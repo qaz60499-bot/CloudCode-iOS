@@ -205,7 +205,9 @@ public struct IPAService: Sendable {
         let staging = destination.deletingLastPathComponent().appendingPathComponent(".\(destination.lastPathComponent).cloudcode-repack-staging")
         if fileManager.fileExists(atPath: staging.path) { try fileManager.removeItem(at: staging) }
         do {
-            guard let archive = try? Archive(url: staging, accessMode: .create) else { throw IPAServiceError.invalidArchive }
+            let archive: Archive
+            do { archive = try Archive(url: staging, accessMode: .create) }
+            catch { throw IPAServiceError.invalidArchive }
             guard let enumerator = fileManager.enumerator(
                 at: root,
                 includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey],
