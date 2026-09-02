@@ -92,7 +92,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.providerBaseURL = defaults.string(forKey: "provider.baseURL") ?? "https://api.openai.com/v1"
         self.providerModel = defaults.string(forKey: "provider.model") ?? "gpt-5.1"
         self.permissionMode = PermissionMode(rawValue: defaults.string(forKey: "permission.mode") ?? "safe") ?? .safe
-        self.browsePath = FileManager.default.homeDirectoryForCurrentUser.path
+        self.browsePath = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).path
         self.session = AgentSession(permissionMode: self.permissionMode)
         self.approvalCenter = approval
         self.appResolver = resolver
@@ -156,7 +156,7 @@ public final class CloudCodeViewModel: ObservableObject {
         activityLines.append("Planning request…")
 
         let config = ProviderConfiguration(name: providerName, baseURL: baseURL, model: providerModel, apiKeyReference: Self.keyReference)
-        let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : FileManager.default.homeDirectoryForCurrentUser
+        let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
 
         currentTask?.cancel()
         currentTask = Task {
@@ -211,7 +211,7 @@ public final class CloudCodeViewModel: ObservableObject {
 
     public func refreshFiles() throws {
         let root = URL(fileURLWithPath: browsePath, isDirectory: true)
-        let allowed = capabilities.isAvailable("filesystem.unrestricted") ? nil : FileManager.default.homeDirectoryForCurrentUser
+        let allowed = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
         files = try fileService.list(directory: root, allowedRoot: allowed)
     }
 
@@ -256,7 +256,7 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private static func supportRoot() -> URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).appendingPathComponent("Library/Application Support")
         let root = base.appendingPathComponent("CloudCode", isDirectory: true)
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root

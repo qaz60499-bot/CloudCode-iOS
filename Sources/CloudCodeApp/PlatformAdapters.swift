@@ -64,7 +64,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     public func dataContainerPath(for bundleID: String) async -> String? {
         if Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
         if let value = containerPaths[bundleID] { return value }
-        if bundleID == Bundle.main.bundleIdentifier { return FileManager.default.homeDirectoryForCurrentUser.path }
+        if bundleID == Bundle.main.bundleIdentifier { return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).path }
         return nil
     }
 
@@ -136,7 +136,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     private func fallbackOwnApp() -> [ResourceNode] {
         guard let bundleID = Bundle.main.bundleIdentifier else { return [] }
         bundlePaths[bundleID] = Bundle.main.bundleURL.path
-        containerPaths[bundleID] = FileManager.default.homeDirectoryForCurrentUser.path
+        containerPaths[bundleID] = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).path
         return [ResourceNode(id: ResourceID("app://\(bundleID)"), kind: .app, displayName: Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "Cloud Code", logicalLocation: "app://\(bundleID)", resolvedPath: Bundle.main.bundleURL.path, ownerBundleID: bundleID)]
     }
 

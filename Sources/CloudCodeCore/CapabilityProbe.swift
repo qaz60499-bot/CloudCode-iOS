@@ -18,7 +18,7 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
     public init(
         appResolver: AppContainerResolving,
         fileManager: FileManager = .default,
-        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+        homeDirectory: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
     ) {
         self.appResolver = appResolver
         self.fileManager = fileManager
