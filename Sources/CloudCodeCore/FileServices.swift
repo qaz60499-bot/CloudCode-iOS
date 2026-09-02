@@ -353,6 +353,12 @@ public actor TrashService {
         }
     }
 
+    public func verifyRestored(_ record: TrashRecord) -> Bool {
+        let target = URL(fileURLWithPath: record.originalPath)
+        guard fileManager.fileExists(atPath: target.path) else { return false }
+        return Self.hashFileOrMetadata(url: target, fileManager: fileManager) == record.hash
+    }
+
     public func permanentlyDelete(_ id: UUID) throws {
         var all = try records()
         guard let index = all.firstIndex(where: { $0.id == id }) else { return }

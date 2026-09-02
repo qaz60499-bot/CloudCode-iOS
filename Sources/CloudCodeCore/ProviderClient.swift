@@ -265,17 +265,19 @@ public enum ProviderRetryClassifier {
             case .invalidResponse(let code):
                 return (500...599).contains(code)
             case .transport:
-                return true
+                return false
             case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .malformedEvent:
                 return false
             }
         }
         guard let urlError = error as? URLError else { return false }
         switch urlError.code {
-        case .timedOut, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
-             .networkConnectionLost, .notConnectedToInternet, .internationalRoamingOff,
-             .callIsActive, .dataNotAllowed, .cannotLoadFromNetwork:
+        case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
+             .notConnectedToInternet, .internationalRoamingOff,
+             .dataNotAllowed, .cannotLoadFromNetwork:
             return true
+        case .timedOut, .networkConnectionLost, .callIsActive:
+            return false
         case .cancelled, .badURL, .unsupportedURL, .userAuthenticationRequired,
              .userCancelledAuthentication, .secureConnectionFailed, .serverCertificateHasBadDate,
              .serverCertificateUntrusted, .serverCertificateHasUnknownRoot,

@@ -117,8 +117,11 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             let guarded = try PathGuard().validate(target: target, allowedRoot: context.allowedRoot, rejectSymlink: true)
             if FileManager.default.fileExists(atPath: guarded.path) { throw CocoaError(.fileWriteFileExists) }
             try FileManager.default.createDirectory(at: guarded.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try Data((call.arguments["content"] ?? "").utf8).write(to: guarded, options: [.atomic])
-            let verification = VerificationResult(passed: FileManager.default.fileExists(atPath: guarded.path), checks: ["created target exists"], failures: [])
+            let expected = Data((call.arguments["content"] ?? "").utf8)
+            try expected.write(to: guarded, options: [.atomic])
+            let actual = try? Data(contentsOf: guarded)
+            let passed = actual.map { $0 == expected } ?? false
+            let verification = VerificationResult(passed: passed, checks: ["created target exists", "re-read bytes match requested content"], failures: passed ? [] : ["created file bytes differ from request"])
             try await audit.append(AuditEvent(sessionID: call.sessionID, toolCallID: call.id, action: call.name, target: guarded.path, risk: descriptor.risk, result: verification.passed ? "created" : "verification_failed"))
             return ToolResult(toolCallID: call.id, success: verification.passed, summary: "Created \(guarded.lastPathComponent)", payload: ["path": guarded.path], verification: verification)
 
@@ -175,8 +178,8 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
         case "trash.restore":
             guard let raw = call.arguments["id"], let id = UUID(uuidString: raw) else { throw CocoaError(.fileNoSuchFile) }
             let record = try await trashService.restore(id)
-            let passed = FileManager.default.fileExists(atPath: record.originalPath)
-            return try result(call.id, summary: "Restored \(record.filename)", key: "trashRecord", value: record, verification: VerificationResult(passed: passed, checks: ["original path exists"], failures: passed ? [] : ["restore target missing"]))
+            let passed = await trashService.verifyRestored(record)
+            return try result(call.id, summary: "Restored \(record.filename)", key: "trashRecord", value: record, verification: VerificationResult(passed: passed, checks: ["original path exists", "restored fingerprint matches Trash record"], failures: passed ? [] : ["restored payload does not match Trash record"]))
 
         case "trash.purge":
             guard let raw = call.arguments["id"], let id = UUID(uuidString: raw) else { throw CocoaError(.fileNoSuchFile) }
@@ -185,9 +188,16 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
                 let preview = ApprovalPreview(title: "Permanently delete Trash item", target: raw, reason: "Permanent deletion cannot be restored", plan: ["Locate Trash record", "Delete Trash payload", "Update journal"], risk: .permanentDestructive)
                 guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
             }
+            let beforeRecords = try await trashService.records()
+            let before = beforeRecords.first(where: { $0.id == id })
             try await trashService.permanentlyDelete(id)
-            try await audit.append(AuditEvent(sessionID: call.sessionID, toolCallID: call.id, action: call.name, target: raw, risk: descriptor.risk, result: "permanently_deleted"))
-            return ToolResult(toolCallID: call.id, success: true, summary: "Trash item permanently deleted")
+            let after = try await trashService.records()
+            let journalGone = !after.contains(where: { $0.id == id })
+            let payloadGone = before.map { !FileManager.default.fileExists(atPath: $0.trashPath) } ?? true
+            let passed = journalGone && payloadGone
+            let verification = VerificationResult(passed: passed, checks: ["Trash journal record absent", "Trash payload absent"], failures: passed ? [] : ["permanent deletion postcondition failed"])
+            try await audit.append(AuditEvent(sessionID: call.sessionID, toolCallID: call.id, action: call.name, target: raw, risk: descriptor.risk, result: passed ? "permanently_deleted" : "verification_failed"))
+            return ToolResult(toolCallID: call.id, success: passed, summary: passed ? "Trash item permanently deleted" : "Trash permanent deletion verification failed", verification: verification)
 
         case "ipa.locate":
             let root = try requiredURL(call, key: "path")
@@ -205,8 +215,12 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             let destination = URL(fileURLWithPath: destinationRaw)
             _ = try PathGuard().validate(target: destination, allowedRoot: context.allowedRoot, rejectSymlink: true)
             try ipaService.extract(target, to: destination)
-            let passed = FileManager.default.fileExists(atPath: destination.path)
-            let verification = VerificationResult(passed: passed, checks: ["extraction destination exists"], failures: passed ? [] : ["destination missing"])
+            let payload = destination.appendingPathComponent("Payload", isDirectory: true)
+            let appInfoFound = ((try? FileManager.default.contentsOfDirectory(at: payload, includingPropertiesForKeys: [.isDirectoryKey])) ?? [])
+                .filter { $0.pathExtension == "app" }
+                .contains { FileManager.default.fileExists(atPath: $0.appendingPathComponent("Info.plist").path) }
+            let passed = FileManager.default.fileExists(atPath: destination.path) && appInfoFound
+            let verification = VerificationResult(passed: passed, checks: ["extraction destination exists", "Payload app Info.plist exists"], failures: passed ? [] : ["extracted IPA payload is incomplete"])
             return ToolResult(toolCallID: call.id, success: passed, summary: "IPA extracted", payload: ["destination": destination.path], verification: verification)
 
         case "ipa.repack":
