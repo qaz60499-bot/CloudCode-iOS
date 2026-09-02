@@ -1,0 +1,99 @@
+name: iOS CI and IPA
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudcode-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-ipa:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          swift --version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Resolve and test core package
+        run: |
+          set -euo pipefail
+          swift package resolve
+          swift test --parallel
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build app for iOS Simulator
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project CloudCodeIOS.xcodeproj \
+            -scheme CloudCodeIOS \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Build unsigned device app
+        run: |
+          set -euo pipefail
+          rm -rf build/DerivedData build/ipa
+          xcodebuild \
+            -project CloudCodeIOS.xcodeproj \
+            -scheme CloudCodeIOS \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+          APP_PATH="build/DerivedData/Build/Products/Release-iphoneos/CloudCode.app"
+          test -d "$APP_PATH"
+          mkdir -p build/ipa/Payload
+          cp -R "$APP_PATH" build/ipa/Payload/
+          (cd build/ipa && zip -qry ../CloudCode-iOS-unsigned.ipa Payload)
+
+      - name: Verify IPA
+        run: bash scripts/verify_ipa.sh build/CloudCode-iOS-unsigned.ipa
+
+      - name: Static safety checks
+        run: |
+          set -euo pipefail
+          ! grep -R --line-number --exclude-dir=.build --exclude-dir=build 'root_exec(' .
+          ! grep -R --line-number --exclude-dir=.build --exclude-dir=build 'removeItem(atPath: "/")' Sources
+          grep -R --line-number 'DEVICE_VALIDATION_REQUIRED\|deviceValidationRequired' Sources docs || true
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudCode-iOS-unsigned
+          path: build/CloudCode-iOS-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload test/build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudCode-iOS-ci-diagnostics
+          path: |
+            .build/debug.yaml
+            build/DerivedData/Logs
+          if-no-files-found: ignore
+          retention-days: 7

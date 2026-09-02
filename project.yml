@@ -1,0 +1,60 @@
+name: CloudCodeIOS
+options:
+  bundleIdPrefix: com.cloudcode
+  deploymentTarget:
+    iOS: "16.0"
+packages:
+  ZIPFoundation:
+    url: https://github.com/weichsel/ZIPFoundation.git
+    from: 0.9.19
+targets:
+  CloudCodeCore:
+    type: framework
+    platform: iOS
+    sources:
+      - Sources/CloudCodeCore
+    dependencies:
+      - package: ZIPFoundation
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.core
+        PRODUCT_NAME: CloudCodeCore
+        DEFINES_MODULE: YES
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: 5.9
+        SKIP_INSTALL: YES
+  CloudCodeIOS:
+    type: application
+    platform: iOS
+    sources:
+      - Sources/CloudCodeApp
+    dependencies:
+      - target: CloudCodeCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios
+        PRODUCT_NAME: CloudCode
+        SWIFT_VERSION: 5.9
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Cloud Code
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: Cloud Code can inspect photo metadata only when the user grants access.
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+        CODE_SIGN_ENTITLEMENTS: Entitlements/CloudCode.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+    scheme:
+      testTargets:
+        - CloudCodeIOSTests
+  CloudCodeIOSTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests/CloudCodeCoreTests
+    dependencies:
+      - target: CloudCodeCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.tests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: 5.9
