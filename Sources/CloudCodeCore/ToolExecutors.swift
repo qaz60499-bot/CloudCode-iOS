@@ -170,8 +170,9 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
                 sourceApp: call.arguments["sourceApp"],
                 allowedRoot: context.allowedRoot
             )
-            let passed = !FileManager.default.fileExists(atPath: target.path) && FileManager.default.fileExists(atPath: record.trashPath)
-            let verification = VerificationResult(passed: passed, checks: ["source removed", "trash target exists"], failures: passed ? [] : ["trash postcondition failed"])
+            let payloadVerified = await trashService.verifyTrashed(record)
+            let passed = !FileManager.default.fileExists(atPath: target.path) && payloadVerified
+            let verification = VerificationResult(passed: passed, checks: ["source removed", "Trash payload fingerprint matches pre-delete snapshot"], failures: passed ? [] : ["trash postcondition or payload fingerprint failed"])
             try await audit.append(AuditEvent(sessionID: call.sessionID, toolCallID: call.id, action: call.name, target: target.path, risk: descriptor.risk, result: passed ? "trashed" : "verification_failed", detail: ["trashID": record.id.uuidString]))
             return try result(call.id, summary: "Moved to Cloud Code Trash", key: "trashRecord", value: record, verification: verification)
 

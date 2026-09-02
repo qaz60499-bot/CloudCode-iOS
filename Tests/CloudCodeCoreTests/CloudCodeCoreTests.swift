@@ -689,6 +689,8 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(afterReplay.count, 1)
         XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: first.trashPath))
+        let trashedFingerprintMatches = await service.verifyTrashed(first)
+        XCTAssertTrue(trashedFingerprintMatches)
 
         try await service.permanentlyDelete(first.id)
         try await service.permanentlyDelete(first.id)

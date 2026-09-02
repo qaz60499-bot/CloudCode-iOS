@@ -353,6 +353,12 @@ public actor TrashService {
         }
     }
 
+    public func verifyTrashed(_ record: TrashRecord) -> Bool {
+        let target = URL(fileURLWithPath: record.trashPath)
+        guard fileManager.fileExists(atPath: target.path) else { return false }
+        return Self.hashFileOrMetadata(url: target, fileManager: fileManager) == record.hash
+    }
+
     public func verifyRestored(_ record: TrashRecord) -> Bool {
         let target = URL(fileURLWithPath: record.originalPath)
         guard fileManager.fileExists(atPath: target.path) else { return false }
@@ -382,7 +388,9 @@ public actor TrashService {
             throw error
         }
 
-        try? fileManager.removeItem(at: quarantine)
+        if fileManager.fileExists(atPath: quarantine.path) {
+            try fileManager.removeItem(at: quarantine)
+        }
     }
 
     private func writeRecords(_ records: [TrashRecord]) throws {
