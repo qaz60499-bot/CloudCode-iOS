@@ -40,9 +40,10 @@ targets:
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
         INFOPLIST_KEY_NSPhotoLibraryUsageDescription: Cloud Code can inspect photo metadata only when the user grants access.
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
         CODE_SIGN_ENTITLEMENTS: Entitlements/CloudCode.entitlements
-        TARGETED_DEVICE_FAMILY: "1,2"
+        TARGETED_DEVICE_FAMILY: "1"
     scheme:
       testTargets:
         - CloudCodeIOSTests
