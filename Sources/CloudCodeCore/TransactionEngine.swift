@@ -222,8 +222,20 @@ public actor TransactionEngine {
         guard let backupPath = transaction.backupPath else { throw TransactionError.noBackup }
         let backupURL = URL(fileURLWithPath: backupPath)
         guard fileManager.fileExists(atPath: backupURL.path) else { throw TransactionError.noBackup }
-        if fileManager.fileExists(atPath: target.path) { try fileManager.removeItem(at: target) }
-        try fileManager.copyItem(at: backupURL, to: target)
+        let safeBackup = try pathGuard.validate(target: backupURL, allowedRoot: backupRoot, rejectSymlink: true, fileManager: fileManager)
+        let safeTarget = try pathGuard.validate(target: target, rejectSymlink: true, fileManager: fileManager)
+        let temporary = safeTarget.deletingLastPathComponent().appendingPathComponent(".cloudcode-rollback-\(UUID().uuidString).tmp")
+        try fileManager.copyItem(at: safeBackup, to: temporary)
+        do {
+            if fileManager.fileExists(atPath: safeTarget.path) {
+                _ = try fileManager.replaceItemAt(safeTarget, withItemAt: temporary, backupItemName: nil, options: [])
+            } else {
+                try fileManager.moveItem(at: temporary, to: safeTarget)
+            }
+        } catch {
+            try? fileManager.removeItem(at: temporary)
+            throw error
+        }
     }
 
     private func identity(of url: URL) throws -> FileIdentity {

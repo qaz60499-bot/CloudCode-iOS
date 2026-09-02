@@ -119,11 +119,21 @@ private struct TasksView: View {
                             .foregroundStyle(.secondary)
                     }
                     ForEach(model.interruptedTasks) { task in
-                        VStack(alignment: .leading, spacing: 4) {
+                        VStack(alignment: .leading, spacing: 8) {
                             Text(task.taskName).font(.headline)
                             Text("Step \(task.stepIndex)/\(task.totalSteps): \(task.stepName)")
                             Text(task.state).font(.caption).foregroundStyle(.secondary)
+                            HStack {
+                                Button("Resume") { model.resumeTask(task) }
+                                    .buttonStyle(.borderedProminent)
+                                    .disabled(model.isRunning)
+                                Button("Rollback") { model.rollbackTask(task) }
+                                    .buttonStyle(.bordered)
+                                Button("Cancel", role: .destructive) { model.cancelInterruptedTask(task) }
+                                    .buttonStyle(.bordered)
+                            }
                         }
+                        .padding(.vertical, 4)
                     }
                 }
                 Section("Lifecycle") {

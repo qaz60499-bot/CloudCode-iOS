@@ -8,6 +8,7 @@ public final class CloudCodeViewModel: ObservableObject {
     @Published public var transcript: String = ""
     @Published public var activityLines: [String] = []
     @Published public var capabilities = CapabilityProfile(records: [])
+    @Published public var capabilityGraph = CapabilityGraph()
     @Published public var apps: [ResourceNode] = []
     @Published public var files: [FileEntry] = []
     @Published public var trash: [TrashRecord] = []
@@ -27,9 +28,12 @@ public final class CloudCodeViewModel: ObservableObject {
 
     private let appResolver: IOSAppResolver
     private let capabilityProbe: CapabilityProbe
+    private let toolRegistry: ToolRegistry
     private let fileService: FileService
     private let trashService: TrashService
     private let auditStore: AuditLogStore
+    private let transactionJournal: TransactionJournal
+    private let transactionEngine: TransactionEngine
     private let checkpointStore: TaskCheckpointStore
     private let sessionStore: SessionStore
     private let keyVault: KeychainAPIKeyVault
@@ -98,9 +102,12 @@ public final class CloudCodeViewModel: ObservableObject {
         self.approvalCenter = approval
         self.appResolver = resolver
         self.capabilityProbe = probe
+        self.toolRegistry = registry
         self.fileService = fileService
         self.trashService = trash
         self.auditStore = audit
+        self.transactionJournal = transactionJournal
+        self.transactionEngine = transactionEngine
         self.checkpointStore = checkpoints
         self.sessionStore = sessions
         self.keyVault = keyVault
@@ -112,6 +119,7 @@ public final class CloudCodeViewModel: ObservableObject {
     public func bootstrap() {
         Task {
             capabilities = await capabilityProbe.probe()
+            capabilityGraph = CapabilityGraphBuilder().build(profile: capabilities, tools: await toolRegistry.all())
             apps = await appResolver.installedApps()
             createKnowledgeSeedIfNeeded()
             do {
@@ -202,9 +210,83 @@ public final class CloudCodeViewModel: ObservableObject {
         activityLines.append("Task interrupted; checkpoint retained for resume/rollback inspection.")
     }
 
+    public func resumeTask(_ checkpoint: TaskCheckpoint) {
+        guard !isRunning else { return }
+        currentTask?.cancel()
+        isRunning = true
+        lastError = nil
+        activityLines.append("Resuming checkpoint \(checkpoint.stepIndex)/\(checkpoint.totalSteps)…")
+
+        currentTask = Task {
+            do {
+                let resumedSession = try await sessionStore.load(checkpoint.sessionID)
+                guard let request = checkpoint.payload["request"] ?? resumedSession.messages.last(where: { $0.role == .user })?.content,
+                      !request.isEmpty else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                guard let baseURL = URL(string: checkpoint.payload["provider.baseURL"] ?? providerBaseURL) else {
+                    throw ProviderError.invalidEndpoint
+                }
+                let config = ProviderConfiguration(
+                    name: checkpoint.payload["provider.name"] ?? providerName,
+                    baseURL: baseURL,
+                    model: checkpoint.payload["provider.model"] ?? providerModel,
+                    apiKeyReference: Self.keyReference
+                )
+                session = resumedSession
+                let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                let source = InputSource(rawValue: checkpoint.payload["inputSource"] ?? "text") ?? .text
+                let stream = await agentCore.send(
+                    text: request,
+                    inputSource: source,
+                    session: resumedSession,
+                    providerConfiguration: config,
+                    allowedRoot: allowedRoot,
+                    appendUserMessage: false,
+                    resumeCheckpoint: checkpoint
+                )
+                try await consume(stream)
+                if let saved = try? await sessionStore.load(checkpoint.sessionID) { session = saved }
+            } catch {
+                lastError = String(describing: error)
+            }
+            isRunning = false
+            await reloadActivity()
+        }
+    }
+
+    public func cancelInterruptedTask(_ checkpoint: TaskCheckpoint) {
+        Task {
+            do {
+                try await checkpointStore.mark(checkpoint.id, state: "cancelled", stepName: "cancelled by user")
+                await reloadActivity()
+            } catch {
+                lastError = String(describing: error)
+            }
+        }
+    }
+
+    public func rollbackTask(_ checkpoint: TaskCheckpoint) {
+        Task {
+            do {
+                let transactions = await transactionJournal.all()
+                let candidate = transactions.first(where: {
+                    $0.sessionID == checkpoint.sessionID && $0.backupPath != nil && $0.state == .committed
+                })
+                guard let transaction = candidate else { throw TransactionError.noBackup }
+                _ = try await transactionEngine.rollback(transactionID: transaction.id)
+                try await checkpointStore.mark(checkpoint.id, state: "rolled_back", stepName: "latest committed transaction rolled back")
+                await reloadActivity()
+            } catch {
+                lastError = String(describing: error)
+            }
+        }
+    }
+
     public func refreshCapabilities() {
         Task {
             capabilities = await capabilityProbe.probe()
+            capabilityGraph = CapabilityGraphBuilder().build(profile: capabilities, tools: await toolRegistry.all())
             apps = await appResolver.installedApps()
             try? await resourceIndex.seedLightweight(apps: apps, capabilityProfile: capabilities)
         }
@@ -258,6 +340,32 @@ public final class CloudCodeViewModel: ObservableObject {
                 guard let bundleID = app.ownerBundleID else { continue }
                 let knowledge = AppKnowledge(appName: app.displayName, bundleID: bundleID, preferredRoutes: [.structuredTool, .urlScheme, .guiFallback], successRate: 0.5, estimatedCost: 0.5, appVersion: app.metadata["version"])
                 try? await appKnowledge.upsert(knowledge)
+            }
+        }
+    }
+
+    private func consume(_ stream: AsyncThrowingStream<AgentEvent, Error>) async throws {
+        var assistantStarted = false
+        for try await event in stream {
+            switch event {
+            case .status(let value):
+                activityLines.append(value)
+            case .token(let token):
+                if !assistantStarted {
+                    transcript += transcript.isEmpty ? "Assistant: " : "\nAssistant: "
+                    assistantStarted = true
+                }
+                transcript += token
+            case .toolStarted(let name, _):
+                activityLines.append("Tool: \(name)")
+            case .toolFinished(let result):
+                activityLines.append("\(result.success ? "✓" : "✗") \(result.summary)")
+            case .approvalRequired:
+                break
+            case .error(let value):
+                lastError = value
+            case .finished:
+                if assistantStarted { transcript += "\n" }
             }
         }
     }

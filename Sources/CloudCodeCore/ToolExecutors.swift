@@ -53,7 +53,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             "capability.probe", "apps.list", "apps.inspect", "container.resolve",
             "files.list", "files.search", "files.read", "storage.analyze", "files.create",
             "files.modify", "files.delete", "trash.restore", "trash.purge",
-            "ipa.locate", "ipa.inspect", "ipa.extract"
+            "ipa.locate", "ipa.inspect", "ipa.extract", "ipa.repack"
         ]
         return supported.contains(tool.name)
     }
@@ -208,6 +208,33 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             let passed = FileManager.default.fileExists(atPath: destination.path)
             let verification = VerificationResult(passed: passed, checks: ["extraction destination exists"], failures: passed ? [] : ["destination missing"])
             return ToolResult(toolCallID: call.id, success: passed, summary: "IPA extracted", payload: ["destination": destination.path], verification: verification)
+
+        case "ipa.repack":
+            let source = try requiredURL(call, key: "source")
+            let destination = try requiredURL(call, key: "destination")
+            _ = try PathGuard().validate(target: source, allowedRoot: context.allowedRoot, rejectSymlink: true)
+            _ = try PathGuard().validate(target: destination, allowedRoot: context.allowedRoot, rejectSymlink: true)
+            let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: destination.path)
+            if decision == .requireConfirmation {
+                let preview = ApprovalPreview(
+                    title: "Repack IPA",
+                    target: destination.path,
+                    originalSummary: nil,
+                    reason: call.arguments["reason"] ?? "Agent requested IPA repack",
+                    plan: ["Validate source tree", "Reject symlinks/path traversal", "Create new IPA", "Re-open and inspect archive"],
+                    risk: descriptor.risk
+                )
+                guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
+            }
+            try ipaService.repack(sourceRoot: source, to: destination)
+            let inspection = try ipaService.inspect(destination)
+            let verification = VerificationResult(
+                passed: inspection.bundleIdentifier != nil,
+                checks: ["re-opened generated IPA", "resolved Payload app Info.plist"],
+                failures: inspection.bundleIdentifier == nil ? ["generated IPA has no bundle identifier"] : []
+            )
+            try await audit.append(AuditEvent(sessionID: call.sessionID, toolCallID: call.id, action: call.name, target: destination.path, risk: descriptor.risk, result: verification.passed ? "repacked" : "verification_failed"))
+            return try result(call.id, summary: "IPA repacked", key: "inspection", value: inspection, verification: verification)
 
         default:
             throw ToolRouterError.noExecutionRoute(call.name)

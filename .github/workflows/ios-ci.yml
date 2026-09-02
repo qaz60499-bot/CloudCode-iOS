@@ -75,9 +75,15 @@ jobs:
       - name: Static safety checks
         run: |
           set -euo pipefail
-          ! grep -R --line-number --exclude-dir=.build --exclude-dir=build 'root_exec(' .
-          ! grep -R --line-number --exclude-dir=.build --exclude-dir=build 'removeItem(atPath: "/")' Sources
-          grep -R --line-number 'DEVICE_VALIDATION_REQUIRED\|deviceValidationRequired' Sources docs || true
+          if grep -R --line-number 'root_exec(' Sources; then
+            echo "FAIL: unrestricted root_exec primitive found in Sources" >&2
+            exit 1
+          fi
+          if grep -R --line-number 'removeItem(atPath: "/")' Sources; then
+            echo "FAIL: direct filesystem-root deletion primitive found" >&2
+            exit 1
+          fi
+          grep -R --line-number 'DEVICE_VALIDATION_REQUIRED\|deviceValidationRequired' Sources docs >/dev/null
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4

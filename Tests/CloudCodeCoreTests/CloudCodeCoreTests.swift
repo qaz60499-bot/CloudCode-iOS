@@ -186,6 +186,82 @@ final class CloudCodeCoreTests: XCTestCase {
         }
     }
 
+    func testCapabilityGraphSeparatesUnprovenCapabilitiesFromExecutableTools() {
+        let profile = CapabilityProfile(records: [
+            CapabilityRecord(id: "ipa.inspect", domain: .ipa, status: .available, detail: "implemented"),
+            CapabilityRecord(id: "ipa.install", domain: .ipa, status: .deviceValidationRequired, detail: "device pending")
+        ])
+        let tools = [
+            ToolDescriptor(name: "ipa.inspect", summary: "", risk: .readOnly, requiredCapabilities: ["ipa.inspect"]),
+            ToolDescriptor(name: "ipa.install", summary: "", risk: .systemChange, requiredCapabilities: ["ipa.install"], preferredRoute: .privateFramework)
+        ]
+        let graph = CapabilityGraphBuilder().build(profile: profile, tools: tools)
+        XCTAssertEqual(graph.node("capability://ipa.inspect")?.status, .available)
+        XCTAssertEqual(graph.node("capability://ipa.install")?.status, .deviceValidationRequired)
+        XCTAssertTrue(graph.edges.contains(where: { $0.from == "tool://ipa.install" && $0.to == "capability://ipa.install" }))
+    }
+
+    func testCheckpointCanBeMarkedCancelled() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json"))
+        let checkpoint = TaskCheckpoint(sessionID: UUID(), taskName: "test", stepIndex: 2, stepName: "running", totalSteps: 5, state: "interrupted")
+        try await store.upsert(checkpoint)
+        try await store.mark(checkpoint.id, state: "cancelled", stepName: "cancelled by test")
+        let stored = await store.checkpoint(checkpoint.id)
+        let interrupted = await store.interrupted()
+        XCTAssertEqual(stored?.state, "cancelled")
+        XCTAssertTrue(interrupted.isEmpty)
+    }
+
+    func testIPARepackInspectAndExtractRoundTrip() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        let app = source.appendingPathComponent("Payload/Test.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+        let plist: [String: Any] = [
+            "CFBundleIdentifier": "com.example.test",
+            "CFBundleDisplayName": "Test",
+            "CFBundleExecutable": "Test",
+            "CFBundleVersion": "1",
+            "CFBundleShortVersionString": "1.0",
+            "MinimumOSVersion": "16.0"
+        ]
+        let plistData = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try plistData.write(to: app.appendingPathComponent("Info.plist"))
+        var executable = Data([0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01])
+        executable.append(Data(repeating: 0, count: 64))
+        try executable.write(to: app.appendingPathComponent("Test"))
+
+        let ipa = root.appendingPathComponent("Test.ipa")
+        let service = IPAService()
+        try service.repack(sourceRoot: source, to: ipa)
+        let inspection = try service.inspect(ipa)
+        XCTAssertEqual(inspection.bundleIdentifier, "com.example.test")
+        XCTAssertTrue(inspection.architectures.contains("arm64"))
+
+        let extracted = root.appendingPathComponent("extracted", isDirectory: true)
+        try service.extract(ipa, to: extracted)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: extracted.appendingPathComponent("Payload/Test.app/Info.plist").path))
+    }
+
+    func testIPAExtractionHonorsTotalSizeLimit() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        let app = source.appendingPathComponent("Payload/Test.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+        try Data(repeating: 1, count: 128).write(to: app.appendingPathComponent("payload.bin"))
+        let ipa = root.appendingPathComponent("large.ipa")
+        try IPAService().repack(sourceRoot: source, to: ipa)
+        let destination = root.appendingPathComponent("too-large", isDirectory: true)
+        XCTAssertThrowsError(try IPAService(maxExtractedBytes: 32).extract(ipa, to: destination)) { error in
+            XCTAssertEqual(error as? IPAServiceError, .archiveTooLarge)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
     func testToolRouterPrefersStructuredToolOverGUI() async throws {
         let registry = ToolRegistry(descriptors: [ToolDescriptor(name: "files.list", summary: "", risk: .readOnly)])
         let structured = StubExecutor(route: .structuredTool, names: ["files.list"])

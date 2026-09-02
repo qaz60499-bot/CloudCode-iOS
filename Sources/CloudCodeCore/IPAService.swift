@@ -55,13 +55,18 @@ public enum IPAServiceError: Error, Equatable {
     case missingInfoPlist
     case unsafeEntry(String)
     case entryTooLarge(String)
+    case archiveTooLarge
+    case destinationExists
+    case invalidRepackSource
 }
 
 public struct IPAService: Sendable {
     public let maxMetadataEntryBytes: Int64
+    public let maxExtractedBytes: UInt64
 
-    public init(maxMetadataEntryBytes: Int64 = 64 * 1024 * 1024) {
+    public init(maxMetadataEntryBytes: Int64 = 64 * 1024 * 1024, maxExtractedBytes: UInt64 = 4 * 1024 * 1024 * 1024) {
         self.maxMetadataEntryBytes = maxMetadataEntryBytes
+        self.maxExtractedBytes = maxExtractedBytes
     }
 
     public func locate(root: URL, fileService: FileService = FileService()) throws -> [FileEntry] {
@@ -157,14 +162,63 @@ public struct IPAService: Sendable {
         let archive: Archive
         do { archive = try Archive(url: ipaURL, accessMode: .read) }
         catch { throw IPAServiceError.invalidArchive }
-        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-        let safeRoot = destination.standardizedFileURL
-        for entry in archive {
+        if FileManager.default.fileExists(atPath: destination.path) { throw IPAServiceError.destinationExists }
+
+        let entries = Array(archive)
+        var total: UInt64 = 0
+        for entry in entries {
             try validate(entry.path)
-            let target = safeRoot.appendingPathComponent(entry.path).standardizedFileURL
+            let (next, overflow) = total.addingReportingOverflow(UInt64(entry.uncompressedSize))
+            guard !overflow, next <= maxExtractedBytes else { throw IPAServiceError.archiveTooLarge }
+            total = next
+        }
+
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        do {
+            let safeRoot = destination.standardizedFileURL
             let prefix = safeRoot.path.hasSuffix("/") ? safeRoot.path : safeRoot.path + "/"
-            guard target.path == safeRoot.path || target.path.hasPrefix(prefix) else { throw IPAServiceError.unsafeEntry(entry.path) }
-            _ = try archive.extract(entry, to: target)
+            for entry in entries {
+                let target = safeRoot.appendingPathComponent(entry.path).standardizedFileURL
+                guard target.path == safeRoot.path || target.path.hasPrefix(prefix) else { throw IPAServiceError.unsafeEntry(entry.path) }
+                _ = try archive.extract(entry, to: target)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
+    }
+
+    public func repack(sourceRoot: URL, to destination: URL) throws {
+        let fileManager = FileManager.default
+        guard fileManager.directoryExists(at: sourceRoot),
+              fileManager.directoryExists(at: sourceRoot.appendingPathComponent("Payload", isDirectory: true)) else {
+            throw IPAServiceError.invalidRepackSource
+        }
+        if fileManager.fileExists(atPath: destination.path) { throw IPAServiceError.destinationExists }
+        try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        let root = sourceRoot.standardizedFileURL
+        guard let archive = try? Archive(url: destination, accessMode: .create) else { throw IPAServiceError.invalidArchive }
+        guard let enumerator = fileManager.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey],
+            options: []
+        ) else { throw IPAServiceError.invalidRepackSource }
+
+        do {
+            for case let item as URL in enumerator {
+                let values = try item.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey])
+                if values.isSymbolicLink == true { throw IPAServiceError.unsafeEntry(item.path) }
+                let relative = String(item.path.dropFirst(root.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                guard !relative.isEmpty else { continue }
+                try validate(relative)
+                if values.isRegularFile == true {
+                    try archive.addEntry(with: relative, relativeTo: root, compressionMethod: .deflate)
+                }
+            }
+        } catch {
+            try? fileManager.removeItem(at: destination)
+            throw error
         }
     }
 
