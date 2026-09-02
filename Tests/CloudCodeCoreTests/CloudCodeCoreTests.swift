@@ -604,8 +604,8 @@ final class CloudCodeCoreTests: XCTestCase {
         _ = await consumer.result
 
         for _ in 0..<40 {
-            if let checkpoint = await checkpoints.interrupted().first(where: { $0.sessionID == session.id }) {
-                XCTAssertEqual(checkpoint.state, "interrupted")
+            if let checkpoint = await checkpoints.interrupted().first(where: { $0.sessionID == session.id }),
+               checkpoint.state == "interrupted" {
                 XCTAssertTrue(checkpoint.stepName.contains("cancelled"))
                 return
             }
