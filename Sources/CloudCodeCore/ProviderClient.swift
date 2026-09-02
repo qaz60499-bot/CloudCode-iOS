@@ -20,6 +20,8 @@ public actor MemoryKeyVault: APIKeyVault {
 public enum ProviderError: Error, Equatable, CustomStringConvertible {
     case missingAPIKey
     case invalidEndpoint
+    case authenticationFailed(Int)
+    case rateLimited
     case invalidResponse(Int)
     case malformedEvent
     case transport(String)
@@ -28,6 +30,8 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
         switch self {
         case .missingAPIKey: return "Provider API key is missing"
         case .invalidEndpoint: return "Provider endpoint is invalid"
+        case .authenticationFailed(let code): return "Provider authentication failed (HTTP \(code)); update the API key in Settings"
+        case .rateLimited: return "Provider rate limit exceeded; retry later"
         case .invalidResponse(let code): return "Provider returned HTTP \(code)"
         case .malformedEvent: return "Provider returned malformed streaming data"
         case .transport(let value): return value
@@ -86,9 +90,11 @@ public protocol ProviderStreaming: Sendable {
 
 public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable {
     private let session: URLSession
+    private let retryPolicy: RetryPolicy
 
-    public init(session: URLSession = .shared) {
+    public init(session: URLSession = .shared, retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 2, initialDelayNanoseconds: 1_500_000_000)) {
         self.session = session
+        self.retryPolicy = retryPolicy
     }
 
     public func stream(
@@ -99,25 +105,32 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable {
     ) -> AsyncThrowingStream<ProviderEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
-                var attempt = 0
-                while attempt < 2 {
+                var attempt = 1
+                while attempt <= retryPolicy.maxAttempts {
                     var responseStarted = false
                     do {
                         let request = try makeRequest(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
                         let (bytes, response) = try await session.bytes(for: request)
                         guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("Missing HTTP response") }
-                        guard (200..<300).contains(http.statusCode) else { throw ProviderError.invalidResponse(http.statusCode) }
+                        if let statusError = ProviderHTTPClassifier.error(for: http.statusCode) {
+                            throw statusError
+                        }
 
                         var toolCallState: [Int: ToolCallAccumulator] = [:]
+                        var sawValidStreamEvent = false
                         for try await line in bytes.lines {
                             if Task.isCancelled { throw CancellationError() }
                             guard line.hasPrefix("data:") else { continue }
                             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-                            if payload == "[DONE]" { break }
+                            if payload == "[DONE]" {
+                                sawValidStreamEvent = true
+                                break
+                            }
                             guard let data = payload.data(using: .utf8),
                                   let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                                   let choices = object["choices"] as? [[String: Any]],
                                   let delta = choices.first?["delta"] as? [String: Any] else { continue }
+                            sawValidStreamEvent = true
 
                             if let content = delta["content"] as? String, !content.isEmpty {
                                 responseStarted = true
@@ -139,9 +152,12 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable {
                             }
                         }
 
+                        guard sawValidStreamEvent else { throw ProviderError.malformedEvent }
+
                         for index in toolCallState.keys.sorted() {
                             if let call = toolCallState[index], !call.name.isEmpty {
-                                continuation.yield(.toolCall(id: call.id.isEmpty ? UUID().uuidString : call.id, name: call.name, argumentsJSON: call.arguments.isEmpty ? "{}" : call.arguments))
+                                guard !call.id.isEmpty else { throw ProviderError.malformedEvent }
+                                continuation.yield(.toolCall(id: call.id, name: call.name, argumentsJSON: call.arguments.isEmpty ? "{}" : call.arguments))
                             }
                         }
                         continuation.yield(.finished)
@@ -151,13 +167,21 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable {
                         continuation.finish()
                         return
                     } catch {
-                        let mayReplay = !responseStarted && attempt == 0 && isRetryableBeforeOutput(error)
+                        let mayReplay = !responseStarted && attempt < retryPolicy.maxAttempts && ProviderRetryClassifier.isRetryableBeforeOutput(error)
                         guard mayReplay else {
                             continuation.finish(throwing: error)
                             return
                         }
+                        let shift = UInt64(min(max(attempt - 1, 0), 8))
+                        let multiplier = UInt64(1) << shift
+                        let (delay, overflow) = retryPolicy.initialDelayNanoseconds.multipliedReportingOverflow(by: multiplier)
                         attempt += 1
-                        try? await Task.sleep(nanoseconds: 1_500_000_000)
+                        do {
+                            try await Task.sleep(nanoseconds: overflow ? UInt64.max / 4 : delay)
+                        } catch {
+                            continuation.finish()
+                            return
+                        }
                     }
                 }
             }
@@ -198,18 +222,6 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable {
         return request
     }
 
-    private func isRetryableBeforeOutput(_ error: Error) -> Bool {
-        if let providerError = error as? ProviderError {
-            switch providerError {
-            case .invalidResponse(let code): return (500...599).contains(code)
-            case .transport: return true
-            case .missingAPIKey, .invalidEndpoint, .malformedEvent: return false
-            }
-        }
-        if error is URLError { return true }
-        return false
-    }
-
     private func providerMessageObject(_ message: ChatMessage) -> [String: Any] {
         var object: [String: Any] = ["role": message.role.rawValue, "content": message.content]
         if message.role == .tool, let toolCallID = message.providerMetadata["tool_call_id"] {
@@ -230,6 +242,48 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable {
             ]]
         }
         return object
+    }
+}
+
+public enum ProviderHTTPClassifier {
+    public static func error(for statusCode: Int) -> ProviderError? {
+        switch statusCode {
+        case 200..<300: return nil
+        case 401, 403: return .authenticationFailed(statusCode)
+        case 429: return .rateLimited
+        default: return .invalidResponse(statusCode)
+        }
+    }
+}
+
+public enum ProviderRetryClassifier {
+    public static func isRetryableBeforeOutput(_ error: Error) -> Bool {
+        if let providerError = error as? ProviderError {
+            switch providerError {
+            case .rateLimited:
+                return true
+            case .invalidResponse(let code):
+                return (500...599).contains(code)
+            case .transport:
+                return true
+            case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .malformedEvent:
+                return false
+            }
+        }
+        guard let urlError = error as? URLError else { return false }
+        switch urlError.code {
+        case .timedOut, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
+             .networkConnectionLost, .notConnectedToInternet, .internationalRoamingOff,
+             .callIsActive, .dataNotAllowed, .cannotLoadFromNetwork:
+            return true
+        case .cancelled, .badURL, .unsupportedURL, .userAuthenticationRequired,
+             .userCancelledAuthentication, .secureConnectionFailed, .serverCertificateHasBadDate,
+             .serverCertificateUntrusted, .serverCertificateHasUnknownRoot,
+             .serverCertificateNotYetValid, .clientCertificateRejected, .clientCertificateRequired:
+            return false
+        default:
+            return false
+        }
     }
 }
 

@@ -187,6 +187,75 @@ public actor TrashService {
     }
 
     public func records() throws -> [TrashRecord] {
+        var all = try loadRecords()
+        guard fileManager.fileExists(atPath: root.path) else { return all }
+        var journalChanged = false
+        var removeIDs = Set<UUID>()
+
+        for record in all {
+            let trashURL = URL(fileURLWithPath: record.trashPath)
+            let recordDirectory = trashURL.deletingLastPathComponent()
+            let quarantine = root.appendingPathComponent(".purging-\(record.id.uuidString)", isDirectory: true)
+            let original = URL(fileURLWithPath: record.originalPath)
+
+            if fileManager.fileExists(atPath: quarantine.path), !fileManager.fileExists(atPath: recordDirectory.path) {
+                try fileManager.moveItem(at: quarantine, to: recordDirectory)
+            }
+
+            let backups = ((try? fileManager.contentsOfDirectory(at: recordDirectory, includingPropertiesForKeys: nil)) ?? [])
+                .filter { $0.lastPathComponent.hasPrefix(".restore-overwrite-") }
+            let sourceExists = fileManager.fileExists(atPath: trashURL.path)
+            let targetExists = fileManager.fileExists(atPath: original.path)
+
+            if sourceExists, !targetExists, let backup = backups.first {
+                try fileManager.createDirectory(at: original.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try fileManager.moveItem(at: backup, to: original)
+                for extra in backups.dropFirst() { try? fileManager.removeItem(at: extra) }
+                continue
+            }
+
+            if !sourceExists, targetExists, let backup = backups.first {
+                let targetMatchesTrash = Self.hashFileOrMetadata(url: original, fileManager: fileManager) == record.hash
+                if targetMatchesTrash {
+                    try fileManager.createDirectory(at: trashURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try fileManager.moveItem(at: original, to: trashURL)
+                    try fileManager.moveItem(at: backup, to: original)
+                    for extra in backups.dropFirst() { try? fileManager.removeItem(at: extra) }
+                }
+                continue
+            }
+
+            if !sourceExists, !targetExists, let backup = backups.first {
+                try fileManager.createDirectory(at: original.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try fileManager.moveItem(at: backup, to: original)
+                for extra in backups.dropFirst() { try? fileManager.removeItem(at: extra) }
+                removeIDs.insert(record.id)
+                journalChanged = true
+                continue
+            }
+
+            if !sourceExists, targetExists, backups.isEmpty,
+               Self.hashFileOrMetadata(url: original, fileManager: fileManager) == record.hash {
+                removeIDs.insert(record.id)
+                journalChanged = true
+            }
+        }
+
+        if !removeIDs.isEmpty { all.removeAll { removeIDs.contains($0.id) } }
+        let activeIDs = Set(all.map(\.id))
+        let rootItems = (try? fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
+        for item in rootItems where item.lastPathComponent.hasPrefix(".purging-") {
+            let rawID = String(item.lastPathComponent.dropFirst(".purging-".count))
+            if let id = UUID(uuidString: rawID), !activeIDs.contains(id) {
+                try? fileManager.removeItem(at: item)
+            }
+        }
+
+        if journalChanged { try writeRecords(all) }
+        return all
+    }
+
+    private func loadRecords() throws -> [TrashRecord] {
         guard fileManager.fileExists(atPath: journalURL.path) else { return [] }
         let data = try Data(contentsOf: journalURL)
         let decoder = JSONDecoder()
@@ -203,6 +272,11 @@ public actor TrashService {
         sourceApp: String?,
         allowedRoot: URL? = nil
     ) throws -> TrashRecord {
+        var all = try records()
+        if let existing = all.first(where: { $0.toolCallID == toolCallID }), fileManager.fileExists(atPath: existing.trashPath) {
+            return existing
+        }
+
         let safe = try pathGuard.validate(target: target, allowedRoot: allowedRoot, rejectSymlink: true, recursiveDelete: fileManager.directoryExists(at: target), fileManager: fileManager)
         try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
 
@@ -213,9 +287,7 @@ public actor TrashService {
 
         let size = (try? fileManager.allocatedSizeOfItem(at: safe)) ?? 0
         let hash = Self.hashFileOrMetadata(url: safe, fileManager: fileManager)
-        try fileManager.moveItem(at: safe, to: trashTarget)
 
-        var all = (try? records()) ?? []
         let record = TrashRecord(
             originalPath: safe.path,
             logicalResourceID: logicalResourceID,
@@ -230,7 +302,15 @@ public actor TrashService {
         )
         all.append(record)
         try writeRecords(all)
-        return record
+        do {
+            try fileManager.moveItem(at: safe, to: trashTarget)
+            return record
+        } catch {
+            all.removeAll(where: { $0.id == record.id })
+            try? writeRecords(all)
+            try? fileManager.removeItem(at: targetDirectory)
+            throw error
+        }
     }
 
     public func restore(_ id: UUID, overwrite: Bool = false) throws -> TrashRecord {
@@ -240,27 +320,63 @@ public actor TrashService {
         let source = URL(fileURLWithPath: record.trashPath)
         let target = URL(fileURLWithPath: record.originalPath)
 
+        var overwrittenBackup: URL?
         if fileManager.fileExists(atPath: target.path) {
             guard overwrite else { throw CocoaError(.fileWriteFileExists) }
-            try fileManager.removeItem(at: target)
+            let backup = source.deletingLastPathComponent().appendingPathComponent(".restore-overwrite-\(UUID().uuidString)")
+            try fileManager.moveItem(at: target, to: backup)
+            overwrittenBackup = backup
         }
         try fileManager.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try fileManager.moveItem(at: source, to: target)
+        do {
+            try fileManager.moveItem(at: source, to: target)
+        } catch {
+            if let overwrittenBackup, fileManager.fileExists(atPath: overwrittenBackup.path) {
+                try? fileManager.moveItem(at: overwrittenBackup, to: target)
+            }
+            throw error
+        }
         all.remove(at: index)
-        try writeRecords(all)
-        return record
+        do {
+            try writeRecords(all)
+            if let overwrittenBackup { try? fileManager.removeItem(at: overwrittenBackup) }
+            return record
+        } catch {
+            if fileManager.fileExists(atPath: target.path), !fileManager.fileExists(atPath: source.path) {
+                try? fileManager.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try? fileManager.moveItem(at: target, to: source)
+            }
+            if let overwrittenBackup, fileManager.fileExists(atPath: overwrittenBackup.path), !fileManager.fileExists(atPath: target.path) {
+                try? fileManager.moveItem(at: overwrittenBackup, to: target)
+            }
+            throw error
+        }
     }
 
     public func permanentlyDelete(_ id: UUID) throws {
         var all = try records()
-        guard let index = all.firstIndex(where: { $0.id == id }) else { throw CocoaError(.fileNoSuchFile) }
+        guard let index = all.firstIndex(where: { $0.id == id }) else { return }
         let record = all[index]
         let trashURL = URL(fileURLWithPath: record.trashPath)
-        if fileManager.fileExists(atPath: trashURL.path) { try fileManager.removeItem(at: trashURL) }
         let recordDirectory = trashURL.deletingLastPathComponent()
-        try? fileManager.removeItem(at: recordDirectory)
+        let quarantine = root.appendingPathComponent(".purging-\(id.uuidString)", isDirectory: true)
+
+        if fileManager.fileExists(atPath: quarantine.path) { try fileManager.removeItem(at: quarantine) }
+        if fileManager.fileExists(atPath: recordDirectory.path) {
+            try fileManager.moveItem(at: recordDirectory, to: quarantine)
+        }
+
         all.remove(at: index)
-        try writeRecords(all)
+        do {
+            try writeRecords(all)
+        } catch {
+            if fileManager.fileExists(atPath: quarantine.path), !fileManager.fileExists(atPath: recordDirectory.path) {
+                try? fileManager.moveItem(at: quarantine, to: recordDirectory)
+            }
+            throw error
+        }
+
+        try? fileManager.removeItem(at: quarantine)
     }
 
     private func writeRecords(_ records: [TrashRecord]) throws {

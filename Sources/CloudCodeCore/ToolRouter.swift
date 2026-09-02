@@ -71,10 +71,13 @@ public actor ToolRegistry {
 public actor ToolRouter {
     private let registry: ToolRegistry
     private let executors: [ToolExecuting]
+    private let executionLedger: ToolExecutionLedger?
+    private var inFlight: [UUID: (call: ToolCall, task: Task<ToolResult, Error>)] = [:]
 
-    public init(registry: ToolRegistry, executors: [ToolExecuting]) {
+    public init(registry: ToolRegistry, executors: [ToolExecuting], executionLedger: ToolExecutionLedger? = nil) {
         self.registry = registry
         self.executors = executors
+        self.executionLedger = executionLedger
     }
 
     public func chooseRoute(for call: ToolCall, capabilities: CapabilityProfile) async throws -> AppExecutionRoute {
@@ -97,12 +100,39 @@ public actor ToolRouter {
     public func execute(_ call: ToolCall, context: ToolExecutionContext) async throws -> ToolResult {
         guard let descriptor = await registry.descriptor(named: call.name) else { throw ToolRouterError.unknownTool(call.name) }
         let route = try await chooseRoute(for: call, capabilities: context.capabilityProfile)
+
+        var selectedExecutor: ToolExecuting?
         for executor in executors where executor.route == route {
             if await executor.supports(descriptor, capabilities: context.capabilityProfile) {
-                return try await executor.execute(call, descriptor: descriptor, context: context)
+                selectedExecutor = executor
+                break
             }
         }
-        throw ToolRouterError.noExecutionRoute(call.name)
+        guard let executor = selectedExecutor else { throw ToolRouterError.noExecutionRoute(call.name) }
+
+        if descriptor.risk == .readOnly {
+            return try await executor.execute(call, descriptor: descriptor, context: context)
+        }
+
+        if let existing = inFlight[call.id] {
+            guard existing.call == call else { throw ToolExecutionLedgerError.idempotencyConflict(call.id) }
+            return try await existing.task.value
+        }
+
+        let task = Task<ToolResult, Error> {
+            if let executionLedger,
+               let cached = try await executionLedger.prepare(call) {
+                return cached
+            }
+            let result = try await executor.execute(call, descriptor: descriptor, context: context)
+            if result.success, let executionLedger {
+                try await executionLedger.complete(result, for: call)
+            }
+            return result
+        }
+        inFlight[call.id] = (call, task)
+        defer { inFlight.removeValue(forKey: call.id) }
+        return try await task.value
     }
 
     private func routeOrder(preferred: AppExecutionRoute) -> [AppExecutionRoute] {

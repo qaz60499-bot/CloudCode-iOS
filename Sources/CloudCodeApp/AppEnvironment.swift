@@ -16,6 +16,7 @@ public final class CloudCodeViewModel: ObservableObject {
     @Published public var interruptedTasks: [TaskCheckpoint] = []
     @Published public var isRunning = false
     @Published public var lastError: String?
+    @Published public private(set) var inFlightOperationKeys: Set<String> = []
 
     @Published public var providerName: String
     @Published public var providerBaseURL: String
@@ -41,6 +42,10 @@ public final class CloudCodeViewModel: ObservableObject {
     private let resourceIndex: ProgressiveResourceIndex
     private let appKnowledge: AppKnowledgeRegistry
     private var currentTask: Task<Void, Never>?
+    private var runGeneration = RunGenerationGuard()
+    private var bootstrapTask: Task<Void, Never>?
+    private var capabilityRefreshTask: Task<Void, Never>?
+    private var didBootstrap = false
 
     private static let keyReference = "primary-provider"
 
@@ -76,7 +81,8 @@ public final class CloudCodeViewModel: ObservableObject {
         let registry = ToolRegistry()
         let cli = IOSSystemExecutor(policy: policy, approval: approval)
         let gui = GUIFallbackExecutor(backend: UnavailableGUIBackend())
-        let router = ToolRouter(registry: registry, executors: [structured, cli, URLSchemeExecutor(), gui])
+        let executionLedger = ToolExecutionLedger(fileURL: support.appendingPathComponent("Execution/tool-results.json"))
+        let router = ToolRouter(registry: registry, executors: [structured, cli, URLSchemeExecutor(), gui], executionLedger: executionLedger)
         let keyVault = KeychainAPIKeyVault()
         let sessions = SessionStore(root: support.appendingPathComponent("Sessions", isDirectory: true))
         let checkpoints = TaskCheckpointStore(fileURL: support.appendingPathComponent("Tasks/checkpoints.json"))
@@ -117,38 +123,50 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func bootstrap() {
-        Task {
+        guard !didBootstrap, bootstrapTask == nil else { return }
+        bootstrapTask = Task {
+            defer { bootstrapTask = nil }
             capabilities = await capabilityProbe.probe()
             capabilityGraph = CapabilityGraphBuilder().build(profile: capabilities, tools: await toolRegistry.all())
             apps = await appResolver.installedApps()
-            createKnowledgeSeedIfNeeded()
+            await seedKnowledgeIfNeeded(apps)
             do {
+                try await checkpointStore.recoverUnfinishedAfterRestart()
+                let recoveredTransactions = try await transactionEngine.recoverInterruptedTransactions()
+                if !recoveredTransactions.isEmpty {
+                    activityLines.append("Recovered \(recoveredTransactions.count) interrupted transaction(s) to a terminal state.")
+                }
                 try await resourceIndex.seedLightweight(apps: apps, capabilityProfile: capabilities)
                 trash = try await trashService.records()
                 auditEvents = Array((try await auditStore.readAll()).suffix(200).reversed())
                 interruptedTasks = await checkpointStore.interrupted()
                 try refreshFiles()
+                didBootstrap = true
             } catch {
                 lastError = String(describing: error)
             }
         }
     }
 
-    public func saveProvider() {
+    @discardableResult
+    public func saveProvider() -> Bool {
+        if !providerAPIKey.isEmpty {
+            do {
+                try keyVault.set(providerAPIKey, for: Self.keyReference)
+            } catch {
+                lastError = "Keychain: \(error)"
+                return false
+            }
+        }
+
         let defaults = UserDefaults.standard
         defaults.set(providerName, forKey: "provider.name")
         defaults.set(providerBaseURL, forKey: "provider.baseURL")
         defaults.set(providerModel, forKey: "provider.model")
         defaults.set(permissionMode.rawValue, forKey: "permission.mode")
         session.permissionMode = permissionMode
-        if !providerAPIKey.isEmpty {
-            do {
-                try keyVault.set(providerAPIKey, for: Self.keyReference)
-                providerAPIKey = ""
-            } catch {
-                lastError = "Keychain: \(error)"
-            }
-        }
+        providerAPIKey = ""
+        return true
     }
 
     public func send(_ text: String) {
@@ -158,7 +176,7 @@ public final class CloudCodeViewModel: ObservableObject {
             lastError = "Invalid provider URL/model"
             return
         }
-        saveProvider()
+        guard saveProvider() else { return }
         isRunning = true
         lastError = nil
         transcript += transcript.isEmpty ? "You: \(trimmed)\n\n" : "\nYou: \(trimmed)\n\n"
@@ -168,11 +186,13 @@ public final class CloudCodeViewModel: ObservableObject {
         let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
 
         currentTask?.cancel()
+        let runID = runGeneration.start()
         currentTask = Task {
             let stream = await agentCore.send(text: trimmed, session: session, providerConfiguration: config, allowedRoot: allowedRoot)
             do {
                 var assistantStarted = false
                 for try await event in stream {
+                    guard runGeneration.isCurrent(runID) else { break }
                     switch event {
                     case .status(let value):
                         activityLines.append(value)
@@ -194,32 +214,44 @@ public final class CloudCodeViewModel: ObservableObject {
                         transcript += "\n"
                     }
                 }
-                if let saved = try? await sessionStore.load(session.id) { session = saved }
+                if runGeneration.isCurrent(runID),
+                   let saved = try? await sessionStore.load(session.id) { session = saved }
             } catch {
-                lastError = String(describing: error)
+                if runGeneration.isCurrent(runID) { lastError = String(describing: error) }
             }
-            isRunning = false
+            if runGeneration.finish(runID) {
+                currentTask = nil
+                isRunning = false
+            }
             await reloadActivity()
+            refreshFilesFromDisk()
         }
     }
 
     public func cancelCurrentTask() {
         currentTask?.cancel()
         currentTask = nil
+        runGeneration.cancel()
         isRunning = false
         activityLines.append("Task interrupted; checkpoint retained for resume/rollback inspection.")
     }
 
     public func resumeTask(_ checkpoint: TaskCheckpoint) {
         guard !isRunning else { return }
+        let operationKey = checkpointOperationKey(checkpoint.id)
+        guard beginExclusiveOperation(operationKey) else { return }
         currentTask?.cancel()
+        let runID = runGeneration.start()
         isRunning = true
         lastError = nil
         activityLines.append("Resuming checkpoint \(checkpoint.stepIndex)/\(checkpoint.totalSteps)…")
 
         currentTask = Task {
+            defer { endExclusiveOperation(operationKey) }
             do {
-                let resumedSession = try await sessionStore.load(checkpoint.sessionID)
+                var resumedSession = try await sessionStore.load(checkpoint.sessionID)
+                resumedSession.permissionMode = permissionMode
+                try await sessionStore.save(resumedSession)
                 guard let request = checkpoint.payload["request"] ?? resumedSession.messages.last(where: { $0.role == .user })?.content,
                       !request.isEmpty else {
                     throw CocoaError(.fileReadCorruptFile)
@@ -245,18 +277,26 @@ public final class CloudCodeViewModel: ObservableObject {
                     appendUserMessage: false,
                     resumeCheckpoint: checkpoint
                 )
-                try await consume(stream)
-                if let saved = try? await sessionStore.load(checkpoint.sessionID) { session = saved }
+                try await consume(stream, runID: runID)
+                if runGeneration.isCurrent(runID),
+                   let saved = try? await sessionStore.load(checkpoint.sessionID) { session = saved }
             } catch {
-                lastError = String(describing: error)
+                if runGeneration.isCurrent(runID) { lastError = String(describing: error) }
             }
-            isRunning = false
+            if runGeneration.finish(runID) {
+                currentTask = nil
+                isRunning = false
+            }
             await reloadActivity()
+            refreshFilesFromDisk()
         }
     }
 
     public func cancelInterruptedTask(_ checkpoint: TaskCheckpoint) {
+        let key = checkpointOperationKey(checkpoint.id)
+        guard beginExclusiveOperation(key) else { return }
         Task {
+            defer { endExclusiveOperation(key) }
             do {
                 try await checkpointStore.mark(checkpoint.id, state: "cancelled", stepName: "cancelled by user")
                 await reloadActivity()
@@ -267,8 +307,12 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func rollbackTask(_ checkpoint: TaskCheckpoint) {
+        let key = checkpointOperationKey(checkpoint.id)
+        guard beginExclusiveOperation(key) else { return }
         Task {
+            defer { endExclusiveOperation(key) }
             do {
+                try await transactionJournal.assertHealthy()
                 let transactions = await transactionJournal.all()
                 let candidate = transactions.first(where: {
                     $0.sessionID == checkpoint.sessionID && $0.backupPath != nil && $0.state == .committed
@@ -277,6 +321,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 _ = try await transactionEngine.rollback(transactionID: transaction.id)
                 try await checkpointStore.mark(checkpoint.id, state: "rolled_back", stepName: "latest committed transaction rolled back")
                 await reloadActivity()
+                refreshFilesFromDisk()
             } catch {
                 lastError = String(describing: error)
             }
@@ -284,7 +329,9 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func refreshCapabilities() {
-        Task {
+        guard bootstrapTask == nil, capabilityRefreshTask == nil else { return }
+        capabilityRefreshTask = Task {
+            defer { capabilityRefreshTask = nil }
             capabilities = await capabilityProbe.probe()
             capabilityGraph = CapabilityGraphBuilder().build(profile: capabilities, tools: await toolRegistry.all())
             apps = await appResolver.installedApps()
@@ -299,23 +346,38 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func reloadActivity() async {
-        trash = (try? await trashService.records()) ?? []
-        auditEvents = Array(((try? await auditStore.readAll()) ?? []).suffix(200).reversed())
+        do {
+            trash = try await trashService.records()
+        } catch {
+            lastError = "Trash state could not be refreshed: \(error)"
+        }
+        do {
+            auditEvents = Array((try await auditStore.readAll()).suffix(200).reversed())
+        } catch {
+            lastError = "Audit state could not be refreshed: \(error)"
+        }
         interruptedTasks = await checkpointStore.interrupted()
     }
 
     public func restoreTrash(_ record: TrashRecord) {
+        let key = trashOperationKey(record.id)
+        guard beginExclusiveOperation(key) else { return }
         Task {
+            defer { endExclusiveOperation(key) }
             do {
                 _ = try await trashService.restore(record.id)
                 await reloadActivity()
+                refreshFilesFromDisk()
             } catch { lastError = String(describing: error) }
         }
     }
 
     public func purgeTrash(_ record: TrashRecord) {
+        let key = trashOperationKey(record.id)
+        guard beginExclusiveOperation(key) else { return }
         Task {
-            let preview = ApprovalPreview(title: "Permanently delete Trash item", target: record.originalPath, originalSummary: "\(record.size) bytes", reason: "Permanent deletion cannot be rolled back", plan: ["Delete Trash payload", "Update journal"], risk: .permanentDestructive)
+            defer { endExclusiveOperation(key) }
+            let preview = ApprovalPreview(title: "Permanently delete Trash item", target: record.originalPath, originalSummary: "\(record.size) bytes", reason: "Permanent deletion cannot be rolled back", plan: ["Quarantine Trash payload", "Update journal", "Delete quarantined payload"], risk: .permanentDestructive)
             let approved: Bool
             if permissionMode == .full {
                 approved = true
@@ -326,27 +388,54 @@ public final class CloudCodeViewModel: ObservableObject {
             do {
                 try await trashService.permanentlyDelete(record.id)
                 await reloadActivity()
+                refreshFilesFromDisk()
             } catch { lastError = String(describing: error) }
         }
     }
 
-    public func createKnowledgeSeedIfNeeded() {
-        Task {
-            let common = (await appResolver.installedApps()).filter { node in
-                let name = node.displayName.lowercased()
-                return name.contains("documents") || name == "files" || name.contains("slides")
-            }
-            for app in common {
-                guard let bundleID = app.ownerBundleID else { continue }
-                let knowledge = AppKnowledge(appName: app.displayName, bundleID: bundleID, preferredRoutes: [.structuredTool, .urlScheme, .guiFallback], successRate: 0.5, estimatedCost: 0.5, appVersion: app.metadata["version"])
-                try? await appKnowledge.upsert(knowledge)
-            }
+    private func refreshFilesFromDisk() {
+        do {
+            try refreshFiles()
+        } catch {
+            lastError = "File view could not be refreshed: \(error)"
         }
     }
 
-    private func consume(_ stream: AsyncThrowingStream<AgentEvent, Error>) async throws {
+    private func seedKnowledgeIfNeeded(_ installedApps: [ResourceNode]) async {
+        let common = installedApps.filter { node in
+            let name = node.displayName.lowercased()
+            return name.contains("documents") || name == "files" || name.contains("slides")
+        }
+        for app in common {
+            guard let bundleID = app.ownerBundleID else { continue }
+            let knowledge = AppKnowledge(appName: app.displayName, bundleID: bundleID, preferredRoutes: [.structuredTool, .urlScheme, .guiFallback], successRate: 0.5, estimatedCost: 0.5, appVersion: app.metadata["version"])
+            try? await appKnowledge.upsert(knowledge)
+        }
+    }
+
+    public func isTrashOperationInFlight(_ id: UUID) -> Bool {
+        inFlightOperationKeys.contains(trashOperationKey(id))
+    }
+
+    public func isCheckpointOperationInFlight(_ id: UUID) -> Bool {
+        inFlightOperationKeys.contains(checkpointOperationKey(id))
+    }
+
+    private func beginExclusiveOperation(_ key: String) -> Bool {
+        inFlightOperationKeys.insert(key).inserted
+    }
+
+    private func endExclusiveOperation(_ key: String) {
+        inFlightOperationKeys.remove(key)
+    }
+
+    private func trashOperationKey(_ id: UUID) -> String { "trash:\(id.uuidString)" }
+    private func checkpointOperationKey(_ id: UUID) -> String { "checkpoint:\(id.uuidString)" }
+
+    private func consume(_ stream: AsyncThrowingStream<AgentEvent, Error>, runID: UUID) async throws {
         var assistantStarted = false
         for try await event in stream {
+            guard runGeneration.isCurrent(runID) else { break }
             switch event {
             case .status(let value):
                 activityLines.append(value)

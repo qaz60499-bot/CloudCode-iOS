@@ -173,17 +173,21 @@ public struct IPAService: Sendable {
             total = next
         }
 
-        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let fileManager = FileManager.default
+        let staging = destination.deletingLastPathComponent().appendingPathComponent(".\(destination.lastPathComponent).cloudcode-extract-staging", isDirectory: true)
+        if fileManager.fileExists(atPath: staging.path) { try fileManager.removeItem(at: staging) }
+        try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
         do {
-            let safeRoot = destination.standardizedFileURL
+            let safeRoot = staging.standardizedFileURL
             let prefix = safeRoot.path.hasSuffix("/") ? safeRoot.path : safeRoot.path + "/"
             for entry in entries {
                 let target = safeRoot.appendingPathComponent(entry.path).standardizedFileURL
                 guard target.path == safeRoot.path || target.path.hasPrefix(prefix) else { throw IPAServiceError.unsafeEntry(entry.path) }
                 _ = try archive.extract(entry, to: target)
             }
+            try fileManager.moveItem(at: staging, to: destination)
         } catch {
-            try? FileManager.default.removeItem(at: destination)
+            try? fileManager.removeItem(at: staging)
             throw error
         }
     }
@@ -197,27 +201,38 @@ public struct IPAService: Sendable {
         if fileManager.fileExists(atPath: destination.path) { throw IPAServiceError.destinationExists }
         try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
 
-        let root = sourceRoot.standardizedFileURL
-        guard let archive = try? Archive(url: destination, accessMode: .create) else { throw IPAServiceError.invalidArchive }
-        guard let enumerator = fileManager.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey],
-            options: []
-        ) else { throw IPAServiceError.invalidRepackSource }
-
+        let root = sourceRoot.standardizedFileURL.resolvingSymlinksInPath()
+        let staging = destination.deletingLastPathComponent().appendingPathComponent(".\(destination.lastPathComponent).cloudcode-repack-staging")
+        if fileManager.fileExists(atPath: staging.path) { try fileManager.removeItem(at: staging) }
         do {
+            guard let archive = try? Archive(url: staging, accessMode: .create) else { throw IPAServiceError.invalidArchive }
+            guard let enumerator = fileManager.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey],
+                options: []
+            ) else { throw IPAServiceError.invalidRepackSource }
+
+            let rootPrefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
             for case let item as URL in enumerator {
                 let values = try item.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey])
                 if values.isSymbolicLink == true { throw IPAServiceError.unsafeEntry(item.path) }
-                let relative = String(item.path.dropFirst(root.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                let resolvedItem = item.standardizedFileURL.resolvingSymlinksInPath()
+                guard resolvedItem.path.hasPrefix(rootPrefix) else { throw IPAServiceError.unsafeEntry(item.path) }
+                let relative = String(resolvedItem.path.dropFirst(rootPrefix.count))
                 guard !relative.isEmpty else { continue }
                 try validate(relative)
                 if values.isRegularFile == true {
-                    try archive.addEntry(with: relative, relativeTo: root, compressionMethod: .deflate)
+                    try archive.addEntry(with: relative, fileURL: resolvedItem, compressionMethod: .deflate)
                 }
             }
         } catch {
-            try? fileManager.removeItem(at: destination)
+            try? fileManager.removeItem(at: staging)
+            throw error
+        }
+        do {
+            try fileManager.moveItem(at: staging, to: destination)
+        } catch {
+            try? fileManager.removeItem(at: staging)
             throw error
         }
     }

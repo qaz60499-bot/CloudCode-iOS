@@ -126,11 +126,13 @@ private struct TasksView: View {
                             HStack {
                                 Button("Resume") { model.resumeTask(task) }
                                     .buttonStyle(.borderedProminent)
-                                    .disabled(model.isRunning)
+                                    .disabled(model.isRunning || model.isCheckpointOperationInFlight(task.id))
                                 Button("Rollback") { model.rollbackTask(task) }
                                     .buttonStyle(.bordered)
+                                    .disabled(model.isCheckpointOperationInFlight(task.id))
                                 Button("Cancel", role: .destructive) { model.cancelInterruptedTask(task) }
                                     .buttonStyle(.bordered)
+                                    .disabled(model.isCheckpointOperationInFlight(task.id))
                             }
                         }
                         .padding(.vertical, 4)
@@ -278,7 +280,9 @@ private struct TrashView: View {
                         .font(.caption)
                     HStack {
                         Button("Restore") { model.restoreTrash(record) }
+                            .disabled(model.isTrashOperationInFlight(record.id))
                         Button("Delete permanently", role: .destructive) { model.purgeTrash(record) }
+                            .disabled(model.isTrashOperationInFlight(record.id))
                     }
                     .buttonStyle(.bordered)
                 }

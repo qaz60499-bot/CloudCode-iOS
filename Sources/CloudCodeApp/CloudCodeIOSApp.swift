@@ -9,7 +9,6 @@ struct CloudCodeIOSApp: App {
             ContentView(model: model)
                 .task {
                     model.bootstrap()
-                    model.createKnowledgeSeedIfNeeded()
                 }
         }
     }

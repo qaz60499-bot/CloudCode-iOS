@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 public enum PermissionMode: String, Codable, CaseIterable, Sendable {
     case safe
@@ -220,6 +221,19 @@ public struct ToolCall: Codable, Hashable, Sendable {
         self.name = name
         self.arguments = arguments
         self.sessionID = sessionID
+    }
+
+    public static func stableID(sessionID: UUID, providerCallID: String) -> UUID {
+        let digest = SHA256.hash(data: Data("\(sessionID.uuidString)|\(providerCallID)".utf8))
+        var bytes = Array(digest.prefix(16))
+        bytes[6] = (bytes[6] & 0x0f) | 0x50
+        bytes[8] = (bytes[8] & 0x3f) | 0x80
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
     }
 }
 
@@ -446,6 +460,34 @@ public struct AgentSession: Codable, Equatable, Identifiable, Sendable {
         self.permissionMode = permissionMode
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+    }
+}
+
+public struct RunGenerationGuard: Sendable, Equatable {
+    public private(set) var current: UUID?
+
+    public init(current: UUID? = nil) {
+        self.current = current
+    }
+
+    @discardableResult
+    public mutating func start() -> UUID {
+        let id = UUID()
+        current = id
+        return id
+    }
+
+    public func isCurrent(_ id: UUID) -> Bool { current == id }
+
+    @discardableResult
+    public mutating func finish(_ id: UUID) -> Bool {
+        guard current == id else { return false }
+        current = nil
+        return true
+    }
+
+    public mutating func cancel() {
+        current = nil
     }
 }
 

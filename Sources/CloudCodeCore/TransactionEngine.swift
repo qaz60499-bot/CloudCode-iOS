@@ -28,22 +28,35 @@ public struct FileIdentity: Equatable, Sendable {
     }
 }
 
+public enum TransactionJournalError: Error, Equatable {
+    case corruptJournal
+}
+
 public actor TransactionJournal {
     private let fileURL: URL
     private var recordsByID: [UUID: TransactionRecord] = [:]
+    private var loadFailed = false
 
     public init(fileURL: URL) {
         self.fileURL = fileURL
-        if let data = try? Data(contentsOf: fileURL) {
+        if FileManager.default.fileExists(atPath: fileURL.path) {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
-            if let decoded = try? decoder.decode([UUID: TransactionRecord].self, from: data) {
+            if let data = try? Data(contentsOf: fileURL),
+               let decoded = try? decoder.decode([UUID: TransactionRecord].self, from: data) {
                 self.recordsByID = decoded
+            } else {
+                loadFailed = true
             }
         }
     }
 
+    public func assertHealthy() throws {
+        guard !loadFailed else { throw TransactionJournalError.corruptJournal }
+    }
+
     public func upsert(_ record: TransactionRecord) throws {
+        try assertHealthy()
         recordsByID[record.id] = record
         try persist()
     }
@@ -207,8 +220,56 @@ public actor TransactionEngine {
         }
     }
 
+    public func recoverInterruptedTransactions() async throws -> [TransactionRecord] {
+        try await journal.assertHealthy()
+        let candidates = await journal.all()
+        var recovered: [TransactionRecord] = []
+        for var transaction in candidates {
+            let target = URL(fileURLWithPath: transaction.targetPath)
+            switch transaction.state {
+            case .planned, .awaitingConfirmation:
+                transaction.state = .failed
+                transaction.failure = "Abandoned after app restart before mutation"
+                transaction.finishedAt = Date()
+                try await journal.upsert(transaction)
+                try await audit.append(AuditEvent(
+                    sessionID: transaction.sessionID,
+                    toolCallID: transaction.toolCallID,
+                    action: "transaction.recover",
+                    target: target.path,
+                    risk: .sensitiveWrite,
+                    result: "abandoned_before_mutation",
+                    detail: ["transactionID": transaction.id.uuidString]
+                ))
+                recovered.append(transaction)
+            case .backedUp, .applying, .verifying:
+                guard transaction.backupPath != nil else { continue }
+                try restoreBackup(transaction: transaction, target: target)
+                transaction.state = .rolledBack
+                transaction.failure = "Recovered after interrupted transaction"
+                transaction.finishedAt = Date()
+                try await journal.upsert(transaction)
+                try await audit.append(AuditEvent(
+                    sessionID: transaction.sessionID,
+                    toolCallID: transaction.toolCallID,
+                    action: "transaction.recover",
+                    target: target.path,
+                    risk: .sensitiveWrite,
+                    result: "rolled_back_after_restart",
+                    detail: ["transactionID": transaction.id.uuidString]
+                ))
+                recovered.append(transaction)
+            case .committed, .rolledBack, .failed:
+                continue
+            }
+        }
+        return recovered
+    }
+
     public func rollback(transactionID: UUID) async throws -> TransactionRecord {
+        try await journal.assertHealthy()
         guard var transaction = await journal.record(transactionID) else { throw TransactionError.noBackup }
+        if transaction.state == .rolledBack { return transaction }
         let target = URL(fileURLWithPath: transaction.targetPath)
         try restoreBackup(transaction: transaction, target: target)
         transaction.state = .rolledBack
