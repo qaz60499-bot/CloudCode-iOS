@@ -365,7 +365,10 @@ public final class CloudCodeViewModel: ObservableObject {
         Task {
             defer { endExclusiveOperation(key) }
             do {
-                _ = try await trashService.restore(record.id)
+                let restored = try await trashService.restore(record.id)
+                guard await trashService.verifyRestored(restored) else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
                 await reloadActivity()
                 refreshFilesFromDisk()
             } catch { lastError = String(describing: error) }
@@ -387,6 +390,11 @@ public final class CloudCodeViewModel: ObservableObject {
             guard approved else { return }
             do {
                 try await trashService.permanentlyDelete(record.id)
+                let remaining = try await trashService.records()
+                guard !remaining.contains(where: { $0.id == record.id }),
+                      !FileManager.default.fileExists(atPath: record.trashPath) else {
+                    throw CocoaError(.fileWriteUnknown)
+                }
                 await reloadActivity()
                 refreshFilesFromDisk()
             } catch { lastError = String(describing: error) }
