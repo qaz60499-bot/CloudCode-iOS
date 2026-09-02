@@ -116,14 +116,14 @@ public struct PathGuard: Sendable {
             }
         }
 
-        if rejectSymlink, fileManager.fileExists(atPath: target.path) {
-            let values = try target.resourceValues(forKeys: [.isSymbolicLinkKey])
-            if values.isSymbolicLink == true { throw PathSafetyError.symlink }
-        }
-
         if recursiveDelete {
             let componentCount = standardized.pathComponents.filter { $0 != "/" }.count
             if componentCount < 3 { throw PathSafetyError.recursiveDeleteTooBroad }
+        }
+
+        if rejectSymlink, fileManager.fileExists(atPath: target.path) {
+            let values = try target.resourceValues(forKeys: [.isSymbolicLinkKey])
+            if values.isSymbolicLink == true { throw PathSafetyError.symlink }
         }
 
         return standardized

@@ -10,7 +10,7 @@ public protocol CapabilityProbing: Sendable {
     func probe() async -> CapabilityProfile
 }
 
-public struct CapabilityProbe: CapabilityProbing, Sendable {
+public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
     private let appResolver: AppContainerResolving
     private let fileManager: FileManager
     private let homeDirectory: URL

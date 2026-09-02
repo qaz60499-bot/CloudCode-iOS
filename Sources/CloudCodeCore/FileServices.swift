@@ -100,7 +100,7 @@ public struct FileSearchQuery: Sendable {
     }
 }
 
-public struct FileService: Sendable {
+public struct FileService: @unchecked Sendable {
     public let fileManager: FileManager
     public let pathGuard: PathGuard
 
