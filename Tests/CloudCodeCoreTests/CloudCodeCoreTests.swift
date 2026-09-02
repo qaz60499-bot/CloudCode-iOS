@@ -572,6 +572,48 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(invocationCount, 0)
     }
 
+    func testAgentCancellationPersistsInterruptedCheckpoint() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = ToolRegistry(descriptors: [])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let checkpoints = TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json"))
+        let agent = AgentCore(
+            provider: BlockingProvider(),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(registry: registry, executors: []),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: checkpoints,
+            maxToolRounds: 2
+        )
+        let session = AgentSession(permissionMode: .safe)
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        let stream = await agent.send(text: "cancel me", session: session, providerConfiguration: config)
+        let consumer = Task {
+            do {
+                for try await _ in stream {}
+            } catch {
+                // Cancellation is expected.
+            }
+        }
+
+        try await Task.sleep(nanoseconds: 30_000_000)
+        consumer.cancel()
+        _ = await consumer.result
+
+        for _ in 0..<40 {
+            if let checkpoint = await checkpoints.interrupted().first(where: { $0.sessionID == session.id }) {
+                XCTAssertEqual(checkpoint.state, "interrupted")
+                XCTAssertTrue(checkpoint.stepName.contains("cancelled"))
+                return
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("Cancelled Agent request did not persist an interrupted checkpoint")
+    }
+
     func testProviderHTTPClassifierMapsCredentialAndRetryableStatuses() {
         XCTAssertNil(ProviderHTTPClassifier.error(for: 200))
         XCTAssertEqual(ProviderHTTPClassifier.error(for: 401), .authenticationFailed(401))
@@ -940,6 +982,28 @@ private final class ScriptedURLProtocol: URLProtocol {
 private struct FixedCapabilityProbe: CapabilityProbing, Sendable {
     let profile: CapabilityProfile
     func probe() async -> CapabilityProfile { profile }
+}
+
+private struct BlockingProvider: ProviderStreaming, Sendable {
+    func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try await Task.sleep(nanoseconds: 5_000_000_000)
+                    continuation.yield(.finished)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: CancellationError())
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
 
 private struct FinishingProvider: ProviderStreaming, Sendable {

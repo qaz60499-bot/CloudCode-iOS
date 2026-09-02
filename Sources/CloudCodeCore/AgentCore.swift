@@ -276,6 +276,7 @@ public actor AgentCore {
                         )
 
                         for try await event in stream {
+                            try Task.checkCancellation()
                             switch event {
                             case .token(let token):
                                 assistantText += token
@@ -286,6 +287,8 @@ public actor AgentCore {
                                 break
                             }
                         }
+
+                        try Task.checkCancellation()
 
                         if providerToolCalls.isEmpty {
                             if !assistantText.isEmpty {
@@ -304,6 +307,7 @@ public actor AgentCore {
                         }
 
                         for (providerCallID, name, argumentsJSON) in providerToolCalls {
+                            try Task.checkCancellation()
                             session.messages.append(ChatMessage(
                                 role: .assistant,
                                 content: "",

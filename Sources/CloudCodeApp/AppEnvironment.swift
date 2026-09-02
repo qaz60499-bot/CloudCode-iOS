@@ -236,6 +236,23 @@ public final class CloudCodeViewModel: ObservableObject {
         activityLines.append("Task interrupted; checkpoint retained for resume/rollback inspection.")
     }
 
+    public func suspendForBackground() {
+        guard isRunning || currentTask != nil else { return }
+        currentTask?.cancel()
+        currentTask = nil
+        runGeneration.cancel()
+        isRunning = false
+        activityLines.append("App entered background; active task was interrupted instead of being blindly replayed. Resume is available after checkpoint reconciliation.")
+    }
+
+    public func refreshAfterForeground() {
+        Task {
+            await reloadActivity()
+            refreshFilesFromDisk()
+        }
+        refreshCapabilities()
+    }
+
     public func resumeTask(_ checkpoint: TaskCheckpoint) {
         guard !isRunning else { return }
         let operationKey = checkpointOperationKey(checkpoint.id)

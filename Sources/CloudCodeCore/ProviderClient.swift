@@ -164,7 +164,7 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable {
                         continuation.finish()
                         return
                     } catch is CancellationError {
-                        continuation.finish()
+                        continuation.finish(throwing: CancellationError())
                         return
                     } catch {
                         let mayReplay = !responseStarted && attempt < retryPolicy.maxAttempts && ProviderRetryClassifier.isRetryableBeforeOutput(error)
