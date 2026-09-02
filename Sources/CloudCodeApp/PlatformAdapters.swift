@@ -226,7 +226,8 @@ public struct GUIFallbackExecutor: ToolExecuting, Sendable {
     public init(backend: GUIAutomationBackend) { self.backend = backend }
 
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
-        tool.name.hasPrefix("gui.") && await backend.isAvailable()
+        guard tool.name.hasPrefix("gui.") else { return false }
+        return await backend.isAvailable()
     }
 
     public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {

@@ -233,7 +233,13 @@ public final class CloudCodeViewModel: ObservableObject {
     public func purgeTrash(_ record: TrashRecord) {
         Task {
             let preview = ApprovalPreview(title: "Permanently delete Trash item", target: record.originalPath, originalSummary: "\(record.size) bytes", reason: "Permanent deletion cannot be rolled back", plan: ["Delete Trash payload", "Update journal"], risk: .permanentDestructive)
-            guard permissionMode == .full || await approvalCenter.requestApproval(preview) else { return }
+            let approved: Bool
+            if permissionMode == .full {
+                approved = true
+            } else {
+                approved = await approvalCenter.requestApproval(preview)
+            }
+            guard approved else { return }
             do {
                 try await trashService.permanentlyDelete(record.id)
                 await reloadActivity()
