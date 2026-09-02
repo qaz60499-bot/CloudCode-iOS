@@ -88,12 +88,13 @@ public final class CloudCodeViewModel: ObservableObject {
         )
 
         let defaults = UserDefaults.standard
+        let initialPermissionMode = PermissionMode(rawValue: defaults.string(forKey: "permission.mode") ?? "safe") ?? .safe
         self.providerName = defaults.string(forKey: "provider.name") ?? "OpenAI-compatible"
         self.providerBaseURL = defaults.string(forKey: "provider.baseURL") ?? "https://api.openai.com/v1"
         self.providerModel = defaults.string(forKey: "provider.model") ?? "gpt-5.1"
-        self.permissionMode = PermissionMode(rawValue: defaults.string(forKey: "permission.mode") ?? "safe") ?? .safe
+        self.permissionMode = initialPermissionMode
         self.browsePath = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).path
-        self.session = AgentSession(permissionMode: self.permissionMode)
+        self.session = AgentSession(permissionMode: initialPermissionMode)
         self.approvalCenter = approval
         self.appResolver = resolver
         self.capabilityProbe = probe
