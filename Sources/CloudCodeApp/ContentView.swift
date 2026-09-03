@@ -626,7 +626,12 @@ private func localizedCapabilityDetail(_ id: String, detail: String) -> String {
     case "data.photos": return "照片权限由你控制；只有授权后才会开放对应访问。"
     case "data.contacts": return "联系人权限受系统授权控制，核心不会自动请求。"
     case "data.calendar": return "日历权限受系统授权控制，核心不会自动请求。"
-    case "data.keychain_scope": return "可以使用 Cloud Code 自身的 Keychain；不会假定可读取其他 App 的 Keychain。"
+    case "data.keychain_scope":
+        if detail.contains("-34018") { return "当前安装签名缺少 Keychain 身份/访问组授权，因此不能保存或读取厂商 Key。" }
+        if detail.contains("write succeeded") { return "Keychain 写入成功，但读取回验失败，当前不能把它当成可用。" }
+        if detail.contains("currently unavailable") { return "Keychain 当前受保护不可访问（例如设备锁定）；解锁后重新检测。" }
+        if detail.contains("Verified on this runtime") { return "已在当前设备实际完成临时写入、读取和删除回验；Cloud Code 自身 Keychain 可用。" }
+        return "正在按当前设备实际结果判断 Cloud Code 自身 Keychain，不再仅凭配置假定可用。"
     case "automation.url_scheme": return "可通过 App 适配器打开 URL，仍受 iOS 系统策略限制。"
     case "automation.xctest_wda": return "需要独立的 XCTest / WDA 运行后端；未接入或未验证时不会假定可用。"
     case "automation.gui": return "GUI 自动化只有在后端实际就绪并通过探测后才会启用。"

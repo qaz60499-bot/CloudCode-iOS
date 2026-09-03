@@ -152,10 +152,15 @@ public final class CloudCodeViewModel: ObservableObject {
                 auditEvents = Array((try await auditStore.readAll()).suffix(200).reversed())
                 interruptedTasks = await checkpointStore.interrupted()
                 try refreshFiles()
-                do {
-                    try await importBootstrapIfPresent()
-                } catch {
-                    lastError = "预配置 Key 自动导入失败：\(Self.userFacingProviderBootstrapError(error))"
+                if capabilities.status("data.keychain_scope") == .available {
+                    do {
+                        try await importBootstrapIfPresent()
+                    } catch {
+                        let message = Self.userFacingProviderBootstrapError(error)
+                        activityLines.append("预配置 Key 自动导入未完成：\(message)")
+                    }
+                } else if bundledPrivateBootstrapAvailable {
+                    activityLines.append("检测到私有 Key 版 IPA，但当前设备的 Keychain 实际探测未通过，因此已跳过自动导入，避免反复弹出失败提示。")
                 }
                 didBootstrap = true
             } catch {
@@ -758,6 +763,13 @@ public final class CloudCodeViewModel: ObservableObject {
         }
         if error is CocoaError {
             return "Key 配置文件校验失败，请确认文件来自当前版本。"
+        }
+        let nsError = error as NSError
+        if nsError.domain == NSOSStatusErrorDomain && nsError.code == Int(errSecMissingEntitlement) {
+            return "当前安装签名缺少 Keychain 身份/访问组授权（-34018）。请安装已修复签名的版本；这不是 Key 内容错误。"
+        }
+        if nsError.domain == NSOSStatusErrorDomain && nsError.code == Int(errSecInteractionNotAllowed) {
+            return "Keychain 当前受系统保护不可访问；请保持设备解锁后重试。"
         }
         if let providerError = error as? ProviderError {
             return String(describing: providerError)

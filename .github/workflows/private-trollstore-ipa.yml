@@ -1,4 +1,4 @@
-name: Private TrollStore IPA
+name: Private TrollStore Stable IPA
 
 on:
   workflow_dispatch:
@@ -83,27 +83,24 @@ jobs:
           print("Private Provider bootstrap embedded; secret values were not printed.")
           PY
 
-      - name: Ad-hoc sign for TrollStore private entitlements
+      - name: Assert stable release is not pre-signed with custom entitlements
         run: |
           set -euo pipefail
           APP_PATH="build/PrivateDerivedData/Build/Products/Release-iphoneos/CloudCode.app"
-          while IFS= read -r dylib; do
-            codesign --force --sign - "$dylib"
-          done < <(find "$APP_PATH" -type f -name '*.dylib' -print)
-          while IFS= read -r framework; do
-            codesign --force --sign - "$framework"
-          done < <(find "$APP_PATH" -type d -name '*.framework' -print | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2-)
-          while IFS= read -r appex; do
-            codesign --force --sign - "$appex"
-          done < <(find "$APP_PATH" -type d -name '*.appex' -print | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2-)
-          codesign --force --sign - --entitlements Entitlements/TrollStore.entitlements "$APP_PATH"
-          codesign --verify --deep --strict "$APP_PATH"
+          MAIN_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
+          EMBEDDED_ENTITLEMENTS="$(ldid -e "$APP_PATH/$MAIN_EXECUTABLE" 2>/dev/null || true)"
+          if [[ -n "${EMBEDDED_ENTITLEMENTS//[[:space:]]/}" ]]; then
+            echo "FAIL: stable TrollStore IPA must remain unsigned so TrollStore can inject its standard fallback identity/keychain entitlements" >&2
+            printf '%s\n' "$EMBEDDED_ENTITLEMENTS" >&2
+            exit 1
+          fi
+          echo 'PASS: release app is unsigned and has no pre-embedded custom entitlement dictionary'
 
-      - name: TrollStore ldid compatibility preflight
+      - name: TrollStore fallback-signing compatibility preflight
         run: |
           set -euo pipefail
           APP_PATH="build/PrivateDerivedData/Build/Products/Release-iphoneos/CloudCode.app"
-          PREFLIGHT="$RUNNER_TEMP/CloudCode-ldid-preflight.app"
+          PREFLIGHT="$RUNNER_TEMP/CloudCode-trollstore-fallback-preflight.app"
           rm -rf "$PREFLIGHT"
           cp -R "$APP_PATH" "$PREFLIGHT"
           while IFS= read -r dylib; do
@@ -115,24 +112,29 @@ jobs:
             ldid -S "$framework/$framework_name"
           done < <(find "$PREFLIGHT" -type d -name '*.framework' -print)
           MAIN_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PREFLIGHT/Info.plist")"
-          ldid -SEntitlements/TrollStore.entitlements "$PREFLIGHT/$MAIN_EXECUTABLE"
-          ldid -e "$PREFLIGHT/$MAIN_EXECUTABLE" | plutil -lint - >/dev/null
-          rm -rf "$PREFLIGHT"
-          echo 'PASS: TrollStore-compatible ldid can process all embedded Mach-O bundles'
+          ldid -SEntitlements/TrollStoreFallback.entitlements "$PREFLIGHT/$MAIN_EXECUTABLE"
+          ENTITLEMENTS="$RUNNER_TEMP/cloudcode-trollstore-fallback-entitlements.plist"
+          ldid -e "$PREFLIGHT/$MAIN_EXECUTABLE" > "$ENTITLEMENTS"
+          plutil -lint "$ENTITLEMENTS" >/dev/null
+          test "$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$ENTITLEMENTS")" = 'TROLLTROLL.*'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$ENTITLEMENTS")" = 'TROLLTROLL'
+          /usr/libexec/PlistBuddy -c 'Print :keychain-access-groups:0' "$ENTITLEMENTS" | grep -F 'TROLLTROLL.*'
+          rm -rf "$PREFLIGHT" "$ENTITLEMENTS"
+          echo 'PASS: current app bundle survives TrollStore-style fallback signing and includes the Keychain identity/access group needed by Security.framework'
 
-      - name: Package private TrollStore IPA
+      - name: Package stable private TrollStore IPA
         run: |
           set -euo pipefail
           APP_PATH="build/PrivateDerivedData/Build/Products/Release-iphoneos/CloudCode.app"
           mkdir -p build/private-ipa/Payload
           cp -R "$APP_PATH" build/private-ipa/Payload/
-          (cd build/private-ipa && zip -qry ../CloudCode-iOS-TrollStore-private.ipa Payload)
+          (cd build/private-ipa && zip -qry ../CloudCode-iOS-TrollStore-STABLE-private.ipa Payload)
 
       - name: Verify private IPA and secret isolation
         run: |
           set -euo pipefail
-          bash scripts/verify_private_ipa.sh build/CloudCode-iOS-TrollStore-private.ipa
-          bash scripts/test_verify_ipa_negative.sh build/CloudCode-iOS-TrollStore-private.ipa
+          bash scripts/verify_private_ipa.sh build/CloudCode-iOS-TrollStore-STABLE-private.ipa
+          bash scripts/test_verify_ipa_negative.sh build/CloudCode-iOS-TrollStore-STABLE-private.ipa
           if find . -path './.git' -prune -o -type f \( -name '*.ipa' -o -name '*Provider-Bootstrap*.json' \) -print | grep -vE '^\./build/' | grep -q .; then
             echo "FAIL: private build material escaped the build directory" >&2
             exit 1
@@ -152,17 +154,17 @@ jobs:
         run: |
           set -euo pipefail
           openssl enc -aes-256-cbc -pbkdf2 -salt \
-            -in build/CloudCode-iOS-TrollStore-private.ipa \
-            -out build/CloudCode-iOS-TrollStore-private.ipa.enc \
+            -in build/CloudCode-iOS-TrollStore-STABLE-private.ipa \
+            -out build/CloudCode-iOS-TrollStore-STABLE-private.ipa.enc \
             -pass env:CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD
-          rm -rf build/private-ipa build/CloudCode-iOS-TrollStore-private.ipa build/PrivateDerivedData
-          test -s build/CloudCode-iOS-TrollStore-private.ipa.enc
-          test ! -e build/CloudCode-iOS-TrollStore-private.ipa
+          rm -rf build/private-ipa build/CloudCode-iOS-TrollStore-STABLE-private.ipa build/PrivateDerivedData
+          test -s build/CloudCode-iOS-TrollStore-STABLE-private.ipa.enc
+          test ! -e build/CloudCode-iOS-TrollStore-STABLE-private.ipa
 
       - name: Upload encrypted private IPA
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: CloudCode-iOS-TrollStore-private-encrypted
-          path: build/CloudCode-iOS-TrollStore-private.ipa.enc
+          name: CloudCode-iOS-TrollStore-STABLE-private-encrypted
+          path: build/CloudCode-iOS-TrollStore-STABLE-private.ipa.enc
           if-no-files-found: error
           retention-days: 1

@@ -2,7 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Experimental privileged profile only. The stable release is intentionally unsigned so TrollStore can inject its standard fallback identity/keychain entitlements. -->
     <key>application-identifier</key>
     <string>TROLLTROLL.*</string>
     <key>com.apple.developer.team-identifier</key>
@@ -14,13 +13,5 @@
         <string>TROLLTROLL.*</string>
         <string>com.apple.token</string>
     </array>
-    <key>com.apple.private.security.no-sandbox</key>
-    <true/>
-    <key>platform-application</key>
-    <true/>
-    <key>com.apple.private.security.storage.AppDataContainers</key>
-    <true/>
-    <key>com.apple.private.persona-mgmt</key>
-    <true/>
 </dict>
 </plist>

@@ -97,8 +97,8 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
                               "Contacts access is authorization-gated and not automatically requested by the core."))
         records.append(record("data.calendar", .data, .deviceValidationRequired,
                               "Calendar access is authorization-gated and not automatically requested by the core."))
-        records.append(record("data.keychain_scope", .data, .available,
-                              "The app can use its own Keychain scope; cross-app Keychain access is not assumed."))
+        let keychainProbe = Self.probeOwnKeychain()
+        records.append(record("data.keychain_scope", .data, keychainProbe.status, keychainProbe.detail))
 
         records.append(record("automation.url_scheme", .automation, .available,
                               "URL opening is available through the app adapter, subject to iOS policy."))
@@ -130,6 +130,46 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         guard fileManager.isReadableFile(atPath: root.path) else { return false }
         let sensitiveProbe = root.appendingPathComponent("Library/Preferences", isDirectory: true)
         return fileManager.isReadableFile(atPath: sensitiveProbe.path)
+    }
+
+    private static func probeOwnKeychain() -> (status: CapabilityStatus, detail: String) {
+        #if canImport(Security)
+        let service = "CloudCodeIOS.CapabilityProbe"
+        let account = UUID().uuidString
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(query as CFDictionary)
+
+        var add = query
+        add[kSecValueData as String] = Data([0x43, 0x43])
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        let addStatus = SecItemAdd(add as CFDictionary, nil)
+        guard addStatus == errSecSuccess else {
+            if addStatus == errSecMissingEntitlement {
+                return (.unavailable, "Keychain runtime probe failed with errSecMissingEntitlement (-34018); the installed signature does not grant the required Keychain identity/access group.")
+            }
+            if addStatus == errSecInteractionNotAllowed {
+                return (.unknown, "Keychain runtime probe could not run because the protected Keychain is currently unavailable (for example while the device is locked).")
+            }
+            return (.unavailable, "Keychain runtime probe failed with OSStatus \(addStatus).")
+        }
+        defer { SecItemDelete(query as CFDictionary) }
+
+        var readQuery = query
+        readQuery[kSecReturnData as String] = true
+        readQuery[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let readStatus = SecItemCopyMatching(readQuery as CFDictionary, &result)
+        guard readStatus == errSecSuccess, let data = result as? Data, data == Data([0x43, 0x43]) else {
+            return (.unavailable, "Keychain write succeeded but read-back verification failed with OSStatus \(readStatus).")
+        }
+        return (.available, "Verified on this runtime by writing, reading and deleting a temporary item in Cloud Code's own Keychain scope.")
+        #else
+        return (.unknown, "Security framework is unavailable on this runtime, so Keychain capability cannot be proven.")
+        #endif
     }
 
     private static func hasDynamicSymbol(_ name: String) -> Bool {

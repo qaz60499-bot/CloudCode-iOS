@@ -43,13 +43,14 @@ This is intentional: the project does not use “try the privileged operation an
 
 ## High-privilege target
 
-The repository contains a separate TrollStore entitlement profile for future device builds. The standard GitHub Runner artifact does not prove TrollStore behavior, root-helper behavior, cross-app container access, app install/uninstall, app termination, decryption, or XCTest/WDA control. Those remain `DEVICE_VALIDATION_REQUIRED` until tested on the target iPhone.
+The repository contains a separate **experimental** TrollStore privileged entitlement profile for future device builds. It is not applied to the stable private-Provider IPA. The stable private-Provider IPA is intentionally left unsigned so TrollStore can apply its own standard fallback application identity and Keychain access-group entitlements at install time; pre-signing it with only private entitlements previously caused `errSecMissingEntitlement (-34018)` and broke Provider Key import. The standard GitHub Runner artifact still does not prove root-helper behavior, cross-app container access, app install/uninstall, app termination, decryption, or XCTest/WDA control. Those remain `DEVICE_VALIDATION_REQUIRED` until tested on the target iPhone.
 
 See:
 
 - `docs/reference-research.md`
 - `docs/device-validation.md`
-- `Entitlements/TrollStore.entitlements`
+- `Entitlements/TrollStore.entitlements` (experimental privileged profile; not used by stable release)
+- `Entitlements/TrollStoreFallback.entitlements` (CI-only simulation of TrollStore's standard fallback identity/Keychain entitlements)
 
 ## Build
 

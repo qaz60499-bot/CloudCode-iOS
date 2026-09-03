@@ -114,6 +114,15 @@ jobs:
             echo "FAIL: Provider Keys must not remain readable while the device is locked" >&2
             exit 1
           fi
+          if grep -F 'record("data.keychain_scope", .data, .available' Sources/CloudCodeCore/CapabilityProbe.swift; then
+            echo "FAIL: Keychain capability must be runtime-probed rather than hard-coded available" >&2
+            exit 1
+          fi
+          grep -F 'probeOwnKeychain()' Sources/CloudCodeCore/CapabilityProbe.swift >/dev/null
+          if grep -F 'codesign --force --sign - --entitlements Entitlements/TrollStore.entitlements' .github/workflows/private-trollstore-ipa.yml; then
+            echo "FAIL: stable private TrollStore workflow must not pre-sign with experimental privileged entitlements" >&2
+            exit 1
+          fi
           if find . -path './.git' -prune -o -type f \( -name 'CloudCode-Provider-Bootstrap.json' -o -name '*.provider-bootstrap.json' \) -print | grep -q .; then
             echo "FAIL: private Provider bootstrap exists in checkout" >&2
             exit 1
