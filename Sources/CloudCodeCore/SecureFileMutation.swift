@@ -45,14 +45,26 @@ public enum SecureFileMutationError: Error, Equatable, CustomStringConvertible {
 /// to defend against ordinary concurrent filesystem/symlink races, not a kernel/root attacker.
 public struct SecureFileMutation: Sendable {
     private let beforeFinalMutation: (@Sendable () -> Void)?
+    private let beforeCommitMutation: (@Sendable () -> Void)?
 
     public init() {
         self.beforeFinalMutation = nil
+        self.beforeCommitMutation = nil
     }
 
     /// Deterministic race injection for @testable tests. Production callers use init().
     init(beforeFinalMutation: @escaping @Sendable () -> Void) {
         self.beforeFinalMutation = beforeFinalMutation
+        self.beforeCommitMutation = nil
+    }
+
+    /// Deterministic injection immediately before the final rename/swap syscall.
+    init(
+        beforeFinalMutation: (@Sendable () -> Void)? = nil,
+        beforeCommitMutation: @escaping @Sendable () -> Void
+    ) {
+        self.beforeFinalMutation = beforeFinalMutation
+        self.beforeCommitMutation = beforeCommitMutation
     }
 
     public func identity(of approvedTarget: URL, allowedRoot: URL?) throws -> SecureFileIdentity {
@@ -205,24 +217,65 @@ public struct SecureFileMutation: Sendable {
 
         beforeFinalMutation?()
         try assertPinnedDirectoryStillMatches(parent.fd, path: parent.path)
+        try assertLeafStillMatches(parentFD: parent.fd, leaf: parent.leaf, expected: targetStat)
 
-        var finalTargetStat = stat()
-        let finalTargetStatus = parent.leaf.withCString {
-            fstatat(parent.fd, $0, &finalTargetStat, AT_SYMLINK_NOFOLLOW)
-        }
-        guard finalTargetStatus == 0,
-              finalTargetStat.st_dev == targetStat.st_dev,
-              finalTargetStat.st_ino == targetStat.st_ino,
-              (finalTargetStat.st_mode & S_IFMT) == S_IFREG else {
+        var temporaryStat = stat()
+        guard fstat(temporaryFD, &temporaryStat) == 0 else { throw SecureFileMutationError.posix(errno) }
+        beforeCommitMutation?()
+
+        #if canImport(Darwin)
+        try swapRename(
+            fromParentFD: parent.fd,
+            fromLeaf: temporaryLeaf,
+            toParentFD: parent.fd,
+            toLeaf: parent.leaf
+        )
+        var swapNeedsRollback = true
+        do {
+            try assertLeafStillMatches(parentFD: parent.fd, leaf: parent.leaf, expected: temporaryStat)
+            try assertLeafStillMatches(parentFD: parent.fd, leaf: temporaryLeaf, expected: targetStat)
+            try assertPinnedDirectoryStillMatches(parent.fd, path: parent.path)
+            swapNeedsRollback = false
+        } catch {
+            if swapNeedsRollback {
+                do {
+                    try swapRename(
+                        fromParentFD: parent.fd,
+                        fromLeaf: temporaryLeaf,
+                        toParentFD: parent.fd,
+                        toLeaf: parent.leaf
+                    )
+                } catch {
+                    throw SecureFileMutationError.verificationFailed
+                }
+            }
             throw SecureFileMutationError.verificationFailed
         }
-
+        try assertLeafStillMatches(parentFD: parent.fd, leaf: temporaryLeaf, expected: targetStat)
+        let cleanupResult = temporaryLeaf.withCString { unlinkat(parent.fd, $0, 0) }
+        guard cleanupResult == 0 else {
+            let cleanupCode = errno
+            do {
+                try swapRename(
+                    fromParentFD: parent.fd,
+                    fromLeaf: temporaryLeaf,
+                    toParentFD: parent.fd,
+                    toLeaf: parent.leaf
+                )
+            } catch {
+                throw SecureFileMutationError.verificationFailed
+            }
+            throw SecureFileMutationError.posix(cleanupCode)
+        }
+        #else
+        try assertLeafStillMatches(parentFD: parent.fd, leaf: parent.leaf, expected: targetStat)
         let result = temporaryLeaf.withCString { temporaryName in
             parent.leaf.withCString { targetName in
                 renameat(parent.fd, temporaryName, parent.fd, targetName)
             }
         }
         guard result == 0 else { throw SecureFileMutationError.posix(errno) }
+        #endif
         committed = true
         try assertPinnedDirectoryStillMatches(parent.fd, path: parent.path)
     }
@@ -346,25 +399,30 @@ public struct SecureFileMutation: Sendable {
             throw SecureFileMutationError.verificationFailed
         }
         try requireDestinationAbsent(parentFD: destinationParent.fd, leaf: destinationParent.leaf)
-
-        let result = sourceParent.leaf.withCString { sourceName in
-            destinationParent.leaf.withCString { destinationName in
-                renameat(sourceParent.fd, sourceName, destinationParent.fd, destinationName)
-            }
-        }
-        guard result == 0 else { throw SecureFileMutationError.posix(errno) }
+        beforeCommitMutation?()
+        try renameExclusive(
+            fromParentFD: sourceParent.fd,
+            fromLeaf: sourceParent.leaf,
+            toParentFD: destinationParent.fd,
+            toLeaf: destinationParent.leaf
+        )
 
         do {
             try assertPinnedDirectoryStillMatches(sourceParent.fd, path: sourceParent.path)
             try assertPinnedDirectoryStillMatches(destinationParent.fd, path: destinationParent.path)
+            try assertLeafStillMatches(parentFD: destinationParent.fd, leaf: destinationParent.leaf, expected: sourceStat)
         } catch {
-            let rollback = destinationParent.leaf.withCString { destinationName in
-                sourceParent.leaf.withCString { sourceName in
-                    renameat(destinationParent.fd, destinationName, sourceParent.fd, sourceName)
-                }
+            do {
+                try renameExclusive(
+                    fromParentFD: destinationParent.fd,
+                    fromLeaf: destinationParent.leaf,
+                    toParentFD: sourceParent.fd,
+                    toLeaf: sourceParent.leaf
+                )
+            } catch {
+                throw SecureFileMutationError.verificationFailed
             }
-            guard rollback == 0 else { throw SecureFileMutationError.verificationFailed }
-            throw error
+            throw SecureFileMutationError.verificationFailed
         }
     }
 
@@ -561,6 +619,50 @@ public struct SecureFileMutation: Sendable {
             throw SecureFileMutationError.verificationFailed
         }
     }
+
+    private func renameExclusive(
+        fromParentFD: Int32,
+        fromLeaf: String,
+        toParentFD: Int32,
+        toLeaf: String
+    ) throws {
+        let result: Int32
+        #if canImport(Darwin)
+        result = fromLeaf.withCString { sourceName in
+            toLeaf.withCString { destinationName in
+                renameatx_np(fromParentFD, sourceName, toParentFD, destinationName, UInt32(RENAME_EXCL))
+            }
+        }
+        #else
+        try requireDestinationAbsent(parentFD: toParentFD, leaf: toLeaf)
+        result = fromLeaf.withCString { sourceName in
+            toLeaf.withCString { destinationName in
+                renameat(fromParentFD, sourceName, toParentFD, destinationName)
+            }
+        }
+        #endif
+        guard result == 0 else {
+            let code = errno
+            if code == EEXIST { throw SecureFileMutationError.destinationExists }
+            throw SecureFileMutationError.posix(code)
+        }
+    }
+
+    #if canImport(Darwin)
+    private func swapRename(
+        fromParentFD: Int32,
+        fromLeaf: String,
+        toParentFD: Int32,
+        toLeaf: String
+    ) throws {
+        let result = fromLeaf.withCString { sourceName in
+            toLeaf.withCString { destinationName in
+                renameatx_np(fromParentFD, sourceName, toParentFD, destinationName, UInt32(RENAME_SWAP))
+            }
+        }
+        guard result == 0 else { throw SecureFileMutationError.posix(errno) }
+    }
+    #endif
 
     private func requireDestinationAbsent(parentFD: Int32, leaf: String) throws {
         var destinationStat = stat()
