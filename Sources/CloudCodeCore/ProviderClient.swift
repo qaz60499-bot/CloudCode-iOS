@@ -762,7 +762,8 @@ public enum ProviderKeyRotationClassifier {
         switch providerError {
         case .authenticationFailed, .capacityExhausted:
             return true
-        case .missingAPIKey, .invalidEndpoint, .rateLimited, .invalidResponse, .malformedEvent, .streamInterrupted, .transport:
+        case .missingAPIKey, .invalidEndpoint, .rateLimited, .invalidResponse, .malformedEvent, .streamInterrupted,
+             .attachmentUnavailable, .attachmentTooLarge, .unsupportedAttachmentType, .transport:
             return false
         }
     }
@@ -778,7 +779,8 @@ public enum ProviderRetryClassifier {
                 return (500...599).contains(code)
             case .capacityExhausted, .transport, .streamInterrupted:
                 return false
-            case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .malformedEvent:
+            case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .malformedEvent,
+                 .attachmentUnavailable, .attachmentTooLarge, .unsupportedAttachmentType:
                 return false
             }
         }
