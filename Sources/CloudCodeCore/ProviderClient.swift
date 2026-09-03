@@ -61,6 +61,9 @@ public enum ProviderURLSessionFactory {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.urlCache = nil
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.waitsForConnectivity = true
+        configuration.timeoutIntervalForRequest = 120
+        configuration.timeoutIntervalForResource = 90 * 60
         return URLSession(configuration: configuration, delegate: ProviderSameOriginRedirectDelegate(), delegateQueue: nil)
     }
 }
@@ -363,7 +366,7 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
     fileprivate let session: URLSession
     fileprivate let retryPolicy: RetryPolicy
 
-    public init(session: URLSession = ProviderURLSessionFactory.make(), retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 2, initialDelayNanoseconds: 1_500_000_000)) {
+    public init(session: URLSession = ProviderURLSessionFactory.make(), retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 3, initialDelayNanoseconds: 1_500_000_000)) {
         self.session = session
         self.retryPolicy = retryPolicy
     }
@@ -391,7 +394,8 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
         var sawEvent = false
         var terminal = false
         var outputStarted = false
-        for try await line in bytes.lines {
+        do {
+            for try await line in bytes.lines {
             try Task.checkCancellation()
             guard line.hasPrefix("data:") else { continue }
             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
@@ -422,6 +426,12 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
                     toolCallState[index] = accumulator
                 }
             }
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            if outputStarted { throw ProviderError.streamInterrupted }
+            throw error
         }
         guard sawEvent else { throw ProviderError.malformedEvent }
         guard terminal else { throw outputStarted ? ProviderError.streamInterrupted : ProviderError.malformedEvent }
@@ -439,7 +449,7 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
     fileprivate let session: URLSession
     fileprivate let retryPolicy: RetryPolicy
 
-    public init(session: URLSession = ProviderURLSessionFactory.make(), retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 2, initialDelayNanoseconds: 1_500_000_000)) {
+    public init(session: URLSession = ProviderURLSessionFactory.make(), retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 3, initialDelayNanoseconds: 1_500_000_000)) {
         self.session = session
         self.retryPolicy = retryPolicy
     }
@@ -470,7 +480,8 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
         var sawEvent = false
         var terminal = false
         var outputStarted = false
-        for try await line in bytes.lines {
+        do {
+            for try await line in bytes.lines {
             try Task.checkCancellation()
             guard line.hasPrefix("data:") else { continue }
             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
@@ -512,6 +523,12 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
             default:
                 break
             }
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            if outputStarted { throw ProviderError.streamInterrupted }
+            throw error
         }
         guard sawEvent else { throw ProviderError.malformedEvent }
         guard terminal else { throw outputStarted ? ProviderError.streamInterrupted : ProviderError.malformedEvent }
@@ -527,7 +544,7 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
     fileprivate let session: URLSession
     fileprivate let retryPolicy: RetryPolicy
 
-    public init(session: URLSession = ProviderURLSessionFactory.make(), retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 2, initialDelayNanoseconds: 1_500_000_000)) {
+    public init(session: URLSession = ProviderURLSessionFactory.make(), retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 3, initialDelayNanoseconds: 1_500_000_000)) {
         self.session = session
         self.retryPolicy = retryPolicy
     }
@@ -552,7 +569,8 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
         var sawEvent = false
         var terminal = false
         var outputStarted = false
-        for try await line in bytes.lines {
+        do {
+            for try await line in bytes.lines {
             try Task.checkCancellation()
             guard line.hasPrefix("data:") else { continue }
             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
@@ -598,6 +616,12 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
             default:
                 break
             }
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            if outputStarted { throw ProviderError.streamInterrupted }
+            throw error
         }
         guard sawEvent else { throw ProviderError.malformedEvent }
         guard terminal else { throw outputStarted ? ProviderError.streamInterrupted : ProviderError.malformedEvent }
@@ -795,7 +819,10 @@ public enum ProviderRetryClassifier {
              .dataNotAllowed, .cannotLoadFromNetwork:
             return true
         case .timedOut, .networkConnectionLost, .callIsActive:
-            return false
+            // Safe only before the stream has emitted any text or tool-call material.
+            // Once output starts, consume(...) normalizes transport loss to
+            // streamInterrupted, which is intentionally never replayed.
+            return true
         case .cancelled, .badURL, .unsupportedURL, .userAuthenticationRequired,
              .userCancelledAuthentication, .secureConnectionFailed, .serverCertificateHasBadDate,
              .serverCertificateUntrusted, .serverCertificateHasUnknownRoot,

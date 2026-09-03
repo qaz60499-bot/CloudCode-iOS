@@ -57,9 +57,11 @@ public final class CloudCodeViewModel: ObservableObject {
     #if canImport(UIKit)
     private var backgroundTaskIdentifier: UIBackgroundTaskIdentifier = .invalid
     #endif
+    private var backgroundWindowTask: Task<Void, Never>?
     private var didBootstrap = false
     private static let providerKeyMutationOperationKey = "provider-key:mutation"
     private static let autoResumeTaskDefaultsKey = "task.autoResumeUnlessStopped"
+    private static let backgroundContinuationWindow: TimeInterval = 90 * 60
 
     public init() {
         let support = Self.supportRoot()
@@ -443,7 +445,7 @@ public final class CloudCodeViewModel: ObservableObject {
         // 立即取消会把已经被系统接受的状态变更卡在“请求已发出、结果未校验”的窗口。
         // 申请一段有界后台时间，让当前步骤优先完成结果校验；只有系统明确收回后台时间时
         // 才取消并依赖持久化检查点恢复。
-        activityLines.append("App 已进入后台；正在保留当前步骤以完成结果校验。若系统后台时间耗尽，将安全中断并保留检查点。")
+        activityLines.append("App 已进入后台；Cloud Code 将以 90 分钟为连续任务保留窗口。iOS 若更早收回后台执行时间，会安全中断并保留检查点，回到可执行状态后自动继续。")
         beginBackgroundExecutionIfNeeded()
     }
 
@@ -459,6 +461,18 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private func beginBackgroundExecutionIfNeeded() {
+        backgroundWindowTask?.cancel()
+        backgroundWindowTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await Task.sleep(nanoseconds: UInt64(Self.backgroundContinuationWindow * 1_000_000_000))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            self.backgroundContinuationWindowDidElapse()
+        }
+
         #if canImport(UIKit)
         guard backgroundTaskIdentifier == .invalid else { return }
         backgroundTaskIdentifier = UIApplication.shared.beginBackgroundTask(withName: "CloudCode.ActiveRun") { [weak self] in
@@ -467,19 +481,28 @@ public final class CloudCodeViewModel: ObservableObject {
             }
         }
         if backgroundTaskIdentifier == .invalid {
-            activityLines.append("系统未授予额外后台执行时间；当前任务将由 iOS 自身挂起机制管理，恢复前不会盲目重放。")
+            activityLines.append("系统未授予额外后台执行时间；90 分钟是 Cloud Code 的恢复窗口，不代表 iOS 会允许连续后台执行 90 分钟。恢复前不会盲目重放。")
         }
         #endif
     }
 
     private func backgroundExecutionDidExpire() {
         endBackgroundExecutionIfNeeded()
+        interruptActiveRunForBackground(reason: "iOS 已收回后台执行时间；当前任务已安全中断并保留检查点。由于你没有明确停止，回到可执行状态后会先核对检查点并自动继续。")
+    }
+
+    private func backgroundContinuationWindowDidElapse() {
+        endBackgroundExecutionIfNeeded()
+        interruptActiveRunForBackground(reason: "后台连续任务已达到 90 分钟保留上限；当前任务已安全中断并保留检查点，避免无限后台占用。回到前台后可从最近检查点继续。")
+    }
+
+    private func interruptActiveRunForBackground(reason: String) {
         guard isRunning || currentTask != nil else { return }
         currentTask?.cancel()
         currentTask = nil
         runGeneration.cancel()
         isRunning = false
-        activityLines.append("系统后台执行时间已耗尽；当前任务已安全中断并保留检查点。由于你没有明确停止，回到可执行状态后会先核对检查点并自动继续。")
+        activityLines.append(reason)
     }
 
     private func resumeMostRecentInterruptedTaskIfRequested() {
@@ -500,6 +523,8 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private func endBackgroundExecutionIfNeeded() {
+        backgroundWindowTask?.cancel()
+        backgroundWindowTask = nil
         #if canImport(UIKit)
         guard backgroundTaskIdentifier != .invalid else { return }
         let identifier = backgroundTaskIdentifier

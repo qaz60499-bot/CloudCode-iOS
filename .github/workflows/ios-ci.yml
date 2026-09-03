@@ -119,6 +119,10 @@ jobs:
             exit 1
           fi
           grep -F 'probeOwnKeychain()' Sources/CloudCodeCore/CapabilityProbe.swift >/dev/null
+          grep -F 'backgroundContinuationWindow: TimeInterval = 90 * 60' Sources/CloudCodeApp/AppEnvironment.swift >/dev/null
+          grep -F 'configuration.waitsForConnectivity = true' Sources/CloudCodeCore/ProviderClient.swift >/dev/null
+          grep -F 'configuration.timeoutIntervalForResource = 90 * 60' Sources/CloudCodeCore/ProviderClient.swift >/dev/null
+          grep -F 'ProviderError.streamInterrupted' Sources/CloudCodeCore/ProviderClient.swift >/dev/null
           if grep -F 'codesign --force --sign - --entitlements Entitlements/TrollStore.entitlements' .github/workflows/private-trollstore-ipa.yml; then
             echo "FAIL: stable private TrollStore workflow must not pre-sign with experimental privileged entitlements" >&2
             exit 1

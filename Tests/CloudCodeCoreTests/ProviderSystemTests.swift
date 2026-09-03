@@ -655,6 +655,15 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertFalse(ProviderKeyRotationClassifier.shouldRotate(try! XCTUnwrap(error)))
     }
 
+    func testTransientDisconnectsRetryOnlyBeforeOutput() {
+        XCTAssertTrue(ProviderRetryClassifier.isRetryableBeforeOutput(URLError(.timedOut)))
+        XCTAssertTrue(ProviderRetryClassifier.isRetryableBeforeOutput(URLError(.networkConnectionLost)))
+        XCTAssertTrue(ProviderRetryClassifier.isRetryableBeforeOutput(URLError(.cannotConnectToHost)))
+        XCTAssertFalse(ProviderRetryClassifier.isRetryableBeforeOutput(ProviderError.streamInterrupted))
+        XCTAssertFalse(ProviderRetryClassifier.isRetryableBeforeOutput(ProviderError.authenticationFailed(401)))
+        XCTAssertFalse(ProviderRetryClassifier.isRetryableBeforeOutput(URLError(.secureConnectionFailed)))
+    }
+
     func testProviderEndpointPolicyRejectsLoopbackAndAmbiguousURLs() {
         XCTAssertTrue(ProviderEndpointPolicy.allowsBaseURL(URL(string: "https://api.example.com")!))
         XCTAssertTrue(ProviderEndpointPolicy.allowsBaseURL(URL(string: "https://api.example.com/v1")!))
