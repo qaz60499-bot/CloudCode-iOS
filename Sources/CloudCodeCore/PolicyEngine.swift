@@ -77,6 +77,7 @@ public enum PathSafetyError: Error, Equatable, CustomStringConvertible {
     case traversal
     case symlink
     case targetEscapesAllowedRoot
+    case targetChangedAfterApproval
     case recursiveDeleteTooBroad
     case systemManagedApplicationContainer
 
@@ -87,6 +88,7 @@ public enum PathSafetyError: Error, Equatable, CustomStringConvertible {
         case .traversal: return "Path traversal is not allowed"
         case .symlink: return "Symlink target is not allowed for this operation"
         case .targetEscapesAllowedRoot: return "Resolved target escapes the allowed root"
+        case .targetChangedAfterApproval: return "Resolved target changed after approval; re-plan before writing"
         case .recursiveDeleteTooBroad: return "Recursive delete target is too broad"
         case .systemManagedApplicationContainer: return "Installed app bundles and top-level app data containers must be removed through apps.uninstall, not files.delete"
         }

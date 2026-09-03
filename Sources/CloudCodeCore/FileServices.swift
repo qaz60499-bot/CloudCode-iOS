@@ -108,10 +108,16 @@ public struct FileSearchQuery: Sendable {
 public struct FileService: @unchecked Sendable {
     public let fileManager: FileManager
     public let pathGuard: PathGuard
+    public let secureFileMutation: SecureFileMutation
 
-    public init(fileManager: FileManager = .default, pathGuard: PathGuard = PathGuard()) {
+    public init(
+        fileManager: FileManager = .default,
+        pathGuard: PathGuard = PathGuard(),
+        secureFileMutation: SecureFileMutation = SecureFileMutation()
+    ) {
         self.fileManager = fileManager
         self.pathGuard = pathGuard
+        self.secureFileMutation = secureFileMutation
     }
 
     public func list(directory: URL, allowedRoot: URL? = nil) throws -> [FileEntry] {
@@ -162,9 +168,9 @@ public struct FileService: @unchecked Sendable {
 
     public func readText(_ url: URL, allowedRoot: URL? = nil, maxBytes: Int = 1_000_000) throws -> String {
         let safe = try pathGuard.validate(target: url, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
-        let data = try Data(contentsOf: safe, options: [.mappedIfSafe])
-        let slice = data.prefix(maxBytes)
-        guard let value = String(data: slice, encoding: .utf8) else {
+        let identity = try secureFileMutation.identity(of: safe, allowedRoot: allowedRoot)
+        let data = try secureFileMutation.readFile(at: safe, allowedRoot: allowedRoot, expectedIdentity: identity, maxBytes: maxBytes)
+        guard let value = String(data: data, encoding: .utf8) else {
             throw CocoaError(.fileReadInapplicableStringEncoding)
         }
         return value
@@ -183,12 +189,19 @@ public actor TrashService {
     private let journalURL: URL
     private let fileManager: FileManager
     private let pathGuard: PathGuard
+    private let secureFileMutation: SecureFileMutation
 
-    public init(root: URL, fileManager: FileManager = .default, pathGuard: PathGuard = PathGuard()) {
+    public init(
+        root: URL,
+        fileManager: FileManager = .default,
+        pathGuard: PathGuard = PathGuard(),
+        secureFileMutation: SecureFileMutation = SecureFileMutation()
+    ) {
         self.root = root
         self.journalURL = root.appendingPathComponent("trash-index.json")
         self.fileManager = fileManager
         self.pathGuard = pathGuard
+        self.secureFileMutation = secureFileMutation
     }
 
     public func records() throws -> [TrashRecord] {
@@ -202,45 +215,81 @@ public actor TrashService {
             let recordDirectory = trashURL.deletingLastPathComponent()
             let quarantine = root.appendingPathComponent(".purging-\(record.id.uuidString)", isDirectory: true)
             let original = URL(fileURLWithPath: record.originalPath)
+            let recoveryAllowedRoot = record.allowedRootPath.map { URL(fileURLWithPath: $0, isDirectory: true) }
 
             if fileManager.fileExists(atPath: quarantine.path), !fileManager.fileExists(atPath: recordDirectory.path) {
-                try fileManager.moveItem(at: quarantine, to: recordDirectory)
+                try secureFileMutation.moveItem(
+                    from: quarantine,
+                    sourceAllowedRoot: root,
+                    to: recordDirectory,
+                    destinationAllowedRoot: root,
+                    createDestinationIntermediates: true
+                )
             }
 
             let backups = ((try? fileManager.contentsOfDirectory(at: recordDirectory, includingPropertiesForKeys: nil)) ?? [])
                 .filter { $0.lastPathComponent.hasPrefix(".restore-overwrite-") }
             let sourceExists = fileManager.fileExists(atPath: trashURL.path)
             let targetExists = fileManager.fileExists(atPath: original.path)
+            let expectedOriginalPath = original.standardizedFileURL.path
+            let safeOriginal = recoveryAllowedRoot.flatMap { recoveryRoot -> URL? in
+                guard let validated = try? pathGuard.validate(target: original, allowedRoot: recoveryRoot, rejectSymlink: true, fileManager: fileManager),
+                      validated.path == expectedOriginalPath else { return nil }
+                return validated
+            }
 
-            if sourceExists, !targetExists, let backup = backups.first {
-                try fileManager.createDirectory(at: original.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try fileManager.moveItem(at: backup, to: original)
+            // Legacy records that predate allowedRoot persistence are never allowed to write back
+            // into a user path during automatic recovery. They remain visible for explicit repair.
+            if sourceExists, !targetExists, let backup = backups.first, let safeOriginal, let recoveryAllowedRoot {
+                try secureFileMutation.moveItem(
+                    from: backup,
+                    sourceAllowedRoot: root,
+                    to: safeOriginal,
+                    destinationAllowedRoot: recoveryAllowedRoot,
+                    createDestinationIntermediates: true
+                )
                 for extra in backups.dropFirst() { try? fileManager.removeItem(at: extra) }
                 continue
             }
 
-            if !sourceExists, targetExists, let backup = backups.first {
-                let targetMatchesTrash = Self.hashFileOrMetadata(url: original, fileManager: fileManager) == record.hash
+            if !sourceExists, targetExists, let backup = backups.first, let safeOriginal, let recoveryAllowedRoot {
+                let targetMatchesTrash = Self.hashFileOrMetadata(url: safeOriginal, fileManager: fileManager) == record.hash
                 if targetMatchesTrash {
-                    try fileManager.createDirectory(at: trashURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    try fileManager.moveItem(at: original, to: trashURL)
-                    try fileManager.moveItem(at: backup, to: original)
+                    try secureFileMutation.moveItem(
+                        from: safeOriginal,
+                        sourceAllowedRoot: recoveryAllowedRoot,
+                        to: trashURL,
+                        destinationAllowedRoot: root,
+                        createDestinationIntermediates: true
+                    )
+                    try secureFileMutation.moveItem(
+                        from: backup,
+                        sourceAllowedRoot: root,
+                        to: safeOriginal,
+                        destinationAllowedRoot: recoveryAllowedRoot,
+                        createDestinationIntermediates: true
+                    )
                     for extra in backups.dropFirst() { try? fileManager.removeItem(at: extra) }
                 }
                 continue
             }
 
-            if !sourceExists, !targetExists, let backup = backups.first {
-                try fileManager.createDirectory(at: original.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try fileManager.moveItem(at: backup, to: original)
+            if !sourceExists, !targetExists, let backup = backups.first, let safeOriginal, let recoveryAllowedRoot {
+                try secureFileMutation.moveItem(
+                    from: backup,
+                    sourceAllowedRoot: root,
+                    to: safeOriginal,
+                    destinationAllowedRoot: recoveryAllowedRoot,
+                    createDestinationIntermediates: true
+                )
                 for extra in backups.dropFirst() { try? fileManager.removeItem(at: extra) }
                 removeIDs.insert(record.id)
                 journalChanged = true
                 continue
             }
 
-            if !sourceExists, targetExists, backups.isEmpty,
-               Self.hashFileOrMetadata(url: original, fileManager: fileManager) == record.hash {
+            if !sourceExists, targetExists, backups.isEmpty, let safeOriginal,
+               Self.hashFileOrMetadata(url: safeOriginal, fileManager: fileManager) == record.hash {
                 removeIDs.insert(record.id)
                 journalChanged = true
             }
@@ -275,7 +324,9 @@ public actor TrashService {
         toolCallID: UUID,
         reason: String,
         sourceApp: String?,
-        allowedRoot: URL? = nil
+        allowedRoot: URL? = nil,
+        expectedResolvedTarget: URL? = nil,
+        expectedSourceIdentity: SecureFileIdentity? = nil
     ) throws -> TrashRecord {
         var all = try records()
         if let existing = all.first(where: { $0.toolCallID == toolCallID }), fileManager.fileExists(atPath: existing.trashPath) {
@@ -283,6 +334,13 @@ public actor TrashService {
         }
 
         let safe = try pathGuard.validate(target: target, allowedRoot: allowedRoot, rejectSymlink: true, recursiveDelete: fileManager.directoryExists(at: target), fileManager: fileManager)
+        if let expectedResolvedTarget, safe.path != expectedResolvedTarget.standardizedFileURL.path {
+            throw PathSafetyError.targetChangedAfterApproval
+        }
+        let currentSourceIdentity = try secureFileMutation.identity(of: safe, allowedRoot: allowedRoot)
+        if let expectedSourceIdentity, currentSourceIdentity != expectedSourceIdentity {
+            throw PathSafetyError.targetChangedAfterApproval
+        }
         try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
 
         let identifier = UUID().uuidString
@@ -303,12 +361,20 @@ public actor TrashService {
             sessionID: sessionID,
             toolCallID: toolCallID,
             reason: reason,
-            sourceApp: sourceApp
+            sourceApp: sourceApp,
+            allowedRootPath: allowedRoot?.standardizedFileURL.resolvingSymlinksInPath().path ?? "/"
         )
         all.append(record)
         try writeRecords(all)
         do {
-            try fileManager.moveItem(at: safe, to: trashTarget)
+            try secureFileMutation.moveItem(
+                from: safe,
+                sourceAllowedRoot: allowedRoot,
+                to: trashTarget,
+                destinationAllowedRoot: root,
+                createDestinationIntermediates: true,
+                expectedSourceIdentity: currentSourceIdentity
+            )
             return record
         } catch {
             all.removeAll(where: { $0.id == record.id })
@@ -318,26 +384,66 @@ public actor TrashService {
         }
     }
 
-    public func restore(_ id: UUID, overwrite: Bool = false) throws -> TrashRecord {
+    public func restore(
+        _ id: UUID,
+        overwrite: Bool = false,
+        allowedRoot: URL? = nil,
+        expectedResolvedTarget: URL? = nil,
+        expectedDestinationParentIdentity: SecureFileIdentity? = nil
+    ) throws -> TrashRecord {
         var all = try records()
         guard let index = all.firstIndex(where: { $0.id == id }) else { throw CocoaError(.fileNoSuchFile) }
         let record = all[index]
         let source = URL(fileURLWithPath: record.trashPath)
-        let target = URL(fileURLWithPath: record.originalPath)
+        let sourceIdentity = try secureFileMutation.identity(of: source, allowedRoot: root)
+        let target = try pathGuard.validate(
+            target: URL(fileURLWithPath: record.originalPath),
+            allowedRoot: allowedRoot,
+            rejectSymlink: true,
+            fileManager: fileManager
+        )
+        if let expectedResolvedTarget,
+           target.path != expectedResolvedTarget.standardizedFileURL.path {
+            throw PathSafetyError.targetChangedAfterApproval
+        }
 
         var overwrittenBackup: URL?
+        var overwrittenIdentity: SecureFileIdentity?
         if fileManager.fileExists(atPath: target.path) {
             guard overwrite else { throw CocoaError(.fileWriteFileExists) }
+            let targetIdentity = try secureFileMutation.identity(of: target, allowedRoot: allowedRoot)
             let backup = source.deletingLastPathComponent().appendingPathComponent(".restore-overwrite-\(UUID().uuidString)")
-            try fileManager.moveItem(at: target, to: backup)
+            try secureFileMutation.moveItem(
+                from: target,
+                sourceAllowedRoot: allowedRoot,
+                to: backup,
+                destinationAllowedRoot: root,
+                createDestinationIntermediates: true,
+                expectedSourceIdentity: targetIdentity
+            )
             overwrittenBackup = backup
+            overwrittenIdentity = targetIdentity
         }
-        try fileManager.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
         do {
-            try fileManager.moveItem(at: source, to: target)
+            try secureFileMutation.moveItem(
+                from: source,
+                sourceAllowedRoot: root,
+                to: target,
+                destinationAllowedRoot: allowedRoot,
+                createDestinationIntermediates: true,
+                expectedSourceIdentity: sourceIdentity,
+                expectedDestinationParentIdentity: expectedDestinationParentIdentity
+            )
         } catch {
             if let overwrittenBackup, fileManager.fileExists(atPath: overwrittenBackup.path) {
-                try? fileManager.moveItem(at: overwrittenBackup, to: target)
+                try? secureFileMutation.moveItem(
+                    from: overwrittenBackup,
+                    sourceAllowedRoot: root,
+                    to: target,
+                    destinationAllowedRoot: allowedRoot,
+                    createDestinationIntermediates: true,
+                    expectedSourceIdentity: overwrittenIdentity
+                )
             }
             throw error
         }
@@ -348,11 +454,24 @@ public actor TrashService {
             return record
         } catch {
             if fileManager.fileExists(atPath: target.path), !fileManager.fileExists(atPath: source.path) {
-                try? fileManager.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try? fileManager.moveItem(at: target, to: source)
+                try? secureFileMutation.moveItem(
+                    from: target,
+                    sourceAllowedRoot: allowedRoot,
+                    to: source,
+                    destinationAllowedRoot: root,
+                    createDestinationIntermediates: true,
+                    expectedSourceIdentity: sourceIdentity
+                )
             }
             if let overwrittenBackup, fileManager.fileExists(atPath: overwrittenBackup.path), !fileManager.fileExists(atPath: target.path) {
-                try? fileManager.moveItem(at: overwrittenBackup, to: target)
+                try? secureFileMutation.moveItem(
+                    from: overwrittenBackup,
+                    sourceAllowedRoot: root,
+                    to: target,
+                    destinationAllowedRoot: allowedRoot,
+                    createDestinationIntermediates: true,
+                    expectedSourceIdentity: overwrittenIdentity
+                )
             }
             throw error
         }
@@ -379,8 +498,18 @@ public actor TrashService {
         let quarantine = root.appendingPathComponent(".purging-\(id.uuidString)", isDirectory: true)
 
         if fileManager.fileExists(atPath: quarantine.path) { try fileManager.removeItem(at: quarantine) }
+        var quarantinedIdentity: SecureFileIdentity?
         if fileManager.fileExists(atPath: recordDirectory.path) {
-            try fileManager.moveItem(at: recordDirectory, to: quarantine)
+            let recordDirectoryIdentity = try secureFileMutation.identity(of: recordDirectory, allowedRoot: root)
+            try secureFileMutation.moveItem(
+                from: recordDirectory,
+                sourceAllowedRoot: root,
+                to: quarantine,
+                destinationAllowedRoot: root,
+                createDestinationIntermediates: true,
+                expectedSourceIdentity: recordDirectoryIdentity
+            )
+            quarantinedIdentity = recordDirectoryIdentity
         }
 
         all.remove(at: index)
@@ -388,7 +517,14 @@ public actor TrashService {
             try writeRecords(all)
         } catch {
             if fileManager.fileExists(atPath: quarantine.path), !fileManager.fileExists(atPath: recordDirectory.path) {
-                try? fileManager.moveItem(at: quarantine, to: recordDirectory)
+                try? secureFileMutation.moveItem(
+                    from: quarantine,
+                    sourceAllowedRoot: root,
+                    to: recordDirectory,
+                    destinationAllowedRoot: root,
+                    createDestinationIntermediates: true,
+                    expectedSourceIdentity: quarantinedIdentity
+                )
             }
             throw error
         }

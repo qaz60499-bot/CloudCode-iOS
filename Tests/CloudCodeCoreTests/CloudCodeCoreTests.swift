@@ -185,6 +185,16 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(engine.decision(mode: .full, tool: tool), .allow)
     }
 
+    func testGUITypeApprovalTargetNeverExposesInputText() {
+        let secret = "super-secret-input-body"
+        let call = ToolCall(name: "gui.type", arguments: ["text": secret], sessionID: UUID())
+        let target = GUIApprovalTargetSanitizer.target(for: call)
+        XCTAssertFalse(target.contains(secret))
+        XCTAssertFalse(target.contains("super-secret"))
+        XCTAssertTrue(target.contains(String(secret.count)))
+        XCTAssertTrue(target.contains("内容已隐藏"))
+    }
+
     func testDatabaseAndPlistAreSensitive() {
         let classifier = SensitivityClassifier()
         XCTAssertTrue(classifier.isSensitive(path: "/tmp/state.sqlite", operation: "files.modify"))
@@ -226,6 +236,144 @@ final class CloudCodeCoreTests: XCTestCase {
             XCTFail("Sensitive file creation in safe mode must require approval")
         } catch {
             XCTAssertEqual(error as? TransactionError, .confirmationDenied)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+    }
+
+    func testStructuredCreateRevalidatesPathAfterApprovalAndBlocksSymlinkSwap() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        let parent = allowed.appendingPathComponent("parent", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let target = parent.appendingPathComponent("config.plist")
+        let resolver = StaticAppResolver()
+        let audit = AuditLogStore(fileURL: root.appendingPathComponent("audit/audit.jsonl"))
+        let journal = TransactionJournal(fileURL: root.appendingPathComponent("transactions/transactions.json"))
+        let policy = PolicyEngine()
+        let approval = MutatingApprovalRequester {
+            try? FileManager.default.removeItem(at: parent)
+            try? FileManager.default.createSymbolicLink(at: parent, withDestinationURL: outside)
+        }
+        let executor = StructuredToolExecutor(
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            appResolver: resolver,
+            resourceResolver: ResourceResolver(appResolver: resolver),
+            fileService: FileService(),
+            ipaService: IPAService(),
+            trashService: TrashService(root: root.appendingPathComponent("trash", isDirectory: true)),
+            transactionEngine: TransactionEngine(
+                backupRoot: root.appendingPathComponent("backups", isDirectory: true),
+                policy: policy,
+                journal: journal,
+                audit: audit
+            ),
+            policy: policy,
+            audit: audit,
+            approval: approval
+        )
+        let descriptor = ToolDescriptor(name: "files.create", summary: "", risk: .safeWrite)
+        let call = ToolCall(name: "files.create", arguments: ["path": target.path, "content": "must-not-escape"], sessionID: UUID())
+        let context = ToolExecutionContext(permissionMode: .safe, capabilityProfile: CapabilityProfile(records: []), allowedRoot: allowed)
+
+        do {
+            _ = try await executor.execute(call, descriptor: descriptor, context: context)
+            XCTFail("Post-approval symlink swap must be rejected")
+        } catch {
+            XCTAssertEqual(error as? PathSafetyError, .targetEscapesAllowedRoot)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("config.plist").path))
+    }
+
+    func testStructuredCreateFinalMutationBlocksSymlinkSwapAfterApproval() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        let parent = allowed.appendingPathComponent("parent", isDirectory: true)
+        let parked = allowed.appendingPathComponent("parent-original", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let target = parent.appendingPathComponent("config.plist")
+        let race = MutationOnInvocation(trigger: 1) {
+            try? FileManager.default.moveItem(at: parent, to: parked)
+            try? FileManager.default.createSymbolicLink(at: parent, withDestinationURL: outside)
+        }
+        let secureMutation = SecureFileMutation(beforeFinalMutation: { race.invoke() })
+        let resolver = StaticAppResolver()
+        let audit = AuditLogStore(fileURL: root.appendingPathComponent("audit/audit.jsonl"))
+        let policy = PolicyEngine()
+        let executor = StructuredToolExecutor(
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            appResolver: resolver,
+            resourceResolver: ResourceResolver(appResolver: resolver),
+            fileService: FileService(),
+            ipaService: IPAService(),
+            trashService: TrashService(root: root.appendingPathComponent("trash", isDirectory: true)),
+            transactionEngine: TransactionEngine(
+                backupRoot: root.appendingPathComponent("backups", isDirectory: true),
+                policy: policy,
+                journal: TransactionJournal(fileURL: root.appendingPathComponent("transactions/transactions.json")),
+                audit: audit
+            ),
+            policy: policy,
+            audit: audit,
+            approval: FixedApprovalRequester(approved: true),
+            secureFileMutation: secureMutation
+        )
+        let descriptor = ToolDescriptor(name: "files.create", summary: "", risk: .safeWrite)
+        let call = ToolCall(name: "files.create", arguments: ["path": target.path, "content": "must-not-escape"], sessionID: UUID())
+        let context = ToolExecutionContext(permissionMode: .safe, capabilityProfile: CapabilityProfile(records: []), allowedRoot: allowed)
+
+        do {
+            _ = try await executor.execute(call, descriptor: descriptor, context: context)
+            XCTFail("The pinned-FD mutation must fail closed when the approved parent path is swapped")
+        } catch {
+            XCTAssertNotNil(error as? SecureFileMutationError)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("config.plist").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: parked.appendingPathComponent("config.plist").path))
+    }
+
+    func testStructuredCreateRejectsDestinationOutsideAllowedRoot() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: allowed, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let target = outside.appendingPathComponent("escape.txt")
+        let resolver = StaticAppResolver()
+        let audit = AuditLogStore(fileURL: root.appendingPathComponent("audit/audit.jsonl"))
+        let policy = PolicyEngine()
+        let executor = StructuredToolExecutor(
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            appResolver: resolver,
+            resourceResolver: ResourceResolver(appResolver: resolver),
+            fileService: FileService(),
+            ipaService: IPAService(),
+            trashService: TrashService(root: root.appendingPathComponent("trash", isDirectory: true)),
+            transactionEngine: TransactionEngine(
+                backupRoot: root.appendingPathComponent("backups", isDirectory: true),
+                policy: policy,
+                journal: TransactionJournal(fileURL: root.appendingPathComponent("transactions/transactions.json")),
+                audit: audit
+            ),
+            policy: policy,
+            audit: audit,
+            approval: FixedApprovalRequester(approved: true)
+        )
+        let call = ToolCall(name: "files.create", arguments: ["path": target.path, "content": "escape"], sessionID: UUID())
+        let descriptor = ToolDescriptor(name: "files.create", summary: "", risk: .safeWrite)
+        let context = ToolExecutionContext(permissionMode: .full, capabilityProfile: CapabilityProfile(records: []), allowedRoot: allowed)
+
+        do {
+            _ = try await executor.execute(call, descriptor: descriptor, context: context)
+            XCTFail("files.create must not escape allowedRoot")
+        } catch {
+            XCTAssertEqual(error as? PathSafetyError, .targetEscapesAllowedRoot)
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
     }
@@ -300,6 +448,188 @@ final class CloudCodeCoreTests: XCTestCase {
         _ = try await service.restore(record.id)
         XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
         XCTAssertEqual(String(data: try Data(contentsOf: file), encoding: .utf8), "hello")
+    }
+
+    func testTrashRestoreRevalidatesAllowedRootAndBlocksSymlinkSwap() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent("work", isDirectory: true)
+        let parent = work.appendingPathComponent("parent", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        let trashRoot = root.appendingPathComponent("trash", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let file = parent.appendingPathComponent("note.txt")
+        try Data("hello".utf8).write(to: file)
+
+        let service = TrashService(root: trashRoot)
+        let record = try await service.moveToTrash(
+            target: file,
+            logicalResourceID: "file://note",
+            sessionID: UUID(),
+            toolCallID: UUID(),
+            reason: "test",
+            sourceApp: nil,
+            allowedRoot: work
+        )
+        let approvedTarget = try PathGuard().validate(target: file, allowedRoot: work, rejectSymlink: true)
+        try FileManager.default.removeItem(at: parent)
+        try FileManager.default.createSymbolicLink(at: parent, withDestinationURL: outside)
+
+        do {
+            _ = try await service.restore(record.id, allowedRoot: work, expectedResolvedTarget: approvedTarget)
+            XCTFail("Restore must not escape the current allowed root after a symlink swap")
+        } catch {
+            XCTAssertEqual(error as? PathSafetyError, .targetEscapesAllowedRoot)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: record.trashPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("note.txt").path))
+    }
+
+    func testFilesDeleteFinalMutationBlocksParentSymlinkSwapAndRollsBackJournal() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent("work", isDirectory: true)
+        let parent = work.appendingPathComponent("parent", isDirectory: true)
+        let parked = work.appendingPathComponent("parent-original", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        let trashRoot = root.appendingPathComponent("trash", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let file = parent.appendingPathComponent("note.txt")
+        try Data("hello".utf8).write(to: file)
+        let race = MutationOnInvocation(trigger: 1) {
+            try? FileManager.default.moveItem(at: parent, to: parked)
+            try? FileManager.default.createSymbolicLink(at: parent, withDestinationURL: outside)
+        }
+        let service = TrashService(
+            root: trashRoot,
+            secureFileMutation: SecureFileMutation(beforeFinalMutation: { race.invoke() })
+        )
+
+        do {
+            _ = try await service.moveToTrash(
+                target: file,
+                logicalResourceID: "file://note",
+                sessionID: UUID(),
+                toolCallID: UUID(),
+                reason: "race",
+                sourceApp: nil,
+                allowedRoot: work
+            )
+            XCTFail("files.delete must fail closed after a final parent symlink swap")
+        } catch {
+            XCTAssertNotNil(error as? SecureFileMutationError)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: parked.appendingPathComponent("note.txt").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("note.txt").path))
+        let remainingRecords = try await service.records()
+        XCTAssertTrue(remainingRecords.isEmpty)
+    }
+
+    func testFilesDeleteRejectsTargetOutsideAllowedRoot() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        let trashRoot = root.appendingPathComponent("trash", isDirectory: true)
+        try FileManager.default.createDirectory(at: allowed, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let file = outside.appendingPathComponent("note.txt")
+        try Data("hello".utf8).write(to: file)
+        let service = TrashService(root: trashRoot)
+
+        do {
+            _ = try await service.moveToTrash(
+                target: file,
+                logicalResourceID: "file://outside-note",
+                sessionID: UUID(),
+                toolCallID: UUID(),
+                reason: "test",
+                sourceApp: nil,
+                allowedRoot: allowed
+            )
+            XCTFail("files.delete must reject targets outside allowedRoot")
+        } catch {
+            XCTAssertEqual(error as? PathSafetyError, .targetEscapesAllowedRoot)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    func testTrashRestoreFinalMutationBlocksParentSymlinkSwapWithoutLosingTrashPayload() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent("work", isDirectory: true)
+        let parent = work.appendingPathComponent("parent", isDirectory: true)
+        let parked = work.appendingPathComponent("parent-original", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        let trashRoot = root.appendingPathComponent("trash", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let file = parent.appendingPathComponent("config.plist")
+        try Data("hello".utf8).write(to: file)
+
+        let normalService = TrashService(root: trashRoot)
+        let record = try await normalService.moveToTrash(
+            target: file,
+            logicalResourceID: "file://config",
+            sessionID: UUID(),
+            toolCallID: UUID(),
+            reason: "prepare",
+            sourceApp: nil,
+            allowedRoot: work
+        )
+        let approvedTarget = try PathGuard().validate(target: file, allowedRoot: work, rejectSymlink: true)
+        let race = MutationOnInvocation(trigger: 1) {
+            try? FileManager.default.moveItem(at: parent, to: parked)
+            try? FileManager.default.createSymbolicLink(at: parent, withDestinationURL: outside)
+        }
+        let racedService = TrashService(
+            root: trashRoot,
+            secureFileMutation: SecureFileMutation(beforeFinalMutation: { race.invoke() })
+        )
+
+        do {
+            _ = try await racedService.restore(record.id, allowedRoot: work, expectedResolvedTarget: approvedTarget)
+            XCTFail("trash.restore must fail closed after a final parent symlink swap")
+        } catch {
+            XCTAssertNotNil(error as? SecureFileMutationError)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: record.trashPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("config.plist").path))
+        let remainingRecords = try await racedService.records()
+        XCTAssertEqual(remainingRecords.map(\.id), [record.id])
+    }
+
+    func testTrashRestoreRejectsOriginalTargetOutsideAllowedRoot() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        let trashRoot = root.appendingPathComponent("trash", isDirectory: true)
+        try FileManager.default.createDirectory(at: allowed, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let file = outside.appendingPathComponent("note.txt")
+        try Data("hello".utf8).write(to: file)
+        let service = TrashService(root: trashRoot)
+        let record = try await service.moveToTrash(
+            target: file,
+            logicalResourceID: "file://outside",
+            sessionID: UUID(),
+            toolCallID: UUID(),
+            reason: "prepare",
+            sourceApp: nil,
+            allowedRoot: nil
+        )
+
+        do {
+            _ = try await service.restore(record.id, allowedRoot: allowed)
+            XCTFail("trash.restore must reject an original target outside allowedRoot")
+        } catch {
+            XCTAssertEqual(error as? PathSafetyError, .targetEscapesAllowedRoot)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: record.trashPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
     }
 
     func testCorruptTrashJournalFailsClosedBeforeDelete() async throws {
@@ -380,6 +710,55 @@ final class CloudCodeCoreTests: XCTestCase {
         }
         XCTAssertEqual(String(data: try Data(contentsOf: target), encoding: .utf8), "old")
         XCTAssertEqual(String(data: try Data(contentsOf: journalURL), encoding: .utf8), "corrupt")
+    }
+
+    func testFilesModifyFinalMutationBlocksParentSymlinkSwapWithoutWritingOutsideRoot() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        let parent = allowed.appendingPathComponent("parent", isDirectory: true)
+        let parked = allowed.appendingPathComponent("parent-original", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let target = parent.appendingPathComponent("config.plist")
+        try Data("old".utf8).write(to: target)
+
+        let race = MutationOnInvocation(trigger: 2) {
+            try? FileManager.default.moveItem(at: parent, to: parked)
+            try? FileManager.default.createSymbolicLink(at: parent, withDestinationURL: outside)
+        }
+        let journal = TransactionJournal(fileURL: root.appendingPathComponent("journal/transactions.json"))
+        let engine = TransactionEngine(
+            backupRoot: root.appendingPathComponent("backups"),
+            policy: PolicyEngine(),
+            journal: journal,
+            audit: AuditLogStore(fileURL: root.appendingPathComponent("audit/audit.jsonl")),
+            secureFileMutation: SecureFileMutation(beforeFinalMutation: { race.invoke() })
+        )
+
+        do {
+            _ = try await engine.replaceFile(
+                target: target,
+                proposedData: Data("new".utf8),
+                tool: ToolDescriptor(name: "files.modify", summary: "", risk: .sensitiveWrite),
+                sessionID: UUID(),
+                toolCallID: UUID(),
+                mode: .full,
+                reason: "race",
+                allowedRoot: allowed,
+                approval: { _ in true },
+                verify: { _ in VerificationResult(passed: true) }
+            )
+            XCTFail("files.modify must fail closed when the approved parent is swapped before the final rename")
+        } catch {
+            XCTAssertNotNil(error as? SecureFileMutationError)
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("config.plist").path))
+        XCTAssertEqual(String(data: try Data(contentsOf: parked.appendingPathComponent("config.plist")), encoding: .utf8), "old")
+        let records = await journal.all()
+        XCTAssertEqual(records.first?.state, .failed)
     }
 
     func testTransactionRollsBackOnFailedVerification() async throws {
@@ -657,6 +1036,146 @@ final class CloudCodeCoreTests: XCTestCase {
             XCTAssertEqual(error as? IPAServiceError, .archiveTooLarge)
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
+    func testIPAExtractionRejectsSourceOutsideAllowedRootBeforeArchiveRead() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: allowed, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let outsideIPA = outside.appendingPathComponent("outside.ipa")
+        try Data("not-an-archive".utf8).write(to: outsideIPA)
+        let destination = allowed.appendingPathComponent("extracted", isDirectory: true)
+
+        XCTAssertThrowsError(try IPAService().extract(outsideIPA, to: destination, allowedRoot: allowed)) { error in
+            XCTAssertEqual(error as? PathSafetyError, .targetEscapesAllowedRoot)
+        }
+        XCTAssertThrowsError(try IPAService().inspect(outsideIPA, allowedRoot: allowed)) { error in
+            XCTAssertEqual(error as? PathSafetyError, .targetEscapesAllowedRoot)
+        }
+        XCTAssertThrowsError(try IPAService().locate(root: outside, allowedRoot: allowed)) { error in
+            XCTAssertEqual(error as? PathSafetyError, .targetEscapesAllowedRoot)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
+    func testIPAExtractAndRepackRejectDestinationsOutsideAllowedRoot() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        let source = allowed.appendingPathComponent("source", isDirectory: true)
+        let app = source.appendingPathComponent("Payload/Test.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+        try Data("plist".utf8).write(to: app.appendingPathComponent("Info.plist"))
+        let ipa = allowed.appendingPathComponent("Test.ipa")
+        try IPAService(stagingRoot: root.appendingPathComponent("staging-a", isDirectory: true)).repack(sourceRoot: source, to: ipa, allowedRoot: allowed)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+
+        let extractDestination = outside.appendingPathComponent("extract", isDirectory: true)
+        XCTAssertThrowsError(try IPAService().extract(ipa, to: extractDestination, allowedRoot: allowed)) { error in
+            XCTAssertEqual(error as? PathSafetyError, .targetEscapesAllowedRoot)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: extractDestination.path))
+
+        let repackDestination = outside.appendingPathComponent("escape.ipa")
+        XCTAssertThrowsError(try IPAService().repack(sourceRoot: source, to: repackDestination, allowedRoot: allowed)) { error in
+            XCTAssertEqual(error as? PathSafetyError, .targetEscapesAllowedRoot)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: repackDestination.path))
+    }
+
+    func testIPAExtractFinalMoveBlocksDestinationSymlinkSwapAndCleansPrivateStaging() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        let source = allowed.appendingPathComponent("source", isDirectory: true)
+        let app = source.appendingPathComponent("Payload/Test.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+        let plist: [String: Any] = [
+            "CFBundleIdentifier": "com.example.extract-race",
+            "CFBundleExecutable": "Test",
+            "CFBundleVersion": "1",
+            "CFBundleShortVersionString": "1.0"
+        ]
+        try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            .write(to: app.appendingPathComponent("Info.plist"))
+        var executable = Data([0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01])
+        executable.append(Data(repeating: 0, count: 64))
+        try executable.write(to: app.appendingPathComponent("Test"))
+        let buildStaging = root.appendingPathComponent("build-staging", isDirectory: true)
+        let ipa = allowed.appendingPathComponent("Test.ipa")
+        try IPAService(stagingRoot: buildStaging).repack(sourceRoot: source, to: ipa, allowedRoot: allowed)
+
+        let destinationParent = allowed.appendingPathComponent("destination-parent", isDirectory: true)
+        let parked = allowed.appendingPathComponent("destination-parent-original", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        let staging = root.appendingPathComponent("private-extract-staging", isDirectory: true)
+        try FileManager.default.createDirectory(at: destinationParent, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let destination = destinationParent.appendingPathComponent("extracted", isDirectory: true)
+        let race = MutationOnInvocation(trigger: 2) {
+            try? FileManager.default.moveItem(at: destinationParent, to: parked)
+            try? FileManager.default.createSymbolicLink(at: destinationParent, withDestinationURL: outside)
+        }
+        let service = IPAService(
+            stagingRoot: staging,
+            secureFileMutation: SecureFileMutation(beforeFinalMutation: { race.invoke() })
+        )
+
+        XCTAssertThrowsError(try service.extract(ipa, to: destination, allowedRoot: allowed)) { error in
+            XCTAssertNotNil(error as? SecureFileMutationError)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("extracted").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: parked.appendingPathComponent("extracted").path))
+        let stagedItems = (try? FileManager.default.contentsOfDirectory(at: staging, includingPropertiesForKeys: nil)) ?? []
+        XCTAssertTrue(stagedItems.isEmpty)
+    }
+
+    func testIPARepackFinalMoveBlocksDestinationSymlinkSwapAndCleansPrivateStaging() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        let source = allowed.appendingPathComponent("source", isDirectory: true)
+        let app = source.appendingPathComponent("Payload/Test.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+        let plist: [String: Any] = [
+            "CFBundleIdentifier": "com.example.repack-race",
+            "CFBundleExecutable": "Test",
+            "CFBundleVersion": "1",
+            "CFBundleShortVersionString": "1.0"
+        ]
+        try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            .write(to: app.appendingPathComponent("Info.plist"))
+        var executable = Data([0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01])
+        executable.append(Data(repeating: 0, count: 64))
+        try executable.write(to: app.appendingPathComponent("Test"))
+
+        let destinationParent = allowed.appendingPathComponent("destination-parent", isDirectory: true)
+        let parked = allowed.appendingPathComponent("destination-parent-original", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        let staging = root.appendingPathComponent("private-repack-staging", isDirectory: true)
+        try FileManager.default.createDirectory(at: destinationParent, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let destination = destinationParent.appendingPathComponent("Test.ipa")
+        let race = MutationOnInvocation(trigger: 3) {
+            try? FileManager.default.moveItem(at: destinationParent, to: parked)
+            try? FileManager.default.createSymbolicLink(at: destinationParent, withDestinationURL: outside)
+        }
+        let service = IPAService(
+            stagingRoot: staging,
+            secureFileMutation: SecureFileMutation(beforeFinalMutation: { race.invoke() })
+        )
+
+        XCTAssertThrowsError(try service.repack(sourceRoot: source, to: destination, allowedRoot: allowed)) { error in
+            XCTAssertNotNil(error as? SecureFileMutationError)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("Test.ipa").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: parked.appendingPathComponent("Test.ipa").path))
+        let stagedItems = (try? FileManager.default.contentsOfDirectory(at: staging, includingPropertiesForKeys: nil)) ?? []
+        XCTAssertTrue(stagedItems.isEmpty)
     }
 
     func testRunGenerationGuardRejectsStaleCompletionAndCancelInvalidatesRun() {
@@ -1240,6 +1759,43 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(pendingInvocationCount, 0)
     }
 
+    func testSemanticDuplicateVerificationMustBeBoundToTheChangedTarget() {
+        let fileScope = AgentCore.semanticToolScope(name: "files.delete", arguments: ["path": "/tmp/work/note.txt"])
+        XCTAssertEqual(fileScope, "file:/tmp/work/note.txt")
+        XCTAssertFalse(AgentCore.readOnlyToolVerifiesLastStateChange(
+            name: "files.list",
+            arguments: ["path": "/tmp/unrelated"],
+            scope: fileScope
+        ))
+        XCTAssertTrue(AgentCore.readOnlyToolVerifiesLastStateChange(
+            name: "files.list",
+            arguments: ["path": "/tmp/work"],
+            scope: fileScope
+        ))
+        XCTAssertTrue(AgentCore.readOnlyToolVerifiesLastStateChange(
+            name: "files.read",
+            arguments: ["path": "/tmp/work/note.txt"],
+            scope: fileScope
+        ))
+
+        let appScope = AgentCore.semanticToolScope(name: "apps.uninstall", arguments: ["bundleId": "com.example.app"])
+        XCTAssertFalse(AgentCore.readOnlyToolVerifiesLastStateChange(
+            name: "apps.inspect",
+            arguments: ["bundleId": "com.other.app"],
+            scope: appScope
+        ))
+        XCTAssertTrue(AgentCore.readOnlyToolVerifiesLastStateChange(
+            name: "apps.inspect",
+            arguments: ["bundleId": "com.example.app"],
+            scope: appScope
+        ))
+        XCTAssertFalse(AgentCore.readOnlyToolVerifiesLastStateChange(
+            name: "apps.list",
+            arguments: [:],
+            scope: appScope
+        ))
+    }
+
     func testAgentCoreBlocksImmediateSemanticDuplicateStateChangeWithDifferentProviderCallIDs() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1406,6 +1962,41 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(savedFirst.messages.last(where: { $0.role == .assistant })?.content, "first-session")
         XCTAssertEqual(savedSecond.messages.last(where: { $0.role == .assistant })?.content, "second-session")
         XCTAssertNotEqual(savedFirst.id, savedSecond.id)
+    }
+
+    func testAgentCoreRejectsConcurrentPrimaryRunsForSameSession() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = ToolRegistry(descriptors: [])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let checkpoints = TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json"))
+        let agent = AgentCore(
+            provider: BlockingProvider(),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(registry: registry, executors: []),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: checkpoints,
+            maxToolRounds: 2
+        )
+        let session = AgentSession(permissionMode: .safe)
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        let firstStream = await agent.send(text: "first", session: session, providerConfiguration: config)
+        let firstConsumer = Task {
+            do { for try await _ in firstStream {} } catch { }
+        }
+
+        let secondStream = await agent.send(text: "second", session: session, providerConfiguration: config)
+        do {
+            for try await _ in secondStream {}
+            XCTFail("A second primary Agent run for the same session must be rejected")
+        } catch {
+            XCTAssertEqual(error as? AgentRunError, .sessionAlreadyRunning(session.id))
+        }
+
+        firstConsumer.cancel()
+        _ = await firstConsumer.result
     }
 
     func testAgentCoreProviderFailureResumeDoesNotDuplicateUserMessage() async throws {
@@ -1684,6 +2275,24 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(snapshots.first(where: { $0.id == .network })?.status, .unknown)
     }
 
+    func testHomeOSBroadAppCapabilityDoesNotPromotePartialPrimitiveAvailability() {
+        let partial = HomeOSCapabilityLayer.snapshots(from: [
+            CapabilityRecord(id: "apps.enumerate", domain: .apps, status: .available, detail: "yes"),
+            CapabilityRecord(id: "apps.launch", domain: .apps, status: .available, detail: "yes"),
+            CapabilityRecord(id: "apps.terminate", domain: .apps, status: .unavailable, detail: "no"),
+            CapabilityRecord(id: "apps.uninstall", domain: .apps, status: .deviceValidationRequired, detail: "pending")
+        ])
+        XCTAssertEqual(partial.first(where: { $0.id == .app })?.status, .deviceValidationRequired)
+
+        let complete = HomeOSCapabilityLayer.snapshots(from: [
+            CapabilityRecord(id: "apps.enumerate", domain: .apps, status: .available, detail: "yes"),
+            CapabilityRecord(id: "apps.launch", domain: .apps, status: .available, detail: "yes"),
+            CapabilityRecord(id: "apps.terminate", domain: .apps, status: .available, detail: "yes"),
+            CapabilityRecord(id: "apps.uninstall", domain: .apps, status: .available, detail: "yes")
+        ])
+        XCTAssertEqual(complete.first(where: { $0.id == .app })?.status, .available)
+    }
+
     func testHomeOSCapabilityLayerHandlesDuplicatePrimitiveRecordsFailClosed() {
         let snapshots = HomeOSCapabilityLayer.snapshots(from: [
             CapabilityRecord(id: "network.urlsession", domain: .network, status: .available, detail: "first"),
@@ -1735,6 +2344,23 @@ final class CloudCodeCoreTests: XCTestCase {
             XCTAssertEqual(error as? ProviderError, .malformedEvent)
         }
         XCTAssertEqual(ScriptedURLProtocol.requestCount(), 1)
+    }
+
+    func testProviderRetriesUpstreamResponseEmpty502BeforeOutputAndSucceeds() async throws {
+        let recovered = Data("data: {\"choices\":[{\"delta\":{\"content\":\"recovered-502\"}}]}\n\ndata: [DONE]\n\n".utf8)
+        ScriptedURLProtocol.reset(steps: [
+            .http(status: 502, body: Data("upstream_response_empty".utf8)),
+            .http(status: 200, body: recovered)
+        ])
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ScriptedURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let provider = OpenAICompatibleProviderClient(session: session, retryPolicy: RetryPolicy(maxAttempts: 3, initialDelayNanoseconds: 1))
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.invalid/v1")!, model: "test", apiKeyReference: "key")
+        let text = try await collectProviderTokenText(provider.stream(configuration: config, apiKey: "ok", messages: [ChatMessage(role: .user, content: "hi")], tools: []))
+        XCTAssertEqual(text, "recovered-502")
+        XCTAssertEqual(ScriptedURLProtocol.requestCount(), 2)
     }
 
     func testProviderRetriesTransientFailureBeforeOutputAndVerifiesStreamContent() async throws {
@@ -1981,6 +2607,43 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(String(data: try Data(contentsOf: file), encoding: .utf8), "hello")
     }
 
+    func testTrashRecoveryDoesNotWriteThroughParentSymlinkAfterRestart() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent("work", isDirectory: true)
+        let parent = work.appendingPathComponent("parent", isDirectory: true)
+        let parked = work.appendingPathComponent("parent-original", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        let trashRoot = root.appendingPathComponent("trash", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let file = parent.appendingPathComponent("note.txt")
+        try Data("hello".utf8).write(to: file)
+
+        let service = TrashService(root: trashRoot)
+        let record = try await service.moveToTrash(
+            target: file,
+            logicalResourceID: "file://note",
+            sessionID: UUID(),
+            toolCallID: UUID(),
+            reason: "prepare recovery",
+            sourceApp: nil,
+            allowedRoot: work
+        )
+        let recordDirectory = URL(fileURLWithPath: record.trashPath).deletingLastPathComponent()
+        let backup = recordDirectory.appendingPathComponent(".restore-overwrite-test")
+        try Data("old-target".utf8).write(to: backup)
+        try FileManager.default.moveItem(at: parent, to: parked)
+        try FileManager.default.createSymbolicLink(at: parent, withDestinationURL: outside)
+
+        let restarted = TrashService(root: trashRoot)
+        let reconciled = try await restarted.records()
+        XCTAssertEqual(reconciled.map(\.id), [record.id])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: record.trashPath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: backup.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("note.txt").path))
+    }
+
     func testTrashJournalRecoversInterruptedPurgeBeforeJournalCommit() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2041,16 +2704,30 @@ final class CloudCodeCoreTests: XCTestCase {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let target = root.appendingPathComponent("config.plist")
-        try Data("new".utf8).write(to: target)
+        try Data("old".utf8).write(to: target)
+        let secureMutation = SecureFileMutation()
+        let originalIdentity = try secureMutation.identity(of: target, allowedRoot: root)
         let backupRoot = root.appendingPathComponent("backups", isDirectory: true)
         let transactionID = UUID()
         let backupDirectory = backupRoot.appendingPathComponent(transactionID.uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
         let backup = backupDirectory.appendingPathComponent(target.lastPathComponent)
         try Data("old".utf8).write(to: backup)
+        try secureMutation.replaceFile(at: target, data: Data("new".utf8), allowedRoot: root, expectedTargetIdentity: originalIdentity)
+        let appliedIdentity = try secureMutation.identity(of: target, allowedRoot: root)
 
         let journal = TransactionJournal(fileURL: root.appendingPathComponent("transactions.json"))
-        var record = TransactionRecord(id: transactionID, sessionID: UUID(), toolCallID: UUID(), targetPath: target.path, backupPath: backup.path, state: .applying)
+        var record = TransactionRecord(
+            id: transactionID,
+            sessionID: UUID(),
+            toolCallID: UUID(),
+            targetPath: target.path,
+            allowedRootPath: root.path,
+            originalIdentity: originalIdentity,
+            appliedIdentity: appliedIdentity,
+            backupPath: backup.path,
+            state: .verifying
+        )
         try await journal.upsert(record)
         let audit = AuditLogStore(fileURL: root.appendingPathComponent("audit.jsonl"))
         let engine = TransactionEngine(backupRoot: backupRoot, policy: PolicyEngine(), journal: journal, audit: audit)
@@ -2060,6 +2737,42 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(String(data: try Data(contentsOf: target), encoding: .utf8), "old")
         let persisted = await journal.record(transactionID)
         XCTAssertEqual(persisted?.state, .rolledBack)
+    }
+
+    func testInterruptedTransactionWithoutPersistedAppliedIdentityFailsClosed() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("config.plist")
+        try Data("old".utf8).write(to: target)
+        let secureMutation = SecureFileMutation()
+        let originalIdentity = try secureMutation.identity(of: target, allowedRoot: root)
+        let backupRoot = root.appendingPathComponent("backups", isDirectory: true)
+        let transactionID = UUID()
+        let backupDirectory = backupRoot.appendingPathComponent(transactionID.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
+        let backup = backupDirectory.appendingPathComponent(target.lastPathComponent)
+        try Data("old".utf8).write(to: backup)
+        try secureMutation.replaceFile(at: target, data: Data("new".utf8), allowedRoot: root, expectedTargetIdentity: originalIdentity)
+
+        let journal = TransactionJournal(fileURL: root.appendingPathComponent("transactions.json"))
+        let record = TransactionRecord(
+            id: transactionID,
+            sessionID: UUID(),
+            toolCallID: UUID(),
+            targetPath: target.path,
+            allowedRootPath: root.path,
+            originalIdentity: originalIdentity,
+            appliedIdentity: nil,
+            backupPath: backup.path,
+            state: .applying
+        )
+        try await journal.upsert(record)
+        let audit = AuditLogStore(fileURL: root.appendingPathComponent("audit.jsonl"))
+        let engine = TransactionEngine(backupRoot: backupRoot, policy: PolicyEngine(), journal: journal, audit: audit)
+        let recovered = try await engine.recoverInterruptedTransactions()
+        XCTAssertEqual(recovered.first?.state, .failed)
+        XCTAssertTrue(recovered.first?.failure?.contains("identity") == true)
+        XCTAssertEqual(String(data: try Data(contentsOf: target), encoding: .utf8), "new")
     }
 
     func testSessionStorePersistsFinalStateAcrossRestart() async throws {
@@ -2510,6 +3223,39 @@ private actor RecordingToolRoundProvider: ProviderStreaming {
 
     private func record(messages: [ChatMessage], tools: [ProviderToolSchema]) {
         recorded.append(Snapshot(messages: messages, tools: tools))
+    }
+}
+
+private final class MutationOnInvocation: @unchecked Sendable {
+    private let lock = NSLock()
+    private let trigger: Int
+    private let mutation: @Sendable () -> Void
+    private var count = 0
+
+    init(trigger: Int, mutation: @escaping @Sendable () -> Void) {
+        self.trigger = trigger
+        self.mutation = mutation
+    }
+
+    func invoke() {
+        lock.lock()
+        count += 1
+        let shouldMutate = count == trigger
+        lock.unlock()
+        if shouldMutate { mutation() }
+    }
+}
+
+private struct MutatingApprovalRequester: ApprovalRequesting, @unchecked Sendable {
+    let mutation: () -> Void
+
+    init(_ mutation: @escaping () -> Void) {
+        self.mutation = mutation
+    }
+
+    func requestApproval(_ preview: ApprovalPreview) async -> Bool {
+        mutation()
+        return true
     }
 }
 

@@ -63,20 +63,35 @@ public enum IPAServiceError: Error, Equatable {
 public struct IPAService: Sendable {
     public let maxMetadataEntryBytes: Int64
     public let maxExtractedBytes: UInt64
+    public let stagingRoot: URL
+    private let secureFileMutation: SecureFileMutation
 
-    public init(maxMetadataEntryBytes: Int64 = 64 * 1024 * 1024, maxExtractedBytes: UInt64 = 4 * 1024 * 1024 * 1024) {
+    public init(
+        maxMetadataEntryBytes: Int64 = 64 * 1024 * 1024,
+        maxExtractedBytes: UInt64 = 4 * 1024 * 1024 * 1024,
+        stagingRoot: URL? = nil,
+        secureFileMutation: SecureFileMutation = SecureFileMutation()
+    ) {
         self.maxMetadataEntryBytes = maxMetadataEntryBytes
         self.maxExtractedBytes = maxExtractedBytes
+        self.stagingRoot = stagingRoot ?? FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeIPAStaging", isDirectory: true)
+        self.secureFileMutation = secureFileMutation
     }
 
-    public func locate(root: URL, fileService: FileService = FileService()) throws -> [FileEntry] {
-        try fileService.search(root: root, query: FileSearchQuery(extensions: ["ipa"], maxDepth: 8, maxResults: 200))
-            .filter { !$0.isDirectory }
+    public func locate(root: URL, allowedRoot: URL? = nil, fileService: FileService = FileService()) throws -> [FileEntry] {
+        try fileService.search(
+            root: root,
+            query: FileSearchQuery(extensions: ["ipa"], maxDepth: 8, maxResults: 200),
+            allowedRoot: allowedRoot
+        ).filter { !$0.isDirectory }
     }
 
-    public func inspect(_ ipaURL: URL) throws -> IPAInspection {
+    public func inspect(_ ipaURL: URL, allowedRoot: URL? = nil) throws -> IPAInspection {
+        let pathGuard = PathGuard()
+        let safeIPA = try pathGuard.validate(target: ipaURL, allowedRoot: allowedRoot, rejectSymlink: true)
+        let initialIdentity = try secureFileMutation.identity(of: safeIPA, allowedRoot: allowedRoot)
         let archive: Archive
-        do { archive = try Archive(url: ipaURL, accessMode: .read) }
+        do { archive = try Archive(url: safeIPA, accessMode: .read) }
         catch { throw IPAServiceError.invalidArchive }
         let entries = Array(archive)
         for entry in entries { try validate(entry.path) }
@@ -139,8 +154,14 @@ public struct IPAService: Sendable {
         if entitlementXML == nil { warnings.append("Entitlements were not recoverable as embedded XML; DER-only entitlements require device/toolchain validation.") }
         if !hasSignature { warnings.append("No _CodeSignature directory found in archive.") }
 
+        let finalIPA = try pathGuard.validate(target: ipaURL, allowedRoot: allowedRoot, rejectSymlink: true)
+        guard finalIPA.path == safeIPA.path,
+              try secureFileMutation.identity(of: finalIPA, allowedRoot: allowedRoot) == initialIdentity else {
+            throw PathSafetyError.targetChangedAfterApproval
+        }
+
         return IPAInspection(
-            path: ipaURL.path,
+            path: safeIPA.path,
             bundleIdentifier: info["CFBundleIdentifier"] as? String,
             displayName: (info["CFBundleDisplayName"] as? String) ?? (info["CFBundleName"] as? String),
             version: info["CFBundleShortVersionString"] as? String,
@@ -158,84 +179,232 @@ public struct IPAService: Sendable {
         )
     }
 
-    public func extract(_ ipaURL: URL, to destination: URL) throws {
+    public func extract(
+        _ ipaURL: URL,
+        to destination: URL,
+        allowedRoot: URL? = nil,
+        expectedResolvedSource: URL? = nil,
+        expectedResolvedDestination: URL? = nil,
+        expectedSourceIdentity: SecureFileIdentity? = nil,
+        expectedDestinationParentIdentity: SecureFileIdentity? = nil
+    ) throws {
+        let fileManager = FileManager.default
+        let pathGuard = PathGuard()
+        let safeSource = try pathGuard.validate(target: ipaURL, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
+        let initialDestination = try pathGuard.validate(target: destination, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
+        if let expectedResolvedSource, safeSource.path != expectedResolvedSource.standardizedFileURL.path {
+            throw PathSafetyError.targetChangedAfterApproval
+        }
+        if let expectedResolvedDestination, initialDestination.path != expectedResolvedDestination.standardizedFileURL.path {
+            throw PathSafetyError.targetChangedAfterApproval
+        }
+        let currentSourceIdentity = try secureFileMutation.identity(of: safeSource, allowedRoot: allowedRoot)
+        if let expectedSourceIdentity, currentSourceIdentity != expectedSourceIdentity {
+            throw PathSafetyError.targetChangedAfterApproval
+        }
+        if fileManager.fileExists(atPath: initialDestination.path) { throw IPAServiceError.destinationExists }
+
+        let finalSource = try pathGuard.validate(target: ipaURL, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
+        let finalDestination = try pathGuard.validate(target: destination, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
+        guard finalSource.path == safeSource.path, finalDestination.path == initialDestination.path else {
+            throw PathSafetyError.targetChangedAfterApproval
+        }
+
+        let operationRoot = try makeOperationRoot(prefix: "extract")
+        let stagedArchive = operationRoot.appendingPathComponent("input.ipa")
+        let stagedOutput = operationRoot.appendingPathComponent("output", isDirectory: true)
+        defer { try? fileManager.removeItem(at: operationRoot) }
+
+        try secureFileMutation.copyFile(
+            from: finalSource,
+            sourceAllowedRoot: allowedRoot,
+            to: stagedArchive,
+            destinationAllowedRoot: stagingRoot,
+            createDestinationIntermediates: true,
+            expectedSourceIdentity: currentSourceIdentity
+        )
+
         let archive: Archive
-        do { archive = try Archive(url: ipaURL, accessMode: .read) }
+        do { archive = try Archive(url: stagedArchive, accessMode: .read) }
         catch { throw IPAServiceError.invalidArchive }
-        if FileManager.default.fileExists(atPath: destination.path) { throw IPAServiceError.destinationExists }
 
         let entries = Array(archive)
         var total: UInt64 = 0
         for entry in entries {
             try validate(entry.path)
+            if entry.type == .symlink { throw IPAServiceError.unsafeEntry(entry.path) }
             let (next, overflow) = total.addingReportingOverflow(UInt64(entry.uncompressedSize))
             guard !overflow, next <= maxExtractedBytes else { throw IPAServiceError.archiveTooLarge }
             total = next
         }
 
-        let fileManager = FileManager.default
-        let staging = destination.deletingLastPathComponent().appendingPathComponent(".\(destination.lastPathComponent).cloudcode-extract-staging", isDirectory: true)
-        if fileManager.fileExists(atPath: staging.path) { try fileManager.removeItem(at: staging) }
-        try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
-        do {
-            let safeRoot = staging.standardizedFileURL
-            let prefix = safeRoot.path.hasSuffix("/") ? safeRoot.path : safeRoot.path + "/"
-            for entry in entries {
-                let target = safeRoot.appendingPathComponent(entry.path).standardizedFileURL
-                guard target.path == safeRoot.path || target.path.hasPrefix(prefix) else { throw IPAServiceError.unsafeEntry(entry.path) }
-                _ = try archive.extract(entry, to: target)
+        try fileManager.createDirectory(at: stagedOutput, withIntermediateDirectories: true)
+        let prefix = stagedOutput.path.hasSuffix("/") ? stagedOutput.path : stagedOutput.path + "/"
+        for entry in entries {
+            let target = stagedOutput.appendingPathComponent(entry.path).standardizedFileURL
+            guard target.path == stagedOutput.path || target.path.hasPrefix(prefix) else {
+                throw IPAServiceError.unsafeEntry(entry.path)
             }
-            try fileManager.moveItem(at: staging, to: destination)
-        } catch {
-            try? fileManager.removeItem(at: staging)
-            throw error
+            _ = try archive.extract(entry, to: target)
         }
+
+        let moveDestination = try pathGuard.validate(target: destination, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
+        guard moveDestination.path == finalDestination.path else { throw PathSafetyError.targetChangedAfterApproval }
+        try secureFileMutation.moveItem(
+            from: stagedOutput,
+            sourceAllowedRoot: stagingRoot,
+            to: moveDestination,
+            destinationAllowedRoot: allowedRoot,
+            createDestinationIntermediates: true,
+            expectedDestinationParentIdentity: expectedDestinationParentIdentity
+        )
     }
 
-    public func repack(sourceRoot: URL, to destination: URL) throws {
+    public func repack(
+        sourceRoot: URL,
+        to destination: URL,
+        allowedRoot: URL? = nil,
+        expectedResolvedSource: URL? = nil,
+        expectedResolvedDestination: URL? = nil,
+        expectedSourceIdentity: SecureFileIdentity? = nil,
+        expectedDestinationParentIdentity: SecureFileIdentity? = nil
+    ) throws {
         let fileManager = FileManager.default
-        guard fileManager.directoryExists(at: sourceRoot),
-              fileManager.directoryExists(at: sourceRoot.appendingPathComponent("Payload", isDirectory: true)) else {
+        let pathGuard = PathGuard()
+        let initialSource = try pathGuard.validate(target: sourceRoot, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
+        let initialDestination = try pathGuard.validate(target: destination, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
+        if let expectedResolvedSource, initialSource.path != expectedResolvedSource.standardizedFileURL.path {
+            throw PathSafetyError.targetChangedAfterApproval
+        }
+        if let expectedResolvedDestination, initialDestination.path != expectedResolvedDestination.standardizedFileURL.path {
+            throw PathSafetyError.targetChangedAfterApproval
+        }
+        let currentSourceIdentity = try secureFileMutation.identity(of: initialSource, allowedRoot: allowedRoot)
+        if let expectedSourceIdentity, currentSourceIdentity != expectedSourceIdentity {
+            throw PathSafetyError.targetChangedAfterApproval
+        }
+        guard fileManager.directoryExists(at: initialSource) else { throw IPAServiceError.invalidRepackSource }
+        if fileManager.fileExists(atPath: initialDestination.path) { throw IPAServiceError.destinationExists }
+
+        let finalSource = try pathGuard.validate(target: sourceRoot, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
+        let finalDestination = try pathGuard.validate(target: destination, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
+        guard finalSource.path == initialSource.path, finalDestination.path == initialDestination.path else {
+            throw PathSafetyError.targetChangedAfterApproval
+        }
+
+        let operationRoot = try makeOperationRoot(prefix: "repack")
+        let snapshotRoot = operationRoot.appendingPathComponent("snapshot", isDirectory: true)
+        let stagedArchive = operationRoot.appendingPathComponent("output.ipa")
+        defer { try? fileManager.removeItem(at: operationRoot) }
+
+        try fileManager.createDirectory(at: snapshotRoot, withIntermediateDirectories: true)
+        try snapshotSourceTree(
+            from: finalSource,
+            to: snapshotRoot,
+            allowedRoot: allowedRoot,
+            expectedSourceIdentity: currentSourceIdentity
+        )
+        guard fileManager.directoryExists(at: snapshotRoot.appendingPathComponent("Payload", isDirectory: true)) else {
             throw IPAServiceError.invalidRepackSource
         }
-        if fileManager.fileExists(atPath: destination.path) { throw IPAServiceError.destinationExists }
-        try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
 
-        let root = sourceRoot.standardizedFileURL.resolvingSymlinksInPath()
-        let staging = destination.deletingLastPathComponent().appendingPathComponent(".\(destination.lastPathComponent).cloudcode-repack-staging")
-        if fileManager.fileExists(atPath: staging.path) { try fileManager.removeItem(at: staging) }
-        do {
-            let archive: Archive
-            do { archive = try Archive(url: staging, accessMode: .create) }
-            catch { throw IPAServiceError.invalidArchive }
-            guard let enumerator = fileManager.enumerator(
-                at: root,
-                includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey],
-                options: []
-            ) else { throw IPAServiceError.invalidRepackSource }
+        let archive: Archive
+        do { archive = try Archive(url: stagedArchive, accessMode: .create) }
+        catch { throw IPAServiceError.invalidArchive }
+        guard let enumerator = fileManager.enumerator(
+            at: snapshotRoot,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey],
+            options: []
+        ) else { throw IPAServiceError.invalidRepackSource }
 
-            let rootPrefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
-            for case let item as URL in enumerator {
-                let values = try item.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey])
-                if values.isSymbolicLink == true { throw IPAServiceError.unsafeEntry(item.path) }
-                let resolvedItem = item.standardizedFileURL.resolvingSymlinksInPath()
-                guard resolvedItem.path.hasPrefix(rootPrefix) else { throw IPAServiceError.unsafeEntry(item.path) }
-                let relative = String(resolvedItem.path.dropFirst(rootPrefix.count))
-                guard !relative.isEmpty else { continue }
-                try validate(relative)
-                if values.isRegularFile == true {
-                    try archive.addEntry(with: relative, fileURL: resolvedItem, compressionMethod: .deflate)
-                }
+        let snapshotPrefix = snapshotRoot.path.hasSuffix("/") ? snapshotRoot.path : snapshotRoot.path + "/"
+        for case let item as URL in enumerator {
+            let values = try item.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey])
+            if values.isSymbolicLink == true { throw IPAServiceError.unsafeEntry(item.path) }
+            let lexicalItem = item.standardizedFileURL
+            guard lexicalItem.path.hasPrefix(snapshotPrefix) else { throw IPAServiceError.unsafeEntry(item.path) }
+            let relative = String(lexicalItem.path.dropFirst(snapshotPrefix.count))
+            guard !relative.isEmpty else { continue }
+            try validate(relative)
+            if values.isRegularFile == true {
+                try archive.addEntry(with: relative, fileURL: lexicalItem, compressionMethod: .deflate)
             }
-        } catch {
-            try? fileManager.removeItem(at: staging)
-            throw error
         }
-        do {
-            try fileManager.moveItem(at: staging, to: destination)
-        } catch {
-            try? fileManager.removeItem(at: staging)
-            throw error
+
+        let moveDestination = try pathGuard.validate(target: destination, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
+        guard moveDestination.path == finalDestination.path else { throw PathSafetyError.targetChangedAfterApproval }
+        try secureFileMutation.moveItem(
+            from: stagedArchive,
+            sourceAllowedRoot: stagingRoot,
+            to: moveDestination,
+            destinationAllowedRoot: allowedRoot,
+            createDestinationIntermediates: true,
+            expectedDestinationParentIdentity: expectedDestinationParentIdentity
+        )
+    }
+
+    private func makeOperationRoot(prefix: String) throws -> URL {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
+        let operationRoot = stagingRoot.appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: operationRoot, withIntermediateDirectories: false)
+        return operationRoot
+    }
+
+    private func snapshotSourceTree(
+        from sourceRoot: URL,
+        to snapshotRoot: URL,
+        allowedRoot: URL?,
+        expectedSourceIdentity: SecureFileIdentity
+    ) throws {
+        let fileManager = FileManager.default
+        guard try secureFileMutation.identity(of: sourceRoot, allowedRoot: allowedRoot) == expectedSourceIdentity else {
+            throw PathSafetyError.targetChangedAfterApproval
+        }
+        guard let enumerator = fileManager.enumerator(
+            at: sourceRoot,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey],
+            options: []
+        ) else { throw IPAServiceError.invalidRepackSource }
+
+        let sourcePrefix = sourceRoot.path.hasSuffix("/") ? sourceRoot.path : sourceRoot.path + "/"
+        for case let item as URL in enumerator {
+            guard try secureFileMutation.identity(of: sourceRoot, allowedRoot: allowedRoot) == expectedSourceIdentity else {
+                throw PathSafetyError.targetChangedAfterApproval
+            }
+            let values = try item.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey])
+            if values.isSymbolicLink == true {
+                if values.isDirectory == true { enumerator.skipDescendants() }
+                throw IPAServiceError.unsafeEntry(item.path)
+            }
+
+            let lexicalItem = item.standardizedFileURL
+            guard lexicalItem.path.hasPrefix(sourcePrefix) else { throw IPAServiceError.unsafeEntry(item.path) }
+            let relative = String(lexicalItem.path.dropFirst(sourcePrefix.count))
+            guard !relative.isEmpty else { continue }
+            try validate(relative)
+            let snapshotTarget = snapshotRoot.appendingPathComponent(relative)
+
+            if values.isDirectory == true {
+                try fileManager.createDirectory(at: snapshotTarget, withIntermediateDirectories: true)
+            } else if values.isRegularFile == true {
+                try fileManager.createDirectory(at: snapshotTarget.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try secureFileMutation.copyFile(
+                    from: lexicalItem,
+                    sourceAllowedRoot: allowedRoot,
+                    to: snapshotTarget,
+                    destinationAllowedRoot: stagingRoot,
+                    createDestinationIntermediates: true
+                )
+            } else {
+                throw IPAServiceError.unsafeEntry(item.path)
+            }
+        }
+
+        let finalSource = try PathGuard().validate(target: sourceRoot, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
+        guard finalSource.path == sourceRoot.path,
+              try secureFileMutation.identity(of: finalSource, allowedRoot: allowedRoot) == expectedSourceIdentity else {
+            throw PathSafetyError.targetChangedAfterApproval
         }
     }
 

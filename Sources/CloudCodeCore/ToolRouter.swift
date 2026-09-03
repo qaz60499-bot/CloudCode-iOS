@@ -24,6 +24,24 @@ public enum ToolRouterError: Error, Equatable {
     case noExecutionRoute(String)
 }
 
+public enum GUIApprovalTargetSanitizer {
+    /// Builds approval text without ever embedding gui.type input contents.
+    public static func target(for call: ToolCall) -> String {
+        switch call.name {
+        case "gui.openApp":
+            return call.arguments["bundleId"] ?? "当前前台 App"
+        case "gui.type":
+            let count = call.arguments["text"]?.count ?? 0
+            return "当前前台 App · 输入 \(count) 个字符（内容已隐藏）"
+        case "gui.tap": return "当前前台 App · tap"
+        case "gui.scroll": return "当前前台 App · scroll"
+        case "gui.swipe": return "当前前台 App · swipe"
+        case "gui.verify": return "当前 GUI 会话 · verify"
+        default: return "当前 GUI 会话"
+        }
+    }
+}
+
 public actor ToolRegistry {
     private var descriptors: [String: ToolDescriptor]
 

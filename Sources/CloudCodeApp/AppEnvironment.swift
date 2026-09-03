@@ -48,6 +48,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private let toolRegistry: ToolRegistry
     private let fileService: FileService
     private let trashService: TrashService
+    private let policyEngine: PolicyEngine
     private let auditStore: AuditLogStore
     private let diagnosticLogStore: DiagnosticLogStore
     private let diagnosticBundleExporter: DiagnosticBundleExporter
@@ -175,6 +176,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.toolRegistry = registry
         self.fileService = fileService
         self.trashService = trash
+        self.policyEngine = policy
         self.auditStore = audit
         self.diagnosticLogStore = diagnosticLogStore
         self.diagnosticBundleExporter = DiagnosticBundleExporter(logStore: diagnosticLogStore)
@@ -910,6 +912,18 @@ public final class CloudCodeViewModel: ObservableObject {
                     $0.sessionID == checkpoint.sessionID && $0.backupPath != nil && $0.state == .committed
                 })
                 guard let transaction = candidate else { throw TransactionError.noBackup }
+                let descriptor = ToolDescriptor(name: "files.modify", summary: "Rollback a committed file transaction.", risk: .sensitiveWrite)
+                let decision = policyEngine.decision(mode: permissionMode, tool: descriptor, targetPath: transaction.targetPath)
+                if decision == .requireConfirmation {
+                    let preview = ApprovalPreview(
+                        title: "回滚已提交事务",
+                        target: transaction.targetPath,
+                        reason: "回滚会把文件恢复为事务前的内容。",
+                        plan: ["验证事务备份", "确认当前目标身份", "原子恢复备份", "验证恢复后的字节"],
+                        risk: descriptor.risk
+                    )
+                    guard await approvalCenter.requestApproval(preview) else { return }
+                }
                 _ = try await transactionEngine.rollback(transactionID: transaction.id)
                 try await checkpointStore.mark(checkpoint.id, state: "rolled_back", stepName: "最近一次已提交事务已回滚")
                 await reloadActivity()
@@ -1188,7 +1202,38 @@ public final class CloudCodeViewModel: ObservableObject {
         Task {
             defer { endExclusiveOperation(key) }
             do {
-                let restored = try await trashService.restore(record.id)
+                let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted")
+                    ? nil
+                    : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                let target = URL(fileURLWithPath: record.originalPath)
+                let approvedTarget = try PathGuard().validate(
+                    target: target,
+                    allowedRoot: allowedRoot,
+                    rejectSymlink: true
+                )
+                let secureMutation = SecureFileMutation()
+                let approvedParentIdentity = try? secureMutation.parentIdentity(of: approvedTarget, allowedRoot: allowedRoot)
+                let descriptor = ToolDescriptor(name: "trash.restore", summary: "Restore a Cloud Code Trash record.", risk: .safeWrite)
+                let decision = policyEngine.decision(mode: permissionMode, tool: descriptor, targetPath: approvedTarget.path)
+                if decision == .requireConfirmation {
+                    let preview = ApprovalPreview(
+                        title: "恢复回收站项目",
+                        target: approvedTarget.path,
+                        originalSummary: "\(record.size) 字节",
+                        reason: "恢复会写回原始路径。",
+                        plan: ["验证原始路径", "确认目标目录身份", "恢复内容", "验证内容指纹"],
+                        risk: descriptor.risk
+                    )
+                    guard await approvalCenter.requestApproval(preview) else { return }
+                }
+                let finalTarget = try PathGuard().validate(target: target, allowedRoot: allowedRoot, rejectSymlink: true)
+                guard finalTarget.path == approvedTarget.path else { throw PathSafetyError.targetChangedAfterApproval }
+                let restored = try await trashService.restore(
+                    record.id,
+                    allowedRoot: allowedRoot,
+                    expectedResolvedTarget: approvedTarget,
+                    expectedDestinationParentIdentity: approvedParentIdentity
+                )
                 guard await trashService.verifyRestored(restored) else {
                     throw CocoaError(.fileReadCorruptFile)
                 }

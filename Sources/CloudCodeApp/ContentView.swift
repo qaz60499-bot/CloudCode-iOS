@@ -1443,7 +1443,7 @@ private func localizedCapabilityDetail(_ id: String, detail: String) -> String {
     switch id {
     case "filesystem.own_container": return "检测当前 App 主目录是否可读写。"
     case "filesystem.shared_user_files": return "检测用户媒体目录的读取权限；实际范围取决于当前签名权限和设备。"
-    case "filesystem.unrestricted": return "保守检测 /var/mobile 等扩展目录访问；可访问不等于具有 root 身份。"
+    case "filesystem.unrestricted": return "保守验证 /var/mobile 范围的实际读写能力；通过也不等于具有 root 身份。"
     case "apps.enumerate":
         if detail.contains("verified") || detail.contains("返回") {
             let count = detail.split(separator: " ").first(where: { Int($0) != nil }).map(String.init) ?? "若干"

@@ -1104,15 +1104,23 @@ public enum ProviderHTTPClassifier {
 }
 
 public enum ProviderKeyRotationClassifier {
+    /// Key failover is only consulted before any token/tool output was emitted.
+    /// It covers credential/capacity failures and transient upstream failures after the
+    /// per-key retry budget has already been exhausted. Once output exists the router never
+    /// rotates or replays the request.
     public static func shouldRotate(_ error: Error) -> Bool {
-        guard let providerError = error as? ProviderError else { return false }
-        switch providerError {
-        case .authenticationFailed, .capacityExhausted:
-            return true
-        case .missingAPIKey, .invalidEndpoint, .rateLimited, .invalidResponse, .malformedEvent, .streamInterrupted,
-             .attachmentUnavailable, .attachmentTooLarge, .unsupportedAttachmentType, .transport:
-            return false
+        if let providerError = error as? ProviderError {
+            switch providerError {
+            case .authenticationFailed, .capacityExhausted:
+                return true
+            case .invalidResponse(let code):
+                return (500...599).contains(code)
+            case .missingAPIKey, .invalidEndpoint, .rateLimited, .malformedEvent, .streamInterrupted,
+                 .attachmentUnavailable, .attachmentTooLarge, .unsupportedAttachmentType, .transport:
+                return false
+            }
         }
+        return ProviderRetryClassifier.isRetryableBeforeOutput(error)
     }
 }
 

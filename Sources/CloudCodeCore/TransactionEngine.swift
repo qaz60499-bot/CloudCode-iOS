@@ -113,6 +113,7 @@ public actor TransactionEngine {
     private let audit: AuditLogStore
     private let fileManager: FileManager
     private let diffEngine: TextDiff
+    private let secureFileMutation: SecureFileMutation
 
     public init(
         backupRoot: URL,
@@ -121,7 +122,8 @@ public actor TransactionEngine {
         audit: AuditLogStore,
         fileManager: FileManager = .default,
         pathGuard: PathGuard = PathGuard(),
-        diffEngine: TextDiff = TextDiff()
+        diffEngine: TextDiff = TextDiff(),
+        secureFileMutation: SecureFileMutation = SecureFileMutation()
     ) {
         self.backupRoot = backupRoot
         self.policy = policy
@@ -130,6 +132,7 @@ public actor TransactionEngine {
         self.fileManager = fileManager
         self.pathGuard = pathGuard
         self.diffEngine = diffEngine
+        self.secureFileMutation = secureFileMutation
     }
 
     public func replaceFile(
@@ -146,12 +149,20 @@ public actor TransactionEngine {
     ) async throws -> TransactionRecord {
         let safeTarget = try pathGuard.validate(target: target, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
         let initialIdentity = try identity(of: safeTarget)
+        let initialSecureIdentity = try secureFileMutation.identity(of: safeTarget, allowedRoot: allowedRoot)
         let originalData = try Data(contentsOf: safeTarget, options: [.mappedIfSafe])
         let originalText = String(data: originalData, encoding: .utf8)
         let proposedText = String(data: proposedData, encoding: .utf8)
         let diff = (originalText != nil && proposedText != nil) ? diffEngine.make(old: originalText!, new: proposedText!) : "二进制替换：\(originalData.count) 字节 → \(proposedData.count) 字节"
 
-        var transaction = TransactionRecord(sessionID: sessionID, toolCallID: toolCallID, targetPath: safeTarget.path, diff: diff)
+        var transaction = TransactionRecord(
+            sessionID: sessionID,
+            toolCallID: toolCallID,
+            targetPath: safeTarget.path,
+            allowedRootPath: allowedRoot?.standardizedFileURL.resolvingSymlinksInPath().path ?? "/",
+            originalIdentity: initialSecureIdentity,
+            diff: diff
+        )
         try await journal.upsert(transaction)
 
         let decision = policy.decision(mode: mode, tool: tool, targetPath: safeTarget.path)
@@ -179,7 +190,8 @@ public actor TransactionEngine {
         }
 
         let currentIdentity = try identity(of: safeTarget)
-        guard currentIdentity == initialIdentity else {
+        let currentSecureIdentity = try secureFileMutation.identity(of: safeTarget, allowedRoot: allowedRoot)
+        guard currentIdentity == initialIdentity, currentSecureIdentity == initialSecureIdentity else {
             transaction.state = .failed
             transaction.failure = TransactionError.targetChangedDuringApproval.description
             transaction.finishedAt = Date()
@@ -191,7 +203,14 @@ public actor TransactionEngine {
         let backupDirectory = backupRoot.appendingPathComponent(transaction.id.uuidString, isDirectory: true)
         try fileManager.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
         let backupURL = backupDirectory.appendingPathComponent(safeTarget.lastPathComponent)
-        try fileManager.copyItem(at: safeTarget, to: backupURL)
+        try secureFileMutation.copyFile(
+            from: safeTarget,
+            sourceAllowedRoot: allowedRoot,
+            to: backupURL,
+            destinationAllowedRoot: backupRoot,
+            createDestinationIntermediates: true,
+            expectedSourceIdentity: initialSecureIdentity
+        )
         transaction.backupPath = backupURL.path
         transaction.state = .backedUp
         try await journal.upsert(transaction)
@@ -199,11 +218,15 @@ public actor TransactionEngine {
         do {
             transaction.state = .applying
             try await journal.upsert(transaction)
-            let tempURL = safeTarget.deletingLastPathComponent().appendingPathComponent(".cloudcode-\(UUID().uuidString).tmp")
-            try proposedData.write(to: tempURL, options: [.atomic])
-            _ = try pathGuard.validate(target: safeTarget, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
-            _ = try fileManager.replaceItemAt(safeTarget, withItemAt: tempURL, backupItemName: nil, options: [])
-
+            let finalTarget = try pathGuard.validate(target: target, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
+            guard finalTarget.path == safeTarget.path else { throw TransactionError.targetChangedDuringApproval }
+            try secureFileMutation.replaceFile(
+                at: finalTarget,
+                data: proposedData,
+                allowedRoot: allowedRoot,
+                expectedTargetIdentity: initialSecureIdentity
+            )
+            transaction.appliedIdentity = try secureFileMutation.identity(of: finalTarget, allowedRoot: allowedRoot)
             transaction.state = .verifying
             try await journal.upsert(transaction)
             let verification = try await verify(safeTarget)
@@ -217,13 +240,22 @@ public actor TransactionEngine {
             try await audit.append(AuditEvent(sessionID: sessionID, toolCallID: toolCallID, action: tool.name, target: safeTarget.path, risk: tool.risk, result: "committed", detail: ["transactionID": transaction.id.uuidString]))
             return transaction
         } catch {
-            try? restoreBackup(transaction: transaction, target: safeTarget)
-            transaction.state = .rolledBack
-            transaction.failure = String(describing: error)
-            transaction.finishedAt = Date()
-            try await journal.upsert(transaction)
-            try? await audit.append(AuditEvent(sessionID: sessionID, toolCallID: toolCallID, action: tool.name, target: safeTarget.path, risk: tool.risk, result: "rolled_back", detail: ["error": String(describing: error)]))
-            throw error
+            let applyError = error
+            do {
+                try restoreBackup(transaction: transaction, target: safeTarget, allowedRoot: allowedRoot)
+                transaction.state = .rolledBack
+                transaction.failure = String(describing: applyError)
+                transaction.finishedAt = Date()
+                try await journal.upsert(transaction)
+                try? await audit.append(AuditEvent(sessionID: sessionID, toolCallID: toolCallID, action: tool.name, target: safeTarget.path, risk: tool.risk, result: "rolled_back", detail: ["error": String(describing: applyError)]))
+            } catch {
+                transaction.state = .failed
+                transaction.failure = "Apply failed: \(applyError); rollback failed: \(error)"
+                transaction.finishedAt = Date()
+                try await journal.upsert(transaction)
+                try? await audit.append(AuditEvent(sessionID: sessionID, toolCallID: toolCallID, action: tool.name, target: safeTarget.path, risk: tool.risk, result: "rollback_failed", detail: ["applyError": String(describing: applyError), "rollbackError": String(describing: error)]))
+            }
+            throw applyError
         }
     }
 
@@ -251,20 +283,37 @@ public actor TransactionEngine {
                 recovered.append(transaction)
             case .backedUp, .applying, .verifying:
                 guard transaction.backupPath != nil else { continue }
-                try restoreBackup(transaction: transaction, target: target)
-                transaction.state = .rolledBack
-                transaction.failure = "Recovered after interrupted transaction"
-                transaction.finishedAt = Date()
-                try await journal.upsert(transaction)
-                try await audit.append(AuditEvent(
-                    sessionID: transaction.sessionID,
-                    toolCallID: transaction.toolCallID,
-                    action: "transaction.recover",
-                    target: target.path,
-                    risk: .sensitiveWrite,
-                    result: "rolled_back_after_restart",
-                    detail: ["transactionID": transaction.id.uuidString]
-                ))
+                let transactionAllowedRoot = transaction.allowedRootPath.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                do {
+                    try restoreBackup(transaction: transaction, target: target, allowedRoot: transactionAllowedRoot)
+                    transaction.state = .rolledBack
+                    transaction.failure = "Recovered after interrupted transaction"
+                    transaction.finishedAt = Date()
+                    try await journal.upsert(transaction)
+                    try await audit.append(AuditEvent(
+                        sessionID: transaction.sessionID,
+                        toolCallID: transaction.toolCallID,
+                        action: "transaction.recover",
+                        target: target.path,
+                        risk: .sensitiveWrite,
+                        result: "rolled_back_after_restart",
+                        detail: ["transactionID": transaction.id.uuidString]
+                    ))
+                } catch {
+                    transaction.state = .failed
+                    transaction.failure = "Recovery blocked because target identity could not be proven: \(error)"
+                    transaction.finishedAt = Date()
+                    try await journal.upsert(transaction)
+                    try await audit.append(AuditEvent(
+                        sessionID: transaction.sessionID,
+                        toolCallID: transaction.toolCallID,
+                        action: "transaction.recover",
+                        target: target.path,
+                        risk: .sensitiveWrite,
+                        result: "recovery_identity_uncertain",
+                        detail: ["transactionID": transaction.id.uuidString, "error": String(describing: error)]
+                    ))
+                }
                 recovered.append(transaction)
             case .committed, .rolledBack, .failed:
                 continue
@@ -278,7 +327,8 @@ public actor TransactionEngine {
         guard var transaction = await journal.record(transactionID) else { throw TransactionError.noBackup }
         if transaction.state == .rolledBack { return transaction }
         let target = URL(fileURLWithPath: transaction.targetPath)
-        try restoreBackup(transaction: transaction, target: target)
+        let transactionAllowedRoot = transaction.allowedRootPath.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        try restoreBackup(transaction: transaction, target: target, allowedRoot: transactionAllowedRoot)
         transaction.state = .rolledBack
         transaction.finishedAt = Date()
         try await journal.upsert(transaction)
@@ -286,23 +336,44 @@ public actor TransactionEngine {
         return transaction
     }
 
-    private func restoreBackup(transaction: TransactionRecord, target: URL) throws {
-        guard let backupPath = transaction.backupPath else { throw TransactionError.noBackup }
+    private func restoreBackup(transaction: TransactionRecord, target: URL, allowedRoot: URL?) throws {
+        guard transaction.allowedRootPath != nil,
+              let originalIdentity = transaction.originalIdentity,
+              let backupPath = transaction.backupPath else {
+            throw TransactionError.targetChangedDuringApproval
+        }
         let backupURL = URL(fileURLWithPath: backupPath)
         guard fileManager.fileExists(atPath: backupURL.path) else { throw TransactionError.noBackup }
         let safeBackup = try pathGuard.validate(target: backupURL, allowedRoot: backupRoot, rejectSymlink: true, fileManager: fileManager)
-        let safeTarget = try pathGuard.validate(target: target, rejectSymlink: true, fileManager: fileManager)
-        let temporary = safeTarget.deletingLastPathComponent().appendingPathComponent(".cloudcode-rollback-\(UUID().uuidString).tmp")
-        try fileManager.copyItem(at: safeBackup, to: temporary)
-        do {
-            if fileManager.fileExists(atPath: safeTarget.path) {
-                _ = try fileManager.replaceItemAt(safeTarget, withItemAt: temporary, backupItemName: nil, options: [])
-            } else {
-                try fileManager.moveItem(at: temporary, to: safeTarget)
-            }
-        } catch {
-            try? fileManager.removeItem(at: temporary)
-            throw error
+        let backupIdentity = try secureFileMutation.identity(of: safeBackup, allowedRoot: backupRoot)
+        let backupData = try secureFileMutation.readFile(at: safeBackup, allowedRoot: backupRoot, expectedIdentity: backupIdentity)
+        let safeTarget = try pathGuard.validate(target: target, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
+        guard safeTarget.path == transaction.targetPath,
+              fileManager.fileExists(atPath: safeTarget.path) else {
+            throw TransactionError.targetChangedDuringApproval
+        }
+
+        let currentIdentity = try secureFileMutation.identity(of: safeTarget, allowedRoot: allowedRoot)
+        if currentIdentity == originalIdentity {
+            return
+        }
+        guard let appliedIdentity = transaction.appliedIdentity,
+              currentIdentity == appliedIdentity else {
+            throw TransactionError.targetChangedDuringApproval
+        }
+        try secureFileMutation.replaceFile(
+            at: safeTarget,
+            data: backupData,
+            allowedRoot: allowedRoot,
+            expectedTargetIdentity: appliedIdentity
+        )
+        let restoredIdentity = try secureFileMutation.identity(of: safeTarget, allowedRoot: allowedRoot)
+        guard restoredIdentity != appliedIdentity else {
+            throw TransactionError.verificationFailed("Rollback did not replace the applied inode")
+        }
+        let restoredData = try secureFileMutation.readFile(at: safeTarget, allowedRoot: allowedRoot, expectedIdentity: restoredIdentity)
+        guard restoredData == backupData else {
+            throw TransactionError.verificationFailed("Rollback bytes do not match the persisted backup")
         }
     }
 

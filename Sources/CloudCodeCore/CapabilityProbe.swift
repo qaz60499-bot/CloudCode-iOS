@@ -41,7 +41,7 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
 
         let mobileRoot = URL(fileURLWithPath: "/var/mobile", isDirectory: true)
         records.append(record("filesystem.unrestricted", .filesystem, unrestrictedFilesystemProbe(root: mobileRoot) ? .available : .unavailable,
-                              "Conservative direct filesystem probe. This does not imply root identity."))
+                              "Conservative direct read/write probe outside the app container. This does not imply root identity."))
 
         let apps = await appResolver.installedApps()
         let ownBundle = Bundle.main.bundleIdentifier ?? ""
@@ -200,7 +200,19 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
     private func unrestrictedFilesystemProbe(root: URL) -> Bool {
         guard fileManager.isReadableFile(atPath: root.path) else { return false }
         let sensitiveProbe = root.appendingPathComponent("Library/Preferences", isDirectory: true)
-        return fileManager.isReadableFile(atPath: sensitiveProbe.path)
+        guard fileManager.isReadableFile(atPath: sensitiveProbe.path), fileManager.isWritableFile(atPath: sensitiveProbe.path) else { return false }
+
+        let canary = sensitiveProbe.appendingPathComponent(".cloudcode-capability-\(UUID().uuidString)")
+        let bytes = Data([0x43, 0x43, 0x50, 0x52])
+        do {
+            try bytes.write(to: canary, options: [.atomic, .withoutOverwriting])
+            defer { try? fileManager.removeItem(at: canary) }
+            let actual = try Data(contentsOf: canary)
+            return actual == bytes
+        } catch {
+            try? fileManager.removeItem(at: canary)
+            return false
+        }
     }
 
     private static func probeOwnKeychain() -> (status: CapabilityStatus, detail: String) {

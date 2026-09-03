@@ -925,13 +925,40 @@ public struct GUIFallbackExecutor: ToolExecuting, Sendable {
     }
 
     public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
+        switch call.name {
+        case "gui.openApp":
+            guard let bundle = call.arguments["bundleId"], !bundle.isEmpty else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
+        case "gui.tree", "gui.screenshot":
+            break
+        case "gui.tap":
+            guard Double(call.arguments["x"] ?? "") != nil, Double(call.arguments["y"] ?? "") != nil else {
+                throw ToolRouterError.noExecutionRoute("tap coordinates missing or invalid")
+            }
+        case "gui.type":
+            guard call.arguments["text"] != nil else { throw ToolRouterError.noExecutionRoute("text missing") }
+        case "gui.scroll":
+            guard Double(call.arguments["dx"] ?? "") != nil, Double(call.arguments["dy"] ?? "") != nil else {
+                throw ToolRouterError.noExecutionRoute("scroll delta missing or invalid")
+            }
+        case "gui.swipe":
+            let keys = ["fromX", "fromY", "toX", "toY"]
+            guard keys.allSatisfy({ Double(call.arguments[$0] ?? "") != nil }) else {
+                throw ToolRouterError.noExecutionRoute("swipe coordinates missing or invalid")
+            }
+        case "gui.verify":
+            guard call.arguments["assertion"] != nil else { throw ToolRouterError.noExecutionRoute("assertion missing") }
+        default:
+            throw ToolRouterError.noExecutionRoute(call.name)
+        }
+        let approvalTarget = GUIApprovalTargetSanitizer.target(for: call)
+
         let decision = policy.decision(mode: context.permissionMode, tool: descriptor)
         if decision == .requireConfirmation {
             let preview = ApprovalPreview(
                 title: "执行 GUI 操作",
-                target: call.arguments["bundleId"] ?? call.name,
+                target: approvalTarget,
                 reason: "GUI 写入可能影响前台 App 状态或输入敏感内容。",
-                plan: ["确认操作类型", "执行受限 GUI 动作", "按需验证界面状态"],
+                plan: ["验证操作参数", "确认操作类型", "执行受限 GUI 动作", "按需验证界面状态"],
                 risk: descriptor.risk
             )
             guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }

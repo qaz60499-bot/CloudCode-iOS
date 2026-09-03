@@ -42,22 +42,23 @@ public enum HomeOSCapabilityLayer {
             }
         }
         func status(_ id: String) -> CapabilityStatus { map[id] ?? .unknown }
-        func strongest(_ candidates: [CapabilityStatus]) -> CapabilityStatus {
-            if candidates.contains(.available) { return .available }
+        func allRequired(_ candidates: [CapabilityStatus]) -> CapabilityStatus {
+            guard !candidates.isEmpty else { return .unavailable }
+            if candidates.allSatisfy({ $0 == .available }) { return .available }
             if candidates.contains(.deviceValidationRequired) { return .deviceValidationRequired }
             if candidates.contains(.unknown) { return .unknown }
             return .unavailable
         }
         return [
-            .init(id: .file, status: strongest([status("filesystem.unrestricted"), status("filesystem.own_container")]), detail: "FileService/TransactionEngine backing; allowedRoot remains authoritative.", backingCapabilities: ["filesystem.unrestricted", "filesystem.own_container"]),
-            .init(id: .app, status: strongest([status("apps.enumerate"), status("apps.launch"), status("apps.uninstall")]), detail: "Existing app resolver/private adapters with policy and postcondition checks.", backingCapabilities: ["apps.enumerate", "apps.launch", "apps.terminate", "apps.uninstall"]),
-            .init(id: .process, status: strongest([status("apps.terminate"), status("execution.root_helper")]), detail: "Process operations require a verified lifecycle/root-helper backend.", backingCapabilities: ["apps.terminate", "execution.root_helper"]),
+            .init(id: .file, status: status("filesystem.own_container"), detail: "File facade is proven only for Cloud Code's own container here. Unrestricted access remains a separate primitive and is never inferred from this aggregate.", backingCapabilities: ["filesystem.own_container"]),
+            .init(id: .app, status: allRequired([status("apps.enumerate"), status("apps.launch"), status("apps.terminate"), status("apps.uninstall")]), detail: "Broad app control is available only when every underlying lifecycle primitive is verified; individual operations must still check their exact primitive.", backingCapabilities: ["apps.enumerate", "apps.launch", "apps.terminate", "apps.uninstall"]),
+            .init(id: .process, status: allRequired([status("apps.terminate"), status("execution.root_helper")]), detail: "Broad process control is available only when both lifecycle and root-helper primitives are verified; exact operations remain separately gated.", backingCapabilities: ["apps.terminate", "execution.root_helper"]),
             .init(id: .shell, status: status("execution.ios_system"), detail: "Existing semantic ios_system route; not a privileged escape hatch.", backingCapabilities: ["execution.ios_system"]),
             .init(id: .git, status: .unavailable, detail: "No libgit2/MiniGit backend is linked yet; do not expose a fake Git capability.", backingCapabilities: []),
             .init(id: .archive, status: status("ipa.inspect"), detail: "ZIPFoundation/IPAService-backed archive inspection; mutations remain transactional.", backingCapabilities: ["ipa.inspect"]),
             .init(id: .network, status: status("network.urlsession"), detail: "Foundation URLSession availability is exposed through the primitive network.urlsession probe; endpoint policy and live reachability checks still apply.", backingCapabilities: ["network.urlsession"]),
             .init(id: .script, status: status("execution.ios_system"), detail: "Script execution is available only through verified shell/runtime adapters.", backingCapabilities: ["execution.ios_system"]),
-            .init(id: .device, status: strongest([status("apps.enumerate"), status("data.keychain_scope")]), detail: "Device facts aggregate existing probes and never imply root by themselves.", backingCapabilities: ["apps.enumerate", "data.keychain_scope"]),
+            .init(id: .device, status: allRequired([status("apps.enumerate"), status("data.keychain_scope")]), detail: "Device aggregate is available only when all listed read primitives are verified and never implies root by itself.", backingCapabilities: ["apps.enumerate", "data.keychain_scope"]),
             .init(id: .workspace, status: status("filesystem.own_container"), detail: "Workspace root is app-controlled unless unrestricted filesystem access is actually verified.", backingCapabilities: ["filesystem.own_container", "filesystem.unrestricted"]),
             .init(id: .rootHelper, status: status("execution.root_helper"), detail: "Embedded root helper is exposed only after runtime UID 0/persona validation.", backingCapabilities: ["execution.root_helper"])
         ]

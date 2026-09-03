@@ -297,7 +297,7 @@ final class ProviderRouterTests: XCTestCase {
         }
     }
 
-    func test5xxDoesNotRotateKey() async throws {
+    func test5xxWithoutOutputRotatesToFallbackAfterPerKeyRetriesAreExhausted() async throws {
         let vault = MemoryKeyVault(keys: ["fallback": "good"])
         let router = ProviderClientRouter(
             keyVault: vault,
@@ -308,12 +308,8 @@ final class ProviderRouterTests: XCTestCase {
         var configuration = config(protocolName: .anthropic)
         configuration.fallbackAPIKeyReferences = ["fallback"]
         configuration.allowSameProviderKeyFailover = true
-        do {
-            _ = try await collectText(router.stream(configuration: configuration, apiKey: "server-error", messages: [], tools: []))
-            XCTFail("5xx is provider/network evidence, not bad-Key evidence")
-        } catch {
-            XCTAssertEqual(error as? ProviderError, .invalidResponse(503))
-        }
+        let text = try await collectText(router.stream(configuration: configuration, apiKey: "server-error", messages: [], tools: []))
+        XCTAssertEqual(text, "good")
     }
 
     func testRotationDisabledNeverUsesFallback() async throws {
@@ -653,6 +649,15 @@ final class ProviderProtocolClientTests: XCTestCase {
         let error = ProviderHTTPClassifier.error(for: 403, body: Data())
         XCTAssertEqual(error, .invalidResponse(403))
         XCTAssertFalse(ProviderKeyRotationClassifier.shouldRotate(try! XCTUnwrap(error)))
+    }
+
+    func testTransient5xxAndCannotParseCanRotateOnlyBeforeOutput() {
+        XCTAssertTrue(ProviderKeyRotationClassifier.shouldRotate(ProviderError.invalidResponse(502)))
+        XCTAssertTrue(ProviderKeyRotationClassifier.shouldRotate(ProviderError.invalidResponse(503)))
+        XCTAssertTrue(ProviderKeyRotationClassifier.shouldRotate(URLError(.cannotParseResponse)))
+        XCTAssertFalse(ProviderKeyRotationClassifier.shouldRotate(ProviderError.invalidResponse(400)))
+        XCTAssertFalse(ProviderKeyRotationClassifier.shouldRotate(ProviderError.rateLimited))
+        XCTAssertFalse(ProviderKeyRotationClassifier.shouldRotate(ProviderError.streamInterrupted))
     }
 
     func testTransientDisconnectsRetryOnlyBeforeOutput() {

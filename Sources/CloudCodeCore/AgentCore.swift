@@ -11,6 +11,17 @@ public enum AgentEvent: Sendable, Equatable {
     case finished
 }
 
+public enum AgentRunError: Error, Equatable, CustomStringConvertible {
+    case sessionAlreadyRunning(UUID)
+
+    public var description: String {
+        switch self {
+        case .sessionAlreadyRunning(let id):
+            return "Session \(id) already has an active Agent run; submit steering instead of starting a concurrent run"
+        }
+    }
+}
+
 public enum ToolArgumentValidationError: Error, Equatable, CustomStringConvertible {
     case malformedJSON
     case expectedObject
@@ -254,6 +265,7 @@ public actor AgentCore {
     private let memoryProvider: HermesMemoryProviding
     private let diagnosticLogger: DiagnosticLogStore?
     private let maxToolRounds: Int
+    private var activeSessionRuns: [UUID: UUID] = [:]
 
     public init(
         provider: ProviderStreaming,
@@ -290,8 +302,19 @@ public actor AgentCore {
         appendUserMessage: Bool = true,
         resumeCheckpoint: TaskCheckpoint? = nil
     ) -> AsyncThrowingStream<AgentEvent, Error> {
-        AsyncThrowingStream { continuation in
+        let runID = UUID()
+        guard activeSessionRuns[initialSession.id] == nil else {
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: AgentRunError.sessionAlreadyRunning(initialSession.id))
+            }
+        }
+        activeSessionRuns[initialSession.id] = runID
+
+        return AsyncThrowingStream { continuation in
             let task = Task {
+                defer {
+                    self.releaseSessionRun(sessionID: initialSession.id, runID: runID)
+                }
                 var session = initialSession
                 var checkpoint = resumeCheckpoint ?? TaskCheckpoint(
                     sessionID: session.id,
@@ -395,6 +418,8 @@ public actor AgentCore {
                     let descriptorsByName = Dictionary(uniqueKeysWithValues: descriptors.map { ($0.name, $0) })
                     var lastStateChangeSignature = checkpoint.payload["tool.lastStateChangeSignature"]
                         ?? Self.lastCompletedStateChangeSignature(in: session, descriptorsByName: descriptorsByName)
+                    var lastStateChangeScope = checkpoint.payload["tool.lastStateChangeScope"]
+                        ?? Self.lastCompletedStateChangeScope(in: session, descriptorsByName: descriptorsByName)
                     var verificationSinceLastStateChange = checkpoint.payload["tool.verificationSinceLastStateChange"] == "true"
 
                     var previousToolPlanSignature: String?
@@ -594,12 +619,20 @@ public actor AgentCore {
                                     if name == "capability.probe" { capabilities = await capabilityProbe.probe() }
                                     if let stateChangeSignature {
                                         lastStateChangeSignature = stateChangeSignature
+                                        lastStateChangeScope = Self.semanticToolScope(name: name, arguments: arguments)
                                         verificationSinceLastStateChange = false
                                         checkpoint.payload["tool.lastStateChangeSignature"] = stateChangeSignature
+                                        if let lastStateChangeScope {
+                                            checkpoint.payload["tool.lastStateChangeScope"] = lastStateChangeScope
+                                        } else {
+                                            checkpoint.payload.removeValue(forKey: "tool.lastStateChangeScope")
+                                        }
                                         checkpoint.payload["tool.verificationSinceLastStateChange"] = "false"
                                         checkpoint.updatedAt = Date()
                                         try await checkpointStore.upsert(checkpoint)
-                                    } else if result.success, name != "capability.probe" {
+                                    } else if result.success,
+                                              name != "capability.probe",
+                                              Self.readOnlyToolVerifiesLastStateChange(name: name, arguments: arguments, scope: lastStateChangeScope) {
                                         verificationSinceLastStateChange = true
                                         checkpoint.payload["tool.verificationSinceLastStateChange"] = "true"
                                         checkpoint.updatedAt = Date()
@@ -608,8 +641,14 @@ public actor AgentCore {
                                 } catch {
                                     if let stateChangeSignature {
                                         lastStateChangeSignature = stateChangeSignature
+                                        lastStateChangeScope = Self.semanticToolScope(name: name, arguments: arguments)
                                         verificationSinceLastStateChange = false
                                         checkpoint.payload["tool.lastStateChangeSignature"] = stateChangeSignature
+                                        if let lastStateChangeScope {
+                                            checkpoint.payload["tool.lastStateChangeScope"] = lastStateChangeScope
+                                        } else {
+                                            checkpoint.payload.removeValue(forKey: "tool.lastStateChangeScope")
+                                        }
                                         checkpoint.payload["tool.verificationSinceLastStateChange"] = "false"
                                         checkpoint.updatedAt = Date()
                                         try? await checkpointStore.upsert(checkpoint)
@@ -791,16 +830,92 @@ public actor AgentCore {
         return session
     }
 
+    private func releaseSessionRun(sessionID: UUID, runID: UUID) {
+        guard activeSessionRuns[sessionID] == runID else { return }
+        activeSessionRuns.removeValue(forKey: sessionID)
+    }
+
     private static func semanticToolSignature(name: String, arguments: [String: String]) -> String {
         let canonical = ([name] + arguments.keys.sorted().map { key in "\(key)=\(arguments[key] ?? "")" }).joined(separator: "\n")
         let digest = SHA256.hash(data: Data(canonical.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
+    static func semanticToolScope(name: String, arguments: [String: String]) -> String? {
+        func fileScope(_ raw: String?) -> String? {
+            guard let raw, !raw.isEmpty else { return nil }
+            return "file:\(URL(fileURLWithPath: raw).standardizedFileURL.path)"
+        }
+        switch name {
+        case "files.create", "files.modify", "files.delete":
+            return fileScope(arguments["path"])
+        case "ipa.extract":
+            return fileScope(arguments["destination"])
+        case "ipa.repack":
+            return fileScope(arguments["destination"])
+        case "apps.launch", "apps.terminate", "apps.uninstall":
+            guard let bundleID = arguments["bundleId"], !bundleID.isEmpty else { return nil }
+            return "app:\(bundleID)"
+        case "trash.restore", "trash.purge":
+            guard let id = arguments["id"], !id.isEmpty else { return nil }
+            return "trash:\(id.lowercased())"
+        case "gui.openApp":
+            guard let bundleID = arguments["bundleId"], !bundleID.isEmpty else { return "gui:foreground" }
+            return "gui:\(bundleID)"
+        case "gui.tap", "gui.type", "gui.scroll", "gui.swipe":
+            return "gui:foreground"
+        default:
+            if let destination = arguments["destination"] { return fileScope(destination) }
+            if let path = arguments["path"] { return fileScope(path) }
+            if let bundleID = arguments["bundleId"], !bundleID.isEmpty { return "app:\(bundleID)" }
+            return nil
+        }
+    }
+
+    static func readOnlyToolVerifiesLastStateChange(name: String, arguments: [String: String], scope: String?) -> Bool {
+        guard let scope else { return false }
+        if scope.hasPrefix("file:") {
+            let targetPath = String(scope.dropFirst("file:".count))
+            switch name {
+            case "files.read", "ipa.inspect":
+                guard let raw = arguments["path"] else { return false }
+                return URL(fileURLWithPath: raw).standardizedFileURL.path == targetPath
+            case "files.list":
+                guard let raw = arguments["path"] else { return false }
+                let directory = URL(fileURLWithPath: raw).standardizedFileURL.path
+                return URL(fileURLWithPath: targetPath).deletingLastPathComponent().standardizedFileURL.path == directory
+            default:
+                return false
+            }
+        }
+        if scope.hasPrefix("app:") {
+            let bundleID = String(scope.dropFirst("app:".count))
+            return name == "apps.inspect" && arguments["bundleId"] == bundleID
+        }
+        if scope.hasPrefix("gui:") {
+            return name == "gui.verify"
+        }
+        return false
+    }
+
     private static func lastCompletedStateChangeSignature(
         in session: AgentSession,
         descriptorsByName: [String: ToolDescriptor]
     ) -> String? {
+        lastCompletedStateChangeContext(in: session, descriptorsByName: descriptorsByName)?.signature
+    }
+
+    private static func lastCompletedStateChangeScope(
+        in session: AgentSession,
+        descriptorsByName: [String: ToolDescriptor]
+    ) -> String? {
+        lastCompletedStateChangeContext(in: session, descriptorsByName: descriptorsByName)?.scope
+    }
+
+    private static func lastCompletedStateChangeContext(
+        in session: AgentSession,
+        descriptorsByName: [String: ToolDescriptor]
+    ) -> (signature: String, scope: String?)? {
         for message in session.messages.reversed() where message.role == .tool {
             guard message.providerMetadata["idempotency"] != "semantic_duplicate_blocked",
                   let providerCallID = message.providerMetadata["tool_call_id"],
@@ -814,7 +929,10 @@ public actor AgentCore {
                   let arguments = try? validatedArguments(fromJSON: argumentsJSON, toolName: name) else {
                 continue
             }
-            return semanticToolSignature(name: name, arguments: arguments)
+            return (
+                semanticToolSignature(name: name, arguments: arguments),
+                semanticToolScope(name: name, arguments: arguments)
+            )
         }
         return nil
     }

@@ -329,8 +329,9 @@ public struct TrashRecord: Codable, Equatable, Identifiable, Sendable {
     public var toolCallID: UUID
     public var reason: String
     public var sourceApp: String?
+    public var allowedRootPath: String?
 
-    public init(id: UUID = UUID(), originalPath: String, logicalResourceID: String, trashPath: String, filename: String, size: Int64, hash: String, timestamp: Date = Date(), sessionID: UUID, toolCallID: UUID, reason: String, sourceApp: String?) {
+    public init(id: UUID = UUID(), originalPath: String, logicalResourceID: String, trashPath: String, filename: String, size: Int64, hash: String, timestamp: Date = Date(), sessionID: UUID, toolCallID: UUID, reason: String, sourceApp: String?, allowedRootPath: String? = nil) {
         self.id = id
         self.originalPath = originalPath
         self.logicalResourceID = logicalResourceID
@@ -343,6 +344,7 @@ public struct TrashRecord: Codable, Equatable, Identifiable, Sendable {
         self.toolCallID = toolCallID
         self.reason = reason
         self.sourceApp = sourceApp
+        self.allowedRootPath = allowedRootPath
     }
 }
 
@@ -362,6 +364,9 @@ public struct TransactionRecord: Codable, Equatable, Identifiable, Sendable {
     public var sessionID: UUID
     public var toolCallID: UUID
     public var targetPath: String
+    public var allowedRootPath: String?
+    public var originalIdentity: SecureFileIdentity?
+    public var appliedIdentity: SecureFileIdentity?
     public var backupPath: String?
     public var diff: String?
     public var state: TransactionState
@@ -369,11 +374,14 @@ public struct TransactionRecord: Codable, Equatable, Identifiable, Sendable {
     public var finishedAt: Date?
     public var failure: String?
 
-    public init(id: UUID = UUID(), sessionID: UUID, toolCallID: UUID, targetPath: String, backupPath: String? = nil, diff: String? = nil, state: TransactionState = .planned, startedAt: Date = Date(), finishedAt: Date? = nil, failure: String? = nil) {
+    public init(id: UUID = UUID(), sessionID: UUID, toolCallID: UUID, targetPath: String, allowedRootPath: String? = nil, originalIdentity: SecureFileIdentity? = nil, appliedIdentity: SecureFileIdentity? = nil, backupPath: String? = nil, diff: String? = nil, state: TransactionState = .planned, startedAt: Date = Date(), finishedAt: Date? = nil, failure: String? = nil) {
         self.id = id
         self.sessionID = sessionID
         self.toolCallID = toolCallID
         self.targetPath = targetPath
+        self.allowedRootPath = allowedRootPath
+        self.originalIdentity = originalIdentity
+        self.appliedIdentity = appliedIdentity
         self.backupPath = backupPath
         self.diff = diff
         self.state = state
