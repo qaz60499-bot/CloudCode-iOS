@@ -483,6 +483,18 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertFalse(ProviderKeyRotationClassifier.shouldRotate(try! XCTUnwrap(error)))
     }
 
+    func testProviderEndpointPolicyRejectsLoopbackAndAmbiguousURLs() {
+        XCTAssertTrue(ProviderEndpointPolicy.allowsBaseURL(URL(string: "https://api.example.com")!))
+        XCTAssertTrue(ProviderEndpointPolicy.allowsBaseURL(URL(string: "https://api.example.com/v1")!))
+        XCTAssertFalse(ProviderEndpointPolicy.allowsBaseURL(URL(string: "http://api.example.com")!))
+        XCTAssertFalse(ProviderEndpointPolicy.allowsBaseURL(URL(string: "https://localhost:8443")!))
+        XCTAssertFalse(ProviderEndpointPolicy.allowsBaseURL(URL(string: "https://127.0.0.1")!))
+        XCTAssertFalse(ProviderEndpointPolicy.allowsBaseURL(URL(string: "https://[::1]")!))
+        XCTAssertFalse(ProviderEndpointPolicy.allowsBaseURL(URL(string: "https://user:pass@api.example.com")!))
+        XCTAssertFalse(ProviderEndpointPolicy.allowsBaseURL(URL(string: "https://api.example.com?v=1")!))
+        XCTAssertFalse(ProviderEndpointPolicy.allowsBaseURL(URL(string: "https://api.example.com#fragment")!))
+    }
+
     func testProviderRedirectPolicyAllowsOnlySameOrigin() {
         let original = URL(string: "https://api.example.com/v1/messages")!
         XCTAssertTrue(ProviderRedirectPolicy.allows(

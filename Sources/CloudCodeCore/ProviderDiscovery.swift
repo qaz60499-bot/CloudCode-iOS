@@ -119,7 +119,7 @@ public struct ProviderDiscoveryClient: Sendable {
     }
 
     private func discoveryEndpoint(baseURL: URL, path: String) throws -> URL {
-        guard baseURL.scheme == "https" || baseURL.host == "localhost" else { throw ProviderError.invalidEndpoint }
+        guard ProviderEndpointPolicy.allowsBaseURL(baseURL) else { throw ProviderError.invalidEndpoint }
         var url = baseURL
         let normalized = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         if normalized.hasSuffix(path) { return url }

@@ -525,8 +525,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedLabel.isEmpty,
               let baseURL = URL(string: baseURLText.trimmingCharacters(in: .whitespacesAndNewlines)),
-              baseURL.scheme == "https",
-              baseURL.host != nil,
+              ProviderEndpointPolicy.allowsBaseURL(baseURL),
               !apiKey.isEmpty else {
             endExclusiveOperation(operationKey)
             lastError = "Custom Provider requires a label, HTTPS Base URL and API Key."

@@ -3,6 +3,20 @@ import Foundation
 import FoundationNetworking
 #endif
 
+public enum ProviderEndpointPolicy {
+    public static func allowsBaseURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "https",
+              let host = url.host?.lowercased(),
+              !host.isEmpty,
+              url.user == nil,
+              url.password == nil,
+              url.query == nil,
+              url.fragment == nil else { return false }
+        let loopbackHosts: Set<String> = ["localhost", "127.0.0.1", "::1", "[::1]"]
+        return !loopbackHosts.contains(host)
+    }
+}
+
 public enum ProviderRedirectPolicy {
     public static func allows(original: URL, destination: URL) -> Bool {
         guard let originalScheme = original.scheme?.lowercased(),
@@ -691,7 +705,7 @@ private enum ProviderFailureEvidence {
 
 private enum ProviderEndpoint {
     static func endpoint(baseURL: URL, path: String) throws -> URL {
-        guard baseURL.scheme == "https" || baseURL.host == "localhost" else { throw ProviderError.invalidEndpoint }
+        guard ProviderEndpointPolicy.allowsBaseURL(baseURL) else { throw ProviderError.invalidEndpoint }
         var url = baseURL
         let normalizedPath = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         if normalizedPath.hasSuffix(path) { return url }
