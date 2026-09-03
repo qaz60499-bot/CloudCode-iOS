@@ -103,8 +103,11 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     private var enumerationDetail = "尚未检测已安装 App 枚举能力。"
     private var uninstallDetail = "尚未检测 App 卸载后端。"
     private var pendingUninstallBundleID: String?
+    private let diagnosticLogger: DiagnosticLogStore?
 
-    public init() {}
+    public init(diagnosticLogger: DiagnosticLogStore? = nil) {
+        self.diagnosticLogger = diagnosticLogger
+    }
 
     public func installedApps() async -> [ResourceNode] {
         if Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
@@ -134,7 +137,15 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     }
 
     public func rootHelperCapability() async -> RootHelperCapabilitySnapshot {
-        EmbeddedRootHelper.probe()
+        let snapshot = EmbeddedRootHelper.probe()
+        try? await diagnosticLogger?.log(
+            level: snapshot.available ? .info : .warning,
+            subsystem: "root-helper",
+            action: "probe",
+            result: snapshot.available ? "available" : "unavailable",
+            diagnostic: snapshot.detail
+        )
+        return snapshot
     }
 
     public func appLaunchCapability() async -> AppLifecycleCapabilitySnapshot {
@@ -159,6 +170,13 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             return AppLifecycleCapabilitySnapshot(available: false, detail: "跨 App 枚举尚未验证，不能安全定位待停止的 App。")
         }
         let helper = EmbeddedRootHelper.terminateCapability()
+        try? await diagnosticLogger?.log(
+            level: helper.available ? .info : .warning,
+            subsystem: "root-helper",
+            action: "terminate-capability",
+            result: helper.available ? "available" : "unavailable",
+            diagnostic: helper.detail
+        )
         return AppLifecycleCapabilitySnapshot(
             available: helper.available,
             detail: helper.available ? "Embedded root helper 可按目标 Bundle 路径停止进程并验证结果。" : helper.detail
@@ -195,7 +213,16 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         }
         let capability = await appTerminateCapability()
         guard capability.available else { return (false, "停止能力不可用：\(capability.detail)") }
-        return EmbeddedRootHelper.terminate(bundlePath: path)
+        let outcome = EmbeddedRootHelper.terminate(bundlePath: path)
+        try? await diagnosticLogger?.log(
+            level: outcome.success ? .info : .error,
+            subsystem: "root-helper",
+            action: "terminate",
+            result: outcome.success ? "success" : "failure",
+            diagnostic: outcome.detail,
+            metadata: ["bundleID": bundleID, "bundlePath": path]
+        )
+        return outcome
     }
 
     public func canUninstallInstalledApps() async -> Bool {
@@ -282,9 +309,24 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             return .rejected("LaunchServices 在执行前未确认目标仍处于已安装状态。")
         }
 
+        try? await diagnosticLogger?.log(
+            level: .info,
+            subsystem: "app-management",
+            action: "uninstall",
+            result: "started",
+            metadata: ["bundleID": bundleID, "bundlePath": bundlePath]
+        )
         var request = performUninstallRequest(bundleID: bundleID, workspace: workspace, workspaceClass: workspaceClass)
         if !request.accepted {
             let rootFallback = EmbeddedRootHelper.uninstall(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath)
+            try? await diagnosticLogger?.log(
+                level: rootFallback.accepted ? .info : .warning,
+                subsystem: "root-helper",
+                action: "uninstall-fallback",
+                result: rootFallback.accepted ? "accepted" : "rejected",
+                diagnostic: rootFallback.detail,
+                metadata: ["bundleID": bundleID]
+            )
             if rootFallback.accepted {
                 request = rootFallback
             } else {
@@ -309,6 +351,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         uninstallDetail = "卸载请求已由 \(request.detail) 接受；正在同时验证 LaunchServices 注册状态、Bundle 目录和数据容器。"
         if await verifyUninstallPostconditions(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath, attempts: 31) {
             finalizeVerifiedUninstall(bundleID: bundleID)
+            try? await diagnosticLogger?.log(level: .info, subsystem: "verification", action: "apps.uninstall", result: "passed", diagnostic: uninstallDetail, metadata: ["bundleID": bundleID])
             return .removed
         }
 
@@ -316,10 +359,19 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         // Tool Call，就允许在完成第一次最终状态核对后升级到嵌入式 root helper；这不是盲目重放。
         if !request.detail.contains("root helper") {
             let rootFallback = EmbeddedRootHelper.uninstall(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath)
+            try? await diagnosticLogger?.log(
+                level: rootFallback.accepted ? .info : .error,
+                subsystem: "root-helper",
+                action: "uninstall-escalation",
+                result: rootFallback.accepted ? "accepted" : "failed",
+                diagnostic: rootFallback.detail,
+                metadata: ["bundleID": bundleID]
+            )
             if rootFallback.accepted {
                 uninstallDetail = "LaunchServices 接受请求但未完成删除，已在同一确认操作内切换到 root helper fallback；正在再次验证最终状态。"
                 if await verifyUninstallPostconditions(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath, attempts: 20) {
                     finalizeVerifiedUninstall(bundleID: bundleID)
+                    try? await diagnosticLogger?.log(level: .info, subsystem: "verification", action: "apps.uninstall", result: "passed_after_root_fallback", diagnostic: uninstallDetail, metadata: ["bundleID": bundleID])
                     return .removed
                 }
             } else {
@@ -327,7 +379,9 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             }
         }
 
-        return .verificationTimedOut(uninstallDetail + "。目标最终状态仍未满足‘注册消失 + Bundle 消失 + 已知数据容器消失’，因此不会误报卸载成功。")
+        let timeoutDetail = uninstallDetail + "。目标最终状态仍未满足‘注册消失 + Bundle 消失 + 已知数据容器消失’，因此不会误报卸载成功。"
+        try? await diagnosticLogger?.log(level: .error, subsystem: "verification", action: "apps.uninstall", result: "timed_out", diagnostic: timeoutDetail, metadata: ["bundleID": bundleID])
+        return .verificationTimedOut(timeoutDetail)
     }
 
     private enum UninstallReconciliation {

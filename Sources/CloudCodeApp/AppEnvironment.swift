@@ -8,7 +8,8 @@ import UIKit
 @MainActor
 public final class CloudCodeViewModel: ObservableObject {
     @Published public var session: AgentSession
-    @Published public private(set) var streamingAssistantMessageID: UUID?
+    @Published private var streamingAssistantMessageIDs: [UUID: UUID] = [:]
+    @Published public private(set) var runningSessionIDs: Set<UUID> = []
     @Published public var activityLines: [String] = []
     @Published public var capabilities = CapabilityProfile(records: [])
     @Published public var capabilityGraph = CapabilityGraph()
@@ -18,12 +19,13 @@ public final class CloudCodeViewModel: ObservableObject {
     @Published public var auditEvents: [AuditEvent] = []
     @Published public var interruptedTasks: [TaskCheckpoint] = []
     @Published public private(set) var sessionHistory: [AgentSession] = []
-    @Published public var isRunning = false
     @Published public private(set) var isRefreshingCapabilities = false
     @Published public private(set) var capabilityRefreshMessage: String?
     @Published public private(set) var lastCapabilityRefreshAt: Date?
     @Published public var lastError: String?
     @Published public private(set) var inFlightOperationKeys: Set<String> = []
+    @Published public private(set) var diagnosticLogs: [DiagnosticLogRecord] = []
+    @Published public private(set) var diagnosticLogBytes: Int64 = 0
 
     @Published public private(set) var providerProfiles: [ProviderProfile]
     @Published public var selectedProviderID: String
@@ -40,18 +42,27 @@ public final class CloudCodeViewModel: ObservableObject {
     private let fileService: FileService
     private let trashService: TrashService
     private let auditStore: AuditLogStore
+    private let diagnosticLogStore: DiagnosticLogStore
+    private let diagnosticBundleExporter: DiagnosticBundleExporter
+    private let diagnosticSourceFiles: [DiagnosticBundleSource]
     private let transactionJournal: TransactionJournal
     private let transactionEngine: TransactionEngine
     private let checkpointStore: TaskCheckpointStore
+    private let executionLedger: ToolExecutionLedger
     private let sessionStore: SessionStore
     private let attachmentStore: ChatAttachmentStore
     private let keyVault: KeychainAPIKeyVault
+    private let steeringMailbox: AgentSteeringMailbox
     private let agentCore: AgentCore
     private let resourceIndex: ProgressiveResourceIndex
     private let appKnowledge: AppKnowledgeRegistry
     private let customProviderFileURL: URL
-    private var currentTask: Task<Void, Never>?
-    private var runGeneration = RunGenerationGuard()
+    private var activeTasks: [UUID: Task<Void, Never>] = [:]
+    private var activeRunTokens: [UUID: UUID] = [:]
+    private var activeConfigurations: [UUID: ProviderConfiguration] = [:]
+    private var liveSessions: [UUID: AgentSession] = [:]
+    private var sessionActivityLines: [UUID: [String]] = [:]
+    private var sessionErrors: [UUID: String] = [:]
     private var bootstrapTask: Task<Void, Never>?
     private var capabilityRefreshTask: Task<Void, Never>?
     #if canImport(UIKit)
@@ -66,8 +77,9 @@ public final class CloudCodeViewModel: ObservableObject {
     public init() {
         let support = Self.supportRoot()
         let approval = ApprovalCenter()
-        let resolver = IOSAppResolver()
-        let probe = CapabilityProbe(appResolver: resolver)
+        let diagnosticLogStore = DiagnosticLogStore(directory: support.appendingPathComponent("Diagnostics/Runtime", isDirectory: true))
+        let resolver = IOSAppResolver(diagnosticLogger: diagnosticLogStore)
+        let probe = CapabilityProbe(appResolver: resolver, diagnosticLogger: diagnosticLogStore)
         let resourceResolver = ResourceResolver(appResolver: resolver)
         let fileService = FileService()
         let policy = PolicyEngine()
@@ -96,13 +108,22 @@ public final class CloudCodeViewModel: ObservableObject {
         let cli = IOSSystemExecutor(policy: policy, approval: approval)
         let privateApps = IOSPrivateAppExecutor(appResolver: resolver, policy: policy, approval: approval, audit: audit)
         let gui = GUIFallbackExecutor(backend: UnavailableGUIBackend())
-        let executionLedger = ToolExecutionLedger(fileURL: support.appendingPathComponent("Execution/tool-results.json"))
-        let router = ToolRouter(registry: registry, executors: [structured, cli, privateApps, URLSchemeExecutor(), gui], executionLedger: executionLedger)
+        let executionLedgerURL = support.appendingPathComponent("Execution/tool-results.json")
+        let executionLedger = ToolExecutionLedger(fileURL: executionLedgerURL)
+        let router = ToolRouter(registry: registry, executors: [structured, cli, privateApps, URLSchemeExecutor(), gui], executionLedger: executionLedger, diagnosticLogger: diagnosticLogStore)
         let keyVault = KeychainAPIKeyVault()
         let sessions = SessionStore(root: support.appendingPathComponent("Sessions", isDirectory: true))
         let attachments = ChatAttachmentStore(root: support.appendingPathComponent("Attachments", isDirectory: true))
-        let checkpoints = TaskCheckpointStore(fileURL: support.appendingPathComponent("Tasks/checkpoints.json"))
-        let provider = ProviderClientRouter(keyVault: keyVault)
+        let checkpointURL = support.appendingPathComponent("Tasks/checkpoints.json")
+        let checkpoints = TaskCheckpointStore(fileURL: checkpointURL)
+        let provider = ProviderClientRouter(
+            keyVault: keyVault,
+            anthropic: AnthropicProviderClient(diagnosticLogger: diagnosticLogStore),
+            openAIChat: OpenAICompatibleProviderClient(diagnosticLogger: diagnosticLogStore),
+            responses: OpenAIResponsesProviderClient(diagnosticLogger: diagnosticLogStore),
+            diagnosticLogger: diagnosticLogStore
+        )
+        let steeringMailbox = AgentSteeringMailbox()
         let agent = AgentCore(
             provider: provider,
             keyVault: keyVault,
@@ -110,7 +131,9 @@ public final class CloudCodeViewModel: ObservableObject {
             registry: registry,
             capabilityProbe: probe,
             sessionStore: sessions,
-            checkpointStore: checkpoints
+            checkpointStore: checkpoints,
+            steeringMailbox: steeringMailbox,
+            diagnosticLogger: diagnosticLogStore
         )
 
         let defaults = UserDefaults.standard
@@ -143,12 +166,19 @@ public final class CloudCodeViewModel: ObservableObject {
         self.fileService = fileService
         self.trashService = trash
         self.auditStore = audit
+        self.diagnosticLogStore = diagnosticLogStore
+        self.diagnosticBundleExporter = DiagnosticBundleExporter(logStore: diagnosticLogStore)
+        self.diagnosticSourceFiles = [
+            DiagnosticBundleSource(archivePath: "index/resource-graph.json", fileURL: support.appendingPathComponent("Index/resource-graph.json"))
+        ]
         self.transactionJournal = transactionJournal
         self.transactionEngine = transactionEngine
         self.checkpointStore = checkpoints
+        self.executionLedger = executionLedger
         self.sessionStore = sessions
         self.attachmentStore = attachments
         self.keyVault = keyVault
+        self.steeringMailbox = steeringMailbox
         self.agentCore = agent
         self.resourceIndex = ProgressiveResourceIndex(fileURL: support.appendingPathComponent("Index/resource-graph.json"))
         self.appKnowledge = AppKnowledgeRegistry(fileURL: support.appendingPathComponent("Index/app-knowledge.json"))
@@ -158,6 +188,17 @@ public final class CloudCodeViewModel: ObservableObject {
     public func bootstrap() {
         guard !didBootstrap, bootstrapTask == nil else { return }
         bootstrapTask = Task {
+            try? await diagnosticLogStore.log(
+                level: .info,
+                subsystem: "app",
+                action: "bootstrap",
+                result: "started",
+                metadata: [
+                    "bundleID": Bundle.main.bundleIdentifier ?? "",
+                    "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
+                    "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
+                ]
+            )
             defer {
                 bootstrapTask = nil
                 isRefreshingCapabilities = false
@@ -194,11 +235,30 @@ public final class CloudCodeViewModel: ObservableObject {
                     activityLines.append("检测到私有 Key 版 IPA，但当前设备的 Keychain 实际探测未通过，因此已跳过自动导入，避免反复弹出失败提示。")
                 }
                 didBootstrap = true
+                try? await diagnosticLogStore.log(level: .info, subsystem: "app", action: "bootstrap", result: "completed")
+                await refreshDiagnosticLogs()
                 resumeMostRecentInterruptedTaskIfRequested()
             } catch {
+                try? await diagnosticLogStore.log(level: .error, subsystem: "app", action: "bootstrap", result: "failed", error: error)
                 lastError = "初始化失败：\(error)"
             }
         }
+    }
+
+    public var isRunning: Bool {
+        !runningSessionIDs.isEmpty
+    }
+
+    public var isCurrentSessionRunning: Bool {
+        runningSessionIDs.contains(session.id)
+    }
+
+    public var streamingAssistantMessageID: UUID? {
+        streamingAssistantMessageIDs[session.id]
+    }
+
+    public func isSessionRunning(_ sessionID: UUID) -> Bool {
+        runningSessionIDs.contains(sessionID)
     }
 
     public var selectedProvider: ProviderProfile? {
@@ -325,11 +385,22 @@ public final class CloudCodeViewModel: ObservableObject {
         imageFilename: String = "photo.jpg"
     ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard (!trimmed.isEmpty || imageData != nil), !isRunning else { return }
+        guard !trimmed.isEmpty || imageData != nil else { return }
         if let imageData, (imageData.isEmpty || imageData.count > ChatMessageAttachmentPolicy.maxImageBytes) {
             lastError = "图片大小必须小于 4 MB。"
             return
         }
+
+        if isCurrentSessionRunning {
+            submitSteering(
+                trimmed,
+                imageData: imageData,
+                imageMimeType: imageMimeType,
+                imageFilename: imageFilename
+            )
+            return
+        }
+
         guard saveProviderSelection(), let config = currentProviderConfiguration() else {
             if lastError == nil { lastError = "厂商 / Key / 模型选择无效。" }
             return
@@ -339,17 +410,22 @@ public final class CloudCodeViewModel: ObservableObject {
             return
         }
 
-        isRunning = true
-        UserDefaults.standard.set(true, forKey: Self.autoResumeTaskDefaultsKey)
-        lastError = nil
-        streamingAssistantMessageID = nil
-        activityLines.append("正在使用 \(config.name) / \(config.model) 规划请求…")
+        let sessionID = session.id
+        let runToken = UUID()
+        let initialSession = session
         let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
 
-        currentTask?.cancel()
-        let runID = runGeneration.start()
-        let initialSession = session
-        currentTask = Task {
+        runningSessionIDs.insert(sessionID)
+        activeRunTokens[sessionID] = runToken
+        activeConfigurations[sessionID] = config
+        liveSessions[sessionID] = initialSession
+        streamingAssistantMessageIDs.removeValue(forKey: sessionID)
+        sessionErrors.removeValue(forKey: sessionID)
+        sessionActivityLines[sessionID, default: []].append("正在使用 \(config.name) / \(config.model) 规划请求…")
+        syncVisibleSessionState(sessionID)
+        UserDefaults.standard.set(true, forKey: Self.autoResumeTaskDefaultsKey)
+
+        let task = Task {
             do {
                 var requestSession = initialSession
                 var attachments: [ChatAttachment] = []
@@ -370,8 +446,10 @@ public final class CloudCodeViewModel: ObservableObject {
                     requestSession.title = Self.sessionTitle(from: trimmed.isEmpty ? "图片" : trimmed)
                 }
                 requestSession.updatedAt = Date()
-                guard runGeneration.isCurrent(runID) else { return }
-                session = requestSession
+                guard activeRunTokens[sessionID] == runToken else { return }
+                liveSessions[sessionID] = requestSession
+                upsertSessionHistory(requestSession)
+                syncVisibleSessionState(sessionID)
 
                 let requestText = trimmed.isEmpty && !attachments.isEmpty ? "请处理这张图片。" : trimmed
                 let stream = await agentCore.send(
@@ -382,76 +460,112 @@ public final class CloudCodeViewModel: ObservableObject {
                     appendUserMessage: false
                 )
                 for try await event in stream {
-                    guard runGeneration.isCurrent(runID) else { break }
-                    switch event {
-                    case .status(let value):
-                        activityLines.append(value)
-                    case .token(let token):
-                        if let messageID = streamingAssistantMessageID,
-                           let assistantIndex = session.messages.firstIndex(where: { $0.id == messageID }) {
-                            session.messages[assistantIndex].content += token
-                            session.updatedAt = Date()
-                        } else {
-                            let message = ChatMessage(role: .assistant, content: token)
-                            session.messages.append(message)
-                            streamingAssistantMessageID = message.id
-                        }
-                    case .toolStarted(let name, _):
-                        activityLines.append("工具：\(name)")
-                    case .toolFinished(let result):
-                        activityLines.append("\(result.success ? "✓" : "✗") \(result.summary)")
-                    case .approvalRequired:
-                        break
-                    case .error(let value):
-                        lastError = value
-                    case .finished:
-                        break
-                    }
+                    guard activeRunTokens[sessionID] == runToken else { break }
+                    handleAgentEvent(event, sessionID: sessionID)
                 }
-                if runGeneration.isCurrent(runID),
-                   let saved = try? await sessionStore.load(requestSession.id) {
-                    session = saved
-                    streamingAssistantMessageID = nil
-                    UserDefaults.standard.set(saved.id.uuidString, forKey: "session.current.id")
+                if activeRunTokens[sessionID] == runToken,
+                   let saved = try? await sessionStore.load(sessionID) {
+                    liveSessions[sessionID] = saved
+                    upsertSessionHistory(saved)
+                    streamingAssistantMessageIDs.removeValue(forKey: sessionID)
+                    syncVisibleSessionState(sessionID)
                 }
             } catch {
-                if runGeneration.isCurrent(runID) { lastError = String(describing: error) }
+                if activeRunTokens[sessionID] == runToken {
+                    sessionErrors[sessionID] = String(describing: error)
+                    syncVisibleSessionState(sessionID)
+                }
             }
-            if runGeneration.finish(runID) {
-                currentTask = nil
-                isRunning = false
-                endBackgroundExecutionIfNeeded()
-            }
+
+            finishSessionRun(sessionID: sessionID, runToken: runToken)
             await reloadActivity()
             clearAutoResumeIntentIfNoPendingTask()
-            try? await reloadSessionHistory()
+            try? await reloadSessionHistoryMergingLiveSessions()
             refreshFilesFromDisk()
+        }
+        activeTasks[sessionID] = task
+    }
+
+    private func submitSteering(
+        _ text: String,
+        imageData: Data?,
+        imageMimeType: String,
+        imageFilename: String
+    ) {
+        let sessionID = session.id
+        guard runningSessionIDs.contains(sessionID) else { return }
+        var attachments: [ChatAttachment] = []
+        do {
+            if let imageData {
+                attachments = [try attachmentStore.save(
+                    data: imageData,
+                    filename: imageFilename,
+                    mimeType: imageMimeType,
+                    pixelWidth: nil,
+                    pixelHeight: nil,
+                    sessionID: sessionID
+                )]
+            }
+        } catch {
+            lastError = "追加图片失败：\(error)"
+            return
+        }
+
+        let content = text.isEmpty && !attachments.isEmpty ? "请同时参考这张追加图片，并按我最新的要求调整。" : text
+        let message = ChatMessage(role: .user, content: content, attachments: attachments)
+        var visible = liveSessions[sessionID] ?? session
+        visible.messages.append(message)
+        visible.updatedAt = Date()
+        liveSessions[sessionID] = visible
+        streamingAssistantMessageIDs.removeValue(forKey: sessionID)
+        sessionActivityLines[sessionID, default: []].append("已收到追加指令；将在安全边界中止旧规划或完成当前不可打断步骤后按新要求继续。")
+        upsertSessionHistory(visible)
+        syncVisibleSessionState(sessionID)
+
+        Task {
+            await steeringMailbox.submit(message, sessionID: sessionID)
         }
     }
 
     public func cancelCurrentTask() {
-        currentTask?.cancel()
-        currentTask = nil
-        runGeneration.cancel()
-        isRunning = false
-        UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
-        endBackgroundExecutionIfNeeded()
-        activityLines.append("任务已按你的明确命令停止；检查点已保留，但不会自动继续。")
+        let sessionID = session.id
+        guard let task = activeTasks[sessionID] else { return }
+        task.cancel()
+        activeTasks.removeValue(forKey: sessionID)
+        activeRunTokens.removeValue(forKey: sessionID)
+        activeConfigurations.removeValue(forKey: sessionID)
+        runningSessionIDs.remove(sessionID)
+        streamingAssistantMessageIDs.removeValue(forKey: sessionID)
+        Task { await steeringMailbox.clear(sessionID: sessionID) }
+        sessionActivityLines[sessionID, default: []].append("任务已按你的明确命令停止；检查点已保留，但这个会话不会自动继续。")
+        if runningSessionIDs.isEmpty {
+            UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
+            endBackgroundExecutionIfNeeded()
+        }
+        syncVisibleSessionState(sessionID)
     }
 
     public func suspendForBackground() {
-        guard isRunning || currentTask != nil else { return }
+        guard isRunning else { return }
+        Task {
+            try? await diagnosticLogStore.log(level: .info, subsystem: "app", action: "background", result: "entered", metadata: ["runningSessions": String(runningSessionIDs.count)])
+        }
         // 系统弹窗、App 切换或 LaunchServices 状态变化都可能让 scenePhase 短暂进入后台。
         // 立即取消会把已经被系统接受的状态变更卡在“请求已发出、结果未校验”的窗口。
         // 申请一段有界后台时间，让当前步骤优先完成结果校验；只有系统明确收回后台时间时
         // 才取消并依赖持久化检查点恢复。
-        activityLines.append("App 已进入后台；Cloud Code 将以 90 分钟为连续任务保留窗口。iOS 若更早收回后台执行时间，会安全中断并保留检查点，回到可执行状态后自动继续。")
+        let message = "App 已进入后台；Cloud Code 将以 90 分钟为连续任务保留窗口。iOS 若更早收回后台执行时间，会安全中断并保留检查点，回到可执行状态后自动继续。"
+        for sessionID in runningSessionIDs {
+            sessionActivityLines[sessionID, default: []].append(message)
+        }
+        syncVisibleSessionState(session.id)
         beginBackgroundExecutionIfNeeded()
     }
 
     public func refreshAfterForeground() {
         endBackgroundExecutionIfNeeded()
         Task {
+            try? await diagnosticLogStore.log(level: .info, subsystem: "app", action: "foreground", result: "entered", metadata: ["runningSessions": String(runningSessionIDs.count)])
             await reloadActivity()
             refreshFilesFromDisk()
             try? await reloadSessionHistory()
@@ -481,7 +595,11 @@ public final class CloudCodeViewModel: ObservableObject {
             }
         }
         if backgroundTaskIdentifier == .invalid {
-            activityLines.append("系统未授予额外后台执行时间；90 分钟是 Cloud Code 的恢复窗口，不代表 iOS 会允许连续后台执行 90 分钟。恢复前不会盲目重放。")
+            let message = "系统未授予额外后台执行时间；90 分钟是 Cloud Code 的恢复窗口，不代表 iOS 会允许连续后台执行 90 分钟。恢复前不会盲目重放。"
+            for sessionID in runningSessionIDs {
+                sessionActivityLines[sessionID, default: []].append(message)
+            }
+            syncVisibleSessionState(session.id)
         }
         #endif
     }
@@ -497,28 +615,35 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private func interruptActiveRunForBackground(reason: String) {
-        guard isRunning || currentTask != nil else { return }
-        currentTask?.cancel()
-        currentTask = nil
-        runGeneration.cancel()
-        isRunning = false
-        activityLines.append(reason)
+        guard isRunning else { return }
+        let sessionIDs = Array(runningSessionIDs)
+        for sessionID in sessionIDs {
+            activeTasks[sessionID]?.cancel()
+            activeTasks.removeValue(forKey: sessionID)
+            activeRunTokens.removeValue(forKey: sessionID)
+            activeConfigurations.removeValue(forKey: sessionID)
+            runningSessionIDs.remove(sessionID)
+            streamingAssistantMessageIDs.removeValue(forKey: sessionID)
+            sessionActivityLines[sessionID, default: []].append(reason)
+            Task {
+                try? await diagnosticLogStore.log(level: .warning, subsystem: "app", action: "background-run-interrupt", result: "interrupted", sessionID: sessionID, diagnostic: reason)
+            }
+        }
+        if sessionIDs.contains(session.id) { syncVisibleSessionState(session.id) }
     }
 
     private func resumeMostRecentInterruptedTaskIfRequested() {
-        guard UserDefaults.standard.bool(forKey: Self.autoResumeTaskDefaultsKey),
-              !isRunning,
-              currentTask == nil else { return }
-        guard let checkpoint = interruptedTasks.first else {
-            UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
+        guard UserDefaults.standard.bool(forKey: Self.autoResumeTaskDefaultsKey) else { return }
+        guard let checkpoint = interruptedTasks.first(where: { !runningSessionIDs.contains($0.sessionID) }) else {
+            if interruptedTasks.isEmpty { UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey) }
             return
         }
-        activityLines.append("检测到未明确停止的中断任务；正在从最近检查点自动继续。")
+        sessionActivityLines[checkpoint.sessionID, default: []].append("检测到未明确停止的中断任务；正在从最近检查点自动继续。")
         resumeTask(checkpoint)
     }
 
     private func clearAutoResumeIntentIfNoPendingTask() {
-        guard !isRunning, interruptedTasks.isEmpty else { return }
+        guard runningSessionIDs.isEmpty, interruptedTasks.isEmpty else { return }
         UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
     }
 
@@ -534,10 +659,6 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func createNewSession() {
-        guard !isRunning else {
-            lastError = "当前任务仍在运行，请先停止或等待完成后再新建对话。"
-            return
-        }
         let newSession = AgentSession(
             permissionMode: permissionMode,
             providerID: selectedProviderID,
@@ -545,23 +666,25 @@ public final class CloudCodeViewModel: ObservableObject {
             model: selectedModel
         )
         session = newSession
-        streamingAssistantMessageID = nil
+        streamingAssistantMessageIDs.removeValue(forKey: newSession.id)
         activityLines = []
+        lastError = nil
         UserDefaults.standard.set(newSession.id.uuidString, forKey: "session.current.id")
         // 空白新对话保持为内存态；只有真正发送第一条消息后才写入历史，避免反复新建产生大量空记录。
     }
 
     public func openSession(_ candidate: AgentSession) {
-        guard !isRunning else {
-            lastError = "当前任务仍在运行，请先停止或等待完成后再切换对话。"
+        if let live = liveSessions[candidate.id], runningSessionIDs.contains(candidate.id) {
+            adoptSession(live)
+            syncVisibleSessionState(candidate.id)
             return
         }
         Task {
             do {
                 let loaded = try await sessionStore.load(candidate.id)
                 adoptSession(loaded)
-                activityLines = []
-                try await reloadSessionHistory()
+                syncVisibleSessionState(candidate.id)
+                try await reloadSessionHistoryMergingLiveSessions()
             } catch {
                 lastError = "打开旧对话失败：\(error)"
             }
@@ -569,8 +692,8 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func deleteSession(_ candidate: AgentSession) {
-        guard !isRunning else {
-            lastError = "当前任务仍在运行，请先停止或等待完成后再删除对话。"
+        guard !runningSessionIDs.contains(candidate.id) else {
+            lastError = "这个对话仍在运行；请先停止该对话，再删除。"
             return
         }
         guard !sessionHasUnfinishedTask(candidate.id) else {
@@ -592,14 +715,15 @@ public final class CloudCodeViewModel: ObservableObject {
                     try await sessionStore.delete(candidate.id)
                     try? attachmentStore.removeAll(for: candidate.id)
                     session = replacement
-                    streamingAssistantMessageID = nil
+                    streamingAssistantMessageIDs.removeValue(forKey: candidate.id)
                     activityLines = []
+                    lastError = nil
                     UserDefaults.standard.set(replacement.id.uuidString, forKey: "session.current.id")
                 } else {
                     try await sessionStore.delete(candidate.id)
                     try? attachmentStore.removeAll(for: candidate.id)
                 }
-                try await reloadSessionHistory()
+                try await reloadSessionHistoryMergingLiveSessions()
             } catch {
                 lastError = "删除对话失败：\(error)"
             }
@@ -623,20 +747,23 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func resumeTask(_ checkpoint: TaskCheckpoint) {
-        guard !isRunning else { return }
+        let sessionID = checkpoint.sessionID
+        guard !runningSessionIDs.contains(sessionID) else { return }
         let operationKey = checkpointOperationKey(checkpoint.id)
         guard beginExclusiveOperation(operationKey) else { return }
-        currentTask?.cancel()
-        let runID = runGeneration.start()
-        isRunning = true
-        UserDefaults.standard.set(true, forKey: Self.autoResumeTaskDefaultsKey)
-        lastError = nil
-        activityLines.append("正在继续检查点 \(checkpoint.stepIndex)/\(checkpoint.totalSteps)…")
 
-        currentTask = Task {
+        let runToken = UUID()
+        runningSessionIDs.insert(sessionID)
+        activeRunTokens[sessionID] = runToken
+        sessionErrors.removeValue(forKey: sessionID)
+        sessionActivityLines[sessionID, default: []].append("正在继续检查点 \(checkpoint.stepIndex)/\(checkpoint.totalSteps)…")
+        UserDefaults.standard.set(true, forKey: Self.autoResumeTaskDefaultsKey)
+        syncVisibleSessionState(sessionID)
+
+        let task = Task {
             defer { endExclusiveOperation(operationKey) }
             do {
-                var resumedSession = try await sessionStore.load(checkpoint.sessionID)
+                var resumedSession = try await sessionStore.load(sessionID)
                 guard let request = checkpoint.payload["request"] ?? resumedSession.messages.last(where: { $0.role == .user })?.content,
                       !request.isEmpty else {
                     throw CocoaError(.fileReadCorruptFile)
@@ -645,12 +772,16 @@ public final class CloudCodeViewModel: ObservableObject {
                     payload: checkpoint.payload,
                     profiles: providerProfiles
                 )
-                resumedSession.permissionMode = permissionMode
                 resumedSession.providerID = config.providerID
                 resumedSession.model = config.model
                 resumedSession.keySlotID = keySlotID(for: config) ?? resumedSession.keySlotID
                 try await sessionStore.save(resumedSession)
-                adoptSession(resumedSession)
+                guard activeRunTokens[sessionID] == runToken else { return }
+                activeConfigurations[sessionID] = config
+                liveSessions[sessionID] = resumedSession
+                upsertSessionHistory(resumedSession)
+                syncVisibleSessionState(sessionID)
+
                 let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
                 let source = InputSource(rawValue: checkpoint.payload["inputSource"] ?? "text") ?? .text
                 let stream = await agentCore.send(
@@ -662,24 +793,31 @@ public final class CloudCodeViewModel: ObservableObject {
                     appendUserMessage: false,
                     resumeCheckpoint: checkpoint
                 )
-                try await consume(stream, runID: runID)
-                if runGeneration.isCurrent(runID),
-                   let saved = try? await sessionStore.load(checkpoint.sessionID) {
-                    adoptSession(saved)
+                for try await event in stream {
+                    guard activeRunTokens[sessionID] == runToken else { break }
+                    handleAgentEvent(event, sessionID: sessionID)
+                }
+                if activeRunTokens[sessionID] == runToken,
+                   let saved = try? await sessionStore.load(sessionID) {
+                    liveSessions[sessionID] = saved
+                    upsertSessionHistory(saved)
+                    streamingAssistantMessageIDs.removeValue(forKey: sessionID)
+                    syncVisibleSessionState(sessionID)
                 }
             } catch {
-                if runGeneration.isCurrent(runID) { lastError = String(describing: error) }
+                if activeRunTokens[sessionID] == runToken {
+                    sessionErrors[sessionID] = String(describing: error)
+                    syncVisibleSessionState(sessionID)
+                }
             }
-            if runGeneration.finish(runID) {
-                currentTask = nil
-                isRunning = false
-                endBackgroundExecutionIfNeeded()
-            }
+
+            finishSessionRun(sessionID: sessionID, runToken: runToken)
             await reloadActivity()
             clearAutoResumeIntentIfNoPendingTask()
-            try? await reloadSessionHistory()
+            try? await reloadSessionHistoryMergingLiveSessions()
             refreshFilesFromDisk()
         }
+        activeTasks[sessionID] = task
     }
 
     public func cancelInterruptedTask(_ checkpoint: TaskCheckpoint) {
@@ -776,6 +914,99 @@ public final class CloudCodeViewModel: ObservableObject {
             lastError = "审计记录刷新失败：\(error)"
         }
         interruptedTasks = await checkpointStore.interrupted()
+        await refreshDiagnosticLogs()
+    }
+
+    public func refreshDiagnosticLogs() async {
+        do {
+            diagnosticLogs = Array((try await diagnosticLogStore.readAll(limit: 12_000)).reversed())
+            diagnosticLogBytes = try await diagnosticLogStore.totalBytes()
+        } catch {
+            lastError = "诊断日志读取失败：\(error)"
+        }
+    }
+
+    public func filteredDiagnosticLogs(
+        query: String,
+        sessionID: UUID?,
+        toolCallID: UUID?,
+        level: DiagnosticLogLevel?
+    ) -> [DiagnosticLogRecord] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return diagnosticLogs.filter { record in
+            if let sessionID, record.sessionID != sessionID { return false }
+            if let toolCallID, record.toolCallID != toolCallID { return false }
+            if let level, record.level != level { return false }
+            guard !needle.isEmpty else { return true }
+            let haystack = [
+                record.subsystem,
+                record.action,
+                record.result,
+                record.errorDomain ?? "",
+                record.diagnostic ?? "",
+                record.metadata.map { "\($0.key)=\($0.value)" }.joined(separator: " ")
+            ].joined(separator: " ").lowercased()
+            return haystack.contains(needle)
+        }
+    }
+
+    public func diagnosticTextForAll(limit: Int = 1_500) async -> String {
+        (try? await diagnosticLogStore.text(limit: limit)) ?? ""
+    }
+
+    public func diagnosticTextForMostRecentTask(limit: Int = 1_500) async -> String {
+        do {
+            let recent = try await diagnosticLogStore.readAll(limit: max(limit * 4, 4_000))
+            let taskSessionID = recent.reversed().compactMap(\.sessionID).first ?? session.id
+            return try await diagnosticLogStore.text(sessionID: taskSessionID, limit: limit)
+        } catch {
+            return ""
+        }
+    }
+
+    public func exportDiagnosticBundle() async throws -> URL {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let capabilitiesData = try encoder.encode(capabilities)
+        let runtime: [String: Any] = [
+            "generatedAt": ISO8601DateFormatter().string(from: Date()),
+            "bundleID": Bundle.main.bundleIdentifier ?? "",
+            "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
+            "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "",
+            "activeSessionIDs": runningSessionIDs.map(\.uuidString).sorted(),
+            "currentSessionID": session.id.uuidString,
+            "providerID": selectedProviderID,
+            "model": selectedModel,
+            "permissionMode": permissionMode.rawValue,
+            "localOnly": true
+        ]
+        let runtimeData = try JSONSerialization.data(withJSONObject: runtime, options: [.prettyPrinted, .sortedKeys])
+        let auditData = try await auditStore.exportSnapshotData()
+        let toolResultsData = try await executionLedger.exportSnapshotData()
+        let checkpointData = try await checkpointStore.exportSnapshotData()
+        let transactionData = try await transactionJournal.exportSnapshotData()
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeDiagnostics", isDirectory: true)
+        let url = try await diagnosticBundleExporter.export(
+            destinationDirectory: destination,
+            sources: diagnosticSourceFiles,
+            generatedFiles: [
+                "runtime/runtime.json": runtimeData,
+                "capabilities/capabilities.json": capabilitiesData,
+                "audit/audit.jsonl": auditData,
+                "tool-results/tool-results.json": toolResultsData,
+                "checkpoints/checkpoints.json": checkpointData,
+                "transactions/transactions.json": transactionData
+            ]
+        )
+        try? await diagnosticLogStore.log(
+            level: .info,
+            subsystem: "diagnostics",
+            action: "export",
+            result: "completed",
+            metadata: ["filename": url.lastPathComponent]
+        )
+        return url
     }
 
     public func restoreTrash(_ record: TrashRecord) {
@@ -842,6 +1073,7 @@ public final class CloudCodeViewModel: ObservableObject {
         activityLines.append("正在发现 \(trimmedLabel) 的模型和协议…")
         Task {
             defer { endExclusiveOperation(operationKey) }
+            try? await diagnosticLogStore.log(level: .info, subsystem: "provider-discovery", action: "discover", result: "started", metadata: ["label": trimmedLabel, "host": baseURL.host ?? ""])
             do {
                 let discovery = try await ProviderDiscoveryClient().discover(baseURL: baseURL, apiKey: apiKey)
                 guard !discovery.models.isEmpty, let preferred = discovery.protocols.first else {
@@ -882,9 +1114,11 @@ public final class CloudCodeViewModel: ObservableObject {
                 }
                 selectProvider(providerID)
                 activityLines.append("自定义厂商已就绪：\(trimmedLabel)（\(discovery.models.count) 个模型）。")
+                try? await diagnosticLogStore.log(level: .info, subsystem: "provider-discovery", action: "discover", result: "completed", metadata: ["label": trimmedLabel, "models": String(discovery.models.count)])
             } catch {
                 try? keyVault.remove(reference)
                 providerProfiles.removeAll { $0.id == providerID }
+                try? await diagnosticLogStore.log(level: .error, subsystem: "provider-discovery", action: "discover", result: "failed", error: error, metadata: ["label": trimmedLabel])
                 lastError = "自定义厂商配置失败：\(error)"
             }
         }
@@ -1067,23 +1301,48 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private func reloadSessionHistory() async throws {
-        sessionHistory = try await sessionStore.all()
+        try await reloadSessionHistoryMergingLiveSessions()
+    }
+
+    private func reloadSessionHistoryMergingLiveSessions() async throws {
+        let stored = try await sessionStore.all()
+        var merged = Dictionary(uniqueKeysWithValues: stored.map { ($0.id, $0) })
+        for sessionID in runningSessionIDs {
+            if let live = liveSessions[sessionID] {
+                merged[sessionID] = live
+            }
+        }
+        sessionHistory = merged.values.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private func upsertSessionHistory(_ value: AgentSession) {
+        if let index = sessionHistory.firstIndex(where: { $0.id == value.id }) {
+            sessionHistory[index] = value
+        } else {
+            sessionHistory.append(value)
+        }
+        sessionHistory.sort { $0.updatedAt > $1.updatedAt }
     }
 
     private func adoptSession(_ loaded: AgentSession) {
-        session = loaded
-        streamingAssistantMessageID = nil
-        permissionMode = loaded.permissionMode
+        let visible = liveSessions[loaded.id] ?? loaded
+        session = visible
+        if !runningSessionIDs.contains(visible.id) {
+            streamingAssistantMessageIDs.removeValue(forKey: visible.id)
+        }
+        permissionMode = visible.permissionMode
         let desired = ProviderSelectionState(
-            providerID: loaded.providerID ?? selectedProviderID,
-            keySlotID: loaded.keySlotID ?? selectedKeySlotID,
-            model: loaded.model ?? selectedModel
+            providerID: visible.providerID ?? selectedProviderID,
+            keySlotID: visible.keySlotID ?? selectedKeySlotID,
+            model: visible.model ?? selectedModel
         )
         let reconciled = ProviderSelectionResolver.reconcile(desired, profiles: providerProfiles)
         applySelection(reconciled)
         session.providerID = reconciled.providerID
         session.keySlotID = reconciled.keySlotID
         session.model = reconciled.model
+        activityLines = sessionActivityLines[visible.id] ?? []
+        lastError = sessionErrors[visible.id]
         UserDefaults.standard.set(session.id.uuidString, forKey: "session.current.id")
     }
 
@@ -1180,34 +1439,60 @@ public final class CloudCodeViewModel: ObservableObject {
     private func checkpointOperationKey(_ id: UUID) -> String { "checkpoint:\(id.uuidString)" }
     private func sessionOperationKey(_ id: UUID) -> String { "session:\(id.uuidString)" }
 
-    private func consume(_ stream: AsyncThrowingStream<AgentEvent, Error>, runID: UUID) async throws {
-        for try await event in stream {
-            guard runGeneration.isCurrent(runID) else { break }
-            switch event {
-            case .status(let value):
-                activityLines.append(value)
-            case .token(let token):
-                if let messageID = streamingAssistantMessageID,
-                   let assistantIndex = session.messages.firstIndex(where: { $0.id == messageID }) {
-                    session.messages[assistantIndex].content += token
-                    session.updatedAt = Date()
-                } else {
-                    let message = ChatMessage(role: .assistant, content: token)
-                    session.messages.append(message)
-                    streamingAssistantMessageID = message.id
-                }
-            case .toolStarted(let name, _):
-                activityLines.append("工具：\(name)")
-            case .toolFinished(let result):
-                activityLines.append("\(result.success ? "✓" : "✗") \(result.summary)")
-            case .approvalRequired:
-                break
-            case .error(let value):
-                lastError = value
-            case .finished:
-                break
+    private func handleAgentEvent(_ event: AgentEvent, sessionID: UUID) {
+        var live = liveSessions[sessionID] ?? sessionHistory.first(where: { $0.id == sessionID }) ?? AgentSession(id: sessionID)
+        switch event {
+        case .status(let value):
+            sessionActivityLines[sessionID, default: []].append(value)
+        case .token(let token):
+            if let messageID = streamingAssistantMessageIDs[sessionID],
+               let assistantIndex = live.messages.firstIndex(where: { $0.id == messageID }) {
+                live.messages[assistantIndex].content += token
+                live.updatedAt = Date()
+            } else {
+                let message = ChatMessage(role: .assistant, content: token)
+                live.messages.append(message)
+                live.updatedAt = Date()
+                streamingAssistantMessageIDs[sessionID] = message.id
             }
+            liveSessions[sessionID] = live
+            upsertSessionHistory(live)
+        case .toolStarted(let name, _):
+            streamingAssistantMessageIDs.removeValue(forKey: sessionID)
+            sessionActivityLines[sessionID, default: []].append("工具：\(name)")
+        case .toolFinished(let result):
+            streamingAssistantMessageIDs.removeValue(forKey: sessionID)
+            sessionActivityLines[sessionID, default: []].append("\(result.success ? "✓" : "✗") \(result.summary)")
+        case .approvalRequired:
+            break
+        case .error(let value):
+            sessionErrors[sessionID] = value
+        case .finished:
+            streamingAssistantMessageIDs.removeValue(forKey: sessionID)
         }
+        syncVisibleSessionState(sessionID)
+    }
+
+    private func finishSessionRun(sessionID: UUID, runToken: UUID) {
+        guard activeRunTokens[sessionID] == runToken else { return }
+        activeTasks.removeValue(forKey: sessionID)
+        activeRunTokens.removeValue(forKey: sessionID)
+        activeConfigurations.removeValue(forKey: sessionID)
+        runningSessionIDs.remove(sessionID)
+        streamingAssistantMessageIDs.removeValue(forKey: sessionID)
+        if runningSessionIDs.isEmpty {
+            endBackgroundExecutionIfNeeded()
+        }
+        syncVisibleSessionState(sessionID)
+    }
+
+    private func syncVisibleSessionState(_ sessionID: UUID) {
+        guard session.id == sessionID else { return }
+        if let live = liveSessions[sessionID] {
+            session = live
+        }
+        activityLines = sessionActivityLines[sessionID] ?? []
+        lastError = sessionErrors[sessionID]
     }
 
     private static func supportRoot() -> URL {

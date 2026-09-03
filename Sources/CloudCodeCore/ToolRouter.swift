@@ -73,12 +73,19 @@ public actor ToolRouter {
     private let registry: ToolRegistry
     private let executors: [ToolExecuting]
     private let executionLedger: ToolExecutionLedger?
+    private let diagnosticLogger: DiagnosticLogStore?
     private var inFlight: [UUID: (call: ToolCall, task: Task<ToolResult, Error>)] = [:]
 
-    public init(registry: ToolRegistry, executors: [ToolExecuting], executionLedger: ToolExecutionLedger? = nil) {
+    public init(
+        registry: ToolRegistry,
+        executors: [ToolExecuting],
+        executionLedger: ToolExecutionLedger? = nil,
+        diagnosticLogger: DiagnosticLogStore? = nil
+    ) {
         self.registry = registry
         self.executors = executors
         self.executionLedger = executionLedger
+        self.diagnosticLogger = diagnosticLogger
     }
 
     public func chooseRoute(for call: ToolCall, capabilities: CapabilityProfile) async throws -> AppExecutionRoute {
@@ -99,8 +106,27 @@ public actor ToolRouter {
     }
 
     public func execute(_ call: ToolCall, context: ToolExecutionContext) async throws -> ToolResult {
-        guard let descriptor = await registry.descriptor(named: call.name) else { throw ToolRouterError.unknownTool(call.name) }
-        let route = try await chooseRoute(for: call, capabilities: context.capabilityProfile)
+        try? await diagnosticLogger?.log(
+            level: .info,
+            subsystem: "tool",
+            action: call.name,
+            result: "started",
+            sessionID: call.sessionID,
+            toolCallID: call.id,
+            metadata: ["argumentKeys": call.arguments.keys.sorted().joined(separator: ",")]
+        )
+        guard let descriptor = await registry.descriptor(named: call.name) else {
+            let error = ToolRouterError.unknownTool(call.name)
+            try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "unknown_tool", sessionID: call.sessionID, toolCallID: call.id, error: error)
+            throw error
+        }
+        let route: AppExecutionRoute
+        do {
+            route = try await chooseRoute(for: call, capabilities: context.capabilityProfile)
+        } catch {
+            try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "route_failed", sessionID: call.sessionID, toolCallID: call.id, error: error)
+            throw error
+        }
 
         var selectedExecutor: ToolExecuting?
         for executor in executors where executor.route == route {
@@ -112,7 +138,18 @@ public actor ToolRouter {
         guard let executor = selectedExecutor else { throw ToolRouterError.noExecutionRoute(call.name) }
 
         if descriptor.risk == .readOnly {
-            return try await executor.execute(call, descriptor: descriptor, context: context)
+            do {
+                let result = try await DiagnosticContext.$sessionID.withValue(call.sessionID) {
+                    try await DiagnosticContext.$toolCallID.withValue(call.id) {
+                        try await executor.execute(call, descriptor: descriptor, context: context)
+                    }
+                }
+                try? await diagnosticLogger?.log(level: result.success ? .info : .warning, subsystem: "tool", action: call.name, result: result.success ? "completed" : "failed", sessionID: call.sessionID, toolCallID: call.id, diagnostic: result.summary, metadata: ["route": route.rawValue, "verification": result.verification.map { $0.passed ? "passed" : "failed" } ?? "none"])
+                return result
+            } catch {
+                try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "failed", sessionID: call.sessionID, toolCallID: call.id, error: error, metadata: ["route": route.rawValue])
+                throw error
+            }
         }
 
         if let existing = inFlight[call.id] {
@@ -123,9 +160,14 @@ public actor ToolRouter {
         let task = Task<ToolResult, Error> {
             if let executionLedger,
                let cached = try await executionLedger.prepare(call) {
+                try? await diagnosticLogger?.log(level: .info, subsystem: "tool", action: call.name, result: "idempotent_cached", sessionID: call.sessionID, toolCallID: call.id, diagnostic: cached.summary)
                 return cached
             }
-            let result = try await executor.execute(call, descriptor: descriptor, context: context)
+            let result = try await DiagnosticContext.$sessionID.withValue(call.sessionID) {
+                try await DiagnosticContext.$toolCallID.withValue(call.id) {
+                    try await executor.execute(call, descriptor: descriptor, context: context)
+                }
+            }
             if result.success, let executionLedger {
                 try await executionLedger.complete(result, for: call)
             }
@@ -133,7 +175,23 @@ public actor ToolRouter {
         }
         inFlight[call.id] = (call, task)
         defer { inFlight.removeValue(forKey: call.id) }
-        return try await task.value
+        do {
+            let result = try await task.value
+            try? await diagnosticLogger?.log(
+                level: result.success ? .info : .warning,
+                subsystem: "tool",
+                action: call.name,
+                result: result.success ? "completed" : "failed",
+                sessionID: call.sessionID,
+                toolCallID: call.id,
+                diagnostic: result.summary,
+                metadata: ["route": route.rawValue, "verification": result.verification.map { $0.passed ? "passed" : "failed" } ?? "none"]
+            )
+            return result
+        } catch {
+            try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "failed", sessionID: call.sessionID, toolCallID: call.id, error: error, metadata: ["route": route.rawValue])
+            throw error
+        }
     }
 
     private func routeOrder(preferred: AppExecutionRoute) -> [AppExecutionRoute] {

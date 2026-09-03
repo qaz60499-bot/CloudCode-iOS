@@ -128,6 +128,13 @@ public actor ToolExecutionLedger {
         records.values.sorted { ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt) }
     }
 
+    public func exportSnapshotData() throws -> Data {
+        if loadFailed, FileManager.default.fileExists(atPath: fileURL.path) {
+            return try Data(contentsOf: fileURL)
+        }
+        return try JSONEncoder.pretty.encode(records)
+    }
+
     private func persist() throws {
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONEncoder.pretty.encode(records).write(to: fileURL, options: .atomic)

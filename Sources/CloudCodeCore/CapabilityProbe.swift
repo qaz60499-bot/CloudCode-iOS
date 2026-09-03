@@ -14,18 +14,22 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
     private let appResolver: AppContainerResolving
     private let fileManager: FileManager
     private let homeDirectory: URL
+    private let diagnosticLogger: DiagnosticLogStore?
 
     public init(
         appResolver: AppContainerResolving,
         fileManager: FileManager = .default,
-        homeDirectory: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        homeDirectory: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true),
+        diagnosticLogger: DiagnosticLogStore? = nil
     ) {
         self.appResolver = appResolver
         self.fileManager = fileManager
         self.homeDirectory = homeDirectory
+        self.diagnosticLogger = diagnosticLogger
     }
 
     public func probe() async -> CapabilityProfile {
+        try? await diagnosticLogger?.log(level: .info, subsystem: "capability", action: "probe.start", result: "running")
         var records: [CapabilityRecord] = []
 
         records.append(record("filesystem.own_container", .filesystem, canReadAndWrite(homeDirectory) ? .available : .unavailable,
@@ -158,7 +162,25 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         records.append(record("ipa.install", .ipa, .unavailable,
                               "No IPA installation executor is connected in the current build."))
 
-        return CapabilityProfile(records: records)
+        let profile = CapabilityProfile(records: records)
+        for item in records {
+            try? await diagnosticLogger?.log(
+                level: .info,
+                subsystem: "capability",
+                action: item.id,
+                result: item.status.rawValue,
+                diagnostic: item.detail,
+                metadata: ["domain": item.domain.rawValue]
+            )
+        }
+        try? await diagnosticLogger?.log(
+            level: .info,
+            subsystem: "capability",
+            action: "probe.finish",
+            result: "completed",
+            metadata: ["count": String(records.count)]
+        )
+        return profile
     }
 
     private func record(_ id: String, _ domain: CapabilityDomain, _ status: CapabilityStatus, _ detail: String) -> CapabilityRecord {

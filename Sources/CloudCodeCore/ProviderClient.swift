@@ -457,6 +457,7 @@ public protocol ProviderStreaming: Sendable {
 private protocol ProviderRequestBuilding {
     var session: URLSession { get }
     var retryPolicy: RetryPolicy { get }
+    var diagnosticLogger: DiagnosticLogStore? { get }
     func makeRequest(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) throws -> URLRequest
     func consume(lines: AsyncThrowingStream<String, Error>, continuation: AsyncThrowingStream<ProviderEvent, Error>.Continuation) async throws -> Bool
 }
@@ -474,10 +475,35 @@ private extension ProviderRequestBuilding {
                 while attempt <= retryPolicy.maxAttempts {
                     var responseStarted = false
                     var successfulStreamEstablished = false
+                    try? await diagnosticLogger?.log(
+                        level: .info,
+                        subsystem: "provider",
+                        action: "request.attempt",
+                        result: "started",
+                        metadata: [
+                            "providerID": configuration.providerID ?? "",
+                            "model": configuration.model,
+                            "attempt": String(attempt),
+                            "maxAttempts": String(retryPolicy.maxAttempts),
+                            "endpoint": (configuration.baseURL.host ?? "") + configuration.baseURL.path
+                        ]
+                    )
                     do {
                         let request = try makeRequest(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
                         let transport = ProviderStreamingTransport(configuration: session.configuration, request: request)
                         let (http, lines) = try await transport.start()
+                        try? await diagnosticLogger?.log(
+                            level: (200..<300).contains(http.statusCode) ? .info : .warning,
+                            subsystem: "provider",
+                            action: "request.response",
+                            result: (200..<300).contains(http.statusCode) ? "accepted" : "http_error",
+                            metadata: [
+                                "statusCode": String(http.statusCode),
+                                "attempt": String(attempt),
+                                "providerID": configuration.providerID ?? "",
+                                "model": configuration.model
+                            ]
+                        )
                         if !(200..<300).contains(http.statusCode) {
                             var body = Data()
                             do {
@@ -496,9 +522,23 @@ private extension ProviderRequestBuilding {
                         successfulStreamEstablished = true
                         responseStarted = try await consume(lines: lines, continuation: continuation)
                         continuation.yield(.finished)
+                        try? await diagnosticLogger?.log(
+                            level: .info,
+                            subsystem: "provider",
+                            action: "request.finish",
+                            result: "completed",
+                            metadata: ["attempt": String(attempt), "providerID": configuration.providerID ?? "", "model": configuration.model]
+                        )
                         continuation.finish()
                         return
                     } catch is CancellationError {
+                        try? await diagnosticLogger?.log(
+                            level: .warning,
+                            subsystem: "provider",
+                            action: "request.cancel",
+                            result: "cancelled",
+                            metadata: ["attempt": String(attempt), "providerID": configuration.providerID ?? "", "model": configuration.model]
+                        )
                         continuation.finish(throwing: CancellationError())
                         return
                     } catch {
@@ -507,15 +547,44 @@ private extension ProviderRequestBuilding {
                             && attempt < retryPolicy.maxAttempts
                             && ProviderRetryClassifier.isRetryableBeforeOutput(error)
                         guard mayReplay else {
+                            try? await diagnosticLogger?.log(
+                                level: .error,
+                                subsystem: "provider",
+                                action: "request.failure",
+                                result: "failed",
+                                error: error,
+                                metadata: [
+                                    "attempt": String(attempt),
+                                    "providerID": configuration.providerID ?? "",
+                                    "model": configuration.model,
+                                    "responseStarted": String(responseStarted),
+                                    "streamEstablished": String(successfulStreamEstablished)
+                                ]
+                            )
                             continuation.finish(throwing: error)
                             return
                         }
                         let shift = UInt64(min(max(attempt - 1, 0), 8))
                         let multiplier = UInt64(1) << shift
                         let (delay, overflow) = retryPolicy.initialDelayNanoseconds.multipliedReportingOverflow(by: multiplier)
+                        let retryDelay = overflow ? UInt64.max / 4 : delay
+                        try? await diagnosticLogger?.log(
+                            level: .warning,
+                            subsystem: "provider",
+                            action: "request.retry",
+                            result: "scheduled",
+                            error: error,
+                            metadata: [
+                                "attempt": String(attempt),
+                                "nextAttempt": String(attempt + 1),
+                                "delayNanoseconds": String(retryDelay),
+                                "providerID": configuration.providerID ?? "",
+                                "model": configuration.model
+                            ]
+                        )
                         attempt += 1
                         do {
-                            try await Task.sleep(nanoseconds: overflow ? UInt64.max / 4 : delay)
+                            try await Task.sleep(nanoseconds: retryDelay)
                         } catch {
                             continuation.finish(throwing: CancellationError())
                             return
@@ -531,10 +600,16 @@ private extension ProviderRequestBuilding {
 public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, ProviderRequestBuilding {
     fileprivate let session: URLSession
     fileprivate let retryPolicy: RetryPolicy
+    fileprivate let diagnosticLogger: DiagnosticLogStore?
 
-    public init(session: URLSession = ProviderURLSessionFactory.make(), retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 3, initialDelayNanoseconds: 1_500_000_000)) {
+    public init(
+        session: URLSession = ProviderURLSessionFactory.make(),
+        retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 3, initialDelayNanoseconds: 1_500_000_000),
+        diagnosticLogger: DiagnosticLogStore? = nil
+    ) {
         self.session = session
         self.retryPolicy = retryPolicy
+        self.diagnosticLogger = diagnosticLogger
     }
 
     public func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
@@ -614,10 +689,16 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
 public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequestBuilding {
     fileprivate let session: URLSession
     fileprivate let retryPolicy: RetryPolicy
+    fileprivate let diagnosticLogger: DiagnosticLogStore?
 
-    public init(session: URLSession = ProviderURLSessionFactory.make(), retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 3, initialDelayNanoseconds: 1_500_000_000)) {
+    public init(
+        session: URLSession = ProviderURLSessionFactory.make(),
+        retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 3, initialDelayNanoseconds: 1_500_000_000),
+        diagnosticLogger: DiagnosticLogStore? = nil
+    ) {
         self.session = session
         self.retryPolicy = retryPolicy
+        self.diagnosticLogger = diagnosticLogger
     }
 
     public func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
@@ -709,10 +790,16 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
 public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, ProviderRequestBuilding {
     fileprivate let session: URLSession
     fileprivate let retryPolicy: RetryPolicy
+    fileprivate let diagnosticLogger: DiagnosticLogStore?
 
-    public init(session: URLSession = ProviderURLSessionFactory.make(), retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 3, initialDelayNanoseconds: 1_500_000_000)) {
+    public init(
+        session: URLSession = ProviderURLSessionFactory.make(),
+        retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 3, initialDelayNanoseconds: 1_500_000_000),
+        diagnosticLogger: DiagnosticLogStore? = nil
+    ) {
         self.session = session
         self.retryPolicy = retryPolicy
+        self.diagnosticLogger = diagnosticLogger
     }
 
     public func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
@@ -835,19 +922,22 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
     private let openAIChat: ProviderStreaming
     private let responses: ProviderStreaming
     private let requestKeyState: ProviderRequestKeyState
+    private let diagnosticLogger: DiagnosticLogStore?
 
     public init(
         keyVault: APIKeyVault,
         anthropic: ProviderStreaming = AnthropicProviderClient(),
         openAIChat: ProviderStreaming = OpenAICompatibleProviderClient(),
         responses: ProviderStreaming = OpenAIResponsesProviderClient(),
-        requestKeyState: ProviderRequestKeyState = ProviderRequestKeyState()
+        requestKeyState: ProviderRequestKeyState = ProviderRequestKeyState(),
+        diagnosticLogger: DiagnosticLogStore? = nil
     ) {
         self.keyVault = keyVault
         self.anthropic = anthropic
         self.openAIChat = openAIChat
         self.responses = responses
         self.requestKeyState = requestKeyState
+        self.diagnosticLogger = diagnosticLogger
     }
 
     public func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
@@ -883,6 +973,17 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                 var lastError: Error = ProviderError.missingAPIKey
                 for (index, candidate) in candidates.enumerated() {
                     var emittedOutput = false
+                    try? await diagnosticLogger?.log(
+                        level: .info,
+                        subsystem: "provider",
+                        action: "key-slot.attempt",
+                        result: "started",
+                        metadata: [
+                            "providerID": configuration.providerID ?? "",
+                            "keyReference": candidate.0,
+                            "candidateIndex": String(index)
+                        ]
+                    )
                     do {
                         let stream = client.stream(configuration: configuration, apiKey: candidate.1, messages: messages, tools: tools)
                         for try await event in stream {
@@ -896,6 +997,13 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                             continuation.yield(event)
                         }
                         await requestKeyState.markSuccessful(configurationID: configuration.id, reference: candidate.0)
+                        try? await diagnosticLogger?.log(
+                            level: .info,
+                            subsystem: "provider",
+                            action: "key-slot.attempt",
+                            result: "completed",
+                            metadata: ["providerID": configuration.providerID ?? "", "keyReference": candidate.0]
+                        )
                         continuation.finish()
                         return
                     } catch is CancellationError {
@@ -905,7 +1013,17 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                         lastError = error
                         let hasAnother = index + 1 < candidates.count
                         let mayRotate = !emittedOutput && hasAnother && configuration.allowSameProviderKeyFailover == true && ProviderKeyRotationClassifier.shouldRotate(error)
-                        if mayRotate { continue }
+                        if mayRotate {
+                            try? await diagnosticLogger?.log(
+                                level: .warning,
+                                subsystem: "provider",
+                                action: "key-slot.rotate",
+                                result: "rotating",
+                                error: error,
+                                metadata: ["providerID": configuration.providerID ?? "", "fromKeyReference": candidate.0]
+                            )
+                            continue
+                        }
                         continuation.finish(throwing: error)
                         return
                     }

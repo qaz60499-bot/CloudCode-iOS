@@ -111,7 +111,7 @@ private struct ChatView: View {
                     }
                 }
 
-                if model.isRunning && model.streamingAssistantMessageID == nil {
+                if model.isCurrentSessionRunning && model.streamingAssistantMessageID == nil {
                     HStack {
                         ProgressView()
                         Text("Cloud Code 正在处理…")
@@ -184,26 +184,24 @@ private struct ChatView: View {
                 Image(systemName: "photo")
                     .frame(width: 30, height: 30)
             }
-            .disabled(model.isRunning)
 
             Button(action: toggleVoiceInput) {
                 Image(systemName: voice.isRecording ? "stop.circle.fill" : "mic")
                     .frame(width: 30, height: 30)
             }
-            .disabled(model.isRunning)
             .accessibilityLabel(voice.isRecording ? "停止语音输入" : "开始语音输入")
 
             TextField("输入要让 Cloud Code 完成的任务…", text: $input, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...5)
 
-            if model.isRunning {
+            Button(model.isCurrentSessionRunning ? "追加" : "发送", action: sendCurrentInput)
+                .buttonStyle(.borderedProminent)
+                .disabled(!canSend)
+
+            if model.isCurrentSessionRunning {
                 Button("停止") { model.cancelCurrentTask() }
                     .buttonStyle(.bordered)
-            } else {
-                Button("发送", action: sendCurrentInput)
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!canSend)
             }
         }
     }
@@ -216,12 +214,10 @@ private struct ChatView: View {
             } label: {
                 Label("历史", systemImage: "clock.arrow.circlepath")
             }
-            .disabled(model.isRunning)
 
             Button(action: createNewConversation) {
                 Label("新建对话", systemImage: "square.and.pencil")
             }
-            .disabled(model.isRunning)
         }
     }
 
@@ -364,7 +360,11 @@ private struct SessionHistoryView: View {
                             HStack {
                                 Text(item.title).font(.headline).foregroundStyle(.primary)
                                 Spacer()
-                                if model.sessionHasUnfinishedTask(item.id) {
+                                if model.isSessionRunning(item.id) {
+                                    Label("运行中", systemImage: "play.circle.fill")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                } else if model.sessionHasUnfinishedTask(item.id) {
                                     Label("未完成", systemImage: "clock.badge.exclamationmark")
                                         .font(.caption2)
                                         .foregroundStyle(.orange)
@@ -388,11 +388,11 @@ private struct SessionHistoryView: View {
                     .buttonStyle(.plain)
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         Button("删除", role: .destructive) { pendingDelete = item }
-                            .disabled(model.sessionHasUnfinishedTask(item.id))
+                            .disabled(model.isSessionRunning(item.id) || model.sessionHasUnfinishedTask(item.id))
                     }
                     .contextMenu {
                         Button("删除对话", role: .destructive) { pendingDelete = item }
-                            .disabled(model.sessionHasUnfinishedTask(item.id))
+                            .disabled(model.isSessionRunning(item.id) || model.sessionHasUnfinishedTask(item.id))
                     }
                 }
             }
@@ -425,7 +425,6 @@ private struct SessionHistoryView: View {
                         model.createNewSession()
                         isPresented = false
                     }
-                    .disabled(model.isRunning)
                 }
             }
         }
@@ -451,13 +450,13 @@ private struct TasksView: View {
                             HStack {
                                 Button("继续") { model.resumeTask(task) }
                                     .buttonStyle(.borderedProminent)
-                                    .disabled(model.isRunning || model.isCheckpointOperationInFlight(task.id))
+                                    .disabled(model.isSessionRunning(task.sessionID) || model.isCheckpointOperationInFlight(task.id))
                                 Button("回滚") { model.rollbackTask(task) }
                                     .buttonStyle(.bordered)
-                                    .disabled(model.isCheckpointOperationInFlight(task.id))
+                                    .disabled(model.isSessionRunning(task.sessionID) || model.isCheckpointOperationInFlight(task.id))
                                 Button("取消", role: .destructive) { model.cancelInterruptedTask(task) }
                                     .buttonStyle(.bordered)
-                                    .disabled(model.isCheckpointOperationInFlight(task.id))
+                                    .disabled(model.isSessionRunning(task.sessionID) || model.isCheckpointOperationInFlight(task.id))
                             }
                         }
                         .padding(.vertical, 4)
@@ -809,6 +808,17 @@ private struct SettingsView: View {
                         .disabled(model.isProviderKeyMutationInFlight)
                 }
 
+                Section("诊断") {
+                    NavigationLink {
+                        DiagnosticLogsView(model: model)
+                    } label: {
+                        Label("日志", systemImage: "doc.text.magnifyingglass")
+                    }
+                    Text("结构化日志仅保存在本机，默认保留 72 小时且总量约 100 MB；写入和导出都会脱敏。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("高级") {
                     LabeledContent("协议", value: model.selectedProtocol?.rawValue ?? "待验证")
                     if let provider = model.selectedProvider {
@@ -911,6 +921,184 @@ private struct CustomProviderSheet: View {
                 }
             }
         }
+    }
+}
+
+private struct DiagnosticLogsView: View {
+    @ObservedObject var model: CloudCodeViewModel
+    @State private var query = ""
+    @State private var selectedSessionID: UUID?
+    @State private var selectedToolCallID: UUID?
+    @State private var selectedLevel: DiagnosticLogLevel?
+    @State private var statusMessage: String?
+    @State private var shareItem: DiagnosticShareItem?
+    @State private var isExporting = false
+
+    private var sessionIDs: [UUID] {
+        Array(Set(model.diagnosticLogs.compactMap(\.sessionID))).sorted { $0.uuidString < $1.uuidString }
+    }
+
+    private var toolCallIDs: [UUID] {
+        Array(Set(model.diagnosticLogs.compactMap(\.toolCallID))).sorted { $0.uuidString < $1.uuidString }
+    }
+
+    private var visibleLogs: [DiagnosticLogRecord] {
+        model.filteredDiagnosticLogs(
+            query: query,
+            sessionID: selectedSessionID,
+            toolCallID: selectedToolCallID,
+            level: selectedLevel
+        )
+    }
+
+    var body: some View {
+        List {
+            Section("操作") {
+                HStack {
+                    Button("复制诊断日志") {
+                        Task {
+                            UIPasteboard.general.string = await model.diagnosticTextForAll()
+                            statusMessage = "已复制脱敏后的诊断日志。"
+                        }
+                    }
+                    Button("复制最近一次任务日志") {
+                        Task {
+                            UIPasteboard.general.string = await model.diagnosticTextForMostRecentTask()
+                            statusMessage = "已复制当前会话的脱敏日志。"
+                        }
+                    }
+                }
+                Button {
+                    guard !isExporting else { return }
+                    isExporting = true
+                    Task {
+                        defer { isExporting = false }
+                        do {
+                            let url = try await model.exportDiagnosticBundle()
+                            shareItem = DiagnosticShareItem(url: url)
+                            statusMessage = "诊断包已生成，可保存到“文件”App或分享。"
+                        } catch {
+                            model.lastError = "导出诊断包失败：\(error)"
+                        }
+                    }
+                } label: {
+                    HStack {
+                        if isExporting { ProgressView() }
+                        Text("导出诊断包")
+                    }
+                }
+                .disabled(isExporting)
+                LabeledContent("当前日志占用", value: ByteCountFormatter.string(fromByteCount: model.diagnosticLogBytes, countStyle: .file))
+                    .font(.caption)
+                if let statusMessage {
+                    Text(statusMessage).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            Section("筛选") {
+                Picker("Session", selection: $selectedSessionID) {
+                    Text("全部").tag(Optional<UUID>.none)
+                    ForEach(sessionIDs, id: \.self) { id in
+                        Text(String(id.uuidString.prefix(8))).tag(Optional(id))
+                    }
+                }
+                Picker("Tool Call", selection: $selectedToolCallID) {
+                    Text("全部").tag(Optional<UUID>.none)
+                    ForEach(toolCallIDs, id: \.self) { id in
+                        Text(String(id.uuidString.prefix(8))).tag(Optional(id))
+                    }
+                }
+                Picker("级别", selection: $selectedLevel) {
+                    Text("全部").tag(Optional<DiagnosticLogLevel>.none)
+                    ForEach(DiagnosticLogLevel.allCases, id: \.self) { level in
+                        Text(diagnosticLevelName(level)).tag(Optional(level))
+                    }
+                }
+            }
+
+            Section("日志 · \(visibleLogs.count)") {
+                if visibleLogs.isEmpty {
+                    Text("没有匹配的日志。")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(visibleLogs) { record in
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack {
+                            Text(diagnosticLevelName(record.level))
+                                .font(.caption.bold())
+                            Text(record.subsystem)
+                                .font(.caption.monospaced())
+                            Spacer()
+                            Text(record.timestamp.formatted(date: .omitted, time: .standard))
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+                        Text("\(record.action) · \(record.result)")
+                            .font(.subheadline)
+                        if let diagnostic = record.diagnostic, !diagnostic.isEmpty {
+                            Text(diagnostic)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        HStack(spacing: 8) {
+                            if let sessionID = record.sessionID {
+                                Text("S \(sessionID.uuidString.prefix(8))")
+                            }
+                            if let toolCallID = record.toolCallID {
+                                Text("T \(toolCallID.uuidString.prefix(8))")
+                            }
+                            if let domain = record.errorDomain {
+                                Text("\(domain) \(record.errorCode.map { String($0) } ?? "")")
+                            }
+                        }
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.tertiary)
+                    }
+                    .padding(.vertical, 3)
+                }
+            }
+        }
+        .navigationTitle("诊断日志")
+        .searchable(text: $query, prompt: "搜索动作、结果、错误或 diagnostic")
+        .refreshable { await model.refreshDiagnosticLogs() }
+        .task {
+            while !Task.isCancelled {
+                await model.refreshDiagnosticLogs()
+                do {
+                    try await Task.sleep(nanoseconds: 3_000_000_000)
+                } catch {
+                    break
+                }
+            }
+        }
+        .sheet(item: $shareItem) { item in
+            DiagnosticActivityShareSheet(items: [item.url])
+        }
+    }
+}
+
+private struct DiagnosticShareItem: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+private struct DiagnosticActivityShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+private func diagnosticLevelName(_ level: DiagnosticLogLevel) -> String {
+    switch level {
+    case .debug: return "调试"
+    case .info: return "信息"
+    case .warning: return "警告"
+    case .error: return "错误"
     }
 }
 

@@ -67,6 +67,13 @@ public actor TransactionJournal {
         recordsByID.values.sorted { $0.startedAt > $1.startedAt }
     }
 
+    public func exportSnapshotData() throws -> Data {
+        if loadFailed, FileManager.default.fileExists(atPath: fileURL.path) {
+            return try Data(contentsOf: fileURL)
+        }
+        return try JSONEncoder.pretty.encode(recordsByID)
+    }
+
     private func persist() throws {
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let data = try JSONEncoder.pretty.encode(recordsByID)

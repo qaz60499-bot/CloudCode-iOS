@@ -148,6 +148,18 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
 
         case "files.delete":
             let target = try requiredURL(call, key: "path")
+            if PathGuard.isSystemManagedApplicationContainerTarget(target.standardizedFileURL.resolvingSymlinksInPath()) {
+                throw PathSafetyError.systemManagedApplicationContainer
+            }
+            // Fail before presenting a generic "move to Cloud Code trash" approval for an installed App.
+            // System-managed App bundles/top-level data containers must go through apps.uninstall so
+            // LaunchServices registration and container state stay consistent.
+            _ = try PathGuard().validate(
+                target: target,
+                allowedRoot: context.allowedRoot,
+                rejectSymlink: true,
+                recursiveDelete: FileManager.default.directoryExists(at: target)
+            )
             let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: target.path)
             if decision == .requireConfirmation {
                 let size = (try? FileManager.default.allocatedSizeOfItem(at: target)) ?? 0

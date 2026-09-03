@@ -18,7 +18,10 @@ let package = Package(
         ),
         .testTarget(
             name: "CloudCodeCoreTests",
-            dependencies: ["CloudCodeCore"],
+            dependencies: [
+                "CloudCodeCore",
+                .product(name: "ZIPFoundation", package: "ZIPFoundation")
+            ],
             path: "Tests/CloudCodeCoreTests"
         )
     ]

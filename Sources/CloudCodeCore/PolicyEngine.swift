@@ -78,6 +78,7 @@ public enum PathSafetyError: Error, Equatable, CustomStringConvertible {
     case symlink
     case targetEscapesAllowedRoot
     case recursiveDeleteTooBroad
+    case systemManagedApplicationContainer
 
     public var description: String {
         switch self {
@@ -87,6 +88,7 @@ public enum PathSafetyError: Error, Equatable, CustomStringConvertible {
         case .symlink: return "Symlink target is not allowed for this operation"
         case .targetEscapesAllowedRoot: return "Resolved target escapes the allowed root"
         case .recursiveDeleteTooBroad: return "Recursive delete target is too broad"
+        case .systemManagedApplicationContainer: return "Installed app bundles and top-level app data containers must be removed through apps.uninstall, not files.delete"
         }
     }
 }
@@ -119,6 +121,9 @@ public struct PathGuard: Sendable {
         if recursiveDelete {
             let componentCount = standardized.pathComponents.filter { $0 != "/" }.count
             if componentCount < 3 { throw PathSafetyError.recursiveDeleteTooBroad }
+            if Self.isSystemManagedApplicationContainerTarget(standardized) {
+                throw PathSafetyError.systemManagedApplicationContainer
+            }
         }
 
         if rejectSymlink, fileManager.fileExists(atPath: target.path) {
@@ -127,6 +132,33 @@ public struct PathGuard: Sendable {
         }
 
         return standardized
+    }
+
+    static func isSystemManagedApplicationContainerTarget(_ url: URL) -> Bool {
+        let path = url.path.replacingOccurrences(of: "//", with: "/")
+        let bundleMarkers = [
+            "/private/var/containers/Bundle/Application/",
+            "/var/containers/Bundle/Application/"
+        ]
+        for marker in bundleMarkers {
+            guard let range = path.range(of: marker) else { continue }
+            let suffix = String(path[range.upperBound...])
+            let components = suffix.split(separator: "/", omittingEmptySubsequences: true)
+            if components.count == 1 { return true }
+            if components.count == 2, components[1].lowercased().hasSuffix(".app") { return true }
+        }
+
+        let dataMarkers = [
+            "/private/var/mobile/Containers/Data/Application/",
+            "/var/mobile/Containers/Data/Application/"
+        ]
+        for marker in dataMarkers {
+            guard let range = path.range(of: marker) else { continue }
+            let suffix = String(path[range.upperBound...])
+            let components = suffix.split(separator: "/", omittingEmptySubsequences: true)
+            if components.count == 1 { return true }
+        }
+        return false
     }
 }
 

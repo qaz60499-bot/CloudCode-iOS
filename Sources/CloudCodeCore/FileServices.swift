@@ -37,6 +37,11 @@ public actor AuditLogStore {
         decoder.dateDecodingStrategy = .iso8601
         return data.split(separator: 0x0A).compactMap { try? decoder.decode(AuditEvent.self, from: Data($0)) }
     }
+
+    public func exportSnapshotData() throws -> Data {
+        guard fileManager.fileExists(atPath: fileURL.path) else { return Data() }
+        return try Data(contentsOf: fileURL)
+    }
 }
 
 public actor AppKnowledgeRegistry {

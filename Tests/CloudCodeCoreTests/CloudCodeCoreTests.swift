@@ -1,8 +1,168 @@
 import Foundation
 import XCTest
+import ZIPFoundation
 @testable import CloudCodeCore
 
 final class CloudCodeCoreTests: XCTestCase {
+    func testDiagnosticLogDefaultRetentionAndCapacityPolicy() {
+        let policy = DiagnosticLogStore.Policy()
+        XCTAssertEqual(policy.retentionSeconds, TimeInterval(72 * 60 * 60))
+        XCTAssertEqual(policy.maxTotalBytes, 100 * 1024 * 1024)
+        XCTAssertEqual(policy.maxFileBytes, 8 * 1024 * 1024)
+    }
+
+    func testDiagnosticRedactorRemovesSecretsFromTextMetadataAndRecords() {
+        let raw = "Authorization: Bearer super-secret-token-123456789 api_key=sk-abcdefghijklmnop Cookie=session=abcdef"
+        let redacted = DiagnosticRedactor.redact(raw)
+        XCTAssertFalse(redacted.contains("super-secret-token"))
+        XCTAssertFalse(redacted.contains("sk-abcdefghijklmnop"))
+        XCTAssertFalse(redacted.contains("session=abcdef"))
+
+        let record = DiagnosticLogRecord(
+            level: .error,
+            subsystem: "provider",
+            action: "request",
+            result: "failed",
+            diagnostic: raw,
+            metadata: ["Authorization": "Bearer another-secret-123456", "model": "safe-model"]
+        )
+        let safe = DiagnosticRedactor.redact(record: record)
+        XCTAssertEqual(safe.metadata["Authorization"], "<redacted>")
+        XCTAssertEqual(safe.metadata["model"], "safe-model")
+        XCTAssertFalse((safe.diagnostic ?? "").contains("another-secret"))
+    }
+
+    func testDiagnosticLogStoreCapturesNSErrorDomainCodeAndDiagnostic() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = DiagnosticLogStore(directory: root.appendingPathComponent("logs", isDirectory: true))
+        let error = NSError(domain: NSCocoaErrorDomain, code: NSFileNoSuchFileError, userInfo: [NSLocalizedDescriptionKey: "missing file"])
+        try await store.log(level: .error, subsystem: "filesystem", action: "read", result: "failed", error: error)
+        let records = try await store.readAll(limit: 10)
+        let record = try XCTUnwrap(records.last)
+        XCTAssertEqual(record.errorDomain, NSCocoaErrorDomain)
+        XCTAssertEqual(record.errorCode, NSFileNoSuchFileError)
+        XCTAssertTrue((record.diagnostic ?? "").contains("missing file"))
+    }
+
+    func testDiagnosticLogStoreSupportsConcurrentSessionWrites() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = DiagnosticLogStore(directory: root.appendingPathComponent("logs", isDirectory: true))
+        let sessions = (0..<8).map { _ in UUID() }
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for sessionID in sessions {
+                group.addTask {
+                    for index in 0..<75 {
+                        try await store.log(
+                            level: .info,
+                            subsystem: "test",
+                            action: "concurrent",
+                            result: "ok",
+                            sessionID: sessionID,
+                            metadata: ["index": String(index)]
+                        )
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        let records = try await store.readAll(limit: 1_000)
+        XCTAssertEqual(records.count, sessions.count * 75)
+        XCTAssertEqual(Set(records.compactMap(\.sessionID)), Set(sessions))
+    }
+
+    func testDiagnosticLogStoreDropsExpiredFilesUsingLogicalLogTime() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let policy = DiagnosticLogStore.Policy(retentionSeconds: 60, maxTotalBytes: 2 * 1024 * 1024, maxFileBytes: 256 * 1024)
+        let store = DiagnosticLogStore(directory: root.appendingPathComponent("logs", isDirectory: true), policy: policy)
+        try await store.append(DiagnosticLogRecord(timestamp: Date().addingTimeInterval(-180), level: .info, subsystem: "test", action: "old", result: "ok"))
+        try await store.cleanup(now: Date())
+        let remaining = try await store.readAll()
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testDiagnosticLogStoreRotatesUnderCapacityLimit() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let maxBytes: Int64 = 1024 * 1024
+        let policy = DiagnosticLogStore.Policy(retentionSeconds: 72 * 60 * 60, maxTotalBytes: maxBytes, maxFileBytes: 256 * 1024)
+        let store = DiagnosticLogStore(directory: root.appendingPathComponent("logs", isDirectory: true), policy: policy)
+        let payload = String(repeating: "x", count: 12_000)
+        for index in 0..<220 {
+            try await store.log(level: .debug, subsystem: "capacity", action: "write", result: "ok", diagnostic: payload, metadata: ["index": String(index)])
+        }
+        let total = try await store.totalBytes()
+        XCTAssertLessThanOrEqual(total, maxBytes)
+    }
+
+    func testDiagnosticLogStoreSurvivesRestartAndKeepsRecentRecords() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = root.appendingPathComponent("logs", isDirectory: true)
+        let first = DiagnosticLogStore(directory: directory)
+        let sessionID = UUID()
+        try await first.log(level: .info, subsystem: "restart", action: "before", result: "ok", sessionID: sessionID)
+
+        let restarted = DiagnosticLogStore(directory: directory)
+        try await restarted.log(level: .info, subsystem: "restart", action: "after", result: "ok", sessionID: sessionID)
+        let records = try await restarted.recent(sessionID: sessionID, limit: 10)
+        XCTAssertEqual(records.map(\.action), ["before", "after"])
+    }
+
+    func testDiagnosticLogStoreSkipsCorruptLinesAndKeepsValidRecords() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = root.appendingPathComponent("logs", isDirectory: true)
+        let store = DiagnosticLogStore(directory: directory)
+        try await store.log(level: .info, subsystem: "test", action: "before-corruption", result: "ok")
+        let file = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).first)
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{corrupt-json-line}\n".utf8))
+        try handle.close()
+        try await store.log(level: .info, subsystem: "test", action: "after-corruption", result: "ok")
+        let records = try await store.readAll()
+        XCTAssertTrue(records.contains { $0.action == "before-corruption" })
+        XCTAssertTrue(records.contains { $0.action == "after-corruption" })
+    }
+
+    func testDiagnosticExportCanSnapshotWhileLoggingContinuesAndRemainsRedacted() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let logStore = DiagnosticLogStore(directory: root.appendingPathComponent("logs", isDirectory: true))
+        let exporter = DiagnosticBundleExporter(logStore: logStore)
+        try await logStore.log(level: .info, subsystem: "provider", action: "seed", result: "ok", diagnostic: "Authorization: Bearer secret-secret-secret")
+
+        let writer = Task {
+            for index in 0..<250 {
+                try await logStore.log(level: .debug, subsystem: "writer", action: "append", result: "ok", metadata: ["index": String(index)])
+            }
+        }
+        let output = try await exporter.export(
+            destinationDirectory: root.appendingPathComponent("exports", isDirectory: true),
+            sources: [],
+            generatedFiles: ["runtime/generated.json": Data("{\"api_key\":\"sk-super-secret-123456789\"}".utf8)]
+        )
+        try await writer.value
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+        XCTAssertGreaterThan((try output.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0, 0)
+        let archive = try Archive(url: output, accessMode: .read)
+        let generatedEntry = try XCTUnwrap(archive["runtime/generated.json"])
+        var generatedData = Data()
+        _ = try archive.extract(generatedEntry) { generatedData.append($0) }
+        let generatedText = String(data: generatedData, encoding: .utf8) ?? ""
+        XCTAssertFalse(generatedText.contains("sk-super-secret-123456789"))
+        XCTAssertTrue(generatedText.contains("<redacted>"))
+        let generatedObject = try XCTUnwrap(try JSONSerialization.jsonObject(with: generatedData) as? [String: String])
+        XCTAssertEqual(generatedObject["api_key"], "<redacted>")
+        let copied = try await logStore.text(limit: 1_000)
+        XCTAssertFalse(copied.contains("secret-secret-secret"))
+    }
+
     func testSafeModeRequiresConfirmationForImportantModification() {
         let engine = PolicyEngine()
         let tool = ToolDescriptor(name: "files.modify", summary: "", risk: .sensitiveWrite)
@@ -31,6 +191,22 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertThrowsError(try guarder.validate(target: URL(fileURLWithPath: "/tmp"), recursiveDelete: true)) { error in
             XCTAssertEqual(error as? PathSafetyError, .recursiveDeleteTooBroad)
         }
+    }
+
+    func testInstalledAppContainersCannotBeRemovedThroughGenericFileDeletePath() throws {
+        let guarder = PathGuard()
+        let bundle = URL(fileURLWithPath: "/private/var/containers/Bundle/Application/11111111-2222-3333-4444-555555555555/Target.app")
+        XCTAssertThrowsError(try guarder.validate(target: bundle, rejectSymlink: false, recursiveDelete: true)) { error in
+            XCTAssertEqual(error as? PathSafetyError, .systemManagedApplicationContainer)
+        }
+
+        let dataContainer = URL(fileURLWithPath: "/private/var/mobile/Containers/Data/Application/AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")
+        XCTAssertThrowsError(try guarder.validate(target: dataContainer, rejectSymlink: false, recursiveDelete: true)) { error in
+            XCTAssertEqual(error as? PathSafetyError, .systemManagedApplicationContainer)
+        }
+
+        let extractedBundle = URL(fileURLWithPath: "/tmp/Payload/Target.app")
+        XCTAssertNoThrow(try guarder.validate(target: extractedBundle, rejectSymlink: false, recursiveDelete: true))
     }
 
     func testSymlinkIsRejected() throws {
@@ -1063,6 +1239,81 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTFail("Cancelled Agent request did not persist an interrupted checkpoint")
     }
 
+    func testAgentCoreRunsIndependentSessionsConcurrentlyWithoutStateCollision() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = ToolRegistry(descriptors: [])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let checkpoints = TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json"))
+        let agent = AgentCore(
+            provider: SessionEchoProvider(),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(registry: registry, executors: []),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: checkpoints,
+            maxToolRounds: 4
+        )
+        let firstSession = AgentSession(permissionMode: .safe)
+        let secondSession = AgentSession(permissionMode: .safe)
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        let firstStream = await agent.send(text: "first-session", session: firstSession, providerConfiguration: config)
+        let secondStream = await agent.send(text: "second-session", session: secondSession, providerConfiguration: config)
+
+        async let firstOutput: String = collectAgentTokenText(firstStream)
+        async let secondOutput: String = collectAgentTokenText(secondStream)
+        let outputs = try await (firstOutput, secondOutput)
+        XCTAssertEqual(outputs.0, "first-session")
+        XCTAssertEqual(outputs.1, "second-session")
+
+        let savedFirst = try await sessions.load(firstSession.id)
+        let savedSecond = try await sessions.load(secondSession.id)
+        XCTAssertEqual(savedFirst.messages.last(where: { $0.role == .assistant })?.content, "first-session")
+        XCTAssertEqual(savedSecond.messages.last(where: { $0.role == .assistant })?.content, "second-session")
+        XCTAssertNotEqual(savedFirst.id, savedSecond.id)
+    }
+
+    func testRunningAgentAcceptsSteeringAndReplansWithoutManualStop() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = ToolRegistry(descriptors: [])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let checkpoints = TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json"))
+        let mailbox = AgentSteeringMailbox()
+        let agent = AgentCore(
+            provider: SteeringAwareProvider(),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(registry: registry, executors: []),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: checkpoints,
+            steeringMailbox: mailbox,
+            maxToolRounds: 4
+        )
+        let session = AgentSession(permissionMode: .safe)
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        let stream = await agent.send(text: "initial", session: session, providerConfiguration: config)
+        var output = ""
+        var submitted = false
+        for try await event in stream {
+            if case .token(let token) = event {
+                output += token
+                if token == "old" && !submitted {
+                    submitted = true
+                    await mailbox.submit(ChatMessage(role: .user, content: "steer now"), sessionID: session.id)
+                }
+            }
+        }
+
+        XCTAssertTrue(submitted)
+        XCTAssertTrue(output.contains("new"))
+        let saved = try await sessions.load(session.id)
+        XCTAssertTrue(saved.messages.contains { $0.role == .user && $0.content == "steer now" })
+        XCTAssertTrue(saved.messages.contains { $0.role == .assistant && $0.content.contains("new") })
+    }
+
     func testProviderHTTPClassifierMapsCredentialAndRetryableStatuses() {
         XCTAssertNil(ProviderHTTPClassifier.error(for: 200))
         XCTAssertEqual(ProviderHTTPClassifier.error(for: 401), .authenticationFailed(401))
@@ -1362,6 +1613,14 @@ final class CloudCodeCoreTests: XCTestCase {
     }
 }
 
+private func collectAgentTokenText(_ stream: AsyncThrowingStream<AgentEvent, Error>) async throws -> String {
+    var output = ""
+    for try await event in stream {
+        if case .token(let token) = event { output += token }
+    }
+    return output
+}
+
 private final class ScriptedURLProtocol: URLProtocol {
     enum Step {
         case http(status: Int, body: Data)
@@ -1456,6 +1715,30 @@ private struct FixedCapabilityProbe: CapabilityProbing, Sendable {
     func probe() async -> CapabilityProfile { profile }
 }
 
+private struct SessionEchoProvider: ProviderStreaming, Sendable {
+    func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        let text = messages.last(where: { $0.role == .user })?.content ?? ""
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try await Task.sleep(nanoseconds: 80_000_000)
+                    continuation.yield(.token(text))
+                    continuation.yield(.finished)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: CancellationError())
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}
+
 private struct BlockingProvider: ProviderStreaming, Sendable {
     func stream(
         configuration: ProviderConfiguration,
@@ -1467,6 +1750,36 @@ private struct BlockingProvider: ProviderStreaming, Sendable {
             let task = Task {
                 do {
                     try await Task.sleep(nanoseconds: 5_000_000_000)
+                    continuation.yield(.finished)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: CancellationError())
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}
+
+private struct SteeringAwareProvider: ProviderStreaming, Sendable {
+    func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                if messages.contains(where: { $0.role == .user && $0.content == "steer now" }) {
+                    continuation.yield(.token("new"))
+                    continuation.yield(.finished)
+                    continuation.finish()
+                    return
+                }
+                continuation.yield(.token("old"))
+                do {
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                    continuation.yield(.token("stale"))
                     continuation.yield(.finished)
                     continuation.finish()
                 } catch {
