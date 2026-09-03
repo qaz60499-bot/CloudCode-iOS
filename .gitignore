@@ -10,4 +10,7 @@ DerivedData/
 .env
 .env.*
 Secrets/
+GeneratedSecrets/
+*.provider-bootstrap.json
+CloudCode-Provider-Bootstrap.json
 *.mobileprovision

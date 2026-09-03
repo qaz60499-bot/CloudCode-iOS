@@ -7,47 +7,6 @@ import ObjectiveC.runtime
 import Darwin
 #endif
 
-public final class KeychainAPIKeyVault: APIKeyVault, @unchecked Sendable {
-    public init() {}
-
-    public func set(_ value: String, for reference: String) throws {
-        let data = Data(value.utf8)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "CloudCodeIOS.ProviderKey",
-            kSecAttrAccount as String: reference
-        ]
-        let update: [String: Any] = [kSecValueData as String: data]
-        let updateStatus = SecItemUpdate(query as CFDictionary, update as CFDictionary)
-        if updateStatus == errSecSuccess { return }
-        guard updateStatus == errSecItemNotFound else {
-            throw NSError(domain: NSOSStatusErrorDomain, code: Int(updateStatus))
-        }
-
-        var add = query
-        add[kSecValueData as String] = data
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        let addStatus = SecItemAdd(add as CFDictionary, nil)
-        guard addStatus == errSecSuccess else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(addStatus)) }
-    }
-
-    public func key(for reference: String) async throws -> String {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "CloudCodeIOS.ProviderKey",
-            kSecAttrAccount as String: reference,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data, let value = String(data: data, encoding: .utf8), !value.isEmpty else {
-            throw ProviderError.missingAPIKey
-        }
-        return value
-    }
-}
-
 public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProviding {
     private var cachedApps: [ResourceNode] = []
     private var bundlePaths: [String: String] = [:]

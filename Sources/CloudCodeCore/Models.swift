@@ -412,13 +412,34 @@ public struct ProviderConfiguration: Codable, Equatable, Identifiable, Sendable 
     public var baseURL: URL
     public var model: String
     public var apiKeyReference: String
+    public var providerID: String?
+    public var protocolName: String?
+    public var authModeName: String?
+    public var fallbackAPIKeyReferences: [String]?
+    public var allowSameProviderKeyFailover: Bool?
 
-    public init(id: UUID = UUID(), name: String, baseURL: URL, model: String, apiKeyReference: String) {
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        baseURL: URL,
+        model: String,
+        apiKeyReference: String,
+        providerID: String? = nil,
+        protocolName: String? = nil,
+        authModeName: String? = nil,
+        fallbackAPIKeyReferences: [String]? = nil,
+        allowSameProviderKeyFailover: Bool? = nil
+    ) {
         self.id = id
         self.name = name
         self.baseURL = baseURL
         self.model = model
         self.apiKeyReference = apiKeyReference
+        self.providerID = providerID
+        self.protocolName = protocolName
+        self.authModeName = authModeName
+        self.fallbackAPIKeyReferences = fallbackAPIKeyReferences
+        self.allowSameProviderKeyFailover = allowSameProviderKeyFailover
     }
 }
 

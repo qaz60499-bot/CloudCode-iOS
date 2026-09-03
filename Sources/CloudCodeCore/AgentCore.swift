@@ -222,7 +222,13 @@ public actor AgentCore {
                         "request": text,
                         "provider.name": providerConfiguration.name,
                         "provider.baseURL": providerConfiguration.baseURL.absoluteString,
-                        "provider.model": providerConfiguration.model
+                        "provider.model": providerConfiguration.model,
+                        "provider.id": providerConfiguration.providerID ?? "",
+                        "provider.protocol": providerConfiguration.protocolName ?? "",
+                        "provider.authMode": providerConfiguration.authModeName ?? "",
+                        "provider.keyReference": providerConfiguration.apiKeyReference,
+                        "provider.fallbackKeyReferences": (providerConfiguration.fallbackAPIKeyReferences ?? []).joined(separator: ","),
+                        "provider.sameProviderFailover": providerConfiguration.allowSameProviderKeyFailover == true ? "true" : "false"
                     ]
                 )
                 checkpoint.sessionID = session.id
@@ -235,6 +241,12 @@ public actor AgentCore {
                 checkpoint.payload["provider.name"] = providerConfiguration.name
                 checkpoint.payload["provider.baseURL"] = providerConfiguration.baseURL.absoluteString
                 checkpoint.payload["provider.model"] = providerConfiguration.model
+                checkpoint.payload["provider.id"] = providerConfiguration.providerID ?? ""
+                checkpoint.payload["provider.protocol"] = providerConfiguration.protocolName ?? ""
+                checkpoint.payload["provider.authMode"] = providerConfiguration.authModeName ?? ""
+                checkpoint.payload["provider.keyReference"] = providerConfiguration.apiKeyReference
+                checkpoint.payload["provider.fallbackKeyReferences"] = (providerConfiguration.fallbackAPIKeyReferences ?? []).joined(separator: ",")
+                checkpoint.payload["provider.sameProviderFailover"] = providerConfiguration.allowSameProviderKeyFailover == true ? "true" : "false"
                 do {
                     if !session.messages.contains(where: { $0.role == .system }) {
                         session.messages.insert(ChatMessage(role: .system, content: Self.agentSafetyInstruction), at: 0)

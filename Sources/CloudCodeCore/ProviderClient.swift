@@ -11,6 +11,7 @@ public actor MemoryKeyVault: APIKeyVault {
     private var keys: [String: String]
     public init(keys: [String: String] = [:]) { self.keys = keys }
     public func set(_ value: String, for reference: String) { keys[reference] = value }
+    public func remove(_ reference: String) { keys.removeValue(forKey: reference) }
     public func key(for reference: String) async throws -> String {
         guard let value = keys[reference], !value.isEmpty else { throw ProviderError.missingAPIKey }
         return value
@@ -21,19 +22,23 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
     case missingAPIKey
     case invalidEndpoint
     case authenticationFailed(Int)
+    case capacityExhausted(Int)
     case rateLimited
     case invalidResponse(Int)
     case malformedEvent
+    case streamInterrupted
     case transport(String)
 
     public var description: String {
         switch self {
         case .missingAPIKey: return "Provider API key is missing"
         case .invalidEndpoint: return "Provider endpoint is invalid"
-        case .authenticationFailed(let code): return "Provider authentication failed (HTTP \(code)); update the API key in Settings"
+        case .authenticationFailed(let code): return "Provider authentication failed (HTTP \(code)); select another valid Key"
+        case .capacityExhausted(let code): return "Provider Key has insufficient quota/capacity (HTTP \(code)); another Key in the same Provider may be selected"
         case .rateLimited: return "Provider rate limit exceeded; retry later"
         case .invalidResponse(let code): return "Provider returned HTTP \(code)"
         case .malformedEvent: return "Provider returned malformed streaming data"
+        case .streamInterrupted: return "Provider stream ended before a terminal event"
         case .transport(let value): return value
         }
     }
@@ -58,23 +63,44 @@ public struct ProviderToolSchema: Sendable, Equatable {
         self.required = required
     }
 
-    fileprivate var jsonObject: [String: Any] {
+    fileprivate var parametersObject: [String: Any] {
         var propertyObject: [String: Any] = [:]
         for (name, type) in properties {
             propertyObject[name] = ["type": type]
         }
         return [
+            "type": "object",
+            "properties": propertyObject,
+            "required": required,
+            "additionalProperties": false
+        ]
+    }
+
+    fileprivate var openAIChatObject: [String: Any] {
+        [
             "type": "function",
             "function": [
                 "name": name,
                 "description": description,
-                "parameters": [
-                    "type": "object",
-                    "properties": propertyObject,
-                    "required": required,
-                    "additionalProperties": false
-                ]
+                "parameters": parametersObject
             ]
+        ]
+    }
+
+    fileprivate var openAIResponsesObject: [String: Any] {
+        [
+            "type": "function",
+            "name": name,
+            "description": description,
+            "parameters": parametersObject
+        ]
+    }
+
+    fileprivate var anthropicObject: [String: Any] {
+        [
+            "name": name,
+            "description": description,
+            "input_schema": parametersObject
         ]
     }
 }
@@ -88,16 +114,15 @@ public protocol ProviderStreaming: Sendable {
     ) -> AsyncThrowingStream<ProviderEvent, Error>
 }
 
-public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable {
-    private let session: URLSession
-    private let retryPolicy: RetryPolicy
+private protocol ProviderRequestBuilding {
+    var session: URLSession { get }
+    var retryPolicy: RetryPolicy { get }
+    func makeRequest(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) throws -> URLRequest
+    func consume(bytes: URLSession.AsyncBytes, continuation: AsyncThrowingStream<ProviderEvent, Error>.Continuation) async throws -> Bool
+}
 
-    public init(session: URLSession = .shared, retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 2, initialDelayNanoseconds: 1_500_000_000)) {
-        self.session = session
-        self.retryPolicy = retryPolicy
-    }
-
-    public func stream(
+private extension ProviderRequestBuilding {
+    func requestStream(
         configuration: ProviderConfiguration,
         apiKey: String,
         messages: [ChatMessage],
@@ -112,54 +137,14 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable {
                         let request = try makeRequest(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
                         let (bytes, response) = try await session.bytes(for: request)
                         guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("Missing HTTP response") }
-                        if let statusError = ProviderHTTPClassifier.error(for: http.statusCode) {
-                            throw statusError
+                        if !(200..<300).contains(http.statusCode) {
+                            var body = Data()
+                            for try await byte in bytes {
+                                if body.count < 262_144 { body.append(byte) }
+                            }
+                            throw ProviderHTTPClassifier.error(for: http.statusCode, body: body) ?? ProviderError.invalidResponse(http.statusCode)
                         }
-
-                        var toolCallState: [Int: ToolCallAccumulator] = [:]
-                        var sawValidStreamEvent = false
-                        for try await line in bytes.lines {
-                            if Task.isCancelled { throw CancellationError() }
-                            guard line.hasPrefix("data:") else { continue }
-                            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-                            if payload == "[DONE]" {
-                                sawValidStreamEvent = true
-                                break
-                            }
-                            guard let data = payload.data(using: .utf8),
-                                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                                  let choices = object["choices"] as? [[String: Any]],
-                                  let delta = choices.first?["delta"] as? [String: Any] else { continue }
-                            sawValidStreamEvent = true
-
-                            if let content = delta["content"] as? String, !content.isEmpty {
-                                responseStarted = true
-                                continuation.yield(.token(content))
-                            }
-
-                            if let toolCalls = delta["tool_calls"] as? [[String: Any]], !toolCalls.isEmpty {
-                                responseStarted = true
-                                for raw in toolCalls {
-                                    let index = raw["index"] as? Int ?? 0
-                                    var accumulator = toolCallState[index] ?? ToolCallAccumulator()
-                                    if let id = raw["id"] as? String { accumulator.id = id }
-                                    if let function = raw["function"] as? [String: Any] {
-                                        if let name = function["name"] as? String { accumulator.name += name }
-                                        if let arguments = function["arguments"] as? String { accumulator.arguments += arguments }
-                                    }
-                                    toolCallState[index] = accumulator
-                                }
-                            }
-                        }
-
-                        guard sawValidStreamEvent else { throw ProviderError.malformedEvent }
-
-                        for index in toolCallState.keys.sorted() {
-                            if let call = toolCallState[index], !call.name.isEmpty {
-                                guard !call.id.isEmpty else { throw ProviderError.malformedEvent }
-                                continuation.yield(.toolCall(id: call.id, name: call.name, argumentsJSON: call.arguments.isEmpty ? "{}" : call.arguments))
-                            }
-                        }
+                        responseStarted = try await consume(bytes: bytes, continuation: continuation)
                         continuation.yield(.finished)
                         continuation.finish()
                         return
@@ -179,7 +164,7 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable {
                         do {
                             try await Task.sleep(nanoseconds: overflow ? UInt64.max / 4 : delay)
                         } catch {
-                            continuation.finish()
+                            continuation.finish(throwing: CancellationError())
                             return
                         }
                     }
@@ -188,70 +173,420 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable {
             continuation.onTermination = { _ in task.cancel() }
         }
     }
+}
 
-    private func makeRequest(
-        configuration: ProviderConfiguration,
-        apiKey: String,
-        messages: [ChatMessage],
-        tools: [ProviderToolSchema]
-    ) throws -> URLRequest {
-        let url: URL
-        if configuration.baseURL.path.hasSuffix("/chat/completions") {
-            url = configuration.baseURL
-        } else {
-            url = configuration.baseURL.appendingPathComponent("chat/completions")
-        }
-        guard url.scheme == "https" || url.host == "localhost" else { throw ProviderError.invalidEndpoint }
+public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, ProviderRequestBuilding {
+    fileprivate let session: URLSession
+    fileprivate let retryPolicy: RetryPolicy
 
+    public init(session: URLSession = .shared, retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 2, initialDelayNanoseconds: 1_500_000_000)) {
+        self.session = session
+        self.retryPolicy = retryPolicy
+    }
+
+    public func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
+        requestStream(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
+    }
+
+    fileprivate func makeRequest(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) throws -> URLRequest {
+        let url = try ProviderEndpoint.endpoint(baseURL: configuration.baseURL, path: "chat/completions")
         var body: [String: Any] = [
             "model": configuration.model,
             "stream": true,
-            "messages": messages.map(providerMessageObject)
+            "messages": messages.map(openAIMessageObject)
         ]
         if !tools.isEmpty {
-            body["tools"] = tools.map(\.jsonObject)
+            body["tools"] = tools.map(\.openAIChatObject)
             body["tool_choice"] = "auto"
         }
+        return try ProviderRequestFactory.jsonPOST(url: url, apiKey: apiKey, authMode: ProviderRequestFactory.authMode(configuration), body: body)
+    }
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        request.timeoutInterval = 120
+    fileprivate func consume(bytes: URLSession.AsyncBytes, continuation: AsyncThrowingStream<ProviderEvent, Error>.Continuation) async throws -> Bool {
+        var toolCallState: [Int: ToolCallAccumulator] = [:]
+        var sawEvent = false
+        var terminal = false
+        var outputStarted = false
+        for try await line in bytes.lines {
+            try Task.checkCancellation()
+            guard line.hasPrefix("data:") else { continue }
+            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            if payload == "[DONE]" {
+                sawEvent = true
+                terminal = true
+                break
+            }
+            guard let data = payload.data(using: .utf8),
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let choices = object["choices"] as? [[String: Any]],
+                  let delta = choices.first?["delta"] as? [String: Any] else { continue }
+            sawEvent = true
+            if let content = delta["content"] as? String, !content.isEmpty {
+                outputStarted = true
+                continuation.yield(.token(content))
+            }
+            if let toolCalls = delta["tool_calls"] as? [[String: Any]], !toolCalls.isEmpty {
+                outputStarted = true
+                for raw in toolCalls {
+                    let index = raw["index"] as? Int ?? 0
+                    var accumulator = toolCallState[index] ?? ToolCallAccumulator()
+                    if let id = raw["id"] as? String { accumulator.id = id }
+                    if let function = raw["function"] as? [String: Any] {
+                        if let name = function["name"] as? String { accumulator.name += name }
+                        if let arguments = function["arguments"] as? String { accumulator.arguments += arguments }
+                    }
+                    toolCallState[index] = accumulator
+                }
+            }
+        }
+        guard sawEvent else { throw ProviderError.malformedEvent }
+        guard terminal else { throw outputStarted ? ProviderError.streamInterrupted : ProviderError.malformedEvent }
+        for index in toolCallState.keys.sorted() {
+            if let call = toolCallState[index], !call.name.isEmpty {
+                guard !call.id.isEmpty else { throw ProviderError.malformedEvent }
+                continuation.yield(.toolCall(id: call.id, name: call.name, argumentsJSON: call.arguments.isEmpty ? "{}" : call.arguments))
+            }
+        }
+        return outputStarted || !toolCallState.isEmpty
+    }
+}
+
+public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequestBuilding {
+    fileprivate let session: URLSession
+    fileprivate let retryPolicy: RetryPolicy
+
+    public init(session: URLSession = .shared, retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 2, initialDelayNanoseconds: 1_500_000_000)) {
+        self.session = session
+        self.retryPolicy = retryPolicy
+    }
+
+    public func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
+        requestStream(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
+    }
+
+    fileprivate func makeRequest(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) throws -> URLRequest {
+        let url = try ProviderEndpoint.endpoint(baseURL: configuration.baseURL, path: "messages")
+        let systemText = messages.filter { $0.role == .system }.map(\.content).joined(separator: "\n\n")
+        let nonSystem = messages.filter { $0.role != .system }
+        var body: [String: Any] = [
+            "model": configuration.model,
+            "max_tokens": 8192,
+            "stream": true,
+            "messages": anthropicMessages(nonSystem)
+        ]
+        if !systemText.isEmpty { body["system"] = systemText }
+        if !tools.isEmpty { body["tools"] = tools.map(\.anthropicObject) }
+        var request = try ProviderRequestFactory.jsonPOST(url: url, apiKey: apiKey, authMode: ProviderRequestFactory.authMode(configuration), body: body)
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         return request
     }
 
-    private func providerMessageObject(_ message: ChatMessage) -> [String: Any] {
-        var object: [String: Any] = ["role": message.role.rawValue, "content": message.content]
-        if message.role == .tool, let toolCallID = message.providerMetadata["tool_call_id"] {
-            object["tool_call_id"] = toolCallID
-            if let toolName = message.providerMetadata["tool_name"] { object["name"] = toolName }
+    fileprivate func consume(bytes: URLSession.AsyncBytes, continuation: AsyncThrowingStream<ProviderEvent, Error>.Continuation) async throws -> Bool {
+        var calls: [Int: ToolCallAccumulator] = [:]
+        var sawEvent = false
+        var terminal = false
+        var outputStarted = false
+        for try await line in bytes.lines {
+            try Task.checkCancellation()
+            guard line.hasPrefix("data:") else { continue }
+            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            guard let data = payload.data(using: .utf8),
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let type = object["type"] as? String else { continue }
+            sawEvent = true
+            switch type {
+            case "content_block_start":
+                let index = object["index"] as? Int ?? 0
+                if let block = object["content_block"] as? [String: Any], block["type"] as? String == "tool_use" {
+                    var call = ToolCallAccumulator()
+                    call.id = block["id"] as? String ?? ""
+                    call.name = block["name"] as? String ?? ""
+                    if let input = block["input"], JSONSerialization.isValidJSONObject(input),
+                       let inputData = try? JSONSerialization.data(withJSONObject: input),
+                       let inputJSON = String(data: inputData, encoding: .utf8), inputJSON != "{}" {
+                        call.arguments = inputJSON
+                    }
+                    calls[index] = call
+                    outputStarted = true
+                }
+            case "content_block_delta":
+                let index = object["index"] as? Int ?? 0
+                guard let delta = object["delta"] as? [String: Any], let deltaType = delta["type"] as? String else { continue }
+                if deltaType == "text_delta", let text = delta["text"] as? String, !text.isEmpty {
+                    outputStarted = true
+                    continuation.yield(.token(text))
+                } else if deltaType == "input_json_delta", let partial = delta["partial_json"] as? String {
+                    var call = calls[index] ?? ToolCallAccumulator()
+                    call.arguments += partial
+                    calls[index] = call
+                    outputStarted = true
+                }
+            case "message_stop":
+                terminal = true
+            case "error":
+                throw ProviderError.transport("Anthropic stream returned an error event")
+            default:
+                break
+            }
         }
-        if message.role == .assistant,
-           let toolCallID = message.providerMetadata["tool_call_id"],
-           let toolName = message.providerMetadata["tool_name"] {
-            object["content"] = NSNull()
-            object["tool_calls"] = [[
-                "id": toolCallID,
-                "type": "function",
-                "function": [
-                    "name": toolName,
-                    "arguments": message.providerMetadata["tool_arguments"] ?? "{}"
-                ]
-            ]]
+        guard sawEvent else { throw ProviderError.malformedEvent }
+        guard terminal else { throw outputStarted ? ProviderError.streamInterrupted : ProviderError.malformedEvent }
+        for index in calls.keys.sorted() {
+            guard let call = calls[index], !call.id.isEmpty, !call.name.isEmpty else { throw ProviderError.malformedEvent }
+            continuation.yield(.toolCall(id: call.id, name: call.name, argumentsJSON: call.arguments.isEmpty ? "{}" : call.arguments))
         }
-        return object
+        return outputStarted || !calls.isEmpty
+    }
+}
+
+public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, ProviderRequestBuilding {
+    fileprivate let session: URLSession
+    fileprivate let retryPolicy: RetryPolicy
+
+    public init(session: URLSession = .shared, retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 2, initialDelayNanoseconds: 1_500_000_000)) {
+        self.session = session
+        self.retryPolicy = retryPolicy
+    }
+
+    public func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
+        requestStream(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
+    }
+
+    fileprivate func makeRequest(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) throws -> URLRequest {
+        let url = try ProviderEndpoint.endpoint(baseURL: configuration.baseURL, path: "responses")
+        var body: [String: Any] = [
+            "model": configuration.model,
+            "stream": true,
+            "input": responsesInput(messages)
+        ]
+        if !tools.isEmpty { body["tools"] = tools.map(\.openAIResponsesObject) }
+        return try ProviderRequestFactory.jsonPOST(url: url, apiKey: apiKey, authMode: ProviderRequestFactory.authMode(configuration), body: body)
+    }
+
+    fileprivate func consume(bytes: URLSession.AsyncBytes, continuation: AsyncThrowingStream<ProviderEvent, Error>.Continuation) async throws -> Bool {
+        var calls: [String: ToolCallAccumulator] = [:]
+        var sawEvent = false
+        var terminal = false
+        var outputStarted = false
+        for try await line in bytes.lines {
+            try Task.checkCancellation()
+            guard line.hasPrefix("data:") else { continue }
+            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            if payload == "[DONE]" { terminal = true; sawEvent = true; break }
+            guard let data = payload.data(using: .utf8),
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let type = object["type"] as? String else { continue }
+            sawEvent = true
+            switch type {
+            case "response.output_text.delta":
+                if let delta = object["delta"] as? String, !delta.isEmpty {
+                    outputStarted = true
+                    continuation.yield(.token(delta))
+                }
+            case "response.output_item.added":
+                if let item = object["item"] as? [String: Any], item["type"] as? String == "function_call" {
+                    let itemID = item["id"] as? String ?? UUID().uuidString
+                    var call = ToolCallAccumulator()
+                    call.id = item["call_id"] as? String ?? itemID
+                    call.name = item["name"] as? String ?? ""
+                    call.arguments = item["arguments"] as? String ?? ""
+                    calls[itemID] = call
+                    outputStarted = true
+                }
+            case "response.function_call_arguments.delta":
+                let itemID = object["item_id"] as? String ?? object["output_item_id"] as? String ?? ""
+                guard !itemID.isEmpty else { continue }
+                var call = calls[itemID] ?? ToolCallAccumulator()
+                if let delta = object["delta"] as? String { call.arguments += delta }
+                calls[itemID] = call
+                outputStarted = true
+            case "response.function_call_arguments.done":
+                let itemID = object["item_id"] as? String ?? object["output_item_id"] as? String ?? ""
+                if !itemID.isEmpty, let arguments = object["arguments"] as? String {
+                    var call = calls[itemID] ?? ToolCallAccumulator()
+                    call.arguments = arguments
+                    calls[itemID] = call
+                }
+            case "response.completed":
+                terminal = true
+            case "response.failed", "error":
+                throw ProviderError.transport("Responses stream returned an error event")
+            default:
+                break
+            }
+        }
+        guard sawEvent else { throw ProviderError.malformedEvent }
+        guard terminal else { throw outputStarted ? ProviderError.streamInterrupted : ProviderError.malformedEvent }
+        for key in calls.keys.sorted() {
+            guard let call = calls[key], !call.id.isEmpty, !call.name.isEmpty else { throw ProviderError.malformedEvent }
+            continuation.yield(.toolCall(id: call.id, name: call.name, argumentsJSON: call.arguments.isEmpty ? "{}" : call.arguments))
+        }
+        return outputStarted || !calls.isEmpty
+    }
+}
+
+public actor ProviderRequestKeyState {
+    private struct Entry: Sendable {
+        var reference: String
+        var touchedAt: Date
+    }
+
+    private var entries: [UUID: Entry] = [:]
+    private let ttl: TimeInterval
+
+    public init(ttl: TimeInterval = 60 * 60) {
+        self.ttl = max(60, ttl)
+    }
+
+    public func preferredReference(configurationID: UUID, allowedReferences: [String], fallback: String) -> String {
+        prune()
+        guard let entry = entries[configurationID], allowedReferences.contains(entry.reference) else { return fallback }
+        entries[configurationID]?.touchedAt = Date()
+        return entry.reference
+    }
+
+    public func markSuccessful(configurationID: UUID, reference: String) {
+        prune()
+        entries[configurationID] = Entry(reference: reference, touchedAt: Date())
+    }
+
+    private func prune(now: Date = Date()) {
+        entries = entries.filter { now.timeIntervalSince($0.value.touchedAt) <= ttl }
+    }
+}
+
+public struct ProviderClientRouter: ProviderStreaming, Sendable {
+    private let keyVault: APIKeyVault
+    private let anthropic: ProviderStreaming
+    private let openAIChat: ProviderStreaming
+    private let responses: ProviderStreaming
+    private let requestKeyState: ProviderRequestKeyState
+
+    public init(
+        keyVault: APIKeyVault,
+        anthropic: ProviderStreaming = AnthropicProviderClient(),
+        openAIChat: ProviderStreaming = OpenAICompatibleProviderClient(),
+        responses: ProviderStreaming = OpenAIResponsesProviderClient(),
+        requestKeyState: ProviderRequestKeyState = ProviderRequestKeyState()
+    ) {
+        self.keyVault = keyVault
+        self.anthropic = anthropic
+        self.openAIChat = openAIChat
+        self.responses = responses
+        self.requestKeyState = requestKeyState
+    }
+
+    public func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                let client = clientFor(configuration)
+                let fallbackReferences = (configuration.fallbackAPIKeyReferences ?? []).filter { $0 != configuration.apiKeyReference }
+                let allowedReferences = [configuration.apiKeyReference] + fallbackReferences
+                let preferredReference = await requestKeyState.preferredReference(
+                    configurationID: configuration.id,
+                    allowedReferences: allowedReferences,
+                    fallback: configuration.apiKeyReference
+                )
+                let orderedReferences: [String]
+                if configuration.allowSameProviderKeyFailover == true,
+                   let preferredIndex = allowedReferences.firstIndex(of: preferredReference) {
+                    orderedReferences = (0..<allowedReferences.count).map { offset in
+                        allowedReferences[(preferredIndex + offset) % allowedReferences.count]
+                    }
+                } else {
+                    orderedReferences = [configuration.apiKeyReference]
+                }
+
+                var candidates: [(String, String)] = []
+                for reference in orderedReferences {
+                    if reference == configuration.apiKeyReference {
+                        candidates.append((reference, apiKey))
+                    } else if let key = try? await keyVault.key(for: reference) {
+                        candidates.append((reference, key))
+                    }
+                }
+
+                var lastError: Error = ProviderError.missingAPIKey
+                for (index, candidate) in candidates.enumerated() {
+                    var emittedOutput = false
+                    do {
+                        let stream = client.stream(configuration: configuration, apiKey: candidate.1, messages: messages, tools: tools)
+                        for try await event in stream {
+                            try Task.checkCancellation()
+                            switch event {
+                            case .token, .toolCall:
+                                emittedOutput = true
+                            case .finished:
+                                break
+                            }
+                            continuation.yield(event)
+                        }
+                        await requestKeyState.markSuccessful(configurationID: configuration.id, reference: candidate.0)
+                        continuation.finish()
+                        return
+                    } catch is CancellationError {
+                        continuation.finish(throwing: CancellationError())
+                        return
+                    } catch {
+                        lastError = error
+                        let hasAnother = index + 1 < candidates.count
+                        let mayRotate = !emittedOutput && hasAnother && configuration.allowSameProviderKeyFailover == true && ProviderKeyRotationClassifier.shouldRotate(error)
+                        if mayRotate { continue }
+                        continuation.finish(throwing: error)
+                        return
+                    }
+                }
+                continuation.finish(throwing: lastError)
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private func clientFor(_ configuration: ProviderConfiguration) -> ProviderStreaming {
+        switch ProviderProtocol(rawValue: configuration.protocolName ?? "") {
+        case .anthropic: return anthropic
+        case .openAIResponses: return responses
+        case .openAIChat, .none: return openAIChat
+        }
     }
 }
 
 public enum ProviderHTTPClassifier {
-    public static func error(for statusCode: Int) -> ProviderError? {
+    public static func error(for statusCode: Int, body: Data = Data()) -> ProviderError? {
         switch statusCode {
-        case 200..<300: return nil
-        case 401, 403: return .authenticationFailed(statusCode)
-        case 429: return .rateLimited
-        default: return .invalidResponse(statusCode)
+        case 200..<300:
+            return nil
+        case 429:
+            return .rateLimited
+        default:
+            break
+        }
+
+        let text = String(data: body.prefix(262_144), encoding: .utf8)?.lowercased() ?? ""
+        if ProviderFailureEvidence.isCapacity(text) {
+            return .capacityExhausted(statusCode)
+        }
+        if statusCode == 401 {
+            return .authenticationFailed(statusCode)
+        }
+        if statusCode == 403, ProviderFailureEvidence.isCredential(text) {
+            return .authenticationFailed(statusCode)
+        }
+        if statusCode == 403, text.isEmpty {
+            return .authenticationFailed(statusCode)
+        }
+        return .invalidResponse(statusCode)
+    }
+}
+
+public enum ProviderKeyRotationClassifier {
+    public static func shouldRotate(_ error: Error) -> Bool {
+        guard let providerError = error as? ProviderError else { return false }
+        switch providerError {
+        case .authenticationFailed, .capacityExhausted:
+            return true
+        case .missingAPIKey, .invalidEndpoint, .rateLimited, .invalidResponse, .malformedEvent, .streamInterrupted, .transport:
+            return false
         }
     }
 }
@@ -264,7 +599,7 @@ public enum ProviderRetryClassifier {
                 return true
             case .invalidResponse(let code):
                 return (500...599).contains(code)
-            case .transport:
+            case .capacityExhausted, .transport, .streamInterrupted:
                 return false
             case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .malformedEvent:
                 return false
@@ -286,6 +621,129 @@ public enum ProviderRetryClassifier {
         default:
             return false
         }
+    }
+}
+
+private enum ProviderFailureEvidence {
+    static func isCredential(_ text: String) -> Bool {
+        let markers = [
+            "invalid key", "key invalid", "invalid api key", "api key invalid", "key expired",
+            "expired key", "api key expired", "authentication failed", "unauthorized api key",
+            "无效密钥", "密钥失效", "密钥过期"
+        ]
+        return markers.contains { text.contains($0) }
+    }
+
+    static func isCapacity(_ text: String) -> Bool {
+        let markers = [
+            "insufficient_user_quota", "insufficient quota", "quota exhausted", "insufficient balance",
+            "balance insufficient", "pre-charge failed", "预扣费额度失败", "用户剩余额度", "余额不足",
+            "余额已用尽", "额度不足", "额度已用尽"
+        ]
+        return markers.contains { text.contains($0) }
+    }
+}
+
+private enum ProviderEndpoint {
+    static func endpoint(baseURL: URL, path: String) throws -> URL {
+        guard baseURL.scheme == "https" || baseURL.host == "localhost" else { throw ProviderError.invalidEndpoint }
+        var url = baseURL
+        let normalizedPath = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if normalizedPath.hasSuffix(path) { return url }
+        if normalizedPath.isEmpty {
+            url.appendPathComponent("v1")
+        } else if normalizedPath != "v1" && !normalizedPath.hasSuffix("/v1") {
+            url.appendPathComponent("v1")
+        }
+        url.appendPathComponent(path)
+        return url
+    }
+}
+
+private enum ProviderRequestFactory {
+    static func authMode(_ configuration: ProviderConfiguration) -> ProviderAuthMode {
+        ProviderAuthMode(rawValue: configuration.authModeName ?? "") ?? .bearer
+    }
+
+    static func jsonPOST(url: URL, apiKey: String, authMode: ProviderAuthMode, body: [String: Any]) throws -> URLRequest {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        switch authMode {
+        case .bearer:
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        case .xAPIKey:
+            request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        case .both:
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.timeoutInterval = 120
+        return request
+    }
+}
+
+private func openAIMessageObject(_ message: ChatMessage) -> [String: Any] {
+    var object: [String: Any] = ["role": message.role.rawValue, "content": message.content]
+    if message.role == .tool, let toolCallID = message.providerMetadata["tool_call_id"] {
+        object["tool_call_id"] = toolCallID
+        if let toolName = message.providerMetadata["tool_name"] { object["name"] = toolName }
+    }
+    if message.role == .assistant,
+       let toolCallID = message.providerMetadata["tool_call_id"],
+       let toolName = message.providerMetadata["tool_name"] {
+        object["content"] = NSNull()
+        object["tool_calls"] = [[
+            "id": toolCallID,
+            "type": "function",
+            "function": [
+                "name": toolName,
+                "arguments": message.providerMetadata["tool_arguments"] ?? "{}"
+            ]
+        ]]
+    }
+    return object
+}
+
+private func anthropicMessages(_ messages: [ChatMessage]) -> [[String: Any]] {
+    messages.map { message in
+        if message.role == .tool, let callID = message.providerMetadata["tool_call_id"] {
+            return ["role": "user", "content": [["type": "tool_result", "tool_use_id": callID, "content": message.content]]]
+        }
+        if message.role == .assistant,
+           let callID = message.providerMetadata["tool_call_id"],
+           let name = message.providerMetadata["tool_name"] {
+            let arguments = message.providerMetadata["tool_arguments"] ?? "{}"
+            let input: Any
+            if let data = arguments.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) {
+                input = object
+            } else {
+                input = [:]
+            }
+            return ["role": "assistant", "content": [["type": "tool_use", "id": callID, "name": name, "input": input]]]
+        }
+        let role = message.role == .assistant ? "assistant" : "user"
+        return ["role": role, "content": message.content]
+    }
+}
+
+private func responsesInput(_ messages: [ChatMessage]) -> [[String: Any]] {
+    messages.map { message in
+        if message.role == .tool, let callID = message.providerMetadata["tool_call_id"] {
+            return ["type": "function_call_output", "call_id": callID, "output": message.content]
+        }
+        if message.role == .assistant,
+           let callID = message.providerMetadata["tool_call_id"],
+           let name = message.providerMetadata["tool_name"] {
+            return [
+                "type": "function_call",
+                "call_id": callID,
+                "name": name,
+                "arguments": message.providerMetadata["tool_arguments"] ?? "{}"
+            ]
+        }
+        return ["role": message.role.rawValue, "content": message.content]
     }
 }
 

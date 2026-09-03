@@ -83,12 +83,26 @@ jobs:
             echo "FAIL: direct filesystem-root deletion primitive found" >&2
             exit 1
           fi
+          if grep -R -E --line-number 'sk-[A-Za-z0-9]{20,}' Sources Tests docs scripts .github; then
+            echo "FAIL: API-Key-shaped material found in tracked source/test/docs/workflow files" >&2
+            exit 1
+          fi
+          if find . -path './.git' -prune -o -type f \( -name 'CloudCode-Provider-Bootstrap.json' -o -name '*.provider-bootstrap.json' \) -print | grep -q .; then
+            echo "FAIL: private Provider bootstrap exists in checkout" >&2
+            exit 1
+          fi
+          if unzip -l build/CloudCode-iOS-unsigned.ipa | grep -E 'Provider-Bootstrap|GeneratedSecrets|/Secrets/'; then
+            echo "FAIL: private bootstrap material was packaged into PUBLIC_UNSIGNED_IPA" >&2
+            exit 1
+          fi
           grep -R --line-number 'DEVICE_VALIDATION_REQUIRED\|deviceValidationRequired' Sources docs >/dev/null
+          echo 'PUBLIC_UNSIGNED_IPA: no embedded Provider credentials detected'
+          echo 'PRIVATE_KEY_BOOTSTRAP_REQUIRED: generate locally with scripts/generate_private_bootstrap.py'
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: CloudCode-iOS-unsigned
+          name: CloudCode-iOS-PUBLIC_UNSIGNED_IPA
           path: build/CloudCode-iOS-unsigned.ipa
           if-no-files-found: error
           retention-days: 14

@@ -7,8 +7,12 @@ Cloud Code iOS
 ├── Agent Core
 │   ├── SessionStore
 │   ├── AgentCore tool loop
-│   ├── streaming provider client
-│   ├── conservative retry
+│   ├── Provider Catalog (Provider → Key → Model)
+│   ├── ProviderClientRouter
+│   │   ├── Anthropic Messages
+│   │   ├── OpenAI Chat Completions
+│   │   └── OpenAI Responses
+│   ├── conservative retry / same-Provider Key failover
 │   ├── checkpoints
 │   └── verification
 ├── Phone Intelligence
@@ -47,6 +51,16 @@ Cloud Code iOS
     ├── Trash
     └── Settings
 ```
+
+## Provider catalog and credentials
+
+The iOS app uses a build-time metadata snapshot of the enabled desktop CloudRuntime Provider registry. SeekAI is intentionally excluded. Tabitoken is a native iOS Provider and talks directly to `https://tabitoken.com/v1/messages`; the Windows localhost relay is never copied into the mobile runtime.
+
+Selection is user-owned and scoped as `Provider → Key Slot → Model`. Per-Key model catalogs override Provider-wide models when verified metadata exists. The protocol router selects Anthropic Messages, OpenAI Chat, or OpenAI Responses from Provider/Key/Model metadata rather than from a UI protocol switch. Automatic cross-Provider failover is forbidden. Tabitoken may rotate to the next configured Tabitoken Key only for explicit credential or quota/capacity evidence, never for 429, generic 5xx, ambiguous network failures, or after stream output has begun.
+
+Provider metadata and selected IDs may be persisted. Raw credentials may not. API Keys are stored in iOS Keychain under a Provider/Key-Slot reference. The public GitHub artifact is `PUBLIC_UNSIGNED_IPA` and contains no bootstrap credentials. A private local bootstrap can be generated with `scripts/generate_private_bootstrap.py`; the bootstrap is Git-ignored, imported once into Keychain, verified by fingerprint, and the plaintext source is then deleted. If deletion fails, the app reports that condition instead of claiming a safe import.
+
+Custom Providers are added with Label, HTTPS Base URL and API Key. The app discovers `/v1/models`, detects the working auth mode and performs one-token probes for Anthropic Messages, OpenAI Chat, and OpenAI Responses before making the Provider selectable.
 
 ## Tool-first routing
 

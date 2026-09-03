@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import CloudCodeCore
 
 struct ContentView: View {
@@ -296,21 +297,102 @@ private struct TrashView: View {
 
 private struct SettingsView: View {
     @ObservedObject var model: CloudCodeViewModel
+    @State private var selectedKeyInput = ""
+    @State private var customModelInput = ""
+    @State private var showCustomProvider = false
+    @State private var showBootstrapImporter = false
 
     var body: some View {
         NavigationStack {
             Form {
                 Section("Provider") {
-                    TextField("Name", text: $model.providerName)
-                    TextField("Base URL", text: $model.providerBaseURL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    TextField("Model", text: $model.providerModel)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    SecureField("API key (stored in Keychain)", text: $model.providerAPIKey)
-                    Button("Save Provider") { model.saveProvider() }
+                    Picker("Provider", selection: Binding(
+                        get: { model.selectedProviderID },
+                        set: { model.selectProvider($0) }
+                    )) {
+                        ForEach(model.providerProfiles.filter(\.enabled)) { provider in
+                            Text(provider.displayName).tag(provider.id)
+                        }
+                    }
+
+                    Picker("Key", selection: Binding(
+                        get: { model.selectedKeySlotID },
+                        set: { model.selectKey($0) }
+                    )) {
+                        ForEach(model.availableKeySlots) { slot in
+                            Text("\(slot.label) · \(slot.status.rawValue)").tag(slot.id)
+                        }
+                    }
+                    .disabled(model.availableKeySlots.isEmpty)
+
+                    Picker("Model", selection: Binding(
+                        get: { model.selectedModel },
+                        set: { model.selectModel($0) }
+                    )) {
+                        ForEach(model.availableModels, id: \.self) { modelID in
+                            Text(modelID).tag(modelID)
+                        }
+                        if model.selectedProvider?.customModelAllowed == true,
+                           !model.selectedModel.isEmpty,
+                           !model.availableModels.contains(model.selectedModel) {
+                            Text("Custom · \(model.selectedModel)").tag(model.selectedModel)
+                        }
+                    }
+                    .disabled(model.availableModels.isEmpty)
+
+                    if let provider = model.selectedProvider {
+                        LabeledContent("Status", value: provider.readiness.rawValue)
+                        LabeledContent("Keychain", value: model.selectedKeyIsInstalled ? "READY" : "KEY REQUIRED")
+                    }
                 }
+
+                Section("Key management") {
+                    SecureField("Replace selected Key", text: $selectedKeyInput)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Button("Store selected Key in Keychain") {
+                        guard model.setKey(selectedKeyInput) else { return }
+                        selectedKeyInput = ""
+                    }
+                    .disabled(selectedKeyInput.isEmpty)
+
+                    Button("Import private Key bootstrap") { showBootstrapImporter = true }
+                    Text("The public IPA contains no API Keys. A private bootstrap is imported into iOS Keychain and its plaintext source is deleted; Key values are never stored in UserDefaults.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                if model.selectedProvider?.customModelAllowed == true {
+                    Section("Custom Model") {
+                        TextField("Model ID", text: $customModelInput)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        Button("Use Custom Model") {
+                            let value = customModelInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !value.isEmpty else { return }
+                            model.selectModel(value)
+                            customModelInput = ""
+                        }
+                        .disabled(customModelInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
+
+                Section("Provider management") {
+                    Button("Add Custom Provider") { showCustomProvider = true }
+                }
+
+                Section("Advanced") {
+                    LabeledContent("Protocol", value: model.selectedProtocol?.rawValue ?? "needs validation")
+                    if let provider = model.selectedProvider {
+                        Text(provider.baseURL.absoluteString)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                        Text("Protocol routing is selected from verified Provider/Key/Model metadata. Automatic cross-Provider failover is disabled.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 Section("Agent Permission") {
                     Picker("Mode", selection: $model.permissionMode) {
                         Text("Safe").tag(PermissionMode.safe)
@@ -330,6 +412,15 @@ private struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            .sheet(isPresented: $showCustomProvider) {
+                CustomProviderSheet(model: model, isPresented: $showCustomProvider)
+            }
+            .fileImporter(isPresented: $showBootstrapImporter, allowedContentTypes: [.json]) { result in
+                switch result {
+                case .success(let url): model.importProviderBootstrap(from: url)
+                case .failure(let error): model.lastError = String(describing: error)
+                }
+            }
         }
     }
 
@@ -338,6 +429,49 @@ private struct SettingsView: View {
         case .safe: return "Reads are generally allowed. Important modification, deletion, install/uninstall, external side effects and permanent deletion require approval."
         case .balanced: return "Ordinary writes can proceed; deletion goes to Cloud Code Trash. Important data and irreversible operations still require approval."
         case .full: return "The Agent may skip most confirmations, but Audit Log, transaction records and backups remain enabled when feasible. This mode must be selected by you."
+        }
+    }
+}
+
+private struct CustomProviderSheet: View {
+    @ObservedObject var model: CloudCodeViewModel
+    @Binding var isPresented: Bool
+    @State private var label = ""
+    @State private var baseURL = ""
+    @State private var apiKey = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Custom Provider") {
+                    TextField("Label", text: $label)
+                    TextField("Base URL", text: $baseURL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    SecureField("API Key", text: $apiKey)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+                Section {
+                    Text("Cloud Code will discover /v1/models and probe Anthropic Messages, OpenAI Chat, and OpenAI Responses with a one-token validation request. The Key is stored only in Keychain.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Add Provider")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { isPresented = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Add") {
+                        model.addCustomProvider(label: label, baseURLText: baseURL, apiKey: apiKey)
+                        apiKey = ""
+                        isPresented = false
+                    }
+                    .disabled(label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || baseURL.isEmpty || apiKey.isEmpty)
+                }
+            }
         }
     }
 }

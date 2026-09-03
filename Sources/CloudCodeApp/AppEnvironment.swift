@@ -18,10 +18,10 @@ public final class CloudCodeViewModel: ObservableObject {
     @Published public var lastError: String?
     @Published public private(set) var inFlightOperationKeys: Set<String> = []
 
-    @Published public var providerName: String
-    @Published public var providerBaseURL: String
-    @Published public var providerModel: String
-    @Published public var providerAPIKey: String = ""
+    @Published public private(set) var providerProfiles: [ProviderProfile]
+    @Published public var selectedProviderID: String
+    @Published public var selectedKeySlotID: String
+    @Published public var selectedModel: String
     @Published public var permissionMode: PermissionMode
     @Published public var browsePath: String
 
@@ -41,13 +41,12 @@ public final class CloudCodeViewModel: ObservableObject {
     private let agentCore: AgentCore
     private let resourceIndex: ProgressiveResourceIndex
     private let appKnowledge: AppKnowledgeRegistry
+    private let customProviderFileURL: URL
     private var currentTask: Task<Void, Never>?
     private var runGeneration = RunGenerationGuard()
     private var bootstrapTask: Task<Void, Never>?
     private var capabilityRefreshTask: Task<Void, Never>?
     private var didBootstrap = false
-
-    private static let keyReference = "primary-provider"
 
     public init() {
         let support = Self.supportRoot()
@@ -86,7 +85,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let keyVault = KeychainAPIKeyVault()
         let sessions = SessionStore(root: support.appendingPathComponent("Sessions", isDirectory: true))
         let checkpoints = TaskCheckpointStore(fileURL: support.appendingPathComponent("Tasks/checkpoints.json"))
-        let provider = OpenAICompatibleProviderClient()
+        let provider = ProviderClientRouter(keyVault: keyVault)
         let agent = AgentCore(
             provider: provider,
             keyVault: keyVault,
@@ -99,9 +98,19 @@ public final class CloudCodeViewModel: ObservableObject {
 
         let defaults = UserDefaults.standard
         let initialPermissionMode = PermissionMode(rawValue: defaults.string(forKey: "permission.mode") ?? "safe") ?? .safe
-        self.providerName = defaults.string(forKey: "provider.name") ?? "OpenAI-compatible"
-        self.providerBaseURL = defaults.string(forKey: "provider.baseURL") ?? "https://api.openai.com/v1"
-        self.providerModel = defaults.string(forKey: "provider.model") ?? "gpt-5.1"
+        let customProviderFileURL = support.appendingPathComponent("Provider/custom-providers.json")
+        let customProfiles = Self.loadCustomProviders(from: customProviderFileURL)
+        let allProfiles = ProviderCatalog.desktopSnapshot + customProfiles
+        let storedSelection = ProviderSelectionState(
+            providerID: defaults.string(forKey: "provider.selected.id") ?? "",
+            keySlotID: defaults.string(forKey: "provider.selected.keySlot") ?? "",
+            model: defaults.string(forKey: "provider.selected.model") ?? ""
+        )
+        let selection = ProviderSelectionResolver.reconcile(storedSelection, profiles: allProfiles)
+        self.providerProfiles = allProfiles
+        self.selectedProviderID = selection.providerID
+        self.selectedKeySlotID = selection.keySlotID
+        self.selectedModel = selection.model
         self.permissionMode = initialPermissionMode
         self.browsePath = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).path
         self.session = AgentSession(permissionMode: initialPermissionMode)
@@ -120,6 +129,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.agentCore = agent
         self.resourceIndex = ProgressiveResourceIndex(fileURL: support.appendingPathComponent("Index/resource-graph.json"))
         self.appKnowledge = AppKnowledgeRegistry(fileURL: support.appendingPathComponent("Index/app-knowledge.json"))
+        self.customProviderFileURL = customProviderFileURL
     }
 
     public func bootstrap() {
@@ -141,6 +151,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 auditEvents = Array((try await auditStore.readAll()).suffix(200).reversed())
                 interruptedTasks = await checkpointStore.interrupted()
                 try refreshFiles()
+                try await importBootstrapIfPresent()
                 didBootstrap = true
             } catch {
                 lastError = String(describing: error)
@@ -148,41 +159,109 @@ public final class CloudCodeViewModel: ObservableObject {
         }
     }
 
+    public var selectedProvider: ProviderProfile? {
+        providerProfiles.first(where: { $0.id == selectedProviderID && $0.enabled })
+    }
+
+    public var availableKeySlots: [ProviderKeySlot] {
+        selectedProvider?.keySlots ?? []
+    }
+
+    public var availableModels: [String] {
+        selectedProvider?.models(for: selectedKeySlotID) ?? []
+    }
+
+    public var selectedProtocol: ProviderProtocol? {
+        selectedProvider?.protocolFor(model: selectedModel, keySlotID: selectedKeySlotID)
+    }
+
+    public var selectedKeyIsInstalled: Bool {
+        guard let provider = selectedProvider, !selectedKeySlotID.isEmpty else { return false }
+        return keyVault.contains(ProviderCatalog.keyReference(providerID: provider.id, keySlotID: selectedKeySlotID))
+    }
+
+    public func selectProvider(_ providerID: String) {
+        let state = ProviderSelectionResolver.reconcile(
+            ProviderSelectionState(providerID: providerID, keySlotID: "", model: ""),
+            profiles: providerProfiles
+        )
+        applySelection(state)
+    }
+
+    public func selectKey(_ keySlotID: String) {
+        let state = ProviderSelectionResolver.reconcile(
+            ProviderSelectionState(providerID: selectedProviderID, keySlotID: keySlotID, model: selectedModel),
+            profiles: providerProfiles
+        )
+        applySelection(state)
+    }
+
+    public func selectModel(_ model: String) {
+        guard let provider = selectedProvider else { return }
+        let allowed = provider.models(for: selectedKeySlotID)
+        guard allowed.contains(model) || provider.customModelAllowed else { return }
+        selectedModel = model
+        persistProviderSelection()
+    }
+
     @discardableResult
-    public func saveProvider() -> Bool {
-        if !providerAPIKey.isEmpty {
-            do {
-                try keyVault.set(providerAPIKey, for: Self.keyReference)
-            } catch {
-                lastError = "Keychain: \(error)"
+    public func setKey(_ secret: String, providerID: String? = nil, keySlotID: String? = nil) -> Bool {
+        let providerID = providerID ?? selectedProviderID
+        let keySlotID = keySlotID ?? selectedKeySlotID
+        guard !providerID.isEmpty, !keySlotID.isEmpty, !secret.isEmpty else {
+            lastError = "Provider/Key/secret is missing"
+            return false
+        }
+        let reference = ProviderCatalog.keyReference(providerID: providerID, keySlotID: keySlotID)
+        do {
+            try keyVault.set(secret, for: reference)
+            if let profile = providerProfiles.first(where: { $0.id == providerID }),
+               let slot = profile.keySlots.first(where: { $0.id == keySlotID }),
+               !slot.fingerprint.isEmpty,
+               ProviderFingerprint.sha256(secret) != slot.fingerprint {
+                try? keyVault.remove(reference)
+                lastError = "The Key does not match this desktop Key slot fingerprint."
                 return false
             }
+            return true
+        } catch {
+            lastError = "Keychain: \(error)"
+            return false
         }
+    }
 
-        let defaults = UserDefaults.standard
-        defaults.set(providerName, forKey: "provider.name")
-        defaults.set(providerBaseURL, forKey: "provider.baseURL")
-        defaults.set(providerModel, forKey: "provider.model")
-        defaults.set(permissionMode.rawValue, forKey: "permission.mode")
+    @discardableResult
+    public func saveProviderSelection() -> Bool {
+        let reconciled = ProviderSelectionResolver.reconcile(
+            ProviderSelectionState(providerID: selectedProviderID, keySlotID: selectedKeySlotID, model: selectedModel),
+            profiles: providerProfiles
+        )
+        guard !reconciled.providerID.isEmpty, !reconciled.keySlotID.isEmpty, !reconciled.model.isEmpty else {
+            lastError = "Select a Provider, Key and Model first."
+            return false
+        }
+        applySelection(reconciled)
+        UserDefaults.standard.set(permissionMode.rawValue, forKey: "permission.mode")
         session.permissionMode = permissionMode
-        providerAPIKey = ""
         return true
     }
 
     public func send(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isRunning else { return }
-        guard let baseURL = URL(string: providerBaseURL), !providerModel.isEmpty else {
-            lastError = "Invalid provider URL/model"
+        guard saveProviderSelection(), let config = currentProviderConfiguration() else {
+            if lastError == nil { lastError = "Invalid Provider/Key/Model selection" }
             return
         }
-        guard saveProvider() else { return }
+        guard selectedKeyIsInstalled else {
+            lastError = "The selected Key is not installed in iOS Keychain. Import the private bootstrap or add this Key locally."
+            return
+        }
         isRunning = true
         lastError = nil
         transcript += transcript.isEmpty ? "You: \(trimmed)\n\n" : "\nYou: \(trimmed)\n\n"
-        activityLines.append("Planning request…")
+        activityLines.append("Planning request with \(config.name) / \(config.model)…")
 
-        let config = ProviderConfiguration(name: providerName, baseURL: baseURL, model: providerModel, apiKeyReference: Self.keyReference)
         let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
 
         currentTask?.cancel()
@@ -273,14 +352,24 @@ public final class CloudCodeViewModel: ObservableObject {
                       !request.isEmpty else {
                     throw CocoaError(.fileReadCorruptFile)
                 }
-                guard let baseURL = URL(string: checkpoint.payload["provider.baseURL"] ?? providerBaseURL) else {
+                let fallback = (checkpoint.payload["provider.fallbackKeyReferences"] ?? "")
+                    .split(separator: ",")
+                    .map(String.init)
+                    .filter { !$0.isEmpty }
+                guard let currentConfig = currentProviderConfiguration(),
+                      let baseURL = URL(string: checkpoint.payload["provider.baseURL"] ?? currentConfig.baseURL.absoluteString) else {
                     throw ProviderError.invalidEndpoint
                 }
                 let config = ProviderConfiguration(
-                    name: checkpoint.payload["provider.name"] ?? providerName,
+                    name: checkpoint.payload["provider.name"] ?? currentConfig.name,
                     baseURL: baseURL,
-                    model: checkpoint.payload["provider.model"] ?? providerModel,
-                    apiKeyReference: Self.keyReference
+                    model: checkpoint.payload["provider.model"] ?? currentConfig.model,
+                    apiKeyReference: checkpoint.payload["provider.keyReference"] ?? currentConfig.apiKeyReference,
+                    providerID: checkpoint.payload["provider.id"] ?? currentConfig.providerID,
+                    protocolName: checkpoint.payload["provider.protocol"] ?? currentConfig.protocolName,
+                    authModeName: checkpoint.payload["provider.authMode"] ?? currentConfig.authModeName,
+                    fallbackAPIKeyReferences: fallback.isEmpty ? currentConfig.fallbackAPIKeyReferences : fallback,
+                    allowSameProviderKeyFailover: checkpoint.payload["provider.sameProviderFailover"] == "true"
                 )
                 session = resumedSession
                 let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
@@ -416,6 +505,171 @@ public final class CloudCodeViewModel: ObservableObject {
                 refreshFilesFromDisk()
             } catch { lastError = String(describing: error) }
         }
+    }
+
+    public func addCustomProvider(label: String, baseURLText: String, apiKey: String) {
+        let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedLabel.isEmpty,
+              let baseURL = URL(string: baseURLText.trimmingCharacters(in: .whitespacesAndNewlines)),
+              baseURL.scheme == "https",
+              baseURL.host != nil,
+              !apiKey.isEmpty else {
+            lastError = "Custom Provider requires a label, HTTPS Base URL and API Key."
+            return
+        }
+        let providerID = "custom-\(UUID().uuidString.lowercased())"
+        let slotID = "slot-1"
+        let reference = ProviderCatalog.keyReference(providerID: providerID, keySlotID: slotID)
+        do {
+            try keyVault.set(apiKey, for: reference)
+        } catch {
+            lastError = "Keychain: \(error)"
+            return
+        }
+        let fingerprint = ProviderFingerprint.sha256(apiKey)
+        activityLines.append("Discovering models and protocol for \(trimmedLabel)…")
+        Task {
+            do {
+                let discovery = try await ProviderDiscoveryClient().discover(baseURL: baseURL, apiKey: apiKey)
+                guard !discovery.models.isEmpty, let preferred = discovery.protocols.first else {
+                    try? keyVault.remove(reference)
+                    lastError = "Provider discovery could not verify an inference protocol."
+                    return
+                }
+                let slot = ProviderKeySlot(
+                    id: slotID,
+                    label: "Key 1",
+                    fingerprint: fingerprint,
+                    status: .verified,
+                    models: discovery.models,
+                    protocols: discovery.protocols
+                )
+                let profile = ProviderProfile(
+                    id: providerID,
+                    displayName: trimmedLabel,
+                    baseURL: baseURL,
+                    protocols: discovery.protocols,
+                    preferredProtocol: preferred,
+                    authMode: discovery.authMode,
+                    models: discovery.models,
+                    keySlots: [slot],
+                    readiness: discovery.readiness,
+                    source: .custom,
+                    customModelAllowed: true
+                )
+                providerProfiles.append(profile)
+                try persistCustomProviders()
+                selectProvider(providerID)
+                activityLines.append("Custom Provider ready: \(trimmedLabel) (\(discovery.models.count) models).")
+            } catch {
+                try? keyVault.remove(reference)
+                lastError = "Provider discovery failed: \(error)"
+            }
+        }
+    }
+
+    public func importProviderBootstrap(from url: URL) {
+        Task {
+            do {
+                let count = try await importProviderBootstrapNow(from: url, removeSource: true)
+                activityLines.append("Imported \(count) Provider Key(s) into Keychain; bootstrap plaintext removed.")
+            } catch {
+                lastError = "Private bootstrap import failed: \(error)"
+            }
+        }
+    }
+
+    private func currentProviderConfiguration() -> ProviderConfiguration? {
+        guard let provider = selectedProvider,
+              let slot = provider.keySlots.first(where: { $0.id == selectedKeySlotID }),
+              !selectedModel.isEmpty else { return nil }
+        let protocolName = provider.protocolFor(model: selectedModel, keySlotID: slot.id)
+        let references = provider.orderedKeyReferences(selectedKeySlotID: slot.id)
+        guard let primary = references.first else { return nil }
+        return ProviderConfiguration(
+            name: provider.displayName,
+            baseURL: provider.baseURL,
+            model: selectedModel,
+            apiKeyReference: primary,
+            providerID: provider.id,
+            protocolName: protocolName.rawValue,
+            authModeName: provider.authMode.rawValue,
+            fallbackAPIKeyReferences: provider.autoRotateKeys ? Array(references.dropFirst()) : [],
+            allowSameProviderKeyFailover: provider.autoRotateKeys
+        )
+    }
+
+    private func applySelection(_ state: ProviderSelectionState) {
+        selectedProviderID = state.providerID
+        selectedKeySlotID = state.keySlotID
+        selectedModel = state.model
+        persistProviderSelection()
+    }
+
+    private func persistProviderSelection() {
+        let defaults = UserDefaults.standard
+        defaults.set(selectedProviderID, forKey: "provider.selected.id")
+        defaults.set(selectedKeySlotID, forKey: "provider.selected.keySlot")
+        defaults.set(selectedModel, forKey: "provider.selected.model")
+    }
+
+    private func persistCustomProviders() throws {
+        let profiles = providerProfiles.filter { $0.source == .custom }
+        try FileManager.default.createDirectory(at: customProviderFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(profiles).write(to: customProviderFileURL, options: .atomic)
+    }
+
+    private static func loadCustomProviders(from url: URL) -> [ProviderProfile] {
+        guard let data = try? Data(contentsOf: url),
+              let profiles = try? JSONDecoder().decode([ProviderProfile].self, from: data) else { return [] }
+        return profiles.filter { $0.enabled && $0.source == .custom }
+    }
+
+    private func importBootstrapIfPresent() async throws {
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        guard let url = documents?.appendingPathComponent("CloudCode-Provider-Bootstrap.json"),
+              FileManager.default.fileExists(atPath: url.path) else { return }
+        let count = try await importProviderBootstrapNow(from: url, removeSource: true)
+        activityLines.append("Private bootstrap imported automatically: \(count) Key(s).")
+    }
+
+    private func importProviderBootstrapNow(from url: URL, removeSource: Bool) async throws -> Int {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        var data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        defer { data.resetBytes(in: 0..<data.count) }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let payload = try decoder.decode(ProviderBootstrapPayload.self, from: data)
+        guard payload.schemaVersion == 1 else { throw CocoaError(.fileReadCorruptFile) }
+
+        var importedReferences: [String] = []
+        for providerKeys in payload.providers {
+            guard let profile = providerProfiles.first(where: { $0.id == providerKeys.providerID && $0.enabled }) else { continue }
+            for key in providerKeys.keys {
+                guard let slot = profile.keySlots.first(where: { $0.id == key.slotID }), !key.secret.isEmpty else { continue }
+                let fingerprint = ProviderFingerprint.sha256(key.secret)
+                if !slot.fingerprint.isEmpty, slot.fingerprint != fingerprint { throw CocoaError(.fileReadCorruptFile) }
+                if let declared = key.fingerprint, !declared.isEmpty, declared != fingerprint { throw CocoaError(.fileReadCorruptFile) }
+                let reference = ProviderCatalog.keyReference(providerID: profile.id, keySlotID: slot.id)
+                try keyVault.set(key.secret, for: reference)
+                importedReferences.append(reference)
+            }
+        }
+        guard !importedReferences.isEmpty else { throw ProviderError.missingAPIKey }
+        for reference in importedReferences {
+            _ = try await keyVault.key(for: reference)
+        }
+        if removeSource {
+            do {
+                try FileManager.default.removeItem(at: url)
+            } catch {
+                throw NSError(domain: "CloudCodeBootstrap", code: 1, userInfo: [NSLocalizedDescriptionKey: "Keys are in Keychain, but the plaintext bootstrap source could not be deleted. Delete that source file before continuing."])
+            }
+        }
+        return importedReferences.count
     }
 
     private func refreshFilesFromDisk() {
