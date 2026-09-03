@@ -91,6 +91,23 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(restored, original)
         XCTAssertEqual(ProviderSelectionResolver.reconcile(restored, profiles: ProviderCatalog.desktopSnapshot), original)
     }
+
+    func testSelectionReconciliationStressAlwaysProducesValidScopedState() throws {
+        let profiles = ProviderCatalog.desktopSnapshot
+        XCTAssertFalse(profiles.isEmpty)
+        for iteration in 0..<2_000 {
+            let provider = profiles[iteration % profiles.count]
+            let invalidState = ProviderSelectionState(
+                providerID: provider.id,
+                keySlotID: "stale-key-\(iteration % 17)",
+                model: "stale-model-\(iteration % 29)"
+            )
+            let reconciled = ProviderSelectionResolver.reconcile(invalidState, profiles: profiles)
+            let selectedProvider = try XCTUnwrap(profiles.first(where: { $0.id == reconciled.providerID }))
+            XCTAssertTrue(selectedProvider.keySlots.contains(where: { $0.id == reconciled.keySlotID }))
+            XCTAssertTrue(selectedProvider.models(for: reconciled.keySlotID).contains(reconciled.model))
+        }
+    }
 }
 
 final class ProviderRouterTests: XCTestCase {
@@ -275,6 +292,62 @@ final class ProviderRouterTests: XCTestCase {
             XCTAssertEqual(error as? ProviderError, .streamInterrupted)
         }
         XCTAssertEqual(text, "partial")
+    }
+
+    func testConcurrentSameProviderFailoverIsStable() async throws {
+        let vault = MemoryKeyVault(keys: ["fallback": "good"])
+        let router = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: KeyOutcomeProvider(),
+            openAIChat: KeyOutcomeProvider(),
+            responses: KeyOutcomeProvider()
+        )
+        var configuration = config(protocolName: .anthropic)
+        configuration.fallbackAPIKeyReferences = ["fallback"]
+        configuration.allowSameProviderKeyFailover = true
+
+        let outputs = try await withThrowingTaskGroup(of: String.self, returning: [String].self) { group in
+            for _ in 0..<64 {
+                group.addTask {
+                    try await collectText(router.stream(
+                        configuration: configuration,
+                        apiKey: "bad-auth",
+                        messages: [],
+                        tools: []
+                    ))
+                }
+            }
+            var values: [String] = []
+            for try await value in group { values.append(value) }
+            return values
+        }
+        XCTAssertEqual(outputs.count, 64)
+        XCTAssertTrue(outputs.allSatisfy { $0 == "good" })
+    }
+
+    func testSuccessfulFallbackPreferenceDoesNotLeakAcrossConfigurations() async throws {
+        let vault = MemoryKeyVault(keys: ["fallback": "good"])
+        let recorder = RecordingKeyOutcomeProvider()
+        let router = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: recorder,
+            openAIChat: recorder,
+            responses: recorder
+        )
+        var first = config(protocolName: .anthropic)
+        first.fallbackAPIKeyReferences = ["fallback"]
+        first.allowSameProviderKeyFailover = true
+        var second = config(protocolName: .anthropic)
+        second.fallbackAPIKeyReferences = ["fallback"]
+        second.allowSameProviderKeyFailover = true
+
+        XCTAssertNotEqual(first.id, second.id)
+        let firstOutput = try await collectText(router.stream(configuration: first, apiKey: "bad-auth", messages: [], tools: []))
+        let secondOutput = try await collectText(router.stream(configuration: second, apiKey: "bad-auth", messages: [], tools: []))
+        let seen = await recorder.keysSeen()
+        XCTAssertEqual(firstOutput, "good")
+        XCTAssertEqual(secondOutput, "good")
+        XCTAssertEqual(seen, ["bad-auth", "good", "bad-auth", "good"])
     }
 
     private func config(protocolName: ProviderProtocol) -> ProviderConfiguration {
@@ -462,6 +535,27 @@ final class ProviderKeychainTests: XCTestCase {
         XCTAssertEqual(loadedSecret, secret)
         let serializedDefaults = UserDefaults.standard.dictionaryRepresentation().values.map(String.init(describing:)).joined(separator: "\n")
         XCTAssertFalse(serializedDefaults.contains(secret))
+    }
+
+    func testRepeatedKeychainOverwriteReadAndDeleteRemainsConsistent() async throws {
+        let service = "CloudCodeIOS.Tests.\(UUID().uuidString)"
+        let vault = KeychainAPIKeyVault(service: service)
+        defer { try? vault.remove("stress") }
+        for iteration in 0..<40 {
+            let value = "stress-value-\(iteration)-\(UUID().uuidString)"
+            try vault.set(value, for: "stress")
+            let loaded = try await vault.key(for: "stress")
+            XCTAssertEqual(loaded, value)
+            XCTAssertTrue(vault.contains("stress"))
+        }
+        try vault.remove("stress")
+        XCTAssertFalse(vault.contains("stress"))
+        do {
+            _ = try await vault.key(for: "stress")
+            XCTFail("Deleted stress Key must not remain readable")
+        } catch {
+            XCTAssertEqual(error as? ProviderError, .missingAPIKey)
+        }
     }
 }
 
