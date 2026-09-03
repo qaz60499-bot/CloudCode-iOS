@@ -1249,13 +1249,17 @@ public final class CloudCodeViewModel: ObservableObject {
         Task {
             defer { endExclusiveOperation(key) }
             let preview = ApprovalPreview(title: "永久删除回收站项目", target: record.originalPath, originalSummary: "\(record.size) 字节", reason: "永久删除后无法回滚", plan: ["隔离回收站内容", "更新日志", "删除隔离内容"], risk: .permanentDestructive)
-            let approved: Bool
-            if permissionMode == .full {
-                approved = true
-            } else {
-                approved = await approvalCenter.requestApproval(preview)
+            let descriptor = ToolDescriptor(name: "trash.purge", summary: "Purge a Cloud Code Trash record.", risk: .permanentDestructive)
+            let decision = policyEngine.decision(
+                mode: permissionMode,
+                tool: descriptor,
+                targetPath: record.originalPath,
+                explicitlyPermanent: true
+            )
+            guard decision != .deny else { return }
+            if decision == .requireConfirmation {
+                guard await approvalCenter.requestApproval(preview) else { return }
             }
-            guard approved else { return }
             do {
                 try await trashService.permanentlyDelete(record.id)
                 let remaining = try await trashService.records()
