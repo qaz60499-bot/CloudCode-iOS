@@ -548,8 +548,8 @@ final class ProviderProtocolClientTests: XCTestCase {
         let anthropic = AnthropicProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
         let anthropicConfig = ProviderConfiguration(name: "a", baseURL: URL(string: "https://example.com/v1")!, model: "m", apiKeyReference: "k", protocolName: ProviderProtocol.anthropic.rawValue)
         for try await _ in anthropic.stream(configuration: anthropicConfig, apiKey: "secret", messages: messages, tools: [safeSchema]) {}
-        let anthropicRequest = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
-        let anthropicData = try XCTUnwrap(anthropicRequest.httpBody)
+        _ = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
+        let anthropicData = try XCTUnwrap(ProviderTestURLProtocol.lastRequestBody())
         let anthropicBody = try XCTUnwrap(JSONSerialization.jsonObject(with: anthropicData) as? [String: Any])
         let anthropicMessages = try XCTUnwrap(anthropicBody["messages"] as? [[String: Any]])
         let assistantBlocks = try XCTUnwrap(anthropicMessages[1]["content"] as? [[String: Any]])
@@ -559,8 +559,8 @@ final class ProviderProtocolClientTests: XCTestCase {
         let chat = OpenAICompatibleProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
         let chatConfig = ProviderConfiguration(name: "c", baseURL: URL(string: "https://example.com/v1")!, model: "m", apiKeyReference: "k", protocolName: ProviderProtocol.openAIChat.rawValue)
         for try await _ in chat.stream(configuration: chatConfig, apiKey: "secret", messages: messages, tools: [safeSchema]) {}
-        let chatRequest = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
-        let chatData = try XCTUnwrap(chatRequest.httpBody)
+        _ = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
+        let chatData = try XCTUnwrap(ProviderTestURLProtocol.lastRequestBody())
         let chatBody = try XCTUnwrap(JSONSerialization.jsonObject(with: chatData) as? [String: Any])
         let chatMessages = try XCTUnwrap(chatBody["messages"] as? [[String: Any]])
         let chatToolCalls = try XCTUnwrap(chatMessages[1]["tool_calls"] as? [[String: Any]])
@@ -572,8 +572,8 @@ final class ProviderProtocolClientTests: XCTestCase {
         let responses = OpenAIResponsesProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
         let responsesConfig = ProviderConfiguration(name: "r", baseURL: URL(string: "https://example.com/v1")!, model: "m", apiKeyReference: "k", protocolName: ProviderProtocol.openAIResponses.rawValue)
         for try await _ in responses.stream(configuration: responsesConfig, apiKey: "secret", messages: messages, tools: [safeSchema]) {}
-        let responsesRequest = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
-        let responsesData = try XCTUnwrap(responsesRequest.httpBody)
+        _ = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
+        let responsesData = try XCTUnwrap(ProviderTestURLProtocol.lastRequestBody())
         let responsesBody = try XCTUnwrap(JSONSerialization.jsonObject(with: responsesData) as? [String: Any])
         let input = try XCTUnwrap(responsesBody["input"] as? [[String: Any]])
         XCTAssertEqual(input[1]["name"] as? String, "files_read")
@@ -1072,6 +1072,7 @@ private final class ProviderTestURLProtocol: URLProtocol, @unchecked Sendable {
     private static var responseBody = Data()
     private static var responseHeaders: [String: String] = [:]
     private static var capturedRequest: URLRequest?
+    private static var capturedBody: Data?
 
     static func install(status: Int, body: Data, headers: [String: String] = [:]) {
         lock.lock()
@@ -1079,6 +1080,7 @@ private final class ProviderTestURLProtocol: URLProtocol, @unchecked Sendable {
         responseBody = body
         responseHeaders = headers
         capturedRequest = nil
+        capturedBody = nil
         lock.unlock()
     }
 
@@ -1092,12 +1094,34 @@ private final class ProviderTestURLProtocol: URLProtocol, @unchecked Sendable {
         return capturedRequest
     }
 
+    static func lastRequestBody() -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return capturedBody
+    }
+
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        var requestBody = request.httpBody
+        if requestBody == nil, let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var data = Data()
+            let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+            defer { buffer.deallocate() }
+            while stream.hasBytesAvailable {
+                let count = stream.read(buffer, maxLength: 4096)
+                if count <= 0 { break }
+                data.append(buffer, count: count)
+            }
+            requestBody = data
+        }
+
         Self.lock.lock()
         Self.capturedRequest = request
+        Self.capturedBody = requestBody
         let status = Self.responseStatus
         let body = Self.responseBody
         let headers = Self.responseHeaders
