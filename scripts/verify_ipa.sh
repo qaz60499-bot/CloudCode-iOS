@@ -107,11 +107,17 @@ for root, dirs, files in os.walk(app_path):
         with open(info_path, "rb") as handle:
             info = plistlib.load(handle)
         executable = info.get("CFBundleExecutable")
+        package_type = info.get("CFBundlePackageType")
+        if package_type == "FMWK":
+            version = info.get("CFBundleShortVersionString")
+            build = info.get("CFBundleVersion")
+            if not version or not build:
+                raise SystemExit(f"FAIL: embedded framework version metadata missing: {root}")
         if executable:
             binary = os.path.join(root, executable)
             if not os.path.isfile(binary):
                 raise SystemExit(f"FAIL: bundle executable missing: {binary}")
-print("PASS: archive paths and nested bundle executables validated")
+print("PASS: archive paths, nested bundle executables and framework metadata validated")
 PY
 
 plutil -lint "$INFO"

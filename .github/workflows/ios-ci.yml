@@ -76,6 +76,9 @@ jobs:
       - name: Verify IPA
         run: bash scripts/verify_ipa.sh build/CloudCode-iOS-unsigned.ipa
 
+      - name: Verify installability guardrails reject broken IPA metadata
+        run: bash scripts/test_verify_ipa_negative.sh build/CloudCode-iOS-unsigned.ipa
+
       - name: Static safety checks
         run: |
           set -euo pipefail

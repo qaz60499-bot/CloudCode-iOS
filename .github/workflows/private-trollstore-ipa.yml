@@ -132,6 +132,7 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/verify_private_ipa.sh build/CloudCode-iOS-TrollStore-private.ipa
+          bash scripts/test_verify_ipa_negative.sh build/CloudCode-iOS-TrollStore-private.ipa
           if find . -path './.git' -prune -o -type f \( -name '*.ipa' -o -name '*Provider-Bootstrap*.json' \) -print | grep -vE '^\./build/' | grep -q .; then
             echo "FAIL: private build material escaped the build directory" >&2
             exit 1
