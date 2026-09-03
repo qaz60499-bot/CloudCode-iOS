@@ -327,6 +327,8 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(profile.status("apps.enumerate"), .available)
         XCTAssertEqual(profile.status("apps.resolve_bundle_path"), .available)
         XCTAssertEqual(profile.status("apps.uninstall"), .available)
+        XCTAssertEqual(profile.status("execution.spawn_helper"), .available)
+        XCTAssertEqual(profile.status("execution.root_helper"), .available)
     }
 
     func testCapabilityGraphSeparatesUnprovenCapabilitiesFromExecutableTools() {
@@ -1057,6 +1059,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(ProviderHTTPClassifier.error(for: 403), .invalidResponse(403))
         XCTAssertEqual(ProviderHTTPClassifier.error(for: 429), .rateLimited)
         XCTAssertEqual(ProviderHTTPClassifier.error(for: 503), .invalidResponse(503))
+        XCTAssertEqual(ProviderError.invalidResponse(503).description, "上游厂商服务暂时不可用（HTTP 503）；这不是设备权限或卸载链路错误")
     }
 
     func testProviderAuthenticationFailureDoesNotRetry() async throws {
@@ -1416,7 +1419,7 @@ private final class ScriptedURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
-private struct VerifiedAppManagementResolver: AppContainerResolving, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, Sendable {
+private struct VerifiedAppManagementResolver: AppContainerResolving, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, RootHelperCapabilityProviding, Sendable {
     private let app = ResourceNode(
         id: ResourceID("app://com.example.visible"),
         kind: .app,
@@ -1433,6 +1436,9 @@ private struct VerifiedAppManagementResolver: AppContainerResolving, AppEnumerat
     func installedAppEnumerationDetail() async -> String { "verified test backend" }
     func canUninstallInstalledApps() async -> Bool { true }
     func installedAppUninstallDetail() async -> String { "verified test backend" }
+    func rootHelperCapability() async -> RootHelperCapabilitySnapshot {
+        RootHelperCapabilitySnapshot(available: true, detail: "verified UID 0 test helper")
+    }
 }
 
 private struct FixedCapabilityProbe: CapabilityProbing, Sendable {

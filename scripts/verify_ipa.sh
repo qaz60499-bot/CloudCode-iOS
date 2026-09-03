@@ -64,6 +64,19 @@ if ! /usr/libexec/PlistBuddy -c 'Print :CFBundleIcons:CFBundlePrimaryIcon' "$INF
   echo "FAIL: CFBundleIcons/CFBundlePrimaryIcon metadata missing" >&2
   exit 14
 fi
+HELPER="$APP_PATH/CloudCodeRootHelper"
+if [[ ! -f "$HELPER" ]]; then
+  echo "FAIL: embedded CloudCodeRootHelper missing; privileged uninstall fallback would be unavailable" >&2
+  exit 15
+fi
+if [[ "$(/usr/libexec/PlistBuddy -c 'Print :TSRootBinaries:0' "$INFO" 2>/dev/null || true)" != "CloudCodeRootHelper" ]]; then
+  echo "FAIL: TSRootBinaries does not declare CloudCodeRootHelper" >&2
+  exit 16
+fi
+if ! lipo -info "$HELPER" | grep -q 'arm64'; then
+  echo "FAIL: CloudCodeRootHelper does not contain arm64" >&2
+  exit 17
+fi
 
 file "$APP_PATH/$EXECUTABLE"
 if ! lipo -info "$APP_PATH/$EXECUTABLE" | grep -q 'arm64'; then

@@ -96,6 +96,9 @@ jobs:
             ldid -S "$framework/$framework_name"
           done < <(find "$APP_PATH" -type d -name '*.framework' -print)
           MAIN_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
+          ROOT_HELPER="$APP_PATH/CloudCodeRootHelper"
+          test -f "$ROOT_HELPER"
+          ldid -SEntitlements/TrollStore.entitlements "$ROOT_HELPER"
           ldid -SEntitlements/TrollStore.entitlements "$APP_PATH/$MAIN_EXECUTABLE"
           ENTITLEMENTS="$RUNNER_TEMP/cloudcode-privileged-entitlements.plist"
           ldid -e "$APP_PATH/$MAIN_EXECUTABLE" > "$ENTITLEMENTS"

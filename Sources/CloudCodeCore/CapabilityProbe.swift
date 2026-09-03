@@ -88,10 +88,19 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
                               "Detected dynamically. Core tools do not require ios_system."))
         records.append(record("execution.posix_spawn_symbol", .execution, Self.hasDynamicSymbol("posix_spawn") ? .available : .unavailable,
                               "Only reports symbol presence; it does not prove sandbox escape or helper privilege."))
-        records.append(record("execution.spawn_helper", .execution, .unavailable,
-                              "This build does not bundle a helper executable, so helper spawning is not currently implemented."))
-        records.append(record("execution.root_helper", .execution, .unavailable,
-                              "This build does not bundle a root helper; TrollStore installation alone does not create one."))
+        if let provider = appResolver as? any RootHelperCapabilityProviding {
+            let helper = await provider.rootHelperCapability()
+            let helperStatus: CapabilityStatus = helper.available ? .available : .deviceValidationRequired
+            records.append(record("execution.spawn_helper", .execution, helperStatus,
+                                  helper.available ? "Embedded helper spawn verified on this runtime: \(helper.detail)" : "Embedded helper exists but root spawn is not yet verified on this runtime: \(helper.detail)"))
+            records.append(record("execution.root_helper", .execution, helperStatus,
+                                  helper.available ? "Embedded helper executed with UID 0 on this runtime: \(helper.detail)" : "Root-helper execution requires a successful TrollStore persona/root probe: \(helper.detail)"))
+        } else {
+            records.append(record("execution.spawn_helper", .execution, .unavailable,
+                                  "This build does not expose an embedded helper capability provider."))
+            records.append(record("execution.root_helper", .execution, .unavailable,
+                                  "This build does not expose an embedded root-helper capability provider."))
+        }
         records.append(record("execution.jit_wasm", .execution, .unavailable,
                               "No WASM/JIT execution backend is connected in the current app build."))
 

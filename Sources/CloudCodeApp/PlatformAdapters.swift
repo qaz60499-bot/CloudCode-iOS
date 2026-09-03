@@ -13,7 +13,40 @@ public enum AppUninstallOutcome: Sendable, Equatable {
     case verificationTimedOut(String)
 }
 
-public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding {
+private enum EmbeddedRootHelper {
+    static let executableName = "CloudCodeRootHelper"
+
+    static var executablePath: String {
+        Bundle.main.bundleURL.appendingPathComponent(executableName, isDirectory: false).path
+    }
+
+    static func probe() -> RootHelperCapabilitySnapshot {
+        let path = executablePath
+        guard FileManager.default.fileExists(atPath: path) else {
+            return RootHelperCapabilitySnapshot(available: false, detail: "\(executableName) 未包含在当前 App Bundle 中。")
+        }
+        guard FileManager.default.isExecutableFile(atPath: path) else {
+            return RootHelperCapabilitySnapshot(available: false, detail: "\(executableName) 存在但没有可执行权限。")
+        }
+        let code = CloudCodeSpawnRootHelper(path, ["probe"])
+        if code == 0 {
+            return RootHelperCapabilitySnapshot(available: true, detail: "\(executableName) 已通过 persona 99 / UID 0 / GID 0 探测。")
+        }
+        return RootHelperCapabilitySnapshot(available: false, detail: "\(executableName) root 探测退出码 \(code)。")
+    }
+
+    static func uninstall(bundleID: String, bundlePath: String, dataPath: String?) -> (accepted: Bool, detail: String) {
+        let capability = probe()
+        guard capability.available else { return (false, capability.detail) }
+        let code = CloudCodeSpawnRootHelper(executablePath, ["uninstall", bundleID, bundlePath, dataPath ?? "-"])
+        if code == 0 {
+            return (true, "Embedded root helper 已执行受限卸载流程")
+        }
+        return (false, "Embedded root helper 卸载退出码 \(code)")
+    }
+}
+
+public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, RootHelperCapabilityProviding {
     private var cachedApps: [ResourceNode] = []
     private var bundlePaths: [String: String] = [:]
     private var containerPaths: [String: String] = [:]
@@ -50,6 +83,10 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     public func installedAppEnumerationDetail() async -> String {
         if Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
         return enumerationDetail
+    }
+
+    public func rootHelperCapability() async -> RootHelperCapabilitySnapshot {
+        EmbeddedRootHelper.probe()
     }
 
     public func canUninstallInstalledApps() async -> Bool {
@@ -91,8 +128,9 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         let hasLaunchServicesUninstall = class_getInstanceMethod(workspaceClass, NSSelectorFromString("uninstallApplication:withOptions:error:")) != nil
             || class_getInstanceMethod(workspaceClass, NSSelectorFromString("uninstallApplication:withOptions:")) != nil
         let hasMobileInstallationFallback = Self.mobileInstallationUninstallSymbol() != nil
-        guard hasLaunchServicesUninstall || hasMobileInstallationFallback else {
-            uninstallDetail = "当前系统既没有暴露 LaunchServices 卸载 selector，也没有暴露 MobileInstallationUninstall 兼容后端。"
+        let rootHelper = EmbeddedRootHelper.probe()
+        guard hasLaunchServicesUninstall || hasMobileInstallationFallback || rootHelper.available else {
+            uninstallDetail = "当前系统卸载 SPI 不可用，且嵌入式 root helper 未通过探测：\(rootHelper.detail)"
             return false
         }
         guard hasAuthoritativeInstallationQuery(workspaceClass) else {
@@ -103,15 +141,11 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             uninstallDetail = "LaunchServices 无损安装状态查询未通过。"
             return false
         }
-        let backendSummary: String
-        if hasLaunchServicesUninstall && hasMobileInstallationFallback {
-            backendSummary = "LaunchServices + MobileInstallation fallback"
-        } else if hasLaunchServicesUninstall {
-            backendSummary = "LaunchServices"
-        } else {
-            backendSummary = "MobileInstallation fallback"
-        }
-        uninstallDetail = "已验证跨 App 枚举和权威安装状态查询；可用卸载后端：\(backendSummary)。实际卸载仍会做最终状态校验。"
+        var backends: [String] = []
+        if hasLaunchServicesUninstall { backends.append("LaunchServices") }
+        if hasMobileInstallationFallback { backends.append("MobileInstallation") }
+        if rootHelper.available { backends.append("Embedded root helper") }
+        uninstallDetail = "已验证跨 App 枚举和权威安装状态查询；可用卸载后端：\(backends.joined(separator: " + "))。root helper 状态：\(rootHelper.detail) 实际卸载仍会验证注册状态、Bundle 和数据容器。"
         return true
     }
 
@@ -128,11 +162,10 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         guard enumerationProven else {
             return .rejected("跨 App 枚举能力当前未通过验证。")
         }
-        guard cachedApps.contains(where: {
-            $0.ownerBundleID == bundleID && Self.isUserApplicationBundlePath($0.resolvedPath)
-        }) else {
+        guard let bundlePath = bundlePaths[bundleID], Self.isUserApplicationBundlePath(bundlePath) else {
             return .rejected("目标不是当前可验证的普通用户 App，或已经不存在。")
         }
+        let dataPath = containerPaths[bundleID]
         guard await canUninstallInstalledApps(), let (workspace, workspaceClass) = launchServicesWorkspace() else {
             return .rejected(uninstallDetail)
         }
@@ -140,39 +173,63 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             return .rejected("LaunchServices 在执行前未确认目标仍处于已安装状态。")
         }
 
-        let request = performUninstallRequest(bundleID: bundleID, workspace: workspace, workspaceClass: workspaceClass)
-        guard request.accepted else {
-            uninstallDetail = "卸载后端拒绝了最近一次请求：\(request.detail)"
-            return .rejected(uninstallDetail)
+        var request = performUninstallRequest(bundleID: bundleID, workspace: workspace, workspaceClass: workspaceClass)
+        if !request.accepted {
+            let rootFallback = EmbeddedRootHelper.uninstall(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath)
+            if rootFallback.accepted {
+                request = rootFallback
+            } else {
+                uninstallDetail = "系统卸载 SPI 被拒绝，root helper fallback 也未成功。系统后端：\(request.detail)；root helper：\(rootFallback.detail)"
+                return .rejected(uninstallDetail)
+            }
         }
+
         pendingUninstallBundleID = bundleID
-        uninstallDetail = "卸载请求已由 \(request.detail) 接受，正在通过 LaunchServices 反查最终状态。"
+        uninstallDetail = "卸载请求已由 \(request.detail) 接受；正在同时验证 LaunchServices 注册状态、Bundle 目录和数据容器。"
+        if await verifyUninstallPostconditions(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath, attempts: 31) {
+            finalizeVerifiedUninstall(bundleID: bundleID)
+            return .removed
+        }
 
-        // LaunchServices 的返回值只代表请求被接受。真正删除 bundle / data container
-        // 是异步的，真机上可能明显慢于 1 秒。使用权威安装状态做较长的有界轮询，
-        // 避免把“请求已接受但删除尚未完成”误报成失败并诱发重复卸载。
-        let verificationAttempts = 31
-        for attempt in 0..<verificationAttempts {
-            if Task.isCancelled {
-                return .verificationTimedOut("卸载请求已被系统接受，但结果校验在任务取消前尚未完成；恢复后必须先重新查询目标状态，不能盲目重放。")
-            }
-            if attempt > 0 {
-                try? await Task.sleep(nanoseconds: 400_000_000)
-            }
-            guard let (verificationWorkspace, verificationClass) = launchServicesWorkspace() else { continue }
-            if applicationIsInstalled(bundleID, workspace: verificationWorkspace, workspaceClass: verificationClass) == false {
-                pendingUninstallBundleID = nil
-                cachedApps.removeAll { $0.ownerBundleID == bundleID }
-                bundlePaths.removeValue(forKey: bundleID)
-                containerPaths.removeValue(forKey: bundleID)
-                lastRefresh = .distantPast
-                uninstallDetail = "最近一次卸载已通过 LaunchServices 安装状态反查验证。"
-                return .removed
+        // 有些系统会先接受 LaunchServices 请求但迟迟不执行删除。只要这是同一个已经确认过的
+        // Tool Call，就允许在完成第一次最终状态核对后升级到嵌入式 root helper；这不是盲目重放。
+        if !request.detail.contains("root helper") {
+            let rootFallback = EmbeddedRootHelper.uninstall(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath)
+            if rootFallback.accepted {
+                uninstallDetail = "LaunchServices 接受请求但未完成删除，已在同一确认操作内切换到 root helper fallback；正在再次验证最终状态。"
+                if await verifyUninstallPostconditions(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath, attempts: 20) {
+                    finalizeVerifiedUninstall(bundleID: bundleID)
+                    return .removed
+                }
+            } else {
+                uninstallDetail = "LaunchServices 请求未在约 12 秒内完成；root helper fallback 也失败：\(rootFallback.detail)"
             }
         }
 
-        uninstallDetail = "系统已接受最近一次卸载请求，但约 12 秒内仍未观察到目标变为未安装；需要先重新查询最终状态，禁止直接重复卸载。"
-        return .verificationTimedOut(uninstallDetail)
+        return .verificationTimedOut(uninstallDetail + "。目标最终状态仍未满足‘注册消失 + Bundle 消失 + 已知数据容器消失’，因此不会误报卸载成功。")
+    }
+
+    private func verifyUninstallPostconditions(bundleID: String, bundlePath: String, dataPath: String?, attempts: Int) async -> Bool {
+        let fileManager = FileManager.default
+        for attempt in 0..<attempts {
+            if Task.isCancelled { return false }
+            if attempt > 0 { try? await Task.sleep(nanoseconds: 400_000_000) }
+            guard let (verificationWorkspace, verificationClass) = launchServicesWorkspace() else { continue }
+            let registrationGone = applicationIsInstalled(bundleID, workspace: verificationWorkspace, workspaceClass: verificationClass) == false
+            let bundleGone = !fileManager.fileExists(atPath: bundlePath)
+            let dataGone = dataPath.map { !fileManager.fileExists(atPath: $0) } ?? true
+            if registrationGone && bundleGone && dataGone { return true }
+        }
+        return false
+    }
+
+    private func finalizeVerifiedUninstall(bundleID: String) {
+        pendingUninstallBundleID = nil
+        cachedApps.removeAll { $0.ownerBundleID == bundleID }
+        bundlePaths.removeValue(forKey: bundleID)
+        containerPaths.removeValue(forKey: bundleID)
+        lastRefresh = .distantPast
+        uninstallDetail = "最近一次卸载已通过三项最终校验：LaunchServices 未安装、Bundle 已移除、已知数据容器已移除。"
     }
 
     public func forceRefresh() {

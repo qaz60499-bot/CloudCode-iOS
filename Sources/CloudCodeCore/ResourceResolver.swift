@@ -27,6 +27,20 @@ public protocol AppUninstallCapabilityProviding: Sendable {
     func installedAppUninstallDetail() async -> String
 }
 
+public struct RootHelperCapabilitySnapshot: Sendable, Equatable {
+    public var available: Bool
+    public var detail: String
+
+    public init(available: Bool, detail: String) {
+        self.available = available
+        self.detail = detail
+    }
+}
+
+public protocol RootHelperCapabilityProviding: Sendable {
+    func rootHelperCapability() async -> RootHelperCapabilitySnapshot
+}
+
 public actor ResourceResolver {
     private let appResolver: AppContainerResolving
     private let fileManager: FileManager

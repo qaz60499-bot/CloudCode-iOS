@@ -87,6 +87,22 @@ test "$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$ENTITLEMENT
 test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$ENTITLEMENTS")" = 'TROLLTROLL'
 /usr/libexec/PlistBuddy -c 'Print :keychain-access-groups:0' "$ENTITLEMENTS" | grep -F 'TROLLTROLL.*' >/dev/null
 
-echo "PASS: privileged TrollStore entitlement set is embedded in the main executable"
+HELPER="$APP_PATH/CloudCodeRootHelper"
+test -f "$HELPER"
+HELPER_ENTITLEMENTS="$TMP_DIR/root-helper-entitlements.plist"
+ldid -e "$HELPER" > "$HELPER_ENTITLEMENTS"
+plutil -lint "$HELPER_ENTITLEMENTS" >/dev/null
+for key in \
+  'com.apple.private.security.no-sandbox' \
+  'platform-application' \
+  'com.apple.private.persona-mgmt'; do
+  value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$HELPER_ENTITLEMENTS" 2>/dev/null || true)"
+  if [[ "$value" != "true" ]]; then
+    echo "FAIL: root helper entitlement missing or false: $key" >&2
+    exit 12
+  fi
+done
+
+echo "PASS: privileged TrollStore entitlement set is embedded in the main executable and root helper"
 echo "SECURITY: this IPA contains private Provider credentials and privileged entitlements; use only on the user's own TrollStore test device"
 echo "NOTE: entitlement presence does not prove device runtime support; capability probes must still verify each operation on-device."

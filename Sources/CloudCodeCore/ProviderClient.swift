@@ -101,7 +101,11 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
         case .authenticationFailed(let code): return "厂商认证失败（HTTP \(code)）；请选择另一个有效 Key"
         case .capacityExhausted(let code): return "当前厂商 Key 的额度 / 容量不足（HTTP \(code)）；可选择同一厂商内的其他 Key"
         case .rateLimited: return "厂商触发限流，请稍后重试"
-        case .invalidResponse(let code): return "厂商返回 HTTP \(code)"
+        case .invalidResponse(let code):
+            if (500...599).contains(code) {
+                return "上游厂商服务暂时不可用（HTTP \(code)）；这不是设备权限或卸载链路错误"
+            }
+            return "厂商返回 HTTP \(code)"
         case .malformedEvent: return "厂商返回了格式错误的流数据"
         case .streamInterrupted: return "厂商流在完成事件前中断"
         case .attachmentUnavailable(let filename): return "图片附件无法读取：\(filename)"
