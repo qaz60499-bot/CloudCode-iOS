@@ -1,94 +1,16 @@
-name: Private Privileged IPA Plain Delivery
+name: Private Privileged IPA Local Plain Delivery
 
 on:
   workflow_dispatch:
-    inputs:
-      source_run_id:
-        description: Successful Private TrollStore Privileged Validation IPA run ID
-        required: true
-        type: string
 
 permissions:
-  contents: write
-  actions: read
+  contents: read
 
 jobs:
-  publish-plain-ipa-draft:
+  guidance:
     runs-on: macos-15
-    timeout-minutes: 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Validate source run and download encrypted build artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      - name: Plaintext delivery policy
         run: |
-          set -euo pipefail
-          RUN_JSON="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json conclusion,headSha,name)"
-          SOURCE_HEAD="$(python3 - "$RUN_JSON" <<'PY'
-          import json
-          import sys
-          run = json.loads(sys.argv[1])
-          if run.get("conclusion") != "success":
-              raise SystemExit("FAIL: source privileged IPA run is not successful")
-          if run.get("name") != "Private TrollStore Privileged Validation IPA":
-              raise SystemExit("FAIL: source run is not the privileged private IPA workflow")
-          head = run.get("headSha") or ""
-          if len(head) != 40:
-              raise SystemExit("FAIL: source run HEAD is invalid")
-          print(head)
-          PY
-          )"
-          test "$SOURCE_HEAD" = "$GITHUB_SHA"
-          mkdir -p "$RUNNER_TEMP/source"
-          gh run download "$SOURCE_RUN_ID" \
-            --repo "$GITHUB_REPOSITORY" \
-            --name CloudCode-iOS-TrollStore-PRIVILEGED-private-encrypted \
-            --dir "$RUNNER_TEMP/source"
-          SOURCE_ENC="$(find "$RUNNER_TEMP/source" -maxdepth 1 -type f -name 'CloudCode-iOS-TrollStore-PRIVILEGED-*.ipa.enc' -print -quit)"
-          test -n "$SOURCE_ENC"
-          test -s "$SOURCE_ENC"
-          printf '%s' "$SOURCE_ENC" > "$RUNNER_TEMP/source-enc-path.txt"
-
-      - name: Decrypt to plain IPA and verify
-        env:
-          CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD: ${{ secrets.CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD }}
-        run: |
-          set -euo pipefail
-          test -n "$CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD"
-          mkdir -p "$RUNNER_TEMP/plain"
-          SOURCE_ENC="$(cat "$RUNNER_TEMP/source-enc-path.txt")"
-          IPA_NAME="$(basename "$SOURCE_ENC" .enc)"
-          IPA="$RUNNER_TEMP/plain/$IPA_NAME"
-          openssl enc -d -aes-256-cbc -pbkdf2 \
-            -in "$SOURCE_ENC" \
-            -out "$IPA" \
-            -pass env:CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD
-          test -s "$IPA"
-          unzip -tq "$IPA" >/dev/null
-          bash scripts/verify_privileged_private_ipa.sh "$IPA"
-          unzip -l "$IPA" | grep -F 'Payload/CloudCode.app/CloudCode-Provider-Bootstrap.json' >/dev/null
-          printf '%s' "$IPA" > "$RUNNER_TEMP/plain-ipa-path.txt"
-
-      - name: Publish plaintext IPA as draft release asset
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
-        run: |
-          set -euo pipefail
-          IPA="$(cat "$RUNNER_TEMP/plain-ipa-path.txt")"
-          SHORT_SHA="${GITHUB_SHA:0:7}"
-          TAG="private-privileged-ipa-${SHORT_SHA}-${GITHUB_RUN_ID}"
-          TITLE="CloudCode iOS Privileged IPA ${SHORT_SHA}"
-          NOTES="Plain .ipa delivery for owner testing. Source validation run: ${SOURCE_RUN_ID}. Source HEAD: ${GITHUB_SHA}. This is a DRAFT release because the repository is public and the IPA contains private Provider credentials."
-          gh release create "$TAG" "$IPA" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "$TITLE" \
-            --notes "$NOTES" \
-            --draft
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,assets,isDraft,tagName
-          rm -f "$IPA"
-          test ! -e "$IPA"
+          echo "Plaintext privileged IPA must not be uploaded to a public repository because it embeds private Provider credentials."
+          echo "Use the secure delivery workflow for transport, then decrypt locally on the owner's machine and hand off only the final .ipa file."
