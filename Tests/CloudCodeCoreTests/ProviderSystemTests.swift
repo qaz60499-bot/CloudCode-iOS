@@ -527,7 +527,11 @@ final class ProviderProtocolClientTests: XCTestCase {
     }
 
     func testImageAttachmentIsEncodedForChatAnthropicAndResponses() async throws {
-        let imageURL = FileManager.default.temporaryDirectory.appendingPathComponent("cloudcode-provider-image-\(UUID().uuidString).jpg")
+        let support = (FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).appendingPathComponent("Library/Application Support", isDirectory: true))
+            .appendingPathComponent("CloudCode/Attachments/provider-tests", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let imageURL = support.appendingPathComponent("cloudcode-provider-image-\(UUID().uuidString).jpg")
         let bytes = Data([0xFF, 0xD8, 0xFF, 0xD9])
         try bytes.write(to: imageURL, options: .atomic)
         defer { try? FileManager.default.removeItem(at: imageURL) }

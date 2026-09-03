@@ -984,12 +984,20 @@ private func localizedCapabilityDetail(_ id: String, detail: String) -> String {
     case "apps.resolve_data_container": return detail.contains("Resolved") ? "已成功解析至少一个其他 App 的数据目录；目录会动态解析，不缓存容器 UUID。" : "当前运行环境尚未证明可以解析其他 App 的数据目录。"
     case "execution.ios_system": return "动态检测 ios_system 接口；结构化工具不会依赖它。"
     case "execution.posix_spawn_symbol": return "只检测进程创建符号是否存在，不代表已经获得越过沙盒或高权限执行能力。"
-    case "execution.spawn_helper": return "需要安装包内辅助程序、签名权限和当前设备共同验证后才能启用。"
-    case "execution.root_helper": return "需要当前 TrollStore 设备上的高权限签名和辅助程序实际握手成功；不会仅因为使用 TrollStore 就假定可用。"
-    case "execution.jit_wasm": return "JIT / WASM 能力取决于设备版本、签名方式和权限。"
-    case "apps.launch": return "启动其他 App 的私有接口需要在当前设备上验证后才能使用。"
-    case "apps.terminate": return "终止其他 App 属于系统级变更，必须在当前设备上验证并受权限策略保护。"
-    case "apps.uninstall": return "卸载属于永久性破坏操作；只有已验证的高权限适配器存在时才允许执行，并继续受确认策略保护。"
+    case "execution.spawn_helper":
+        return detail.contains("does not bundle") ? "当前安装包没有内置辅助程序，因此这项能力现在不可用。" : "需要安装包内辅助程序、签名权限和当前设备共同验证后才能启用。"
+    case "execution.root_helper":
+        return detail.contains("does not bundle") ? "当前安装包没有 root helper；TrollStore 安装本身不会自动提供 root helper。" : "需要当前 TrollStore 设备上的高权限签名和辅助程序实际握手成功。"
+    case "execution.jit_wasm":
+        return detail.contains("No WASM/JIT") ? "当前版本没有接入 WASM / JIT 执行后端，因此不可用。" : "JIT / WASM 能力取决于设备版本、签名方式和权限。"
+    case "apps.launch":
+        return detail.contains("No app-launch executor") ? "当前版本没有接入启动其他 App 的执行器，因此不可用。" : "启动其他 App 的私有接口需要在当前设备上验证后才能使用。"
+    case "apps.terminate":
+        return detail.contains("No app-termination executor") ? "当前版本没有接入终止其他 App 的执行器，因此不可用。" : "终止其他 App 属于系统级变更，必须在当前设备上验证并受权限策略保护。"
+    case "apps.uninstall":
+        if detail.contains("prerequisites are present") { return "已检测到卸载后端所需的 LaunchServices 枚举、安装状态查询和卸载接口；真正卸载时仍会要求确认并在操作后重新查询验证。" }
+        if detail.contains("not currently executable") { return "当前卸载后端没有达到可执行条件；请展开本次检测结果判断是枚举、LaunchServices 接口还是安装状态查询缺失。" }
+        return "卸载属于永久性破坏操作；只有运行时探测达到可执行条件时才允许进入确认和执行流程。"
     case "data.photos": return "照片权限由你控制；只有授权后才会开放对应访问。"
     case "data.contacts": return "联系人权限受系统授权控制，核心不会自动请求。"
     case "data.calendar": return "日历权限受系统授权控制，核心不会自动请求。"
@@ -999,12 +1007,17 @@ private func localizedCapabilityDetail(_ id: String, detail: String) -> String {
         if detail.contains("currently unavailable") { return "Keychain 当前受保护不可访问（例如设备锁定）；解锁后重新检测。" }
         if detail.contains("Verified on this runtime") { return "已在当前设备实际完成临时写入、读取和删除回验；Cloud Code 自身 Keychain 可用。" }
         return "正在按当前设备实际结果判断 Cloud Code 自身 Keychain，不再仅凭配置假定可用。"
-    case "automation.url_scheme": return "当前 URL 打开适配器尚未接入并在本机完成验证，因此保持“需要真机验证”；不会仅凭系统存在 URL Scheme 机制就假定可用。"
-    case "automation.xctest_wda": return "需要独立的 XCTest / WDA 运行后端；未接入或未验证时不会假定可用。"
-    case "automation.gui": return "GUI 自动化只有在后端实际就绪并通过探测后才会启用。"
+    case "automation.url_scheme":
+        return detail.contains("disabled placeholder") ? "当前 URL Scheme 执行器只是禁用占位实现，因此现在不可用。" : "只有 URL 打开适配器真实接入并验证后才会启用。"
+    case "automation.xctest_wda":
+        return detail.contains("No XCTest/WDA") ? "当前版本没有接入 XCTest / WDA 运行后端，因此不可用。" : "需要独立的 XCTest / WDA 运行后端。"
+    case "automation.gui":
+        return detail.contains("explicitly unavailable") ? "当前 GUI 自动化后端明确处于不可用状态，没有连接可执行的自动化运行时。" : "GUI 自动化只有在后端实际就绪并通过探测后才会启用。"
     case "ipa.inspect": return "可在本地进程内检查 IPA 的 ZIP、Info.plist、架构和签名元数据。"
-    case "ipa.decrypt": return "解密需要兼容的高权限运行环境以及可访问的目标进程。"
-    case "ipa.install": return "安装 IPA 依赖 TrollStore 或其他已验证的高权限安装能力。"
+    case "ipa.decrypt":
+        return detail.contains("No IPA decryption executor") ? "当前版本没有接入 IPA 解密执行器，因此不可用。" : "解密需要兼容的高权限运行环境以及可访问的目标进程。"
+    case "ipa.install":
+        return detail.contains("No IPA installation executor") ? "当前版本没有接入 IPA 安装执行器，因此不可用。" : "安装 IPA 依赖 TrollStore 或其他已验证的高权限安装能力。"
     default: return detail
     }
 }

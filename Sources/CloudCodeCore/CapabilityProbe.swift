@@ -40,21 +40,25 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
                               "Conservative direct filesystem probe. This does not imply root identity."))
 
         let apps = await appResolver.installedApps()
+        let ownBundle = Bundle.main.bundleIdentifier ?? ""
         let enumerationProven: Bool
         let enumerationDetail: String
         if let provider = appResolver as? any AppEnumerationCapabilityProviding {
             enumerationProven = await provider.canEnumerateInstalledApps()
             enumerationDetail = await provider.installedAppEnumerationDetail()
         } else {
-            enumerationProven = !apps.isEmpty
+            let crossAppCount = apps.filter { node in
+                guard let bundleID = node.ownerBundleID, !bundleID.isEmpty else { return false }
+                return ownBundle.isEmpty || bundleID != ownBundle
+            }.count
+            enumerationProven = crossAppCount > 0
             enumerationDetail = enumerationProven
-                ? "Resolver returned \(apps.count) app records."
-                : "Resolver returned no app records."
+                ? "Resolver returned \(apps.count) app records including \(crossAppCount) non-own apps."
+                : "Resolver did not prove visibility of any non-own installed app."
         }
         records.append(record("apps.enumerate", .apps, enumerationProven ? .available : .unavailable,
                               enumerationProven ? "Installed-app enumeration verified: \(enumerationDetail)" : "Installed-app enumeration not proven: \(enumerationDetail)"))
 
-        let ownBundle = Bundle.main.bundleIdentifier ?? ""
         let ownBundlePath = ownBundle.isEmpty ? nil : await appResolver.bundlePath(for: ownBundle)
         records.append(record("apps.resolve_own_bundle_path", .apps, ownBundlePath == nil ? .unknown : .available,
                               "Resolution of Cloud Code's own bundle path."))
