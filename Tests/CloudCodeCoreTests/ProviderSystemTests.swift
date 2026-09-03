@@ -1111,7 +1111,7 @@ private final class ProviderTestURLProtocol: URLProtocol, @unchecked Sendable {
             var data = Data()
             let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
             defer { buffer.deallocate() }
-            while stream.hasBytesAvailable {
+            while true {
                 let count = stream.read(buffer, maxLength: 4096)
                 if count <= 0 { break }
                 data.append(buffer, count: count)

@@ -302,6 +302,21 @@ final class CloudCodeCoreTests: XCTestCase {
         }
     }
 
+    func testCapabilityRefreshProbeUsesRuntimeEvidenceAndDoesNotFakeUnwiredURLAutomation() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let probe = CapabilityProbe(appResolver: StaticAppResolver(), homeDirectory: root)
+        let first = await probe.probe()
+        let second = await probe.probe()
+
+        XCTAssertEqual(first.status("filesystem.own_container"), .available)
+        XCTAssertEqual(first.status("apps.enumerate"), .unavailable)
+        XCTAssertEqual(first.status("automation.url_scheme"), .deviceValidationRequired)
+        XCTAssertEqual(first.status("ipa.inspect"), .available)
+        XCTAssertEqual(second.status("automation.url_scheme"), .deviceValidationRequired)
+        XCTAssertGreaterThanOrEqual(second.generatedAt, first.generatedAt)
+    }
+
     func testCapabilityGraphSeparatesUnprovenCapabilitiesFromExecutableTools() {
         let profile = CapabilityProfile(records: [
             CapabilityRecord(id: "ipa.inspect", domain: .ipa, status: .available, detail: "implemented"),
@@ -549,6 +564,47 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(persistedToolCall?.providerMetadata["tool_name"], "files.create")
         XCTAssertEqual(persistedToolCall?.providerMetadata["provider_tool_name"], "files_create")
         XCTAssertEqual(saved.title, "create it")
+    }
+
+    func testMultipleProviderToolCallsInOneRoundMapToDistinctInternalTools() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let counter = InvocationCounter()
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "files.create", summary: "", risk: .safeWrite),
+            ToolDescriptor(name: "files.read", summary: "", risk: .readOnly)
+        ])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let agent = AgentCore(
+            provider: ToolThenFinishProvider(events: [
+                .toolCall(id: "create-1", name: "files_create", argumentsJSON: "{\"path\":\"/tmp/a\",\"content\":\"a\"}"),
+                .toolCall(id: "read-1", name: "files_read", argumentsJSON: "{\"path\":\"/tmp/a\"}"),
+                .finished
+            ]),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(
+                registry: registry,
+                executors: [CountingExecutor(route: .structuredTool, names: ["files.create", "files.read"], counter: counter)],
+                executionLedger: ToolExecutionLedger(fileURL: root.appendingPathComponent("ledger.json"))
+            ),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 3
+        )
+        let session = AgentSession(permissionMode: .full)
+        let stream = await agent.send(
+            text: "test",
+            session: session,
+            providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key")
+        )
+        for try await _ in stream {}
+        let executionCount = await counter.value()
+        XCTAssertEqual(executionCount, 2)
+        let saved = try await sessions.load(session.id)
+        let names = saved.messages.filter { $0.role == .assistant && $0.providerMetadata["tool_call_id"] != nil }.compactMap { $0.providerMetadata["tool_name"] }
+        XCTAssertEqual(names, ["files.create", "files.read"])
     }
 
     func testUnknownProviderToolNameFailsClosedBeforeExecution() async throws {

@@ -468,8 +468,6 @@ public final class CloudCodeViewModel: ObservableObject {
             defer { endExclusiveOperation(operationKey) }
             do {
                 var resumedSession = try await sessionStore.load(checkpoint.sessionID)
-                resumedSession.permissionMode = permissionMode
-                try await sessionStore.save(resumedSession)
                 guard let request = checkpoint.payload["request"] ?? resumedSession.messages.last(where: { $0.role == .user })?.content,
                       !request.isEmpty else {
                     throw CocoaError(.fileReadCorruptFile)
@@ -478,7 +476,12 @@ public final class CloudCodeViewModel: ObservableObject {
                     payload: checkpoint.payload,
                     profiles: providerProfiles
                 )
-                session = resumedSession
+                resumedSession.permissionMode = permissionMode
+                resumedSession.providerID = config.providerID
+                resumedSession.model = config.model
+                resumedSession.keySlotID = keySlotID(for: config) ?? resumedSession.keySlotID
+                try await sessionStore.save(resumedSession)
+                adoptSession(resumedSession)
                 let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
                 let source = InputSource(rawValue: checkpoint.payload["inputSource"] ?? "text") ?? .text
                 let stream = await agentCore.send(
@@ -750,6 +753,14 @@ public final class CloudCodeViewModel: ObservableObject {
                 lastError = "预配置 Key 导入失败：\(Self.userFacingProviderBootstrapError(error))"
             }
         }
+    }
+
+    private func keySlotID(for configuration: ProviderConfiguration) -> String? {
+        guard let providerID = configuration.providerID,
+              let provider = providerProfiles.first(where: { $0.id == providerID }) else { return nil }
+        return provider.keySlots.first(where: {
+            ProviderCatalog.keyReference(providerID: provider.id, keySlotID: $0.id) == configuration.apiKeyReference
+        })?.id
     }
 
     private func currentProviderConfiguration() -> ProviderConfiguration? {
