@@ -301,6 +301,7 @@ private struct SettingsView: View {
     @State private var customModelInput = ""
     @State private var showCustomProvider = false
     @State private var showBootstrapImporter = false
+    @FocusState private var keyInputFocused: Bool
 
     var body: some View {
         NavigationStack {
@@ -352,15 +353,34 @@ private struct SettingsView: View {
                     SecureField("替换当前选择的 Key", text: $selectedKeyInput)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .focused($keyInputFocused)
+                        .submitLabel(.done)
+                        .onSubmit { keyInputFocused = false }
                     Button("保存当前 Key 到 Keychain") {
+                        keyInputFocused = false
                         guard model.setKey(selectedKeyInput) else { return }
                         selectedKeyInput = ""
                     }
                     .disabled(selectedKeyInput.isEmpty || model.isProviderKeyMutationInFlight)
 
-                    Button("导入私有 Key 配置") { showBootstrapImporter = true }
+                    if model.bundledPrivateBootstrapAvailable {
+                        Button("一键导入预配置 Key") {
+                            keyInputFocused = false
+                            model.importBundledProviderBootstrap()
+                        }
                         .disabled(model.isProviderKeyMutationInFlight)
-                    Text("厂商、Key 和模型都由你手动选择。私有 Key 配置导入后写入 iOS Keychain，明文配置源会被删除；真实 Key 不写入 UserDefaults，也不会随公开 IPA 分发。")
+                    }
+
+                    Button("从文件导入 Key 配置") {
+                        keyInputFocused = false
+                        showBootstrapImporter = true
+                    }
+                    .disabled(model.isProviderKeyMutationInFlight)
+
+                    LabeledContent("已配置 Key", value: "\(model.configuredCatalogKeyCount) / \(model.totalCatalogKeyCount)")
+                    Text(model.bundledPrivateBootstrapAvailable
+                         ? "当前是私有 Key 版 IPA：首次启动会自动把预配置 Key 写入 iOS Keychain；也可以点上方按钮重新一键导入。厂商、Key 和模型仍由你手动选择。"
+                         : "当前安装包未内置预配置 Key。可以从文件导入；导入后写入 iOS Keychain。真实 Key 不写入 UserDefaults。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -416,6 +436,16 @@ private struct SettingsView: View {
                 }
             }
             .navigationTitle("设置")
+            .onDisappear {
+                keyInputFocused = false
+                selectedKeyInput = ""
+            }
+            .toolbar {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("完成") { keyInputFocused = false }
+                }
+            }
             .sheet(isPresented: $showCustomProvider) {
                 CustomProviderSheet(model: model, isPresented: $showCustomProvider)
             }

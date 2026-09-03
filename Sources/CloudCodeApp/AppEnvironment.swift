@@ -185,6 +185,20 @@ public final class CloudCodeViewModel: ObservableObject {
         return isKeyInstalled(providerID: provider.id, keySlotID: selectedKeySlotID)
     }
 
+    public var totalCatalogKeyCount: Int {
+        providerProfiles.filter(\.enabled).reduce(0) { $0 + $1.keySlots.count }
+    }
+
+    public var configuredCatalogKeyCount: Int {
+        providerProfiles.filter(\.enabled).reduce(0) { count, provider in
+            count + provider.keySlots.filter { isKeyInstalled(providerID: provider.id, keySlotID: $0.id) }.count
+        }
+    }
+
+    public var bundledPrivateBootstrapAvailable: Bool {
+        Bundle.main.url(forResource: "CloudCode-Provider-Bootstrap", withExtension: "json") != nil
+    }
+
     public func isKeyInstalled(providerID: String, keySlotID: String) -> Bool {
         guard !providerID.isEmpty, !keySlotID.isEmpty else { return false }
         return keyVault.contains(ProviderCatalog.keyReference(providerID: providerID, keySlotID: keySlotID))
@@ -593,6 +607,27 @@ public final class CloudCodeViewModel: ObservableObject {
         }
     }
 
+    public func importBundledProviderBootstrap() {
+        guard let url = Bundle.main.url(forResource: "CloudCode-Provider-Bootstrap", withExtension: "json") else {
+            lastError = "当前安装包不包含预配置 Key。请使用私有 Key 版 IPA，或选择“从文件导入”。"
+            return
+        }
+        let operationKey = Self.providerKeyMutationOperationKey
+        guard beginExclusiveOperation(operationKey) else {
+            lastError = "另一个厂商 Key 操作正在进行中。"
+            return
+        }
+        Task {
+            defer { endExclusiveOperation(operationKey) }
+            do {
+                let count = try await importProviderBootstrapNow(from: url, removeSource: false)
+                activityLines.append("已一键导入预配置 Key：\(count) 个 Key 已写入 iOS Keychain。")
+            } catch {
+                lastError = "预配置 Key 导入失败：\(error)"
+            }
+        }
+    }
+
     private func currentProviderConfiguration() -> ProviderConfiguration? {
         guard let provider = selectedProvider,
               let slot = provider.keySlots.first(where: { $0.id == selectedKeySlotID }),
@@ -647,11 +682,24 @@ public final class CloudCodeViewModel: ObservableObject {
             throw ProviderError.transport("另一个厂商 Key 操作正在进行中")
         }
         defer { endExclusiveOperation(operationKey) }
+
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-        guard let url = documents?.appendingPathComponent("CloudCode-Provider-Bootstrap.json"),
-              FileManager.default.fileExists(atPath: url.path) else { return }
-        let count = try await importProviderBootstrapNow(from: url, removeSource: true)
-        activityLines.append("已自动导入私有 Key 配置：\(count) 个 Key。")
+        if let url = documents?.appendingPathComponent("CloudCode-Provider-Bootstrap.json"),
+           FileManager.default.fileExists(atPath: url.path) {
+            let count = try await importProviderBootstrapNow(from: url, removeSource: true)
+            activityLines.append("已自动导入私有 Key 配置：\(count) 个 Key。")
+            return
+        }
+
+        let bundledCatalogFullyConfigured = ProviderCatalog.desktopSnapshot.allSatisfy { provider in
+            provider.keySlots.allSatisfy { slot in
+                isKeyInstalled(providerID: provider.id, keySlotID: slot.id)
+            }
+        }
+        guard !bundledCatalogFullyConfigured,
+              let bundled = Bundle.main.url(forResource: "CloudCode-Provider-Bootstrap", withExtension: "json") else { return }
+        let count = try await importProviderBootstrapNow(from: bundled, removeSource: false)
+        activityLines.append("检测到私有 Key 版 IPA，已自动配置 \(count) 个 Key 到 iOS Keychain。")
     }
 
     private func importProviderBootstrapNow(from url: URL, removeSource: Bool) async throws -> Int {
