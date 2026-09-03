@@ -59,6 +59,7 @@ public final class CloudCodeViewModel: ObservableObject {
     #endif
     private var didBootstrap = false
     private static let providerKeyMutationOperationKey = "provider-key:mutation"
+    private static let autoResumeTaskDefaultsKey = "task.autoResumeUnlessStopped"
 
     public init() {
         let support = Self.supportRoot()
@@ -191,6 +192,7 @@ public final class CloudCodeViewModel: ObservableObject {
                     activityLines.append("检测到私有 Key 版 IPA，但当前设备的 Keychain 实际探测未通过，因此已跳过自动导入，避免反复弹出失败提示。")
                 }
                 didBootstrap = true
+                resumeMostRecentInterruptedTaskIfRequested()
             } catch {
                 lastError = "初始化失败：\(error)"
             }
@@ -336,6 +338,7 @@ public final class CloudCodeViewModel: ObservableObject {
         }
 
         isRunning = true
+        UserDefaults.standard.set(true, forKey: Self.autoResumeTaskDefaultsKey)
         lastError = nil
         streamingAssistantMessageID = nil
         activityLines.append("正在使用 \(config.name) / \(config.model) 规划请求…")
@@ -418,6 +421,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 endBackgroundExecutionIfNeeded()
             }
             await reloadActivity()
+            clearAutoResumeIntentIfNoPendingTask()
             try? await reloadSessionHistory()
             refreshFilesFromDisk()
         }
@@ -428,8 +432,9 @@ public final class CloudCodeViewModel: ObservableObject {
         currentTask = nil
         runGeneration.cancel()
         isRunning = false
+        UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
         endBackgroundExecutionIfNeeded()
-        activityLines.append("任务已中断；检查点已保留，可继续、回滚或检查最终状态。")
+        activityLines.append("任务已按你的明确命令停止；检查点已保留，但不会自动继续。")
     }
 
     public func suspendForBackground() {
@@ -448,6 +453,7 @@ public final class CloudCodeViewModel: ObservableObject {
             await reloadActivity()
             refreshFilesFromDisk()
             try? await reloadSessionHistory()
+            resumeMostRecentInterruptedTaskIfRequested()
         }
         refreshCapabilities()
     }
@@ -473,7 +479,24 @@ public final class CloudCodeViewModel: ObservableObject {
         currentTask = nil
         runGeneration.cancel()
         isRunning = false
-        activityLines.append("系统后台执行时间已耗尽；当前任务已安全中断并保留检查点。回到前台后请先核对最终状态，再决定是否继续。")
+        activityLines.append("系统后台执行时间已耗尽；当前任务已安全中断并保留检查点。由于你没有明确停止，回到可执行状态后会先核对检查点并自动继续。")
+    }
+
+    private func resumeMostRecentInterruptedTaskIfRequested() {
+        guard UserDefaults.standard.bool(forKey: Self.autoResumeTaskDefaultsKey),
+              !isRunning,
+              currentTask == nil else { return }
+        guard let checkpoint = interruptedTasks.first else {
+            UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
+            return
+        }
+        activityLines.append("检测到未明确停止的中断任务；正在从最近检查点自动继续。")
+        resumeTask(checkpoint)
+    }
+
+    private func clearAutoResumeIntentIfNoPendingTask() {
+        guard !isRunning, interruptedTasks.isEmpty else { return }
+        UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
     }
 
     private func endBackgroundExecutionIfNeeded() {
@@ -581,6 +604,7 @@ public final class CloudCodeViewModel: ObservableObject {
         currentTask?.cancel()
         let runID = runGeneration.start()
         isRunning = true
+        UserDefaults.standard.set(true, forKey: Self.autoResumeTaskDefaultsKey)
         lastError = nil
         activityLines.append("正在继续检查点 \(checkpoint.stepIndex)/\(checkpoint.totalSteps)…")
 
@@ -627,6 +651,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 endBackgroundExecutionIfNeeded()
             }
             await reloadActivity()
+            clearAutoResumeIntentIfNoPendingTask()
             try? await reloadSessionHistory()
             refreshFilesFromDisk()
         }
@@ -640,6 +665,7 @@ public final class CloudCodeViewModel: ObservableObject {
             do {
                 try await checkpointStore.mark(checkpoint.id, state: "cancelled", stepName: "用户取消")
                 await reloadActivity()
+                clearAutoResumeIntentIfNoPendingTask()
             } catch {
                 lastError = String(describing: error)
             }
@@ -661,6 +687,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 _ = try await transactionEngine.rollback(transactionID: transaction.id)
                 try await checkpointStore.mark(checkpoint.id, state: "rolled_back", stepName: "最近一次已提交事务已回滚")
                 await reloadActivity()
+                clearAutoResumeIntentIfNoPendingTask()
                 refreshFilesFromDisk()
             } catch {
                 lastError = String(describing: error)

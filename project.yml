@@ -20,8 +20,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.core
         PRODUCT_NAME: CloudCodeCore
-        MARKETING_VERSION: 1.0.4
-        CURRENT_PROJECT_VERSION: 5
+        MARKETING_VERSION: 1.0.5
+        CURRENT_PROJECT_VERSION: 6
         VERSIONING_SYSTEM: apple-generic
         DEFINES_MODULE: YES
         GENERATE_INFOPLIST_FILE: YES
@@ -38,8 +38,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios
         PRODUCT_NAME: CloudCode
-        MARKETING_VERSION: 1.0.4
-        CURRENT_PROJECT_VERSION: 5
+        MARKETING_VERSION: 1.0.5
+        CURRENT_PROJECT_VERSION: 6
         VERSIONING_SYSTEM: apple-generic
         SWIFT_VERSION: 5.9
         GENERATE_INFOPLIST_FILE: YES
@@ -51,8 +51,16 @@ targets:
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_ENTITLEMENTS: Entitlements/CloudCode.entitlements
         TARGETED_DEVICE_FAMILY: "1"
+    preBuildScripts:
+      - name: Materialize App Icon
+        script: |
+          set -euo pipefail
+          cd "$SRCROOT"
+          xcrun swift scripts/materialize_app_icon.swift
+        basedOnDependencyAnalysis: false
     scheme:
       testTargets:
         - CloudCodeIOSTests

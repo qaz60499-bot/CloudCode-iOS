@@ -56,6 +56,14 @@ if [[ ! -f "$APP_PATH/$EXECUTABLE" ]]; then
   echo "FAIL: executable missing: $EXECUTABLE" >&2
   exit 10
 fi
+if [[ ! -f "$APP_PATH/Assets.car" ]]; then
+  echo "FAIL: compiled asset catalog missing; app icon would be absent after installation" >&2
+  exit 13
+fi
+if ! /usr/libexec/PlistBuddy -c 'Print :CFBundleIcons:CFBundlePrimaryIcon' "$INFO" >/dev/null 2>&1; then
+  echo "FAIL: CFBundleIcons/CFBundlePrimaryIcon metadata missing" >&2
+  exit 14
+fi
 
 file "$APP_PATH/$EXECUTABLE"
 if ! lipo -info "$APP_PATH/$EXECUTABLE" | grep -q 'arm64'; then

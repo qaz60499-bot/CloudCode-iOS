@@ -88,9 +88,11 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             uninstallDetail = "无法取得 LaunchServices workspace。"
             return false
         }
-        let uninstallSelector = NSSelectorFromString("uninstallApplication:withOptions:")
-        guard class_getInstanceMethod(workspaceClass, uninstallSelector) != nil else {
-            uninstallDetail = "当前系统没有暴露 uninstallApplication:withOptions:。"
+        let hasLaunchServicesUninstall = class_getInstanceMethod(workspaceClass, NSSelectorFromString("uninstallApplication:withOptions:error:")) != nil
+            || class_getInstanceMethod(workspaceClass, NSSelectorFromString("uninstallApplication:withOptions:")) != nil
+        let hasMobileInstallationFallback = Self.mobileInstallationUninstallSymbol() != nil
+        guard hasLaunchServicesUninstall || hasMobileInstallationFallback else {
+            uninstallDetail = "当前系统既没有暴露 LaunchServices 卸载 selector，也没有暴露 MobileInstallationUninstall 兼容后端。"
             return false
         }
         guard hasAuthoritativeInstallationQuery(workspaceClass) else {
@@ -101,7 +103,15 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             uninstallDetail = "LaunchServices 无损安装状态查询未通过。"
             return false
         }
-        uninstallDetail = "LaunchServices 可枚举其他 App、可权威查询安装状态，且卸载 selector 存在；实际卸载仍会做结果校验。"
+        let backendSummary: String
+        if hasLaunchServicesUninstall && hasMobileInstallationFallback {
+            backendSummary = "LaunchServices + MobileInstallation fallback"
+        } else if hasLaunchServicesUninstall {
+            backendSummary = "LaunchServices"
+        } else {
+            backendSummary = "MobileInstallation fallback"
+        }
+        uninstallDetail = "已验证跨 App 枚举和权威安装状态查询；可用卸载后端：\(backendSummary)。实际卸载仍会做最终状态校验。"
         return true
     }
 
@@ -130,19 +140,13 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             return .rejected("LaunchServices 在执行前未确认目标仍处于已安装状态。")
         }
 
-        let selector = NSSelectorFromString("uninstallApplication:withOptions:")
-        guard let method = class_getInstanceMethod(workspaceClass, selector) else {
-            return .rejected("当前系统没有暴露 uninstallApplication:withOptions:。")
-        }
-        typealias UninstallMethod = @convention(c) (AnyObject, Selector, AnyObject, AnyObject) -> Bool
-        let implementation = method_getImplementation(method)
-        let uninstall = unsafeBitCast(implementation, to: UninstallMethod.self)
-        let accepted = uninstall(workspace, selector, bundleID as NSString, NSDictionary())
-        guard accepted else {
-            uninstallDetail = "LaunchServices 拒绝了最近一次卸载请求；需要重新检测该设备上的卸载后端。"
+        let request = performUninstallRequest(bundleID: bundleID, workspace: workspace, workspaceClass: workspaceClass)
+        guard request.accepted else {
+            uninstallDetail = "卸载后端拒绝了最近一次请求：\(request.detail)"
             return .rejected(uninstallDetail)
         }
         pendingUninstallBundleID = bundleID
+        uninstallDetail = "卸载请求已由 \(request.detail) 接受，正在通过 LaunchServices 反查最终状态。"
 
         // LaunchServices 的返回值只代表请求被接受。真正删除 bundle / data container
         // 是异步的，真机上可能明显慢于 1 秒。使用权威安装状态做较长的有界轮询，
@@ -274,6 +278,57 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         let implementation = method_getImplementation(method)
         let isInstalled = unsafeBitCast(implementation, to: IsInstalledMethod.self)
         return isInstalled(workspace, selector, bundleID as NSString)
+    }
+
+    private func performUninstallRequest(bundleID: String, workspace: NSObject, workspaceClass: AnyClass) -> (accepted: Bool, detail: String) {
+        let errorSelector = NSSelectorFromString("uninstallApplication:withOptions:error:")
+        if let method = class_getInstanceMethod(workspaceClass, errorSelector) {
+            typealias UninstallErrorMethod = @convention(c) (AnyObject, Selector, AnyObject, AnyObject, UnsafeMutablePointer<AnyObject?>?) -> Bool
+            let implementation = method_getImplementation(method)
+            let uninstall = unsafeBitCast(implementation, to: UninstallErrorMethod.self)
+            var errorObject: AnyObject?
+            let accepted = uninstall(workspace, errorSelector, bundleID as NSString, NSDictionary(), &errorObject)
+            if accepted { return (true, "LaunchServices(error-aware)") }
+            if let error = errorObject as? NSError {
+                uninstallDetail = "LaunchServices(error-aware) 拒绝：\(error.domain) \(error.code) · \(error.localizedDescription)"
+            } else {
+                uninstallDetail = "LaunchServices(error-aware) 返回 rejected，未提供 NSError。"
+            }
+        }
+
+        let legacySelector = NSSelectorFromString("uninstallApplication:withOptions:")
+        if let method = class_getInstanceMethod(workspaceClass, legacySelector) {
+            typealias UninstallMethod = @convention(c) (AnyObject, Selector, AnyObject, AnyObject) -> Bool
+            let implementation = method_getImplementation(method)
+            let uninstall = unsafeBitCast(implementation, to: UninstallMethod.self)
+            if uninstall(workspace, legacySelector, bundleID as NSString, NSDictionary()) {
+                return (true, "LaunchServices(legacy)")
+            }
+            uninstallDetail += uninstallDetail.isEmpty ? "LaunchServices(legacy) 返回 rejected。" : "；LaunchServices(legacy) 也返回 rejected。"
+        }
+
+        #if canImport(Darwin)
+        if let symbol = Self.mobileInstallationUninstallSymbol() {
+            typealias MobileInstallationUninstall = @convention(c) (UnsafeRawPointer?, UnsafeRawPointer?, UnsafeRawPointer?) -> Int32
+            let uninstall = unsafeBitCast(symbol, to: MobileInstallationUninstall.self)
+            let identifier = bundleID as NSString
+            let identifierPointer = UnsafeRawPointer(Unmanaged.passUnretained(identifier).toOpaque())
+            let code = uninstall(identifierPointer, nil, nil)
+            if code == 0 { return (true, "MobileInstallationUninstall") }
+            uninstallDetail += uninstallDetail.isEmpty ? "MobileInstallationUninstall 返回 \(code)。" : "；MobileInstallationUninstall 返回 \(code)。"
+        }
+        #endif
+
+        return (false, uninstallDetail.isEmpty ? "没有可执行的卸载后端。" : uninstallDetail)
+    }
+
+    private static func mobileInstallationUninstallSymbol() -> UnsafeMutableRawPointer? {
+        #if canImport(Darwin)
+        guard let handle = dlopen("/System/Library/PrivateFrameworks/MobileInstallation.framework/MobileInstallation", RTLD_LAZY | RTLD_LOCAL) else { return nil }
+        return dlsym(handle, "MobileInstallationUninstall")
+        #else
+        return nil
+        #endif
     }
 
     private func collectInstalledApplicationProxies(workspace: NSObject, workspaceClass: AnyClass) -> ([NSObject], String) {
