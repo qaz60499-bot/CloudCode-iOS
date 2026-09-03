@@ -464,7 +464,7 @@ final class ProviderProtocolClientTests: XCTestCase {
 
         data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}
 
-        data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tool-1","name":"files.read","input":{}}}
+        data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tool-1","name":"files_read","input":{}}}
 
         data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"/tmp/a\\"}"}}
 
@@ -483,11 +483,11 @@ final class ProviderProtocolClientTests: XCTestCase {
             authModeName: ProviderAuthMode.both.rawValue
         )
         var events: [ProviderEvent] = []
-        for try await event in client.stream(configuration: configuration, apiKey: "test-secret", messages: [ChatMessage(role: .user, content: "hi")], tools: [ProviderToolSchema(name: "files.read", description: "read", properties: ["path": "string"])]) {
+        for try await event in client.stream(configuration: configuration, apiKey: "test-secret", messages: [ChatMessage(role: .user, content: "hi")], tools: [ProviderToolSchema(name: "files_read", description: "read", properties: ["path": "string"])]) {
             events.append(event)
         }
         XCTAssertTrue(events.contains(.token("hello")))
-        XCTAssertTrue(events.contains(.toolCall(id: "tool-1", name: "files.read", argumentsJSON: "{\"path\":\"/tmp/a\"}")))
+        XCTAssertTrue(events.contains(.toolCall(id: "tool-1", name: "files_read", argumentsJSON: "{\"path\":\"/tmp/a\"}")))
         XCTAssertEqual(events.last, .finished)
         let request = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
         XCTAssertEqual(request.url?.absoluteString, "https://tabitoken.com/v1/messages")
@@ -500,7 +500,7 @@ final class ProviderProtocolClientTests: XCTestCase {
         let body = Data("""
         data: {"type":"response.output_text.delta","delta":"ok"}
 
-        data: {"type":"response.output_item.added","item":{"type":"function_call","id":"item-1","call_id":"call-1","name":"files.read","arguments":""}}
+        data: {"type":"response.output_item.added","item":{"type":"function_call","id":"item-1","call_id":"call-1","name":"files_read","arguments":""}}
 
         data: {"type":"response.function_call_arguments.delta","item_id":"item-1","delta":"{\\"path\\":\\"/x\\"}"}
 
@@ -522,8 +522,61 @@ final class ProviderProtocolClientTests: XCTestCase {
             events.append(event)
         }
         XCTAssertTrue(events.contains(.token("ok")))
-        XCTAssertTrue(events.contains(.toolCall(id: "call-1", name: "files.read", argumentsJSON: "{\"path\":\"/x\"}")))
+        XCTAssertTrue(events.contains(.toolCall(id: "call-1", name: "files_read", argumentsJSON: "{\"path\":\"/x\"}")))
         XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://example.com/v1/responses")
+    }
+
+    func testPersistedInternalToolNamesAreProviderSafeAcrossAnthropicChatAndResponsesHistory() async throws {
+        let assistantCall = ChatMessage(role: .assistant, content: "", providerMetadata: [
+            "tool_call_id": "call-1",
+            "tool_name": "files.read",
+            "tool_arguments": "{\"path\":\"/tmp/a\"}"
+        ])
+        let toolResult = ChatMessage(role: .tool, content: "ok", providerMetadata: [
+            "tool_call_id": "call-1",
+            "tool_name": "files.read"
+        ])
+        let messages = [ChatMessage(role: .user, content: "read"), assistantCall, toolResult]
+        let safeSchema = ProviderToolSchema(name: "files_read", description: "read", properties: ["path": "string"], required: ["path"])
+
+        ProviderTestURLProtocol.install(status: 200, body: Data("""
+        data: {"type":"message_start","message":{"id":"m1"}}
+
+        data: {"type":"message_stop"}
+
+        """.utf8), headers: ["Content-Type": "text/event-stream"])
+        let anthropic = AnthropicProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let anthropicConfig = ProviderConfiguration(name: "a", baseURL: URL(string: "https://example.com/v1")!, model: "m", apiKeyReference: "k", protocolName: ProviderProtocol.anthropic.rawValue)
+        for try await _ in anthropic.stream(configuration: anthropicConfig, apiKey: "secret", messages: messages, tools: [safeSchema]) {}
+        let anthropicRequest = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
+        let anthropicData = try XCTUnwrap(anthropicRequest.httpBody)
+        let anthropicBody = try XCTUnwrap(JSONSerialization.jsonObject(with: anthropicData) as? [String: Any])
+        let anthropicMessages = try XCTUnwrap(anthropicBody["messages"] as? [[String: Any]])
+        let assistantBlocks = try XCTUnwrap(anthropicMessages[1]["content"] as? [[String: Any]])
+        XCTAssertEqual(assistantBlocks.first?["name"] as? String, "files_read")
+
+        ProviderTestURLProtocol.install(status: 200, body: Data("data: [DONE]\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let chat = OpenAICompatibleProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let chatConfig = ProviderConfiguration(name: "c", baseURL: URL(string: "https://example.com/v1")!, model: "m", apiKeyReference: "k", protocolName: ProviderProtocol.openAIChat.rawValue)
+        for try await _ in chat.stream(configuration: chatConfig, apiKey: "secret", messages: messages, tools: [safeSchema]) {}
+        let chatRequest = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
+        let chatData = try XCTUnwrap(chatRequest.httpBody)
+        let chatBody = try XCTUnwrap(JSONSerialization.jsonObject(with: chatData) as? [String: Any])
+        let chatMessages = try XCTUnwrap(chatBody["messages"] as? [[String: Any]])
+        let chatToolCalls = try XCTUnwrap(chatMessages[1]["tool_calls"] as? [[String: Any]])
+        let chatFunction = try XCTUnwrap(chatToolCalls.first?["function"] as? [String: Any])
+        XCTAssertEqual(chatFunction["name"] as? String, "files_read")
+        XCTAssertEqual(chatMessages[2]["name"] as? String, "files_read")
+
+        ProviderTestURLProtocol.install(status: 200, body: Data("data: {\"type\":\"response.completed\"}\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let responses = OpenAIResponsesProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let responsesConfig = ProviderConfiguration(name: "r", baseURL: URL(string: "https://example.com/v1")!, model: "m", apiKeyReference: "k", protocolName: ProviderProtocol.openAIResponses.rawValue)
+        for try await _ in responses.stream(configuration: responsesConfig, apiKey: "secret", messages: messages, tools: [safeSchema]) {}
+        let responsesRequest = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
+        let responsesData = try XCTUnwrap(responsesRequest.httpBody)
+        let responsesBody = try XCTUnwrap(JSONSerialization.jsonObject(with: responsesData) as? [String: Any])
+        let input = try XCTUnwrap(responsesBody["input"] as? [[String: Any]])
+        XCTAssertEqual(input[1]["name"] as? String, "files_read")
     }
 
     func testHTTP403QuotaIsCapacityNotCredentialFailure() {
@@ -587,6 +640,104 @@ final class ProviderProtocolClientTests: XCTestCase {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ProviderTestURLProtocol.self]
         return URLSession(configuration: configuration)
+    }
+}
+
+final class ProviderLiveIntegrationTests: XCTestCase {
+    func testTabitokenAgentUsesFullCloudCodeToolSchemaExecutesToolAndContinuesAfterResult() async throws {
+        guard ProcessInfo.processInfo.environment["CLOUDCODE_LIVE_SMOKE"] == "1" else {
+            throw XCTSkip("Live Provider smoke is enabled only in the dedicated GitHub Actions workflow")
+        }
+        guard let bootstrapText = ProcessInfo.processInfo.environment["CLOUDCODE_PROVIDER_BOOTSTRAP"],
+              let bootstrapData = bootstrapText.data(using: .utf8) else {
+            XCTFail("CLOUDCODE_PROVIDER_BOOTSTRAP is missing")
+            return
+        }
+        let payload = try ProviderBootstrapPayload.decodeBootstrap(from: bootstrapData)
+        let tabitoken = try XCTUnwrap(payload.providers.first(where: { $0.providerID == ProviderCatalog.tabitokenID }))
+        let key = try XCTUnwrap(tabitoken.keys.first?.secret)
+        XCTAssertFalse(key.isEmpty)
+
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeLiveSmoke-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let vault = MemoryKeyVault(keys: ["live-tabitoken": key])
+        let registry = ToolRegistry()
+        let probe = LiveSmokeCapabilityProbe()
+        let router = ToolRouter(
+            registry: registry,
+            executors: [LiveSmokeCapabilityExecutor()],
+            executionLedger: ToolExecutionLedger(fileURL: root.appendingPathComponent("execution-ledger.json"))
+        )
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let agent = AgentCore(
+            provider: AnthropicProviderClient(retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0)),
+            keyVault: vault,
+            toolRouter: router,
+            registry: registry,
+            capabilityProbe: probe,
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 4
+        )
+        let session = AgentSession(permissionMode: .full)
+        let configuration = ProviderConfiguration(
+            name: "Tabitoken",
+            baseURL: URL(string: "https://tabitoken.com")!,
+            model: "claude-opus-5",
+            apiKeyReference: "live-tabitoken",
+            providerID: ProviderCatalog.tabitokenID,
+            protocolName: ProviderProtocol.anthropic.rawValue,
+            authModeName: ProviderAuthMode.both.rawValue
+        )
+
+        var sawCapabilityTool = false
+        var sawSuccessfulToolResult = false
+        var assistantText = ""
+        let stream = await agent.send(
+            text: "You must call the capability_probe tool exactly once before answering. Do not call any other tool. After receiving its tool result, reply exactly LIVE_TOOL_ROUND_OK.",
+            session: session,
+            providerConfiguration: configuration
+        )
+        for try await event in stream {
+            switch event {
+            case .toolStarted(let name, _):
+                if name == "capability.probe" { sawCapabilityTool = true }
+            case .toolFinished(let result):
+                if result.success { sawSuccessfulToolResult = true }
+            case .token(let token):
+                assistantText += token
+            default:
+                break
+            }
+        }
+
+        XCTAssertTrue(sawCapabilityTool, "Live model did not call the mapped capability_probe tool")
+        XCTAssertTrue(sawSuccessfulToolResult, "Live tool result was not produced")
+        XCTAssertTrue(assistantText.contains("LIVE_TOOL_ROUND_OK"), "Live model did not continue after tool result")
+        let saved = try await sessions.load(session.id)
+        XCTAssertTrue(saved.messages.contains { $0.role == .assistant && $0.content.contains("LIVE_TOOL_ROUND_OK") })
+        let toolCall = saved.messages.first(where: { $0.role == .assistant && $0.providerMetadata["tool_call_id"] != nil })
+        XCTAssertEqual(toolCall?.providerMetadata["tool_name"], "capability.probe")
+        XCTAssertEqual(toolCall?.providerMetadata["provider_tool_name"], "capability_probe")
+    }
+}
+
+private struct LiveSmokeCapabilityProbe: CapabilityProbing, Sendable {
+    func probe() async -> CapabilityProfile {
+        CapabilityProfile(records: [CapabilityRecord(id: "filesystem.own_container", domain: .filesystem, status: .available, detail: "live smoke")])
+    }
+}
+
+private struct LiveSmokeCapabilityExecutor: ToolExecuting, Sendable {
+    let route: AppExecutionRoute = .structuredTool
+
+    func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
+        tool.name == "capability.probe"
+    }
+
+    func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
+        guard call.name == "capability.probe" else { throw ToolRouterError.noExecutionRoute(call.name) }
+        return ToolResult(toolCallID: call.id, success: true, summary: "Capability probe live smoke executed", payload: ["available": "1"])
     }
 }
 

@@ -32,7 +32,7 @@ jobs:
           secret = provider["keys"][0]["secret"]
           base = "https://tabitoken.com/v1"
 
-          def request(label, method, path, payload=None, extra_headers=None):
+          def request(label, method, path, payload=None, extra_headers=None, expected=200):
               data = None if payload is None else json.dumps(payload).encode("utf-8")
               headers = {
                   "Accept": "application/json",
@@ -55,6 +55,8 @@ jobs:
               body = body.replace(secret, "[REDACTED]")
               compact = " ".join(body.split())[:1200]
               print(f"PROBE {label}: HTTP {status} BODY {compact}")
+              if status != expected:
+                  raise SystemExit(f"FAIL: {label} expected HTTP {expected}, got {status}")
               return status, body
 
           status, models_body = request("models", "GET", "/models")
@@ -73,6 +75,10 @@ jobs:
                               if isinstance(value, str):
                                   ids.append(value)
                   print("TABITOKEN_MODEL_MATCHES:", [m for m in ids if "claude" in m.lower()][:40])
+                  required_models = {"claude-opus-5", "claude-opus-5-thinking"}
+                  missing = sorted(required_models.difference(ids))
+                  if missing:
+                      raise SystemExit(f"FAIL: required Tabitoken models missing: {missing}")
               except Exception as exc:
                   print("MODEL_PARSE_NOTE:", type(exc).__name__)
 
@@ -83,6 +89,10 @@ jobs:
               "messages": [{"role": "user", "content": "Reply OK"}],
           }
           request("anthropic-minimal", "POST", "/messages", base_anthropic, {"anthropic-version": "2023-06-01"})
+
+          thinking = dict(base_anthropic)
+          thinking["model"] = "claude-opus-5-thinking"
+          request("anthropic-thinking-minimal", "POST", "/messages", thinking, {"anthropic-version": "2023-06-01"})
 
           large = dict(base_anthropic)
           large["max_tokens"] = 8192
@@ -112,7 +122,7 @@ jobs:
                   "additionalProperties": False,
               },
           }]
-          request("anthropic-tool-dotted-name", "POST", "/messages", dotted_tool, {"anthropic-version": "2023-06-01"})
+          request("anthropic-tool-dotted-name", "POST", "/messages", dotted_tool, {"anthropic-version": "2023-06-01"}, expected=400)
 
           request("openai-chat-minimal", "POST", "/chat/completions", {
               "model": "claude-opus-5",
@@ -159,5 +169,19 @@ jobs:
                       },
                   },
               }],
-          })
+          }, expected=400)
           PY
+
+      - name: Resolve pinned Swift package
+        run: |
+          set -euo pipefail
+          swift package resolve
+          test "$(git -C .build/checkouts/ZIPFoundation rev-parse HEAD)" = "22787ffb59de99e5dc1fbfe80b19c97a904ad48d"
+
+      - name: Run real Cloud Code Agent tool round against Tabitoken
+        env:
+          CLOUDCODE_LIVE_SMOKE: "1"
+          CLOUDCODE_PROVIDER_BOOTSTRAP: ${{ secrets.CLOUDCODE_PROVIDER_BOOTSTRAP }}
+        run: |
+          set -euo pipefail
+          swift test --filter ProviderLiveIntegrationTests

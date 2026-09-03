@@ -428,6 +428,163 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertNotEqual(first, other)
     }
 
+    func testProviderToolNameMapCoversAllRegisteredToolsAndRoundTripsWithoutCollisions() async throws {
+        let descriptors = await ToolRegistry().all()
+        let internalNames = descriptors.map(\.name)
+        let map = try ProviderToolNameMap(internalNames: internalNames)
+        XCTAssertEqual(map.internalToProvider.count, internalNames.count)
+        XCTAssertEqual(map.providerToInternal.count, internalNames.count)
+
+        for internalName in internalNames {
+            let providerName = try XCTUnwrap(map.providerName(forInternalName: internalName))
+            XCTAssertTrue(ProviderToolNameMap.isProviderSafe(providerName), providerName)
+            XCTAssertFalse(providerName.contains("."), providerName)
+            XCTAssertEqual(map.internalName(forProviderName: providerName), internalName)
+            XCTAssertEqual(try ProviderToolNameMap.decode(providerName), internalName)
+        }
+
+        let dotted = try ProviderToolNameMap.encode("a.b")
+        let underscored = try ProviderToolNameMap.encode("a_b")
+        XCTAssertEqual(dotted, "a_b")
+        XCTAssertEqual(underscored, "a-u-b")
+        XCTAssertNotEqual(dotted, underscored)
+        XCTAssertEqual(try ProviderToolNameMap.decode(try ProviderToolNameMap.encode("a._-b")), "a._-b")
+        XCTAssertEqual(try ProviderToolNameMap.encode("a-b"), "a-h-b")
+        XCTAssertEqual(try ProviderToolNameMap.decode(try ProviderToolNameMap.encode("a.x41")), "a.x41")
+        XCTAssertThrowsError(try ProviderToolNameMap.encode("bad/name"))
+    }
+
+    func testSessionStoreCRUDSearchAndIndependentSessionsSurviveRestart() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionsRoot = root.appendingPathComponent("sessions", isDirectory: true)
+        let first = AgentSession(
+            title: "照片整理",
+            messages: [ChatMessage(role: .user, content: "整理相册"), ChatMessage(role: .assistant, content: "已读取照片索引")],
+            permissionMode: .safe,
+            providerID: "tabitoken",
+            keySlotID: "primary",
+            model: "claude-opus-5",
+            updatedAt: Date(timeIntervalSince1970: 100)
+        )
+        let second = AgentSession(
+            title: "文件检查",
+            messages: [ChatMessage(role: .user, content: "检查 IPA 元数据")],
+            permissionMode: .balanced,
+            providerID: "another",
+            keySlotID: "key-2",
+            model: "model-2",
+            updatedAt: Date(timeIntervalSince1970: 200)
+        )
+        let store = SessionStore(root: sessionsRoot)
+        try await store.save(first)
+        try await store.save(second)
+        XCTAssertNotEqual(first.id, second.id)
+        let loadedFirst = try await store.load(first.id)
+        let photoMatches = try await store.search("照片")
+        let ipaMatches = try await store.search("IPA")
+        let allSessions = try await store.all()
+        XCTAssertEqual(loadedFirst.messages.first?.content, "整理相册")
+        XCTAssertEqual(photoMatches.map(\.id), [first.id])
+        XCTAssertEqual(ipaMatches.map(\.id), [second.id])
+        XCTAssertEqual(allSessions.map(\.id), [second.id, first.id])
+
+        let restarted = SessionStore(root: sessionsRoot)
+        let reopened = try await restarted.load(first.id)
+        XCTAssertEqual(reopened.providerID, "tabitoken")
+        XCTAssertEqual(reopened.model, "claude-opus-5")
+        XCTAssertEqual(reopened.messages.count, 2)
+    }
+
+    func testAgentMapsProviderSafeToolNameBackToInternalAndUsesSafeHistoryOnSecondRound() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let counter = InvocationCounter()
+        let provider = RecordingToolRoundProvider()
+        let registry = ToolRegistry(descriptors: [ToolDescriptor(name: "files.create", summary: "create", risk: .safeWrite)])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let agent = AgentCore(
+            provider: provider,
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(
+                registry: registry,
+                executors: [CountingExecutor(route: .structuredTool, names: ["files.create"], counter: counter)],
+                executionLedger: ToolExecutionLedger(fileURL: root.appendingPathComponent("ledger.json"))
+            ),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 3
+        )
+        let initial = AgentSession(permissionMode: .full)
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        var startedTools: [String] = []
+        var finalText = ""
+        let stream = await agent.send(text: "create it", session: initial, providerConfiguration: config)
+        for try await event in stream {
+            switch event {
+            case .toolStarted(let name, _): startedTools.append(name)
+            case .token(let token): finalText += token
+            default: break
+            }
+        }
+
+        XCTAssertEqual(startedTools, ["files.create"])
+        let executionCount = await counter.value()
+        XCTAssertEqual(executionCount, 1)
+        XCTAssertEqual(finalText, "done")
+        let snapshots = await provider.snapshots()
+        XCTAssertEqual(snapshots.count, 2)
+        XCTAssertEqual(snapshots[0].tools.map(\.name), ["files_create"])
+        XCTAssertTrue(snapshots[0].tools.allSatisfy { ProviderToolNameMap.isProviderSafe($0.name) && !$0.name.contains(".") })
+        let secondAssistantTool = snapshots[1].messages.first(where: { $0.role == .assistant && $0.providerMetadata["tool_call_id"] == "call-1" })
+        XCTAssertEqual(secondAssistantTool?.providerMetadata["tool_name"], "files.create")
+        XCTAssertEqual(secondAssistantTool?.providerMetadata["provider_tool_name"], "files_create")
+        let secondToolResult = snapshots[1].messages.first(where: { $0.role == .tool && $0.providerMetadata["tool_call_id"] == "call-1" })
+        XCTAssertEqual(secondToolResult?.providerMetadata["provider_tool_name"], "files_create")
+
+        let saved = try await sessions.load(initial.id)
+        let persistedToolCall = saved.messages.first(where: { $0.role == .assistant && $0.providerMetadata["tool_call_id"] == "call-1" })
+        XCTAssertEqual(persistedToolCall?.providerMetadata["tool_name"], "files.create")
+        XCTAssertEqual(persistedToolCall?.providerMetadata["provider_tool_name"], "files_create")
+        XCTAssertEqual(saved.title, "create it")
+    }
+
+    func testUnknownProviderToolNameFailsClosedBeforeExecution() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let counter = InvocationCounter()
+        let registry = ToolRegistry(descriptors: [ToolDescriptor(name: "files.create", summary: "", risk: .safeWrite)])
+        let agent = AgentCore(
+            provider: ToolThenFinishProvider(events: [.toolCall(id: "forged", name: "files_delete", argumentsJSON: "{}"), .finished]),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(
+                registry: registry,
+                executors: [CountingExecutor(route: .structuredTool, names: ["files.create"], counter: counter)],
+                executionLedger: ToolExecutionLedger(fileURL: root.appendingPathComponent("ledger.json"))
+            ),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true)),
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 2
+        )
+        do {
+            let stream = await agent.send(
+                text: "test",
+                session: AgentSession(permissionMode: .full),
+                providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key")
+            )
+            for try await _ in stream {}
+            XCTFail("Unknown provider tool name must fail closed")
+        } catch {
+            XCTAssertEqual(error as? ToolArgumentValidationError, .unknownProviderTool("files_delete"))
+        }
+        let executionCount = await counter.value()
+        XCTAssertEqual(executionCount, 0)
+    }
+
     func testMalformedToolArgumentsAreRejectedWithoutExecutingStateChange() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -437,7 +594,7 @@ final class CloudCodeCoreTests: XCTestCase {
         let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
         let checkpoints = TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json"))
         let agent = AgentCore(
-            provider: ToolThenFinishProvider(events: [.toolCall(id: "bad-json", name: "files.create", argumentsJSON: "{\"path\":"), .finished]),
+            provider: ToolThenFinishProvider(events: [.toolCall(id: "bad-json", name: "files_create", argumentsJSON: "{\"path\":"), .finished]),
             keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
             toolRouter: ToolRouter(registry: registry, executors: [executor], executionLedger: ToolExecutionLedger(fileURL: root.appendingPathComponent("ledger.json"))),
             registry: registry,
@@ -467,7 +624,7 @@ final class CloudCodeCoreTests: XCTestCase {
         let executor = CountingExecutor(route: .structuredTool, names: ["files.create"], counter: counter)
         let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
         let agent = AgentCore(
-            provider: ToolThenFinishProvider(events: [.toolCall(id: "missing-content", name: "files.create", argumentsJSON: "{\"path\":\"/tmp/a\"}"), .finished]),
+            provider: ToolThenFinishProvider(events: [.toolCall(id: "missing-content", name: "files_create", argumentsJSON: "{\"path\":\"/tmp/a\"}"), .finished]),
             keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
             toolRouter: ToolRouter(registry: registry, executors: [executor], executionLedger: ToolExecutionLedger(fileURL: root.appendingPathComponent("ledger.json"))),
             registry: registry,
@@ -493,8 +650,8 @@ final class CloudCodeCoreTests: XCTestCase {
         let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
         let agent = AgentCore(
             provider: ToolThenFinishProvider(events: [
-                .toolCall(id: "duplicate", name: "files.create", argumentsJSON: "{\"path\":\"/tmp/a\",\"content\":\"a\"}"),
-                .toolCall(id: "duplicate", name: "files.create", argumentsJSON: "{\"path\":\"/tmp/b\",\"content\":\"b\"}"),
+                .toolCall(id: "duplicate", name: "files_create", argumentsJSON: "{\"path\":\"/tmp/a\",\"content\":\"a\"}"),
+                .toolCall(id: "duplicate", name: "files_create", argumentsJSON: "{\"path\":\"/tmp/b\",\"content\":\"b\"}"),
                 .finished
             ]),
             keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
@@ -1185,6 +1342,46 @@ private struct ToolThenFinishProvider: ProviderStreaming, Sendable {
             }
             continuation.finish()
         }
+    }
+}
+
+private actor RecordingToolRoundProvider: ProviderStreaming {
+    struct Snapshot: Sendable {
+        var messages: [ChatMessage]
+        var tools: [ProviderToolSchema]
+    }
+
+    private var recorded: [Snapshot] = []
+
+    func snapshots() -> [Snapshot] { recorded }
+
+    nonisolated func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                await record(messages: messages, tools: tools)
+                if messages.contains(where: { $0.role == .tool }) {
+                    continuation.yield(.token("done"))
+                    continuation.yield(.finished)
+                } else {
+                    continuation.yield(.toolCall(
+                        id: "call-1",
+                        name: "files_create",
+                        argumentsJSON: "{\"path\":\"/tmp/provider-map-test\",\"content\":\"x\"}"
+                    ))
+                    continuation.yield(.finished)
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    private func record(messages: [ChatMessage], tools: [ProviderToolSchema]) {
+        recorded.append(Snapshot(messages: messages, tools: tools))
     }
 }
 

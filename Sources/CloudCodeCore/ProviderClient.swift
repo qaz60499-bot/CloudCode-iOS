@@ -167,6 +167,118 @@ public struct ProviderToolSchema: Sendable, Equatable {
     }
 }
 
+public enum ProviderToolNameMapError: Error, Equatable, CustomStringConvertible {
+    case emptyInternalName
+    case invalidInternalName(String)
+    case encodedNameTooLong(String)
+    case invalidProviderName(String)
+    case duplicateInternalName(String)
+    case collision(providerName: String, firstInternalName: String, secondInternalName: String)
+
+    public var description: String {
+        switch self {
+        case .emptyInternalName: return "内部工具 ID 不能为空"
+        case .invalidInternalName(let name): return "内部工具 ID 含有不受支持的字符：\(name)"
+        case .encodedNameTooLong(let name): return "工具 ID 编码后的厂商名称超过 64 字符：\(name)"
+        case .invalidProviderName(let name): return "生成了厂商不接受的工具名称：\(name)"
+        case .duplicateInternalName(let name): return "发现重复内部工具 ID：\(name)"
+        case .collision(let providerName, let first, let second): return "工具名称映射冲突：\(first) / \(second) → \(providerName)"
+        }
+    }
+}
+
+/// Internal Tool ID ↔ provider-safe function name mapping.
+/// `.` becomes `_`, literal `_` becomes `-u-`, and literal `-` becomes `-h-`,
+/// so common names stay readable (`files.read` → `files_read`) while the transform
+/// is prefix-unambiguous, deterministic, reversible and collision-safe. Internal
+/// IDs outside `[A-Za-z0-9._-]` fail closed.
+public struct ProviderToolNameMap: Sendable, Equatable {
+    public let internalToProvider: [String: String]
+    public let providerToInternal: [String: String]
+
+    public init(internalNames: [String]) throws {
+        var forward: [String: String] = [:]
+        var reverse: [String: String] = [:]
+        for internalName in internalNames.sorted() {
+            guard forward[internalName] == nil else { throw ProviderToolNameMapError.duplicateInternalName(internalName) }
+            let providerName = try Self.encode(internalName)
+            if let existing = reverse[providerName], existing != internalName {
+                throw ProviderToolNameMapError.collision(providerName: providerName, firstInternalName: existing, secondInternalName: internalName)
+            }
+            guard try Self.decode(providerName) == internalName else { throw ProviderToolNameMapError.invalidProviderName(providerName) }
+            forward[internalName] = providerName
+            reverse[providerName] = internalName
+        }
+        internalToProvider = forward
+        providerToInternal = reverse
+    }
+
+    public func providerName(forInternalName name: String) -> String? { internalToProvider[name] }
+    public func internalName(forProviderName name: String) -> String? { providerToInternal[name] }
+
+    public static func encode(_ internalName: String) throws -> String {
+        guard !internalName.isEmpty else { throw ProviderToolNameMapError.emptyInternalName }
+        var output = ""
+        for byte in internalName.utf8 {
+            switch byte {
+            case 48...57, 65...90, 97...122:
+                output.append(Character(UnicodeScalar(Int(byte))!))
+            case 46:
+                output += "_"
+            case 95:
+                output += "-u-"
+            case 45:
+                output += "-h-"
+            default:
+                throw ProviderToolNameMapError.invalidInternalName(internalName)
+            }
+        }
+        guard output.count <= 64 else { throw ProviderToolNameMapError.encodedNameTooLong(internalName) }
+        guard isProviderSafe(output) else { throw ProviderToolNameMapError.invalidProviderName(output) }
+        return output
+    }
+
+    public static func decode(_ providerName: String) throws -> String {
+        guard isProviderSafe(providerName), !providerName.isEmpty else { throw ProviderToolNameMapError.invalidProviderName(providerName) }
+        let bytes = Array(providerName.utf8)
+        var decoded: [UInt8] = []
+        var index = 0
+        while index < bytes.count {
+            let byte = bytes[index]
+            if byte == 95 {
+                decoded.append(46)
+                index += 1
+                continue
+            }
+            if byte == 45 {
+                guard index + 2 < bytes.count, bytes[index + 2] == 45 else {
+                    throw ProviderToolNameMapError.invalidProviderName(providerName)
+                }
+                switch bytes[index + 1] {
+                case 117: decoded.append(95)
+                case 104: decoded.append(45)
+                default: throw ProviderToolNameMapError.invalidProviderName(providerName)
+                }
+                index += 3
+                continue
+            }
+            decoded.append(byte)
+            index += 1
+        }
+        guard let result = String(bytes: decoded, encoding: .utf8), !result.isEmpty else {
+            throw ProviderToolNameMapError.invalidProviderName(providerName)
+        }
+        return result
+    }
+
+    public static func isProviderSafe(_ name: String) -> Bool {
+        guard !name.isEmpty, name.count <= 64 else { return false }
+        return name.utf8.allSatisfy { byte in
+            (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte) || byte == 45 || byte == 95
+        }
+    }
+}
+
 public protocol ProviderStreaming: Sendable {
     func stream(
         configuration: ProviderConfiguration,
@@ -743,15 +855,23 @@ private enum ProviderRequestFactory {
     }
 }
 
+private func providerVisibleToolName(_ message: ChatMessage) -> String? {
+    if let explicit = message.providerMetadata["provider_tool_name"], ProviderToolNameMap.isProviderSafe(explicit) {
+        return explicit
+    }
+    guard let internalName = message.providerMetadata["tool_name"] else { return nil }
+    return try? ProviderToolNameMap.encode(internalName)
+}
+
 private func openAIMessageObject(_ message: ChatMessage) -> [String: Any] {
     var object: [String: Any] = ["role": message.role.rawValue, "content": message.content]
     if message.role == .tool, let toolCallID = message.providerMetadata["tool_call_id"] {
         object["tool_call_id"] = toolCallID
-        if let toolName = message.providerMetadata["tool_name"] { object["name"] = toolName }
+        if let toolName = providerVisibleToolName(message) { object["name"] = toolName }
     }
     if message.role == .assistant,
        let toolCallID = message.providerMetadata["tool_call_id"],
-       let toolName = message.providerMetadata["tool_name"] {
+       let toolName = providerVisibleToolName(message) {
         object["content"] = NSNull()
         object["tool_calls"] = [[
             "id": toolCallID,
@@ -772,7 +892,7 @@ private func anthropicMessages(_ messages: [ChatMessage]) -> [[String: Any]] {
         }
         if message.role == .assistant,
            let callID = message.providerMetadata["tool_call_id"],
-           let name = message.providerMetadata["tool_name"] {
+           let name = providerVisibleToolName(message) {
             let arguments = message.providerMetadata["tool_arguments"] ?? "{}"
             let input: Any
             if let data = arguments.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) {
@@ -794,7 +914,7 @@ private func responsesInput(_ messages: [ChatMessage]) -> [[String: Any]] {
         }
         if message.role == .assistant,
            let callID = message.providerMetadata["tool_call_id"],
-           let name = message.providerMetadata["tool_name"] {
+           let name = providerVisibleToolName(message) {
             return [
                 "type": "function_call",
                 "call_id": callID,

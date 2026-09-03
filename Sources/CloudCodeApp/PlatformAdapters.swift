@@ -38,6 +38,11 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         return enumerationProven
     }
 
+    public func forceRefresh() {
+        lastRefresh = .distantPast
+        refresh()
+    }
+
     private func refresh() {
         defer { lastRefresh = Date() }
         var apps: [ResourceNode] = []

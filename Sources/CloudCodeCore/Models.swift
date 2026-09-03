@@ -471,14 +471,30 @@ public struct AgentSession: Codable, Equatable, Identifiable, Sendable {
     public var title: String
     public var messages: [ChatMessage]
     public var permissionMode: PermissionMode
+    public var providerID: String?
+    public var keySlotID: String?
+    public var model: String?
     public var createdAt: Date
     public var updatedAt: Date
 
-    public init(id: UUID = UUID(), title: String = "New Session", messages: [ChatMessage] = [], permissionMode: PermissionMode = .safe, createdAt: Date = Date(), updatedAt: Date = Date()) {
+    public init(
+        id: UUID = UUID(),
+        title: String = "新对话",
+        messages: [ChatMessage] = [],
+        permissionMode: PermissionMode = .safe,
+        providerID: String? = nil,
+        keySlotID: String? = nil,
+        model: String? = nil,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
         self.id = id
         self.title = title
         self.messages = messages
         self.permissionMode = permissionMode
+        self.providerID = providerID
+        self.keySlotID = keySlotID
+        self.model = model
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }

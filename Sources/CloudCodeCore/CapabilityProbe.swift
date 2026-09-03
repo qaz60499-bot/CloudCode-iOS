@@ -100,8 +100,8 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         let keychainProbe = Self.probeOwnKeychain()
         records.append(record("data.keychain_scope", .data, keychainProbe.status, keychainProbe.detail))
 
-        records.append(record("automation.url_scheme", .automation, .available,
-                              "URL opening is available through the app adapter, subject to iOS policy."))
+        records.append(record("automation.url_scheme", .automation, .deviceValidationRequired,
+                              "A URL-opening adapter must be connected and verified on this device before this capability can be used."))
         records.append(record("automation.xctest_wda", .automation, .deviceValidationRequired,
                               "XCTest/WDA requires a separate runtime/backend and is never assumed."))
         records.append(record("automation.gui", .automation, .deviceValidationRequired,

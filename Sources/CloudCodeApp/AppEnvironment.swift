@@ -14,7 +14,11 @@ public final class CloudCodeViewModel: ObservableObject {
     @Published public var trash: [TrashRecord] = []
     @Published public var auditEvents: [AuditEvent] = []
     @Published public var interruptedTasks: [TaskCheckpoint] = []
+    @Published public private(set) var sessionHistory: [AgentSession] = []
     @Published public var isRunning = false
+    @Published public private(set) var isRefreshingCapabilities = false
+    @Published public private(set) var capabilityRefreshMessage: String?
+    @Published public private(set) var lastCapabilityRefreshAt: Date?
     @Published public var lastError: String?
     @Published public private(set) var inFlightOperationKeys: Set<String> = []
 
@@ -114,7 +118,12 @@ public final class CloudCodeViewModel: ObservableObject {
         self.selectedModel = selection.model
         self.permissionMode = initialPermissionMode
         self.browsePath = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).path
-        self.session = AgentSession(permissionMode: initialPermissionMode)
+        self.session = AgentSession(
+            permissionMode: initialPermissionMode,
+            providerID: selection.providerID,
+            keySlotID: selection.keySlotID,
+            model: selection.model
+        )
         self.approvalCenter = approval
         self.appResolver = resolver
         self.capabilityProbe = probe
@@ -136,8 +145,16 @@ public final class CloudCodeViewModel: ObservableObject {
     public func bootstrap() {
         guard !didBootstrap, bootstrapTask == nil else { return }
         bootstrapTask = Task {
-            defer { bootstrapTask = nil }
+            defer {
+                bootstrapTask = nil
+                isRefreshingCapabilities = false
+            }
+            isRefreshingCapabilities = true
+            capabilityRefreshMessage = "正在检测设备能力…"
+            await appResolver.forceRefresh()
             capabilities = await capabilityProbe.probe()
+            lastCapabilityRefreshAt = capabilities.generatedAt
+            capabilityRefreshMessage = Self.capabilitySummary(capabilities)
             capabilityGraph = CapabilityGraphBuilder().build(profile: capabilities, tools: await toolRegistry.all())
             apps = await appResolver.installedApps()
             await seedKnowledgeIfNeeded(apps)
@@ -151,6 +168,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 trash = try await trashService.records()
                 auditEvents = Array((try await auditStore.readAll()).suffix(200).reversed())
                 interruptedTasks = await checkpointStore.interrupted()
+                try await restoreSessionState()
                 try refreshFiles()
                 if capabilities.status("data.keychain_scope") == .available {
                     do {
@@ -280,6 +298,9 @@ public final class CloudCodeViewModel: ObservableObject {
         applySelection(reconciled)
         UserDefaults.standard.set(permissionMode.rawValue, forKey: "permission.mode")
         session.permissionMode = permissionMode
+        session.providerID = selectedProviderID
+        session.keySlotID = selectedKeySlotID
+        session.model = selectedModel
         return true
     }
 
@@ -331,7 +352,11 @@ public final class CloudCodeViewModel: ObservableObject {
                     }
                 }
                 if runGeneration.isCurrent(runID),
-                   let saved = try? await sessionStore.load(session.id) { session = saved }
+                   let saved = try? await sessionStore.load(session.id) {
+                    session = saved
+                    transcript = Self.transcript(for: saved)
+                    UserDefaults.standard.set(saved.id.uuidString, forKey: "session.current.id")
+                }
             } catch {
                 if runGeneration.isCurrent(runID) { lastError = String(describing: error) }
             }
@@ -340,6 +365,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 isRunning = false
             }
             await reloadActivity()
+            try? await reloadSessionHistory()
             refreshFilesFromDisk()
         }
     }
@@ -365,8 +391,67 @@ public final class CloudCodeViewModel: ObservableObject {
         Task {
             await reloadActivity()
             refreshFilesFromDisk()
+            try? await reloadSessionHistory()
         }
         refreshCapabilities()
+    }
+
+    public func createNewSession() {
+        guard !isRunning else {
+            lastError = "当前任务仍在运行，请先停止或等待完成后再新建对话。"
+            return
+        }
+        let newSession = AgentSession(
+            permissionMode: permissionMode,
+            providerID: selectedProviderID,
+            keySlotID: selectedKeySlotID,
+            model: selectedModel
+        )
+        session = newSession
+        transcript = ""
+        activityLines = []
+        UserDefaults.standard.set(newSession.id.uuidString, forKey: "session.current.id")
+        Task {
+            do {
+                try await sessionStore.save(newSession)
+                try await reloadSessionHistory()
+            } catch {
+                lastError = "新建对话保存失败：\(error)"
+            }
+        }
+    }
+
+    public func openSession(_ candidate: AgentSession) {
+        guard !isRunning else {
+            lastError = "当前任务仍在运行，请先停止或等待完成后再切换对话。"
+            return
+        }
+        Task {
+            do {
+                let loaded = try await sessionStore.load(candidate.id)
+                adoptSession(loaded)
+                activityLines = []
+                try await reloadSessionHistory()
+            } catch {
+                lastError = "打开旧对话失败：\(error)"
+            }
+        }
+    }
+
+    public func sessions(matching query: String) -> [AgentSession] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return sessionHistory }
+        return sessionHistory.filter { item in
+            if item.title.localizedCaseInsensitiveContains(trimmed) { return true }
+            return item.messages.contains { message in
+                (message.role == .user || message.role == .assistant)
+                    && message.content.localizedCaseInsensitiveContains(trimmed)
+            }
+        }
+    }
+
+    public func sessionHasUnfinishedTask(_ sessionID: UUID) -> Bool {
+        interruptedTasks.contains { $0.sessionID == sessionID }
     }
 
     public func resumeTask(_ checkpoint: TaskCheckpoint) {
@@ -407,7 +492,9 @@ public final class CloudCodeViewModel: ObservableObject {
                 )
                 try await consume(stream, runID: runID)
                 if runGeneration.isCurrent(runID),
-                   let saved = try? await sessionStore.load(checkpoint.sessionID) { session = saved }
+                   let saved = try? await sessionStore.load(checkpoint.sessionID) {
+                    adoptSession(saved)
+                }
             } catch {
                 if runGeneration.isCurrent(runID) { lastError = String(describing: error) }
             }
@@ -416,6 +503,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 isRunning = false
             }
             await reloadActivity()
+            try? await reloadSessionHistory()
             refreshFilesFromDisk()
         }
     }
@@ -457,13 +545,40 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func refreshCapabilities() {
-        guard bootstrapTask == nil, capabilityRefreshTask == nil else { return }
+        if bootstrapTask != nil {
+            capabilityRefreshMessage = "初始化中的设备能力检测尚未完成。"
+            return
+        }
+        guard capabilityRefreshTask == nil else { return }
+        isRefreshingCapabilities = true
+        capabilityRefreshMessage = "正在检测设备能力…"
+        let previous = capabilities
         capabilityRefreshTask = Task {
-            defer { capabilityRefreshTask = nil }
-            capabilities = await capabilityProbe.probe()
-            capabilityGraph = CapabilityGraphBuilder().build(profile: capabilities, tools: await toolRegistry.all())
+            defer {
+                capabilityRefreshTask = nil
+                isRefreshingCapabilities = false
+            }
+            await appResolver.forceRefresh()
+            guard !Task.isCancelled else {
+                capabilityRefreshMessage = "设备能力检测已取消。"
+                return
+            }
+            let refreshed = await capabilityProbe.probe()
+            guard !Task.isCancelled else {
+                capabilityRefreshMessage = "设备能力检测已取消。"
+                return
+            }
+            capabilities = refreshed
+            lastCapabilityRefreshAt = refreshed.generatedAt
+            capabilityGraph = CapabilityGraphBuilder().build(profile: refreshed, tools: await toolRegistry.all())
             apps = await appResolver.installedApps()
-            try? await resourceIndex.seedLightweight(apps: apps, capabilityProfile: capabilities)
+            do {
+                try await resourceIndex.seedLightweight(apps: apps, capabilityProfile: refreshed)
+            } catch {
+                lastError = "设备能力检测完成，但资源索引刷新失败：\(error)"
+            }
+            let changed = Self.changedCapabilityCount(from: previous, to: refreshed)
+            capabilityRefreshMessage = Self.capabilitySummary(refreshed) + (changed > 0 ? " · \(changed) 项状态变化" : " · 状态无变化")
         }
     }
 
@@ -746,6 +861,78 @@ public final class CloudCodeViewModel: ObservableObject {
             }
         )
         return importedCount
+    }
+
+    private func restoreSessionState() async throws {
+        let all = try await sessionStore.all()
+        sessionHistory = all
+        let currentID = UserDefaults.standard.string(forKey: "session.current.id").flatMap(UUID.init(uuidString:))
+        if let currentID, let current = all.first(where: { $0.id == currentID }) {
+            adoptSession(current)
+            return
+        }
+        if let mostRecent = all.first {
+            adoptSession(mostRecent)
+            return
+        }
+        session.providerID = selectedProviderID
+        session.keySlotID = selectedKeySlotID
+        session.model = selectedModel
+        try await sessionStore.save(session)
+        UserDefaults.standard.set(session.id.uuidString, forKey: "session.current.id")
+        sessionHistory = [session]
+        transcript = Self.transcript(for: session)
+    }
+
+    private func reloadSessionHistory() async throws {
+        sessionHistory = try await sessionStore.all()
+    }
+
+    private func adoptSession(_ loaded: AgentSession) {
+        session = loaded
+        permissionMode = loaded.permissionMode
+        let desired = ProviderSelectionState(
+            providerID: loaded.providerID ?? selectedProviderID,
+            keySlotID: loaded.keySlotID ?? selectedKeySlotID,
+            model: loaded.model ?? selectedModel
+        )
+        let reconciled = ProviderSelectionResolver.reconcile(desired, profiles: providerProfiles)
+        applySelection(reconciled)
+        session.providerID = reconciled.providerID
+        session.keySlotID = reconciled.keySlotID
+        session.model = reconciled.model
+        transcript = Self.transcript(for: session)
+        UserDefaults.standard.set(session.id.uuidString, forKey: "session.current.id")
+    }
+
+    private static func transcript(for session: AgentSession) -> String {
+        session.messages.compactMap { message -> String? in
+            switch message.role {
+            case .user:
+                return message.content.isEmpty ? nil : "你：\(message.content)"
+            case .assistant:
+                return message.content.isEmpty ? nil : "Cloud Code：\(message.content)"
+            case .system, .tool:
+                return nil
+            }
+        }.joined(separator: "\n\n")
+    }
+
+    private static func capabilitySummary(_ profile: CapabilityProfile) -> String {
+        let available = profile.records.filter { $0.status == .available }.count
+        let unavailable = profile.records.filter { $0.status == .unavailable }.count
+        let validation = profile.records.filter { $0.status == .deviceValidationRequired }.count
+        let unknown = profile.records.filter { $0.status == .unknown }.count
+        var summary = "检测完成：\(available) 可用 / \(unavailable) 不可用 / \(validation) 需要真机验证"
+        if unknown > 0 { summary += " / \(unknown) 未知" }
+        return summary
+    }
+
+    private static func changedCapabilityCount(from old: CapabilityProfile, to new: CapabilityProfile) -> Int {
+        let oldStatuses = Dictionary(uniqueKeysWithValues: old.records.map { ($0.id, $0.status) })
+        return new.records.reduce(into: 0) { count, record in
+            if oldStatuses[record.id] != record.status { count += 1 }
+        }
     }
 
     private static func userFacingProviderBootstrapError(_ error: Error) -> String {

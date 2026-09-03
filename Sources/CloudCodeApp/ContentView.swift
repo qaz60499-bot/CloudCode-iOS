@@ -52,6 +52,7 @@ struct ContentView: View {
 private struct ChatView: View {
     @ObservedObject var model: CloudCodeViewModel
     @State private var input = ""
+    @State private var showSessionHistory = false
 
     var body: some View {
         NavigationStack {
@@ -102,8 +103,92 @@ private struct ChatView: View {
                 }
                 .padding()
             }
-            .navigationTitle("对话")
+            .navigationTitle(model.session.title)
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button {
+                        showSessionHistory = true
+                    } label: {
+                        Label("历史", systemImage: "clock.arrow.circlepath")
+                    }
+                    .disabled(model.isRunning)
+
+                    Button {
+                        input = ""
+                        model.createNewSession()
+                    } label: {
+                        Label("新建对话", systemImage: "square.and.pencil")
+                    }
+                    .disabled(model.isRunning)
+                }
+            }
+            .sheet(isPresented: $showSessionHistory) {
+                SessionHistoryView(model: model, isPresented: $showSessionHistory)
+            }
+        }
+    }
+}
+
+private struct SessionHistoryView: View {
+    @ObservedObject var model: CloudCodeViewModel
+    @Binding var isPresented: Bool
+    @State private var query = ""
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if model.sessions(matching: query).isEmpty {
+                    Text(query.isEmpty ? "暂无历史对话" : "没有匹配的对话")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(model.sessions(matching: query)) { item in
+                    Button {
+                        model.openSession(item)
+                        isPresented = false
+                    } label: {
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Text(item.title).font(.headline).foregroundStyle(.primary)
+                                Spacer()
+                                if model.sessionHasUnfinishedTask(item.id) {
+                                    Label("未完成", systemImage: "clock.badge.exclamationmark")
+                                        .font(.caption2)
+                                        .foregroundStyle(.orange)
+                                }
+                            }
+                            Text(sessionLastMessageSummary(item))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                            HStack(spacing: 8) {
+                                Text(item.providerID ?? "厂商未记录")
+                                Text(item.model ?? "模型未记录")
+                                Spacer()
+                                Text(item.updatedAt.formatted(date: .abbreviated, time: .shortened))
+                            }
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 3)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .navigationTitle("历史对话")
+            .searchable(text: $query, prompt: "搜索标题或消息")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") { isPresented = false }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button("新建对话") {
+                        model.createNewSession()
+                        isPresented = false
+                    }
+                    .disabled(model.isRunning)
+                }
+            }
         }
     }
 }
@@ -156,6 +241,25 @@ private struct PhoneView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section("检测") {
+                    HStack(spacing: 10) {
+                        if model.isRefreshingCapabilities {
+                            ProgressView()
+                        } else {
+                            Image(systemName: "checkmark.circle")
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(model.capabilityRefreshMessage ?? "尚未完成设备能力检测。")
+                            .font(.subheadline)
+                    }
+                    if let date = model.lastCapabilityRefreshAt {
+                        LabeledContent("最近检测", value: date.formatted(date: .abbreviated, time: .standard))
+                            .font(.caption)
+                    }
+                    Text("“需要真机验证”表示当前 Runtime 没有足够证据自动证明该能力；不会为了显示全绿而把未验证能力标成可用。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
                 Section("能力状态") {
                     ForEach(model.capabilities.records, id: \.id) { record in
                         HStack(alignment: .top) {
@@ -174,7 +278,16 @@ private struct PhoneView: View {
             }
             .navigationTitle("设备")
             .toolbar {
-                Button("重新检测") { model.refreshCapabilities() }
+                Button {
+                    model.refreshCapabilities()
+                } label: {
+                    if model.isRefreshingCapabilities {
+                        ProgressView()
+                    } else {
+                        Text("重新检测")
+                    }
+                }
+                .disabled(model.isRefreshingCapabilities)
             }
         }
     }
@@ -544,6 +657,13 @@ private struct ApprovalSheet: View {
     }
 }
 
+private func sessionLastMessageSummary(_ session: AgentSession) -> String {
+    let text = session.messages.reversed().first(where: {
+        ($0.role == .user || $0.role == .assistant) && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    })?.content.trimmingCharacters(in: .whitespacesAndNewlines) ?? "暂无消息"
+    return text.count <= 80 ? text : String(text.prefix(80)) + "…"
+}
+
 private func localizedProviderStatus(_ value: String) -> String {
     switch value {
     case "READY": return "可用"
@@ -632,7 +752,7 @@ private func localizedCapabilityDetail(_ id: String, detail: String) -> String {
         if detail.contains("currently unavailable") { return "Keychain 当前受保护不可访问（例如设备锁定）；解锁后重新检测。" }
         if detail.contains("Verified on this runtime") { return "已在当前设备实际完成临时写入、读取和删除回验；Cloud Code 自身 Keychain 可用。" }
         return "正在按当前设备实际结果判断 Cloud Code 自身 Keychain，不再仅凭配置假定可用。"
-    case "automation.url_scheme": return "可通过 App 适配器打开 URL，仍受 iOS 系统策略限制。"
+    case "automation.url_scheme": return "当前 URL 打开适配器尚未接入并在本机完成验证，因此保持“需要真机验证”；不会仅凭系统存在 URL Scheme 机制就假定可用。"
     case "automation.xctest_wda": return "需要独立的 XCTest / WDA 运行后端；未接入或未验证时不会假定可用。"
     case "automation.gui": return "GUI 自动化只有在后端实际就绪并通过探测后才会启用。"
     case "ipa.inspect": return "可在本地进程内检查 IPA 的 ZIP、Info.plist、架构和签名元数据。"
