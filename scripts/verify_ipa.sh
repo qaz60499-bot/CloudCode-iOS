@@ -11,12 +11,12 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 unzip -q "$IPA_PATH" -d "$TMP_DIR"
-mapfile -t APPS < <(find "$TMP_DIR/Payload" -maxdepth 1 -type d -name '*.app' -print)
-if [[ "${#APPS[@]}" -ne 1 ]]; then
-  echo "FAIL: expected exactly one Payload/*.app, found ${#APPS[@]}" >&2
+APP_COUNT="$(find "$TMP_DIR/Payload" -maxdepth 1 -type d -name '*.app' -print | wc -l | tr -d ' ')"
+if [[ "$APP_COUNT" != "1" ]]; then
+  echo "FAIL: expected exactly one Payload/*.app, found $APP_COUNT" >&2
   exit 3
 fi
-APP_PATH="${APPS[0]}"
+APP_PATH="$(find "$TMP_DIR/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
 
 INFO="$APP_PATH/Info.plist"
 if [[ ! -f "$INFO" ]]; then
