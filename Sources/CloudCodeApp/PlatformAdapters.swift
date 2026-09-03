@@ -698,6 +698,7 @@ public struct IOSSystemExecutor: ToolExecuting, Sendable {
     public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
         guard let command = call.arguments["command"], !command.isEmpty else { throw ToolRouterError.noExecutionRoute("command missing") }
         let decision = policy.decision(mode: context.permissionMode, tool: descriptor)
+        if decision == .deny { throw TransactionError.confirmationDenied }
         if decision == .requireConfirmation {
             let preview = ApprovalPreview(title: "Run advanced shell", target: command, originalSummary: nil, diff: nil, reason: "Generic shell bypasses typed-tool safety and is high risk", plan: ["Validate permission", "Execute ios_system", "Capture exit status"], risk: .systemChange)
             guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
@@ -743,6 +744,18 @@ public struct IOSPrivateAppExecutor: ToolExecuting, Sendable {
         }
 
         if call.name == "apps.launch" {
+            let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: bundleID)
+            if decision == .deny { throw TransactionError.confirmationDenied }
+            if decision == .requireConfirmation {
+                let preview = ApprovalPreview(
+                    title: "启动 App",
+                    target: bundleID,
+                    reason: "启动目标 App 会改变设备前台状态。",
+                    plan: ["确认目标 Bundle ID", "调用已验证的 LaunchServices 启动接口", "记录启动结果"],
+                    risk: descriptor.risk
+                )
+                guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
+            }
             let outcome = await appResolver.launchApplication(bundleID: bundleID)
             try await audit.append(AuditEvent(
                 sessionID: call.sessionID,
@@ -767,6 +780,7 @@ public struct IOSPrivateAppExecutor: ToolExecuting, Sendable {
                 throw ToolRouterError.noExecutionRoute("Cloud Code cannot terminate itself through the active session")
             }
             let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: bundleID)
+            if decision == .deny { throw TransactionError.confirmationDenied }
             if decision == .requireConfirmation {
                 let preview = ApprovalPreview(
                     title: "停止 App",
@@ -802,6 +816,7 @@ public struct IOSPrivateAppExecutor: ToolExecuting, Sendable {
         }
 
         let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: bundleID, explicitlyPermanent: true)
+        if decision == .deny { throw TransactionError.confirmationDenied }
         if decision == .requireConfirmation {
             let preview = ApprovalPreview(
                 title: "卸载 App",
@@ -953,6 +968,7 @@ public struct GUIFallbackExecutor: ToolExecuting, Sendable {
         let approvalTarget = GUIApprovalTargetSanitizer.target(for: call)
 
         let decision = policy.decision(mode: context.permissionMode, tool: descriptor)
+        if decision == .deny { throw TransactionError.confirmationDenied }
         if decision == .requireConfirmation {
             let preview = ApprovalPreview(
                 title: "执行 GUI 操作",
