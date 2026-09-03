@@ -110,7 +110,11 @@ public struct PathGuard: Sendable {
         if raw == "/" { throw PathSafetyError.rootPath }
         if raw.split(separator: "/").contains("..") { throw PathSafetyError.traversal }
 
-        let standardized = target.standardizedFileURL.resolvingSymlinksInPath()
+        let standardizedInput = target.standardizedFileURL
+        let resolvedParent = standardizedInput.deletingLastPathComponent().resolvingSymlinksInPath()
+        let standardized = resolvedParent
+            .appendingPathComponent(standardizedInput.lastPathComponent, isDirectory: false)
+            .standardizedFileURL
         if standardized.path == "/" { throw PathSafetyError.rootPath }
 
         if let root = allowedRoot?.standardizedFileURL.resolvingSymlinksInPath() {

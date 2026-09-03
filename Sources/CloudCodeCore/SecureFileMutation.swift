@@ -268,6 +268,8 @@ public struct SecureFileMutation: Sendable {
         beforeFinalMutation?()
         try assertPinnedDirectoryStillMatches(sourceParent.fd, path: sourceParent.path)
         try assertPinnedDirectoryStillMatches(destinationParent.fd, path: destinationParent.path)
+        try assertLeafStillMatches(parentFD: sourceParent.fd, leaf: sourceParent.leaf, expected: sourceStat)
+        try requireDestinationAbsent(parentFD: destinationParent.fd, leaf: destinationParent.leaf)
 
         let destinationFD = destinationParent.leaf.withCString {
             openat(destinationParent.fd, $0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
@@ -290,6 +292,7 @@ public struct SecureFileMutation: Sendable {
         guard fsync(destinationFD) == 0 else { throw SecureFileMutationError.posix(errno) }
         try assertPinnedDirectoryStillMatches(sourceParent.fd, path: sourceParent.path)
         try assertPinnedDirectoryStillMatches(destinationParent.fd, path: destinationParent.path)
+        try assertLeafStillMatches(parentFD: sourceParent.fd, leaf: sourceParent.leaf, expected: sourceStat)
         committed = true
     }
 
@@ -376,17 +379,19 @@ public struct SecureFileMutation: Sendable {
         allowedRoot: URL?,
         createIntermediates: Bool
     ) throws -> OpenParent {
-        let targetPath = approvedTarget.standardizedFileURL.path
-        guard targetPath.hasPrefix("/"), targetPath != "/" else { throw SecureFileMutationError.invalidPath }
-
-        let rootURL: URL
-        if let allowedRoot {
-            rootURL = allowedRoot.standardizedFileURL.resolvingSymlinksInPath()
-        } else {
-            rootURL = URL(fileURLWithPath: "/", isDirectory: true)
+        let standardizedTarget = approvedTarget.standardizedFileURL
+        guard standardizedTarget.path.hasPrefix("/"), standardizedTarget.path != "/" else {
+            throw SecureFileMutationError.invalidPath
         }
-        let rootPath = rootURL.path
-        let rootPrefix = rootPath == "/" ? "/" : (rootPath.hasSuffix("/") ? rootPath : rootPath + "/")
+
+        let rootPath: String
+        if let allowedRoot {
+            rootPath = try canonicalExistingDirectoryPath(allowedRoot.standardizedFileURL.path)
+        } else {
+            rootPath = "/"
+        }
+        let targetPath = try canonicalTargetPathPreservingMissingParent(standardizedTarget)
+        let rootPrefix = rootPath == "/" ? "/" : rootPath + "/"
         guard rootPath == "/" || targetPath.hasPrefix(rootPrefix) else {
             throw SecureFileMutationError.outsideAllowedRoot
         }
@@ -417,9 +422,7 @@ public struct SecureFileMutation: Sendable {
                 guard nextFD >= 0 else { throw SecureFileMutationError.posix(errno) }
                 close(directoryFD)
                 directoryFD = nextFD
-                currentPath = URL(fileURLWithPath: currentPath, isDirectory: true)
-                    .appendingPathComponent(component, isDirectory: true)
-                    .standardizedFileURL.path
+                currentPath = appendCanonicalPath(currentPath, component)
             }
             return OpenParent(fd: directoryFD, leaf: leaf, path: currentPath)
         } catch {
@@ -428,28 +431,100 @@ public struct SecureFileMutation: Sendable {
         }
     }
 
+    private func canonicalExistingDirectoryPath(_ path: String) throws -> String {
+        guard path.hasPrefix("/") else { throw SecureFileMutationError.invalidPath }
+        let canonical = try canonicalExistingPath(path)
+        var value = stat()
+        let status = canonical.withCString { lstat($0, &value) }
+        guard status == 0 else { throw SecureFileMutationError.posix(errno) }
+        guard (value.st_mode & S_IFMT) == S_IFDIR else { throw SecureFileMutationError.invalidPath }
+        return canonical
+    }
+
+    private func canonicalTargetPathPreservingMissingParent(_ target: URL) throws -> String {
+        let leaf = target.lastPathComponent
+        guard validComponent(leaf) else { throw SecureFileMutationError.invalidPath }
+
+        var probe = target.deletingLastPathComponent().standardizedFileURL
+        var missingComponents: [String] = []
+        while true {
+            do {
+                var canonicalParent = try canonicalExistingPath(probe.path)
+                for component in missingComponents {
+                    guard validComponent(component) else { throw SecureFileMutationError.invalidPath }
+                    canonicalParent = appendCanonicalPath(canonicalParent, component)
+                }
+                return appendCanonicalPath(canonicalParent, leaf)
+            } catch SecureFileMutationError.posix(let code)
+                where code == ENOENT || code == ENOTDIR || code == ELOOP {
+                guard probe.path != "/" else { throw SecureFileMutationError.posix(code) }
+                let missing = probe.lastPathComponent
+                guard validComponent(missing) else { throw SecureFileMutationError.invalidPath }
+                missingComponents.insert(missing, at: 0)
+                let parent = probe.deletingLastPathComponent().standardizedFileURL
+                guard parent.path != probe.path else { throw SecureFileMutationError.invalidPath }
+                probe = parent
+            }
+        }
+    }
+
+    private func canonicalExistingPath(_ path: String) throws -> String {
+        var failure: Int32 = 0
+        let pointer: UnsafeMutablePointer<CChar>? = path.withCString { rawPath in
+            let resolved = realpath(rawPath, nil)
+            if resolved == nil { failure = errno }
+            return resolved
+        }
+        guard let pointer else { throw SecureFileMutationError.posix(failure == 0 ? errno : failure) }
+        defer { free(pointer) }
+        return String(cString: pointer)
+    }
+
+    private func appendCanonicalPath(_ base: String, _ component: String) -> String {
+        base == "/" ? "/" + component : base + "/" + component
+    }
+
     private func openAbsoluteDirectoryNoFollow(_ path: String) throws -> Int32 {
         guard path.hasPrefix("/") else { throw SecureFileMutationError.invalidPath }
-        // The resolved allowed root is the trust anchor. Re-opening a directory path here is
-        // only a read-only identity check; all actual descendant mutation still uses pinned
-        // directory FDs plus openat/renameat with O_NOFOLLOW. Opening the final directory in
-        // one syscall intentionally permits macOS system-level intermediate aliases such as
-        // /var -> /private/var, while O_NOFOLLOW still rejects a swapped final component.
         let flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
-        let directoryFD = path.withCString { open($0, flags) }
+        var directoryFD = open("/", flags)
         guard directoryFD >= 0 else { throw SecureFileMutationError.posix(errno) }
-        return directoryFD
+        if path == "/" { return directoryFD }
+
+        do {
+            let components = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+            for component in components {
+                guard validComponent(component) else { throw SecureFileMutationError.invalidPath }
+                let nextFD = component.withCString { openat(directoryFD, $0, flags) }
+                guard nextFD >= 0 else { throw SecureFileMutationError.posix(errno) }
+                close(directoryFD)
+                directoryFD = nextFD
+            }
+            return directoryFD
+        } catch {
+            close(directoryFD)
+            throw error
+        }
     }
 
     private func assertPinnedDirectoryStillMatches(_ pinnedFD: Int32, path: String) throws {
         var pinned = stat()
         guard fstat(pinnedFD, &pinned) == 0 else { throw SecureFileMutationError.posix(errno) }
+        guard (pinned.st_mode & S_IFMT) == S_IFDIR else { throw SecureFileMutationError.verificationFailed }
 
-        let currentFD = try openAbsoluteDirectoryNoFollow(path)
+        let currentFD: Int32
+        do {
+            currentFD = try openAbsoluteDirectoryNoFollow(path)
+        } catch SecureFileMutationError.posix(let code)
+            where code == ENOENT || code == ENOTDIR || code == ELOOP {
+            throw SecureFileMutationError.verificationFailed
+        }
         defer { close(currentFD) }
         var current = stat()
         guard fstat(currentFD, &current) == 0 else { throw SecureFileMutationError.posix(errno) }
-        guard pinned.st_dev == current.st_dev, pinned.st_ino == current.st_ino else {
+        guard (current.st_mode & S_IFMT) == S_IFDIR,
+              pinned.st_dev == current.st_dev,
+              pinned.st_ino == current.st_ino else {
             throw SecureFileMutationError.verificationFailed
         }
     }
@@ -472,6 +547,19 @@ public struct SecureFileMutation: Sendable {
         var actual = stat()
         guard fstat(fd, &actual) == 0 else { throw SecureFileMutationError.posix(errno) }
         try requireIdentity(expected, actual: actual)
+    }
+
+    private func assertLeafStillMatches(parentFD: Int32, leaf: String, expected: stat) throws {
+        var current = stat()
+        let status = leaf.withCString {
+            fstatat(parentFD, $0, &current, AT_SYMLINK_NOFOLLOW)
+        }
+        guard status == 0,
+              current.st_dev == expected.st_dev,
+              current.st_ino == expected.st_ino,
+              (current.st_mode & S_IFMT) == (expected.st_mode & S_IFMT) else {
+            throw SecureFileMutationError.verificationFailed
+        }
     }
 
     private func requireDestinationAbsent(parentFD: Int32, leaf: String) throws {

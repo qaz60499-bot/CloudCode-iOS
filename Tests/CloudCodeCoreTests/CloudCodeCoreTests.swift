@@ -337,6 +337,89 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: parked.appendingPathComponent("config.plist").path))
     }
 
+    func testPathGuardResolvesSymlinkedParentForMissingLeaf() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        let parent = allowed.appendingPathComponent("parent", isDirectory: true)
+        try FileManager.default.createDirectory(at: allowed, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: parent, withDestinationURL: outside)
+        let missingLeaf = parent.appendingPathComponent("new.txt")
+
+        XCTAssertThrowsError(try PathGuard().validate(target: missingLeaf, allowedRoot: allowed, rejectSymlink: true)) { error in
+            XCTAssertEqual(error as? PathSafetyError, .targetEscapesAllowedRoot)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("new.txt").path))
+    }
+
+    func testSecureCreateRejectsSamePathParentDirectoryReplacement() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        let parent = allowed.appendingPathComponent("parent", isDirectory: true)
+        let parked = allowed.appendingPathComponent("parent-original", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let target = parent.appendingPathComponent("new.txt")
+        let race = MutationOnInvocation(trigger: 1) {
+            try? FileManager.default.moveItem(at: parent, to: parked)
+            try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        }
+        let mutation = SecureFileMutation(beforeFinalMutation: { race.invoke() })
+
+        XCTAssertThrowsError(try mutation.createFile(at: target, data: Data("payload".utf8), allowedRoot: allowed)) { error in
+            XCTAssertEqual(error as? SecureFileMutationError, .verificationFailed)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: parked.appendingPathComponent("new.txt").path))
+    }
+
+    func testSecureCopyRejectsSourceLeafReplacement() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        let sourceParent = allowed.appendingPathComponent("source", isDirectory: true)
+        let destinationParent = allowed.appendingPathComponent("destination", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceParent, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: destinationParent, withIntermediateDirectories: true)
+        let source = sourceParent.appendingPathComponent("input.txt")
+        let parked = sourceParent.appendingPathComponent("input-original.txt")
+        let destination = destinationParent.appendingPathComponent("output.txt")
+        try Data("original".utf8).write(to: source)
+        let race = MutationOnInvocation(trigger: 1) {
+            try? FileManager.default.moveItem(at: source, to: parked)
+            try? Data("replacement".utf8).write(to: source)
+        }
+        let mutation = SecureFileMutation(beforeFinalMutation: { race.invoke() })
+
+        XCTAssertThrowsError(try mutation.copyFile(from: source, sourceAllowedRoot: allowed, to: destination, destinationAllowedRoot: allowed)) { error in
+            XCTAssertEqual(error as? SecureFileMutationError, .verificationFailed)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertEqual(String(data: try Data(contentsOf: parked), encoding: .utf8), "original")
+        XCTAssertEqual(String(data: try Data(contentsOf: source), encoding: .utf8), "replacement")
+    }
+
+    func testSecureCopyDoesNotOverwriteDestinationCreatedAtFinalRace() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        try FileManager.default.createDirectory(at: allowed, withIntermediateDirectories: true)
+        let source = allowed.appendingPathComponent("source.txt")
+        let destination = allowed.appendingPathComponent("destination.txt")
+        try Data("source".utf8).write(to: source)
+        let race = MutationOnInvocation(trigger: 1) {
+            try? Data("attacker".utf8).write(to: destination)
+        }
+        let mutation = SecureFileMutation(beforeFinalMutation: { race.invoke() })
+
+        XCTAssertThrowsError(try mutation.copyFile(from: source, sourceAllowedRoot: allowed, to: destination, destinationAllowedRoot: allowed)) { error in
+            XCTAssertEqual(error as? SecureFileMutationError, .destinationExists)
+        }
+        XCTAssertEqual(String(data: try Data(contentsOf: destination), encoding: .utf8), "attacker")
+    }
+
     func testStructuredCreateRejectsDestinationOutsideAllowedRoot() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
