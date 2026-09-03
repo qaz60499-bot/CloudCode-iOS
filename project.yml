@@ -1,6 +1,7 @@
 name: CloudCodeIOS
 options:
   bundleIdPrefix: com.cloudcode
+  developmentLanguage: zh-Hans
   deploymentTarget:
     iOS: "16.0"
 packages:

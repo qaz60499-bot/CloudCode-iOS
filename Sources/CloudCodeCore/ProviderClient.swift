@@ -93,14 +93,14 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
 
     public var description: String {
         switch self {
-        case .missingAPIKey: return "Provider API key is missing"
-        case .invalidEndpoint: return "Provider endpoint is invalid"
-        case .authenticationFailed(let code): return "Provider authentication failed (HTTP \(code)); select another valid Key"
-        case .capacityExhausted(let code): return "Provider Key has insufficient quota/capacity (HTTP \(code)); another Key in the same Provider may be selected"
-        case .rateLimited: return "Provider rate limit exceeded; retry later"
-        case .invalidResponse(let code): return "Provider returned HTTP \(code)"
-        case .malformedEvent: return "Provider returned malformed streaming data"
-        case .streamInterrupted: return "Provider stream ended before a terminal event"
+        case .missingAPIKey: return "厂商 API Key 缺失"
+        case .invalidEndpoint: return "厂商接口地址无效"
+        case .authenticationFailed(let code): return "厂商认证失败（HTTP \(code)）；请选择另一个有效 Key"
+        case .capacityExhausted(let code): return "当前厂商 Key 的额度 / 容量不足（HTTP \(code)）；可选择同一厂商内的其他 Key"
+        case .rateLimited: return "厂商触发限流，请稍后重试"
+        case .invalidResponse(let code): return "厂商返回 HTTP \(code)"
+        case .malformedEvent: return "厂商返回了格式错误的流数据"
+        case .streamInterrupted: return "厂商流在完成事件前中断"
         case .transport(let value): return value
         }
     }
@@ -198,7 +198,7 @@ private extension ProviderRequestBuilding {
                     do {
                         let request = try makeRequest(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
                         let (bytes, response) = try await session.bytes(for: request)
-                        guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("Missing HTTP response") }
+                        guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("缺少 HTTP 响应") }
                         if !(200..<300).contains(http.statusCode) {
                             var body = Data()
                             for try await byte in bytes {
@@ -386,7 +386,7 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
             case "message_stop":
                 terminal = true
             case "error":
-                throw ProviderError.transport("Anthropic stream returned an error event")
+                throw ProviderError.transport("Anthropic 流返回错误事件")
             default:
                 break
             }
@@ -472,7 +472,7 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
             case "response.completed":
                 terminal = true
             case "response.failed", "error":
-                throw ProviderError.transport("Responses stream returned an error event")
+                throw ProviderError.transport("Responses 流返回错误事件")
             default:
                 break
             }

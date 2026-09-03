@@ -142,7 +142,7 @@ public actor TransactionEngine {
         let originalData = try Data(contentsOf: safeTarget, options: [.mappedIfSafe])
         let originalText = String(data: originalData, encoding: .utf8)
         let proposedText = String(data: proposedData, encoding: .utf8)
-        let diff = (originalText != nil && proposedText != nil) ? diffEngine.make(old: originalText!, new: proposedText!) : "Binary replacement: \(originalData.count) bytes → \(proposedData.count) bytes"
+        let diff = (originalText != nil && proposedText != nil) ? diffEngine.make(old: originalText!, new: proposedText!) : "二进制替换：\(originalData.count) 字节 → \(proposedData.count) 字节"
 
         var transaction = TransactionRecord(sessionID: sessionID, toolCallID: toolCallID, targetPath: safeTarget.path, diff: diff)
         try await journal.upsert(transaction)
@@ -153,12 +153,12 @@ public actor TransactionEngine {
             transaction.state = .awaitingConfirmation
             try await journal.upsert(transaction)
             let preview = ApprovalPreview(
-                title: "Modify important file",
+                title: "修改重要文件",
                 target: safeTarget.path,
                 originalSummary: "\(originalData.count) bytes",
                 diff: diff,
                 reason: reason,
-                plan: ["Revalidate target", "Create backup", "Apply atomically", "Verify postcondition", "Commit or rollback"],
+                plan: ["重新验证目标", "创建备份", "原子写入", "验证最终状态", "提交或回滚"],
                 risk: tool.risk
             )
             guard await approval(preview) else {

@@ -21,13 +21,13 @@ public enum ToolArgumentValidationError: Error, Equatable, CustomStringConvertib
 
     public var description: String {
         switch self {
-        case .malformedJSON: return "Tool arguments are not valid JSON"
-        case .expectedObject: return "Tool arguments must be a JSON object"
-        case .unknownTool(let name): return "Tool arguments reference an unknown tool: \(name)"
-        case .missingRequired(let key): return "Tool arguments are missing required field: \(key)"
-        case .unexpectedArgument(let key): return "Tool arguments contain unexpected field: \(key)"
-        case .invalidType(let key, let expected): return "Tool argument \(key) must be \(expected)"
-        case .duplicateToolCallID(let id): return "Provider emitted duplicate tool call id in one round: \(id)"
+        case .malformedJSON: return "工具参数不是有效 JSON"
+        case .expectedObject: return "工具参数必须是 JSON 对象"
+        case .unknownTool(let name): return "工具参数引用了未知工具：\(name)"
+        case .missingRequired(let key): return "工具参数缺少必填字段：\(key)"
+        case .unexpectedArgument(let key): return "工具参数包含未允许字段：\(key)"
+        case .invalidType(let key, let expected): return "工具参数 \(key) 的类型必须是 \(expected)"
+        case .duplicateToolCallID(let id): return "厂商在同一轮返回了重复的工具调用 ID：\(id)"
         }
     }
 }
@@ -279,7 +279,7 @@ public actor AgentCore {
                     try await sessionStore.save(session)
                     try await checkpointStore.upsert(checkpoint)
 
-                    continuation.yield(.status("Probing device capabilities…"))
+                    continuation.yield(.status("正在检测设备能力…"))
                     var capabilities = await capabilityProbe.probe()
                     session = try await reconcileDanglingToolCalls(
                         in: session,
@@ -297,7 +297,7 @@ public actor AgentCore {
                         checkpoint.updatedAt = Date()
                         try await checkpointStore.upsert(checkpoint)
 
-                        continuation.yield(.status(round == 0 ? "Planning with Tool-first routing…" : "Continuing after tool result…"))
+                        continuation.yield(.status(round == 0 ? "正在使用工具优先路由规划…" : "正在根据工具结果继续…"))
                         var assistantText = ""
                         var providerToolCalls: [(String, String, String)] = []
                         var providerToolCallIDs = Set<String>()
@@ -364,7 +364,7 @@ public actor AgentCore {
                             } catch {
                                 let failure = ToolResult(toolCallID: callID, success: false, summary: String(describing: error), payload: ["error": String(describing: error)])
                                 continuation.yield(.toolFinished(failure))
-                                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):argument_error", content: "Tool arguments rejected: \(error)").promptSafeRepresentation
+                                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):argument_error", content: "工具参数已拒绝：\(error)").promptSafeRepresentation
                                 session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: ["tool_call_id": providerCallID, "tool_name": name]))
                                 session.updatedAt = Date()
                                 try await sessionStore.save(session)
@@ -390,7 +390,7 @@ public actor AgentCore {
                             } catch {
                                 let failure = ToolResult(toolCallID: call.id, success: false, summary: String(describing: error), payload: ["error": String(describing: error)])
                                 continuation.yield(.toolFinished(failure))
-                                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):error", content: "Tool failed: \(error)").promptSafeRepresentation
+                                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):error", content: "工具执行失败：\(error)").promptSafeRepresentation
                                 session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: ["tool_call_id": providerCallID, "tool_name": name]))
                             }
                             session.updatedAt = Date()
@@ -398,7 +398,7 @@ public actor AgentCore {
                         }
                     }
 
-                    throw ProviderError.transport("Agent exceeded the maximum of \(maxToolRounds) tool rounds")
+                    throw ProviderError.transport("Agent 超过最大工具轮次：\(maxToolRounds)")
                 } catch is CancellationError {
                     checkpoint.state = "interrupted"
                     checkpoint.stepName = "cancelled by lifecycle"
@@ -444,7 +444,7 @@ public actor AgentCore {
             do {
                 arguments = try Self.validatedArguments(fromJSON: argumentsJSON, toolName: name)
             } catch {
-                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):recovery_argument_error", content: "Recovery rejected persisted tool arguments: \(error)").promptSafeRepresentation
+                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):recovery_argument_error", content: "恢复流程拒绝了持久化工具参数：\(error)").promptSafeRepresentation
                 session.messages.append(ChatMessage(
                     role: .tool,
                     content: content,
@@ -476,7 +476,7 @@ public actor AgentCore {
                     providerMetadata: ["tool_call_id": providerCallID, "tool_name": name]
                 ))
             } catch {
-                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):recovery_error", content: "Recovery did not blindly replay this tool call: \(error)").promptSafeRepresentation
+                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):recovery_error", content: "恢复流程没有盲目重放该工具调用：\(error)").promptSafeRepresentation
                 session.messages.append(ChatMessage(
                     role: .tool,
                     content: content,

@@ -84,6 +84,15 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(state.model, provider.models(for: "slot-1").first)
     }
 
+    func testSelectedKeyIsAlwaysThePrimaryReferenceBeforeSameProviderRotation() throws {
+        let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.tabitokenID }))
+        for slot in provider.keySlots {
+            let references = provider.orderedKeyReferences(selectedKeySlotID: slot.id)
+            XCTAssertEqual(references.first, ProviderCatalog.keyReference(providerID: provider.id, keySlotID: slot.id))
+            XCTAssertTrue(references.allSatisfy { $0.hasPrefix("provider.\(provider.id).key.") })
+        }
+    }
+
     func testSelectionStateRoundTripsAcrossRestart() throws {
         let original = ProviderSelectionState(providerID: "tabitoken", keySlotID: "slot-3", model: "claude-opus-4-8-thinking")
         let data = try JSONEncoder().encode(original)

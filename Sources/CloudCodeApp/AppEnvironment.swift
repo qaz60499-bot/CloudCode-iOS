@@ -145,7 +145,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 try await checkpointStore.recoverUnfinishedAfterRestart()
                 let recoveredTransactions = try await transactionEngine.recoverInterruptedTransactions()
                 if !recoveredTransactions.isEmpty {
-                    activityLines.append("Recovered \(recoveredTransactions.count) interrupted transaction(s) to a terminal state.")
+                    activityLines.append("已恢复 \(recoveredTransactions.count) 个中断事务到最终状态。")
                 }
                 try await resourceIndex.seedLightweight(apps: apps, capabilityProfile: capabilities)
                 trash = try await trashService.records()
@@ -182,7 +182,12 @@ public final class CloudCodeViewModel: ObservableObject {
 
     public var selectedKeyIsInstalled: Bool {
         guard let provider = selectedProvider, !selectedKeySlotID.isEmpty else { return false }
-        return keyVault.contains(ProviderCatalog.keyReference(providerID: provider.id, keySlotID: selectedKeySlotID))
+        return isKeyInstalled(providerID: provider.id, keySlotID: selectedKeySlotID)
+    }
+
+    public func isKeyInstalled(providerID: String, keySlotID: String) -> Bool {
+        guard !providerID.isEmpty, !keySlotID.isEmpty else { return false }
+        return keyVault.contains(ProviderCatalog.keyReference(providerID: providerID, keySlotID: keySlotID))
     }
 
     public func selectProvider(_ providerID: String) {
@@ -214,12 +219,12 @@ public final class CloudCodeViewModel: ObservableObject {
         let providerID = providerID ?? selectedProviderID
         let keySlotID = keySlotID ?? selectedKeySlotID
         guard !providerID.isEmpty, !keySlotID.isEmpty, !secret.isEmpty else {
-            lastError = "Provider/Key/secret is missing"
+            lastError = "厂商、Key 槽位或 Key 内容缺失。"
             return false
         }
         let reference = ProviderCatalog.keyReference(providerID: providerID, keySlotID: keySlotID)
         guard beginExclusiveOperation(Self.providerKeyMutationOperationKey) else {
-            lastError = "Another Provider Key operation is already in progress."
+            lastError = "另一个厂商 Key 操作正在进行中。"
             return false
         }
         defer { endExclusiveOperation(Self.providerKeyMutationOperationKey) }
@@ -227,14 +232,14 @@ public final class CloudCodeViewModel: ObservableObject {
            let slot = profile.keySlots.first(where: { $0.id == keySlotID }),
            !slot.fingerprint.isEmpty,
            ProviderFingerprint.sha256(secret) != slot.fingerprint {
-            lastError = "The Key does not match this desktop Key slot fingerprint. The existing Key was not changed."
+            lastError = "该 Key 与当前槽位的指纹不匹配，原有 Key 未被修改。"
             return false
         }
         do {
             try keyVault.set(secret, for: reference)
             return true
         } catch {
-            lastError = "Keychain: \(error)"
+            lastError = "Keychain 错误：\(error)"
             return false
         }
     }
@@ -246,7 +251,7 @@ public final class CloudCodeViewModel: ObservableObject {
             profiles: providerProfiles
         )
         guard !reconciled.providerID.isEmpty, !reconciled.keySlotID.isEmpty, !reconciled.model.isEmpty else {
-            lastError = "Select a Provider, Key and Model first."
+            lastError = "请先选择厂商、Key 和模型。"
             return false
         }
         applySelection(reconciled)
@@ -259,17 +264,17 @@ public final class CloudCodeViewModel: ObservableObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isRunning else { return }
         guard saveProviderSelection(), let config = currentProviderConfiguration() else {
-            if lastError == nil { lastError = "Invalid Provider/Key/Model selection" }
+            if lastError == nil { lastError = "厂商 / Key / 模型选择无效。" }
             return
         }
         guard selectedKeyIsInstalled else {
-            lastError = "The selected Key is not installed in iOS Keychain. Import the private bootstrap or add this Key locally."
+            lastError = "当前选择的 Key 尚未写入 iOS Keychain。请导入私有 Key 配置，或手动保存该 Key。"
             return
         }
         isRunning = true
         lastError = nil
-        transcript += transcript.isEmpty ? "You: \(trimmed)\n\n" : "\nYou: \(trimmed)\n\n"
-        activityLines.append("Planning request with \(config.name) / \(config.model)…")
+        transcript += transcript.isEmpty ? "你：\(trimmed)\n\n" : "\n你：\(trimmed)\n\n"
+        activityLines.append("正在使用 \(config.name) / \(config.model) 规划请求…")
 
         let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
 
@@ -286,12 +291,12 @@ public final class CloudCodeViewModel: ObservableObject {
                         activityLines.append(value)
                     case .token(let token):
                         if !assistantStarted {
-                            transcript += "Assistant: "
+                            transcript += "Cloud Code："
                             assistantStarted = true
                         }
                         transcript += token
                     case .toolStarted(let name, _):
-                        activityLines.append("Tool: \(name)")
+                        activityLines.append("工具：\(name)")
                     case .toolFinished(let result):
                         activityLines.append("\(result.success ? "✓" : "✗") \(result.summary)")
                     case .approvalRequired:
@@ -321,7 +326,7 @@ public final class CloudCodeViewModel: ObservableObject {
         currentTask = nil
         runGeneration.cancel()
         isRunning = false
-        activityLines.append("Task interrupted; checkpoint retained for resume/rollback inspection.")
+        activityLines.append("任务已中断；检查点已保留，可继续、回滚或检查最终状态。")
     }
 
     public func suspendForBackground() {
@@ -330,7 +335,7 @@ public final class CloudCodeViewModel: ObservableObject {
         currentTask = nil
         runGeneration.cancel()
         isRunning = false
-        activityLines.append("App entered background; active task was interrupted instead of being blindly replayed. Resume is available after checkpoint reconciliation.")
+        activityLines.append("App 已进入后台；当前任务已安全中断，不会盲目重放。完成检查点核对后可继续。")
     }
 
     public func refreshAfterForeground() {
@@ -349,7 +354,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let runID = runGeneration.start()
         isRunning = true
         lastError = nil
-        activityLines.append("Resuming checkpoint \(checkpoint.stepIndex)/\(checkpoint.totalSteps)…")
+        activityLines.append("正在继续检查点 \(checkpoint.stepIndex)/\(checkpoint.totalSteps)…")
 
         currentTask = Task {
             defer { endExclusiveOperation(operationKey) }
@@ -398,7 +403,7 @@ public final class CloudCodeViewModel: ObservableObject {
         Task {
             defer { endExclusiveOperation(key) }
             do {
-                try await checkpointStore.mark(checkpoint.id, state: "cancelled", stepName: "cancelled by user")
+                try await checkpointStore.mark(checkpoint.id, state: "cancelled", stepName: "用户取消")
                 await reloadActivity()
             } catch {
                 lastError = String(describing: error)
@@ -419,7 +424,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 })
                 guard let transaction = candidate else { throw TransactionError.noBackup }
                 _ = try await transactionEngine.rollback(transactionID: transaction.id)
-                try await checkpointStore.mark(checkpoint.id, state: "rolled_back", stepName: "latest committed transaction rolled back")
+                try await checkpointStore.mark(checkpoint.id, state: "rolled_back", stepName: "最近一次已提交事务已回滚")
                 await reloadActivity()
                 refreshFilesFromDisk()
             } catch {
@@ -449,12 +454,12 @@ public final class CloudCodeViewModel: ObservableObject {
         do {
             trash = try await trashService.records()
         } catch {
-            lastError = "Trash state could not be refreshed: \(error)"
+            lastError = "回收站状态刷新失败：\(error)"
         }
         do {
             auditEvents = Array((try await auditStore.readAll()).suffix(200).reversed())
         } catch {
-            lastError = "Audit state could not be refreshed: \(error)"
+            lastError = "审计记录刷新失败：\(error)"
         }
         interruptedTasks = await checkpointStore.interrupted()
     }
@@ -480,7 +485,7 @@ public final class CloudCodeViewModel: ObservableObject {
         guard beginExclusiveOperation(key) else { return }
         Task {
             defer { endExclusiveOperation(key) }
-            let preview = ApprovalPreview(title: "Permanently delete Trash item", target: record.originalPath, originalSummary: "\(record.size) bytes", reason: "Permanent deletion cannot be rolled back", plan: ["Quarantine Trash payload", "Update journal", "Delete quarantined payload"], risk: .permanentDestructive)
+            let preview = ApprovalPreview(title: "永久删除回收站项目", target: record.originalPath, originalSummary: "\(record.size) 字节", reason: "永久删除后无法回滚", plan: ["隔离回收站内容", "更新日志", "删除隔离内容"], risk: .permanentDestructive)
             let approved: Bool
             if permissionMode == .full {
                 approved = true
@@ -504,7 +509,7 @@ public final class CloudCodeViewModel: ObservableObject {
     public func addCustomProvider(label: String, baseURLText: String, apiKey: String) {
         let operationKey = Self.providerKeyMutationOperationKey
         guard beginExclusiveOperation(operationKey) else {
-            lastError = "Another Provider Key operation is already in progress."
+            lastError = "另一个厂商 Key 操作正在进行中。"
             return
         }
         let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -513,20 +518,20 @@ public final class CloudCodeViewModel: ObservableObject {
               ProviderEndpointPolicy.allowsBaseURL(baseURL),
               !apiKey.isEmpty else {
             endExclusiveOperation(operationKey)
-            lastError = "Custom Provider requires a label, HTTPS Base URL and API Key."
+            lastError = "自定义厂商需要名称、安全 HTTPS Base URL 和 API Key。"
             return
         }
         let providerID = "custom-\(UUID().uuidString.lowercased())"
         let slotID = "slot-1"
         let reference = ProviderCatalog.keyReference(providerID: providerID, keySlotID: slotID)
         let fingerprint = ProviderFingerprint.sha256(apiKey)
-        activityLines.append("Discovering models and protocol for \(trimmedLabel)…")
+        activityLines.append("正在发现 \(trimmedLabel) 的模型和协议…")
         Task {
             defer { endExclusiveOperation(operationKey) }
             do {
                 let discovery = try await ProviderDiscoveryClient().discover(baseURL: baseURL, apiKey: apiKey)
                 guard !discovery.models.isEmpty, let preferred = discovery.protocols.first else {
-                    lastError = "Provider discovery could not verify an inference protocol."
+                    lastError = "厂商发现流程未能验证可用的推理协议。"
                     return
                 }
                 let slot = ProviderKeySlot(
@@ -562,11 +567,11 @@ public final class CloudCodeViewModel: ObservableObject {
                     throw error
                 }
                 selectProvider(providerID)
-                activityLines.append("Custom Provider ready: \(trimmedLabel) (\(discovery.models.count) models).")
+                activityLines.append("自定义厂商已就绪：\(trimmedLabel)（\(discovery.models.count) 个模型）。")
             } catch {
                 try? keyVault.remove(reference)
                 providerProfiles.removeAll { $0.id == providerID }
-                lastError = "Custom Provider setup failed: \(error)"
+                lastError = "自定义厂商配置失败：\(error)"
             }
         }
     }
@@ -574,16 +579,16 @@ public final class CloudCodeViewModel: ObservableObject {
     public func importProviderBootstrap(from url: URL) {
         let operationKey = Self.providerKeyMutationOperationKey
         guard beginExclusiveOperation(operationKey) else {
-            lastError = "Another Provider Key operation is already in progress."
+            lastError = "另一个厂商 Key 操作正在进行中。"
             return
         }
         Task {
             defer { endExclusiveOperation(operationKey) }
             do {
                 let count = try await importProviderBootstrapNow(from: url, removeSource: true)
-                activityLines.append("Imported \(count) Provider Key(s) into Keychain; bootstrap plaintext removed.")
+                activityLines.append("已将 \(count) 个厂商 Key 导入 Keychain，并删除明文配置源。")
             } catch {
-                lastError = "Private bootstrap import failed: \(error)"
+                lastError = "私有 Key 配置导入失败：\(error)"
             }
         }
     }
@@ -639,14 +644,14 @@ public final class CloudCodeViewModel: ObservableObject {
     private func importBootstrapIfPresent() async throws {
         let operationKey = Self.providerKeyMutationOperationKey
         guard beginExclusiveOperation(operationKey) else {
-            throw ProviderError.transport("Another Provider Key operation is already in progress")
+            throw ProviderError.transport("另一个厂商 Key 操作正在进行中")
         }
         defer { endExclusiveOperation(operationKey) }
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
         guard let url = documents?.appendingPathComponent("CloudCode-Provider-Bootstrap.json"),
               FileManager.default.fileExists(atPath: url.path) else { return }
         let count = try await importProviderBootstrapNow(from: url, removeSource: true)
-        activityLines.append("Private bootstrap imported automatically: \(count) Key(s).")
+        activityLines.append("已自动导入私有 Key 配置：\(count) 个 Key。")
     }
 
     private func importProviderBootstrapNow(from url: URL, removeSource: Bool) async throws -> Int {
@@ -692,7 +697,7 @@ public final class CloudCodeViewModel: ObservableObject {
         do {
             try refreshFiles()
         } catch {
-            lastError = "File view could not be refreshed: \(error)"
+            lastError = "文件视图刷新失败：\(error)"
         }
     }
 
@@ -736,12 +741,12 @@ public final class CloudCodeViewModel: ObservableObject {
                 activityLines.append(value)
             case .token(let token):
                 if !assistantStarted {
-                    transcript += transcript.isEmpty ? "Assistant: " : "\nAssistant: "
+                    transcript += transcript.isEmpty ? "Cloud Code：" : "\nCloud Code："
                     assistantStarted = true
                 }
                 transcript += token
             case .toolStarted(let name, _):
-                activityLines.append("Tool: \(name)")
+                activityLines.append("工具：\(name)")
             case .toolFinished(let result):
                 activityLines.append("\(result.success ? "✓" : "✗") \(result.summary)")
             case .approvalRequired:

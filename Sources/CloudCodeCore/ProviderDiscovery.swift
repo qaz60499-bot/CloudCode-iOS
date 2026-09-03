@@ -73,7 +73,7 @@ public struct ProviderDiscoveryClient: Sendable {
         applyAuth(apiKey, mode: authMode, request: &request)
         request.timeoutInterval = 30
         let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("Missing HTTP response") }
+        guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("缺少 HTTP 响应") }
         if let error = ProviderHTTPClassifier.error(for: http.statusCode, body: data) { throw error }
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rows = object["data"] as? [[String: Any]] else { throw ProviderError.malformedEvent }

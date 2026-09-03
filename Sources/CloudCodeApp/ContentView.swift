@@ -14,21 +14,21 @@ struct ContentView: View {
     var body: some View {
         TabView {
             ChatView(model: model)
-                .tabItem { Label("Chat", systemImage: "bubble.left.and.bubble.right") }
+                .tabItem { Label("对话", systemImage: "bubble.left.and.bubble.right") }
             TasksView(model: model)
-                .tabItem { Label("Tasks", systemImage: "checklist") }
+                .tabItem { Label("任务", systemImage: "checklist") }
             PhoneView(model: model)
-                .tabItem { Label("Phone", systemImage: "iphone") }
+                .tabItem { Label("设备", systemImage: "iphone") }
             AppsView(model: model)
-                .tabItem { Label("Apps", systemImage: "square.grid.2x2") }
+                .tabItem { Label("应用", systemImage: "square.grid.2x2") }
             FilesView(model: model)
-                .tabItem { Label("Files", systemImage: "folder") }
+                .tabItem { Label("文件", systemImage: "folder") }
             ActivityView(model: model)
-                .tabItem { Label("Activity", systemImage: "waveform.path.ecg") }
+                .tabItem { Label("记录", systemImage: "waveform.path.ecg") }
             TrashView(model: model)
-                .tabItem { Label("Trash", systemImage: "trash") }
+                .tabItem { Label("回收站", systemImage: "trash") }
             SettingsView(model: model)
-                .tabItem { Label("Settings", systemImage: "gearshape") }
+                .tabItem { Label("设置", systemImage: "gearshape") }
         }
         .sheet(isPresented: Binding(
             get: { approval.pending != nil },
@@ -42,7 +42,7 @@ struct ContentView: View {
             get: { model.lastError != nil },
             set: { if !$0 { model.lastError = nil } }
         )) {
-            Button("OK", role: .cancel) { model.lastError = nil }
+            Button("知道了", role: .cancel) { model.lastError = nil }
         } message: {
             Text(model.lastError ?? "")
         }
@@ -61,7 +61,7 @@ private struct ChatView: View {
                         if model.transcript.isEmpty {
                             Text("Cloud Code iOS")
                                 .font(.title2.bold())
-                            Text("Tool-first local agent. Structured tools and filesystem/container services are preferred over GUI automation.")
+                            Text("本地工具优先 Agent。优先使用结构化工具、文件系统和容器能力，只有必要时才回退到 GUI 自动化。")
                                 .foregroundStyle(.secondary)
                         } else {
                             Text(model.transcript)
@@ -84,14 +84,14 @@ private struct ChatView: View {
 
                 Divider()
                 HStack(alignment: .bottom) {
-                    TextField("Ask Cloud Code…", text: $input, axis: .vertical)
+                    TextField("输入要让 Cloud Code 完成的任务…", text: $input, axis: .vertical)
                         .textFieldStyle(.roundedBorder)
                         .lineLimit(1...5)
                     if model.isRunning {
-                        Button("Stop") { model.cancelCurrentTask() }
+                        Button("停止") { model.cancelCurrentTask() }
                             .buttonStyle(.bordered)
                     } else {
-                        Button("Send") {
+                        Button("发送") {
                             let value = input
                             input = ""
                             model.send(value)
@@ -102,7 +102,7 @@ private struct ChatView: View {
                 }
                 .padding()
             }
-            .navigationTitle("Chat")
+            .navigationTitle("对话")
             .navigationBarTitleDisplayMode(.inline)
         }
     }
@@ -114,24 +114,24 @@ private struct TasksView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("Interrupted / resumable") {
+                Section("中断 / 可恢复") {
                     if model.interruptedTasks.isEmpty {
-                        Text("No interrupted task checkpoints")
+                        Text("暂无中断任务检查点")
                             .foregroundStyle(.secondary)
                     }
                     ForEach(model.interruptedTasks) { task in
                         VStack(alignment: .leading, spacing: 8) {
-                            Text(task.taskName).font(.headline)
-                            Text("Step \(task.stepIndex)/\(task.totalSteps): \(task.stepName)")
-                            Text(task.state).font(.caption).foregroundStyle(.secondary)
+                            Text(localizedTaskName(task.taskName)).font(.headline)
+                            Text("步骤 \(task.stepIndex)/\(task.totalSteps)：\(localizedTaskStepName(task.stepName))")
+                            Text(localizedCheckpointState(task.state)).font(.caption).foregroundStyle(.secondary)
                             HStack {
-                                Button("Resume") { model.resumeTask(task) }
+                                Button("继续") { model.resumeTask(task) }
                                     .buttonStyle(.borderedProminent)
                                     .disabled(model.isRunning || model.isCheckpointOperationInFlight(task.id))
-                                Button("Rollback") { model.rollbackTask(task) }
+                                Button("回滚") { model.rollbackTask(task) }
                                     .buttonStyle(.bordered)
                                     .disabled(model.isCheckpointOperationInFlight(task.id))
-                                Button("Cancel", role: .destructive) { model.cancelInterruptedTask(task) }
+                                Button("取消", role: .destructive) { model.cancelInterruptedTask(task) }
                                     .buttonStyle(.bordered)
                                     .disabled(model.isCheckpointOperationInFlight(task.id))
                             }
@@ -139,12 +139,12 @@ private struct TasksView: View {
                         .padding(.vertical, 4)
                     }
                 }
-                Section("Lifecycle") {
-                    Text("Tasks are checkpointed. If iOS suspends or terminates the app, the next launch can identify the last durable step instead of assuming a Windows-style daemon stayed alive.")
+                Section("生命周期") {
+                    Text("任务会保存检查点。iOS 暂停或终止 App 后，下次启动会识别最后一个可靠步骤，而不是假设后台进程一直存活。")
                         .font(.footnote)
                 }
             }
-            .navigationTitle("Tasks")
+            .navigationTitle("任务")
             .refreshable { await model.reloadActivity() }
         }
     }
@@ -156,7 +156,7 @@ private struct PhoneView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("Capability Profile") {
+                Section("能力状态") {
                     ForEach(model.capabilities.records, id: \.id) { record in
                         HStack(alignment: .top) {
                             VStack(alignment: .leading, spacing: 3) {
@@ -164,16 +164,16 @@ private struct PhoneView: View {
                                 Text(record.detail).font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
-                            Text(record.status.rawValue)
+                            Text(localizedCapabilityStatus(record.status.rawValue))
                                 .font(.caption2.monospaced())
                                 .multilineTextAlignment(.trailing)
                         }
                     }
                 }
             }
-            .navigationTitle("Phone")
+            .navigationTitle("设备")
             .toolbar {
-                Button("Probe") { model.refreshCapabilities() }
+                Button("重新检测") { model.refreshCapabilities() }
             }
         }
     }
@@ -195,8 +195,8 @@ private struct AppsView: View {
                     }
                 }
             }
-            .navigationTitle("Apps")
-            .toolbar { Button("Refresh") { model.refreshCapabilities() } }
+            .navigationTitle("应用")
+            .toolbar { Button("刷新") { model.refreshCapabilities() } }
         }
     }
 }
@@ -208,10 +208,10 @@ private struct FilesView: View {
         NavigationStack {
             VStack(spacing: 0) {
                 HStack {
-                    TextField("Path", text: $model.browsePath)
+                    TextField("路径", text: $model.browsePath)
                         .textFieldStyle(.roundedBorder)
                         .font(.caption.monospaced())
-                    Button("Open") {
+                    Button("打开") {
                         do { try model.refreshFiles() } catch { model.lastError = String(describing: error) }
                     }
                 }
@@ -237,7 +237,7 @@ private struct FilesView: View {
                     }
                 }
             }
-            .navigationTitle("Files")
+            .navigationTitle("文件")
         }
     }
 }
@@ -262,7 +262,7 @@ private struct ActivityView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .navigationTitle("Activity")
+            .navigationTitle("操作记录")
             .refreshable { await model.reloadActivity() }
         }
     }
@@ -280,16 +280,16 @@ private struct TrashView: View {
                     Text(ByteCountFormatter.string(fromByteCount: record.size, countStyle: .file))
                         .font(.caption)
                     HStack {
-                        Button("Restore") { model.restoreTrash(record) }
+                        Button("恢复") { model.restoreTrash(record) }
                             .disabled(model.isTrashOperationInFlight(record.id))
-                        Button("Delete permanently", role: .destructive) { model.purgeTrash(record) }
+                        Button("永久删除", role: .destructive) { model.purgeTrash(record) }
                             .disabled(model.isTrashOperationInFlight(record.id))
                     }
                     .buttonStyle(.bordered)
                 }
                 .padding(.vertical, 4)
             }
-            .navigationTitle("Trash")
+            .navigationTitle("回收站")
             .refreshable { await model.reloadActivity() }
         }
     }
@@ -305,8 +305,8 @@ private struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Provider") {
-                    Picker("Provider", selection: Binding(
+                Section("厂商 / Key / 模型") {
+                    Picker("厂商", selection: Binding(
                         get: { model.selectedProviderID },
                         set: { model.selectProvider($0) }
                     )) {
@@ -320,12 +320,13 @@ private struct SettingsView: View {
                         set: { model.selectKey($0) }
                     )) {
                         ForEach(model.availableKeySlots) { slot in
-                            Text("\(slot.label) · \(slot.status.rawValue)").tag(slot.id)
+                            let installed = model.isKeyInstalled(providerID: model.selectedProviderID, keySlotID: slot.id)
+                            Text("\(slot.label) · \(installed ? "已配置" : "未配置") · \(localizedKeyStatus(slot.status.rawValue))").tag(slot.id)
                         }
                     }
                     .disabled(model.availableKeySlots.isEmpty)
 
-                    Picker("Model", selection: Binding(
+                    Picker("模型", selection: Binding(
                         get: { model.selectedModel },
                         set: { model.selectModel($0) }
                     )) {
@@ -335,40 +336,41 @@ private struct SettingsView: View {
                         if model.selectedProvider?.customModelAllowed == true,
                            !model.selectedModel.isEmpty,
                            !model.availableModels.contains(model.selectedModel) {
-                            Text("Custom · \(model.selectedModel)").tag(model.selectedModel)
+                            Text("自定义 · \(model.selectedModel)").tag(model.selectedModel)
                         }
                     }
                     .disabled(model.availableModels.isEmpty)
 
                     if let provider = model.selectedProvider {
-                        LabeledContent("Status", value: provider.readiness.rawValue)
-                        LabeledContent("Keychain", value: model.selectedKeyIsInstalled ? "READY" : "KEY REQUIRED")
+                        LabeledContent("厂商状态", value: localizedProviderStatus(provider.readiness.rawValue))
+                        LabeledContent("当前 Key", value: model.selectedKeyIsInstalled ? "已配置" : "未配置")
                     }
+                    LabeledContent("配置规模", value: "\(model.providerProfiles.filter(\.enabled).count) 个厂商 · \(model.providerProfiles.filter(\.enabled).reduce(0) { $0 + $1.keySlots.count }) 个 Key")
                 }
 
-                Section("Key management") {
-                    SecureField("Replace selected Key", text: $selectedKeyInput)
+                Section("Key 管理") {
+                    SecureField("替换当前选择的 Key", text: $selectedKeyInput)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                    Button("Store selected Key in Keychain") {
+                    Button("保存当前 Key 到 Keychain") {
                         guard model.setKey(selectedKeyInput) else { return }
                         selectedKeyInput = ""
                     }
                     .disabled(selectedKeyInput.isEmpty || model.isProviderKeyMutationInFlight)
 
-                    Button("Import private Key bootstrap") { showBootstrapImporter = true }
+                    Button("导入私有 Key 配置") { showBootstrapImporter = true }
                         .disabled(model.isProviderKeyMutationInFlight)
-                    Text("The public IPA contains no API Keys. A private bootstrap is imported into iOS Keychain and its plaintext source is deleted; Key values are never stored in UserDefaults.")
+                    Text("厂商、Key 和模型都由你手动选择。私有 Key 配置导入后写入 iOS Keychain，明文配置源会被删除；真实 Key 不写入 UserDefaults，也不会随公开 IPA 分发。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
 
                 if model.selectedProvider?.customModelAllowed == true {
-                    Section("Custom Model") {
-                        TextField("Model ID", text: $customModelInput)
+                    Section("自定义模型") {
+                        TextField("模型 ID", text: $customModelInput)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
-                        Button("Use Custom Model") {
+                        Button("使用自定义模型") {
                             let value = customModelInput.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !value.isEmpty else { return }
                             model.selectModel(value)
@@ -378,42 +380,42 @@ private struct SettingsView: View {
                     }
                 }
 
-                Section("Provider management") {
-                    Button("Add Custom Provider") { showCustomProvider = true }
+                Section("厂商管理") {
+                    Button("添加自定义厂商") { showCustomProvider = true }
                         .disabled(model.isProviderKeyMutationInFlight)
                 }
 
-                Section("Advanced") {
-                    LabeledContent("Protocol", value: model.selectedProtocol?.rawValue ?? "needs validation")
+                Section("高级") {
+                    LabeledContent("协议", value: model.selectedProtocol?.rawValue ?? "待验证")
                     if let provider = model.selectedProvider {
                         Text(provider.baseURL.absoluteString)
                             .font(.caption.monospaced())
                             .textSelection(.enabled)
-                        Text("Protocol routing is selected from verified Provider/Key/Model metadata. Automatic cross-Provider failover is disabled.")
+                        Text("协议由已验证的厂商 / Key / 模型元数据决定。禁止自动跨厂商故障切换。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
                 }
 
-                Section("Agent Permission") {
-                    Picker("Mode", selection: $model.permissionMode) {
-                        Text("Safe").tag(PermissionMode.safe)
-                        Text("Balanced").tag(PermissionMode.balanced)
-                        Text("Full / Don’t Ask").tag(PermissionMode.full)
+                Section("Agent 权限") {
+                    Picker("模式", selection: $model.permissionMode) {
+                        Text("安全").tag(PermissionMode.safe)
+                        Text("平衡").tag(PermissionMode.balanced)
+                        Text("完全 / 不询问").tag(PermissionMode.full)
                     }
                     Text(permissionExplanation)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
-                Section("High privilege") {
-                    Text("TrollStore/no-sandbox/root-helper capabilities are probed separately from Agent Permission. Full mode never grants a system capability that the device does not actually have.")
+                Section("高权限能力") {
+                    Text("TrollStore、no-sandbox、root-helper 等能力与 Agent 权限分开检测。即使选择“完全”模式，也不会凭空获得设备实际不存在的系统能力。")
                         .font(.footnote)
-                    Text("High-privilege entitlements and helper behavior remain DEVICE_VALIDATION_REQUIRED until verified on the target TrollStore iPhone.")
+                    Text("高权限 entitlement 和 helper 行为在目标 TrollStore iPhone 真机验证前仍保持 DEVICE_VALIDATION_REQUIRED。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
             }
-            .navigationTitle("Settings")
+            .navigationTitle("设置")
             .sheet(isPresented: $showCustomProvider) {
                 CustomProviderSheet(model: model, isPresented: $showCustomProvider)
             }
@@ -428,9 +430,9 @@ private struct SettingsView: View {
 
     private var permissionExplanation: String {
         switch model.permissionMode {
-        case .safe: return "Reads are generally allowed. Important modification, deletion, install/uninstall, external side effects and permanent deletion require approval."
-        case .balanced: return "Ordinary writes can proceed; deletion goes to Cloud Code Trash. Important data and irreversible operations still require approval."
-        case .full: return "The Agent may skip most confirmations, but Audit Log, transaction records and backups remain enabled when feasible. This mode must be selected by you."
+        case .safe: return "通常允许读取。重要修改、删除、安装/卸载、外部副作用和永久删除都需要你确认。"
+        case .balanced: return "普通写入可以直接执行；删除会进入 Cloud Code 回收站。重要数据和不可逆操作仍需要确认。"
+        case .full: return "Agent 可以跳过大多数确认，但会尽可能保留审计记录、事务记录和备份。此模式只能由你手动选择。"
         }
     }
 }
@@ -445,8 +447,8 @@ private struct CustomProviderSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Custom Provider") {
-                    TextField("Label", text: $label)
+                Section("自定义厂商") {
+                    TextField("名称", text: $label)
                     TextField("Base URL", text: $baseURL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -455,18 +457,18 @@ private struct CustomProviderSheet: View {
                         .autocorrectionDisabled()
                 }
                 Section {
-                    Text("Cloud Code will discover /v1/models and probe Anthropic Messages, OpenAI Chat, and OpenAI Responses with a one-token validation request. The Key is stored only in Keychain.")
+                    Text("Cloud Code 会发现 /v1/models，并使用最小请求验证 Anthropic Messages、OpenAI Chat 和 OpenAI Responses。Key 只保存到 Keychain。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
             }
-            .navigationTitle("Add Provider")
+            .navigationTitle("添加厂商")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { isPresented = false }
+                    Button("取消") { isPresented = false }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Add") {
+                    Button("添加") {
                         model.addCustomProvider(label: label, baseURLText: baseURL, apiKey: apiKey)
                         apiKey = ""
                         isPresented = false
@@ -485,28 +487,111 @@ private struct ApprovalSheet: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("Target") {
+                Section("目标") {
                     Text(preview.target).font(.caption.monospaced()).textSelection(.enabled)
                     if let original = preview.originalSummary { Text(original) }
                 }
-                Section("Why") { Text(preview.reason) }
+                Section("原因") { Text(preview.reason) }
                 if let diff = preview.diff {
-                    Section("Diff") {
+                    Section("差异") {
                         ScrollView(.horizontal) {
                             Text(diff).font(.caption.monospaced()).textSelection(.enabled)
                         }
                     }
                 }
-                Section("Plan") {
+                Section("执行计划") {
                     ForEach(preview.plan, id: \.self) { Text($0) }
                 }
-                Section("Risk") { Text(preview.risk.rawValue) }
+                Section("风险") { Text(localizedRisk(preview.risk.rawValue)) }
             }
             .navigationTitle(preview.title)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Deny") { approval.deny() } }
-                ToolbarItem(placement: .confirmationAction) { Button("Approve") { approval.approve() } }
+                ToolbarItem(placement: .cancellationAction) { Button("拒绝") { approval.deny() } }
+                ToolbarItem(placement: .confirmationAction) { Button("批准") { approval.approve() } }
             }
         }
+    }
+}
+
+private func localizedProviderStatus(_ value: String) -> String {
+    switch value {
+    case "READY": return "可用"
+    case "PARTIAL": return "部分可用"
+    case "UNAVAILABLE": return "不可用"
+    case "AUTH_FAILED": return "认证失败"
+    case "CAPACITY": return "额度 / 容量不足"
+    case "NEEDS_VALIDATION": return "待验证"
+    default: return value
+    }
+}
+
+private func localizedKeyStatus(_ value: String) -> String {
+    switch value {
+    case "verified": return "已验证"
+    case "unknown": return "未知"
+    case "unavailable": return "不可用"
+    case "auth_failed": return "认证失败"
+    case "capacity": return "额度 / 容量不足"
+    case "needs_validation": return "待验证"
+    default: return value
+    }
+}
+
+private func localizedCapabilityStatus(_ value: String) -> String {
+    switch value {
+    case "available": return "可用"
+    case "unavailable": return "不可用"
+    case "unknown": return "未知"
+    case "device_validation_required": return "需要真机验证"
+    default: return value
+    }
+}
+
+private func localizedTaskName(_ value: String) -> String {
+    switch value {
+    case "Agent request": return "Agent 请求"
+    default: return value
+    }
+}
+
+private func localizedTaskStepName(_ value: String) -> String {
+    if value.hasPrefix("agent round ") {
+        return value.replacingOccurrences(of: "agent round ", with: "Agent 轮次 ")
+    }
+    if value.hasPrefix("resuming: ") {
+        return value.replacingOccurrences(of: "resuming: capability re-probe", with: "继续前重新检测能力")
+    }
+    switch value {
+    case "capability probe": return "能力检测"
+    case "completed": return "已完成"
+    case "cancelled by lifecycle": return "因生命周期变化而取消"
+    case "failed": return "失败"
+    case "recovered after app restart": return "App 重启后恢复"
+    case "用户取消": return "用户取消"
+    case "最近一次已提交事务已回滚": return "最近一次已提交事务已回滚"
+    default: return value
+    }
+}
+
+private func localizedCheckpointState(_ value: String) -> String {
+    switch value {
+    case "running": return "运行中"
+    case "interrupted": return "已中断"
+    case "completed": return "已完成"
+    case "cancelled": return "已取消"
+    case "rolled_back": return "已回滚"
+    default: return value
+    }
+}
+
+private func localizedRisk(_ value: String) -> String {
+    switch value {
+    case "readOnly": return "只读"
+    case "safeWrite": return "普通写入"
+    case "sensitiveWrite": return "重要写入"
+    case "destructive": return "破坏性操作"
+    case "permanentDestructive": return "永久破坏性操作"
+    case "systemChange": return "系统变更"
+    default: return value
     }
 }
