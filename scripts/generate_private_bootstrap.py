@@ -98,7 +98,7 @@ def main() -> int:
         output.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "schemaVersion": 1,
-            "generatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "generatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
             "providers": providers,
         }
         output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

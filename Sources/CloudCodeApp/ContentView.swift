@@ -160,8 +160,9 @@ private struct PhoneView: View {
                     ForEach(model.capabilities.records, id: \.id) { record in
                         HStack(alignment: .top) {
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(record.id).font(.subheadline.monospaced())
-                                Text(record.detail).font(.caption).foregroundStyle(.secondary)
+                                Text(localizedCapabilityName(record.id)).font(.subheadline)
+                                Text(record.id).font(.caption2.monospaced()).foregroundStyle(.tertiary)
+                                Text(localizedCapabilityDetail(record.id, detail: record.detail)).font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
                             Text(localizedCapabilityStatus(record.status.rawValue))
@@ -430,7 +431,7 @@ private struct SettingsView: View {
                 Section("高权限能力") {
                     Text("TrollStore、no-sandbox、root-helper 等能力与 Agent 权限分开检测。即使选择“完全”模式，也不会凭空获得设备实际不存在的系统能力。")
                         .font(.footnote)
-                    Text("高权限 entitlement 和 helper 行为在目标 TrollStore iPhone 真机验证前仍保持 DEVICE_VALIDATION_REQUIRED。")
+                    Text("高权限签名权限和辅助进程能力只有在当前 TrollStore iPhone 上实际探测成功后才会标记为“可用”；未证明的能力会显示为“需要真机验证”或“不可用”。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -564,6 +565,73 @@ private func localizedKeyStatus(_ value: String) -> String {
     case "capacity": return "额度 / 容量不足"
     case "needs_validation": return "待验证"
     default: return value
+    }
+}
+
+private func localizedCapabilityName(_ id: String) -> String {
+    switch id {
+    case "filesystem.own_container": return "本 App 容器读写"
+    case "filesystem.shared_user_files": return "共享用户文件访问"
+    case "filesystem.unrestricted": return "扩展文件系统访问"
+    case "apps.enumerate": return "已安装 App 枚举"
+    case "apps.resolve_own_bundle_path": return "本 App 安装路径解析"
+    case "apps.resolve_own_data_container": return "本 App 数据目录解析"
+    case "apps.resolve_bundle_path": return "其他 App 安装路径解析"
+    case "apps.resolve_data_container": return "其他 App 数据目录解析"
+    case "execution.ios_system": return "iOS 系统命令执行接口"
+    case "execution.posix_spawn_symbol": return "进程创建接口"
+    case "execution.spawn_helper": return "辅助进程启动"
+    case "execution.root_helper": return "高权限辅助进程"
+    case "execution.jit_wasm": return "JIT / WASM 运行能力"
+    case "apps.launch": return "启动其他 App"
+    case "apps.terminate": return "终止其他 App"
+    case "data.photos": return "照片访问"
+    case "data.contacts": return "联系人访问"
+    case "data.calendar": return "日历访问"
+    case "data.keychain_scope": return "本 App Keychain"
+    case "automation.url_scheme": return "URL Scheme 自动化"
+    case "automation.xctest_wda": return "XCTest / WDA 自动化"
+    case "automation.gui": return "GUI 自动化"
+    case "ipa.inspect": return "IPA 检查"
+    case "ipa.decrypt": return "IPA 解密"
+    case "ipa.install": return "IPA 安装"
+    default: return id
+    }
+}
+
+private func localizedCapabilityDetail(_ id: String, detail: String) -> String {
+    switch id {
+    case "filesystem.own_container": return "检测当前 App 主目录是否可读写。"
+    case "filesystem.shared_user_files": return "检测用户媒体目录的读取权限；实际范围取决于当前签名权限和设备。"
+    case "filesystem.unrestricted": return "保守检测 /var/mobile 等扩展目录访问；可访问不等于具有 root 身份。"
+    case "apps.enumerate":
+        if detail.contains("returned") {
+            let count = detail.split(separator: " ").first(where: { Int($0) != nil }).map(String.init) ?? "若干"
+            return "已安装 App 枚举接口可用，当前检测到 \(count) 个 App。"
+        }
+        return "当前只能看到本 App 或回退结果，尚未证明可以枚举全部已安装 App。"
+    case "apps.resolve_own_bundle_path": return "检测 Cloud Code 自身安装路径是否可以解析。"
+    case "apps.resolve_own_data_container": return "检测 Cloud Code 自身数据目录是否可以解析。"
+    case "apps.resolve_bundle_path": return detail.contains("Resolved") ? "已成功解析至少一个其他 App 的安装路径。" : "当前运行环境尚未证明可以解析其他 App 的安装路径。"
+    case "apps.resolve_data_container": return detail.contains("Resolved") ? "已成功解析至少一个其他 App 的数据目录；目录会动态解析，不缓存容器 UUID。" : "当前运行环境尚未证明可以解析其他 App 的数据目录。"
+    case "execution.ios_system": return "动态检测 ios_system 接口；结构化工具不会依赖它。"
+    case "execution.posix_spawn_symbol": return "只检测进程创建符号是否存在，不代表已经获得越过沙盒或高权限执行能力。"
+    case "execution.spawn_helper": return "需要安装包内辅助程序、签名权限和当前设备共同验证后才能启用。"
+    case "execution.root_helper": return "需要当前 TrollStore 设备上的高权限签名和辅助程序实际握手成功；不会仅因为使用 TrollStore 就假定可用。"
+    case "execution.jit_wasm": return "JIT / WASM 能力取决于设备版本、签名方式和权限。"
+    case "apps.launch": return "启动其他 App 的私有接口需要在当前设备上验证后才能使用。"
+    case "apps.terminate": return "终止其他 App 属于系统级变更，必须在当前设备上验证并受权限策略保护。"
+    case "data.photos": return "照片权限由你控制；只有授权后才会开放对应访问。"
+    case "data.contacts": return "联系人权限受系统授权控制，核心不会自动请求。"
+    case "data.calendar": return "日历权限受系统授权控制，核心不会自动请求。"
+    case "data.keychain_scope": return "可以使用 Cloud Code 自身的 Keychain；不会假定可读取其他 App 的 Keychain。"
+    case "automation.url_scheme": return "可通过 App 适配器打开 URL，仍受 iOS 系统策略限制。"
+    case "automation.xctest_wda": return "需要独立的 XCTest / WDA 运行后端；未接入或未验证时不会假定可用。"
+    case "automation.gui": return "GUI 自动化只有在后端实际就绪并通过探测后才会启用。"
+    case "ipa.inspect": return "可在本地进程内检查 IPA 的 ZIP、Info.plist、架构和签名元数据。"
+    case "ipa.decrypt": return "解密需要兼容的高权限运行环境以及可访问的目标进程。"
+    case "ipa.install": return "安装 IPA 依赖 TrollStore 或其他已验证的高权限安装能力。"
+    default: return detail
     }
 }
 

@@ -294,6 +294,28 @@ public struct ProviderBootstrapPayload: Codable, Equatable, Sendable {
         self.generatedAt = generatedAt
         self.providers = providers
     }
+
+    public static func decodeBootstrap(from data: Data) throws -> ProviderBootstrapPayload {
+        struct WirePayload: Decodable {
+            var schemaVersion: Int
+            var generatedAt: String?
+            var providers: [ProviderKeys]
+        }
+
+        let wire = try JSONDecoder().decode(WirePayload.self, from: data)
+        let generatedAt = wire.generatedAt.flatMap(parseBootstrapDate) ?? Date(timeIntervalSince1970: 0)
+        return ProviderBootstrapPayload(schemaVersion: wire.schemaVersion, generatedAt: generatedAt, providers: wire.providers)
+    }
+
+    private static func parseBootstrapDate(_ value: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) { return date }
+
+        let standard = ISO8601DateFormatter()
+        standard.formatOptions = [.withInternetDateTime]
+        return standard.date(from: value)
+    }
 }
 
 public enum ProviderCatalog {

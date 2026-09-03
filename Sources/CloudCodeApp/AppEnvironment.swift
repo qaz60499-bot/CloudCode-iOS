@@ -152,10 +152,14 @@ public final class CloudCodeViewModel: ObservableObject {
                 auditEvents = Array((try await auditStore.readAll()).suffix(200).reversed())
                 interruptedTasks = await checkpointStore.interrupted()
                 try refreshFiles()
-                try await importBootstrapIfPresent()
+                do {
+                    try await importBootstrapIfPresent()
+                } catch {
+                    lastError = "预配置 Key 自动导入失败：\(Self.userFacingProviderBootstrapError(error))"
+                }
                 didBootstrap = true
             } catch {
-                lastError = String(describing: error)
+                lastError = "初始化失败：\(error)"
             }
         }
     }
@@ -602,7 +606,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 let count = try await importProviderBootstrapNow(from: url, removeSource: true)
                 activityLines.append("已将 \(count) 个厂商 Key 导入 Keychain，并删除明文配置源。")
             } catch {
-                lastError = "私有 Key 配置导入失败：\(error)"
+                lastError = "私有 Key 配置导入失败：\(Self.userFacingProviderBootstrapError(error))"
             }
         }
     }
@@ -623,7 +627,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 let count = try await importProviderBootstrapNow(from: url, removeSource: false)
                 activityLines.append("已一键导入预配置 Key：\(count) 个 Key 已写入 iOS Keychain。")
             } catch {
-                lastError = "预配置 Key 导入失败：\(error)"
+                lastError = "预配置 Key 导入失败：\(Self.userFacingProviderBootstrapError(error))"
             }
         }
     }
@@ -707,9 +711,7 @@ public final class CloudCodeViewModel: ObservableObject {
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         var data = try Data(contentsOf: url, options: [.mappedIfSafe])
         defer { data.resetBytes(in: 0..<data.count) }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        let payload = try decoder.decode(ProviderBootstrapPayload.self, from: data)
+        let payload = try ProviderBootstrapPayload.decodeBootstrap(from: data)
         guard payload.schemaVersion == 1 else { throw CocoaError(.fileReadCorruptFile) }
 
         var pending: [(reference: String, secret: String)] = []
@@ -739,6 +741,28 @@ public final class CloudCodeViewModel: ObservableObject {
             }
         )
         return importedCount
+    }
+
+    private static func userFacingProviderBootstrapError(_ error: Error) -> String {
+        if let decodingError = error as? DecodingError {
+            switch decodingError {
+            case .dataCorrupted:
+                return "Key 配置文件格式损坏或包含无法识别的数据。"
+            case .keyNotFound:
+                return "Key 配置文件缺少必要字段。"
+            case .typeMismatch, .valueNotFound:
+                return "Key 配置文件字段类型不正确。"
+            @unknown default:
+                return "Key 配置文件无法解析。"
+            }
+        }
+        if error is CocoaError {
+            return "Key 配置文件校验失败，请确认文件来自当前版本。"
+        }
+        if let providerError = error as? ProviderError {
+            return String(describing: providerError)
+        }
+        return String(describing: error)
     }
 
     private func refreshFilesFromDisk() {

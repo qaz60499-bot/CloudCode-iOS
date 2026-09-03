@@ -156,6 +156,22 @@ final class ProviderCatalogTests: XCTestCase {
             }
         }
     }
+
+    func testBootstrapDecoderAcceptsFractionalISO8601GeneratedAt() throws {
+        let data = Data(#"{"schemaVersion":1,"generatedAt":"2026-09-03T03:39:18.123456Z","providers":[{"providerID":"tabitoken","keys":[{"slotID":"slot-1","label":"Key 1","secret":"test-secret","fingerprint":null}]}]}"#.utf8)
+        let payload = try ProviderBootstrapPayload.decodeBootstrap(from: data)
+        XCTAssertEqual(payload.schemaVersion, 1)
+        XCTAssertEqual(payload.providers.first?.providerID, "tabitoken")
+        XCTAssertGreaterThan(payload.generatedAt.timeIntervalSince1970, 0)
+    }
+
+    func testBootstrapDecoderDoesNotLetNonSecurityTimestampBlockKeyImport() throws {
+        let data = Data(#"{"schemaVersion":1,"generatedAt":"legacy-timestamp","providers":[{"providerID":"tabitoken","keys":[{"slotID":"slot-1","label":"Key 1","secret":"test-secret","fingerprint":null}]}]}"#.utf8)
+        let payload = try ProviderBootstrapPayload.decodeBootstrap(from: data)
+        XCTAssertEqual(payload.schemaVersion, 1)
+        XCTAssertEqual(payload.generatedAt, Date(timeIntervalSince1970: 0))
+        XCTAssertEqual(payload.providers.first?.keys.first?.secret, "test-secret")
+    }
 }
 
 final class ProviderRouterTests: XCTestCase {
