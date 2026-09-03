@@ -59,7 +59,7 @@ targets:
         script: |
           set -euo pipefail
           cd "$SRCROOT"
-          xcrun swift scripts/materialize_app_icon.swift
+          SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" xcrun --sdk macosx swift scripts/materialize_app_icon.swift
         basedOnDependencyAnalysis: false
     scheme:
       testTargets:
