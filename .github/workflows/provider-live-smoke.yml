@@ -1,0 +1,130 @@
+name: Provider Live Smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tabitoken-live-smoke:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Probe Tabitoken request compatibility without exposing secrets
+        env:
+          CLOUDCODE_PROVIDER_BOOTSTRAP: ${{ secrets.CLOUDCODE_PROVIDER_BOOTSTRAP }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          bootstrap = json.loads(os.environ["CLOUDCODE_PROVIDER_BOOTSTRAP"])
+          provider = next((p for p in bootstrap.get("providers", []) if p.get("providerID") == "tabitoken"), None)
+          if not provider or not provider.get("keys"):
+              raise SystemExit("FAIL: Tabitoken key missing from private bootstrap")
+          secret = provider["keys"][0]["secret"]
+          base = "https://tabitoken.com/v1"
+
+          def request(label, method, path, payload=None, extra_headers=None):
+              data = None if payload is None else json.dumps(payload).encode("utf-8")
+              headers = {
+                  "Accept": "application/json",
+                  "Authorization": f"Bearer {secret}",
+                  "x-api-key": secret,
+                  "User-Agent": "CloudCode-iOS-live-smoke/1",
+              }
+              if payload is not None:
+                  headers["Content-Type"] = "application/json"
+              if extra_headers:
+                  headers.update(extra_headers)
+              req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as response:
+                      body = response.read(65536).decode("utf-8", "replace")
+                      status = response.status
+              except urllib.error.HTTPError as exc:
+                  body = exc.read(65536).decode("utf-8", "replace")
+                  status = exc.code
+              body = body.replace(secret, "[REDACTED]")
+              compact = " ".join(body.split())[:1200]
+              print(f"PROBE {label}: HTTP {status} BODY {compact}")
+              return status, body
+
+          status, models_body = request("models", "GET", "/models")
+          if status == 200:
+              try:
+                  parsed = json.loads(models_body)
+                  ids = []
+                  if isinstance(parsed, dict):
+                      items = parsed.get("data") or parsed.get("models") or []
+                      if isinstance(items, list):
+                          for item in items:
+                              if isinstance(item, dict):
+                                  value = item.get("id") or item.get("name")
+                              else:
+                                  value = item
+                              if isinstance(value, str):
+                                  ids.append(value)
+                  print("TABITOKEN_MODEL_MATCHES:", [m for m in ids if "claude" in m.lower()][:40])
+              except Exception as exc:
+                  print("MODEL_PARSE_NOTE:", type(exc).__name__)
+
+          base_anthropic = {
+              "model": "claude-opus-5",
+              "max_tokens": 1,
+              "stream": False,
+              "messages": [{"role": "user", "content": "Reply OK"}],
+          }
+          request("anthropic-minimal", "POST", "/messages", base_anthropic, {"anthropic-version": "2023-06-01"})
+
+          large = dict(base_anthropic)
+          large["max_tokens"] = 8192
+          request("anthropic-max8192", "POST", "/messages", large, {"anthropic-version": "2023-06-01"})
+
+          with_tool = dict(base_anthropic)
+          with_tool["tools"] = [{
+              "name": "files_read",
+              "description": "Read a file",
+              "input_schema": {
+                  "type": "object",
+                  "properties": {"path": {"type": "string"}},
+                  "required": ["path"],
+                  "additionalProperties": False,
+              },
+          }]
+          request("anthropic-tool", "POST", "/messages", with_tool, {"anthropic-version": "2023-06-01"})
+
+          request("openai-chat-minimal", "POST", "/chat/completions", {
+              "model": "claude-opus-5",
+              "max_tokens": 1,
+              "stream": False,
+              "messages": [{"role": "user", "content": "Reply OK"}],
+          })
+
+          request("openai-chat-tool", "POST", "/chat/completions", {
+              "model": "claude-opus-5",
+              "max_tokens": 1,
+              "stream": False,
+              "messages": [{"role": "user", "content": "Reply OK"}],
+              "tools": [{
+                  "type": "function",
+                  "function": {
+                      "name": "files_read",
+                      "description": "Read a file",
+                      "parameters": {
+                          "type": "object",
+                          "properties": {"path": {"type": "string"}},
+                          "required": ["path"],
+                          "additionalProperties": False,
+                      },
+                  },
+              }],
+          })
+          PY
