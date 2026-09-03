@@ -41,13 +41,18 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
 
         let apps = await appResolver.installedApps()
         let enumerationProven: Bool
+        let enumerationDetail: String
         if let provider = appResolver as? any AppEnumerationCapabilityProviding {
             enumerationProven = await provider.canEnumerateInstalledApps()
+            enumerationDetail = await provider.installedAppEnumerationDetail()
         } else {
             enumerationProven = !apps.isEmpty
+            enumerationDetail = enumerationProven
+                ? "Resolver returned \(apps.count) app records."
+                : "Resolver returned no app records."
         }
         records.append(record("apps.enumerate", .apps, enumerationProven ? .available : .unavailable,
-                              enumerationProven ? "Installed-app enumeration backend returned \(apps.count) apps." : "Only fallback/own-app visibility is available; installed-app enumeration is not proven."))
+                              enumerationProven ? "Installed-app enumeration verified: \(enumerationDetail)" : "Installed-app enumeration not proven: \(enumerationDetail)"))
 
         let ownBundle = Bundle.main.bundleIdentifier ?? ""
         let ownBundlePath = ownBundle.isEmpty ? nil : await appResolver.bundlePath(for: ownBundle)
@@ -88,8 +93,15 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
                               "Private LaunchServices/UIApplication launch behavior must be verified on device."))
         records.append(record("apps.terminate", .apps, .deviceValidationRequired,
                               "Termination is privileged/system-changing and must be verified on device."))
-        records.append(record("apps.uninstall", .apps, .deviceValidationRequired,
-                              "Uninstall is permanently destructive and requires a separately verified privileged adapter."))
+        if let provider = appResolver as? any AppUninstallCapabilityProviding {
+            let uninstallReady = await provider.canUninstallInstalledApps()
+            let uninstallDetail = await provider.installedAppUninstallDetail()
+            records.append(record("apps.uninstall", .apps, uninstallReady ? .available : .deviceValidationRequired,
+                                  uninstallReady ? "Private uninstall backend readiness verified without changing device state: \(uninstallDetail)" : "Uninstall backend is not yet proven on this device: \(uninstallDetail)"))
+        } else {
+            records.append(record("apps.uninstall", .apps, .deviceValidationRequired,
+                                  "Uninstall is permanently destructive and requires a separately verified privileged adapter."))
+        }
 
         records.append(record("data.photos", .data, .deviceValidationRequired,
                               "PhotoKit authorization is user-controlled; app layer probes PHPhotoLibrary at runtime."))

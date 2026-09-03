@@ -15,6 +15,16 @@ public protocol AppContainerResolving: Sendable {
 
 public protocol AppEnumerationCapabilityProviding: Sendable {
     func canEnumerateInstalledApps() async -> Bool
+    func installedAppEnumerationDetail() async -> String
+}
+
+public extension AppEnumerationCapabilityProviding {
+    func installedAppEnumerationDetail() async -> String { "Installed-app enumeration detail is unavailable." }
+}
+
+public protocol AppUninstallCapabilityProviding: Sendable {
+    func canUninstallInstalledApps() async -> Bool
+    func installedAppUninstallDetail() async -> String
 }
 
 public actor ResourceResolver {

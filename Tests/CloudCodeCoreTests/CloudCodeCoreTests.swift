@@ -317,6 +317,18 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(second.generatedAt, first.generatedAt)
     }
 
+    func testCapabilityProbeUsesVerifiedAppManagementReadiness() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let resolver = VerifiedAppManagementResolver()
+        let probe = CapabilityProbe(appResolver: resolver, homeDirectory: root)
+        let profile = await probe.probe()
+
+        XCTAssertEqual(profile.status("apps.enumerate"), .available)
+        XCTAssertEqual(profile.status("apps.resolve_bundle_path"), .available)
+        XCTAssertEqual(profile.status("apps.uninstall"), .available)
+    }
+
     func testCapabilityGraphSeparatesUnprovenCapabilitiesFromExecutableTools() {
         let profile = CapabilityProfile(records: [
             CapabilityRecord(id: "ipa.inspect", domain: .ipa, status: .available, detail: "implemented"),
@@ -1336,6 +1348,25 @@ private final class ScriptedURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+private struct VerifiedAppManagementResolver: AppContainerResolving, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, Sendable {
+    private let app = ResourceNode(
+        id: ResourceID("app://com.example.visible"),
+        kind: .app,
+        displayName: "Visible App",
+        logicalLocation: "app://com.example.visible",
+        resolvedPath: "/Applications/Visible.app",
+        ownerBundleID: "com.example.visible"
+    )
+
+    func installedApps() async -> [ResourceNode] { [app] }
+    func bundlePath(for bundleID: String) async -> String? { bundleID == "com.example.visible" ? "/Applications/Visible.app" : nil }
+    func dataContainerPath(for bundleID: String) async -> String? { nil }
+    func canEnumerateInstalledApps() async -> Bool { true }
+    func installedAppEnumerationDetail() async -> String { "verified test backend" }
+    func canUninstallInstalledApps() async -> Bool { true }
+    func installedAppUninstallDetail() async -> String { "verified test backend" }
 }
 
 private struct FixedCapabilityProbe: CapabilityProbing, Sendable {

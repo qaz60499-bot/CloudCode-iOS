@@ -726,11 +726,11 @@ private func localizedCapabilityDetail(_ id: String, detail: String) -> String {
     case "filesystem.shared_user_files": return "检测用户媒体目录的读取权限；实际范围取决于当前签名权限和设备。"
     case "filesystem.unrestricted": return "保守检测 /var/mobile 等扩展目录访问；可访问不等于具有 root 身份。"
     case "apps.enumerate":
-        if detail.contains("returned") {
+        if detail.contains("verified") || detail.contains("返回") {
             let count = detail.split(separator: " ").first(where: { Int($0) != nil }).map(String.init) ?? "若干"
-            return "已安装 App 枚举接口可用，当前检测到 \(count) 个 App。"
+            return "已安装 App 枚举接口已通过跨 App 可见性验证，当前检测到 \(count) 个 App。"
         }
-        return "当前只能看到本 App 或回退结果，尚未证明可以枚举全部已安装 App。"
+        return "当前只能看到本 App 或回退结果，尚未证明可以枚举其他已安装 App。"
     case "apps.resolve_own_bundle_path": return "检测 Cloud Code 自身安装路径是否可以解析。"
     case "apps.resolve_own_data_container": return "检测 Cloud Code 自身数据目录是否可以解析。"
     case "apps.resolve_bundle_path": return detail.contains("Resolved") ? "已成功解析至少一个其他 App 的安装路径。" : "当前运行环境尚未证明可以解析其他 App 的安装路径。"

@@ -44,9 +44,9 @@ jobs:
           mkdir -p "$RUNNER_TEMP/source"
           gh run download "$SOURCE_RUN_ID" \
             --repo "$GITHUB_REPOSITORY" \
-            --name CloudCode-iOS-TrollStore-STABLE-1.0.3-build4-private-encrypted \
+            --name CloudCode-iOS-TrollStore-STABLE-1.0.4-build5-private-encrypted \
             --dir "$RUNNER_TEMP/source"
-          test -s "$RUNNER_TEMP/source/CloudCode-iOS-TrollStore-STABLE-1.0.3-build4.ipa.enc"
+          test -s "$RUNNER_TEMP/source/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa.enc"
 
       - name: Decrypt only in runner and verify IPA metadata
         env:
@@ -56,16 +56,16 @@ jobs:
           test -n "$CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD"
           mkdir -p "$RUNNER_TEMP/delivery"
           openssl enc -d -aes-256-cbc -pbkdf2 \
-            -in "$RUNNER_TEMP/source/CloudCode-iOS-TrollStore-STABLE-1.0.3-build4.ipa.enc" \
-            -out "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.3-build4.ipa" \
+            -in "$RUNNER_TEMP/source/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa.enc" \
+            -out "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa" \
             -pass env:CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD
-          test -s "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.3-build4.ipa"
-          unzip -tq "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.3-build4.ipa" >/dev/null
-          unzip -p "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.3-build4.ipa" Payload/CloudCode.app/Info.plist > "$RUNNER_TEMP/Info.plist"
+          test -s "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa"
+          unzip -tq "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa" >/dev/null
+          unzip -p "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa" Payload/CloudCode.app/Info.plist > "$RUNNER_TEMP/Info.plist"
           plutil -lint "$RUNNER_TEMP/Info.plist" >/dev/null
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$RUNNER_TEMP/Info.plist")" = '1.0.3'
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$RUNNER_TEMP/Info.plist")" = '4'
-          unzip -l "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.3-build4.ipa" | grep -F 'Payload/CloudCode.app/CloudCode-Provider-Bootstrap.json' >/dev/null
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$RUNNER_TEMP/Info.plist")" = '1.0.4'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$RUNNER_TEMP/Info.plist")" = '5'
+          unzip -l "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa" | grep -F 'Payload/CloudCode.app/CloudCode-Provider-Bootstrap.json' >/dev/null
 
       - name: Re-encrypt with one-time RSA delivery key
         env:
@@ -79,34 +79,34 @@ jobs:
           openssl pkey -pubin -in "$RUNNER_TEMP/delivery-public.pem" -noout >/dev/null
           KEY_HEX="$(openssl rand -hex 32)"
           IV_HEX="$(openssl rand -hex 16)"
-          IPA="$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.3-build4.ipa"
+          IPA="$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa"
           openssl enc -aes-256-cbc -K "$KEY_HEX" -iv "$IV_HEX" \
             -in "$IPA" \
-            -out "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.3-build4.ipa.delivery.enc"
+            -out "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa.delivery.enc"
           printf '%s:%s' "$KEY_HEX" "$IV_HEX" > "$RUNNER_TEMP/delivery-key.txt"
           openssl pkeyutl -encrypt -pubin \
             -inkey "$RUNNER_TEMP/delivery-public.pem" \
             -pkeyopt rsa_padding_mode:oaep \
             -in "$RUNNER_TEMP/delivery-key.txt" \
-            -out "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.3-build4.key.enc"
+            -out "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.key.enc"
           SOURCE_HEAD="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json headSha --jq .headSha)"
           IPA_SHA="$(shasum -a 256 "$IPA" | awk '{print $1}')"
           IPA_SIZE="$(stat -f '%z' "$IPA")"
-          printf 'version=1.0.3\nbuild=4\nsource_run_id=%s\nsource_head=%s\nsha256=%s\nsize_bytes=%s\n' \
+          printf 'version=1.0.4\nbuild=5\nsource_run_id=%s\nsource_head=%s\nsha256=%s\nsize_bytes=%s\n' \
             "$SOURCE_RUN_ID" "$SOURCE_HEAD" "$IPA_SHA" "$IPA_SIZE" \
-            > "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.3-build4.metadata.txt"
+            > "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.metadata.txt"
           rm -f "$IPA" "$RUNNER_TEMP/delivery-key.txt" "$RUNNER_TEMP/delivery-public.pem" "$RUNNER_TEMP/Info.plist"
           test ! -e "$IPA"
-          test -s "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.3-build4.ipa.delivery.enc"
-          test -s "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.3-build4.key.enc"
+          test -s "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa.delivery.enc"
+          test -s "$RUNNER_TEMP/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.key.enc"
 
       - name: Upload public-key encrypted delivery bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: CloudCode-iOS-TrollStore-STABLE-1.0.3-build4-secure-delivery
+          name: CloudCode-iOS-TrollStore-STABLE-1.0.4-build5-secure-delivery
           path: |
-            ${{ runner.temp }}/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.3-build4.ipa.delivery.enc
-            ${{ runner.temp }}/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.3-build4.key.enc
-            ${{ runner.temp }}/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.3-build4.metadata.txt
+            ${{ runner.temp }}/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa.delivery.enc
+            ${{ runner.temp }}/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.key.enc
+            ${{ runner.temp }}/delivery/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.metadata.txt
           if-no-files-found: error
           retention-days: 1
