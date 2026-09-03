@@ -569,7 +569,7 @@ public actor AgentCore {
         switch name {
         case "capability.probe", "apps.list", "gui.tree", "gui.screenshot":
             return ToolArgumentSpec(properties: [:], required: [])
-        case "apps.inspect", "container.resolve", "apps.terminate", "apps.uninstall", "gui.openApp":
+        case "apps.inspect", "container.resolve", "apps.launch", "apps.terminate", "apps.uninstall", "gui.openApp":
             return ToolArgumentSpec(properties: ["bundleId": "string"], required: ["bundleId"])
         case "files.list", "files.read", "ipa.inspect":
             return ToolArgumentSpec(properties: ["path": "string"], required: ["path"])

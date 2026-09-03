@@ -41,6 +41,21 @@ public protocol RootHelperCapabilityProviding: Sendable {
     func rootHelperCapability() async -> RootHelperCapabilitySnapshot
 }
 
+public struct AppLifecycleCapabilitySnapshot: Sendable, Equatable {
+    public var available: Bool
+    public var detail: String
+
+    public init(available: Bool, detail: String) {
+        self.available = available
+        self.detail = detail
+    }
+}
+
+public protocol AppLifecycleCapabilityProviding: Sendable {
+    func appLaunchCapability() async -> AppLifecycleCapabilitySnapshot
+    func appTerminateCapability() async -> AppLifecycleCapabilitySnapshot
+}
+
 public actor ResourceResolver {
     private let appResolver: AppContainerResolving
     private let fileManager: FileManager

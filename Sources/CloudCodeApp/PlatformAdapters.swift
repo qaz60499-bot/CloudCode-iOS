@@ -44,9 +44,19 @@ private enum EmbeddedRootHelper {
         }
         return (false, "Embedded root helper 卸载退出码 \(code)")
     }
+
+    static func terminate(bundlePath: String) -> (success: Bool, detail: String) {
+        let capability = probe()
+        guard capability.available else { return (false, capability.detail) }
+        let code = CloudCodeSpawnRootHelper(executablePath, ["terminate", bundlePath])
+        if code == 0 {
+            return (true, "Embedded root helper 已确认目标 App 进程停止")
+        }
+        return (false, "Embedded root helper 停止 App 退出码 \(code)")
+    }
 }
 
-public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, RootHelperCapabilityProviding {
+public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, RootHelperCapabilityProviding, AppLifecycleCapabilityProviding {
     private var cachedApps: [ResourceNode] = []
     private var bundlePaths: [String: String] = [:]
     private var containerPaths: [String: String] = [:]
@@ -87,6 +97,67 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
 
     public func rootHelperCapability() async -> RootHelperCapabilitySnapshot {
         EmbeddedRootHelper.probe()
+    }
+
+    public func appLaunchCapability() async -> AppLifecycleCapabilitySnapshot {
+        if Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
+        guard enumerationProven else {
+            return AppLifecycleCapabilitySnapshot(available: false, detail: "跨 App 枚举尚未验证，不能安全启动任意目标 App。")
+        }
+        guard let (_, workspaceClass) = launchServicesWorkspace() else {
+            return AppLifecycleCapabilitySnapshot(available: false, detail: "无法取得 LaunchServices workspace。")
+        }
+        let selector = NSSelectorFromString("openApplicationWithBundleID:")
+        let available = class_getInstanceMethod(workspaceClass, selector) != nil
+        return AppLifecycleCapabilitySnapshot(
+            available: available,
+            detail: available ? "LaunchServices openApplicationWithBundleID: selector 可用。" : "当前系统未暴露 openApplicationWithBundleID:。"
+        )
+    }
+
+    public func appTerminateCapability() async -> AppLifecycleCapabilitySnapshot {
+        if Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
+        guard enumerationProven else {
+            return AppLifecycleCapabilitySnapshot(available: false, detail: "跨 App 枚举尚未验证，不能安全定位待停止的 App。")
+        }
+        let helper = EmbeddedRootHelper.probe()
+        return AppLifecycleCapabilitySnapshot(
+            available: helper.available,
+            detail: helper.available ? "Embedded root helper 可按目标 Bundle 路径停止进程并验证结果。" : helper.detail
+        )
+    }
+
+    public func launchApplication(bundleID: String) async -> (success: Bool, detail: String) {
+        forceRefresh()
+        guard let path = bundlePaths[bundleID], Self.isUserApplicationBundlePath(path) else {
+            return (false, "目标不是当前可验证的普通用户 App，或已经不存在。")
+        }
+        let capability = await appLaunchCapability()
+        guard capability.available else {
+            return (false, "启动能力不可用：\(capability.detail)")
+        }
+        guard let (workspace, workspaceClass) = launchServicesWorkspace() else {
+            return (false, "无法取得 LaunchServices workspace。")
+        }
+        let selector = NSSelectorFromString("openApplicationWithBundleID:")
+        guard let method = class_getInstanceMethod(workspaceClass, selector) else {
+            return (false, "当前系统没有暴露 openApplicationWithBundleID:。")
+        }
+        typealias OpenApplicationMethod = @convention(c) (AnyObject, Selector, AnyObject) -> Bool
+        let implementation = method_getImplementation(method)
+        let openApplication = unsafeBitCast(implementation, to: OpenApplicationMethod.self)
+        let success = openApplication(workspace, selector, bundleID as NSString)
+        return (success, success ? "LaunchServices 已接受启动请求。" : "LaunchServices 拒绝启动请求。")
+    }
+
+    public func terminateApplication(bundleID: String) async -> (success: Bool, detail: String) {
+        forceRefresh()
+        guard let path = bundlePaths[bundleID], Self.isUserApplicationBundlePath(path) else {
+            return (false, "目标不是当前可验证的普通用户 App，或已经不存在。")
+        }
+        let capability = await appTerminateCapability()
+        guard capability.available else { return (false, "停止能力不可用：\(capability.detail)") }
+        return EmbeddedRootHelper.terminate(bundlePath: path)
     }
 
     public func canUninstallInstalledApps() async -> Bool {
@@ -526,14 +597,72 @@ public struct IOSPrivateAppExecutor: ToolExecuting, Sendable {
     }
 
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
-        tool.name == "apps.uninstall" && capabilities.isAvailable("apps.uninstall")
+        switch tool.name {
+        case "apps.launch": return capabilities.isAvailable("apps.launch")
+        case "apps.terminate": return capabilities.isAvailable("apps.terminate")
+        case "apps.uninstall": return capabilities.isAvailable("apps.uninstall")
+        default: return false
+        }
     }
 
     public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
-        guard call.name == "apps.uninstall" else { throw ToolRouterError.noExecutionRoute(call.name) }
         guard let bundleID = call.arguments["bundleId"], Self.isValidBundleIdentifier(bundleID) else {
             throw ToolRouterError.noExecutionRoute("bundleId missing or invalid")
         }
+
+        if call.name == "apps.launch" {
+            let outcome = await appResolver.launchApplication(bundleID: bundleID)
+            try await audit.append(AuditEvent(
+                sessionID: call.sessionID,
+                toolCallID: call.id,
+                action: call.name,
+                target: bundleID,
+                risk: descriptor.risk,
+                result: outcome.success ? "launch_accepted" : "launch_rejected"
+            ))
+            return ToolResult(
+                toolCallID: call.id,
+                success: outcome.success,
+                summary: outcome.success ? "已请求启动 \(bundleID)" : "启动失败：\(outcome.detail)",
+                payload: ["bundleId": bundleID, "detail": outcome.detail],
+                verification: VerificationResult(passed: outcome.success, checks: ["LaunchServices 接受目标 App 启动请求"], failures: outcome.success ? [] : [outcome.detail])
+            )
+        }
+
+        if call.name == "apps.terminate" {
+            guard bundleID != Bundle.main.bundleIdentifier else {
+                throw ToolRouterError.noExecutionRoute("Cloud Code cannot terminate itself through the active session")
+            }
+            let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: bundleID)
+            if decision == .requireConfirmation {
+                let preview = ApprovalPreview(
+                    title: "停止 App",
+                    target: bundleID,
+                    reason: "停止目标 App 会中断其当前前台或后台工作。",
+                    plan: ["确认目标 Bundle ID", "通过受限 root helper 停止目标 App 进程", "确认目标进程已退出"],
+                    risk: .systemChange
+                )
+                guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
+            }
+            let outcome = await appResolver.terminateApplication(bundleID: bundleID)
+            try await audit.append(AuditEvent(
+                sessionID: call.sessionID,
+                toolCallID: call.id,
+                action: call.name,
+                target: bundleID,
+                risk: descriptor.risk,
+                result: outcome.success ? "terminated" : "terminate_failed"
+            ))
+            return ToolResult(
+                toolCallID: call.id,
+                success: outcome.success,
+                summary: outcome.success ? "已停止 \(bundleID)" : "停止失败：\(outcome.detail)",
+                payload: ["bundleId": bundleID, "detail": outcome.detail],
+                verification: VerificationResult(passed: outcome.success, checks: ["目标 Bundle 路径解析成功", "root helper 确认对应进程已退出"], failures: outcome.success ? [] : [outcome.detail])
+            )
+        }
+
+        guard call.name == "apps.uninstall" else { throw ToolRouterError.noExecutionRoute(call.name) }
         guard bundleID != Bundle.main.bundleIdentifier else {
             throw ToolRouterError.noExecutionRoute("Cloud Code cannot uninstall itself through the active session")
         }

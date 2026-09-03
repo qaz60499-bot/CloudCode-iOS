@@ -4,6 +4,8 @@
 #import <objc/runtime.h>
 #import <stdio.h>
 #import <unistd.h>
+#import <signal.h>
+#import <libproc.h>
 
 static NSString *NormalizePath(NSString *path)
 {
@@ -162,6 +164,53 @@ static BOOL RemovePath(NSString *path, BOOL required)
     return removed || !required;
 }
 
+static NSArray<NSNumber *> *ProcessesUnderBundlePath(NSString *bundlePath)
+{
+    NSString *normalized = NormalizePath(bundlePath);
+    if (!IsSafeBundlePath(normalized)) { return @[]; }
+    NSString *prefix = [normalized stringByAppendingString:@"/"];
+    pid_t pids[4096] = {0};
+    int count = proc_listallpids(pids, sizeof(pids));
+    if (count <= 0) { return @[]; }
+
+    NSMutableArray<NSNumber *> *matches = [NSMutableArray array];
+    for (int index = 0; index < count && index < 4096; index++) {
+        pid_t pid = pids[index];
+        if (pid <= 1 || pid == getpid()) { continue; }
+        char pathBuffer[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        int length = proc_pidpath(pid, pathBuffer, sizeof(pathBuffer));
+        if (length <= 0) { continue; }
+        NSString *processPath = [NSString stringWithUTF8String:pathBuffer];
+        if ([processPath isEqualToString:normalized] || [processPath hasPrefix:prefix]) {
+            [matches addObject:@(pid)];
+        }
+    }
+    return matches.copy;
+}
+
+static int TerminateApplication(NSString *bundlePath)
+{
+    if (!IsSafeBundlePath(bundlePath)) { return 20; }
+    NSArray<NSNumber *> *pids = ProcessesUnderBundlePath(bundlePath);
+    if (pids.count == 0) { return 0; }
+
+    for (NSNumber *value in pids) {
+        kill((pid_t)value.intValue, SIGTERM);
+    }
+    for (NSUInteger attempt = 0; attempt < 12; attempt++) {
+        if (ProcessesUnderBundlePath(bundlePath).count == 0) { return 0; }
+        usleep(100000);
+    }
+    for (NSNumber *value in ProcessesUnderBundlePath(bundlePath)) {
+        kill((pid_t)value.intValue, SIGKILL);
+    }
+    for (NSUInteger attempt = 0; attempt < 10; attempt++) {
+        if (ProcessesUnderBundlePath(bundlePath).count == 0) { return 0; }
+        usleep(100000);
+    }
+    return 32;
+}
+
 static int VerifyRemoved(id workspace, NSString *bundleID, NSString *bundlePath, NSString *dataPath)
 {
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -229,6 +278,11 @@ int main(int argc, const char *argv[])
             NSString *dataPathArgument = [NSString stringWithUTF8String:argv[4]];
             NSString *dataPath = [dataPathArgument isEqualToString:@"-"] ? @"" : dataPathArgument;
             return Uninstall(bundleID, bundlePath, dataPath);
+        }
+        if ([command isEqualToString:@"terminate"]) {
+            if (argc < 3) { return 10; }
+            NSString *bundlePath = [NSString stringWithUTF8String:argv[2]];
+            return TerminateApplication(bundlePath);
         }
         return 10;
     }

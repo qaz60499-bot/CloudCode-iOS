@@ -104,10 +104,19 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         records.append(record("execution.jit_wasm", .execution, .unavailable,
                               "No WASM/JIT execution backend is connected in the current app build."))
 
-        records.append(record("apps.launch", .apps, .unavailable,
-                              "No app-launch executor is connected in the current build."))
-        records.append(record("apps.terminate", .apps, .unavailable,
-                              "No app-termination executor is connected in the current build."))
+        if let lifecycle = appResolver as? any AppLifecycleCapabilityProviding {
+            let launch = await lifecycle.appLaunchCapability()
+            let terminate = await lifecycle.appTerminateCapability()
+            records.append(record("apps.launch", .apps, launch.available ? .available : .deviceValidationRequired,
+                                  launch.available ? "App launch backend verified on this runtime: \(launch.detail)" : "App launch backend requires device validation: \(launch.detail)"))
+            records.append(record("apps.terminate", .apps, terminate.available ? .available : .deviceValidationRequired,
+                                  terminate.available ? "App termination backend verified on this runtime: \(terminate.detail)" : "App termination backend requires device validation: \(terminate.detail)"))
+        } else {
+            records.append(record("apps.launch", .apps, .unavailable,
+                                  "No app-launch capability provider is connected in the current build."))
+            records.append(record("apps.terminate", .apps, .unavailable,
+                                  "No app-termination capability provider is connected in the current build."))
+        }
         if let provider = appResolver as? any AppUninstallCapabilityProviding {
             let uninstallReady = await provider.canUninstallInstalledApps()
             let uninstallDetail = await provider.installedAppUninstallDetail()

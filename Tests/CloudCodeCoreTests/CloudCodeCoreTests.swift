@@ -1005,6 +1005,16 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(shell.requiredCapabilities, ["execution.ios_system"])
         XCTAssertEqual(shell.preferredRoute, .cli)
 
+        let launch = try XCTUnwrap(tools.first(where: { $0.name == "apps.launch" }))
+        XCTAssertEqual(launch.risk, .safeWrite)
+        XCTAssertEqual(launch.requiredCapabilities, ["apps.launch"])
+        XCTAssertEqual(launch.preferredRoute, .privateFramework)
+
+        let terminate = try XCTUnwrap(tools.first(where: { $0.name == "apps.terminate" }))
+        XCTAssertEqual(terminate.risk, .systemChange)
+        XCTAssertEqual(terminate.requiredCapabilities, ["apps.terminate"])
+        XCTAssertEqual(terminate.preferredRoute, .privateFramework)
+
         let uninstall = try XCTUnwrap(tools.first(where: { $0.name == "apps.uninstall" }))
         XCTAssertEqual(uninstall.risk, .permanentDestructive)
         XCTAssertEqual(uninstall.requiredCapabilities, ["apps.uninstall"])
