@@ -1155,7 +1155,8 @@ final class CloudCodeCoreTests: XCTestCase {
             sessionID: sessionID
         )
         let ledger = ToolExecutionLedger(fileURL: root.appendingPathComponent("ledger.json"))
-        XCTAssertNil(try await ledger.prepare(call))
+        let initialLedgerResult = try await ledger.prepare(call)
+        XCTAssertNil(initialLedgerResult)
 
         let counter = InvocationCounter()
         let registry = ToolRegistry(descriptors: [ToolDescriptor(name: "files.create", summary: "", risk: .safeWrite)])
@@ -1400,7 +1401,8 @@ final class CloudCodeCoreTests: XCTestCase {
             appendUserMessage: false,
             resumeCheckpoint: checkpoint
         )
-        XCTAssertEqual(try await collectAgentTokenText(resumed), "resumed-ok")
+        let resumedText = try await collectAgentTokenText(resumed)
+        XCTAssertEqual(resumedText, "resumed-ok")
         let saved = try await sessions.load(initial.id)
         XCTAssertEqual(saved.messages.filter { $0.role == .user && $0.content == "one-user-message" }.count, 1)
         XCTAssertEqual(saved.messages.last(where: { $0.role == .assistant })?.content, "resumed-ok")
@@ -1553,11 +1555,13 @@ final class CloudCodeCoreTests: XCTestCase {
 
         let markdown = root.appendingPathComponent("Imported.md")
         try Data("---\nproject: CloudCode\ntags: memory, vault\npinned: true\n---\n# Imported Note\n\nMarkdown body for Hermes.".utf8).write(to: markdown)
-        XCTAssertEqual(try await store.importMarkdown(at: markdown), 1)
+        let firstImportCount = try await store.importMarkdown(at: markdown)
+        XCTAssertEqual(firstImportCount, 1)
         let imported = try await store.search("Markdown body", project: "CloudCode", limit: 10)
         XCTAssertEqual(imported.first?.title, "Imported Note")
         let importedID = try XCTUnwrap(imported.first?.id)
-        XCTAssertEqual(try await store.importMarkdown(at: markdown), 1)
+        let secondImportCount = try await store.importMarkdown(at: markdown)
+        XCTAssertEqual(secondImportCount, 1)
         let reimported = try await store.search("Markdown body", project: "CloudCode", limit: 10)
         XCTAssertEqual(reimported.filter { $0.title == "Imported Note" }.map(\.id), [importedID])
         let exported = try await store.combinedMarkdown()
