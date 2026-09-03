@@ -1492,6 +1492,7 @@ public final class CloudCodeViewModel: ObservableObject {
             maxBytes: 1_048_576
         )
         defer { data.resetBytes(in: 0..<data.count) }
+        let sourceContentFingerprint = ProviderFingerprint.sha256(data)
         let payload = try ProviderBootstrapPayload.decodeBootstrap(from: data)
         guard payload.schemaVersion == 1 else { throw CocoaError(.fileReadCorruptFile) }
 
@@ -1517,6 +1518,16 @@ public final class CloudCodeViewModel: ObservableObject {
             vault: keyVault,
             finalizer: {
                 if removeSource {
+                    var currentData = try secureMutation.readFile(
+                        at: url,
+                        allowedRoot: nil,
+                        expectedIdentity: sourceIdentity,
+                        maxBytes: 1_048_576
+                    )
+                    defer { currentData.resetBytes(in: 0..<currentData.count) }
+                    guard ProviderFingerprint.sha256(currentData) == sourceContentFingerprint else {
+                        throw SecureFileMutationError.verificationFailed
+                    }
                     try secureMutation.removeFile(
                         at: url,
                         allowedRoot: nil,

@@ -104,12 +104,16 @@ final class CloudCodeCoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let store = DiagnosticLogStore(directory: root.appendingPathComponent("logs", isDirectory: true))
         try await store.log(level: .info, subsystem: "test", action: "before-clear", result: "ok")
-        XCTAssertFalse(try await store.readAll().isEmpty)
-        XCTAssertGreaterThan(try await store.totalBytes(), 0)
+        let beforeClear = try await store.readAll()
+        let beforeClearBytes = try await store.totalBytes()
+        XCTAssertFalse(beforeClear.isEmpty)
+        XCTAssertGreaterThan(beforeClearBytes, 0)
 
         try await store.clearAll()
-        XCTAssertTrue(try await store.readAll().isEmpty)
-        XCTAssertEqual(try await store.totalBytes(), 0)
+        let afterClear = try await store.readAll()
+        let afterClearBytes = try await store.totalBytes()
+        XCTAssertTrue(afterClear.isEmpty)
+        XCTAssertEqual(afterClearBytes, 0)
 
         try await store.log(level: .info, subsystem: "test", action: "after-clear", result: "ok")
         let records = try await store.readAll()

@@ -318,7 +318,11 @@ public enum ProviderCheckpointConfigurationResolver {
 
 public enum ProviderFingerprint {
     public static func sha256(_ secret: String) -> String {
-        SHA256.hash(data: Data(secret.utf8)).map { String(format: "%02x", $0) }.joined()
+        sha256(Data(secret.utf8))
+    }
+
+    public static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 }
 

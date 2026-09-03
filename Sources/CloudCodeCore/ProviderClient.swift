@@ -264,7 +264,7 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
         switch self {
         case .missingAPIKey: return "厂商 API Key 缺失"
         case .invalidEndpoint: return "厂商接口地址无效"
-        case .authenticationFailed(let code): return "厂商认证失败（HTTP \(code)）；请选择另一个有效 Key"
+        case .authenticationFailed(let code): return "厂商返回认证拒绝（HTTP \(code)）。请核对当前协议、接口地址、鉴权方式和 Key；不能仅凭该状态判定 Key 本身无效。"
         case .capacityExhausted(let code): return "当前厂商 Key 的额度 / 容量不足（HTTP \(code)）；可选择同一厂商内的其他 Key"
         case .rateLimited: return "厂商触发限流，请稍后重试"
         case .invalidResponse(let code):
@@ -1247,8 +1247,7 @@ enum ProviderEndpoint {
 
     static func endpoint(baseURL: URL, path: String) throws -> URL {
         guard ProviderEndpointPolicy.allowsBaseURL(baseURL) else { throw ProviderError.invalidEndpoint }
-        var url = baseURL
-        var baseComponents = url.path
+        var baseComponents = baseURL.path
             .split(separator: "/", omittingEmptySubsequences: true)
             .map(String.init)
         let requestedComponents = path
@@ -1257,7 +1256,7 @@ enum ProviderEndpoint {
         guard !requestedComponents.isEmpty else { throw ProviderError.invalidEndpoint }
 
         if baseComponents.suffix(requestedComponents.count).elementsEqual(requestedComponents) {
-            return url
+            return baseURL
         }
         for suffix in knownEndpointSuffixes where baseComponents.suffix(suffix.count).elementsEqual(suffix) {
             baseComponents.removeLast(suffix.count)
@@ -1267,7 +1266,11 @@ enum ProviderEndpoint {
             baseComponents.append("v1")
         }
         baseComponents.append(contentsOf: requestedComponents)
-        url.path = "/" + baseComponents.joined(separator: "/")
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            throw ProviderError.invalidEndpoint
+        }
+        components.path = "/" + baseComponents.joined(separator: "/")
+        guard let url = components.url else { throw ProviderError.invalidEndpoint }
         return url
     }
 }

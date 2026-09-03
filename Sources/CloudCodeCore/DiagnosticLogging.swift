@@ -306,7 +306,7 @@ public actor DiagnosticLogStore {
         let cutoff = now.addingTimeInterval(-policy.retentionSeconds)
         var files = try logFileURLsWithMetadata()
         for file in files where file.modifiedAt < cutoff {
-            try? fileManager.removeItem(at: file.url)
+            try? removeLogFileSafely(file.url)
         }
 
         files = try logFileURLsWithMetadata().sorted { lhs, rhs in
@@ -316,7 +316,7 @@ public actor DiagnosticLogStore {
         var total = files.reduce(Int64(0)) { $0 + $1.size }
         for file in files where total > policy.maxTotalBytes {
             do {
-                try fileManager.removeItem(at: file.url)
+                try removeLogFileSafely(file.url)
                 total -= file.size
             } catch {
                 continue
@@ -336,9 +336,21 @@ public actor DiagnosticLogStore {
             return
         }
         for url in try logFileURLs() {
-            try fileManager.removeItem(at: url)
+            try removeLogFileSafely(url)
         }
         lastCleanupAt = Date()
+    }
+
+    private func removeLogFileSafely(_ url: URL) throws {
+        let approved = try PathGuard().validate(
+            target: url,
+            allowedRoot: directory,
+            rejectSymlink: true,
+            fileManager: fileManager
+        )
+        let mutation = SecureFileMutation()
+        let identity = try mutation.identity(of: approved, allowedRoot: directory)
+        try mutation.removeFile(at: approved, allowedRoot: directory, expectedIdentity: identity)
     }
 
     private func activeLogURL(at date: Date) throws -> URL {
