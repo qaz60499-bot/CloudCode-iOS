@@ -897,7 +897,8 @@ final class CloudCodeCoreTests: XCTestCase {
 
         let first = try await router.execute(call, context: context)
         XCTAssertFalse(first.success)
-        XCTAssertEqual((await ledger.record(for: call.id))?.state, .pending)
+        let pendingRecord = await ledger.record(for: call.id)
+        XCTAssertEqual(pendingRecord?.state, .pending)
 
         do {
             _ = try await router.execute(call, context: context)
