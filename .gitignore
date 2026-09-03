@@ -14,3 +14,4 @@ GeneratedSecrets/
 *.provider-bootstrap.json
 CloudCode-Provider-Bootstrap.json
 *.mobileprovision
+nul
