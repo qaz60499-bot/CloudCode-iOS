@@ -115,6 +115,17 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
         case "files.create":
             let target = try requiredURL(call, key: "path")
             let guarded = try PathGuard().validate(target: target, allowedRoot: context.allowedRoot, rejectSymlink: true)
+            let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: guarded.path)
+            if decision == .requireConfirmation {
+                let preview = ApprovalPreview(
+                    title: "创建文件",
+                    target: guarded.path,
+                    reason: call.arguments["reason"] ?? "Agent 请求创建可能敏感的文件",
+                    plan: ["验证目标路径", "创建文件", "重新读取并验证内容"],
+                    risk: descriptor.risk
+                )
+                guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
+            }
             if FileManager.default.fileExists(atPath: guarded.path) { throw CocoaError(.fileWriteFileExists) }
             try FileManager.default.createDirectory(at: guarded.deletingLastPathComponent(), withIntermediateDirectories: true)
             let expected = Data((call.arguments["content"] ?? "").utf8)
@@ -190,6 +201,20 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
 
         case "trash.restore":
             guard let raw = call.arguments["id"], let id = UUID(uuidString: raw) else { throw CocoaError(.fileNoSuchFile) }
+            let existingRecord = (try await trashService.records()).first(where: { $0.id == id })
+            if let existingRecord {
+                let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: existingRecord.originalPath)
+                if decision == .requireConfirmation {
+                    let preview = ApprovalPreview(
+                        title: "恢复回收站项目",
+                        target: existingRecord.originalPath,
+                        reason: "恢复会写回原始路径。",
+                        plan: ["定位回收站记录", "验证原始路径", "恢复文件", "验证恢复后的内容指纹"],
+                        risk: descriptor.risk
+                    )
+                    guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
+                }
+            }
             let record = try await trashService.restore(id)
             let passed = await trashService.verifyRestored(record)
             return try untrustedResult(call.id, summary: "已恢复 \(record.filename)", key: "trashRecord", value: record, source: "trash.restore", verification: VerificationResult(passed: passed, checks: ["原路径存在", "恢复后的内容指纹与回收站记录一致"], failures: passed ? [] : ["恢复内容与回收站记录不一致"]))
@@ -226,15 +251,26 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             let target = try requiredURL(call, key: "path")
             guard let destinationRaw = call.arguments["destination"] else { throw ToolRouterError.noExecutionRoute("destination missing") }
             let destination = URL(fileURLWithPath: destinationRaw)
-            _ = try PathGuard().validate(target: destination, allowedRoot: context.allowedRoot, rejectSymlink: true)
-            try ipaService.extract(target, to: destination)
-            let payload = destination.appendingPathComponent("Payload", isDirectory: true)
+            let guardedDestination = try PathGuard().validate(target: destination, allowedRoot: context.allowedRoot, rejectSymlink: true)
+            let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: guardedDestination.path)
+            if decision == .requireConfirmation {
+                let preview = ApprovalPreview(
+                    title: "解压 IPA",
+                    target: guardedDestination.path,
+                    reason: "解压会在目标目录创建文件。",
+                    plan: ["验证 IPA", "验证目标目录", "安全解压", "检查 Payload App 元数据"],
+                    risk: descriptor.risk
+                )
+                guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
+            }
+            try ipaService.extract(target, to: guardedDestination)
+            let payload = guardedDestination.appendingPathComponent("Payload", isDirectory: true)
             let appInfoFound = ((try? FileManager.default.contentsOfDirectory(at: payload, includingPropertiesForKeys: [.isDirectoryKey])) ?? [])
                 .filter { $0.pathExtension == "app" }
                 .contains { FileManager.default.fileExists(atPath: $0.appendingPathComponent("Info.plist").path) }
-            let passed = FileManager.default.fileExists(atPath: destination.path) && appInfoFound
+            let passed = FileManager.default.fileExists(atPath: guardedDestination.path) && appInfoFound
             let verification = VerificationResult(passed: passed, checks: ["解压目标存在", "Payload App 的 Info.plist 存在"], failures: passed ? [] : ["解压后的 IPA 内容不完整"])
-            return ToolResult(toolCallID: call.id, success: passed, summary: "IPA 已解压", payload: ["destination": destination.path], verification: verification)
+            return ToolResult(toolCallID: call.id, success: passed, summary: "IPA 已解压", payload: ["destination": guardedDestination.path], verification: verification)
 
         case "ipa.repack":
             let source = try requiredURL(call, key: "source")

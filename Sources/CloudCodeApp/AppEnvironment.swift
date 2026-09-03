@@ -115,7 +115,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let registry = ToolRegistry()
         let cli = IOSSystemExecutor(policy: policy, approval: approval)
         let privateApps = IOSPrivateAppExecutor(appResolver: resolver, policy: policy, approval: approval, audit: audit)
-        let gui = GUIFallbackExecutor(backend: UnavailableGUIBackend())
+        let gui = GUIFallbackExecutor(backend: UnavailableGUIBackend(), policy: policy, approval: approval)
         let executionLedgerURL = support.appendingPathComponent("Execution/tool-results.json")
         let executionLedger = ToolExecutionLedger(fileURL: executionLedgerURL)
         let router = ToolRouter(registry: registry, executors: [structured, cli, privateApps, URLSchemeExecutor(), gui], executionLedger: executionLedger, diagnosticLogger: diagnosticLogStore)

@@ -177,11 +177,57 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(engine.decision(mode: .balanced, tool: ToolDescriptor(name: "trash.purge", summary: "", risk: .permanentDestructive), explicitlyPermanent: true), .requireConfirmation)
     }
 
+    func testGUITypeSensitiveWriteRequiresConfirmationOutsideFullMode() {
+        let engine = PolicyEngine()
+        let tool = ToolDescriptor(name: "gui.type", summary: "", risk: .sensitiveWrite)
+        XCTAssertEqual(engine.decision(mode: .safe, tool: tool), .requireConfirmation)
+        XCTAssertEqual(engine.decision(mode: .balanced, tool: tool), .requireConfirmation)
+        XCTAssertEqual(engine.decision(mode: .full, tool: tool), .allow)
+    }
+
     func testDatabaseAndPlistAreSensitive() {
         let classifier = SensitivityClassifier()
         XCTAssertTrue(classifier.isSensitive(path: "/tmp/state.sqlite", operation: "files.modify"))
         XCTAssertTrue(classifier.isSensitive(path: "/tmp/Info.plist", operation: "files.modify"))
         XCTAssertFalse(classifier.isSensitive(path: "/tmp/new-note.txt", operation: "files.create"))
+    }
+
+    func testStructuredCreateSensitivePathRequiresApprovalBeforeWrite() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("config.plist")
+        let resolver = StaticAppResolver()
+        let audit = AuditLogStore(fileURL: root.appendingPathComponent("audit/audit.jsonl"))
+        let journal = TransactionJournal(fileURL: root.appendingPathComponent("transactions/transactions.json"))
+        let policy = PolicyEngine()
+        let executor = StructuredToolExecutor(
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            appResolver: resolver,
+            resourceResolver: ResourceResolver(appResolver: resolver),
+            fileService: FileService(),
+            ipaService: IPAService(),
+            trashService: TrashService(root: root.appendingPathComponent("trash", isDirectory: true)),
+            transactionEngine: TransactionEngine(
+                backupRoot: root.appendingPathComponent("backups", isDirectory: true),
+                policy: policy,
+                journal: journal,
+                audit: audit
+            ),
+            policy: policy,
+            audit: audit,
+            approval: FixedApprovalRequester(approved: false)
+        )
+        let descriptor = ToolDescriptor(name: "files.create", summary: "", risk: .safeWrite)
+        let call = ToolCall(name: "files.create", arguments: ["path": target.path, "content": "sensitive"], sessionID: UUID())
+        let context = ToolExecutionContext(permissionMode: .safe, capabilityProfile: CapabilityProfile(records: []), allowedRoot: root)
+
+        do {
+            _ = try await executor.execute(call, descriptor: descriptor, context: context)
+            XCTFail("Sensitive file creation in safe mode must require approval")
+        } catch {
+            XCTAssertEqual(error as? TransactionError, .confirmationDenied)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
     }
 
     func testPathTraversalAndBroadRecursiveDeleteAreRejected() throws {

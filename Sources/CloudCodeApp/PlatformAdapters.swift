@@ -910,8 +910,14 @@ public struct URLSchemeExecutor: ToolExecuting, Sendable {
 public struct GUIFallbackExecutor: ToolExecuting, Sendable {
     public let route: AppExecutionRoute = .guiFallback
     private let backend: GUIAutomationBackend
+    private let policy: PolicyEngine
+    private let approval: ApprovalRequesting
 
-    public init(backend: GUIAutomationBackend) { self.backend = backend }
+    public init(backend: GUIAutomationBackend, policy: PolicyEngine, approval: ApprovalRequesting) {
+        self.backend = backend
+        self.policy = policy
+        self.approval = approval
+    }
 
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
         guard tool.name.hasPrefix("gui.") else { return false }
@@ -919,6 +925,17 @@ public struct GUIFallbackExecutor: ToolExecuting, Sendable {
     }
 
     public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
+        let decision = policy.decision(mode: context.permissionMode, tool: descriptor)
+        if decision == .requireConfirmation {
+            let preview = ApprovalPreview(
+                title: "执行 GUI 操作",
+                target: call.arguments["bundleId"] ?? call.name,
+                reason: "GUI 写入可能影响前台 App 状态或输入敏感内容。",
+                plan: ["确认操作类型", "执行受限 GUI 动作", "按需验证界面状态"],
+                risk: descriptor.risk
+            )
+            guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
+        }
         switch call.name {
         case "gui.openApp":
             guard let bundle = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
