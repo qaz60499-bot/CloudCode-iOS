@@ -21,6 +21,7 @@ public enum CapabilityDomain: String, Codable, CaseIterable, Sendable {
     case data
     case automation
     case ipa
+    case network
 }
 
 public struct CapabilityRecord: Codable, Hashable, Sendable {

@@ -162,6 +162,11 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         records.append(record("ipa.install", .ipa, .unavailable,
                               "No IPA installation executor is connected in the current build."))
 
+        records.append(record("network.urlsession", .network, .available,
+                              "Foundation URLSession is linked and available to typed network/provider adapters; this proves API availability, not current internet reachability."))
+
+        records.append(contentsOf: HomeOSCapabilityLayer.records(from: records))
+
         let profile = CapabilityProfile(records: records)
         for item in records {
             try? await diagnosticLogger?.log(

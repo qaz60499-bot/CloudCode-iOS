@@ -5,8 +5,13 @@ import UIKit
 import CloudCodeCore
 
 struct ContentView: View {
+    private enum RootTab: Hashable {
+        case chat, tasks, device, apps, files, memory, activity, trash, settings
+    }
+
     @ObservedObject var model: CloudCodeViewModel
     @ObservedObject private var approval: ApprovalCenter
+    @State private var selectedTab: RootTab = .chat
 
     init(model: CloudCodeViewModel) {
         self.model = model
@@ -14,23 +19,34 @@ struct ContentView: View {
     }
 
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             ChatView(model: model)
                 .tabItem { Label("对话", systemImage: "bubble.left.and.bubble.right") }
+                .tag(RootTab.chat)
             TasksView(model: model)
                 .tabItem { Label("任务", systemImage: "checklist") }
+                .tag(RootTab.tasks)
             PhoneView(model: model)
                 .tabItem { Label("设备", systemImage: "iphone") }
+                .tag(RootTab.device)
             AppsView(model: model)
                 .tabItem { Label("应用", systemImage: "square.grid.2x2") }
+                .tag(RootTab.apps)
             FilesView(model: model)
                 .tabItem { Label("文件", systemImage: "folder") }
+                .tag(RootTab.files)
+            HermesVaultView(model: model)
+                .tabItem { Label("记忆", systemImage: "books.vertical") }
+                .tag(RootTab.memory)
             ActivityView(model: model)
                 .tabItem { Label("记录", systemImage: "waveform.path.ecg") }
+                .tag(RootTab.activity)
             TrashView(model: model)
                 .tabItem { Label("回收站", systemImage: "trash") }
+                .tag(RootTab.trash)
             SettingsView(model: model)
                 .tabItem { Label("设置", systemImage: "gearshape") }
+                .tag(RootTab.settings)
         }
         .sheet(isPresented: Binding(
             get: { approval.pending != nil },
@@ -44,6 +60,20 @@ struct ContentView: View {
             get: { model.lastError != nil },
             set: { if !$0 { model.lastError = nil } }
         )) {
+            if model.hasCurrentProviderFailure {
+                if model.canRetryCurrentProviderFailure {
+                    Button("重试") { model.retryCurrentProviderFailure() }
+                } else {
+                    Button("查看检查点") {
+                        model.lastError = nil
+                        selectedTab = .tasks
+                    }
+                }
+                Button("切换厂商") {
+                    model.lastError = nil
+                    selectedTab = .settings
+                }
+            }
             Button("知道了", role: .cancel) { model.lastError = nil }
         } message: {
             Text(model.lastError ?? "")
@@ -635,6 +665,211 @@ private struct FilesView: View {
     }
 }
 
+private struct HermesVaultView: View {
+    @ObservedObject var model: CloudCodeViewModel
+    @State private var query = ""
+    @State private var showEditor = false
+    @State private var editingRecord: HermesMemoryRecord?
+    @State private var showImporter = false
+    @State private var exportURL: URL?
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if let status = model.hermesStatusMessage, !status.isEmpty {
+                    Section {
+                        Text(status).font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+
+                if !model.hermesProjects.isEmpty {
+                    Section("Projects") {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack {
+                                ForEach(model.hermesProjects, id: \.self) { project in
+                                    Text(project)
+                                        .font(.caption)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 6)
+                                        .background(.thinMaterial, in: Capsule())
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Section(model.hermesRecords.isEmpty ? "记忆" : "记忆 · \(model.hermesRecords.count)") {
+                    if model.hermesRecords.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("还没有 Hermes 记忆", systemImage: "books.vertical")
+                                .font(.headline)
+                            Text("可以新建 Markdown 记忆，或导入 Markdown / Obsidian Vault。")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else {
+                        ForEach(model.hermesRecords) { record in
+                            Button {
+                                editingRecord = record
+                                showEditor = true
+                            } label: {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    HStack {
+                                        if record.pinned { Image(systemName: "pin.fill") }
+                                        Text(record.title).font(.headline)
+                                        Spacer()
+                                        Text(record.kind.displayName).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    Text(record.body)
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(3)
+                                    HStack(spacing: 8) {
+                                        if let project = record.project { Text(project) }
+                                        ForEach(record.tags.prefix(3), id: \.self) { tag in Text("#\(tag)") }
+                                        Spacer()
+                                        Text(record.updatedAt.formatted(date: .abbreviated, time: .omitted))
+                                    }
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                Button(record.pinned ? "取消固定" : "固定") {
+                                    model.setHermesPinned(record, pinned: !record.pinned)
+                                }
+                                Button("删除", role: .destructive) { model.deleteHermesMemory(record) }
+                            }
+                        }
+                    }
+                }
+
+                if !model.hermesTags.isEmpty {
+                    Section("Tags") {
+                        Text(model.hermesTags.map { "#\($0)" }.joined(separator: "  "))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                }
+
+                Section("导入 / 导出") {
+                    Button("导入 Markdown / Obsidian Vault") { showImporter = true }
+                    Button("准备导出 Markdown") {
+                        Task { exportURL = await model.prepareHermesExportFile() }
+                    }
+                    if let exportURL {
+                        ShareLink(item: exportURL) {
+                            Label("分享 Hermes-Export.md", systemImage: "square.and.arrow.up")
+                        }
+                    }
+                    Text("知识库保存在 Application Support/CloudCode/Hermes/。Markdown 是可读源文件，SQLite FTS 用于本地检索；升级 IPA 不会主动删除该目录。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Hermes")
+            .searchable(text: $query, prompt: "搜索记忆、项目、标签")
+            .onChange(of: query) { value in Task { await model.reloadHermes(query: value) } }
+            .refreshable { await model.reloadHermes(query: query) }
+            .task { if model.hermesRecords.isEmpty { await model.reloadHermes() } }
+            .toolbar {
+                Button {
+                    editingRecord = nil
+                    showEditor = true
+                } label: { Image(systemName: "square.and.pencil") }
+            }
+            .sheet(isPresented: $showEditor) {
+                HermesMemoryEditor(model: model, existing: editingRecord, isPresented: $showEditor)
+            }
+            .fileImporter(isPresented: $showImporter, allowedContentTypes: [.folder, .plainText]) { result in
+                switch result {
+                case .success(let url): model.importHermesMarkdown(from: url)
+                case .failure(let error): model.lastError = "Hermes 导入失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
+}
+
+private struct HermesMemoryEditor: View {
+    @ObservedObject var model: CloudCodeViewModel
+    let existing: HermesMemoryRecord?
+    @Binding var isPresented: Bool
+    @State private var kind: HermesMemoryKind
+    @State private var title: String
+    @State private var bodyText: String
+    @State private var project: String
+    @State private var tagsText: String
+    @State private var pinned: Bool
+    @State private var hasExpiry: Bool
+    @State private var expiry: Date
+
+    init(model: CloudCodeViewModel, existing: HermesMemoryRecord?, isPresented: Binding<Bool>) {
+        self.model = model
+        self.existing = existing
+        self._isPresented = isPresented
+        _kind = State(initialValue: existing?.kind ?? .projectMemory)
+        _title = State(initialValue: existing?.title ?? "")
+        _bodyText = State(initialValue: existing?.body ?? "")
+        _project = State(initialValue: existing?.project ?? "")
+        _tagsText = State(initialValue: existing?.tags.joined(separator: ", ") ?? "")
+        _pinned = State(initialValue: existing?.pinned ?? false)
+        _hasExpiry = State(initialValue: existing?.expiresAt != nil)
+        _expiry = State(initialValue: existing?.expiresAt ?? Date().addingTimeInterval(24 * 60 * 60))
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("类型") {
+                    Picker("记忆类型", selection: $kind) {
+                        ForEach(HermesMemoryKind.allCases, id: \.self) { item in
+                            Text(item.displayName).tag(item)
+                        }
+                    }
+                }
+                Section("内容") {
+                    TextField("标题", text: $title)
+                    TextField("Project（可选）", text: $project)
+                    TextField("Tags，以逗号分隔", text: $tagsText)
+                    TextEditor(text: $bodyText).frame(minHeight: 220)
+                    Toggle("固定", isOn: $pinned)
+                }
+                Section("过期") {
+                    Toggle("设置过期时间", isOn: $hasExpiry)
+                    if hasExpiry { DatePicker("过期时间", selection: $expiry) }
+                    Text("Temporary Context 建议设置过期时间；过期记录会从检索和上下文中自动清理。相同类型、标题和 Project 的新记录会让旧记录进入 superseded 状态。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle(existing == nil ? "新建记忆" : "编辑记忆")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { isPresented = false } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") {
+                        let tags = tagsText.split(separator: ",").map(String.init)
+                        model.saveHermesMemory(
+                            id: existing?.id,
+                            kind: kind,
+                            title: title,
+                            body: bodyText,
+                            project: project,
+                            tags: tags,
+                            pinned: pinned,
+                            expiresAt: hasExpiry ? expiry : nil
+                        )
+                        isPresented = false
+                    }
+                    .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+    }
+}
+
 private struct ActivityView: View {
     @ObservedObject var model: CloudCodeViewModel
 
@@ -747,6 +982,12 @@ private struct SettingsView: View {
 
                     if let provider = model.selectedProvider {
                         LabeledContent("厂商状态", value: localizedProviderStatus(provider.readiness.rawValue))
+                        if let health = model.selectedProviderEndpointHealth {
+                            let detail = health.state == .healthy
+                                ? "正常"
+                                : "临时异常" + (health.errorCode.map { " · \($0)" } ?? "")
+                            LabeledContent("接口健康", value: detail)
+                        }
                         LabeledContent("当前 Key", value: model.selectedKeyIsInstalled ? "已配置" : "未配置")
                     }
                     LabeledContent("配置规模", value: "\(model.providerProfiles.filter(\.enabled).count) 个厂商 · \(model.providerProfiles.filter(\.enabled).reduce(0) { $0 + $1.keySlots.count }) 个 Key")

@@ -14,7 +14,8 @@ let package = Package(
         .target(
             name: "CloudCodeCore",
             dependencies: [.product(name: "ZIPFoundation", package: "ZIPFoundation")],
-            path: "Sources/CloudCodeCore"
+            path: "Sources/CloudCodeCore",
+            linkerSettings: [.linkedLibrary("sqlite3")]
         ),
         .testTarget(
             name: "CloudCodeCoreTests",

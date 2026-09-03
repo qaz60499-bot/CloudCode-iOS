@@ -11,6 +11,11 @@ Absorbed:
 - arbitrary/private entitlement packaging is possible on supported TrollStore devices
 - no-sandbox/AppDataContainers/persona-style root-helper patterns are real mechanisms worth probing
 - root-helper binaries and app entitlements are separate concerns
+- TrollStore documents persona-based root helpers for unsandboxed apps, but also explicitly documents that proper platformization and launch-daemon behavior are not implied
+
+License/integration decision:
+
+- TrollStore is primarily MIT; some RootHelper/uicache-derived code is BSD-4-Clause. Cloud Code keeps its helper implementation independent and only follows the published entitlement/persona pattern.
 
 Rejected assumption:
 
@@ -23,6 +28,10 @@ Absorbed:
 - unsandboxed file-manager organization
 - separate RootHelper area rather than placing every privileged operation in the UI process
 - file browsing should remain a structured resource/service model
+
+License/integration decision:
+
+- Santander is MIT licensed. Cloud Code currently reuses the architectural boundary only; any future copied component must keep attribution and remain behind ToolRouter/PolicyEngine.
 
 Rejected assumption:
 
@@ -71,7 +80,12 @@ Applied:
 Absorbed:
 
 - embedded native commands and WASM can expand a mobile shell incrementally
-- command history/context can be mobile-native rather than a desktop daemon
+- command history/context/current-directory should be scoped per workspace rather than treated as process-global state
+- `ios_system` is the command runtime underneath a-Shell, so Cloud Code should reuse that boundary instead of inventing a second shell abstraction
+
+License/integration decision:
+
+- a-Shell is BSD-3-Clause and `ios_system` is BSD-3-Clause; their architecture is compatible with selective reuse, but this phase only absorbs patterns and does not vendor their large command catalogs.
 
 Rejected assumption:
 
@@ -158,6 +172,37 @@ Absorbed:
 Rejected assumption:
 
 - host-to-device lockdown/services cannot be copied as an on-device protocol. Cloud Code copies the module boundaries, not the transport model.
+
+## Git and terminal UI
+
+### libgit2 / iOS wrappers
+
+Absorbed:
+
+- Git should be a linkable library/service capability, not a stringly-typed shell-only feature.
+- repository identity, status, diff, commit and remote operations should become typed tools with explicit workspace roots.
+
+License/integration decision:
+
+- upstream libgit2 uses GPLv2 with a linking exception, which permits linking from this app while modifications to libgit2 itself retain source-distribution obligations.
+- current iOS community build wrappers have maintenance/dependency caveats, so `homeos.git` remains explicitly unavailable until a pinned, reproducible XCFramework/SwiftPM path is validated on the macOS runner and device.
+
+### SwiftTerm
+
+Absorbed:
+
+- terminal rendering can remain a separate UI adapter over a command/session backend.
+- it is optional for HomeOS: command execution does not depend on a terminal widget.
+
+License/integration decision:
+
+- SwiftTerm is MIT licensed and can be considered later for a terminal view, but no dependency is added in this phase because the structured Agent/Tool surface is higher priority.
+
+## HomeOS capability facade
+
+The current HomeOS layer is intentionally an aggregate facade rather than a second router. `homeos.file`, `homeos.app`, `homeos.process`, `homeos.shell`, `homeos.archive`, `homeos.network`, `homeos.script`, `homeos.device`, `homeos.workspace`, and `homeos.root_helper` are derived from existing `CapabilityProbe` facts. `homeos.git` remains unavailable until a real Git backend is linked and verified.
+
+No HomeOS record may turn an unavailable primitive capability into an available one, and all state-changing operations still flow through `ToolRouter`, `PolicyEngine`, execution ledger/transactions, confirmations where required, audit logging, and final-state verification.
 
 ## Local Native Cloud Runtime
 

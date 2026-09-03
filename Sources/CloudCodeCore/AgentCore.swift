@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 public enum AgentEvent: Sendable, Equatable {
     case status(String)
@@ -250,6 +251,7 @@ public actor AgentCore {
     private let sessionStore: SessionStore
     private let checkpointStore: TaskCheckpointStore
     private let steeringMailbox: AgentSteeringMailbox
+    private let memoryProvider: HermesMemoryProviding
     private let diagnosticLogger: DiagnosticLogStore?
     private let maxToolRounds: Int
 
@@ -262,6 +264,7 @@ public actor AgentCore {
         sessionStore: SessionStore,
         checkpointStore: TaskCheckpointStore,
         steeringMailbox: AgentSteeringMailbox = AgentSteeringMailbox(),
+        memoryProvider: HermesMemoryProviding = NullHermesMemoryProvider(),
         diagnosticLogger: DiagnosticLogStore? = nil,
         maxToolRounds: Int = 32
     ) {
@@ -273,6 +276,7 @@ public actor AgentCore {
         self.sessionStore = sessionStore
         self.checkpointStore = checkpointStore
         self.steeringMailbox = steeringMailbox
+        self.memoryProvider = memoryProvider
         self.diagnosticLogger = diagnosticLogger
         self.maxToolRounds = max(1, maxToolRounds)
     }
@@ -348,6 +352,24 @@ public actor AgentCore {
                             session.title = Self.sessionTitle(from: text)
                         }
                     }
+
+                    let hermesContext: String
+                    if let persisted = checkpoint.payload["hermes.context"], !persisted.isEmpty {
+                        hermesContext = persisted
+                    } else if let snapshot = try? await memoryProvider.context(query: text, project: nil, limit: 8), !snapshot.renderedText.isEmpty {
+                        hermesContext = snapshot.renderedText
+                        checkpoint.payload["hermes.context"] = snapshot.renderedText
+                        checkpoint.payload["hermes.memoryIDs"] = snapshot.records.map { $0.id.uuidString }.joined(separator: ",")
+                    } else {
+                        hermesContext = ""
+                    }
+                    if !hermesContext.isEmpty {
+                        session.messages.insert(ChatMessage(
+                            role: .system,
+                            content: hermesContext,
+                            providerMetadata: ["context_layer": "hermes"]
+                        ), at: min(1, session.messages.count))
+                    }
                     session.updatedAt = Date()
                     try await sessionStore.save(session)
                     try await checkpointStore.upsert(checkpoint)
@@ -370,6 +392,10 @@ public actor AgentCore {
                     session = try Self.normalizeProviderToolMetadata(in: session, using: toolNameMap)
                     try await sessionStore.save(session)
                     let schemas = try Self.makeToolSchemas(descriptors: descriptors, toolNameMap: toolNameMap)
+                    let descriptorsByName = Dictionary(uniqueKeysWithValues: descriptors.map { ($0.name, $0) })
+                    var lastStateChangeSignature = checkpoint.payload["tool.lastStateChangeSignature"]
+                        ?? Self.lastCompletedStateChangeSignature(in: session, descriptorsByName: descriptorsByName)
+                    var verificationSinceLastStateChange = checkpoint.payload["tool.verificationSinceLastStateChange"] == "true"
 
                     var previousToolPlanSignature: String?
                     var repeatedToolPlanCount = 0
@@ -399,11 +425,12 @@ public actor AgentCore {
                         var providerToolCallIDs = Set<String>()
                         var steeringInterruptedProviderStream = false
 
+                        let providerMessages = HarnessContextManager.providerMessages(from: session.messages)
                         let stream = DiagnosticContext.$sessionID.withValue(session.id) {
                             provider.stream(
                                 configuration: providerConfiguration,
                                 apiKey: key,
-                                messages: session.messages,
+                                messages: providerMessages,
                                 tools: schemas
                             )
                         }
@@ -454,6 +481,12 @@ public actor AgentCore {
                                 continue
                             }
                             try await sessionStore.save(session)
+                            try? await memoryProvider.recordCompletedTurn(
+                                sessionID: session.id,
+                                sessionTitle: session.title,
+                                userText: text,
+                                assistantText: assistantText
+                            )
                             checkpoint.stepIndex = maxToolRounds + 1
                             checkpoint.stepName = "completed"
                             checkpoint.state = "completed"
@@ -522,25 +555,73 @@ public actor AgentCore {
                                 arguments: arguments,
                                 sessionID: session.id
                             )
+                            guard let descriptor = descriptorsByName[name] else {
+                                throw ToolArgumentValidationError.unknownTool(name)
+                            }
+                            let stateChangeSignature = descriptor.risk == .readOnly ? nil : Self.semanticToolSignature(name: name, arguments: arguments)
                             continuation.yield(.toolStarted(name: name, id: call.id))
 
-                            let context = ToolExecutionContext(permissionMode: session.permissionMode, capabilityProfile: capabilities, allowedRoot: allowedRoot)
-                            do {
-                                let result = try await toolRouter.execute(call, context: context)
-                                continuation.yield(.toolFinished(result))
-                                let data = try JSONEncoder.pretty.encode(result)
-                                let rawContent = String(data: data, encoding: .utf8) ?? result.summary
-                                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name)", content: rawContent).promptSafeRepresentation
-                                session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: ["tool_call_id": providerCallID, "tool_name": name, "provider_tool_name": providerToolName]))
-                                if name == "capability.probe" { capabilities = await capabilityProbe.probe() }
-                            } catch {
-                                let failure = ToolResult(toolCallID: call.id, success: false, summary: String(describing: error), payload: ["error": String(describing: error)])
+                            if let stateChangeSignature,
+                               stateChangeSignature == lastStateChangeSignature,
+                               !verificationSinceLastStateChange {
+                                let failure = ToolResult(
+                                    toolCallID: call.id,
+                                    success: false,
+                                    summary: "已阻止重复状态变更；请先读取/检查目标最终状态，再决定是否需要再次执行。",
+                                    payload: ["idempotency": "semantic_duplicate_blocked"]
+                                )
                                 continuation.yield(.toolFinished(failure))
-                                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):error", content: "工具执行失败：\(error)").promptSafeRepresentation
-                                session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: ["tool_call_id": providerCallID, "tool_name": name, "provider_tool_name": providerToolName]))
+                                let data = try JSONEncoder.pretty.encode(failure)
+                                let rawContent = String(data: data, encoding: .utf8) ?? failure.summary
+                                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):duplicate_blocked", content: rawContent).promptSafeRepresentation
+                                session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: [
+                                    "tool_call_id": providerCallID,
+                                    "tool_name": name,
+                                    "provider_tool_name": providerToolName,
+                                    "idempotency": "semantic_duplicate_blocked"
+                                ]))
+                                session.updatedAt = Date()
+                                try await sessionStore.save(session)
+                            } else {
+                                let context = ToolExecutionContext(permissionMode: session.permissionMode, capabilityProfile: capabilities, allowedRoot: allowedRoot)
+                                do {
+                                    let result = try await toolRouter.execute(call, context: context)
+                                    continuation.yield(.toolFinished(result))
+                                    let data = try JSONEncoder.pretty.encode(result)
+                                    let rawContent = String(data: data, encoding: .utf8) ?? result.summary
+                                    let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name)", content: rawContent).promptSafeRepresentation
+                                    session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: ["tool_call_id": providerCallID, "tool_name": name, "provider_tool_name": providerToolName]))
+                                    if name == "capability.probe" { capabilities = await capabilityProbe.probe() }
+                                    if let stateChangeSignature {
+                                        lastStateChangeSignature = stateChangeSignature
+                                        verificationSinceLastStateChange = false
+                                        checkpoint.payload["tool.lastStateChangeSignature"] = stateChangeSignature
+                                        checkpoint.payload["tool.verificationSinceLastStateChange"] = "false"
+                                        checkpoint.updatedAt = Date()
+                                        try await checkpointStore.upsert(checkpoint)
+                                    } else if result.success, name != "capability.probe" {
+                                        verificationSinceLastStateChange = true
+                                        checkpoint.payload["tool.verificationSinceLastStateChange"] = "true"
+                                        checkpoint.updatedAt = Date()
+                                        try await checkpointStore.upsert(checkpoint)
+                                    }
+                                } catch {
+                                    if let stateChangeSignature {
+                                        lastStateChangeSignature = stateChangeSignature
+                                        verificationSinceLastStateChange = false
+                                        checkpoint.payload["tool.lastStateChangeSignature"] = stateChangeSignature
+                                        checkpoint.payload["tool.verificationSinceLastStateChange"] = "false"
+                                        checkpoint.updatedAt = Date()
+                                        try? await checkpointStore.upsert(checkpoint)
+                                    }
+                                    let failure = ToolResult(toolCallID: call.id, success: false, summary: String(describing: error), payload: ["error": String(describing: error)])
+                                    continuation.yield(.toolFinished(failure))
+                                    let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):error", content: "工具执行失败：\(error)").promptSafeRepresentation
+                                    session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: ["tool_call_id": providerCallID, "tool_name": name, "provider_tool_name": providerToolName]))
+                                }
+                                session.updatedAt = Date()
+                                try await sessionStore.save(session)
                             }
-                            session.updatedAt = Date()
-                            try await sessionStore.save(session)
 
                             let steeringAfterTool = try await applyPendingSteering(to: &session)
                             if steeringAfterTool > 0 {
@@ -598,15 +679,29 @@ public actor AgentCore {
                     )
                     checkpoint.state = "interrupted"
                     checkpoint.stepName = "failed"
-                    checkpoint.payload["error"] = String(describing: error)
+                    let nsError = error as NSError
+                    checkpoint.payload["error"] = Self.compactErrorSummary(error)
+                    checkpoint.payload["error.domain"] = nsError.domain
+                    checkpoint.payload["error.code"] = String(nsError.code)
+                    if ProviderEndpointHealthClassifier.shouldMarkDegraded(error) {
+                        checkpoint.payload["resume.mode"] = "manual_provider_failure"
+                    }
                     checkpoint.updatedAt = Date()
                     try? await checkpointStore.upsert(checkpoint)
-                    continuation.yield(.error(String(describing: error)))
+                    continuation.yield(.error(Self.compactErrorSummary(error)))
                     continuation.finish(throwing: error)
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    private static func compactErrorSummary(_ error: Error) -> String {
+        if let providerError = error as? ProviderError {
+            return providerError.description
+        }
+        let nsError = error as NSError
+        return "\(nsError.domain) (\(nsError.code))"
     }
 
     private func applyPendingSteering(to session: inout AgentSession) async throws -> Int {
@@ -694,6 +789,34 @@ public actor AgentCore {
             try await sessionStore.save(session)
         }
         return session
+    }
+
+    private static func semanticToolSignature(name: String, arguments: [String: String]) -> String {
+        let canonical = ([name] + arguments.keys.sorted().map { key in "\(key)=\(arguments[key] ?? "")" }).joined(separator: "\n")
+        let digest = SHA256.hash(data: Data(canonical.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func lastCompletedStateChangeSignature(
+        in session: AgentSession,
+        descriptorsByName: [String: ToolDescriptor]
+    ) -> String? {
+        for message in session.messages.reversed() where message.role == .tool {
+            guard message.providerMetadata["idempotency"] != "semantic_duplicate_blocked",
+                  let providerCallID = message.providerMetadata["tool_call_id"],
+                  let name = message.providerMetadata["tool_name"],
+                  let descriptor = descriptorsByName[name],
+                  descriptor.risk != .readOnly,
+                  let assistant = session.messages.last(where: {
+                      $0.role == .assistant && $0.providerMetadata["tool_call_id"] == providerCallID
+                  }),
+                  let argumentsJSON = assistant.providerMetadata["tool_arguments"],
+                  let arguments = try? validatedArguments(fromJSON: argumentsJSON, toolName: name) else {
+                continue
+            }
+            return semanticToolSignature(name: name, arguments: arguments)
+        }
+        return nil
     }
 
     private static func sessionTitle(from text: String) -> String {

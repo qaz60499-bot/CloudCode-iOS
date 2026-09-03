@@ -22,6 +22,58 @@ public enum ProviderReadiness: String, Codable, Sendable {
     case needsValidation = "NEEDS_VALIDATION"
 }
 
+public enum ProviderEndpointHealthState: String, Codable, Sendable {
+    case healthy
+    case degraded
+}
+
+public struct ProviderEndpointHealth: Codable, Equatable, Sendable {
+    public var state: ProviderEndpointHealthState
+    public var updatedAt: Date
+    public var errorDomain: String?
+    public var errorCode: Int?
+
+    public init(
+        state: ProviderEndpointHealthState,
+        updatedAt: Date = Date(),
+        errorDomain: String? = nil,
+        errorCode: Int? = nil
+    ) {
+        self.state = state
+        self.updatedAt = updatedAt
+        self.errorDomain = errorDomain
+        self.errorCode = errorCode
+    }
+}
+
+public enum ProviderEndpointHealthClassifier {
+    public static func shouldMarkDegraded(_ error: Error) -> Bool {
+        if let providerError = error as? ProviderError {
+            switch providerError {
+            case .rateLimited:
+                return true
+            case .invalidResponse(let code):
+                return (500...599).contains(code)
+            case .streamInterrupted:
+                return true
+            case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .capacityExhausted,
+                 .malformedEvent, .attachmentUnavailable, .attachmentTooLarge,
+                 .unsupportedAttachmentType, .transport:
+                return false
+            }
+        }
+        guard let urlError = error as? URLError else { return false }
+        switch urlError.code {
+        case .cannotParseResponse, .timedOut, .networkConnectionLost,
+             .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
+             .notConnectedToInternet, .cannotLoadFromNetwork:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 public enum ProviderSource: String, Codable, Sendable {
     case desktopSnapshot = "desktop_snapshot"
     case builtIn = "built_in"

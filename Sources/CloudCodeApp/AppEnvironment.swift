@@ -26,6 +26,13 @@ public final class CloudCodeViewModel: ObservableObject {
     @Published public private(set) var inFlightOperationKeys: Set<String> = []
     @Published public private(set) var diagnosticLogs: [DiagnosticLogRecord] = []
     @Published public private(set) var diagnosticLogBytes: Int64 = 0
+    @Published public private(set) var providerEndpointHealth: [String: ProviderEndpointHealth] = [:]
+    @Published public private(set) var providerFailureSessionIDs: Set<UUID> = []
+    @Published public private(set) var retryableProviderFailureSessionIDs: Set<UUID> = []
+    @Published public private(set) var hermesRecords: [HermesMemoryRecord] = []
+    @Published public private(set) var hermesProjects: [String] = []
+    @Published public private(set) var hermesTags: [String] = []
+    @Published public private(set) var hermesStatusMessage: String?
 
     @Published public private(set) var providerProfiles: [ProviderProfile]
     @Published public var selectedProviderID: String
@@ -53,6 +60,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private let attachmentStore: ChatAttachmentStore
     private let keyVault: KeychainAPIKeyVault
     private let steeringMailbox: AgentSteeringMailbox
+    private let hermesStore: HermesMemoryStore
     private let agentCore: AgentCore
     private let resourceIndex: ProgressiveResourceIndex
     private let appKnowledge: AppKnowledgeRegistry
@@ -116,6 +124,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let attachments = ChatAttachmentStore(root: support.appendingPathComponent("Attachments", isDirectory: true))
         let checkpointURL = support.appendingPathComponent("Tasks/checkpoints.json")
         let checkpoints = TaskCheckpointStore(fileURL: checkpointURL)
+        let hermesStore = HermesMemoryStore(root: support.appendingPathComponent("Hermes", isDirectory: true))
         let provider = ProviderClientRouter(
             keyVault: keyVault,
             anthropic: AnthropicProviderClient(diagnosticLogger: diagnosticLogStore),
@@ -133,6 +142,7 @@ public final class CloudCodeViewModel: ObservableObject {
             sessionStore: sessions,
             checkpointStore: checkpoints,
             steeringMailbox: steeringMailbox,
+            memoryProvider: hermesStore,
             diagnosticLogger: diagnosticLogStore
         )
 
@@ -179,6 +189,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.attachmentStore = attachments
         self.keyVault = keyVault
         self.steeringMailbox = steeringMailbox
+        self.hermesStore = hermesStore
         self.agentCore = agent
         self.resourceIndex = ProgressiveResourceIndex(fileURL: support.appendingPathComponent("Index/resource-graph.json"))
         self.appKnowledge = AppKnowledgeRegistry(fileURL: support.appendingPathComponent("Index/app-knowledge.json"))
@@ -214,6 +225,13 @@ public final class CloudCodeViewModel: ObservableObject {
             await seedKnowledgeIfNeeded(apps)
             do {
                 try await checkpointStore.recoverUnfinishedAfterRestart()
+                do {
+                    try await hermesStore.bootstrap()
+                    await reloadHermes()
+                } catch {
+                    hermesStatusMessage = "Hermes 初始化失败：\(error)"
+                    try? await diagnosticLogStore.log(level: .error, subsystem: "hermes", action: "bootstrap", result: "failed", error: error)
+                }
                 let recoveredTransactions = try await transactionEngine.recoverInterruptedTransactions()
                 if !recoveredTransactions.isEmpty {
                     activityLines.append("已恢复 \(recoveredTransactions.count) 个中断事务到最终状态。")
@@ -253,6 +271,14 @@ public final class CloudCodeViewModel: ObservableObject {
         runningSessionIDs.contains(session.id)
     }
 
+    public var hasCurrentProviderFailure: Bool {
+        providerFailureSessionIDs.contains(session.id)
+    }
+
+    public var canRetryCurrentProviderFailure: Bool {
+        retryableProviderFailureSessionIDs.contains(session.id) && !isCurrentSessionRunning
+    }
+
     public var streamingAssistantMessageID: UUID? {
         streamingAssistantMessageIDs[session.id]
     }
@@ -263,6 +289,10 @@ public final class CloudCodeViewModel: ObservableObject {
 
     public var selectedProvider: ProviderProfile? {
         providerProfiles.first(where: { $0.id == selectedProviderID && $0.enabled })
+    }
+
+    public var selectedProviderEndpointHealth: ProviderEndpointHealth? {
+        providerEndpointHealth[selectedProviderID]
     }
 
     public var availableKeySlots: [ProviderKeySlot] {
@@ -378,6 +408,23 @@ public final class CloudCodeViewModel: ObservableObject {
         return true
     }
 
+    public func retryCurrentProviderFailure() {
+        let sessionID = session.id
+        guard canRetryCurrentProviderFailure else { return }
+        lastError = nil
+        sessionErrors.removeValue(forKey: sessionID)
+        retryableProviderFailureSessionIDs.remove(sessionID)
+        Task {
+            let candidates = await checkpointStore.interrupted().filter { $0.sessionID == sessionID }
+            guard let checkpoint = candidates.max(by: { $0.updatedAt < $1.updatedAt }) else {
+                providerFailureSessionIDs.remove(sessionID)
+                lastError = "没有找到可重试的检查点。"
+                return
+            }
+            resumeTask(checkpoint)
+        }
+    }
+
     public func send(
         _ text: String,
         imageData: Data? = nil,
@@ -421,6 +468,8 @@ public final class CloudCodeViewModel: ObservableObject {
         liveSessions[sessionID] = initialSession
         streamingAssistantMessageIDs.removeValue(forKey: sessionID)
         sessionErrors.removeValue(forKey: sessionID)
+        providerFailureSessionIDs.remove(sessionID)
+        retryableProviderFailureSessionIDs.remove(sessionID)
         sessionActivityLines[sessionID, default: []].append("正在使用 \(config.name) / \(config.model) 规划请求…")
         syncVisibleSessionState(sessionID)
         UserDefaults.standard.set(true, forKey: Self.autoResumeTaskDefaultsKey)
@@ -468,11 +517,15 @@ public final class CloudCodeViewModel: ObservableObject {
                     liveSessions[sessionID] = saved
                     upsertSessionHistory(saved)
                     streamingAssistantMessageIDs.removeValue(forKey: sessionID)
+                    markProviderEndpointHealthy(config)
+                    providerFailureSessionIDs.remove(sessionID)
+                    retryableProviderFailureSessionIDs.remove(sessionID)
                     syncVisibleSessionState(sessionID)
                 }
             } catch {
                 if activeRunTokens[sessionID] == runToken {
-                    sessionErrors[sessionID] = String(describing: error)
+                    recordProviderFailure(error, configuration: config, sessionID: sessionID)
+                    sessionErrors[sessionID] = Self.userFacingRunError(error)
                     syncVisibleSessionState(sessionID)
                 }
             }
@@ -634,8 +687,11 @@ public final class CloudCodeViewModel: ObservableObject {
 
     private func resumeMostRecentInterruptedTaskIfRequested() {
         guard UserDefaults.standard.bool(forKey: Self.autoResumeTaskDefaultsKey) else { return }
-        guard let checkpoint = interruptedTasks.first(where: { !runningSessionIDs.contains($0.sessionID) }) else {
-            if interruptedTasks.isEmpty { UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey) }
+        let automaticCandidates = interruptedTasks.filter {
+            !runningSessionIDs.contains($0.sessionID) && $0.payload["resume.mode"] != "manual_provider_failure"
+        }
+        guard let checkpoint = automaticCandidates.first else {
+            if runningSessionIDs.isEmpty { UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey) }
             return
         }
         sessionActivityLines[checkpoint.sessionID, default: []].append("检测到未明确停止的中断任务；正在从最近检查点自动继续。")
@@ -756,6 +812,7 @@ public final class CloudCodeViewModel: ObservableObject {
         runningSessionIDs.insert(sessionID)
         activeRunTokens[sessionID] = runToken
         sessionErrors.removeValue(forKey: sessionID)
+        retryableProviderFailureSessionIDs.remove(sessionID)
         sessionActivityLines[sessionID, default: []].append("正在继续检查点 \(checkpoint.stepIndex)/\(checkpoint.totalSteps)…")
         UserDefaults.standard.set(true, forKey: Self.autoResumeTaskDefaultsKey)
         syncVisibleSessionState(sessionID)
@@ -802,11 +859,17 @@ public final class CloudCodeViewModel: ObservableObject {
                     liveSessions[sessionID] = saved
                     upsertSessionHistory(saved)
                     streamingAssistantMessageIDs.removeValue(forKey: sessionID)
+                    markProviderEndpointHealthy(config)
+                    providerFailureSessionIDs.remove(sessionID)
+                    retryableProviderFailureSessionIDs.remove(sessionID)
                     syncVisibleSessionState(sessionID)
                 }
             } catch {
                 if activeRunTokens[sessionID] == runToken {
-                    sessionErrors[sessionID] = String(describing: error)
+                    if let config = activeConfigurations[sessionID] {
+                        recordProviderFailure(error, configuration: config, sessionID: sessionID)
+                    }
+                    sessionErrors[sessionID] = Self.userFacingRunError(error)
                     syncVisibleSessionState(sessionID)
                 }
             }
@@ -900,6 +963,116 @@ public final class CloudCodeViewModel: ObservableObject {
         let root = URL(fileURLWithPath: browsePath, isDirectory: true)
         let allowed = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
         files = try fileService.list(directory: root, allowedRoot: allowed)
+    }
+
+    public func reloadHermes(query: String = "") async {
+        do {
+            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            hermesRecords = trimmed.isEmpty
+                ? try await hermesStore.recent(limit: 500)
+                : try await hermesStore.search(trimmed, limit: 500)
+            hermesProjects = try await hermesStore.projects()
+            hermesTags = try await hermesStore.allTags()
+            hermesStatusMessage = "Hermes：\(hermesRecords.count) 条有效记忆"
+        } catch {
+            hermesStatusMessage = "Hermes 读取失败：\(error)"
+        }
+    }
+
+    public func saveHermesMemory(
+        id: UUID? = nil,
+        kind: HermesMemoryKind,
+        title: String,
+        body: String,
+        project: String?,
+        tags: [String],
+        pinned: Bool,
+        expiresAt: Date? = nil
+    ) {
+        Task {
+            do {
+                let existing: HermesMemoryRecord?
+                if let id {
+                    existing = try await hermesStore.record(id)
+                } else {
+                    existing = nil
+                }
+                let record = HermesMemoryRecord(
+                    id: id ?? UUID(),
+                    kind: kind,
+                    title: title,
+                    body: body,
+                    project: project,
+                    tags: tags,
+                    pinned: pinned,
+                    createdAt: existing?.createdAt ?? Date(),
+                    expiresAt: expiresAt,
+                    sourcePath: existing?.sourcePath
+                )
+                _ = try await hermesStore.upsert(record)
+                await reloadHermes()
+            } catch {
+                lastError = Self.userFacingRunError(error)
+            }
+        }
+    }
+
+    public func deleteHermesMemory(_ record: HermesMemoryRecord) {
+        Task {
+            do {
+                try await hermesStore.delete(record.id)
+                await reloadHermes()
+            } catch {
+                lastError = Self.userFacingRunError(error)
+            }
+        }
+    }
+
+    public func setHermesPinned(_ record: HermesMemoryRecord, pinned: Bool) {
+        Task {
+            do {
+                try await hermesStore.setPinned(record.id, pinned: pinned)
+                await reloadHermes()
+            } catch {
+                lastError = Self.userFacingRunError(error)
+            }
+        }
+    }
+
+    public func importHermesMarkdown(from url: URL) {
+        Task {
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let count = try await hermesStore.importMarkdown(at: url)
+                hermesStatusMessage = "已导入 \(count) 个 Markdown 记录"
+                await reloadHermes()
+            } catch {
+                lastError = Self.userFacingRunError(error)
+            }
+        }
+    }
+
+    public func hermesExportMarkdown() async -> String {
+        do {
+            return try await hermesStore.combinedMarkdown()
+        } catch {
+            lastError = Self.userFacingRunError(error)
+            return ""
+        }
+    }
+
+    public func prepareHermesExportFile() async -> URL? {
+        do {
+            let directory = Self.supportRoot().appendingPathComponent("Hermes/Exports", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent("Hermes-Export.md")
+            try await hermesStore.exportCombinedMarkdown(to: url)
+            return url
+        } catch {
+            lastError = Self.userFacingRunError(error)
+            return nil
+        }
     }
 
     public func reloadActivity() async {
@@ -1397,6 +1570,92 @@ public final class CloudCodeViewModel: ObservableObject {
             return String(describing: providerError)
         }
         return String(describing: error)
+    }
+
+    private static func userFacingRunError(_ error: Error) -> String {
+        if let providerError = error as? ProviderError {
+            switch providerError {
+            case .streamInterrupted:
+                return "厂商输出连接已中断。检查点已保留，Cloud Code 不会自动重放已经开始的输出。可到“任务”中继续，或切换厂商。"
+            case .malformedEvent:
+                return "厂商返回的数据格式异常。详细信息已写入诊断日志；可以重试当前厂商或切换厂商。"
+            case .transport:
+                return "厂商传输异常。详细信息已写入诊断日志；可以检查网络后重试。"
+            default:
+                return providerError.description
+            }
+        }
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain {
+            switch URLError.Code(rawValue: nsError.code) {
+            case .cannotParseResponse:
+                return "厂商连接返回了无法解析的响应（-1017）。已完成有界自动重试并释放运行状态；可以重试当前厂商或切换厂商。"
+            case .timedOut:
+                return "厂商请求超时。运行状态已释放，可以立即重试。"
+            case .networkConnectionLost:
+                return "厂商连接中断。运行状态已释放，可以立即重试。"
+            case .notConnectedToInternet, .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed:
+                return "当前无法连接厂商接口。请检查网络后重试，或切换厂商。"
+            default:
+                return "厂商网络请求失败（\(nsError.code)）。详细信息已写入诊断日志。"
+            }
+        }
+        return "任务失败。详细信息已写入诊断日志（\(nsError.domain) \(nsError.code)）。"
+    }
+
+    private static func isSafeProviderRetry(_ error: Error) -> Bool {
+        if let providerError = error as? ProviderError {
+            switch providerError {
+            case .rateLimited:
+                return true
+            case .invalidResponse(let code):
+                return (500...599).contains(code)
+            default:
+                return false
+            }
+        }
+        return ProviderRetryClassifier.isRetryableBeforeOutput(error)
+    }
+
+    private func providerEndpointHealthKey(_ configuration: ProviderConfiguration) -> String {
+        configuration.providerID ?? configuration.baseURL.host ?? configuration.baseURL.absoluteString
+    }
+
+    private func markProviderEndpointHealthy(_ configuration: ProviderConfiguration) {
+        providerEndpointHealth[providerEndpointHealthKey(configuration)] = ProviderEndpointHealth(state: .healthy)
+    }
+
+    private func recordProviderFailure(_ error: Error, configuration: ProviderConfiguration, sessionID: UUID) {
+        providerFailureSessionIDs.insert(sessionID)
+        if Self.isSafeProviderRetry(error) {
+            retryableProviderFailureSessionIDs.insert(sessionID)
+        } else {
+            retryableProviderFailureSessionIDs.remove(sessionID)
+        }
+        if ProviderEndpointHealthClassifier.shouldMarkDegraded(error) {
+            let nsError = error as NSError
+            providerEndpointHealth[providerEndpointHealthKey(configuration)] = ProviderEndpointHealth(
+                state: .degraded,
+                errorDomain: nsError.domain,
+                errorCode: nsError.code
+            )
+        }
+        Task {
+            try? await diagnosticLogStore.log(
+                level: .error,
+                subsystem: "app.provider",
+                action: "run.failure",
+                result: "failed",
+                sessionID: sessionID,
+                error: error,
+                metadata: [
+                    "providerID": configuration.providerID ?? "",
+                    "model": configuration.model,
+                    "endpoint": (configuration.baseURL.host ?? "") + configuration.baseURL.path,
+                    "retryAllowed": Self.isSafeProviderRetry(error) ? "true" : "false"
+                ]
+            )
+        }
     }
 
     private func refreshFilesFromDisk() {

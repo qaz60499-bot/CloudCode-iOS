@@ -475,21 +475,24 @@ private extension ProviderRequestBuilding {
                 while attempt <= retryPolicy.maxAttempts {
                     var responseStarted = false
                     var successfulStreamEstablished = false
-                    try? await diagnosticLogger?.log(
-                        level: .info,
-                        subsystem: "provider",
-                        action: "request.attempt",
-                        result: "started",
-                        metadata: [
-                            "providerID": configuration.providerID ?? "",
-                            "model": configuration.model,
-                            "attempt": String(attempt),
-                            "maxAttempts": String(retryPolicy.maxAttempts),
-                            "endpoint": (configuration.baseURL.host ?? "") + configuration.baseURL.path
-                        ]
-                    )
+                    var endpoint = (configuration.baseURL.host ?? "") + configuration.baseURL.path
                     do {
                         let request = try makeRequest(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
+                        endpoint = (request.url?.host ?? configuration.baseURL.host ?? "") + (request.url?.path ?? configuration.baseURL.path)
+                        try? await diagnosticLogger?.log(
+                            level: .info,
+                            subsystem: "provider",
+                            action: "request.attempt",
+                            result: "started",
+                            metadata: [
+                                "providerID": configuration.providerID ?? "",
+                                "model": configuration.model,
+                                "attempt": String(attempt),
+                                "maxAttempts": String(retryPolicy.maxAttempts),
+                                "endpoint": endpoint,
+                                "transportState": "connecting"
+                            ]
+                        )
                         let transport = ProviderStreamingTransport(configuration: session.configuration, request: request)
                         let (http, lines) = try await transport.start()
                         try? await diagnosticLogger?.log(
@@ -542,10 +545,12 @@ private extension ProviderRequestBuilding {
                         continuation.finish(throwing: CancellationError())
                         return
                     } catch {
-                        let mayReplay = !successfulStreamEstablished
-                            && !responseStarted
+                        let retryableBeforeOutput = ProviderRetryClassifier.isRetryableBeforeOutput(error)
+                        let replaySafeAfterHTTPResponse = ProviderRetryClassifier.isReplaySafeAfterHTTPResponseBeforeOutput(error)
+                        let mayReplay = !responseStarted
                             && attempt < retryPolicy.maxAttempts
-                            && ProviderRetryClassifier.isRetryableBeforeOutput(error)
+                            && retryableBeforeOutput
+                            && (!successfulStreamEstablished || replaySafeAfterHTTPResponse)
                         guard mayReplay else {
                             try? await diagnosticLogger?.log(
                                 level: .error,
@@ -557,8 +562,10 @@ private extension ProviderRequestBuilding {
                                     "attempt": String(attempt),
                                     "providerID": configuration.providerID ?? "",
                                     "model": configuration.model,
+                                    "endpoint": endpoint,
                                     "responseStarted": String(responseStarted),
-                                    "streamEstablished": String(successfulStreamEstablished)
+                                    "streamEstablished": String(successfulStreamEstablished),
+                                    "transportState": successfulStreamEstablished ? "http_stream_failed" : "connect_failed"
                                 ]
                             )
                             continuation.finish(throwing: error)
@@ -579,7 +586,11 @@ private extension ProviderRequestBuilding {
                                 "nextAttempt": String(attempt + 1),
                                 "delayNanoseconds": String(retryDelay),
                                 "providerID": configuration.providerID ?? "",
-                                "model": configuration.model
+                                "model": configuration.model,
+                                "endpoint": endpoint,
+                                "responseStarted": String(responseStarted),
+                                "streamEstablished": String(successfulStreamEstablished),
+                                "transportState": successfulStreamEstablished ? "http_stream_retry" : "connect_retry"
                             ]
                         )
                         attempt += 1
@@ -1100,7 +1111,7 @@ public enum ProviderRetryClassifier {
         switch urlError.code {
         case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
              .notConnectedToInternet, .internationalRoamingOff,
-             .dataNotAllowed, .cannotLoadFromNetwork:
+             .dataNotAllowed, .cannotLoadFromNetwork, .cannotParseResponse:
             return true
         case .timedOut, .networkConnectionLost, .callIsActive:
             // Safe only before the stream has emitted any text or tool-call material.
@@ -1115,6 +1126,11 @@ public enum ProviderRetryClassifier {
         default:
             return false
         }
+    }
+
+    public static func isReplaySafeAfterHTTPResponseBeforeOutput(_ error: Error) -> Bool {
+        guard let urlError = error as? URLError else { return false }
+        return urlError.code == .cannotParseResponse
     }
 }
 
