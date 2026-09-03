@@ -8,6 +8,13 @@ import Darwin
 
 public protocol CapabilityProbing: Sendable {
     func probe() async -> CapabilityProfile
+    func probeStartupSafe() async -> CapabilityProfile
+}
+
+public extension CapabilityProbing {
+    func probeStartupSafe() async -> CapabilityProfile {
+        await probe()
+    }
 }
 
 public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
@@ -26,6 +33,93 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         self.fileManager = fileManager
         self.homeDirectory = homeDirectory
         self.diagnosticLogger = diagnosticLogger
+    }
+
+    public func probeStartupSafe() async -> CapabilityProfile {
+        try? await diagnosticLogger?.log(level: .info, subsystem: "capability", action: "probe.startup-safe.start", result: "running")
+        var records: [CapabilityRecord] = []
+
+        records.append(record("filesystem.own_container", .filesystem, canReadAndWrite(homeDirectory) ? .available : .unavailable,
+                              "Startup-safe read/write check against the app's own home directory."))
+        let sharedCandidate = URL(fileURLWithPath: "/var/mobile/Media", isDirectory: true)
+        records.append(record("filesystem.shared_user_files", .filesystem, fileManager.isReadableFile(atPath: sharedCandidate.path) ? .available : .unavailable,
+                              "Startup-safe read-only visibility check for the user media area."))
+        records.append(record("filesystem.unrestricted", .filesystem, .deviceValidationRequired,
+                              "Deferred during automatic startup. A privileged write outside the app container is never attempted automatically."))
+
+        records.append(record("apps.enumerate", .apps, .deviceValidationRequired,
+                              "Cross-app LaunchServices enumeration is deferred until an explicit device-capability validation."))
+        records.append(record("apps.resolve_own_bundle_path", .apps, .available,
+                              "Cloud Code's own bundle path is available without private API probing."))
+        records.append(record("apps.resolve_own_data_container", .apps, .available,
+                              "Cloud Code's own data container is available without private API probing."))
+        records.append(record("apps.resolve_bundle_path", .apps, .deviceValidationRequired,
+                              "Cross-app bundle resolution is deferred during automatic startup."))
+        records.append(record("apps.resolve_data_container", .apps, .deviceValidationRequired,
+                              "Cross-app data-container resolution is deferred during automatic startup."))
+
+        records.append(record("execution.ios_system", .execution, Self.hasDynamicSymbol("ios_system") ? .available : .unavailable,
+                              "Dynamic symbol presence only; no command is executed during startup."))
+        records.append(record("execution.posix_spawn_symbol", .execution, Self.hasDynamicSymbol("posix_spawn") ? .available : .unavailable,
+                              "Dynamic symbol presence only; no helper is spawned during startup."))
+        records.append(record("execution.spawn_helper", .execution, .deviceValidationRequired,
+                              "Embedded root-helper spawning is deferred until explicit device validation."))
+        records.append(record("execution.root_helper", .execution, .deviceValidationRequired,
+                              "UID 0/persona validation is never executed automatically during app launch."))
+        records.append(record("execution.jit_wasm", .execution, .unavailable,
+                              "No WASM/JIT execution backend is connected in the current app build."))
+
+        records.append(record("apps.launch", .apps, .deviceValidationRequired,
+                              "Private app-launch capability is deferred until explicit device validation."))
+        records.append(record("apps.terminate", .apps, .deviceValidationRequired,
+                              "Privileged app-termination capability is deferred until explicit device validation."))
+        records.append(record("apps.uninstall", .apps, .deviceValidationRequired,
+                              "Privileged uninstall capability is deferred until explicit device validation."))
+
+        records.append(record("data.photos", .data, .deviceValidationRequired,
+                              "PhotoKit authorization is user-controlled and is not requested automatically."))
+        records.append(record("data.contacts", .data, .deviceValidationRequired,
+                              "Contacts access is authorization-gated and is not requested automatically."))
+        records.append(record("data.calendar", .data, .deviceValidationRequired,
+                              "Calendar access is authorization-gated and is not requested automatically."))
+        let keychainProbe = Self.probeOwnKeychain()
+        records.append(record("data.keychain_scope", .data, keychainProbe.status, keychainProbe.detail))
+
+        records.append(record("automation.url_scheme", .automation, .unavailable,
+                              "The current URL-scheme executor is a disabled placeholder and cannot execute app actions."))
+        records.append(record("automation.xctest_wda", .automation, .unavailable,
+                              "No XCTest/WDA runtime backend is connected in this build."))
+        records.append(record("automation.gui", .automation, .unavailable,
+                              "The current GUI backend is explicitly unavailable; no automation runtime is connected."))
+        records.append(record("ipa.inspect", .ipa, .available,
+                              "ZIP/Info.plist inspection is implemented in-process."))
+        records.append(record("ipa.decrypt", .ipa, .unavailable,
+                              "No IPA decryption executor is connected in the current build."))
+        records.append(record("ipa.install", .ipa, .unavailable,
+                              "No IPA installation executor is connected in the current build."))
+        records.append(record("network.urlsession", .network, .available,
+                              "Foundation URLSession is available; no network request is required by this startup probe."))
+
+        records.append(contentsOf: HomeOSCapabilityLayer.records(from: records))
+        let profile = CapabilityProfile(records: records)
+        for item in records {
+            try? await diagnosticLogger?.log(
+                level: .info,
+                subsystem: "capability",
+                action: item.id,
+                result: item.status.rawValue,
+                diagnostic: item.detail,
+                metadata: ["domain": item.domain.rawValue, "mode": "startup-safe"]
+            )
+        }
+        try? await diagnosticLogger?.log(
+            level: .info,
+            subsystem: "capability",
+            action: "probe.startup-safe.finish",
+            result: "completed",
+            metadata: ["count": String(records.count)]
+        )
+        return profile
     }
 
     public func probe() async -> CapabilityProfile {

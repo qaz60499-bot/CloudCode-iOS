@@ -109,6 +109,17 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         self.diagnosticLogger = diagnosticLogger
     }
 
+    public func startupSafeApps() -> [ResourceNode] {
+        enumerationProven = false
+        enumerationDetail = "自动启动阶段仅加载 Cloud Code 自身；跨 App 私有 API 探测已延后。"
+        uninstallDetail = "卸载能力尚未进行显式设备验证。"
+        bundlePaths = [:]
+        containerPaths = [:]
+        cachedApps = fallbackOwnApp()
+        lastRefresh = Date()
+        return cachedApps
+    }
+
     public func installedApps() async -> [ResourceNode] {
         if Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
         return cachedApps

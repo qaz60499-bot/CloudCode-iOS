@@ -217,13 +217,12 @@ public final class CloudCodeViewModel: ObservableObject {
                 isRefreshingCapabilities = false
             }
             isRefreshingCapabilities = true
-            capabilityRefreshMessage = "正在检测设备能力…"
-            await appResolver.forceRefresh()
-            capabilities = await capabilityProbe.probe()
+            capabilityRefreshMessage = "正在执行安全启动检测…"
+            apps = await appResolver.startupSafeApps()
+            capabilities = await capabilityProbe.probeStartupSafe()
             lastCapabilityRefreshAt = capabilities.generatedAt
-            capabilityRefreshMessage = Self.capabilitySummary(capabilities)
+            capabilityRefreshMessage = Self.capabilitySummary(capabilities) + " · 特权/私有 API 检测已延后"
             capabilityGraph = CapabilityGraphBuilder().build(profile: capabilities, tools: await toolRegistry.all())
-            apps = await appResolver.installedApps()
             await seedKnowledgeIfNeeded(apps)
             do {
                 try await checkpointStore.recoverUnfinishedAfterRestart()
@@ -626,7 +625,10 @@ public final class CloudCodeViewModel: ObservableObject {
             try? await reloadSessionHistory()
             resumeMostRecentInterruptedTaskIfRequested()
         }
-        refreshCapabilities()
+        // Foreground transitions happen during normal launch, system sheets, and app switching.
+        // Never re-enter privileged/private capability probes automatically here: on TrollStore
+        // devices those probes can exercise undocumented LaunchServices/persona paths before the
+        // user has an interactive UI. Explicit capability refresh remains available to the user.
     }
 
     private func beginBackgroundExecutionIfNeeded() {

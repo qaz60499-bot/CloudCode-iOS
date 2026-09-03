@@ -399,7 +399,7 @@ public actor AgentCore {
 
                     continuation.yield(.status("正在检测设备能力…"))
                     var capabilities = await DiagnosticContext.$sessionID.withValue(session.id) {
-                        await capabilityProbe.probe()
+                        await capabilityProbe.probeStartupSafe()
                     }
                     session = try await reconcileDanglingToolCalls(
                         in: session,
@@ -407,7 +407,7 @@ public actor AgentCore {
                         allowedRoot: allowedRoot
                     )
                     capabilities = await DiagnosticContext.$sessionID.withValue(session.id) {
-                        await capabilityProbe.probe()
+                        await capabilityProbe.probeStartupSafe()
                     }
                     let key = try await keyVault.key(for: providerConfiguration.apiKeyReference)
                     let descriptors = await registry.all()

@@ -4,6 +4,22 @@ import ZIPFoundation
 @testable import CloudCodeCore
 
 final class CloudCodeCoreTests: XCTestCase {
+    func testStartupSafeCapabilityProbeDefersPrivilegedDeviceOperations() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let probe = CapabilityProbe(appResolver: VerifiedAppManagementResolver(), homeDirectory: root)
+
+        let profile = await probe.probeStartupSafe()
+
+        XCTAssertEqual(profile.status("filesystem.own_container"), .available)
+        XCTAssertEqual(profile.status("filesystem.unrestricted"), .deviceValidationRequired)
+        XCTAssertEqual(profile.status("apps.enumerate"), .deviceValidationRequired)
+        XCTAssertEqual(profile.status("execution.root_helper"), .deviceValidationRequired)
+        XCTAssertEqual(profile.status("apps.launch"), .deviceValidationRequired)
+        XCTAssertEqual(profile.status("apps.terminate"), .deviceValidationRequired)
+        XCTAssertEqual(profile.status("apps.uninstall"), .deviceValidationRequired)
+    }
+
     func testDiagnosticLogDefaultRetentionAndCapacityPolicy() {
         let policy = DiagnosticLogStore.Policy()
         XCTAssertEqual(policy.retentionSeconds, TimeInterval(72 * 60 * 60))
