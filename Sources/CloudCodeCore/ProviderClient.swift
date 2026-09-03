@@ -56,14 +56,76 @@ private final class ProviderSameOriginRedirectDelegate: NSObject, URLSessionTask
     }
 }
 
-private final class ProviderAttemptDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+private final class ProviderStreamingTransport: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let configuration: URLSessionConfiguration
+    private let request: URLRequest
     private let lock = NSLock()
-    private var receivedBytes: Int64 = 0
+    private var responseContinuation: CheckedContinuation<HTTPURLResponse, Error>?
+    private var responseResolved = false
+    private var lineBuffer = Data()
+    private var task: URLSessionDataTask?
+    private var ownedSession: URLSession?
+    private let lineStream: AsyncThrowingStream<String, Error>
+    private let lineContinuation: AsyncThrowingStream<String, Error>.Continuation
 
-    var receivedResponseBytes: Int64 {
+    private static func makeLineStream() -> (AsyncThrowingStream<String, Error>, AsyncThrowingStream<String, Error>.Continuation) {
+        var captured: AsyncThrowingStream<String, Error>.Continuation!
+        let stream = AsyncThrowingStream<String, Error> { continuation in
+            captured = continuation
+        }
+        return (stream, captured)
+    }
+
+    init(configuration: URLSessionConfiguration, request: URLRequest) {
+        self.configuration = configuration
+        self.request = request
+        let pair = Self.makeLineStream()
+        self.lineStream = pair.0
+        self.lineContinuation = pair.1
+        super.init()
+    }
+
+    func start() async throws -> (HTTPURLResponse, AsyncThrowingStream<String, Error>) {
+        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+        let dataTask = session.dataTask(with: request)
         lock.lock()
-        defer { lock.unlock() }
-        return receivedBytes
+        ownedSession = session
+        task = dataTask
+        lock.unlock()
+
+        let response = try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                responseContinuation = continuation
+                lock.unlock()
+                dataTask.resume()
+            }
+        }, onCancel: { [weak self] in
+            self?.cancel()
+        })
+        return (response, lineStream)
+    }
+
+    private func cancel() {
+        lock.lock()
+        let activeTask = task
+        let session = ownedSession
+        lock.unlock()
+        activeTask?.cancel()
+        session?.invalidateAndCancel()
+    }
+
+    private func resolveResponse(_ result: Result<HTTPURLResponse, Error>) {
+        lock.lock()
+        guard !responseResolved else {
+            lock.unlock()
+            return
+        }
+        responseResolved = true
+        let continuation = responseContinuation
+        responseContinuation = nil
+        lock.unlock()
+        continuation?.resume(with: result)
     }
 
     func urlSession(
@@ -82,10 +144,70 @@ private final class ProviderAttemptDelegate: NSObject, URLSessionTaskDelegate, @
         completionHandler(request)
     }
 
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        guard let http = response as? HTTPURLResponse else {
+            resolveResponse(.failure(ProviderError.transport("缺少 HTTP 响应")))
+            completionHandler(.cancel)
+            return
+        }
+        resolveResponse(.success(http))
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard !data.isEmpty else { return }
+        lineBuffer.append(data)
+        if lineBuffer.count > 1_048_576 && !lineBuffer.contains(0x0A) {
+            lineContinuation.finish(throwing: ProviderError.transport("厂商流单行超过 1 MB，已中止"))
+            dataTask.cancel()
+            return
+        }
+        while let newline = lineBuffer.firstIndex(of: 0x0A) {
+            var lineData = Data(lineBuffer[..<newline])
+            lineBuffer.removeSubrange(...newline)
+            if lineData.last == 0x0D { lineData.removeLast() }
+            guard let line = String(data: lineData, encoding: .utf8) else {
+                lineContinuation.finish(throwing: ProviderError.malformedEvent)
+                dataTask.cancel()
+                return
+            }
+            lineContinuation.yield(line)
+        }
+    }
+
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if !lineBuffer.isEmpty {
+            var trailing = lineBuffer
+            lineBuffer.removeAll(keepingCapacity: false)
+            if trailing.last == 0x0D { trailing.removeLast() }
+            if let line = String(data: trailing, encoding: .utf8) {
+                lineContinuation.yield(line)
+            } else {
+                lineContinuation.finish(throwing: ProviderError.malformedEvent)
+            }
+        }
+
+        if let error {
+            resolveResponse(.failure(error))
+            lineContinuation.finish(throwing: error)
+        } else {
+            if !responseResolved {
+                resolveResponse(.failure(ProviderError.transport("连接结束但未收到 HTTP 响应")))
+            }
+            lineContinuation.finish()
+        }
+
         lock.lock()
-        receivedBytes = max(receivedBytes, task.countOfBytesReceived)
+        self.task = nil
+        let ownedSession = self.ownedSession
+        self.ownedSession = nil
         lock.unlock()
+        ownedSession?.finishTasksAndInvalidate()
     }
 }
 
@@ -338,7 +460,7 @@ private protocol ProviderRequestBuilding {
     var session: URLSession { get }
     var retryPolicy: RetryPolicy { get }
     func makeRequest(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) throws -> URLRequest
-    func consume(bytes: URLSession.AsyncBytes, continuation: AsyncThrowingStream<ProviderEvent, Error>.Continuation) async throws -> Bool
+    func consume(lines: AsyncThrowingStream<String, Error>, continuation: AsyncThrowingStream<ProviderEvent, Error>.Continuation) async throws -> Bool
 }
 
 private extension ProviderRequestBuilding {
@@ -353,19 +475,26 @@ private extension ProviderRequestBuilding {
                 var attempt = 1
                 while attempt <= retryPolicy.maxAttempts {
                     var responseStarted = false
-                    let attemptDelegate = ProviderAttemptDelegate()
                     do {
                         let request = try makeRequest(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
-                        let (bytes, response) = try await session.bytes(for: request, delegate: attemptDelegate)
-                        guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("缺少 HTTP 响应") }
+                        let transport = ProviderStreamingTransport(configuration: session.configuration, request: request)
+                        let (http, lines) = try await transport.start()
                         if !(200..<300).contains(http.statusCode) {
                             var body = Data()
-                            for try await byte in bytes {
-                                if body.count < 262_144 { body.append(byte) }
+                            do {
+                                for try await line in lines {
+                                    if body.count < 262_144 {
+                                        body.append(Data(line.utf8))
+                                        body.append(0x0A)
+                                    }
+                                }
+                            } catch {
+                                // HTTP status is authoritative for classification; a truncated
+                                // error body must not turn a known 4xx/5xx into a transport replay.
                             }
                             throw ProviderHTTPClassifier.error(for: http.statusCode, body: body) ?? ProviderError.invalidResponse(http.statusCode)
                         }
-                        responseStarted = try await consume(bytes: bytes, continuation: continuation)
+                        responseStarted = try await consume(lines: lines, continuation: continuation)
                         continuation.yield(.finished)
                         continuation.finish()
                         return
@@ -373,9 +502,7 @@ private extension ProviderRequestBuilding {
                         continuation.finish(throwing: CancellationError())
                         return
                     } catch {
-                        let responseBodyObserved = attemptDelegate.receivedResponseBytes > 0
                         let mayReplay = !responseStarted
-                            && !responseBodyObserved
                             && attempt < retryPolicy.maxAttempts
                             && ProviderRetryClassifier.isRetryableBeforeOutput(error)
                         guard mayReplay else {
@@ -427,13 +554,13 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
         return try ProviderRequestFactory.jsonPOST(url: url, apiKey: apiKey, authMode: ProviderRequestFactory.authMode(configuration), body: body)
     }
 
-    fileprivate func consume(bytes: URLSession.AsyncBytes, continuation: AsyncThrowingStream<ProviderEvent, Error>.Continuation) async throws -> Bool {
+    fileprivate func consume(lines: AsyncThrowingStream<String, Error>, continuation: AsyncThrowingStream<ProviderEvent, Error>.Continuation) async throws -> Bool {
         var toolCallState: [Int: ToolCallAccumulator] = [:]
         var sawEvent = false
         var terminal = false
         var outputStarted = false
         do {
-            for try await line in bytes.lines {
+            for try await line in lines {
             try Task.checkCancellation()
             guard line.hasPrefix("data:") else { continue }
             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
@@ -513,13 +640,13 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
         return request
     }
 
-    fileprivate func consume(bytes: URLSession.AsyncBytes, continuation: AsyncThrowingStream<ProviderEvent, Error>.Continuation) async throws -> Bool {
+    fileprivate func consume(lines: AsyncThrowingStream<String, Error>, continuation: AsyncThrowingStream<ProviderEvent, Error>.Continuation) async throws -> Bool {
         var calls: [Int: ToolCallAccumulator] = [:]
         var sawEvent = false
         var terminal = false
         var outputStarted = false
         do {
-            for try await line in bytes.lines {
+            for try await line in lines {
             try Task.checkCancellation()
             guard line.hasPrefix("data:") else { continue }
             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
@@ -602,13 +729,13 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
         return try ProviderRequestFactory.jsonPOST(url: url, apiKey: apiKey, authMode: ProviderRequestFactory.authMode(configuration), body: body)
     }
 
-    fileprivate func consume(bytes: URLSession.AsyncBytes, continuation: AsyncThrowingStream<ProviderEvent, Error>.Continuation) async throws -> Bool {
+    fileprivate func consume(lines: AsyncThrowingStream<String, Error>, continuation: AsyncThrowingStream<ProviderEvent, Error>.Continuation) async throws -> Bool {
         var calls: [String: ToolCallAccumulator] = [:]
         var sawEvent = false
         var terminal = false
         var outputStarted = false
         do {
-            for try await line in bytes.lines {
+            for try await line in lines {
             try Task.checkCancellation()
             guard line.hasPrefix("data:") else { continue }
             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
