@@ -566,23 +566,23 @@ public final class CloudCodeViewModel: ObservableObject {
                     source: .custom,
                     customModelAllowed: true
                 )
+                try keyVault.set(apiKey, for: reference)
+                let stored = try await keyVault.key(for: reference)
+                guard stored == apiKey else { throw ProviderKeyProvisioningError.verificationFailed(reference) }
+
                 providerProfiles.append(profile)
                 do {
                     try persistCustomProviders()
-                    try keyVault.set(apiKey, for: reference)
-                    let stored = try await keyVault.key(for: reference)
-                    guard stored == apiKey else { throw ProviderKeyProvisioningError.verificationFailed(reference) }
                 } catch {
-                    try? keyVault.remove(reference)
                     providerProfiles.removeAll { $0.id == providerID }
-                    try? persistCustomProviders()
                     throw error
                 }
                 selectProvider(providerID)
                 activityLines.append("Custom Provider ready: \(trimmedLabel) (\(discovery.models.count) models).")
             } catch {
                 try? keyVault.remove(reference)
-                lastError = "Provider discovery failed: \(error)"
+                providerProfiles.removeAll { $0.id == providerID }
+                lastError = "Custom Provider setup failed: \(error)"
             }
         }
     }
