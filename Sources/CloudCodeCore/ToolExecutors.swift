@@ -65,7 +65,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
         switch call.name {
         case "capability.probe":
             let profile = await capabilityProbe.probe()
-            let payload = Dictionary(uniqueKeysWithValues: profile.records.map { ($0.id, $0.status.rawValue) })
+            let payload = Dictionary(profile.records.map { ($0.id, $0.status.rawValue) }, uniquingKeysWith: { _, latest in latest })
             return ToolResult(toolCallID: call.id, success: true, summary: "能力检测完成", payload: payload)
 
         case "apps.list":

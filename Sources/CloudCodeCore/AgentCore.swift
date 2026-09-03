@@ -415,7 +415,7 @@ public actor AgentCore {
                     session = try Self.normalizeProviderToolMetadata(in: session, using: toolNameMap)
                     try await sessionStore.save(session)
                     let schemas = try Self.makeToolSchemas(descriptors: descriptors, toolNameMap: toolNameMap)
-                    let descriptorsByName = Dictionary(uniqueKeysWithValues: descriptors.map { ($0.name, $0) })
+                    let descriptorsByName = Dictionary(descriptors.map { ($0.name, $0) }, uniquingKeysWith: { _, latest in latest })
                     var lastStateChangeSignature = checkpoint.payload["tool.lastStateChangeSignature"]
                         ?? Self.lastCompletedStateChangeSignature(in: session, descriptorsByName: descriptorsByName)
                     var lastStateChangeScope = checkpoint.payload["tool.lastStateChangeScope"]

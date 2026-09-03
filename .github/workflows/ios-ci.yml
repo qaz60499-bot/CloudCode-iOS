@@ -64,7 +64,7 @@ jobs:
           UDID="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ { print $2; exit }')"
           test -n "$UDID"
           xcrun simctl boot "$UDID" >/dev/null 2>&1 || true
-          xcrun simctl bootstatus "$UDID" -b
+          python3 -c 'import subprocess,sys; subprocess.run(["xcrun","simctl","bootstatus",sys.argv[1],"-b"], check=True, timeout=180)' "$UDID"
           xcrun simctl install "$UDID" "$APP_PATH"
           LAUNCH_RESULT="$(xcrun simctl launch "$UDID" com.cloudcode.ios)"
           echo "$LAUNCH_RESULT"
@@ -77,6 +77,7 @@ jobs:
             exit 1
           fi
           xcrun simctl terminate "$UDID" com.cloudcode.ios
+          xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true
           echo 'PASS: Cloud Code remained alive after simulator launch'
 
       - name: Build unsigned device app

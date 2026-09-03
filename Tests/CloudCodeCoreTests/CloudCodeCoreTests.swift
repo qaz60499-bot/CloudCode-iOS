@@ -2276,6 +2276,17 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(uninstall.preferredRoute, .privateFramework)
     }
 
+    func testToolRegistryDuplicateNamesDoNotCrashStartupAndLatestDescriptorWins() async throws {
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "files.read", summary: "old", risk: .readOnly),
+            ToolDescriptor(name: "files.read", summary: "latest", risk: .readOnly)
+        ])
+        let tools = await registry.all()
+        XCTAssertEqual(tools.count, 1)
+        XCTAssertEqual(tools.first?.name, "files.read")
+        XCTAssertEqual(tools.first?.summary, "latest")
+    }
+
     func testAgentCancellationPersistsInterruptedCheckpoint() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

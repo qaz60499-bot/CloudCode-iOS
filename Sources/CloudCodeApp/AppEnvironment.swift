@@ -1564,7 +1564,7 @@ public final class CloudCodeViewModel: ObservableObject {
 
     private func reloadSessionHistoryMergingLiveSessions() async throws {
         let stored = try await sessionStore.all()
-        var merged = Dictionary(uniqueKeysWithValues: stored.map { ($0.id, $0) })
+        var merged = Dictionary(stored.map { ($0.id, $0) }, uniquingKeysWith: { current, latest in latest.updatedAt >= current.updatedAt ? latest : current })
         for sessionID in runningSessionIDs {
             if let live = liveSessions[sessionID] {
                 merged[sessionID] = live
@@ -1622,7 +1622,7 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private static func changedCapabilityCount(from old: CapabilityProfile, to new: CapabilityProfile) -> Int {
-        let oldStatuses = Dictionary(uniqueKeysWithValues: old.records.map { ($0.id, $0.status) })
+        let oldStatuses = Dictionary(old.records.map { ($0.id, $0.status) }, uniquingKeysWith: { _, latest in latest })
         return new.records.reduce(into: 0) { count, record in
             if oldStatuses[record.id] != record.status { count += 1 }
         }

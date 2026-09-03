@@ -46,7 +46,7 @@ public actor ToolRegistry {
     private var descriptors: [String: ToolDescriptor]
 
     public init(descriptors: [ToolDescriptor] = ToolRegistry.phaseOneDefaults) {
-        self.descriptors = Dictionary(uniqueKeysWithValues: descriptors.map { ($0.name, $0) })
+        self.descriptors = Dictionary(descriptors.map { ($0.name, $0) }, uniquingKeysWith: { _, latest in latest })
     }
 
     public func descriptor(named name: String) -> ToolDescriptor? { descriptors[name] }
