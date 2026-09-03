@@ -35,6 +35,7 @@ targets:
       - Sources/CloudCodeApp
     dependencies:
       - target: CloudCodeCore
+      - package: ZIPFoundation
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios
@@ -44,6 +45,7 @@ targets:
         VERSIONING_SYSTEM: apple-generic
         SWIFT_VERSION: 5.9
         SWIFT_OBJC_BRIDGING_HEADER: Sources/CloudCodeApp/RootHelperBridge.h
+        OTHER_LDFLAGS: "$(inherited) -lsqlite3"
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: Cloud Code
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
