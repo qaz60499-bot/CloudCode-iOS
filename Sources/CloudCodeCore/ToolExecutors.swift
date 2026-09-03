@@ -120,6 +120,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             let guarded = try PathGuard().validate(target: target, allowedRoot: context.allowedRoot, rejectSymlink: true)
             let approvedParentIdentity = try? secureFileMutation.parentIdentity(of: guarded, allowedRoot: context.allowedRoot)
             let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: guarded.path)
+            if decision == .deny { throw TransactionError.confirmationDenied }
             if decision == .requireConfirmation {
                 let preview = ApprovalPreview(
                     title: "创建文件",
@@ -186,6 +187,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             )
             let approvedSourceIdentity = try secureFileMutation.identity(of: approvedTarget, allowedRoot: context.allowedRoot)
             let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: approvedTarget.path)
+            if decision == .deny { throw TransactionError.confirmationDenied }
             if decision == .requireConfirmation {
                 let size = (try? FileManager.default.allocatedSizeOfItem(at: target)) ?? 0
                 let preview = ApprovalPreview(
@@ -224,6 +226,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             let approvedTarget = try PathGuard().validate(target: originalTarget, allowedRoot: context.allowedRoot, rejectSymlink: true)
             let approvedParentIdentity = try? secureFileMutation.parentIdentity(of: approvedTarget, allowedRoot: context.allowedRoot)
             let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: approvedTarget.path)
+            if decision == .deny { throw TransactionError.confirmationDenied }
             if decision == .requireConfirmation {
                 let preview = ApprovalPreview(
                     title: "恢复回收站项目",
@@ -246,6 +249,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
         case "trash.purge":
             guard let raw = call.arguments["id"], let id = UUID(uuidString: raw) else { throw CocoaError(.fileNoSuchFile) }
             let decision = policy.decision(mode: context.permissionMode, tool: descriptor, explicitlyPermanent: true)
+            if decision == .deny { throw TransactionError.confirmationDenied }
             if decision == .requireConfirmation {
                 let preview = ApprovalPreview(title: "永久删除回收站项目", target: raw, reason: "永久删除后无法恢复", plan: ["定位回收站记录", "删除回收站内容", "更新日志"], risk: .permanentDestructive)
                 guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
@@ -280,6 +284,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             let guardedDestination = try PathGuard().validate(target: destination, allowedRoot: context.allowedRoot, rejectSymlink: true)
             let approvedDestinationParentIdentity = try? secureFileMutation.parentIdentity(of: guardedDestination, allowedRoot: context.allowedRoot)
             let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: guardedDestination.path)
+            if decision == .deny { throw TransactionError.confirmationDenied }
             if decision == .requireConfirmation {
                 let preview = ApprovalPreview(
                     title: "解压 IPA",
@@ -320,6 +325,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             let approvedDestination = try PathGuard().validate(target: destination, allowedRoot: context.allowedRoot, rejectSymlink: true)
             let approvedDestinationParentIdentity = try? secureFileMutation.parentIdentity(of: approvedDestination, allowedRoot: context.allowedRoot)
             let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: approvedDestination.path)
+            if decision == .deny { throw TransactionError.confirmationDenied }
             if decision == .requireConfirmation {
                 let preview = ApprovalPreview(
                     title: "重新打包 IPA",

@@ -914,6 +914,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 guard let transaction = candidate else { throw TransactionError.noBackup }
                 let descriptor = ToolDescriptor(name: "files.modify", summary: "Rollback a committed file transaction.", risk: .sensitiveWrite)
                 let decision = policyEngine.decision(mode: permissionMode, tool: descriptor, targetPath: transaction.targetPath)
+                guard decision != .deny else { return }
                 if decision == .requireConfirmation {
                     let preview = ApprovalPreview(
                         title: "回滚已提交事务",
@@ -1215,6 +1216,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 let approvedParentIdentity = try? secureMutation.parentIdentity(of: approvedTarget, allowedRoot: allowedRoot)
                 let descriptor = ToolDescriptor(name: "trash.restore", summary: "Restore a Cloud Code Trash record.", risk: .safeWrite)
                 let decision = policyEngine.decision(mode: permissionMode, tool: descriptor, targetPath: approvedTarget.path)
+                guard decision != .deny else { return }
                 if decision == .requireConfirmation {
                     let preview = ApprovalPreview(
                         title: "恢复回收站项目",
