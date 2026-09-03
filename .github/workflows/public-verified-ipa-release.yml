@@ -1,0 +1,74 @@
+name: Public Verified IPA Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Successful iOS CI and IPA run ID"
+        required: true
+        type: string
+      target_sha:
+        description: "Exact 40-character commit SHA built by source run"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Validate verified source run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          CONCLUSION="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json conclusion --jq '.conclusion')"
+          HEAD_SHA="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json headSha --jq '.headSha')"
+          test "$CONCLUSION" = "success"
+          test "$HEAD_SHA" = "$TARGET_SHA"
+
+      - name: Download verified IPA artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh run download "$SOURCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name CloudCode-iOS-PUBLIC_UNSIGNED_IPA \
+            --dir dist
+          test -f dist/CloudCode-iOS-unsigned.ipa
+          unzip -tq dist/CloudCode-iOS-unsigned.ipa
+          SHORT_SHA="${TARGET_SHA:0:7}"
+          mv dist/CloudCode-iOS-unsigned.ipa "dist/CloudCode-iOS-${SHORT_SHA}.ipa"
+          shasum -a 256 "dist/CloudCode-iOS-${SHORT_SHA}.ipa"
+
+      - name: Publish direct IPA release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${TARGET_SHA:0:7}"
+          TAG="cloudcode-ios-${SHORT_SHA}"
+          IPA="dist/CloudCode-iOS-${SHORT_SHA}.ipa"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; refusing to overwrite an existing delivery." >&2
+            exit 1
+          fi
+          gh release create "$TAG" "$IPA" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$TARGET_SHA" \
+            --title "Cloud Code iOS ${SHORT_SHA}" \
+            --notes "Direct .ipa delivery from verified CI run ${SOURCE_RUN_ID}. Public unsigned build; no embedded Provider credentials."
