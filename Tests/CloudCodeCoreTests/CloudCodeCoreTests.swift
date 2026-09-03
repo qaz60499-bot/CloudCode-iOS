@@ -1244,6 +1244,77 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: extracted.appendingPathComponent("Payload/Test.app/Info.plist").path))
     }
 
+    func testIPAExtractionRejectsArchiveTraversalEntryBeforeWritingDestination() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        try FileManager.default.createDirectory(at: allowed, withIntermediateDirectories: true)
+        let ipa = allowed.appendingPathComponent("Traversal.ipa")
+        let safePath = "aa/escape.txt"
+        let unsafePath = "../escape.txt"
+        XCTAssertEqual(safePath.utf8.count, unsafePath.utf8.count)
+        let payload = Data("blocked".utf8)
+        do {
+            let archive = try Archive(url: ipa, accessMode: .create)
+            try archive.addEntry(
+                with: safePath,
+                type: .file,
+                uncompressedSize: Int64(payload.count),
+                provider: { position, size in
+                    payload.subdata(in: Int(position)..<Int(position) + size)
+                }
+            )
+        }
+
+        var archiveBytes = try Data(contentsOf: ipa)
+        let safeBytes = Data(safePath.utf8)
+        let unsafeBytes = Data(unsafePath.utf8)
+        var replacements = 0
+        var searchStart = archiveBytes.startIndex
+        while searchStart < archiveBytes.endIndex,
+              let range = archiveBytes.range(of: safeBytes, in: searchStart..<archiveBytes.endIndex) {
+            archiveBytes.replaceSubrange(range, with: unsafeBytes)
+            replacements += 1
+            searchStart = archiveBytes.index(range.lowerBound, offsetBy: unsafeBytes.count)
+        }
+        XCTAssertGreaterThanOrEqual(replacements, 2)
+        try archiveBytes.write(to: ipa, options: .atomic)
+
+        let destination = allowed.appendingPathComponent("extract", isDirectory: true)
+        XCTAssertThrowsError(try IPAService(stagingRoot: root.appendingPathComponent("staging-traversal", isDirectory: true)).extract(ipa, to: destination, allowedRoot: allowed)) { error in
+            XCTAssertEqual(error as? IPAServiceError, .unsafeEntry(unsafePath))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("escape.txt").path))
+    }
+
+    func testIPAExtractionRejectsSymlinkArchiveEntryBeforeWritingDestination() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        let source = root.appendingPathComponent("symlink-source", isDirectory: true)
+        try FileManager.default.createDirectory(at: allowed, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let target = source.appendingPathComponent("target.txt")
+        let link = source.appendingPathComponent("link")
+        try Data("outside".utf8).write(to: target)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        let ipa = allowed.appendingPathComponent("Symlink.ipa")
+        do {
+            let archive = try Archive(url: ipa, accessMode: .create)
+            try archive.addEntry(with: "Payload/Test.app/link", fileURL: link, compressionMethod: .none)
+        }
+        let destination = allowed.appendingPathComponent("extract", isDirectory: true)
+        XCTAssertThrowsError(try IPAService(stagingRoot: root.appendingPathComponent("staging-symlink", isDirectory: true)).extract(ipa, to: destination, allowedRoot: allowed)) { error in
+            guard case IPAServiceError.unsafeEntry(let path) = error else {
+                return XCTFail("Expected unsafeEntry, got \(error)")
+            }
+            XCTAssertEqual(path, "Payload/Test.app/link")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
     func testIPAExtractionHonorsTotalSizeLimit() throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
