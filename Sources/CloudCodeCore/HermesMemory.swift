@@ -198,7 +198,7 @@ public actor HermesMemoryStore: HermesMemoryProviding {
         // immediately refreshed, human-readable mirror. If filesystem replacement
         // fails after COMMIT, bootstrap reconciliation deterministically repairs it.
         try writeMarkdown(record)
-        if let previousID, previousID != record.id, let previous = try record(previousID) {
+        if let previousID, previousID != record.id, let previous = try self.record(previousID) {
             try writeMarkdown(previous)
         }
         return record
