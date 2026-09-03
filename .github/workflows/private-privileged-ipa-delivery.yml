@@ -1,0 +1,129 @@
+name: Private Privileged IPA Secure Delivery
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful Private TrollStore Privileged Validation IPA run ID
+        required: true
+        type: string
+      delivery_public_key_b64:
+        description: Base64 PEM RSA public key used only to wrap the one-time delivery key
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  rewrap-verified-privileged-ipa:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate source run and download encrypted artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          RUN_JSON="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json conclusion,headSha,name)"
+          python3 - "$RUN_JSON" <<'PY'
+          import json
+          import sys
+          run = json.loads(sys.argv[1])
+          if run.get("conclusion") != "success":
+              raise SystemExit("FAIL: source privileged IPA run is not successful")
+          if run.get("name") != "Private TrollStore Privileged Validation IPA":
+              raise SystemExit("FAIL: source run is not the privileged private IPA workflow")
+          head = run.get("headSha") or ""
+          if len(head) != 40:
+              raise SystemExit("FAIL: source run HEAD is invalid")
+          print(f"SOURCE_HEAD={head}")
+          PY
+          mkdir -p "$RUNNER_TEMP/source"
+          gh run download "$SOURCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name CloudCode-iOS-TrollStore-PRIVILEGED-private-encrypted \
+            --dir "$RUNNER_TEMP/source"
+          SOURCE_ENC="$(find "$RUNNER_TEMP/source" -maxdepth 1 -type f -name 'CloudCode-iOS-TrollStore-PRIVILEGED-*.ipa.enc' -print -quit)"
+          test -n "$SOURCE_ENC"
+          test -s "$SOURCE_ENC"
+          printf '%s' "$SOURCE_ENC" > "$RUNNER_TEMP/source-enc-path.txt"
+
+      - name: Decrypt only in runner and verify IPA metadata
+        env:
+          CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD: ${{ secrets.CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD"
+          mkdir -p "$RUNNER_TEMP/delivery"
+          SOURCE_ENC="$(cat "$RUNNER_TEMP/source-enc-path.txt")"
+          IPA_NAME="$(basename "$SOURCE_ENC" .enc)"
+          IPA="$RUNNER_TEMP/delivery/$IPA_NAME"
+          openssl enc -d -aes-256-cbc -pbkdf2 \
+            -in "$SOURCE_ENC" \
+            -out "$IPA" \
+            -pass env:CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD
+          test -s "$IPA"
+          unzip -tq "$IPA" >/dev/null
+          unzip -p "$IPA" Payload/CloudCode.app/Info.plist > "$RUNNER_TEMP/Info.plist"
+          plutil -lint "$RUNNER_TEMP/Info.plist" >/dev/null
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$RUNNER_TEMP/Info.plist")"
+          BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$RUNNER_TEMP/Info.plist")"
+          test -n "$VERSION"
+          test -n "$BUILD"
+          unzip -l "$IPA" | grep -F 'Payload/CloudCode.app/CloudCode-Provider-Bootstrap.json' >/dev/null
+          printf '%s' "$IPA" > "$RUNNER_TEMP/plain-ipa-path.txt"
+          printf '%s' "$VERSION" > "$RUNNER_TEMP/version.txt"
+          printf '%s' "$BUILD" > "$RUNNER_TEMP/build.txt"
+
+      - name: Re-encrypt with one-time RSA delivery key
+        env:
+          DELIVERY_PUBLIC_KEY_B64: ${{ inputs.delivery_public_key_b64 }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -n "$DELIVERY_PUBLIC_KEY_B64"
+          printf '%s' "$DELIVERY_PUBLIC_KEY_B64" | base64 -D > "$RUNNER_TEMP/delivery-public.pem"
+          openssl pkey -pubin -in "$RUNNER_TEMP/delivery-public.pem" -noout >/dev/null
+          KEY_HEX="$(openssl rand -hex 32)"
+          IV_HEX="$(openssl rand -hex 16)"
+          IPA="$(cat "$RUNNER_TEMP/plain-ipa-path.txt")"
+          IPA_NAME="$(basename "$IPA")"
+          DELIVERY_ENC="$RUNNER_TEMP/delivery/$IPA_NAME.delivery.enc"
+          DELIVERY_KEY="$RUNNER_TEMP/delivery/${IPA_NAME%.ipa}.key.enc"
+          METADATA="$RUNNER_TEMP/delivery/${IPA_NAME%.ipa}.metadata.txt"
+          openssl enc -aes-256-cbc -K "$KEY_HEX" -iv "$IV_HEX" \
+            -in "$IPA" \
+            -out "$DELIVERY_ENC"
+          printf '%s:%s' "$KEY_HEX" "$IV_HEX" > "$RUNNER_TEMP/delivery-key.txt"
+          openssl pkeyutl -encrypt -pubin \
+            -inkey "$RUNNER_TEMP/delivery-public.pem" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -in "$RUNNER_TEMP/delivery-key.txt" \
+            -out "$DELIVERY_KEY"
+          SOURCE_HEAD="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json headSha --jq .headSha)"
+          IPA_SHA="$(shasum -a 256 "$IPA" | awk '{print $1}')"
+          IPA_SIZE="$(stat -f '%z' "$IPA")"
+          VERSION="$(cat "$RUNNER_TEMP/version.txt")"
+          BUILD="$(cat "$RUNNER_TEMP/build.txt")"
+          printf 'version=%s\nbuild=%s\nsource_run_id=%s\nsource_head=%s\nsha256=%s\nsize_bytes=%s\nipa_name=%s\n' \
+            "$VERSION" "$BUILD" "$SOURCE_RUN_ID" "$SOURCE_HEAD" "$IPA_SHA" "$IPA_SIZE" "$IPA_NAME" \
+            > "$METADATA"
+          rm -f "$IPA" "$RUNNER_TEMP/delivery-key.txt" "$RUNNER_TEMP/delivery-public.pem" "$RUNNER_TEMP/Info.plist"
+          test ! -e "$IPA"
+          test -s "$DELIVERY_ENC"
+          test -s "$DELIVERY_KEY"
+
+      - name: Upload public-key encrypted delivery bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: CloudCode-iOS-TrollStore-PRIVILEGED-secure-delivery
+          path: ${{ runner.temp }}/delivery/*
+          if-no-files-found: error
+          retention-days: 1
