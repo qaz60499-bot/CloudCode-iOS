@@ -345,13 +345,15 @@ public actor AgentCore {
                                 let result = try await toolRouter.execute(call, context: context)
                                 continuation.yield(.toolFinished(result))
                                 let data = try JSONEncoder.pretty.encode(result)
-                                let content = String(data: data, encoding: .utf8) ?? result.summary
+                                let rawContent = String(data: data, encoding: .utf8) ?? result.summary
+                                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name)", content: rawContent).promptSafeRepresentation
                                 session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: ["tool_call_id": providerCallID, "tool_name": name]))
                                 if name == "capability.probe" { capabilities = await capabilityProbe.probe() }
                             } catch {
                                 let failure = ToolResult(toolCallID: call.id, success: false, summary: String(describing: error), payload: ["error": String(describing: error)])
                                 continuation.yield(.toolFinished(failure))
-                                session.messages.append(ChatMessage(role: .tool, content: "Tool failed: \(error)", providerMetadata: ["tool_call_id": providerCallID, "tool_name": name]))
+                                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):error", content: "Tool failed: \(error)").promptSafeRepresentation
+                                session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: ["tool_call_id": providerCallID, "tool_name": name]))
                             }
                             session.updatedAt = Date()
                             try await sessionStore.save(session)
@@ -414,16 +416,18 @@ public actor AgentCore {
             do {
                 let result = try await toolRouter.execute(call, context: context)
                 let data = try JSONEncoder.pretty.encode(result)
-                let content = String(data: data, encoding: .utf8) ?? result.summary
+                let rawContent = String(data: data, encoding: .utf8) ?? result.summary
+                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):recovery", content: rawContent).promptSafeRepresentation
                 session.messages.append(ChatMessage(
                     role: .tool,
                     content: content,
                     providerMetadata: ["tool_call_id": providerCallID, "tool_name": name]
                 ))
             } catch {
+                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):recovery_error", content: "Recovery did not blindly replay this tool call: \(error)").promptSafeRepresentation
                 session.messages.append(ChatMessage(
                     role: .tool,
-                    content: "Recovery did not blindly replay this tool call: \(error)",
+                    content: content,
                     providerMetadata: ["tool_call_id": providerCallID, "tool_name": name, "recovery": "uncertain"]
                 ))
             }

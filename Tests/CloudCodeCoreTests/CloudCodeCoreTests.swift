@@ -573,8 +573,12 @@ final class CloudCodeCoreTests: XCTestCase {
         let recovered = saved.messages.first(where: {
             $0.role == .tool && $0.providerMetadata["tool_call_id"] == providerCallID
         })
-        XCTAssertNotNil(recovered)
-        XCTAssertTrue(recovered?.content.contains("already committed") == true)
+        let recoveredMessage = try XCTUnwrap(recovered)
+        XCTAssertTrue(recoveredMessage.content.contains("already committed"))
+        let recoveredData = try XCTUnwrap(recoveredMessage.content.data(using: .utf8))
+        let recoveredEnvelope = try XCTUnwrap(JSONSerialization.jsonObject(with: recoveredData) as? [String: String])
+        XCTAssertEqual(recoveredEnvelope["trust"], "untrusted_data")
+        XCTAssertEqual(recoveredEnvelope["source"], "tool:files.create:recovery")
         let invocationCount = await counter.value()
         XCTAssertEqual(invocationCount, 0)
     }

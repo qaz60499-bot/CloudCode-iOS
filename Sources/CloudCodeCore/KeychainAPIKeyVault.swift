@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-public final class KeychainAPIKeyVault: APIKeyVault, @unchecked Sendable {
+public final class KeychainAPIKeyVault: MutableAPIKeyVault, @unchecked Sendable {
     private let service: String
 
     public init(service: String = "CloudCodeIOS.ProviderKey") {

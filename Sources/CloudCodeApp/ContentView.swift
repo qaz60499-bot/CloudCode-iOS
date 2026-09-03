@@ -354,9 +354,10 @@ private struct SettingsView: View {
                         guard model.setKey(selectedKeyInput) else { return }
                         selectedKeyInput = ""
                     }
-                    .disabled(selectedKeyInput.isEmpty)
+                    .disabled(selectedKeyInput.isEmpty || model.isProviderKeyMutationInFlight)
 
                     Button("Import private Key bootstrap") { showBootstrapImporter = true }
+                        .disabled(model.isProviderKeyMutationInFlight)
                     Text("The public IPA contains no API Keys. A private bootstrap is imported into iOS Keychain and its plaintext source is deleted; Key values are never stored in UserDefaults.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -379,6 +380,7 @@ private struct SettingsView: View {
 
                 Section("Provider management") {
                     Button("Add Custom Provider") { showCustomProvider = true }
+                        .disabled(model.isProviderKeyMutationInFlight)
                 }
 
                 Section("Advanced") {
@@ -469,7 +471,7 @@ private struct CustomProviderSheet: View {
                         apiKey = ""
                         isPresented = false
                     }
-                    .disabled(label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || baseURL.isEmpty || apiKey.isEmpty)
+                    .disabled(label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || baseURL.isEmpty || apiKey.isEmpty || model.isProviderKeyMutationInFlight)
                 }
             }
         }

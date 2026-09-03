@@ -47,6 +47,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private var bootstrapTask: Task<Void, Never>?
     private var capabilityRefreshTask: Task<Void, Never>?
     private var didBootstrap = false
+    private static let providerKeyMutationOperationKey = "provider-key:mutation"
 
     public init() {
         let support = Self.supportRoot()
@@ -175,6 +176,10 @@ public final class CloudCodeViewModel: ObservableObject {
         selectedProvider?.protocolFor(model: selectedModel, keySlotID: selectedKeySlotID)
     }
 
+    public var isProviderKeyMutationInFlight: Bool {
+        inFlightOperationKeys.contains(Self.providerKeyMutationOperationKey)
+    }
+
     public var selectedKeyIsInstalled: Bool {
         guard let provider = selectedProvider, !selectedKeySlotID.isEmpty else { return false }
         return keyVault.contains(ProviderCatalog.keyReference(providerID: provider.id, keySlotID: selectedKeySlotID))
@@ -213,6 +218,11 @@ public final class CloudCodeViewModel: ObservableObject {
             return false
         }
         let reference = ProviderCatalog.keyReference(providerID: providerID, keySlotID: keySlotID)
+        guard beginExclusiveOperation(Self.providerKeyMutationOperationKey) else {
+            lastError = "Another Provider Key operation is already in progress."
+            return false
+        }
+        defer { endExclusiveOperation(Self.providerKeyMutationOperationKey) }
         if let profile = providerProfiles.first(where: { $0.id == providerID }),
            let slot = profile.keySlots.first(where: { $0.id == keySlotID }),
            !slot.fingerprint.isEmpty,
@@ -507,8 +517,11 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func addCustomProvider(label: String, baseURLText: String, apiKey: String) {
-        let operationKey = "custom-provider:add"
-        guard beginExclusiveOperation(operationKey) else { return }
+        let operationKey = Self.providerKeyMutationOperationKey
+        guard beginExclusiveOperation(operationKey) else {
+            lastError = "Another Provider Key operation is already in progress."
+            return
+        }
         let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedLabel.isEmpty,
               let baseURL = URL(string: baseURLText.trimmingCharacters(in: .whitespacesAndNewlines)),
@@ -553,13 +566,16 @@ public final class CloudCodeViewModel: ObservableObject {
                     source: .custom,
                     customModelAllowed: true
                 )
-                try keyVault.set(apiKey, for: reference)
                 providerProfiles.append(profile)
                 do {
                     try persistCustomProviders()
+                    try keyVault.set(apiKey, for: reference)
+                    let stored = try await keyVault.key(for: reference)
+                    guard stored == apiKey else { throw ProviderKeyProvisioningError.verificationFailed(reference) }
                 } catch {
-                    providerProfiles.removeAll { $0.id == providerID }
                     try? keyVault.remove(reference)
+                    providerProfiles.removeAll { $0.id == providerID }
+                    try? persistCustomProviders()
                     throw error
                 }
                 selectProvider(providerID)
@@ -572,8 +588,11 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func importProviderBootstrap(from url: URL) {
-        let operationKey = "provider-bootstrap:import"
-        guard beginExclusiveOperation(operationKey) else { return }
+        let operationKey = Self.providerKeyMutationOperationKey
+        guard beginExclusiveOperation(operationKey) else {
+            lastError = "Another Provider Key operation is already in progress."
+            return
+        }
         Task {
             defer { endExclusiveOperation(operationKey) }
             do {
@@ -634,6 +653,11 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private func importBootstrapIfPresent() async throws {
+        let operationKey = Self.providerKeyMutationOperationKey
+        guard beginExclusiveOperation(operationKey) else {
+            throw ProviderError.transport("Another Provider Key operation is already in progress")
+        }
+        defer { endExclusiveOperation(operationKey) }
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
         guard let url = documents?.appendingPathComponent("CloudCode-Provider-Bootstrap.json"),
               FileManager.default.fileExists(atPath: url.path) else { return }
@@ -667,36 +691,17 @@ public final class CloudCodeViewModel: ObservableObject {
         }
         guard !pending.isEmpty else { throw ProviderError.missingAPIKey }
 
-        var snapshots: [(reference: String, previous: String?)] = []
-        for item in pending {
-            snapshots.append((item.reference, try? await keyVault.key(for: item.reference)))
-        }
-        func rollbackKeychain() {
-            for snapshot in snapshots.reversed() {
-                if let previous = snapshot.previous {
-                    try? keyVault.set(previous, for: snapshot.reference)
-                } else {
-                    try? keyVault.remove(snapshot.reference)
+        let mutations = pending.map { ProviderKeyMutation(reference: $0.reference, secret: $0.secret) }
+        let importedCount = try await ProviderKeyProvisioner.apply(
+            mutations,
+            vault: keyVault,
+            finalizer: {
+                if removeSource {
+                    try FileManager.default.removeItem(at: url)
                 }
             }
-        }
-
-        do {
-            for item in pending {
-                try keyVault.set(item.secret, for: item.reference)
-            }
-            for item in pending {
-                let stored = try await keyVault.key(for: item.reference)
-                guard stored == item.secret else { throw CocoaError(.fileWriteUnknown) }
-            }
-            if removeSource {
-                try FileManager.default.removeItem(at: url)
-            }
-        } catch {
-            rollbackKeychain()
-            throw error
-        }
-        return pending.count
+        )
+        return importedCount
     }
 
     private func refreshFilesFromDisk() {

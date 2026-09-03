@@ -587,6 +587,137 @@ final class ProviderKeychainTests: XCTestCase {
             XCTAssertEqual(error as? ProviderError, .missingAPIKey)
         }
     }
+
+    func testProvisioningSuccessCommitsAllKeys() async throws {
+        let vault = FaultInjectingMutableVault(keys: ["a": "old-a"])
+        let count = try await ProviderKeyProvisioner.apply([
+            ProviderKeyMutation(reference: "a", secret: "new-a"),
+            ProviderKeyMutation(reference: "b", secret: "new-b")
+        ], vault: vault)
+        XCTAssertEqual(count, 2)
+        XCTAssertEqual(vault.snapshot(), ["a": "new-a", "b": "new-b"])
+    }
+
+    func testProvisioningWriteFailureRestoresPreviousKeysAndRemovesNewKeys() async throws {
+        let vault = FaultInjectingMutableVault(keys: ["a": "old-a"], failOnSetReference: "b")
+        do {
+            _ = try await ProviderKeyProvisioner.apply([
+                ProviderKeyMutation(reference: "a", secret: "new-a"),
+                ProviderKeyMutation(reference: "b", secret: "new-b")
+            ], vault: vault)
+            XCTFail("Injected write failure must fail provisioning")
+        } catch {
+            XCTAssertEqual(error as? ProviderError, .transport("injected write failure"))
+        }
+        XCTAssertEqual(vault.snapshot(), ["a": "old-a"])
+    }
+
+    func testProvisioningFinalizerFailureRollsBackCommittedKeychainWrites() async throws {
+        let vault = FaultInjectingMutableVault(keys: ["a": "old-a"])
+        do {
+            _ = try await ProviderKeyProvisioner.apply([
+                ProviderKeyMutation(reference: "a", secret: "new-a"),
+                ProviderKeyMutation(reference: "b", secret: "new-b")
+            ], vault: vault, finalizer: {
+                throw ProviderError.transport("plaintext cleanup failed")
+            })
+            XCTFail("Finalizer failure must roll Keychain back")
+        } catch {
+            XCTAssertEqual(error as? ProviderError, .transport("plaintext cleanup failed"))
+        }
+        XCTAssertEqual(vault.snapshot(), ["a": "old-a"])
+    }
+
+    func testProvisioningDuplicateReferenceFailsBeforeAnyMutation() async throws {
+        let vault = FaultInjectingMutableVault(keys: ["a": "old-a"])
+        do {
+            _ = try await ProviderKeyProvisioner.apply([
+                ProviderKeyMutation(reference: "a", secret: "first"),
+                ProviderKeyMutation(reference: "a", secret: "second")
+            ], vault: vault)
+            XCTFail("Duplicate reference must fail closed")
+        } catch {
+            XCTAssertEqual(error as? ProviderKeyProvisioningError, .duplicateReference("a"))
+        }
+        XCTAssertEqual(vault.snapshot(), ["a": "old-a"])
+        XCTAssertEqual(vault.writeCount(), 0)
+    }
+
+    func testProvisioningVerificationFailureRollsBackAllKeys() async throws {
+        let vault = FaultInjectingMutableVault(keys: ["a": "old-a"], corruptReadReferenceAfterWrite: "b")
+        do {
+            _ = try await ProviderKeyProvisioner.apply([
+                ProviderKeyMutation(reference: "a", secret: "new-a"),
+                ProviderKeyMutation(reference: "b", secret: "new-b")
+            ], vault: vault)
+            XCTFail("Read-back mismatch must fail provisioning")
+        } catch {
+            XCTAssertEqual(error as? ProviderKeyProvisioningError, .verificationFailed("b"))
+        }
+        XCTAssertEqual(vault.snapshot(), ["a": "old-a"])
+    }
+
+    func testProvisioningDoesNotTreatKeychainReadFailureAsMissingKey() async throws {
+        let vault = FaultInjectingMutableVault(keys: ["a": "old-a"], failOnReadReference: "a")
+        do {
+            _ = try await ProviderKeyProvisioner.apply([
+                ProviderKeyMutation(reference: "a", secret: "new-a")
+            ], vault: vault)
+            XCTFail("Read failure must abort before mutation")
+        } catch {
+            XCTAssertEqual(error as? ProviderError, .transport("injected read failure"))
+        }
+        XCTAssertEqual(vault.snapshot(), ["a": "old-a"])
+        XCTAssertEqual(vault.writeCount(), 0)
+    }
+}
+
+
+private final class FaultInjectingMutableVault: MutableAPIKeyVault, @unchecked Sendable {
+    private let queue = DispatchQueue(label: "CloudCodeIOS.Tests.FaultInjectingMutableVault")
+    private var keys: [String: String]
+    private let failOnSetReference: String?
+    private let failOnReadReference: String?
+    private let corruptReadReferenceAfterWrite: String?
+    private var writes = 0
+
+    init(
+        keys: [String: String] = [:],
+        failOnSetReference: String? = nil,
+        failOnReadReference: String? = nil,
+        corruptReadReferenceAfterWrite: String? = nil
+    ) {
+        self.keys = keys
+        self.failOnSetReference = failOnSetReference
+        self.failOnReadReference = failOnReadReference
+        self.corruptReadReferenceAfterWrite = corruptReadReferenceAfterWrite
+    }
+
+    func set(_ value: String, for reference: String) throws {
+        try queue.sync {
+            if reference == failOnSetReference { throw ProviderError.transport("injected write failure") }
+            writes += 1
+            keys[reference] = value
+        }
+    }
+
+    func remove(_ reference: String) throws {
+        queue.sync {
+            keys.removeValue(forKey: reference)
+        }
+    }
+
+    func key(for reference: String) async throws -> String {
+        try queue.sync {
+            if reference == failOnReadReference { throw ProviderError.transport("injected read failure") }
+            guard let value = keys[reference] else { throw ProviderError.missingAPIKey }
+            if reference == corruptReadReferenceAfterWrite, writes > 0 { return "injected-corrupt-read" }
+            return value
+        }
+    }
+
+    func snapshot() -> [String: String] { queue.sync { keys } }
+    func writeCount() -> Int { queue.sync { writes } }
 }
 
 private struct FixedProvider: ProviderStreaming {
