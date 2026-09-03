@@ -71,12 +71,12 @@ jobs:
           PID="${LAUNCH_RESULT##*: }"
           test -n "$PID"
           sleep 8
-          if ! xcrun simctl spawn "$UDID" kill -0 "$PID"; then
+          if ! xcrun simctl terminate "$UDID" com.cloudcode.ios; then
             echo 'FAIL: Cloud Code exited during simulator launch smoke test' >&2
             xcrun simctl spawn "$UDID" log show --last 30s --style compact --predicate 'process == "CloudCode"' || true
+            xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true
             exit 1
           fi
-          xcrun simctl terminate "$UDID" com.cloudcode.ios
           xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true
           echo 'PASS: Cloud Code remained alive after simulator launch'
 
