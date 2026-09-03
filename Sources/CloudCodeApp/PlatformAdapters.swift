@@ -45,8 +45,18 @@ private enum EmbeddedRootHelper {
         return (false, "Embedded root helper 卸载退出码 \(code)")
     }
 
+    static func terminateCapability() -> RootHelperCapabilitySnapshot {
+        let root = probe()
+        guard root.available else { return root }
+        let code = CloudCodeSpawnRootHelper(executablePath, ["probe-terminate"])
+        if code == 0 {
+            return RootHelperCapabilitySnapshot(available: true, detail: "Embedded root helper 已验证 root 身份及按进程路径定位能力。")
+        }
+        return RootHelperCapabilitySnapshot(available: false, detail: "Embedded root helper 的进程定位后端探测退出码 \(code)。")
+    }
+
     static func terminate(bundlePath: String) -> (success: Bool, detail: String) {
-        let capability = probe()
+        let capability = terminateCapability()
         guard capability.available else { return (false, capability.detail) }
         let code = CloudCodeSpawnRootHelper(executablePath, ["terminate", bundlePath])
         if code == 0 {
@@ -120,7 +130,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         guard enumerationProven else {
             return AppLifecycleCapabilitySnapshot(available: false, detail: "跨 App 枚举尚未验证，不能安全定位待停止的 App。")
         }
-        let helper = EmbeddedRootHelper.probe()
+        let helper = EmbeddedRootHelper.terminateCapability()
         return AppLifecycleCapabilitySnapshot(
             available: helper.available,
             detail: helper.available ? "Embedded root helper 可按目标 Bundle 路径停止进程并验证结果。" : helper.detail

@@ -5,7 +5,10 @@
 #import <stdio.h>
 #import <unistd.h>
 #import <signal.h>
-#import <libproc.h>
+
+#define CLOUDCODE_PROC_PATH_MAX 4096
+typedef int (*CloudCodeProcListAllPidsFn)(void *, int);
+typedef int (*CloudCodeProcPidPathFn)(int, void *, uint32_t);
 
 static NSString *NormalizePath(NSString *path)
 {
@@ -164,21 +167,40 @@ static BOOL RemovePath(NSString *path, BOOL required)
     return removed || !required;
 }
 
+static CloudCodeProcListAllPidsFn ProcListAllPids(void)
+{
+    return (CloudCodeProcListAllPidsFn)dlsym(RTLD_DEFAULT, "proc_listallpids");
+}
+
+static CloudCodeProcPidPathFn ProcPidPath(void)
+{
+    return (CloudCodeProcPidPathFn)dlsym(RTLD_DEFAULT, "proc_pidpath");
+}
+
+static BOOL HasProcessInspectionBackend(void)
+{
+    return ProcListAllPids() != NULL && ProcPidPath() != NULL;
+}
+
 static NSArray<NSNumber *> *ProcessesUnderBundlePath(NSString *bundlePath)
 {
     NSString *normalized = NormalizePath(bundlePath);
     if (!IsSafeBundlePath(normalized)) { return @[]; }
+    CloudCodeProcListAllPidsFn listAllPids = ProcListAllPids();
+    CloudCodeProcPidPathFn pidPath = ProcPidPath();
+    if (!listAllPids || !pidPath) { return @[]; }
+
     NSString *prefix = [normalized stringByAppendingString:@"/"];
     pid_t pids[4096] = {0};
-    int count = proc_listallpids(pids, sizeof(pids));
+    int count = listAllPids(pids, sizeof(pids));
     if (count <= 0) { return @[]; }
 
     NSMutableArray<NSNumber *> *matches = [NSMutableArray array];
     for (int index = 0; index < count && index < 4096; index++) {
         pid_t pid = pids[index];
         if (pid <= 1 || pid == getpid()) { continue; }
-        char pathBuffer[PROC_PIDPATHINFO_MAXSIZE] = {0};
-        int length = proc_pidpath(pid, pathBuffer, sizeof(pathBuffer));
+        char pathBuffer[CLOUDCODE_PROC_PATH_MAX] = {0};
+        int length = pidPath(pid, pathBuffer, sizeof(pathBuffer));
         if (length <= 0) { continue; }
         NSString *processPath = [NSString stringWithUTF8String:pathBuffer];
         if ([processPath isEqualToString:normalized] || [processPath hasPrefix:prefix]) {
@@ -191,6 +213,7 @@ static NSArray<NSNumber *> *ProcessesUnderBundlePath(NSString *bundlePath)
 static int TerminateApplication(NSString *bundlePath)
 {
     if (!IsSafeBundlePath(bundlePath)) { return 20; }
+    if (!HasProcessInspectionBackend()) { return 33; }
     NSArray<NSNumber *> *pids = ProcessesUnderBundlePath(bundlePath);
     if (pids.count == 0) { return 0; }
 
@@ -270,6 +293,10 @@ int main(int argc, const char *argv[])
         NSString *command = [NSString stringWithUTF8String:argv[1]];
         if ([command isEqualToString:@"probe"]) {
             return (getuid() == 0 && geteuid() == 0) ? 0 : 11;
+        }
+        if ([command isEqualToString:@"probe-terminate"]) {
+            if (getuid() != 0 || geteuid() != 0) { return 11; }
+            return HasProcessInspectionBackend() ? 0 : 33;
         }
         if ([command isEqualToString:@"uninstall"]) {
             if (argc < 5) { return 10; }
