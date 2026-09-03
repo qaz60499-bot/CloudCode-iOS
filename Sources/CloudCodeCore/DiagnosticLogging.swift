@@ -451,13 +451,15 @@ public actor DiagnosticBundleExporter {
 
     private static func createArchive(from working: URL, to output: URL, fileManager: FileManager) throws {
         let archive = try Archive(url: output, accessMode: .create)
-        guard let enumerator = fileManager.enumerator(at: working, includingPropertiesForKeys: [.isRegularFileKey], options: []) else {
+        let root = working.standardizedFileURL.resolvingSymlinksInPath()
+        guard let enumerator = fileManager.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: []) else {
             throw CocoaError(.fileReadUnknown)
         }
-        let rootPrefix = working.path.hasSuffix("/") ? working.path : working.path + "/"
-        for case let item as URL in enumerator {
+        let rootPrefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        for case let rawItem as URL in enumerator {
+            let item = rawItem.standardizedFileURL.resolvingSymlinksInPath()
             let values = try item.resourceValues(forKeys: [.isRegularFileKey])
-            guard values.isRegularFile == true else { continue }
+            guard values.isRegularFile == true, item.path.hasPrefix(rootPrefix) else { continue }
             let relative = String(item.path.dropFirst(rootPrefix.count))
             guard !relative.isEmpty, !relative.contains("../") else { continue }
             try archive.addEntry(with: relative, fileURL: item, compressionMethod: .deflate)
