@@ -115,6 +115,27 @@ static BOOL SystemUninstall(id workspace, NSString *bundleID)
     return NO;
 }
 
+static BOOL MobileInstallationUninstallApp(NSString *bundleID)
+{
+    void *handle = dlopen("/System/Library/PrivateFrameworks/MobileInstallation.framework/MobileInstallation", RTLD_LAZY | RTLD_LOCAL);
+    if (!handle) {
+        fprintf(stderr, "MobileInstallation: framework unavailable\n");
+        return NO;
+    }
+    typedef int (*MobileInstallationUninstallFn)(NSString *, NSDictionary *, void *);
+    MobileInstallationUninstallFn uninstall = (MobileInstallationUninstallFn)dlsym(handle, "MobileInstallationUninstall");
+    if (!uninstall) {
+        fprintf(stderr, "MobileInstallation: uninstall symbol unavailable\n");
+        dlclose(handle);
+        return NO;
+    }
+    int code = uninstall(bundleID, nil, NULL);
+    dlclose(handle);
+    if (code == 0) { return YES; }
+    fprintf(stderr, "MobileInstallationUninstall: %d\n", code);
+    return NO;
+}
+
 static id ApplicationProxy(NSString *bundleID)
 {
     LoadLaunchServices();
@@ -159,12 +180,28 @@ static NSArray<NSString *> *PluginDataPaths(NSString *bundleID)
 static BOOL RemovePath(NSString *path, BOOL required)
 {
     if (path.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:path]) { return YES; }
-    NSError *error = nil;
-    BOOL removed = [[NSFileManager defaultManager] removeItemAtPath:path error:&error];
-    if (!removed && required) {
-        fprintf(stderr, "remove failed: %s (%s)\n", path.UTF8String ?: "", error.localizedDescription.UTF8String ?: "unknown");
+
+    NSError *lastError = nil;
+    for (NSUInteger attempt = 0; attempt < 4; attempt++) {
+        NSError *error = nil;
+        if ([[NSFileManager defaultManager] removeItemAtPath:path error:&error] || ![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            return YES;
+        }
+        lastError = error;
+        if (attempt < 3) { usleep(150000); }
     }
-    return removed || !required;
+
+    if (required) {
+        fprintf(
+            stderr,
+            "remove failed: path=%s domain=%s code=%ld description=%s\n",
+            path.UTF8String ?: "",
+            lastError.domain.UTF8String ?: "unknown",
+            (long)lastError.code,
+            lastError.localizedDescription.UTF8String ?: "unknown"
+        );
+    }
+    return !required;
 }
 
 static CloudCodeProcListAllPidsFn ProcListAllPids(void)
@@ -261,23 +298,43 @@ static int Uninstall(NSString *bundleID, NSString *bundlePath, NSString *dataPat
     if (!workspace) { return 23; }
     NSArray<NSString *> *pluginPaths = PluginDataPaths(bundleID);
 
+    int terminateResult = TerminateApplication(bundlePath);
+    if (terminateResult != 0) {
+        fprintf(stderr, "terminate before uninstall returned %d; continuing with verified uninstall flow\n", terminateResult);
+    }
+
     if (SystemUninstall(workspace, bundleID)) {
         int verified = VerifyRemoved(workspace, bundleID, bundlePath, dataPath);
         if (verified == 0) { return 0; }
+        fprintf(stderr, "LaunchServices accepted uninstall but final verification did not complete\n");
     }
 
-    // LaunchServices can reject ordinary user-app removal from a platform app even when
-    // the process can access the app containers. The fallback mirrors TrollStore's
-    // uninstall strategy: unregister the bundle, remove only app-owned containers, then
-    // verify both filesystem and LaunchServices postconditions. Shared group containers
-    // are deliberately left untouched to avoid deleting data owned by another app.
-    UnregisterApplication(workspace, bundlePath);
+    if (MobileInstallationUninstallApp(bundleID)) {
+        int verified = VerifyRemoved(workspace, bundleID, bundlePath, dataPath);
+        if (verified == 0) { return 0; }
+        fprintf(stderr, "MobileInstallation accepted uninstall but final verification did not complete\n");
+    }
+
+    // Last-resort fallback. Keep shared group containers untouched. Crucially, remove the
+    // bundle container before app-owned data so a bundle-removal failure cannot leave the
+    // app installed after its data has already been destroyed.
+    BOOL unregistered = UnregisterApplication(workspace, bundlePath);
+    if (!unregistered) {
+        fprintf(stderr, "LaunchServices unregisterApplication returned false; continuing with filesystem fallback and final verification\n");
+    }
+
+    if (!RemovePath(bundleContainer, YES)) {
+        fprintf(stderr, "bundle-container removal failed; app data was intentionally left untouched\n");
+        return 34;
+    }
 
     for (NSString *pluginPath in pluginPaths) {
         RemovePath(pluginPath, NO);
     }
-    if (dataPath.length > 0 && !RemovePath(dataPath, YES)) { return 30; }
-    if (!RemovePath(bundleContainer, YES)) { return 30; }
+    if (dataPath.length > 0 && !RemovePath(dataPath, YES)) {
+        fprintf(stderr, "app bundle is gone but the known data container could not be removed\n");
+        return 35;
+    }
 
     UnregisterApplication(workspace, bundlePath);
     BOOL bundleGone = ![[NSFileManager defaultManager] fileExistsAtPath:bundlePath];

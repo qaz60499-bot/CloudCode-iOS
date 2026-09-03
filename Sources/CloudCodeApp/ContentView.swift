@@ -477,6 +477,12 @@ private struct TasksView: View {
 private struct PhoneView: View {
     @ObservedObject var model: CloudCodeViewModel
 
+    private var buildLabel: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        return "\(version) (\(build))"
+    }
+
     var body: some View {
         NavigationStack {
             List {
@@ -491,11 +497,16 @@ private struct PhoneView: View {
                         Text(model.capabilityRefreshMessage ?? "尚未完成设备能力检测。")
                             .font(.subheadline)
                     }
+                    LabeledContent("当前构建", value: buildLabel)
+                        .font(.caption)
                     if let date = model.lastCapabilityRefreshAt {
                         LabeledContent("最近检测", value: date.formatted(date: .abbreviated, time: .standard))
                             .font(.caption)
                     }
                     Text("“需要真机验证”表示当前 Runtime 没有足够证据自动证明该能力；不会为了显示全绿而把未验证能力标成可用。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Text("“不可用”也可能只是当前版本尚未接入对应执行后端，不等同于 TrollStore 权限或签名失败；每一项下方会显示实际探测原因。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -639,6 +650,16 @@ private struct ActivityView: View {
                     }
                     if let target = event.target {
                         Text(target).font(.caption.monospaced()).foregroundStyle(.secondary)
+                    }
+                    if !event.detail.isEmpty {
+                        ForEach(event.detail.keys.sorted(), id: \.self) { key in
+                            if let value = event.detail[key], !value.isEmpty {
+                                Text("\(key): \(value)")
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                            }
+                        }
                     }
                     Text(event.timestamp.formatted(date: .abbreviated, time: .standard))
                         .font(.caption2)

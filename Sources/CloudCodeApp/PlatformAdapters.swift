@@ -9,6 +9,7 @@ import Darwin
 
 public enum AppUninstallOutcome: Sendable, Equatable {
     case removed
+    case removedWithResidualData(String)
     case rejected(String)
     case verificationTimedOut(String)
 }
@@ -20,6 +21,32 @@ private enum EmbeddedRootHelper {
         Bundle.main.bundleURL.appendingPathComponent(executableName, isDirectory: false).path
     }
 
+    private static func run(_ arguments: [String]) -> (code: Int, diagnostic: String) {
+        var diagnostic: NSString?
+        let code = CloudCodeSpawnRootHelperWithOutput(executablePath, arguments, &diagnostic)
+        let text = (diagnostic as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return (code, text)
+    }
+
+    private static func failureDetail(prefix: String, code: Int, diagnostic: String) -> String {
+        let meaning: String
+        switch code {
+        case 20: meaning = "目标 Bundle 路径未通过安全校验"
+        case 21: meaning = "目标数据容器路径未通过安全校验"
+        case 22: meaning = "目标 Bundle 容器路径未通过安全校验"
+        case 23: meaning = "无法取得 LaunchServices workspace"
+        case 30: meaning = "旧版 helper 的必需路径删除失败"
+        case 31: meaning = "删除后的最终状态校验未通过"
+        case 32: meaning = "目标 App 进程未能停止"
+        case 33: meaning = "进程检查后端不可用"
+        case 34: meaning = "Bundle 容器删除失败，数据容器保持未动"
+        case 35: meaning = "App Bundle 已移除，但已知数据容器仍有残留"
+        default: meaning = ""
+        }
+        let suffix = meaning.isEmpty ? "" : "（\(meaning)）"
+        return diagnostic.isEmpty ? "\(prefix)退出码 \(code)\(suffix)。" : "\(prefix)退出码 \(code)\(suffix)：\(diagnostic)"
+    }
+
     static func probe() -> RootHelperCapabilitySnapshot {
         let path = executablePath
         guard FileManager.default.fileExists(atPath: path) else {
@@ -28,41 +55,42 @@ private enum EmbeddedRootHelper {
         guard FileManager.default.isExecutableFile(atPath: path) else {
             return RootHelperCapabilitySnapshot(available: false, detail: "\(executableName) 存在但没有可执行权限。")
         }
-        let code = CloudCodeSpawnRootHelper(path, ["probe"])
-        if code == 0 {
+        let result = run(["probe"])
+        if result.code == 0 {
             return RootHelperCapabilitySnapshot(available: true, detail: "\(executableName) 已通过 persona 99 / UID 0 / GID 0 探测。")
         }
-        return RootHelperCapabilitySnapshot(available: false, detail: "\(executableName) root 探测退出码 \(code)。")
+        return RootHelperCapabilitySnapshot(available: false, detail: failureDetail(prefix: "\(executableName) root 探测", code: result.code, diagnostic: result.diagnostic))
     }
 
     static func uninstall(bundleID: String, bundlePath: String, dataPath: String?) -> (accepted: Bool, detail: String) {
         let capability = probe()
         guard capability.available else { return (false, capability.detail) }
-        let code = CloudCodeSpawnRootHelper(executablePath, ["uninstall", bundleID, bundlePath, dataPath ?? "-"])
-        if code == 0 {
-            return (true, "Embedded root helper 已执行受限卸载流程")
+        let result = run(["uninstall", bundleID, bundlePath, dataPath ?? "-"])
+        if result.code == 0 {
+            let detail = result.diagnostic.isEmpty ? "Embedded root helper 已执行受限卸载流程" : "Embedded root helper 已执行受限卸载流程：\(result.diagnostic)"
+            return (true, detail)
         }
-        return (false, "Embedded root helper 卸载退出码 \(code)")
+        return (false, failureDetail(prefix: "Embedded root helper 卸载", code: result.code, diagnostic: result.diagnostic))
     }
 
     static func terminateCapability() -> RootHelperCapabilitySnapshot {
         let root = probe()
         guard root.available else { return root }
-        let code = CloudCodeSpawnRootHelper(executablePath, ["probe-terminate"])
-        if code == 0 {
+        let result = run(["probe-terminate"])
+        if result.code == 0 {
             return RootHelperCapabilitySnapshot(available: true, detail: "Embedded root helper 已验证 root 身份及按进程路径定位能力。")
         }
-        return RootHelperCapabilitySnapshot(available: false, detail: "Embedded root helper 的进程定位后端探测退出码 \(code)。")
+        return RootHelperCapabilitySnapshot(available: false, detail: failureDetail(prefix: "Embedded root helper 的进程定位后端探测", code: result.code, diagnostic: result.diagnostic))
     }
 
     static func terminate(bundlePath: String) -> (success: Bool, detail: String) {
         let capability = terminateCapability()
         guard capability.available else { return (false, capability.detail) }
-        let code = CloudCodeSpawnRootHelper(executablePath, ["terminate", bundlePath])
-        if code == 0 {
-            return (true, "Embedded root helper 已确认目标 App 进程停止")
+        let result = run(["terminate", bundlePath])
+        if result.code == 0 {
+            return (true, result.diagnostic.isEmpty ? "Embedded root helper 已确认目标 App 进程停止" : "Embedded root helper 已确认目标 App 进程停止：\(result.diagnostic)")
         }
-        return (false, "Embedded root helper 停止 App 退出码 \(code)")
+        return (false, failureDetail(prefix: "Embedded root helper 停止 App", code: result.code, diagnostic: result.diagnostic))
     }
 }
 
@@ -260,8 +288,20 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             if rootFallback.accepted {
                 request = rootFallback
             } else {
-                uninstallDetail = "系统卸载 SPI 被拒绝，root helper fallback 也未成功。系统后端：\(request.detail)；root helper：\(rootFallback.detail)"
-                return .rejected(uninstallDetail)
+                let reconciliation = reconcileUninstallState(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath, workspace: workspace, workspaceClass: workspaceClass)
+                switch reconciliation {
+                case .removed:
+                    return .removed
+                case .removedWithResidualData(let detail):
+                    return .removedWithResidualData(detail)
+                case .stillInstalled:
+                    uninstallDetail = "系统卸载 SPI 被拒绝，root helper fallback 也未成功。系统后端：\(request.detail)；root helper：\(rootFallback.detail)"
+                    return .rejected(uninstallDetail)
+                case .inconsistent(let detail):
+                    uninstallDetail = "卸载 fallback 返回失败且最终状态不一致：\(detail)。系统后端：\(request.detail)；root helper：\(rootFallback.detail)"
+                    pendingUninstallBundleID = bundleID
+                    return .verificationTimedOut(uninstallDetail)
+                }
             }
         }
 
@@ -288,6 +328,34 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         }
 
         return .verificationTimedOut(uninstallDetail + "。目标最终状态仍未满足‘注册消失 + Bundle 消失 + 已知数据容器消失’，因此不会误报卸载成功。")
+    }
+
+    private enum UninstallReconciliation {
+        case removed
+        case removedWithResidualData(String)
+        case stillInstalled
+        case inconsistent(String)
+    }
+
+    private func reconcileUninstallState(bundleID: String, bundlePath: String, dataPath: String?, workspace: NSObject, workspaceClass: AnyClass) -> UninstallReconciliation {
+        let fileManager = FileManager.default
+        let installed = applicationIsInstalled(bundleID, workspace: workspace, workspaceClass: workspaceClass)
+        let bundleExists = fileManager.fileExists(atPath: bundlePath)
+        let dataExists = dataPath.map { fileManager.fileExists(atPath: $0) } ?? false
+
+        if installed == false && !bundleExists {
+            finalizeVerifiedUninstall(bundleID: bundleID)
+            if dataExists {
+                let detail = "目标 App 已从 LaunchServices 注册和 Bundle 路径移除，但已知数据容器仍存在：\(dataPath ?? "未知")。不会把残留数据误报为完整卸载。"
+                uninstallDetail = detail
+                return .removedWithResidualData(detail)
+            }
+            return .removed
+        }
+        if installed == true && bundleExists {
+            return .stillInstalled
+        }
+        return .inconsistent("LaunchServices installed=\(installed.map { String(describing: $0) } ?? "unknown"), bundleExists=\(bundleExists), dataExists=\(dataExists)")
     }
 
     private func verifyUninstallPostconditions(bundleID: String, bundlePath: String, dataPath: String?, attempts: Int) async -> Bool {
@@ -628,7 +696,8 @@ public struct IOSPrivateAppExecutor: ToolExecuting, Sendable {
                 action: call.name,
                 target: bundleID,
                 risk: descriptor.risk,
-                result: outcome.success ? "launch_accepted" : "launch_rejected"
+                result: outcome.success ? "launch_accepted" : "launch_rejected",
+                detail: ["diagnostic": outcome.detail]
             ))
             return ToolResult(
                 toolCallID: call.id,
@@ -661,7 +730,8 @@ public struct IOSPrivateAppExecutor: ToolExecuting, Sendable {
                 action: call.name,
                 target: bundleID,
                 risk: descriptor.risk,
-                result: outcome.success ? "terminated" : "terminate_failed"
+                result: outcome.success ? "terminated" : "terminate_failed",
+                detail: ["diagnostic": outcome.detail]
             ))
             return ToolResult(
                 toolCallID: call.id,
@@ -713,6 +783,12 @@ public struct IOSPrivateAppExecutor: ToolExecuting, Sendable {
             auditResult = verified ? "uninstalled" : "index_stale_after_uninstall"
             payloadStatus = verified ? "removed" : "removed_index_stale"
             failures = verified ? [] : ["LaunchServices 已确认未安装，但刷新后的应用索引仍返回目标路径"]
+        case .removedWithResidualData(let reason):
+            verified = false
+            summary = "App 已移除，但数据清理不完整：\(bundleID) · \(reason)"
+            auditResult = "removed_with_residual_data"
+            payloadStatus = "removed_with_residual_data"
+            failures = [reason]
         case .rejected(let reason):
             verified = false
             summary = "卸载请求未被系统接受：\(bundleID) · \(reason)"
@@ -737,13 +813,21 @@ public struct IOSPrivateAppExecutor: ToolExecuting, Sendable {
             action: call.name,
             target: bundleID,
             risk: descriptor.risk,
-            result: auditResult
+            result: auditResult,
+            detail: [
+                "status": payloadStatus,
+                "diagnostic": failures.joined(separator: " | ")
+            ]
         ))
         return ToolResult(
             toolCallID: call.id,
             success: verified,
             summary: summary,
-            payload: ["bundleId": bundleID, "status": payloadStatus],
+            payload: [
+                "bundleId": bundleID,
+                "status": payloadStatus,
+                "diagnostic": failures.joined(separator: " | ")
+            ],
             verification: verification
         )
     }
