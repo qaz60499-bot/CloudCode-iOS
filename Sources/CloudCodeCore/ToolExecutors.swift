@@ -67,8 +67,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
 
         case "apps.list":
             let apps = await appResolver.installedApps()
-            let encoded = try String(data: JSONEncoder.pretty.encode(apps), encoding: .utf8) ?? "[]"
-            return ToolResult(toolCallID: call.id, success: true, summary: "Found \(apps.count) apps", payload: ["apps": encoded])
+            return try untrustedResult(call.id, summary: "Found \(apps.count) apps", key: "apps", value: apps, source: "apps.list")
 
         case "apps.inspect":
             guard let bundleID = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
@@ -78,17 +77,18 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             payload["bundleId"] = bundleID
             payload["bundlePath"] = node.resolvedPath ?? ""
             payload["dataContainer"] = dataContainer ?? ""
-            return ToolResult(toolCallID: call.id, success: true, summary: "Resolved \(bundleID)", payload: payload)
+            return try untrustedResult(call.id, summary: "Resolved \(bundleID)", key: "app", value: payload, source: "apps.inspect")
 
         case "container.resolve":
             guard let bundleID = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
             let node = try await resourceResolver.resolve(ResourceID("container://\(bundleID)"))
-            return ToolResult(toolCallID: call.id, success: true, summary: "Container resolved", payload: ["logical": node.logicalLocation, "path": node.resolvedPath ?? ""])
+            let payload = ["logical": node.logicalLocation, "path": node.resolvedPath ?? ""]
+            return try untrustedResult(call.id, summary: "Container resolved", key: "container", value: payload, source: "container.resolve")
 
         case "files.list":
             let url = try requiredURL(call, key: "path")
             let entries = try fileService.list(directory: url, allowedRoot: context.allowedRoot)
-            return try result(call.id, summary: "Listed \(entries.count) entries", key: "entries", value: entries)
+            return try untrustedResult(call.id, summary: "Listed \(entries.count) entries", key: "entries", value: entries, source: "files.list")
 
         case "files.search":
             let root = try requiredURL(call, key: "path")
@@ -99,7 +99,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
                 maxResults: Int(call.arguments["maxResults"] ?? "500") ?? 500
             )
             let entries = try fileService.search(root: root, query: query, allowedRoot: context.allowedRoot)
-            return try result(call.id, summary: "Found \(entries.count) entries", key: "entries", value: entries)
+            return try untrustedResult(call.id, summary: "Found \(entries.count) entries", key: "entries", value: entries, source: "files.search")
 
         case "files.read":
             let url = try requiredURL(call, key: "path")
@@ -110,7 +110,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
         case "storage.analyze":
             let root = try requiredURL(call, key: "path")
             let entries = try fileService.analyzeStorage(root: root, allowedRoot: context.allowedRoot, top: Int(call.arguments["top"] ?? "50") ?? 50)
-            return try result(call.id, summary: "Analyzed storage", key: "largestFiles", value: entries)
+            return try untrustedResult(call.id, summary: "Analyzed storage", key: "largestFiles", value: entries, source: "storage.analyze")
 
         case "files.create":
             let target = try requiredURL(call, key: "path")
@@ -144,7 +144,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
                     return VerificationResult(passed: passed, checks: ["re-read target after atomic replace"], failures: passed ? [] : ["target bytes differ from proposal"])
                 }
             )
-            return try result(call.id, summary: "Transaction \(transaction.state.rawValue)", key: "transaction", value: transaction)
+            return try untrustedResult(call.id, summary: "Transaction \(transaction.state.rawValue)", key: "transaction", value: transaction, source: "files.modify")
 
         case "files.delete":
             let target = try requiredURL(call, key: "path")
@@ -174,13 +174,13 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             let passed = !FileManager.default.fileExists(atPath: target.path) && payloadVerified
             let verification = VerificationResult(passed: passed, checks: ["source removed", "Trash payload fingerprint matches pre-delete snapshot"], failures: passed ? [] : ["trash postcondition or payload fingerprint failed"])
             try await audit.append(AuditEvent(sessionID: call.sessionID, toolCallID: call.id, action: call.name, target: target.path, risk: descriptor.risk, result: passed ? "trashed" : "verification_failed", detail: ["trashID": record.id.uuidString]))
-            return try result(call.id, summary: "Moved to Cloud Code Trash", key: "trashRecord", value: record, verification: verification)
+            return try untrustedResult(call.id, summary: "Moved to Cloud Code Trash", key: "trashRecord", value: record, source: "files.delete", verification: verification)
 
         case "trash.restore":
             guard let raw = call.arguments["id"], let id = UUID(uuidString: raw) else { throw CocoaError(.fileNoSuchFile) }
             let record = try await trashService.restore(id)
             let passed = await trashService.verifyRestored(record)
-            return try result(call.id, summary: "Restored \(record.filename)", key: "trashRecord", value: record, verification: VerificationResult(passed: passed, checks: ["original path exists", "restored fingerprint matches Trash record"], failures: passed ? [] : ["restored payload does not match Trash record"]))
+            return try untrustedResult(call.id, summary: "Restored \(record.filename)", key: "trashRecord", value: record, source: "trash.restore", verification: VerificationResult(passed: passed, checks: ["original path exists", "restored fingerprint matches Trash record"], failures: passed ? [] : ["restored payload does not match Trash record"]))
 
         case "trash.purge":
             guard let raw = call.arguments["id"], let id = UUID(uuidString: raw) else { throw CocoaError(.fileNoSuchFile) }
@@ -203,12 +203,12 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
         case "ipa.locate":
             let root = try requiredURL(call, key: "path")
             let entries = try ipaService.locate(root: root, fileService: fileService)
-            return try result(call.id, summary: "Found \(entries.count) IPA files", key: "ipas", value: entries)
+            return try untrustedResult(call.id, summary: "Found \(entries.count) IPA files", key: "ipas", value: entries, source: "ipa.locate")
 
         case "ipa.inspect":
             let target = try requiredURL(call, key: "path")
             let inspection = try ipaService.inspect(target)
-            return try result(call.id, summary: "Inspected IPA \(inspection.bundleIdentifier ?? target.lastPathComponent)", key: "inspection", value: inspection)
+            return try untrustedResult(call.id, summary: "Inspected IPA \(inspection.bundleIdentifier ?? target.lastPathComponent)", key: "inspection", value: inspection, source: "ipa.inspect")
 
         case "ipa.extract":
             let target = try requiredURL(call, key: "path")
@@ -249,7 +249,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
                 failures: inspection.bundleIdentifier == nil ? ["generated IPA has no bundle identifier"] : []
             )
             try await audit.append(AuditEvent(sessionID: call.sessionID, toolCallID: call.id, action: call.name, target: destination.path, risk: descriptor.risk, result: verification.passed ? "repacked" : "verification_failed"))
-            return try result(call.id, summary: "IPA repacked", key: "inspection", value: inspection, verification: verification)
+            return try untrustedResult(call.id, summary: "IPA repacked", key: "inspection", value: inspection, source: "ipa.repack", verification: verification)
 
         default:
             throw ToolRouterError.noExecutionRoute(call.name)
@@ -261,8 +261,10 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
         return URL(fileURLWithPath: raw)
     }
 
-    private func result<T: Encodable>(_ id: UUID, summary: String, key: String, value: T, verification: VerificationResult? = nil) throws -> ToolResult {
+    private func untrustedResult<T: Encodable>(_ id: UUID, summary: String, key: String, value: T, source: String, verification: VerificationResult? = nil) throws -> ToolResult {
         let encoded = try JSONEncoder.pretty.encode(value)
-        return ToolResult(toolCallID: id, success: verification?.passed ?? true, summary: summary, payload: [key: String(data: encoded, encoding: .utf8) ?? ""], verification: verification)
+        let content = String(data: encoded, encoding: .utf8) ?? ""
+        let envelope = ToolOutputEnvelope(trust: .untrustedData, source: source, content: content)
+        return ToolResult(toolCallID: id, success: verification?.passed ?? true, summary: summary, payload: [key: envelope.promptSafeRepresentation], verification: verification)
     }
 }

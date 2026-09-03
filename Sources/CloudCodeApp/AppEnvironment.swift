@@ -213,16 +213,15 @@ public final class CloudCodeViewModel: ObservableObject {
             return false
         }
         let reference = ProviderCatalog.keyReference(providerID: providerID, keySlotID: keySlotID)
+        if let profile = providerProfiles.first(where: { $0.id == providerID }),
+           let slot = profile.keySlots.first(where: { $0.id == keySlotID }),
+           !slot.fingerprint.isEmpty,
+           ProviderFingerprint.sha256(secret) != slot.fingerprint {
+            lastError = "The Key does not match this desktop Key slot fingerprint. The existing Key was not changed."
+            return false
+        }
         do {
             try keyVault.set(secret, for: reference)
-            if let profile = providerProfiles.first(where: { $0.id == providerID }),
-               let slot = profile.keySlots.first(where: { $0.id == keySlotID }),
-               !slot.fingerprint.isEmpty,
-               ProviderFingerprint.sha256(secret) != slot.fingerprint {
-                try? keyVault.remove(reference)
-                lastError = "The Key does not match this desktop Key slot fingerprint."
-                return false
-            }
             return true
         } catch {
             lastError = "Keychain: \(error)"
@@ -508,31 +507,28 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func addCustomProvider(label: String, baseURLText: String, apiKey: String) {
+        let operationKey = "custom-provider:add"
+        guard beginExclusiveOperation(operationKey) else { return }
         let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedLabel.isEmpty,
               let baseURL = URL(string: baseURLText.trimmingCharacters(in: .whitespacesAndNewlines)),
               baseURL.scheme == "https",
               baseURL.host != nil,
               !apiKey.isEmpty else {
+            endExclusiveOperation(operationKey)
             lastError = "Custom Provider requires a label, HTTPS Base URL and API Key."
             return
         }
         let providerID = "custom-\(UUID().uuidString.lowercased())"
         let slotID = "slot-1"
         let reference = ProviderCatalog.keyReference(providerID: providerID, keySlotID: slotID)
-        do {
-            try keyVault.set(apiKey, for: reference)
-        } catch {
-            lastError = "Keychain: \(error)"
-            return
-        }
         let fingerprint = ProviderFingerprint.sha256(apiKey)
         activityLines.append("Discovering models and protocol for \(trimmedLabel)…")
         Task {
+            defer { endExclusiveOperation(operationKey) }
             do {
                 let discovery = try await ProviderDiscoveryClient().discover(baseURL: baseURL, apiKey: apiKey)
                 guard !discovery.models.isEmpty, let preferred = discovery.protocols.first else {
-                    try? keyVault.remove(reference)
                     lastError = "Provider discovery could not verify an inference protocol."
                     return
                 }
@@ -557,8 +553,15 @@ public final class CloudCodeViewModel: ObservableObject {
                     source: .custom,
                     customModelAllowed: true
                 )
+                try keyVault.set(apiKey, for: reference)
                 providerProfiles.append(profile)
-                try persistCustomProviders()
+                do {
+                    try persistCustomProviders()
+                } catch {
+                    providerProfiles.removeAll { $0.id == providerID }
+                    try? keyVault.remove(reference)
+                    throw error
+                }
                 selectProvider(providerID)
                 activityLines.append("Custom Provider ready: \(trimmedLabel) (\(discovery.models.count) models).")
             } catch {
@@ -569,7 +572,10 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func importProviderBootstrap(from url: URL) {
+        let operationKey = "provider-bootstrap:import"
+        guard beginExclusiveOperation(operationKey) else { return }
         Task {
+            defer { endExclusiveOperation(operationKey) }
             do {
                 let count = try await importProviderBootstrapNow(from: url, removeSource: true)
                 activityLines.append("Imported \(count) Provider Key(s) into Keychain; bootstrap plaintext removed.")
@@ -645,7 +651,8 @@ public final class CloudCodeViewModel: ObservableObject {
         let payload = try decoder.decode(ProviderBootstrapPayload.self, from: data)
         guard payload.schemaVersion == 1 else { throw CocoaError(.fileReadCorruptFile) }
 
-        var importedReferences: [String] = []
+        var pending: [(reference: String, secret: String)] = []
+        var plannedReferences = Set<String>()
         for providerKeys in payload.providers {
             guard let profile = providerProfiles.first(where: { $0.id == providerKeys.providerID && $0.enabled }) else { continue }
             for key in providerKeys.keys {
@@ -654,22 +661,42 @@ public final class CloudCodeViewModel: ObservableObject {
                 if !slot.fingerprint.isEmpty, slot.fingerprint != fingerprint { throw CocoaError(.fileReadCorruptFile) }
                 if let declared = key.fingerprint, !declared.isEmpty, declared != fingerprint { throw CocoaError(.fileReadCorruptFile) }
                 let reference = ProviderCatalog.keyReference(providerID: profile.id, keySlotID: slot.id)
-                try keyVault.set(key.secret, for: reference)
-                importedReferences.append(reference)
+                guard plannedReferences.insert(reference).inserted else { throw CocoaError(.fileReadCorruptFile) }
+                pending.append((reference, key.secret))
             }
         }
-        guard !importedReferences.isEmpty else { throw ProviderError.missingAPIKey }
-        for reference in importedReferences {
-            _ = try await keyVault.key(for: reference)
+        guard !pending.isEmpty else { throw ProviderError.missingAPIKey }
+
+        var snapshots: [(reference: String, previous: String?)] = []
+        for item in pending {
+            snapshots.append((item.reference, try? await keyVault.key(for: item.reference)))
         }
-        if removeSource {
-            do {
+        func rollbackKeychain() {
+            for snapshot in snapshots.reversed() {
+                if let previous = snapshot.previous {
+                    try? keyVault.set(previous, for: snapshot.reference)
+                } else {
+                    try? keyVault.remove(snapshot.reference)
+                }
+            }
+        }
+
+        do {
+            for item in pending {
+                try keyVault.set(item.secret, for: item.reference)
+            }
+            for item in pending {
+                let stored = try await keyVault.key(for: item.reference)
+                guard stored == item.secret else { throw CocoaError(.fileWriteUnknown) }
+            }
+            if removeSource {
                 try FileManager.default.removeItem(at: url)
-            } catch {
-                throw NSError(domain: "CloudCodeBootstrap", code: 1, userInfo: [NSLocalizedDescriptionKey: "Keys are in Keychain, but the plaintext bootstrap source could not be deleted. Delete that source file before continuing."])
             }
+        } catch {
+            rollbackKeychain()
+            throw error
         }
-        return importedReferences.count
+        return pending.count
     }
 
     private func refreshFilesFromDisk() {

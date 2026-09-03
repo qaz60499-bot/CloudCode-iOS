@@ -20,7 +20,7 @@ public struct ProviderDiscoveryResult: Sendable, Equatable {
 public struct ProviderDiscoveryClient: Sendable {
     private let session: URLSession
 
-    public init(session: URLSession = .shared) {
+    public init(session: URLSession = ProviderURLSessionFactory.make()) {
         self.session = session
     }
 

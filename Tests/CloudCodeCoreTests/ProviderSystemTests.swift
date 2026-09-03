@@ -477,6 +477,36 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(ProviderHTTPClassifier.error(for: 429, body: body), .rateLimited)
     }
 
+    func testAmbiguous403DoesNotBecomeCredentialFailureOrTriggerKeyRotation() {
+        let error = ProviderHTTPClassifier.error(for: 403, body: Data())
+        XCTAssertEqual(error, .invalidResponse(403))
+        XCTAssertFalse(ProviderKeyRotationClassifier.shouldRotate(try! XCTUnwrap(error)))
+    }
+
+    func testProviderRedirectPolicyAllowsOnlySameOrigin() {
+        let original = URL(string: "https://api.example.com/v1/messages")!
+        XCTAssertTrue(ProviderRedirectPolicy.allows(
+            original: original,
+            destination: URL(string: "https://api.example.com/v2/messages")!
+        ))
+        XCTAssertTrue(ProviderRedirectPolicy.allows(
+            original: original,
+            destination: URL(string: "https://api.example.com:443/redirected")!
+        ))
+        XCTAssertFalse(ProviderRedirectPolicy.allows(
+            original: original,
+            destination: URL(string: "https://evil.example.net/steal")!
+        ))
+        XCTAssertFalse(ProviderRedirectPolicy.allows(
+            original: original,
+            destination: URL(string: "http://api.example.com/v1/messages")!
+        ))
+        XCTAssertFalse(ProviderRedirectPolicy.allows(
+            original: original,
+            destination: URL(string: "https://api.example.com:8443/v1/messages")!
+        ))
+    }
+
     private func testSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ProviderTestURLProtocol.self]

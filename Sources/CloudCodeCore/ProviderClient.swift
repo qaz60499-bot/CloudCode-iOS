@@ -3,6 +3,54 @@ import Foundation
 import FoundationNetworking
 #endif
 
+public enum ProviderRedirectPolicy {
+    public static func allows(original: URL, destination: URL) -> Bool {
+        guard let originalScheme = original.scheme?.lowercased(),
+              let destinationScheme = destination.scheme?.lowercased(),
+              let originalHost = original.host?.lowercased(),
+              let destinationHost = destination.host?.lowercased() else { return false }
+        return originalScheme == destinationScheme
+            && originalHost == destinationHost
+            && effectivePort(original) == effectivePort(destination)
+    }
+
+    private static func effectivePort(_ url: URL) -> Int? {
+        if let port = url.port { return port }
+        switch url.scheme?.lowercased() {
+        case "https": return 443
+        case "http": return 80
+        default: return nil
+        }
+    }
+}
+
+private final class ProviderSameOriginRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard let original = task.originalRequest?.url,
+              let destination = request.url,
+              ProviderRedirectPolicy.allows(original: original, destination: destination) else {
+            completionHandler(nil)
+            return
+        }
+        completionHandler(request)
+    }
+}
+
+public enum ProviderURLSessionFactory {
+    public static func make() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: configuration, delegate: ProviderSameOriginRedirectDelegate(), delegateQueue: nil)
+    }
+}
+
 public protocol APIKeyVault: Sendable {
     func key(for reference: String) async throws -> String
 }
@@ -179,7 +227,7 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
     fileprivate let session: URLSession
     fileprivate let retryPolicy: RetryPolicy
 
-    public init(session: URLSession = .shared, retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 2, initialDelayNanoseconds: 1_500_000_000)) {
+    public init(session: URLSession = ProviderURLSessionFactory.make(), retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 2, initialDelayNanoseconds: 1_500_000_000)) {
         self.session = session
         self.retryPolicy = retryPolicy
     }
@@ -255,7 +303,7 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
     fileprivate let session: URLSession
     fileprivate let retryPolicy: RetryPolicy
 
-    public init(session: URLSession = .shared, retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 2, initialDelayNanoseconds: 1_500_000_000)) {
+    public init(session: URLSession = ProviderURLSessionFactory.make(), retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 2, initialDelayNanoseconds: 1_500_000_000)) {
         self.session = session
         self.retryPolicy = retryPolicy
     }
@@ -343,7 +391,7 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
     fileprivate let session: URLSession
     fileprivate let retryPolicy: RetryPolicy
 
-    public init(session: URLSession = .shared, retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 2, initialDelayNanoseconds: 1_500_000_000)) {
+    public init(session: URLSession = ProviderURLSessionFactory.make(), retryPolicy: RetryPolicy = RetryPolicy(maxAttempts: 2, initialDelayNanoseconds: 1_500_000_000)) {
         self.session = session
         self.retryPolicy = retryPolicy
     }
@@ -570,9 +618,6 @@ public enum ProviderHTTPClassifier {
             return .authenticationFailed(statusCode)
         }
         if statusCode == 403, ProviderFailureEvidence.isCredential(text) {
-            return .authenticationFailed(statusCode)
-        }
-        if statusCode == 403, text.isEmpty {
             return .authenticationFailed(statusCode)
         }
         return .invalidResponse(statusCode)

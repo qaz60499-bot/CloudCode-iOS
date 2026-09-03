@@ -248,9 +248,8 @@ public actor AgentCore {
                 checkpoint.payload["provider.fallbackKeyReferences"] = (providerConfiguration.fallbackAPIKeyReferences ?? []).joined(separator: ",")
                 checkpoint.payload["provider.sameProviderFailover"] = providerConfiguration.allowSameProviderKeyFailover == true ? "true" : "false"
                 do {
-                    if !session.messages.contains(where: { $0.role == .system }) {
-                        session.messages.insert(ChatMessage(role: .system, content: Self.agentSafetyInstruction), at: 0)
-                    }
+                    session.messages.removeAll { $0.role == .system }
+                    session.messages.insert(ChatMessage(role: .system, content: Self.agentSafetyInstruction), at: 0)
                     if appendUserMessage {
                         session.messages.append(ChatMessage(role: .user, content: text))
                     }

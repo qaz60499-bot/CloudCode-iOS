@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 35
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Show toolchain
         run: |
@@ -28,7 +28,10 @@ jobs:
           swift --version
 
       - name: Install XcodeGen
-        run: brew install xcodegen
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          xcodegen --version | grep -F '2.46.0'
 
       - name: Resolve and test core package
         run: |
@@ -87,6 +90,26 @@ jobs:
             echo "FAIL: API-Key-shaped material found in tracked source/test/docs/workflow files" >&2
             exit 1
           fi
+          if grep -R -E --line-number 'uses: [^#]+@(v[0-9]+|main|master)([[:space:]]|$)' .github/workflows; then
+            echo "FAIL: GitHub Action is not pinned to an immutable commit SHA" >&2
+            exit 1
+          fi
+          grep -F 'revision: "22787ffb59de99e5dc1fbfe80b19c97a904ad48d"' Package.swift >/dev/null
+          grep -F 'revision: 22787ffb59de99e5dc1fbfe80b19c97a904ad48d' project.yml >/dev/null
+          if grep -R --line-number 'NSAllowsArbitraryLoads' Sources project.yml Entitlements; then
+            echo "FAIL: App Transport Security arbitrary loads must remain disabled" >&2
+            exit 1
+          fi
+          if grep -F 'TrollStore.entitlements' project.yml; then
+            echo "FAIL: public Runner build must not use TrollStore private entitlements" >&2
+            exit 1
+          fi
+          grep -F 'CODE_SIGN_ENTITLEMENTS: Entitlements/CloudCode.entitlements' project.yml >/dev/null
+          grep -F 'kSecAttrAccessibleWhenUnlockedThisDeviceOnly' Sources/CloudCodeCore/KeychainAPIKeyVault.swift >/dev/null
+          if grep -F 'kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly' Sources/CloudCodeCore/KeychainAPIKeyVault.swift; then
+            echo "FAIL: Provider Keys must not remain readable while the device is locked" >&2
+            exit 1
+          fi
           if find . -path './.git' -prune -o -type f \( -name 'CloudCode-Provider-Bootstrap.json' -o -name '*.provider-bootstrap.json' \) -print | grep -q .; then
             echo "FAIL: private Provider bootstrap exists in checkout" >&2
             exit 1
@@ -100,7 +123,7 @@ jobs:
           echo 'PRIVATE_KEY_BOOTSTRAP_REQUIRED: generate locally with scripts/generate_private_bootstrap.py'
 
       - name: Upload IPA
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: CloudCode-iOS-PUBLIC_UNSIGNED_IPA
           path: build/CloudCode-iOS-unsigned.ipa
@@ -109,7 +132,7 @@ jobs:
 
       - name: Upload test/build diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: CloudCode-iOS-ci-diagnostics
           path: |

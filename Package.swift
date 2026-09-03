@@ -8,7 +8,7 @@ let package = Package(
         .library(name: "CloudCodeCore", targets: ["CloudCodeCore"])
     ],
     dependencies: [
-        .package(url: "https://github.com/weichsel/ZIPFoundation.git", from: "0.9.19")
+        .package(url: "https://github.com/weichsel/ZIPFoundation.git", revision: "22787ffb59de99e5dc1fbfe80b19c97a904ad48d")
     ],
     targets: [
         .target(

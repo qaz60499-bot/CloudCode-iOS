@@ -12,14 +12,17 @@ public final class KeychainAPIKeyVault: APIKeyVault, @unchecked Sendable {
         guard !reference.isEmpty, !value.isEmpty else { throw ProviderError.missingAPIKey }
         let data = Data(value.utf8)
         let query = baseQuery(reference: reference)
-        let update: [String: Any] = [kSecValueData as String: data]
+        let update: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        ]
         let updateStatus = SecItemUpdate(query as CFDictionary, update as CFDictionary)
         if updateStatus == errSecSuccess { return }
         guard updateStatus == errSecItemNotFound else { throw statusError(updateStatus) }
 
         var add = query
         add[kSecValueData as String] = data
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         let status = SecItemAdd(add as CFDictionary, nil)
         guard status == errSecSuccess else { throw statusError(status) }
     }

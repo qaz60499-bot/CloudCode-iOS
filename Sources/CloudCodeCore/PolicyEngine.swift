@@ -151,7 +151,16 @@ public struct ToolOutputEnvelope: Codable, Sendable {
         case .trustedSystem:
             return content
         case .untrustedData:
-            return "<UNTRUSTED_DATA source=\"\(source)\">\n\(content)\n</UNTRUSTED_DATA>"
+            let object: [String: String] = [
+                "trust": "untrusted_data",
+                "source": source,
+                "content": content
+            ]
+            if let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+               let encoded = String(data: data, encoding: .utf8) {
+                return encoded
+            }
+            return "{\"content\":\"unavailable\",\"source\":\"serialization_failed\",\"trust\":\"untrusted_data\"}"
         }
     }
 }
