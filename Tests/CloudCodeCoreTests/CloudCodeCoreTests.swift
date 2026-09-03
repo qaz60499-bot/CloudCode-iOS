@@ -672,6 +672,37 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(String(data: try Data(contentsOf: file), encoding: .utf8), "hello")
     }
 
+    func testTrashOverwriteRestoreReplacesCurrentTargetAndCleansBackup() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent("work", isDirectory: true)
+        let trashRoot = root.appendingPathComponent("trash", isDirectory: true)
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        let file = work.appendingPathComponent("note.txt")
+        try Data("trashed-original".utf8).write(to: file)
+
+        let service = TrashService(root: trashRoot)
+        let record = try await service.moveToTrash(
+            target: file,
+            logicalResourceID: "file://note",
+            sessionID: UUID(),
+            toolCallID: UUID(),
+            reason: "overwrite-restore",
+            sourceApp: nil,
+            allowedRoot: work
+        )
+        try Data("newer-current".utf8).write(to: file)
+
+        _ = try await service.restore(record.id, overwrite: true, allowedRoot: work)
+        XCTAssertEqual(String(data: try Data(contentsOf: file), encoding: .utf8), "trashed-original")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: record.trashPath))
+        let remainingRecords = try await service.records()
+        XCTAssertFalse(remainingRecords.contains(where: { $0.id == record.id }))
+        let recordDirectory = URL(fileURLWithPath: record.trashPath).deletingLastPathComponent()
+        let leftovers = (try? FileManager.default.contentsOfDirectory(at: recordDirectory, includingPropertiesForKeys: nil)) ?? []
+        XCTAssertFalse(leftovers.contains(where: { $0.lastPathComponent.hasPrefix(".restore-overwrite-") }))
+    }
+
     func testTrashRestoreRevalidatesAllowedRootAndBlocksSymlinkSwap() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
