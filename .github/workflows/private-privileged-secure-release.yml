@@ -1,0 +1,75 @@
+name: Private Privileged Secure Delivery Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      delivery_run_id:
+        description: Successful Private Privileged IPA Secure Delivery run ID
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish-encrypted-delivery:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Validate secure delivery run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DELIVERY_RUN_ID: ${{ inputs.delivery_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$DELIVERY_RUN_ID" =~ ^[0-9]+$ ]]
+          RUN_JSON="$(gh run view "$DELIVERY_RUN_ID" --repo "$GITHUB_REPOSITORY" --json conclusion,headSha,name)"
+          python3 - "$RUN_JSON" <<'PY'
+          import json
+          import sys
+          run = json.loads(sys.argv[1])
+          if run.get("conclusion") != "success":
+              raise SystemExit("FAIL: secure delivery source run is not successful")
+          if run.get("name") != "Private Privileged IPA Secure Delivery":
+              raise SystemExit("FAIL: source run is not the expected secure delivery workflow")
+          head = run.get("headSha") or ""
+          if len(head) != 40:
+              raise SystemExit("FAIL: source run HEAD is invalid")
+          print(f"SOURCE_HEAD={head}")
+          PY
+
+      - name: Download encrypted delivery bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DELIVERY_RUN_ID: ${{ inputs.delivery_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh run download "$DELIVERY_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name CloudCode-iOS-TrollStore-PRIVILEGED-secure-delivery \
+            --dir dist
+          test -n "$(find dist -maxdepth 1 -type f -name '*.ipa.delivery.enc' -print -quit)"
+          test -n "$(find dist -maxdepth 1 -type f -name '*.key.enc' -print -quit)"
+          test -n "$(find dist -maxdepth 1 -type f -name '*.metadata.txt' -print -quit)"
+          if find dist -maxdepth 1 -type f -name '*.ipa' -print | grep -q .; then
+            echo "FAIL: plaintext IPA must never be published by this workflow" >&2
+            exit 1
+          fi
+
+      - name: Publish encrypted delivery assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DELIVERY_RUN_ID: ${{ inputs.delivery_run_id }}
+        run: |
+          set -euo pipefail
+          TAG="cloudcode-secure-delivery-${DELIVERY_RUN_ID}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "FAIL: release already exists" >&2
+            exit 1
+          fi
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Cloud Code secure delivery ${DELIVERY_RUN_ID}" \
+            --notes "Temporarily published RSA-encrypted delivery bundle only. No plaintext IPA or Provider credential is included as a release asset."
