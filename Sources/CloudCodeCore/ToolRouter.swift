@@ -54,7 +54,7 @@ public actor ToolRegistry {
         ToolDescriptor(name: "ipa.extract", summary: "Safely extract an IPA with path traversal protections.", risk: .safeWrite),
         ToolDescriptor(name: "ipa.repack", summary: "Repack a modified IPA.", risk: .sensitiveWrite),
         ToolDescriptor(name: "ipa.install", summary: "Install an IPA through an available privileged adapter.", risk: .systemChange, requiredCapabilities: ["ipa.install"], preferredRoute: .privateFramework),
-        ToolDescriptor(name: "apps.uninstall", summary: "Uninstall an app.", risk: .permanentDestructive, preferredRoute: .privateFramework),
+        ToolDescriptor(name: "apps.uninstall", summary: "Uninstall an app.", risk: .permanentDestructive, requiredCapabilities: ["apps.uninstall"], preferredRoute: .privateFramework),
         ToolDescriptor(name: "apps.terminate", summary: "Terminate an app/process.", risk: .systemChange, requiredCapabilities: ["apps.terminate"], preferredRoute: .privateFramework),
         ToolDescriptor(name: "advanced.shell", summary: "Execute an advanced shell command. High risk and never the default tool path.", risk: .systemChange, requiredCapabilities: ["execution.ios_system"], preferredRoute: .cli),
         ToolDescriptor(name: "gui.openApp", summary: "Open an app using the GUI automation fallback backend.", risk: .safeWrite, requiredCapabilities: ["automation.gui"], preferredRoute: .guiFallback),

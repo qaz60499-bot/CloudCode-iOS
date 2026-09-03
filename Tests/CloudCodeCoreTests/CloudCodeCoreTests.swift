@@ -703,13 +703,19 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(systemMessages.first?.content.contains("untrusted data") == true)
     }
 
-    func testToolRegistryDoesNotExposePermissionMutationAndShellRemainsHighRisk() async throws {
+    func testToolRegistryDoesNotExposePermissionMutationAndPrivilegedToolsStayCapabilityGated() async throws {
         let tools = await ToolRegistry().all()
         XCTAssertFalse(tools.contains { $0.name.lowercased().contains("permission") })
+
         let shell = try XCTUnwrap(tools.first(where: { $0.name == "advanced.shell" }))
         XCTAssertEqual(shell.risk, .systemChange)
         XCTAssertEqual(shell.requiredCapabilities, ["execution.ios_system"])
         XCTAssertEqual(shell.preferredRoute, .cli)
+
+        let uninstall = try XCTUnwrap(tools.first(where: { $0.name == "apps.uninstall" }))
+        XCTAssertEqual(uninstall.risk, .permanentDestructive)
+        XCTAssertEqual(uninstall.requiredCapabilities, ["apps.uninstall"])
+        XCTAssertEqual(uninstall.preferredRoute, .privateFramework)
     }
 
     func testAgentCancellationPersistsInterruptedCheckpoint() async throws {

@@ -88,6 +88,8 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
                               "Private LaunchServices/UIApplication launch behavior must be verified on device."))
         records.append(record("apps.terminate", .apps, .deviceValidationRequired,
                               "Termination is privileged/system-changing and must be verified on device."))
+        records.append(record("apps.uninstall", .apps, .deviceValidationRequired,
+                              "Uninstall is permanently destructive and requires a separately verified privileged adapter."))
 
         records.append(record("data.photos", .data, .deviceValidationRequired,
                               "PhotoKit authorization is user-controlled; app layer probes PHPhotoLibrary at runtime."))
