@@ -108,6 +108,45 @@ final class ProviderCatalogTests: XCTestCase {
             XCTAssertTrue(selectedProvider.models(for: reconciled.keySlotID).contains(reconciled.model))
         }
     }
+
+    func testCheckpointConfigurationRebindsToCatalogAndRejectsEndpointOrCrossProviderKeyTampering() throws {
+        let profiles = ProviderCatalog.desktopSnapshot
+        let provider = try XCTUnwrap(profiles.first(where: { $0.id == ProviderCatalog.tabitokenID }))
+        let primary = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: "slot-1")
+        let fallback = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: "slot-2")
+        let payload: [String: String] = [
+            "provider.id": provider.id,
+            "provider.baseURL": provider.baseURL.absoluteString,
+            "provider.model": "claude-opus-5",
+            "provider.keyReference": primary,
+            "provider.fallbackKeyReferences": fallback,
+            "provider.sameProviderFailover": "true"
+        ]
+
+        let resolved = try ProviderCheckpointConfigurationResolver.resolve(payload: payload, profiles: profiles)
+        XCTAssertEqual(resolved.providerID, provider.id)
+        XCTAssertEqual(resolved.baseURL, provider.baseURL)
+        XCTAssertEqual(resolved.apiKeyReference, primary)
+        XCTAssertEqual(resolved.fallbackAPIKeyReferences, [fallback])
+        XCTAssertEqual(resolved.protocolName, ProviderProtocol.anthropic.rawValue)
+        XCTAssertEqual(resolved.authModeName, ProviderAuthMode.both.rawValue)
+
+        var endpointTampered = payload
+        endpointTampered["provider.baseURL"] = "https://attacker.example"
+        XCTAssertThrowsError(try ProviderCheckpointConfigurationResolver.resolve(payload: endpointTampered, profiles: profiles)) { error in
+            XCTAssertEqual(error as? ProviderCheckpointConfigurationError, .endpointMismatch)
+        }
+
+        let otherProvider = try XCTUnwrap(profiles.first(where: { $0.id != provider.id }))
+        var crossProvider = payload
+        crossProvider["provider.fallbackKeyReferences"] = ProviderCatalog.keyReference(providerID: otherProvider.id, keySlotID: otherProvider.keySlots[0].id)
+        XCTAssertThrowsError(try ProviderCheckpointConfigurationResolver.resolve(payload: crossProvider, profiles: profiles)) { error in
+            guard let typed = error as? ProviderCheckpointConfigurationError,
+                  case .crossProviderFallback = typed else {
+                return XCTFail("Expected cross-provider fallback rejection, got \(error)")
+            }
+        }
+    }
 }
 
 final class ProviderRouterTests: XCTestCase {

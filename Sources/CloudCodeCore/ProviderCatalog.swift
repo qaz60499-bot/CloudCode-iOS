@@ -184,6 +184,76 @@ public enum ProviderSelectionResolver {
     }
 }
 
+public enum ProviderCheckpointConfigurationError: Error, Equatable, CustomStringConvertible {
+    case missingProvider
+    case providerUnavailable(String)
+    case endpointMismatch
+    case invalidKeyReference
+    case invalidModel(String)
+    case crossProviderFallback(String)
+
+    public var description: String {
+        switch self {
+        case .missingProvider: return "Checkpoint is missing a Provider identity"
+        case .providerUnavailable(let id): return "Checkpoint Provider is unavailable: \(id)"
+        case .endpointMismatch: return "Checkpoint Provider endpoint does not match the current Provider catalog"
+        case .invalidKeyReference: return "Checkpoint Key reference is not owned by the checkpoint Provider"
+        case .invalidModel(let model): return "Checkpoint model is not valid for the checkpoint Provider/Key: \(model)"
+        case .crossProviderFallback(let reference): return "Checkpoint fallback Key reference is outside the checkpoint Provider: \(reference)"
+        }
+    }
+}
+
+public enum ProviderCheckpointConfigurationResolver {
+    public static func resolve(payload: [String: String], profiles: [ProviderProfile]) throws -> ProviderConfiguration {
+        guard let providerID = payload["provider.id"], !providerID.isEmpty else {
+            throw ProviderCheckpointConfigurationError.missingProvider
+        }
+        guard let profile = profiles.first(where: { $0.id == providerID && $0.enabled }) else {
+            throw ProviderCheckpointConfigurationError.providerUnavailable(providerID)
+        }
+        if let storedURL = payload["provider.baseURL"], !storedURL.isEmpty,
+           storedURL != profile.baseURL.absoluteString {
+            throw ProviderCheckpointConfigurationError.endpointMismatch
+        }
+        guard let primaryReference = payload["provider.keyReference"], !primaryReference.isEmpty,
+              let slot = profile.keySlots.first(where: {
+                  ProviderCatalog.keyReference(providerID: profile.id, keySlotID: $0.id) == primaryReference
+              }) else {
+            throw ProviderCheckpointConfigurationError.invalidKeyReference
+        }
+        let model = payload["provider.model"] ?? ""
+        let allowedModels = profile.models(for: slot.id)
+        guard !model.isEmpty, allowedModels.contains(model) || profile.customModelAllowed else {
+            throw ProviderCheckpointConfigurationError.invalidModel(model)
+        }
+        let providerReferences = Set(profile.keySlots.map {
+            ProviderCatalog.keyReference(providerID: profile.id, keySlotID: $0.id)
+        })
+        let storedFallbacks = (payload["provider.fallbackKeyReferences"] ?? "")
+            .split(separator: ",")
+            .map(String.init)
+            .filter { !$0.isEmpty }
+        for reference in storedFallbacks where !providerReferences.contains(reference) {
+            throw ProviderCheckpointConfigurationError.crossProviderFallback(reference)
+        }
+        let ordered = profile.orderedKeyReferences(selectedKeySlotID: slot.id)
+        let allowedFallbacks = storedFallbacks.filter { $0 != primaryReference && ordered.contains($0) }
+        let allowFailover = profile.autoRotateKeys && payload["provider.sameProviderFailover"] == "true"
+        return ProviderConfiguration(
+            name: profile.displayName,
+            baseURL: profile.baseURL,
+            model: model,
+            apiKeyReference: primaryReference,
+            providerID: profile.id,
+            protocolName: profile.protocolFor(model: model, keySlotID: slot.id).rawValue,
+            authModeName: profile.authMode.rawValue,
+            fallbackAPIKeyReferences: allowFailover ? allowedFallbacks : [],
+            allowSameProviderKeyFailover: allowFailover
+        )
+    }
+}
+
 public enum ProviderFingerprint {
     public static func sha256(_ secret: String) -> String {
         SHA256.hash(data: Data(secret.utf8)).map { String(format: "%02x", $0) }.joined()

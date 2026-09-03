@@ -428,6 +428,96 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertNotEqual(first, other)
     }
 
+    func testMalformedToolArgumentsAreRejectedWithoutExecutingStateChange() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let counter = InvocationCounter()
+        let registry = ToolRegistry(descriptors: [ToolDescriptor(name: "files.create", summary: "", risk: .safeWrite)])
+        let executor = CountingExecutor(route: .structuredTool, names: ["files.create"], counter: counter)
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let checkpoints = TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json"))
+        let agent = AgentCore(
+            provider: ToolThenFinishProvider(events: [.toolCall(id: "bad-json", name: "files.create", argumentsJSON: "{\"path\":"), .finished]),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(registry: registry, executors: [executor], executionLedger: ToolExecutionLedger(fileURL: root.appendingPathComponent("ledger.json"))),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: checkpoints,
+            maxToolRounds: 2
+        )
+        let session = AgentSession(permissionMode: .full)
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key")
+        let stream = await agent.send(text: "test", session: session, providerConfiguration: config)
+        for try await _ in stream {}
+
+        let invocationCount = await counter.value()
+        XCTAssertEqual(invocationCount, 0)
+        let saved = try await sessions.load(session.id)
+        let rejected = saved.messages.first(where: { $0.role == .tool && $0.providerMetadata["tool_call_id"] == "bad-json" })
+        XCTAssertNotNil(rejected)
+        XCTAssertTrue(rejected?.content.contains("argument_error") == true || rejected?.content.contains("valid JSON") == true)
+    }
+
+    func testMissingRequiredToolArgumentIsRejectedWithoutDefaultingToEmptyWrite() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let counter = InvocationCounter()
+        let registry = ToolRegistry(descriptors: [ToolDescriptor(name: "files.create", summary: "", risk: .safeWrite)])
+        let executor = CountingExecutor(route: .structuredTool, names: ["files.create"], counter: counter)
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let agent = AgentCore(
+            provider: ToolThenFinishProvider(events: [.toolCall(id: "missing-content", name: "files.create", argumentsJSON: "{\"path\":\"/tmp/a\"}"), .finished]),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(registry: registry, executors: [executor], executionLedger: ToolExecutionLedger(fileURL: root.appendingPathComponent("ledger.json"))),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 2
+        )
+        let session = AgentSession(permissionMode: .full)
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key")
+        let stream = await agent.send(text: "test", session: session, providerConfiguration: config)
+        for try await _ in stream {}
+        let invocationCount = await counter.value()
+        XCTAssertEqual(invocationCount, 0)
+    }
+
+    func testDuplicateToolCallIDInOneRoundFailsClosedBeforeAnyExecution() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let counter = InvocationCounter()
+        let registry = ToolRegistry(descriptors: [ToolDescriptor(name: "files.create", summary: "", risk: .safeWrite)])
+        let executor = CountingExecutor(route: .structuredTool, names: ["files.create"], counter: counter)
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let agent = AgentCore(
+            provider: ToolThenFinishProvider(events: [
+                .toolCall(id: "duplicate", name: "files.create", argumentsJSON: "{\"path\":\"/tmp/a\",\"content\":\"a\"}"),
+                .toolCall(id: "duplicate", name: "files.create", argumentsJSON: "{\"path\":\"/tmp/b\",\"content\":\"b\"}"),
+                .finished
+            ]),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(registry: registry, executors: [executor], executionLedger: ToolExecutionLedger(fileURL: root.appendingPathComponent("ledger.json"))),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 2
+        )
+        let session = AgentSession(permissionMode: .full)
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key")
+        do {
+            let stream = await agent.send(text: "test", session: session, providerConfiguration: config)
+            for try await _ in stream {}
+            XCTFail("Duplicate tool call id must fail closed")
+        } catch {
+            XCTAssertEqual(error as? ToolArgumentValidationError, .duplicateToolCallID("duplicate"))
+        }
+        let invocationCount = await counter.value()
+        XCTAssertEqual(invocationCount, 0)
+    }
+
     func testConcurrentDuplicateWriteDoesNotExecuteTwice() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1066,6 +1156,27 @@ private struct FinishingProvider: ProviderStreaming, Sendable {
         AsyncThrowingStream { continuation in
             continuation.yield(.token("done"))
             continuation.yield(.finished)
+            continuation.finish()
+        }
+    }
+}
+
+private struct ToolThenFinishProvider: ProviderStreaming, Sendable {
+    let events: [ProviderEvent]
+
+    func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            if messages.contains(where: { $0.role == .tool }) {
+                continuation.yield(.token("done"))
+                continuation.yield(.finished)
+            } else {
+                for event in events { continuation.yield(event) }
+            }
             continuation.finish()
         }
     }

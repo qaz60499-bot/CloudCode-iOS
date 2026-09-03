@@ -361,24 +361,9 @@ public final class CloudCodeViewModel: ObservableObject {
                       !request.isEmpty else {
                     throw CocoaError(.fileReadCorruptFile)
                 }
-                let fallback = (checkpoint.payload["provider.fallbackKeyReferences"] ?? "")
-                    .split(separator: ",")
-                    .map(String.init)
-                    .filter { !$0.isEmpty }
-                guard let currentConfig = currentProviderConfiguration(),
-                      let baseURL = URL(string: checkpoint.payload["provider.baseURL"] ?? currentConfig.baseURL.absoluteString) else {
-                    throw ProviderError.invalidEndpoint
-                }
-                let config = ProviderConfiguration(
-                    name: checkpoint.payload["provider.name"] ?? currentConfig.name,
-                    baseURL: baseURL,
-                    model: checkpoint.payload["provider.model"] ?? currentConfig.model,
-                    apiKeyReference: checkpoint.payload["provider.keyReference"] ?? currentConfig.apiKeyReference,
-                    providerID: checkpoint.payload["provider.id"] ?? currentConfig.providerID,
-                    protocolName: checkpoint.payload["provider.protocol"] ?? currentConfig.protocolName,
-                    authModeName: checkpoint.payload["provider.authMode"] ?? currentConfig.authModeName,
-                    fallbackAPIKeyReferences: fallback.isEmpty ? currentConfig.fallbackAPIKeyReferences : fallback,
-                    allowSameProviderKeyFailover: checkpoint.payload["provider.sameProviderFailover"] == "true"
+                let config = try ProviderCheckpointConfigurationResolver.resolve(
+                    payload: checkpoint.payload,
+                    profiles: providerProfiles
                 )
                 session = resumedSession
                 let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
