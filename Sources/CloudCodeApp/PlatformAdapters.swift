@@ -65,13 +65,17 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
                 return false
             }
             if installed {
-                uninstallDetail = "上一次卸载请求 \(pendingBundleID) 仍被 LaunchServices 报告为已安装；在状态核对完成前不会开启新的卸载。"
-                return false
+                // 这里已经完成了“先核对最终状态”：权威查询确认目标仍然安装，说明上一轮
+                // 没有观察到删除生效。清除本轮内存态 pending，允许之后由新的、显式确认过的
+                // Tool Call 再次尝试；持久化 execution ledger 仍会阻止旧 Tool Call ID 的盲目重放。
+                pendingUninstallBundleID = nil
+                uninstallDetail = "上一次卸载请求 \(pendingBundleID) 已完成状态核对：目标仍处于已安装状态；旧 Tool Call 不会重放，新的卸载仍需重新确认。"
+            } else {
+                pendingUninstallBundleID = nil
+                cachedApps.removeAll { $0.ownerBundleID == pendingBundleID }
+                bundlePaths.removeValue(forKey: pendingBundleID)
+                containerPaths.removeValue(forKey: pendingBundleID)
             }
-            pendingUninstallBundleID = nil
-            cachedApps.removeAll { $0.ownerBundleID == pendingBundleID }
-            bundlePaths.removeValue(forKey: pendingBundleID)
-            containerPaths.removeValue(forKey: pendingBundleID)
         }
         guard let target = cachedApps.first(where: {
             guard let bundleID = $0.ownerBundleID, bundleID != Bundle.main.bundleIdentifier else { return false }
