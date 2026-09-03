@@ -63,6 +63,7 @@ private final class ProviderStreamingTransport: NSObject, URLSessionDataDelegate
     private var responseContinuation: CheckedContinuation<HTTPURLResponse, Error>?
     private var responseResolved = false
     private var lineBuffer = Data()
+    private var receivedBodyData = false
     private var task: URLSessionDataTask?
     private var ownedSession: URLSession?
     private let lineStream: AsyncThrowingStream<String, Error>
@@ -102,6 +103,12 @@ private final class ProviderStreamingTransport: NSObject, URLSessionDataDelegate
             self?.cancel()
         })
         return (response, lineStream)
+    }
+
+    func hasReceivedBodyData() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return receivedBodyData
     }
 
     private func cancel() {
@@ -159,6 +166,9 @@ private final class ProviderStreamingTransport: NSObject, URLSessionDataDelegate
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard !data.isEmpty else { return }
+        lock.lock()
+        receivedBodyData = true
+        lock.unlock()
         lineBuffer.append(data)
         if lineBuffer.count > 1_048_576 && !lineBuffer.contains(0x0A) {
             lineContinuation.finish(throwing: ProviderError.transport("厂商流单行超过 1 MB，已中止"))
@@ -475,6 +485,7 @@ private extension ProviderRequestBuilding {
                 while attempt <= retryPolicy.maxAttempts {
                     var responseStarted = false
                     var successfulStreamEstablished = false
+                    var transport: ProviderStreamingTransport?
                     var endpoint = (configuration.baseURL.host ?? "") + configuration.baseURL.path
                     do {
                         let request = try makeRequest(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
@@ -493,8 +504,9 @@ private extension ProviderRequestBuilding {
                                 "transportState": "connecting"
                             ]
                         )
-                        let transport = ProviderStreamingTransport(configuration: session.configuration, request: request)
-                        let (http, lines) = try await transport.start()
+                        let attemptTransport = ProviderStreamingTransport(configuration: session.configuration, request: request)
+                        transport = attemptTransport
+                        let (http, lines) = try await attemptTransport.start()
                         try? await diagnosticLogger?.log(
                             level: (200..<300).contains(http.statusCode) ? .info : .warning,
                             subsystem: "provider",
@@ -545,9 +557,18 @@ private extension ProviderRequestBuilding {
                         continuation.finish(throwing: CancellationError())
                         return
                     } catch {
-                        let retryableBeforeOutput = ProviderRetryClassifier.isRetryableBeforeOutput(error)
-                        let replaySafeAfterHTTPResponse = ProviderRetryClassifier.isReplaySafeAfterHTTPResponseBeforeOutput(error)
+                        let bodyDataReceived = transport?.hasReceivedBodyData() ?? false
+                        let effectiveError: Error
+                        if successfulStreamEstablished, bodyDataReceived, error is URLError {
+                            effectiveError = ProviderError.streamInterrupted
+                            responseStarted = true
+                        } else {
+                            effectiveError = error
+                        }
+                        let retryableBeforeOutput = ProviderRetryClassifier.isRetryableBeforeOutput(effectiveError)
+                        let replaySafeAfterHTTPResponse = ProviderRetryClassifier.isReplaySafeAfterHTTPResponseBeforeOutput(effectiveError)
                         let mayReplay = !responseStarted
+                            && !bodyDataReceived
                             && attempt < retryPolicy.maxAttempts
                             && retryableBeforeOutput
                             && (!successfulStreamEstablished || replaySafeAfterHTTPResponse)
@@ -557,7 +578,7 @@ private extension ProviderRequestBuilding {
                                 subsystem: "provider",
                                 action: "request.failure",
                                 result: "failed",
-                                error: error,
+                                error: effectiveError,
                                 metadata: [
                                     "attempt": String(attempt),
                                     "providerID": configuration.providerID ?? "",
@@ -565,10 +586,11 @@ private extension ProviderRequestBuilding {
                                     "endpoint": endpoint,
                                     "responseStarted": String(responseStarted),
                                     "streamEstablished": String(successfulStreamEstablished),
-                                    "transportState": successfulStreamEstablished ? "http_stream_failed" : "connect_failed"
+                                    "transportState": successfulStreamEstablished ? "http_stream_failed" : "connect_failed",
+                                    "bodyDataReceived": String(bodyDataReceived)
                                 ]
                             )
-                            continuation.finish(throwing: error)
+                            continuation.finish(throwing: effectiveError)
                             return
                         }
                         let shift = UInt64(min(max(attempt - 1, 0), 8))
@@ -580,7 +602,7 @@ private extension ProviderRequestBuilding {
                             subsystem: "provider",
                             action: "request.retry",
                             result: "scheduled",
-                            error: error,
+                            error: effectiveError,
                             metadata: [
                                 "attempt": String(attempt),
                                 "nextAttempt": String(attempt + 1),
@@ -590,7 +612,8 @@ private extension ProviderRequestBuilding {
                                 "endpoint": endpoint,
                                 "responseStarted": String(responseStarted),
                                 "streamEstablished": String(successfulStreamEstablished),
-                                "transportState": successfulStreamEstablished ? "http_stream_retry" : "connect_retry"
+                                "transportState": successfulStreamEstablished ? "http_stream_retry" : "connect_retry",
+                                "bodyDataReceived": String(bodyDataReceived)
                             ]
                         )
                         attempt += 1
