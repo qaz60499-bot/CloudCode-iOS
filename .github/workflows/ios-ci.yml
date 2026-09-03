@@ -46,13 +46,38 @@ jobs:
       - name: Build app for iOS Simulator
         run: |
           set -euo pipefail
+          rm -rf build/SimulatorDerivedData
           xcodebuild \
             -project CloudCodeIOS.xcodeproj \
             -scheme CloudCodeIOS \
             -sdk iphonesimulator \
             -configuration Debug \
+            -derivedDataPath build/SimulatorDerivedData \
             CODE_SIGNING_ALLOWED=NO \
             build
+
+      - name: Launch app in iOS Simulator
+        run: |
+          set -euo pipefail
+          APP_PATH="build/SimulatorDerivedData/Build/Products/Debug-iphonesimulator/CloudCode.app"
+          test -d "$APP_PATH"
+          UDID="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ { print $2; exit }')"
+          test -n "$UDID"
+          xcrun simctl boot "$UDID" >/dev/null 2>&1 || true
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl install "$UDID" "$APP_PATH"
+          LAUNCH_RESULT="$(xcrun simctl launch "$UDID" com.cloudcode.ios)"
+          echo "$LAUNCH_RESULT"
+          PID="${LAUNCH_RESULT##*: }"
+          test -n "$PID"
+          sleep 8
+          if ! xcrun simctl spawn "$UDID" kill -0 "$PID"; then
+            echo 'FAIL: Cloud Code exited during simulator launch smoke test' >&2
+            xcrun simctl spawn "$UDID" log show --last 30s --style compact --predicate 'process == "CloudCode"' || true
+            exit 1
+          fi
+          xcrun simctl terminate "$UDID" com.cloudcode.ios
+          echo 'PASS: Cloud Code remained alive after simulator launch'
 
       - name: Build unsigned device app
         run: |
@@ -120,6 +145,11 @@ jobs:
           fi
           grep -F 'probeOwnKeychain()' Sources/CloudCodeCore/CapabilityProbe.swift >/dev/null
           grep -F 'backgroundContinuationWindow: TimeInterval = 90 * 60' Sources/CloudCodeApp/AppEnvironment.swift >/dev/null
+          grep -F 'type: library.static' project.yml >/dev/null
+          if unzip -l build/CloudCode-iOS-unsigned.ipa | grep -F 'Payload/CloudCode.app/Frameworks/CloudCodeCore.framework/'; then
+            echo "FAIL: CloudCodeCore must be statically linked for TrollStore launch reliability" >&2
+            exit 1
+          fi
           grep -F 'configuration.waitsForConnectivity = true' Sources/CloudCodeCore/ProviderClient.swift >/dev/null
           grep -F 'configuration.timeoutIntervalForResource = 90 * 60' Sources/CloudCodeCore/ProviderClient.swift >/dev/null
           grep -F 'ProviderError.streamInterrupted' Sources/CloudCodeCore/ProviderClient.swift >/dev/null
