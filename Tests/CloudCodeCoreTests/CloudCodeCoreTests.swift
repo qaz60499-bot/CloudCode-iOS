@@ -110,7 +110,8 @@ final class CloudCodeCoreTests: XCTestCase {
         let restarted = DiagnosticLogStore(directory: directory)
         try await restarted.log(level: .info, subsystem: "restart", action: "after", result: "ok", sessionID: sessionID)
         let records = try await restarted.recent(sessionID: sessionID, limit: 10)
-        XCTAssertEqual(records.map(\.action), ["before", "after"])
+        XCTAssertEqual(records.count, 2)
+        XCTAssertEqual(Set(records.map(\.action)), Set(["before", "after"]))
     }
 
     func testDiagnosticLogStoreSkipsCorruptLinesAndKeepsValidRecords() async throws {

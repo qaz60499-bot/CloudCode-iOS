@@ -445,8 +445,13 @@ public actor DiagnosticBundleExporter {
         let manifestData = try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
         try manifestData.write(to: working.appendingPathComponent("manifest.json"), options: .atomic)
 
+        try Self.createArchive(from: working, to: output, fileManager: fileManager)
+        return output
+    }
+
+    private static func createArchive(from working: URL, to output: URL, fileManager: FileManager) throws {
         let archive = try Archive(url: output, accessMode: .create)
-        guard let enumerator = fileManager.enumerator(at: working, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) else {
+        guard let enumerator = fileManager.enumerator(at: working, includingPropertiesForKeys: [.isRegularFileKey], options: []) else {
             throw CocoaError(.fileReadUnknown)
         }
         let rootPrefix = working.path.hasSuffix("/") ? working.path : working.path + "/"
@@ -457,6 +462,5 @@ public actor DiagnosticBundleExporter {
             guard !relative.isEmpty, !relative.contains("../") else { continue }
             try archive.addEntry(with: relative, fileURL: item, compressionMethod: .deflate)
         }
-        return output
     }
 }
