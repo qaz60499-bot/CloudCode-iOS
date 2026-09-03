@@ -430,26 +430,15 @@ public struct SecureFileMutation: Sendable {
 
     private func openAbsoluteDirectoryNoFollow(_ path: String) throws -> Int32 {
         guard path.hasPrefix("/") else { throw SecureFileMutationError.invalidPath }
+        // The resolved allowed root is the trust anchor. Re-opening a directory path here is
+        // only a read-only identity check; all actual descendant mutation still uses pinned
+        // directory FDs plus openat/renameat with O_NOFOLLOW. Opening the final directory in
+        // one syscall intentionally permits macOS system-level intermediate aliases such as
+        // /var -> /private/var, while O_NOFOLLOW still rejects a swapped final component.
         let flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
-        var directoryFD = open("/", flags)
+        let directoryFD = path.withCString { open($0, flags) }
         guard directoryFD >= 0 else { throw SecureFileMutationError.posix(errno) }
-        if path == "/" { return directoryFD }
-
-        do {
-            let components = URL(fileURLWithPath: path, isDirectory: true).pathComponents
-                .filter { $0 != "/" && !$0.isEmpty }
-            for component in components {
-                guard validComponent(component) else { throw SecureFileMutationError.invalidPath }
-                let nextFD = component.withCString { openat(directoryFD, $0, flags) }
-                guard nextFD >= 0 else { throw SecureFileMutationError.posix(errno) }
-                close(directoryFD)
-                directoryFD = nextFD
-            }
-            return directoryFD
-        } catch {
-            close(directoryFD)
-            throw error
-        }
+        return directoryFD
     }
 
     private func assertPinnedDirectoryStillMatches(_ pinnedFD: Int32, path: String) throws {
