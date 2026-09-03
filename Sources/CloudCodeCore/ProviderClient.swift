@@ -567,8 +567,9 @@ private extension ProviderRequestBuilding {
                         }
                         let retryableBeforeOutput = ProviderRetryClassifier.isRetryableBeforeOutput(effectiveError)
                         let replaySafeAfterHTTPResponse = ProviderRetryClassifier.isReplaySafeAfterHTTPResponseBeforeOutput(effectiveError)
+                        let bodyBlocksReplay = successfulStreamEstablished && bodyDataReceived
                         let mayReplay = !responseStarted
-                            && !bodyDataReceived
+                            && !bodyBlocksReplay
                             && attempt < retryPolicy.maxAttempts
                             && retryableBeforeOutput
                             && (!successfulStreamEstablished || replaySafeAfterHTTPResponse)

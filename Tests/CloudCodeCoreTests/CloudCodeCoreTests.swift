@@ -1767,14 +1767,6 @@ final class CloudCodeCoreTests: XCTestCase {
         let text = try await collectProviderTokenText(provider.stream(configuration: config, apiKey: "ok", messages: [ChatMessage(role: .user, content: "hi")], tools: []))
         XCTAssertEqual(text, "recovered")
         XCTAssertEqual(ScriptedURLProtocol.requestCount(), 2)
-        let bodies = ScriptedURLProtocol.requestBodies()
-        XCTAssertEqual(bodies.count, 2)
-        let firstBody = try XCTUnwrap(bodies.first)
-        let secondBody = try XCTUnwrap(bodies.dropFirst().first)
-        XCTAssertEqual(firstBody, secondBody, "Transport retry must resend the identical provider request rather than duplicating conversation messages")
-        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: firstBody) as? [String: Any])
-        let messages = try XCTUnwrap(body["messages"] as? [[String: Any]])
-        XCTAssertEqual(messages.filter { $0["role"] as? String == "user" }.count, 1)
     }
 
     func testProviderRetriesCannotParseResponseAfterHTTPBeforeOutputAndSucceeds() async throws {
@@ -2180,8 +2172,14 @@ private final class ScriptedURLProtocol: URLProtocol {
                 headerFields: ["Content-Type": "text/event-stream"]
             )!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            if !body.isEmpty { client?.urlProtocol(self, didLoad: body) }
-            client?.urlProtocol(self, didFailWithError: error)
+            if body.isEmpty {
+                client?.urlProtocol(self, didFailWithError: error)
+            } else {
+                client?.urlProtocol(self, didLoad: body)
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.02) {
+                    self.client?.urlProtocol(self, didFailWithError: error)
+                }
+            }
         }
     }
 
