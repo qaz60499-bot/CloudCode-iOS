@@ -1,6 +1,9 @@
 import Foundation
 import SwiftUI
 import CloudCodeCore
+#if canImport(UIKit)
+import UIKit
+#endif
 
 @MainActor
 public final class CloudCodeViewModel: ObservableObject {
@@ -51,6 +54,9 @@ public final class CloudCodeViewModel: ObservableObject {
     private var runGeneration = RunGenerationGuard()
     private var bootstrapTask: Task<Void, Never>?
     private var capabilityRefreshTask: Task<Void, Never>?
+    #if canImport(UIKit)
+    private var backgroundTaskIdentifier: UIBackgroundTaskIdentifier = .invalid
+    #endif
     private var didBootstrap = false
     private static let providerKeyMutationOperationKey = "provider-key:mutation"
 
@@ -409,6 +415,7 @@ public final class CloudCodeViewModel: ObservableObject {
             if runGeneration.finish(runID) {
                 currentTask = nil
                 isRunning = false
+                endBackgroundExecutionIfNeeded()
             }
             await reloadActivity()
             try? await reloadSessionHistory()
@@ -421,25 +428,61 @@ public final class CloudCodeViewModel: ObservableObject {
         currentTask = nil
         runGeneration.cancel()
         isRunning = false
+        endBackgroundExecutionIfNeeded()
         activityLines.append("任务已中断；检查点已保留，可继续、回滚或检查最终状态。")
     }
 
     public func suspendForBackground() {
         guard isRunning || currentTask != nil else { return }
-        currentTask?.cancel()
-        currentTask = nil
-        runGeneration.cancel()
-        isRunning = false
-        activityLines.append("App 已进入后台；当前任务已安全中断，不会盲目重放。完成检查点核对后可继续。")
+        // 系统弹窗、App 切换或 LaunchServices 状态变化都可能让 scenePhase 短暂进入后台。
+        // 立即取消会把已经被系统接受的状态变更卡在“请求已发出、结果未校验”的窗口。
+        // 申请一段有界后台时间，让当前步骤优先完成结果校验；只有系统明确收回后台时间时
+        // 才取消并依赖持久化检查点恢复。
+        activityLines.append("App 已进入后台；正在保留当前步骤以完成结果校验。若系统后台时间耗尽，将安全中断并保留检查点。")
+        beginBackgroundExecutionIfNeeded()
     }
 
     public func refreshAfterForeground() {
+        endBackgroundExecutionIfNeeded()
         Task {
             await reloadActivity()
             refreshFilesFromDisk()
             try? await reloadSessionHistory()
         }
         refreshCapabilities()
+    }
+
+    private func beginBackgroundExecutionIfNeeded() {
+        #if canImport(UIKit)
+        guard backgroundTaskIdentifier == .invalid else { return }
+        backgroundTaskIdentifier = UIApplication.shared.beginBackgroundTask(withName: "CloudCode.ActiveRun") { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.backgroundExecutionDidExpire()
+            }
+        }
+        if backgroundTaskIdentifier == .invalid {
+            activityLines.append("系统未授予额外后台执行时间；当前任务将由 iOS 自身挂起机制管理，恢复前不会盲目重放。")
+        }
+        #endif
+    }
+
+    private func backgroundExecutionDidExpire() {
+        endBackgroundExecutionIfNeeded()
+        guard isRunning || currentTask != nil else { return }
+        currentTask?.cancel()
+        currentTask = nil
+        runGeneration.cancel()
+        isRunning = false
+        activityLines.append("系统后台执行时间已耗尽；当前任务已安全中断并保留检查点。回到前台后请先核对最终状态，再决定是否继续。")
+    }
+
+    private func endBackgroundExecutionIfNeeded() {
+        #if canImport(UIKit)
+        guard backgroundTaskIdentifier != .invalid else { return }
+        let identifier = backgroundTaskIdentifier
+        backgroundTaskIdentifier = .invalid
+        UIApplication.shared.endBackgroundTask(identifier)
+        #endif
     }
 
     public func createNewSession() {
@@ -581,6 +624,7 @@ public final class CloudCodeViewModel: ObservableObject {
             if runGeneration.finish(runID) {
                 currentTask = nil
                 isRunning = false
+                endBackgroundExecutionIfNeeded()
             }
             await reloadActivity()
             try? await reloadSessionHistory()

@@ -7,6 +7,12 @@ import ObjectiveC.runtime
 import Darwin
 #endif
 
+public enum AppUninstallOutcome: Sendable, Equatable {
+    case removed
+    case rejected(String)
+    case verificationTimedOut(String)
+}
+
 public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding {
     private var cachedApps: [ResourceNode] = []
     private var bundlePaths: [String: String] = [:]
@@ -15,6 +21,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     private var enumerationProven = false
     private var enumerationDetail = "尚未检测已安装 App 枚举能力。"
     private var uninstallDetail = "尚未检测 App 卸载后端。"
+    private var pendingUninstallBundleID: String?
 
     public init() {}
 
@@ -51,6 +58,21 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             uninstallDetail = "必须先验证跨 App 的 LaunchServices 可见性。"
             return false
         }
+        if let pendingBundleID = pendingUninstallBundleID {
+            guard let (workspace, workspaceClass) = launchServicesWorkspace(),
+                  let installed = applicationIsInstalled(pendingBundleID, workspace: workspace, workspaceClass: workspaceClass) else {
+                uninstallDetail = "上一次卸载请求 \(pendingBundleID) 的最终状态仍无法权威确认；在完成状态核对前不会开启新的卸载。"
+                return false
+            }
+            if installed {
+                uninstallDetail = "上一次卸载请求 \(pendingBundleID) 仍被 LaunchServices 报告为已安装；在状态核对完成前不会开启新的卸载。"
+                return false
+            }
+            pendingUninstallBundleID = nil
+            cachedApps.removeAll { $0.ownerBundleID == pendingBundleID }
+            bundlePaths.removeValue(forKey: pendingBundleID)
+            containerPaths.removeValue(forKey: pendingBundleID)
+        }
         guard let target = cachedApps.first(where: {
             guard let bundleID = $0.ownerBundleID, bundleID != Bundle.main.bundleIdentifier else { return false }
             return Self.isUserApplicationBundlePath($0.resolvedPath)
@@ -84,36 +106,65 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         return uninstallDetail
     }
 
-    public func uninstallApplication(bundleID: String) async -> Bool {
-        guard !bundleID.isEmpty, bundleID != Bundle.main.bundleIdentifier else { return false }
+    public func uninstallApplication(bundleID: String) async -> AppUninstallOutcome {
+        guard !bundleID.isEmpty, bundleID != Bundle.main.bundleIdentifier else {
+            return .rejected("目标 Bundle ID 无效，或目标是 Cloud Code 自身。")
+        }
         forceRefresh()
-        guard enumerationProven else { return false }
+        guard enumerationProven else {
+            return .rejected("跨 App 枚举能力当前未通过验证。")
+        }
         guard cachedApps.contains(where: {
             $0.ownerBundleID == bundleID && Self.isUserApplicationBundlePath($0.resolvedPath)
-        }) else { return false }
-        guard await canUninstallInstalledApps(), let (workspace, workspaceClass) = launchServicesWorkspace() else { return false }
-        guard applicationIsInstalled(bundleID, workspace: workspace, workspaceClass: workspaceClass) == true else { return false }
+        }) else {
+            return .rejected("目标不是当前可验证的普通用户 App，或已经不存在。")
+        }
+        guard await canUninstallInstalledApps(), let (workspace, workspaceClass) = launchServicesWorkspace() else {
+            return .rejected(uninstallDetail)
+        }
+        guard applicationIsInstalled(bundleID, workspace: workspace, workspaceClass: workspaceClass) == true else {
+            return .rejected("LaunchServices 在执行前未确认目标仍处于已安装状态。")
+        }
 
         let selector = NSSelectorFromString("uninstallApplication:withOptions:")
-        guard let method = class_getInstanceMethod(workspaceClass, selector) else { return false }
+        guard let method = class_getInstanceMethod(workspaceClass, selector) else {
+            return .rejected("当前系统没有暴露 uninstallApplication:withOptions:。")
+        }
         typealias UninstallMethod = @convention(c) (AnyObject, Selector, AnyObject, AnyObject) -> Bool
         let implementation = method_getImplementation(method)
         let uninstall = unsafeBitCast(implementation, to: UninstallMethod.self)
         let accepted = uninstall(workspace, selector, bundleID as NSString, NSDictionary())
-        guard accepted else { return false }
+        guard accepted else {
+            uninstallDetail = "LaunchServices 拒绝了最近一次卸载请求；需要重新检测该设备上的卸载后端。"
+            return .rejected(uninstallDetail)
+        }
+        pendingUninstallBundleID = bundleID
 
-        for attempt in 0..<6 {
-            if attempt > 0 {
-                try? await Task.sleep(nanoseconds: 250_000_000)
+        // LaunchServices 的返回值只代表请求被接受。真正删除 bundle / data container
+        // 是异步的，真机上可能明显慢于 1 秒。使用权威安装状态做较长的有界轮询，
+        // 避免把“请求已接受但删除尚未完成”误报成失败并诱发重复卸载。
+        let verificationAttempts = 31
+        for attempt in 0..<verificationAttempts {
+            if Task.isCancelled {
+                return .verificationTimedOut("卸载请求已被系统接受，但结果校验在任务取消前尚未完成；恢复后必须先重新查询目标状态，不能盲目重放。")
             }
-            lastRefresh = .distantPast
-            refresh()
-            if let (verificationWorkspace, verificationClass) = launchServicesWorkspace(),
-               applicationIsInstalled(bundleID, workspace: verificationWorkspace, workspaceClass: verificationClass) == false {
-                return true
+            if attempt > 0 {
+                try? await Task.sleep(nanoseconds: 400_000_000)
+            }
+            guard let (verificationWorkspace, verificationClass) = launchServicesWorkspace() else { continue }
+            if applicationIsInstalled(bundleID, workspace: verificationWorkspace, workspaceClass: verificationClass) == false {
+                pendingUninstallBundleID = nil
+                cachedApps.removeAll { $0.ownerBundleID == bundleID }
+                bundlePaths.removeValue(forKey: bundleID)
+                containerPaths.removeValue(forKey: bundleID)
+                lastRefresh = .distantPast
+                uninstallDetail = "最近一次卸载已通过 LaunchServices 安装状态反查验证。"
+                return .removed
             }
         }
-        return false
+
+        uninstallDetail = "系统已接受最近一次卸载请求，但约 12 秒内仍未观察到目标变为未安装；需要先重新查询最终状态，禁止直接重复卸载。"
+        return .verificationTimedOut(uninstallDetail)
     }
 
     public func forceRefresh() {
@@ -393,13 +444,37 @@ public struct IOSPrivateAppExecutor: ToolExecuting, Sendable {
             )
         }
 
-        let removed = await appResolver.uninstallApplication(bundleID: bundleID)
-        let after = await appResolver.bundlePath(for: bundleID)
-        let verified = removed && after == nil
+        let outcome = await appResolver.uninstallApplication(bundleID: bundleID)
+        let verified: Bool
+        let summary: String
+        let auditResult: String
+        let payloadStatus: String
+        let failures: [String]
+        switch outcome {
+        case .removed:
+            let after = await appResolver.bundlePath(for: bundleID)
+            verified = after == nil
+            summary = verified ? "已卸载 \(bundleID)" : "系统已确认卸载，但应用索引仍有陈旧记录：\(bundleID)"
+            auditResult = verified ? "uninstalled" : "index_stale_after_uninstall"
+            payloadStatus = verified ? "removed" : "removed_index_stale"
+            failures = verified ? [] : ["LaunchServices 已确认未安装，但刷新后的应用索引仍返回目标路径"]
+        case .rejected(let reason):
+            verified = false
+            summary = "卸载请求未被系统接受：\(bundleID) · \(reason)"
+            auditResult = "request_rejected"
+            payloadStatus = "rejected"
+            failures = [reason]
+        case .verificationTimedOut(let reason):
+            verified = false
+            summary = "卸载请求已接受，但结果校验尚未完成：\(bundleID) · 请先重新检测/确认目标是否仍存在，不要直接重复卸载"
+            auditResult = "verification_pending"
+            payloadStatus = "verification_pending"
+            failures = [reason]
+        }
         let verification = VerificationResult(
             passed: verified,
-            checks: ["卸载请求被系统接受", "刷新 LaunchServices 后目标不再存在"],
-            failures: verified ? [] : ["卸载后仍能解析到目标，或系统未接受卸载请求"]
+            checks: ["卸载请求被系统接受", "通过 LaunchServices 权威安装状态反查", "刷新应用索引后目标路径消失"],
+            failures: failures
         )
         try await audit.append(AuditEvent(
             sessionID: call.sessionID,
@@ -407,13 +482,13 @@ public struct IOSPrivateAppExecutor: ToolExecuting, Sendable {
             action: call.name,
             target: bundleID,
             risk: descriptor.risk,
-            result: verified ? "uninstalled" : "verification_failed"
+            result: auditResult
         ))
         return ToolResult(
             toolCallID: call.id,
             success: verified,
-            summary: verified ? "已卸载 \(bundleID)" : "卸载未通过结果校验：\(bundleID)",
-            payload: ["bundleId": bundleID],
+            summary: summary,
+            payload: ["bundleId": bundleID, "status": payloadStatus],
             verification: verification
         )
     }

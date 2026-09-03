@@ -879,6 +879,34 @@ final class CloudCodeCoreTests: XCTestCase {
         }
     }
 
+    func testFailedStateChangingResultRemainsPendingAndBlocksBlindReplay() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ledger = ToolExecutionLedger(fileURL: root.appendingPathComponent("ledger.json"))
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "apps.uninstall", summary: "", risk: .permanentDestructive)
+        ])
+        let router = ToolRouter(
+            registry: registry,
+            executors: [FailingExecutor(route: .privateFramework, names: ["apps.uninstall"])],
+            executionLedger: ledger
+        )
+        let sessionID = UUID()
+        let call = ToolCall(name: "apps.uninstall", arguments: ["bundleId": "com.example.target"], sessionID: sessionID)
+        let context = ToolExecutionContext(permissionMode: .full, capabilityProfile: CapabilityProfile(records: []))
+
+        let first = try await router.execute(call, context: context)
+        XCTAssertFalse(first.success)
+        XCTAssertEqual((await ledger.record(for: call.id))?.state, .pending)
+
+        do {
+            _ = try await router.execute(call, context: context)
+            XCTFail("A failed state-changing execution must not be blindly replayed")
+        } catch {
+            XCTAssertEqual(error as? ToolExecutionLedgerError, .priorExecutionUncertain(call.id))
+        }
+    }
+
     func testDanglingCompletedToolCallIsReconciledFromLedgerAfterRestart() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1539,6 +1567,17 @@ private struct CountingExecutor: ToolExecuting, Sendable {
     func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
         await counter.increment()
         return ToolResult(toolCallID: call.id, success: true, summary: "executed")
+    }
+}
+
+private struct FailingExecutor: ToolExecuting, Sendable {
+    let route: AppExecutionRoute
+    let names: Set<String>
+
+    func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool { names.contains(tool.name) }
+
+    func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
+        ToolResult(toolCallID: call.id, success: false, summary: "verification pending")
     }
 }
 
