@@ -174,9 +174,12 @@ final class ProviderRouterTests: XCTestCase {
         configuration.fallbackAPIKeyReferences = ["fallback"]
         configuration.allowSameProviderKeyFailover = true
 
-        XCTAssertEqual(try await collectText(router.stream(configuration: configuration, apiKey: "bad-auth", messages: [], tools: [])), "good")
-        XCTAssertEqual(try await collectText(router.stream(configuration: configuration, apiKey: "bad-auth", messages: [], tools: [])), "good")
-        XCTAssertEqual(await recorder.keysSeen(), ["bad-auth", "good", "good"])
+        let firstText = try await collectText(router.stream(configuration: configuration, apiKey: "bad-auth", messages: [], tools: []))
+        let secondText = try await collectText(router.stream(configuration: configuration, apiKey: "bad-auth", messages: [], tools: []))
+        let seenKeys = await recorder.keysSeen()
+        XCTAssertEqual(firstText, "good")
+        XCTAssertEqual(secondText, "good")
+        XCTAssertEqual(seenKeys, ["bad-auth", "good", "good"])
     }
 
     func testSameProviderCapacityFailureRotatesToNextKey() async throws {
@@ -423,16 +426,21 @@ final class ProviderKeychainTests: XCTestCase {
         try vault.set(a1, for: "a1")
         try vault.set(a2, for: "a2")
         try vault.set(b1, for: "b1")
-        XCTAssertEqual(try await vault.key(for: "a1"), a1)
-        XCTAssertEqual(try await vault.key(for: "a2"), a2)
-        XCTAssertEqual(try await vault.key(for: "b1"), b1)
+        let loadedA1 = try await vault.key(for: "a1")
+        let loadedA2 = try await vault.key(for: "a2")
+        let loadedB1 = try await vault.key(for: "b1")
+        XCTAssertEqual(loadedA1, a1)
+        XCTAssertEqual(loadedA2, a2)
+        XCTAssertEqual(loadedB1, b1)
 
         let replacement = "replacement-\(UUID().uuidString)"
         try vault.set(replacement, for: "a1")
-        XCTAssertEqual(try await vault.key(for: "a1"), replacement)
+        let loadedReplacement = try await vault.key(for: "a1")
+        XCTAssertEqual(loadedReplacement, replacement)
 
         let restartedVault = KeychainAPIKeyVault(service: service)
-        XCTAssertEqual(try await restartedVault.key(for: "a1"), replacement)
+        let restartedReplacement = try await restartedVault.key(for: "a1")
+        XCTAssertEqual(restartedReplacement, replacement)
         XCTAssertTrue(restartedVault.contains("a2"))
 
         try restartedVault.remove("a2")
@@ -450,7 +458,8 @@ final class ProviderKeychainTests: XCTestCase {
         let secret = "defaults-guard-\(UUID().uuidString)"
         defer { try? vault.remove("key") }
         try vault.set(secret, for: "key")
-        XCTAssertEqual(try await vault.key(for: "key"), secret)
+        let loadedSecret = try await vault.key(for: "key")
+        XCTAssertEqual(loadedSecret, secret)
         let serializedDefaults = UserDefaults.standard.dictionaryRepresentation().values.map(String.init(describing:)).joined(separator: "\n")
         XCTAssertFalse(serializedDefaults.contains(secret))
     }
