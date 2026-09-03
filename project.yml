@@ -45,7 +45,9 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: Cloud Code
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
-        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: Cloud Code can inspect photo metadata only when the user grants access.
+        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: Cloud Code can attach a photo to a conversation only when the user grants access.
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: Cloud Code uses the microphone only while you are dictating a message.
+        INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: Cloud Code converts your dictated speech into editable text before you send it.
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait

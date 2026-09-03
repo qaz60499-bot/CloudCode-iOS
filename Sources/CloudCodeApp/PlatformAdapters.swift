@@ -67,11 +67,15 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             uninstallDetail = "当前系统没有暴露 uninstallApplication:withOptions:。"
             return false
         }
-        guard applicationIsInstalled(targetBundleID, workspace: workspace, workspaceClass: workspaceClass) else {
+        guard hasAuthoritativeInstallationQuery(workspaceClass) else {
+            uninstallDetail = "当前系统没有暴露 applicationIsInstalled:，无法对卸载结果做权威校验。"
+            return false
+        }
+        guard applicationIsInstalled(targetBundleID, workspace: workspace, workspaceClass: workspaceClass) == true else {
             uninstallDetail = "LaunchServices 无损安装状态查询未通过。"
             return false
         }
-        uninstallDetail = "LaunchServices 可枚举其他 App、可查询安装状态，且卸载 selector 存在；实际卸载仍会做结果校验。"
+        uninstallDetail = "LaunchServices 可枚举其他 App、可权威查询安装状态，且卸载 selector 存在；实际卸载仍会做结果校验。"
         return true
     }
 
@@ -82,8 +86,13 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
 
     public func uninstallApplication(bundleID: String) async -> Bool {
         guard !bundleID.isEmpty, bundleID != Bundle.main.bundleIdentifier else { return false }
+        forceRefresh()
+        guard enumerationProven else { return false }
+        guard cachedApps.contains(where: {
+            $0.ownerBundleID == bundleID && Self.isUserApplicationBundlePath($0.resolvedPath)
+        }) else { return false }
         guard await canUninstallInstalledApps(), let (workspace, workspaceClass) = launchServicesWorkspace() else { return false }
-        guard applicationIsInstalled(bundleID, workspace: workspace, workspaceClass: workspaceClass) else { return false }
+        guard applicationIsInstalled(bundleID, workspace: workspace, workspaceClass: workspaceClass) == true else { return false }
 
         let selector = NSSelectorFromString("uninstallApplication:withOptions:")
         guard let method = class_getInstanceMethod(workspaceClass, selector) else { return false }
@@ -100,7 +109,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             lastRefresh = .distantPast
             refresh()
             if let (verificationWorkspace, verificationClass) = launchServicesWorkspace(),
-               !applicationIsInstalled(bundleID, workspace: verificationWorkspace, workspaceClass: verificationClass) {
+               applicationIsInstalled(bundleID, workspace: verificationWorkspace, workspaceClass: verificationClass) == false {
                 return true
             }
         }
@@ -117,6 +126,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
 
         enumerationProven = false
         enumerationDetail = "已安装 App 枚举尚未得到跨 App 可见性的有效证据。"
+        uninstallDetail = "正在根据本次 LaunchServices 探测重新判断卸载后端。"
         bundlePaths = [:]
         containerPaths = [:]
 
@@ -198,11 +208,13 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         return (workspace, workspaceClass)
     }
 
-    private func applicationIsInstalled(_ bundleID: String, workspace: NSObject, workspaceClass: AnyClass) -> Bool {
+    private func hasAuthoritativeInstallationQuery(_ workspaceClass: AnyClass) -> Bool {
+        class_getInstanceMethod(workspaceClass, NSSelectorFromString("applicationIsInstalled:")) != nil
+    }
+
+    private func applicationIsInstalled(_ bundleID: String, workspace: NSObject, workspaceClass: AnyClass) -> Bool? {
         let selector = NSSelectorFromString("applicationIsInstalled:")
-        guard let method = class_getInstanceMethod(workspaceClass, selector) else {
-            return cachedApps.contains(where: { $0.ownerBundleID == bundleID })
-        }
+        guard let method = class_getInstanceMethod(workspaceClass, selector) else { return nil }
         typealias IsInstalledMethod = @convention(c) (AnyObject, Selector, AnyObject) -> Bool
         let implementation = method_getImplementation(method)
         let isInstalled = unsafeBitCast(implementation, to: IsInstalledMethod.self)

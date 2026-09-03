@@ -526,6 +526,57 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://example.com/v1/responses")
     }
 
+    func testImageAttachmentIsEncodedForChatAnthropicAndResponses() async throws {
+        let imageURL = FileManager.default.temporaryDirectory.appendingPathComponent("cloudcode-provider-image-\(UUID().uuidString).jpg")
+        let bytes = Data([0xFF, 0xD8, 0xFF, 0xD9])
+        try bytes.write(to: imageURL, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: imageURL) }
+        let message = ChatMessage(
+            role: .user,
+            content: "看图",
+            attachments: [ChatAttachment(filename: "photo.jpg", path: imageURL.path, mimeType: "image/jpeg", byteSize: Int64(bytes.count))]
+        )
+        let expectedDataURL = "data:image/jpeg;base64,\(bytes.base64EncodedString())"
+
+        ProviderTestURLProtocol.install(status: 200, body: Data("data: [DONE]\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let chat = OpenAICompatibleProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let chatConfig = ProviderConfiguration(name: "chat", baseURL: URL(string: "https://example.com/v1")!, model: "vision", apiKeyReference: "key", protocolName: ProviderProtocol.openAIChat.rawValue)
+        for try await _ in chat.stream(configuration: chatConfig, apiKey: "secret", messages: [message], tools: []) {}
+        let chatBodyData = try XCTUnwrap(ProviderTestURLProtocol.lastRequestBody())
+        let chatBody = try XCTUnwrap(JSONSerialization.jsonObject(with: chatBodyData) as? [String: Any])
+        let chatMessages = try XCTUnwrap(chatBody["messages"] as? [[String: Any]])
+        let chatContent = try XCTUnwrap(chatMessages.first?["content"] as? [[String: Any]])
+        let chatImage = try XCTUnwrap(chatContent.last?["image_url"] as? [String: Any])
+        XCTAssertEqual(chatImage["url"] as? String, expectedDataURL)
+
+        ProviderTestURLProtocol.install(status: 200, body: Data("""
+        data: {"type":"message_start","message":{"id":"m1"}}
+
+        data: {"type":"message_stop"}
+
+        """.utf8), headers: ["Content-Type": "text/event-stream"])
+        let anthropic = AnthropicProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let anthropicConfig = ProviderConfiguration(name: "anthropic", baseURL: URL(string: "https://example.com/v1")!, model: "vision", apiKeyReference: "key", protocolName: ProviderProtocol.anthropic.rawValue)
+        for try await _ in anthropic.stream(configuration: anthropicConfig, apiKey: "secret", messages: [message], tools: []) {}
+        let anthropicBodyData = try XCTUnwrap(ProviderTestURLProtocol.lastRequestBody())
+        let anthropicBody = try XCTUnwrap(JSONSerialization.jsonObject(with: anthropicBodyData) as? [String: Any])
+        let anthropicMessages = try XCTUnwrap(anthropicBody["messages"] as? [[String: Any]])
+        let anthropicContent = try XCTUnwrap(anthropicMessages.first?["content"] as? [[String: Any]])
+        let source = try XCTUnwrap(anthropicContent.last?["source"] as? [String: Any])
+        XCTAssertEqual(source["media_type"] as? String, "image/jpeg")
+        XCTAssertEqual(source["data"] as? String, bytes.base64EncodedString())
+
+        ProviderTestURLProtocol.install(status: 200, body: Data("data: {\"type\":\"response.completed\"}\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let responses = OpenAIResponsesProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let responsesConfig = ProviderConfiguration(name: "responses", baseURL: URL(string: "https://example.com/v1")!, model: "vision", apiKeyReference: "key", protocolName: ProviderProtocol.openAIResponses.rawValue)
+        for try await _ in responses.stream(configuration: responsesConfig, apiKey: "secret", messages: [message], tools: []) {}
+        let responsesBodyData = try XCTUnwrap(ProviderTestURLProtocol.lastRequestBody())
+        let responsesBody = try XCTUnwrap(JSONSerialization.jsonObject(with: responsesBodyData) as? [String: Any])
+        let input = try XCTUnwrap(responsesBody["input"] as? [[String: Any]])
+        let responseContent = try XCTUnwrap(input.first?["content"] as? [[String: Any]])
+        XCTAssertEqual(responseContent.last?["image_url"] as? String, expectedDataURL)
+    }
+
     func testPersistedInternalToolNamesAreProviderSafeAcrossAnthropicChatAndResponsesHistory() async throws {
         let assistantCall = ChatMessage(role: .assistant, content: "", providerMetadata: [
             "tool_call_id": "call-1",

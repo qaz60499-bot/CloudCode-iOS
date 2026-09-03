@@ -59,6 +59,12 @@ public actor SessionStore {
         try JSONEncoder.pretty.encode(session).write(to: url, options: .atomic)
     }
 
+    public func delete(_ id: UUID) throws {
+        let url = root.appendingPathComponent(id.uuidString).appendingPathExtension("json")
+        guard fileManager.fileExists(atPath: url.path) else { return }
+        try fileManager.removeItem(at: url)
+    }
+
     public func load(_ id: UUID) throws -> AgentSession {
         let url = root.appendingPathComponent(id.uuidString).appendingPathExtension("json")
         let data = try Data(contentsOf: url)

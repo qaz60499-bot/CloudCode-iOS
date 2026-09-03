@@ -89,6 +89,9 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
     case invalidResponse(Int)
     case malformedEvent
     case streamInterrupted
+    case attachmentUnavailable(String)
+    case attachmentTooLarge(Int64)
+    case unsupportedAttachmentType(String)
     case transport(String)
 
     public var description: String {
@@ -101,6 +104,9 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
         case .invalidResponse(let code): return "厂商返回 HTTP \(code)"
         case .malformedEvent: return "厂商返回了格式错误的流数据"
         case .streamInterrupted: return "厂商流在完成事件前中断"
+        case .attachmentUnavailable(let filename): return "图片附件无法读取：\(filename)"
+        case .attachmentTooLarge(let bytes): return "图片附件过大（\(bytes) 字节）；单张图片限制为 4 MB"
+        case .unsupportedAttachmentType(let mimeType): return "暂不支持的图片类型：\(mimeType)"
         case .transport(let value): return value
         }
     }
@@ -367,7 +373,7 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
         var body: [String: Any] = [
             "model": configuration.model,
             "stream": true,
-            "messages": messages.map(openAIMessageObject)
+            "messages": try messages.map(openAIMessageObject)
         ]
         if !tools.isEmpty {
             body["tools"] = tools.map(\.openAIChatObject)
@@ -446,7 +452,7 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
             "model": configuration.model,
             "max_tokens": 8192,
             "stream": true,
-            "messages": anthropicMessages(nonSystem)
+            "messages": try anthropicMessages(nonSystem)
         ]
         if !systemText.isEmpty { body["system"] = systemText }
         if !tools.isEmpty { body["tools"] = tools.map(\.anthropicObject) }
@@ -531,7 +537,7 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
         var body: [String: Any] = [
             "model": configuration.model,
             "stream": true,
-            "input": responsesInput(messages)
+            "input": try responsesInput(messages)
         ]
         if !tools.isEmpty { body["tools"] = tools.map(\.openAIResponsesObject) }
         return try ProviderRequestFactory.jsonPOST(url: url, apiKey: apiKey, authMode: ProviderRequestFactory.authMode(configuration), body: body)
@@ -863,8 +869,80 @@ private func providerVisibleToolName(_ message: ChatMessage) -> String? {
     return try? ProviderToolNameMap.encode(internalName)
 }
 
-private func openAIMessageObject(_ message: ChatMessage) -> [String: Any] {
-    var object: [String: Any] = ["role": message.role.rawValue, "content": message.content]
+private struct ProviderImageAttachment {
+    let base64: String
+    let mimeType: String
+
+    var dataURL: String { "data:\(mimeType);base64,\(base64)" }
+}
+
+private func providerImageAttachment(_ message: ChatMessage) throws -> ProviderImageAttachment? {
+    guard message.role == .user, let attachment = message.attachments.first else { return nil }
+    guard attachment.byteSize > 0, attachment.byteSize <= Int64(ChatMessageAttachmentPolicy.maxImageBytes) else {
+        throw ProviderError.attachmentTooLarge(attachment.byteSize)
+    }
+    let mimeType = attachment.mimeType.lowercased()
+    guard ["image/jpeg", "image/png", "image/webp", "image/gif"].contains(mimeType) else {
+        throw ProviderError.unsupportedAttachmentType(attachment.mimeType)
+    }
+    let candidate = URL(fileURLWithPath: attachment.path).standardizedFileURL
+    let supportRoot = (FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).appendingPathComponent("Library/Application Support", isDirectory: true))
+        .appendingPathComponent("CloudCode", isDirectory: true)
+        .appendingPathComponent("Attachments", isDirectory: true)
+        .standardizedFileURL
+    guard candidate.path.hasPrefix(supportRoot.path + "/") else {
+        throw ProviderError.attachmentUnavailable(attachment.filename)
+    }
+    guard let data = try? Data(contentsOf: candidate, options: [.mappedIfSafe]),
+          !data.isEmpty,
+          data.count <= ChatMessageAttachmentPolicy.maxImageBytes else {
+        throw ProviderError.attachmentUnavailable(attachment.filename)
+    }
+    return ProviderImageAttachment(base64: data.base64EncodedString(), mimeType: mimeType)
+}
+
+private func openAIImageContent(_ message: ChatMessage, attachment: ProviderImageAttachment) -> [[String: Any]] {
+    var content: [[String: Any]] = []
+    if !message.content.isEmpty {
+        content.append(["type": "text", "text": message.content])
+    }
+    content.append(["type": "image_url", "image_url": ["url": attachment.dataURL]])
+    return content
+}
+
+private func anthropicImageContent(_ message: ChatMessage, attachment: ProviderImageAttachment) -> [[String: Any]] {
+    var content: [[String: Any]] = []
+    if !message.content.isEmpty {
+        content.append(["type": "text", "text": message.content])
+    }
+    content.append([
+        "type": "image",
+        "source": [
+            "type": "base64",
+            "media_type": attachment.mimeType,
+            "data": attachment.base64
+        ]
+    ])
+    return content
+}
+
+private func responsesImageContent(_ message: ChatMessage, attachment: ProviderImageAttachment) -> [[String: Any]] {
+    var content: [[String: Any]] = []
+    if !message.content.isEmpty {
+        content.append(["type": "input_text", "text": message.content])
+    }
+    content.append(["type": "input_image", "image_url": attachment.dataURL])
+    return content
+}
+
+private func openAIMessageObject(_ message: ChatMessage) throws -> [String: Any] {
+    var object: [String: Any] = ["role": message.role.rawValue]
+    if let attachment = try providerImageAttachment(message) {
+        object["content"] = openAIImageContent(message, attachment: attachment)
+    } else {
+        object["content"] = message.content
+    }
     if message.role == .tool, let toolCallID = message.providerMetadata["tool_call_id"] {
         object["tool_call_id"] = toolCallID
         if let toolName = providerVisibleToolName(message) { object["name"] = toolName }
@@ -885,8 +963,8 @@ private func openAIMessageObject(_ message: ChatMessage) -> [String: Any] {
     return object
 }
 
-private func anthropicMessages(_ messages: [ChatMessage]) -> [[String: Any]] {
-    messages.map { message in
+private func anthropicMessages(_ messages: [ChatMessage]) throws -> [[String: Any]] {
+    try messages.map { message in
         if message.role == .tool, let callID = message.providerMetadata["tool_call_id"] {
             return ["role": "user", "content": [["type": "tool_result", "tool_use_id": callID, "content": message.content]]]
         }
@@ -903,12 +981,15 @@ private func anthropicMessages(_ messages: [ChatMessage]) -> [[String: Any]] {
             return ["role": "assistant", "content": [["type": "tool_use", "id": callID, "name": name, "input": input]]]
         }
         let role = message.role == .assistant ? "assistant" : "user"
+        if let attachment = try providerImageAttachment(message) {
+            return ["role": role, "content": anthropicImageContent(message, attachment: attachment)]
+        }
         return ["role": role, "content": message.content]
     }
 }
 
-private func responsesInput(_ messages: [ChatMessage]) -> [[String: Any]] {
-    messages.map { message in
+private func responsesInput(_ messages: [ChatMessage]) throws -> [[String: Any]] {
+    try messages.map { message in
         if message.role == .tool, let callID = message.providerMetadata["tool_call_id"] {
             return ["type": "function_call_output", "call_id": callID, "output": message.content]
         }
@@ -921,6 +1002,9 @@ private func responsesInput(_ messages: [ChatMessage]) -> [[String: Any]] {
                 "name": name,
                 "arguments": message.providerMetadata["tool_arguments"] ?? "{}"
             ]
+        }
+        if let attachment = try providerImageAttachment(message) {
+            return ["role": message.role.rawValue, "content": responsesImageContent(message, attachment: attachment)]
         }
         return ["role": message.role.rawValue, "content": message.content]
     }

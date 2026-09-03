@@ -450,19 +450,88 @@ public enum ChatRole: String, Codable, Sendable {
     case tool
 }
 
+public enum ChatMessageProviderMetadataKey {
+    public static let imageBase64 = "image_base64"
+    public static let imageMimeType = "image_mime_type"
+    public static let imageFilename = "image_filename"
+}
+
+public enum ChatMessageAttachmentPolicy {
+    public static let maxImageBytes = 4 * 1024 * 1024
+}
+
+public struct ChatAttachment: Codable, Equatable, Identifiable, Sendable {
+    public var id: UUID
+    public var filename: String
+    public var path: String
+    public var mimeType: String
+    public var byteSize: Int64
+    public var pixelWidth: Int?
+    public var pixelHeight: Int?
+    public var createdAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        filename: String,
+        path: String,
+        mimeType: String,
+        byteSize: Int64,
+        pixelWidth: Int? = nil,
+        pixelHeight: Int? = nil,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.filename = filename
+        self.path = path
+        self.mimeType = mimeType
+        self.byteSize = byteSize
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.createdAt = createdAt
+    }
+}
+
 public struct ChatMessage: Codable, Equatable, Identifiable, Sendable {
     public var id: UUID
     public var role: ChatRole
     public var content: String
     public var createdAt: Date
     public var providerMetadata: [String: String]
+    public var attachments: [ChatAttachment]
 
-    public init(id: UUID = UUID(), role: ChatRole, content: String, createdAt: Date = Date(), providerMetadata: [String: String] = [:]) {
+    public init(
+        id: UUID = UUID(),
+        role: ChatRole,
+        content: String,
+        createdAt: Date = Date(),
+        providerMetadata: [String: String] = [:],
+        attachments: [ChatAttachment] = []
+    ) {
         self.id = id
         self.role = role
         self.content = content
         self.createdAt = createdAt
         self.providerMetadata = providerMetadata
+        self.attachments = attachments
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case role
+        case content
+        case createdAt
+        case providerMetadata
+        case attachments
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        role = try container.decode(ChatRole.self, forKey: .role)
+        content = try container.decode(String.self, forKey: .content)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        providerMetadata = try container.decode([String: String].self, forKey: .providerMetadata)
+        attachments = try container.decodeIfPresent([ChatAttachment].self, forKey: .attachments) ?? []
     }
 }
 

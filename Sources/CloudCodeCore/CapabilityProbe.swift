@@ -73,34 +73,44 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
                 if otherBundleResolved && otherContainerResolved { break }
             }
         }
-        records.append(record("apps.resolve_bundle_path", .apps, otherBundleResolved ? .available : .deviceValidationRequired,
-                              otherBundleResolved ? "Resolved at least one non-own installed-app bundle path." : "Cross-app bundle path resolution is not proven on this runtime."))
-        records.append(record("apps.resolve_data_container", .apps, otherContainerResolved ? .available : .deviceValidationRequired,
-                              otherContainerResolved ? "Resolved at least one non-own installed-app data container; paths are resolved dynamically." : "Cross-app data-container resolution is not proven on this runtime; container UUIDs are never cached as identity."))
+        let crossBundleStatus: CapabilityStatus = otherBundleResolved ? .available : (enumerationProven ? .deviceValidationRequired : .unavailable)
+        let crossContainerStatus: CapabilityStatus = otherContainerResolved ? .available : (enumerationProven ? .deviceValidationRequired : .unavailable)
+        records.append(record("apps.resolve_bundle_path", .apps, crossBundleStatus,
+                              otherBundleResolved ? "Resolved at least one non-own installed-app bundle path." : (enumerationProven ? "Cross-app bundle path resolution is not proven on this runtime." : "Installed-app enumeration is unavailable, so cross-app bundle-path resolution is currently unavailable.")))
+        records.append(record("apps.resolve_data_container", .apps, crossContainerStatus,
+                              otherContainerResolved ? "Resolved at least one non-own installed-app data container; paths are resolved dynamically." : (enumerationProven ? "Cross-app data-container resolution is not proven on this runtime; container UUIDs are never cached as identity." : "Installed-app enumeration is unavailable, so cross-app data-container resolution is currently unavailable.")))
 
         records.append(record("execution.ios_system", .execution, Self.hasDynamicSymbol("ios_system") ? .available : .unavailable,
                               "Detected dynamically. Core tools do not require ios_system."))
         records.append(record("execution.posix_spawn_symbol", .execution, Self.hasDynamicSymbol("posix_spawn") ? .available : .unavailable,
                               "Only reports symbol presence; it does not prove sandbox escape or helper privilege."))
-        records.append(record("execution.spawn_helper", .execution, .deviceValidationRequired,
-                              "A bundled helper and device signing/entitlement path must prove helper spawn before use."))
-        records.append(record("execution.root_helper", .execution, .deviceValidationRequired,
-                              "Requires TrollStore/high-privilege device validation and a bundled helper. Root is never inferred from TrollStore alone."))
-        records.append(record("execution.jit_wasm", .execution, .deviceValidationRequired,
-                              "WASM/JIT availability varies by device, signing path and entitlement."))
+        records.append(record("execution.spawn_helper", .execution, .unavailable,
+                              "This build does not bundle a helper executable, so helper spawning is not currently implemented."))
+        records.append(record("execution.root_helper", .execution, .unavailable,
+                              "This build does not bundle a root helper; TrollStore installation alone does not create one."))
+        records.append(record("execution.jit_wasm", .execution, .unavailable,
+                              "No WASM/JIT execution backend is connected in the current app build."))
 
-        records.append(record("apps.launch", .apps, .deviceValidationRequired,
-                              "Private LaunchServices/UIApplication launch behavior must be verified on device."))
-        records.append(record("apps.terminate", .apps, .deviceValidationRequired,
-                              "Termination is privileged/system-changing and must be verified on device."))
+        records.append(record("apps.launch", .apps, .unavailable,
+                              "No app-launch executor is connected in the current build."))
+        records.append(record("apps.terminate", .apps, .unavailable,
+                              "No app-termination executor is connected in the current build."))
         if let provider = appResolver as? any AppUninstallCapabilityProviding {
             let uninstallReady = await provider.canUninstallInstalledApps()
             let uninstallDetail = await provider.installedAppUninstallDetail()
-            records.append(record("apps.uninstall", .apps, uninstallReady ? .available : .deviceValidationRequired,
-                                  uninstallReady ? "Private uninstall backend readiness verified without changing device state: \(uninstallDetail)" : "Uninstall backend is not yet proven on this device: \(uninstallDetail)"))
+            let uninstallStatus: CapabilityStatus
+            if uninstallReady {
+                uninstallStatus = .available
+            } else if !enumerationProven || uninstallDetail.contains("没有暴露") || uninstallDetail.contains("无法取得") {
+                uninstallStatus = .unavailable
+            } else {
+                uninstallStatus = .deviceValidationRequired
+            }
+            records.append(record("apps.uninstall", .apps, uninstallStatus,
+                                  uninstallReady ? "Private uninstall backend prerequisites are present and postcondition verification is available: \(uninstallDetail)" : "Uninstall backend is not currently executable: \(uninstallDetail)"))
         } else {
-            records.append(record("apps.uninstall", .apps, .deviceValidationRequired,
-                                  "Uninstall is permanently destructive and requires a separately verified privileged adapter."))
+            records.append(record("apps.uninstall", .apps, .unavailable,
+                                  "No uninstall adapter is connected in the current build."))
         }
 
         records.append(record("data.photos", .data, .deviceValidationRequired,
@@ -112,19 +122,19 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         let keychainProbe = Self.probeOwnKeychain()
         records.append(record("data.keychain_scope", .data, keychainProbe.status, keychainProbe.detail))
 
-        records.append(record("automation.url_scheme", .automation, .deviceValidationRequired,
-                              "A URL-opening adapter must be connected and verified on this device before this capability can be used."))
-        records.append(record("automation.xctest_wda", .automation, .deviceValidationRequired,
-                              "XCTest/WDA requires a separate runtime/backend and is never assumed."))
-        records.append(record("automation.gui", .automation, .deviceValidationRequired,
-                              "GUI fallback is adapter-based and unavailable unless a backend proves readiness."))
+        records.append(record("automation.url_scheme", .automation, .unavailable,
+                              "The current URL-scheme executor is a disabled placeholder and cannot execute app actions."))
+        records.append(record("automation.xctest_wda", .automation, .unavailable,
+                              "No XCTest/WDA runtime backend is connected in this build."))
+        records.append(record("automation.gui", .automation, .unavailable,
+                              "The current GUI backend is explicitly unavailable; no automation runtime is connected."))
 
         records.append(record("ipa.inspect", .ipa, .available,
                               "ZIP/Info.plist inspection is implemented in-process."))
-        records.append(record("ipa.decrypt", .ipa, .deviceValidationRequired,
-                              "Decryption requires a compatible privileged runtime and running target process."))
-        records.append(record("ipa.install", .ipa, .deviceValidationRequired,
-                              "Installation depends on TrollStore/privileged device capability."))
+        records.append(record("ipa.decrypt", .ipa, .unavailable,
+                              "No IPA decryption executor is connected in the current build."))
+        records.append(record("ipa.install", .ipa, .unavailable,
+                              "No IPA installation executor is connected in the current build."))
 
         return CapabilityProfile(records: records)
     }

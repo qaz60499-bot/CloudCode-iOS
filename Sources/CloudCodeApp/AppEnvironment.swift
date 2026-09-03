@@ -5,7 +5,7 @@ import CloudCodeCore
 @MainActor
 public final class CloudCodeViewModel: ObservableObject {
     @Published public var session: AgentSession
-    @Published public var transcript: String = ""
+    @Published public private(set) var streamingAssistantMessageID: UUID?
     @Published public var activityLines: [String] = []
     @Published public var capabilities = CapabilityProfile(records: [])
     @Published public var capabilityGraph = CapabilityGraph()
@@ -41,6 +41,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private let transactionEngine: TransactionEngine
     private let checkpointStore: TaskCheckpointStore
     private let sessionStore: SessionStore
+    private let attachmentStore: ChatAttachmentStore
     private let keyVault: KeychainAPIKeyVault
     private let agentCore: AgentCore
     private let resourceIndex: ProgressiveResourceIndex
@@ -90,6 +91,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let router = ToolRouter(registry: registry, executors: [structured, cli, privateApps, URLSchemeExecutor(), gui], executionLedger: executionLedger)
         let keyVault = KeychainAPIKeyVault()
         let sessions = SessionStore(root: support.appendingPathComponent("Sessions", isDirectory: true))
+        let attachments = ChatAttachmentStore(root: support.appendingPathComponent("Attachments", isDirectory: true))
         let checkpoints = TaskCheckpointStore(fileURL: support.appendingPathComponent("Tasks/checkpoints.json"))
         let provider = ProviderClientRouter(keyVault: keyVault)
         let agent = AgentCore(
@@ -136,6 +138,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.transactionEngine = transactionEngine
         self.checkpointStore = checkpoints
         self.sessionStore = sessions
+        self.attachmentStore = attachments
         self.keyVault = keyVault
         self.agentCore = agent
         self.resourceIndex = ProgressiveResourceIndex(fileURL: support.appendingPathComponent("Index/resource-graph.json"))
@@ -305,9 +308,18 @@ public final class CloudCodeViewModel: ObservableObject {
         return true
     }
 
-    public func send(_ text: String) {
+    public func send(
+        _ text: String,
+        imageData: Data? = nil,
+        imageMimeType: String = "image/jpeg",
+        imageFilename: String = "photo.jpg"
+    ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !isRunning else { return }
+        guard (!trimmed.isEmpty || imageData != nil), !isRunning else { return }
+        if let imageData, (imageData.isEmpty || imageData.count > ChatMessageAttachmentPolicy.maxImageBytes) {
+            lastError = "图片大小必须小于 4 MB。"
+            return
+        }
         guard saveProviderSelection(), let config = currentProviderConfiguration() else {
             if lastError == nil { lastError = "厂商 / Key / 模型选择无效。" }
             return
@@ -316,30 +328,63 @@ public final class CloudCodeViewModel: ObservableObject {
             lastError = "当前选择的 Key 尚未写入 iOS Keychain。请导入私有 Key 配置，或手动保存该 Key。"
             return
         }
+
         isRunning = true
         lastError = nil
-        transcript += transcript.isEmpty ? "你：\(trimmed)\n\n" : "\n你：\(trimmed)\n\n"
+        streamingAssistantMessageID = nil
         activityLines.append("正在使用 \(config.name) / \(config.model) 规划请求…")
-
         let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
 
         currentTask?.cancel()
         let runID = runGeneration.start()
+        let initialSession = session
         currentTask = Task {
-            let stream = await agentCore.send(text: trimmed, session: session, providerConfiguration: config, allowedRoot: allowedRoot)
             do {
-                var assistantStarted = false
+                var requestSession = initialSession
+                var attachments: [ChatAttachment] = []
+                if let imageData {
+                    let attachment = try attachmentStore.save(
+                        data: imageData,
+                        filename: imageFilename,
+                        mimeType: imageMimeType,
+                        pixelWidth: nil,
+                        pixelHeight: nil,
+                        sessionID: requestSession.id
+                    )
+                    attachments = [attachment]
+                }
+
+                requestSession.messages.append(ChatMessage(role: .user, content: trimmed, attachments: attachments))
+                if requestSession.title == "新对话" || requestSession.title == "New Session" {
+                    requestSession.title = Self.sessionTitle(from: trimmed.isEmpty ? "图片" : trimmed)
+                }
+                requestSession.updatedAt = Date()
+                guard runGeneration.isCurrent(runID) else { return }
+                session = requestSession
+
+                let requestText = trimmed.isEmpty && !attachments.isEmpty ? "请处理这张图片。" : trimmed
+                let stream = await agentCore.send(
+                    text: requestText,
+                    session: requestSession,
+                    providerConfiguration: config,
+                    allowedRoot: allowedRoot,
+                    appendUserMessage: false
+                )
                 for try await event in stream {
                     guard runGeneration.isCurrent(runID) else { break }
                     switch event {
                     case .status(let value):
                         activityLines.append(value)
                     case .token(let token):
-                        if !assistantStarted {
-                            transcript += "Cloud Code："
-                            assistantStarted = true
+                        if let messageID = streamingAssistantMessageID,
+                           let assistantIndex = session.messages.firstIndex(where: { $0.id == messageID }) {
+                            session.messages[assistantIndex].content += token
+                            session.updatedAt = Date()
+                        } else {
+                            let message = ChatMessage(role: .assistant, content: token)
+                            session.messages.append(message)
+                            streamingAssistantMessageID = message.id
                         }
-                        transcript += token
                     case .toolStarted(let name, _):
                         activityLines.append("工具：\(name)")
                     case .toolFinished(let result):
@@ -349,13 +394,13 @@ public final class CloudCodeViewModel: ObservableObject {
                     case .error(let value):
                         lastError = value
                     case .finished:
-                        transcript += "\n"
+                        break
                     }
                 }
                 if runGeneration.isCurrent(runID),
-                   let saved = try? await sessionStore.load(session.id) {
+                   let saved = try? await sessionStore.load(requestSession.id) {
                     session = saved
-                    transcript = Self.transcript(for: saved)
+                    streamingAssistantMessageID = nil
                     UserDefaults.standard.set(saved.id.uuidString, forKey: "session.current.id")
                 }
             } catch {
@@ -409,17 +454,10 @@ public final class CloudCodeViewModel: ObservableObject {
             model: selectedModel
         )
         session = newSession
-        transcript = ""
+        streamingAssistantMessageID = nil
         activityLines = []
         UserDefaults.standard.set(newSession.id.uuidString, forKey: "session.current.id")
-        Task {
-            do {
-                try await sessionStore.save(newSession)
-                try await reloadSessionHistory()
-            } catch {
-                lastError = "新建对话保存失败：\(error)"
-            }
-        }
+        // 空白新对话保持为内存态；只有真正发送第一条消息后才写入历史，避免反复新建产生大量空记录。
     }
 
     public func openSession(_ candidate: AgentSession) {
@@ -435,6 +473,44 @@ public final class CloudCodeViewModel: ObservableObject {
                 try await reloadSessionHistory()
             } catch {
                 lastError = "打开旧对话失败：\(error)"
+            }
+        }
+    }
+
+    public func deleteSession(_ candidate: AgentSession) {
+        guard !isRunning else {
+            lastError = "当前任务仍在运行，请先停止或等待完成后再删除对话。"
+            return
+        }
+        guard !sessionHasUnfinishedTask(candidate.id) else {
+            lastError = "包含未完成任务的对话受到保护，请先完成、回滚或取消该任务。"
+            return
+        }
+        let operationKey = sessionOperationKey(candidate.id)
+        guard beginExclusiveOperation(operationKey) else { return }
+        Task {
+            defer { endExclusiveOperation(operationKey) }
+            do {
+                if candidate.id == session.id {
+                    let replacement = AgentSession(
+                        permissionMode: permissionMode,
+                        providerID: selectedProviderID,
+                        keySlotID: selectedKeySlotID,
+                        model: selectedModel
+                    )
+                    try await sessionStore.delete(candidate.id)
+                    try? attachmentStore.removeAll(for: candidate.id)
+                    session = replacement
+                    streamingAssistantMessageID = nil
+                    activityLines = []
+                    UserDefaults.standard.set(replacement.id.uuidString, forKey: "session.current.id")
+                } else {
+                    try await sessionStore.delete(candidate.id)
+                    try? attachmentStore.removeAll(for: candidate.id)
+                }
+                try await reloadSessionHistory()
+            } catch {
+                lastError = "删除对话失败：\(error)"
             }
         }
     }
@@ -890,10 +966,8 @@ public final class CloudCodeViewModel: ObservableObject {
         session.providerID = selectedProviderID
         session.keySlotID = selectedKeySlotID
         session.model = selectedModel
-        try await sessionStore.save(session)
         UserDefaults.standard.set(session.id.uuidString, forKey: "session.current.id")
-        sessionHistory = [session]
-        transcript = Self.transcript(for: session)
+        sessionHistory = []
     }
 
     private func reloadSessionHistory() async throws {
@@ -902,6 +976,7 @@ public final class CloudCodeViewModel: ObservableObject {
 
     private func adoptSession(_ loaded: AgentSession) {
         session = loaded
+        streamingAssistantMessageID = nil
         permissionMode = loaded.permissionMode
         let desired = ProviderSelectionState(
             providerID: loaded.providerID ?? selectedProviderID,
@@ -913,21 +988,14 @@ public final class CloudCodeViewModel: ObservableObject {
         session.providerID = reconciled.providerID
         session.keySlotID = reconciled.keySlotID
         session.model = reconciled.model
-        transcript = Self.transcript(for: session)
         UserDefaults.standard.set(session.id.uuidString, forKey: "session.current.id")
     }
 
-    private static func transcript(for session: AgentSession) -> String {
-        session.messages.compactMap { message -> String? in
-            switch message.role {
-            case .user:
-                return message.content.isEmpty ? nil : "你：\(message.content)"
-            case .assistant:
-                return message.content.isEmpty ? nil : "Cloud Code：\(message.content)"
-            case .system, .tool:
-                return nil
-            }
-        }.joined(separator: "\n\n")
+    private static func sessionTitle(from text: String) -> String {
+        let compact = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        guard !compact.isEmpty else { return "图片消息" }
+        let limit = 32
+        return compact.count <= limit ? compact : String(compact.prefix(limit)) + "…"
     }
 
     private static func capabilitySummary(_ profile: CapabilityProfile) -> String {
@@ -1014,6 +1082,7 @@ public final class CloudCodeViewModel: ObservableObject {
 
     private func trashOperationKey(_ id: UUID) -> String { "trash:\(id.uuidString)" }
     private func checkpointOperationKey(_ id: UUID) -> String { "checkpoint:\(id.uuidString)" }
+    private func sessionOperationKey(_ id: UUID) -> String { "session:\(id.uuidString)" }
 
     private func consume(_ stream: AsyncThrowingStream<AgentEvent, Error>, runID: UUID) async throws {
         var assistantStarted = false
@@ -1023,11 +1092,15 @@ public final class CloudCodeViewModel: ObservableObject {
             case .status(let value):
                 activityLines.append(value)
             case .token(let token):
-                if !assistantStarted {
-                    transcript += transcript.isEmpty ? "Cloud Code：" : "\nCloud Code："
-                    assistantStarted = true
+                if let messageID = streamingAssistantMessageID,
+                   let assistantIndex = session.messages.firstIndex(where: { $0.id == messageID }) {
+                    session.messages[assistantIndex].content += token
+                    session.updatedAt = Date()
+                } else {
+                    let message = ChatMessage(role: .assistant, content: token)
+                    session.messages.append(message)
+                    streamingAssistantMessageID = message.id
                 }
-                transcript += token
             case .toolStarted(let name, _):
                 activityLines.append("工具：\(name)")
             case .toolFinished(let result):
@@ -1037,7 +1110,7 @@ public final class CloudCodeViewModel: ObservableObject {
             case .error(let value):
                 lastError = value
             case .finished:
-                if assistantStarted { transcript += "\n" }
+                break
             }
         }
     }

@@ -1,5 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import PhotosUI
+import UIKit
 import CloudCodeCore
 
 struct ContentView: View {
@@ -51,54 +53,150 @@ struct ContentView: View {
 
 private struct ChatView: View {
     @ObservedObject var model: CloudCodeViewModel
+    @StateObject private var voice = VoiceInputController()
     @State private var input = ""
     @State private var showSessionHistory = false
+    @State private var selectedPhotoItem: PhotosPickerItem?
+    @State private var pendingImageData: Data?
+    @State private var pendingImagePreview: UIImage?
+
+    private var visibleMessages: [ChatMessage] {
+        model.session.messages.filter { $0.role == .user || $0.role == .assistant }
+    }
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
-                        if model.transcript.isEmpty {
-                            Text("Cloud Code iOS")
-                                .font(.title2.bold())
-                            Text("本地工具优先 Agent。优先使用结构化工具、文件系统和容器能力，只有必要时才回退到 GUI 自动化。")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            Text(model.transcript)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 12) {
+                            if visibleMessages.isEmpty {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("Cloud Code iOS")
+                                        .font(.title2.bold())
+                                    Text("消息会按你和 Cloud Code 分开显示。长按消息文字后可以只选择并复制其中一部分。")
+                                        .foregroundStyle(.secondary)
+                                }
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .textSelection(.enabled)
-                                .font(.system(.body, design: .monospaced))
-                        }
+                            } else {
+                                ForEach(visibleMessages) { message in
+                                    ChatBubble(message: message)
+                                        .id(message.id)
+                                }
+                            }
 
-                        if !model.activityLines.isEmpty {
-                            Divider()
-                            ForEach(Array(model.activityLines.suffix(8).enumerated()), id: \.offset) { _, line in
-                                Text(line)
-                                    .font(.caption.monospaced())
-                                    .foregroundStyle(.secondary)
+                            if model.isRunning && model.streamingAssistantMessageID == nil {
+                                HStack {
+                                    ProgressView()
+                                    Text("Cloud Code 正在处理…")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                }
+                            }
+
+                            if !model.activityLines.isEmpty {
+                                Divider()
+                                ForEach(Array(model.activityLines.suffix(5).enumerated()), id: \.offset) { _, line in
+                                    Text(line)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(.secondary)
+                                        .textSelection(.enabled)
+                                }
                             }
                         }
+                        .padding()
                     }
-                    .padding()
+                    .onChange(of: model.session.messages.count) { _ in
+                        guard let last = visibleMessages.last else { return }
+                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    }
+                    .onChange(of: model.streamingAssistantMessageID) { _ in
+                        guard let last = visibleMessages.last else { return }
+                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    }
                 }
 
                 Divider()
-                HStack(alignment: .bottom) {
-                    TextField("输入要让 Cloud Code 完成的任务…", text: $input, axis: .vertical)
-                        .textFieldStyle(.roundedBorder)
-                        .lineLimit(1...5)
-                    if model.isRunning {
-                        Button("停止") { model.cancelCurrentTask() }
-                            .buttonStyle(.bordered)
-                    } else {
-                        Button("发送") {
-                            let value = input
-                            input = ""
-                            model.send(value)
+                VStack(spacing: 8) {
+                    if let pendingImagePreview {
+                        HStack(spacing: 10) {
+                            Image(uiImage: pendingImagePreview)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 58, height: 58)
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("待发送图片")
+                                    .font(.caption.bold())
+                                Text(ByteCountFormatter.string(fromByteCount: Int64(pendingImageData?.count ?? 0), countStyle: .file))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button(role: .destructive) {
+                                pendingImageData = nil
+                                pendingImagePreview = nil
+                                selectedPhotoItem = nil
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+
+                    HStack(alignment: .bottom, spacing: 8) {
+                        PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
+                            Image(systemName: "photo")
+                                .frame(width: 30, height: 30)
+                        }
+                        .disabled(model.isRunning)
+
+                        Button {
+                            if voice.isRecording {
+                                voice.stop()
+                            } else {
+                                voice.start(existingText: input)
+                            }
+                        } label: {
+                            Image(systemName: voice.isRecording ? "stop.circle.fill" : "mic")
+                                .frame(width: 30, height: 30)
+                        }
+                        .disabled(model.isRunning)
+                        .accessibilityLabel(voice.isRecording ? "停止语音输入" : "开始语音输入")
+
+                        TextField("输入要让 Cloud Code 完成的任务…", text: $input, axis: .vertical)
+                            .textFieldStyle(.roundedBorder)
+                            .lineLimit(1...5)
+
+                        if model.isRunning {
+                            Button("停止") { model.cancelCurrentTask() }
+                                .buttonStyle(.bordered)
+                        } else {
+                            Button("发送") {
+                                let value = input
+                                let image = pendingImageData
+                                input = ""
+                                pendingImageData = nil
+                                pendingImagePreview = nil
+                                selectedPhotoItem = nil
+                                voice.stop()
+                                model.send(value, imageData: image, imageMimeType: "image/jpeg", imageFilename: "photo.jpg")
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && pendingImageData == nil)
+                        }
+                    }
+
+                    if voice.isRecording {
+                        HStack(spacing: 6) {
+                            Image(systemName: "waveform")
+                            Text("正在语音转文字；停止后可继续修改再发送。")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
                 .padding()
@@ -116,6 +214,10 @@ private struct ChatView: View {
 
                     Button {
                         input = ""
+                        pendingImageData = nil
+                        pendingImagePreview = nil
+                        selectedPhotoItem = nil
+                        voice.stop()
                         model.createNewSession()
                     } label: {
                         Label("新建对话", systemImage: "square.and.pencil")
@@ -126,6 +228,94 @@ private struct ChatView: View {
             .sheet(isPresented: $showSessionHistory) {
                 SessionHistoryView(model: model, isPresented: $showSessionHistory)
             }
+            .onChange(of: voice.recognizedText) { value in
+                if !value.isEmpty { input = value }
+            }
+            .onChange(of: voice.errorMessage) { value in
+                if let value, !value.isEmpty { model.lastError = value }
+            }
+            .onChange(of: selectedPhotoItem) { item in
+                guard let item else { return }
+                Task {
+                    do {
+                        guard let original = try await item.loadTransferable(type: Data.self),
+                              let prepared = Self.prepareImageForSend(original),
+                              let preview = UIImage(data: prepared) else {
+                            model.lastError = "无法读取所选图片。"
+                            return
+                        }
+                        pendingImageData = prepared
+                        pendingImagePreview = preview
+                    } catch {
+                        model.lastError = "读取图片失败：\(error.localizedDescription)"
+                    }
+                }
+            }
+            .onDisappear { voice.stop() }
+        }
+    }
+
+    private static func prepareImageForSend(_ data: Data) -> Data? {
+        guard let image = UIImage(data: data) else { return nil }
+        let limits: [(CGFloat, CGFloat)] = [(2048, 0.82), (1800, 0.72), (1600, 0.62), (1280, 0.55)]
+        for (maxDimension, quality) in limits {
+            let source = image.size
+            let scale = min(1, maxDimension / max(source.width, source.height))
+            let size = CGSize(width: max(1, source.width * scale), height: max(1, source.height * scale))
+            let renderer = UIGraphicsImageRenderer(size: size)
+            let resized = renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: size)) }
+            if let encoded = resized.jpegData(compressionQuality: quality), encoded.count <= ChatMessageAttachmentPolicy.maxImageBytes {
+                return encoded
+            }
+        }
+        return nil
+    }
+}
+
+private struct ChatBubble: View {
+    let message: ChatMessage
+
+    private var isUser: Bool { message.role == .user }
+
+    var body: some View {
+        HStack(alignment: .bottom) {
+            if isUser { Spacer(minLength: 44) }
+            VStack(alignment: .leading, spacing: 6) {
+                Text(isUser ? "你" : "Cloud Code")
+                    .font(.caption2.bold())
+                    .foregroundStyle(.secondary)
+
+                ForEach(message.attachments) { attachment in
+                    if let data = try? Data(contentsOf: URL(fileURLWithPath: attachment.path)),
+                       let image = UIImage(data: data) {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxWidth: 240, maxHeight: 240)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    } else {
+                        Label(attachment.filename, systemImage: "photo")
+                            .font(.caption)
+                    }
+                }
+
+                if !message.content.isEmpty {
+                    Text(message.content)
+                        .textSelection(.enabled)
+                        .font(.body)
+                }
+            }
+            .padding(10)
+            .background(isUser ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.10))
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .contextMenu {
+                if !message.content.isEmpty {
+                    Button("复制整条消息") {
+                        UIPasteboard.general.string = message.content
+                    }
+                }
+            }
+            if !isUser { Spacer(minLength: 44) }
         }
     }
 }
@@ -134,6 +324,7 @@ private struct SessionHistoryView: View {
     @ObservedObject var model: CloudCodeViewModel
     @Binding var isPresented: Bool
     @State private var query = ""
+    @State private var pendingDelete: AgentSession?
 
     var body: some View {
         NavigationStack {
@@ -173,10 +364,36 @@ private struct SessionHistoryView: View {
                         .padding(.vertical, 3)
                     }
                     .buttonStyle(.plain)
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        Button("删除", role: .destructive) { pendingDelete = item }
+                            .disabled(model.sessionHasUnfinishedTask(item.id))
+                    }
+                    .contextMenu {
+                        Button("删除对话", role: .destructive) { pendingDelete = item }
+                            .disabled(model.sessionHasUnfinishedTask(item.id))
+                    }
                 }
             }
             .navigationTitle("历史对话")
             .searchable(text: $query, prompt: "搜索标题或消息")
+            .confirmationDialog(
+                "删除这条历史对话？",
+                isPresented: Binding(
+                    get: { pendingDelete != nil },
+                    set: { if !$0 { pendingDelete = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                if let pendingDelete {
+                    Button("删除“\(pendingDelete.title)”", role: .destructive) {
+                        model.deleteSession(pendingDelete)
+                        self.pendingDelete = nil
+                    }
+                }
+                Button("取消", role: .cancel) { pendingDelete = nil }
+            } message: {
+                Text("删除后会同时清理该对话保存的图片附件。包含未完成任务的对话必须先处理任务。")
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("关闭") { isPresented = false }
@@ -298,19 +515,49 @@ private struct AppsView: View {
 
     var body: some View {
         NavigationStack {
-            List(model.apps) { app in
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(app.displayName).font(.headline)
-                    Text(app.ownerBundleID ?? app.logicalLocation)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                    if let path = app.resolvedPath {
-                        Text(path).font(.caption2.monospaced()).foregroundStyle(.secondary)
+            List {
+                Section("检测状态") {
+                    HStack(spacing: 8) {
+                        if model.isRefreshingCapabilities { ProgressView() }
+                        Text(model.capabilityRefreshMessage ?? "尚未检测应用能力。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if model.capabilities.status("apps.enumerate") != .available {
+                        Text("当前只能显示 Cloud Code 自身或已知记录。只有真机运行时实际枚举到其他 App 后，才会把“已安装 App 枚举”标记为可用。")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Section("已发现应用") {
+                    if model.apps.isEmpty {
+                        Text("没有发现应用记录")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(model.apps) { app in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(app.displayName).font(.headline)
+                            Text(app.ownerBundleID ?? app.logicalLocation)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                            if let path = app.resolvedPath {
+                                Text(path).font(.caption2.monospaced()).foregroundStyle(.secondary)
+                            }
+                        }
                     }
                 }
             }
             .navigationTitle("应用")
-            .toolbar { Button("刷新") { model.refreshCapabilities() } }
+            .refreshable { model.refreshCapabilities() }
+            .toolbar {
+                Button {
+                    model.refreshCapabilities()
+                } label: {
+                    if model.isRefreshingCapabilities { ProgressView() } else { Text("刷新") }
+                }
+                .disabled(model.isRefreshingCapabilities)
+            }
         }
     }
 }

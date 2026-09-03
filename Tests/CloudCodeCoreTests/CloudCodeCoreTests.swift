@@ -311,9 +311,9 @@ final class CloudCodeCoreTests: XCTestCase {
 
         XCTAssertEqual(first.status("filesystem.own_container"), .available)
         XCTAssertEqual(first.status("apps.enumerate"), .unavailable)
-        XCTAssertEqual(first.status("automation.url_scheme"), .deviceValidationRequired)
+        XCTAssertEqual(first.status("automation.url_scheme"), .unavailable)
         XCTAssertEqual(first.status("ipa.inspect"), .available)
-        XCTAssertEqual(second.status("automation.url_scheme"), .deviceValidationRequired)
+        XCTAssertEqual(second.status("automation.url_scheme"), .unavailable)
         XCTAssertGreaterThanOrEqual(second.generatedAt, first.generatedAt)
     }
 
@@ -521,6 +521,43 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(reopened.providerID, "tabitoken")
         XCTAssertEqual(reopened.model, "claude-opus-5")
         XCTAssertEqual(reopened.messages.count, 2)
+
+        try await restarted.delete(first.id)
+        let afterDelete = try await restarted.all()
+        XCTAssertEqual(afterDelete.map(\.id), [second.id])
+        try await restarted.delete(first.id)
+        let afterIdempotentDelete = try await restarted.all()
+        XCTAssertEqual(afterIdempotentDelete.map(\.id), [second.id])
+    }
+
+    func testChatMessageAttachmentPersistsAndOldMessagesDecodeWithoutAttachments() throws {
+        let attachment = ChatAttachment(
+            filename: "photo.jpg",
+            path: "/tmp/photo.jpg",
+            mimeType: "image/jpeg",
+            byteSize: 1234,
+            pixelWidth: 100,
+            pixelHeight: 80,
+            createdAt: Date(timeIntervalSince1970: 10)
+        )
+        let message = ChatMessage(
+            id: UUID(),
+            role: .user,
+            content: "看这张图",
+            createdAt: Date(timeIntervalSince1970: 20),
+            attachments: [attachment]
+        )
+        let encoded = try JSONEncoder().encode(message)
+        let decoded = try JSONDecoder().decode(ChatMessage.self, from: encoded)
+        XCTAssertEqual(decoded.attachments, [attachment])
+
+        let legacyJSON = """
+        {"id":"00000000-0000-0000-0000-000000000001","role":"user","content":"legacy","createdAt":0,"providerMetadata":{}}
+        """.data(using: .utf8)!
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        let legacy = try decoder.decode(ChatMessage.self, from: legacyJSON)
+        XCTAssertTrue(legacy.attachments.isEmpty)
     }
 
     func testAgentMapsProviderSafeToolNameBackToInternalAndUsesSafeHistoryOnSecondRound() async throws {
