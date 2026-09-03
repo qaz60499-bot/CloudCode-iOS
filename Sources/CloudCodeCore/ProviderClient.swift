@@ -56,6 +56,39 @@ private final class ProviderSameOriginRedirectDelegate: NSObject, URLSessionTask
     }
 }
 
+private final class ProviderAttemptDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var receivedBytes: Int64 = 0
+
+    var receivedResponseBytes: Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return receivedBytes
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard let original = task.originalRequest?.url,
+              let destination = request.url,
+              ProviderRedirectPolicy.allows(original: original, destination: destination) else {
+            completionHandler(nil)
+            return
+        }
+        completionHandler(request)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        lock.lock()
+        receivedBytes = max(receivedBytes, task.countOfBytesReceived)
+        lock.unlock()
+    }
+}
+
 public enum ProviderURLSessionFactory {
     public static func make() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
@@ -320,9 +353,10 @@ private extension ProviderRequestBuilding {
                 var attempt = 1
                 while attempt <= retryPolicy.maxAttempts {
                     var responseStarted = false
+                    let attemptDelegate = ProviderAttemptDelegate()
                     do {
                         let request = try makeRequest(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
-                        let (bytes, response) = try await session.bytes(for: request)
+                        let (bytes, response) = try await session.bytes(for: request, delegate: attemptDelegate)
                         guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("缺少 HTTP 响应") }
                         if !(200..<300).contains(http.statusCode) {
                             var body = Data()
@@ -339,7 +373,11 @@ private extension ProviderRequestBuilding {
                         continuation.finish(throwing: CancellationError())
                         return
                     } catch {
-                        let mayReplay = !responseStarted && attempt < retryPolicy.maxAttempts && ProviderRetryClassifier.isRetryableBeforeOutput(error)
+                        let responseBodyObserved = attemptDelegate.receivedResponseBytes > 0
+                        let mayReplay = !responseStarted
+                            && !responseBodyObserved
+                            && attempt < retryPolicy.maxAttempts
+                            && ProviderRetryClassifier.isRetryableBeforeOutput(error)
                         guard mayReplay else {
                             continuation.finish(throwing: error)
                             return
