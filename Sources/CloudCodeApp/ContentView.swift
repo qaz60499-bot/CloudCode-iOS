@@ -66,192 +66,214 @@ private struct ChatView: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(spacing: 12) {
-                            if visibleMessages.isEmpty {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    Text("Cloud Code iOS")
-                                        .font(.title2.bold())
-                                    Text("消息会按你和 Cloud Code 分开显示。长按消息文字后可以只选择并复制其中一部分。")
-                                        .foregroundStyle(.secondary)
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            } else {
-                                ForEach(visibleMessages) { message in
-                                    ChatBubble(message: message)
-                                        .id(message.id)
-                                }
-                            }
+            chatLayout
+                .navigationTitle(model.session.title)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { chatToolbar }
+                .sheet(isPresented: $showSessionHistory) {
+                    SessionHistoryView(model: model, isPresented: $showSessionHistory)
+                }
+                .onChange(of: voice.recognizedText) { value in
+                    if !value.isEmpty { input = value }
+                }
+                .onChange(of: voice.errorMessage) { value in
+                    if let value, !value.isEmpty { model.lastError = value }
+                }
+                .onChange(of: selectedPhotoItem) { item in
+                    loadSelectedPhoto(item)
+                }
+                .onDisappear { voice.stop() }
+        }
+    }
 
-                            if model.isRunning && model.streamingAssistantMessageID == nil {
-                                HStack {
-                                    ProgressView()
-                                    Text("Cloud Code 正在处理…")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    Spacer()
-                                }
-                            }
+    private var chatLayout: some View {
+        VStack(spacing: 0) {
+            conversationPane
+            Divider()
+            composer
+        }
+    }
 
-                            if !model.activityLines.isEmpty {
-                                Divider()
-                                ForEach(Array(model.activityLines.suffix(5).enumerated()), id: \.offset) { _, line in
-                                    Text(line)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .font(.caption.monospaced())
-                                        .foregroundStyle(.secondary)
-                                        .textSelection(.enabled)
-                                }
-                            }
-                        }
-                        .padding()
+    private var conversationPane: some View {
+        ScrollView {
+            LazyVStack(spacing: 12) {
+                if visibleMessages.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Cloud Code iOS")
+                            .font(.title2.bold())
+                        Text("消息会按你和 Cloud Code 分开显示。长按消息文字后可以只选择并复制其中一部分。")
+                            .foregroundStyle(.secondary)
                     }
-                    .onChange(of: model.session.messages.count) { _ in
-                        guard let last = visibleMessages.last else { return }
-                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                    }
-                    .onChange(of: model.streamingAssistantMessageID) { _ in
-                        guard let last = visibleMessages.last else { return }
-                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    ForEach(visibleMessages) { message in
+                        ChatBubble(message: message)
                     }
                 }
 
-                Divider()
-                VStack(spacing: 8) {
-                    if let pendingImagePreview {
-                        HStack(spacing: 10) {
-                            Image(uiImage: pendingImagePreview)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: 58, height: 58)
-                                .clipShape(RoundedRectangle(cornerRadius: 10))
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("待发送图片")
-                                    .font(.caption.bold())
-                                Text(ByteCountFormatter.string(fromByteCount: Int64(pendingImageData?.count ?? 0), countStyle: .file))
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Button(role: .destructive) {
-                                pendingImageData = nil
-                                pendingImagePreview = nil
-                                selectedPhotoItem = nil
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                            }
-                            .buttonStyle(.plain)
-                        }
+                if model.isRunning && model.streamingAssistantMessageID == nil {
+                    HStack {
+                        ProgressView()
+                        Text("Cloud Code 正在处理…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
                     }
+                }
 
-                    HStack(alignment: .bottom, spacing: 8) {
-                        PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
-                            Image(systemName: "photo")
-                                .frame(width: 30, height: 30)
-                        }
-                        .disabled(model.isRunning)
-
-                        Button {
-                            if voice.isRecording {
-                                voice.stop()
-                            } else {
-                                voice.start(existingText: input)
-                            }
-                        } label: {
-                            Image(systemName: voice.isRecording ? "stop.circle.fill" : "mic")
-                                .frame(width: 30, height: 30)
-                        }
-                        .disabled(model.isRunning)
-                        .accessibilityLabel(voice.isRecording ? "停止语音输入" : "开始语音输入")
-
-                        TextField("输入要让 Cloud Code 完成的任务…", text: $input, axis: .vertical)
-                            .textFieldStyle(.roundedBorder)
-                            .lineLimit(1...5)
-
-                        if model.isRunning {
-                            Button("停止") { model.cancelCurrentTask() }
-                                .buttonStyle(.bordered)
-                        } else {
-                            Button("发送") {
-                                let value = input
-                                let image = pendingImageData
-                                input = ""
-                                pendingImageData = nil
-                                pendingImagePreview = nil
-                                selectedPhotoItem = nil
-                                voice.stop()
-                                model.send(value, imageData: image, imageMimeType: "image/jpeg", imageFilename: "photo.jpg")
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && pendingImageData == nil)
-                        }
+                if !model.activityLines.isEmpty {
+                    Divider()
+                    ForEach(Array(model.activityLines.suffix(5).enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
                     }
+                }
+            }
+            .padding()
+        }
+    }
 
-                    if voice.isRecording {
-                        HStack(spacing: 6) {
-                            Image(systemName: "waveform")
-                            Text("正在语音转文字；停止后可继续修改再发送。")
-                        }
-                        .font(.caption)
+    private var composer: some View {
+        VStack(spacing: 8) {
+            pendingImageBanner
+            inputRow
+            if voice.isRecording {
+                HStack(spacing: 6) {
+                    Image(systemName: "waveform")
+                    Text("正在语音转文字；停止后可继续修改再发送。")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding()
+    }
+
+    @ViewBuilder
+    private var pendingImageBanner: some View {
+        if let pendingImagePreview {
+            HStack(spacing: 10) {
+                Image(uiImage: pendingImagePreview)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 58, height: 58)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("待发送图片")
+                        .font(.caption.bold())
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(pendingImageData?.count ?? 0), countStyle: .file))
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
                 }
-                .padding()
+                Spacer()
+                Button(role: .destructive, action: clearPendingImage) {
+                    Image(systemName: "xmark.circle.fill")
+                }
+                .buttonStyle(.plain)
             }
-            .navigationTitle(model.session.title)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button {
-                        showSessionHistory = true
-                    } label: {
-                        Label("历史", systemImage: "clock.arrow.circlepath")
-                    }
-                    .disabled(model.isRunning)
+        }
+    }
 
-                    Button {
-                        input = ""
-                        pendingImageData = nil
-                        pendingImagePreview = nil
-                        selectedPhotoItem = nil
-                        voice.stop()
-                        model.createNewSession()
-                    } label: {
-                        Label("新建对话", systemImage: "square.and.pencil")
-                    }
-                    .disabled(model.isRunning)
+    private var inputRow: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
+                Image(systemName: "photo")
+                    .frame(width: 30, height: 30)
+            }
+            .disabled(model.isRunning)
+
+            Button(action: toggleVoiceInput) {
+                Image(systemName: voice.isRecording ? "stop.circle.fill" : "mic")
+                    .frame(width: 30, height: 30)
+            }
+            .disabled(model.isRunning)
+            .accessibilityLabel(voice.isRecording ? "停止语音输入" : "开始语音输入")
+
+            TextField("输入要让 Cloud Code 完成的任务…", text: $input, axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+                .lineLimit(1...5)
+
+            if model.isRunning {
+                Button("停止") { model.cancelCurrentTask() }
+                    .buttonStyle(.bordered)
+            } else {
+                Button("发送", action: sendCurrentInput)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!canSend)
+            }
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var chatToolbar: some ToolbarContent {
+        ToolbarItemGroup(placement: .topBarTrailing) {
+            Button {
+                showSessionHistory = true
+            } label: {
+                Label("历史", systemImage: "clock.arrow.circlepath")
+            }
+            .disabled(model.isRunning)
+
+            Button(action: createNewConversation) {
+                Label("新建对话", systemImage: "square.and.pencil")
+            }
+            .disabled(model.isRunning)
+        }
+    }
+
+    private var canSend: Bool {
+        !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || pendingImageData != nil
+    }
+
+    private func toggleVoiceInput() {
+        if voice.isRecording {
+            voice.stop()
+        } else {
+            voice.start(existingText: input)
+        }
+    }
+
+    private func sendCurrentInput() {
+        let value = input
+        let image = pendingImageData
+        input = ""
+        clearPendingImage()
+        voice.stop()
+        model.send(value, imageData: image, imageMimeType: "image/jpeg", imageFilename: "photo.jpg")
+    }
+
+    private func createNewConversation() {
+        input = ""
+        clearPendingImage()
+        voice.stop()
+        model.createNewSession()
+    }
+
+    private func clearPendingImage() {
+        pendingImageData = nil
+        pendingImagePreview = nil
+        selectedPhotoItem = nil
+    }
+
+    private func loadSelectedPhoto(_ item: PhotosPickerItem?) {
+        guard let item else { return }
+        Task {
+            do {
+                guard let original = try await item.loadTransferable(type: Data.self),
+                      let prepared = Self.prepareImageForSend(original),
+                      let preview = UIImage(data: prepared) else {
+                    model.lastError = "无法读取所选图片。"
+                    return
                 }
+                pendingImageData = prepared
+                pendingImagePreview = preview
+            } catch {
+                model.lastError = "读取图片失败：\(error.localizedDescription)"
             }
-            .sheet(isPresented: $showSessionHistory) {
-                SessionHistoryView(model: model, isPresented: $showSessionHistory)
-            }
-            .onChange(of: voice.recognizedText) { value in
-                if !value.isEmpty { input = value }
-            }
-            .onChange(of: voice.errorMessage) { value in
-                if let value, !value.isEmpty { model.lastError = value }
-            }
-            .onChange(of: selectedPhotoItem) { item in
-                guard let item else { return }
-                Task {
-                    do {
-                        guard let original = try await item.loadTransferable(type: Data.self),
-                              let prepared = Self.prepareImageForSend(original),
-                              let preview = UIImage(data: prepared) else {
-                            model.lastError = "无法读取所选图片。"
-                            return
-                        }
-                        pendingImageData = prepared
-                        pendingImagePreview = preview
-                    } catch {
-                        model.lastError = "读取图片失败：\(error.localizedDescription)"
-                    }
-                }
-            }
-            .onDisappear { voice.stop() }
         }
     }
 

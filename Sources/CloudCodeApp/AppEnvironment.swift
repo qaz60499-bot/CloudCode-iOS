@@ -1085,7 +1085,6 @@ public final class CloudCodeViewModel: ObservableObject {
     private func sessionOperationKey(_ id: UUID) -> String { "session:\(id.uuidString)" }
 
     private func consume(_ stream: AsyncThrowingStream<AgentEvent, Error>, runID: UUID) async throws {
-        var assistantStarted = false
         for try await event in stream {
             guard runGeneration.isCurrent(runID) else { break }
             switch event {

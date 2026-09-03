@@ -12,29 +12,33 @@ final class VoiceInputController: NSObject, ObservableObject {
     private let audioEngine = AVAudioEngine()
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    private var recognitionGeneration: UUID?
     private var initialText = ""
-    private var isStopping = false
 
     func start(existingText: String) {
-        guard !isRecording else { return }
+        guard !isRecording, recognitionGeneration == nil else { return }
         errorMessage = nil
         initialText = existingText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let generation = UUID()
+        recognitionGeneration = generation
 
         SFSpeechRecognizer.requestAuthorization { [weak self] status in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, self.recognitionGeneration == generation else { return }
                 guard status == .authorized else {
+                    self.recognitionGeneration = nil
                     self.errorMessage = "语音识别权限未授予。"
                     return
                 }
                 AVAudioSession.sharedInstance().requestRecordPermission { [weak self] granted in
                     Task { @MainActor [weak self] in
-                        guard let self else { return }
+                        guard let self, self.recognitionGeneration == generation else { return }
                         guard granted else {
+                            self.recognitionGeneration = nil
                             self.errorMessage = "麦克风权限未授予。"
                             return
                         }
-                        self.beginRecording()
+                        self.beginRecording(generation: generation)
                     }
                 }
             }
@@ -45,9 +49,10 @@ final class VoiceInputController: NSObject, ObservableObject {
         stopRecording()
     }
 
-    private func beginRecording() {
-        guard !isRecording else { return }
+    private func beginRecording(generation: UUID) {
+        guard recognitionGeneration == generation, !isRecording else { return }
         guard let speechRecognizer, speechRecognizer.isAvailable else {
+            recognitionGeneration = nil
             errorMessage = "语音识别当前不可用。"
             return
         }
@@ -76,7 +81,7 @@ final class VoiceInputController: NSObject, ObservableObject {
                 let text = result?.bestTranscription.formattedString
                 let isFinal = result?.isFinal == true
                 Task { @MainActor [weak self] in
-                    guard let self, !self.isStopping else { return }
+                    guard let self, self.recognitionGeneration == generation else { return }
                     if let text, !text.isEmpty {
                         self.recognizedText = [self.initialText, text]
                             .filter { !$0.isEmpty }
@@ -101,8 +106,10 @@ final class VoiceInputController: NSObject, ObservableObject {
     }
 
     private func stopRecording() {
-        guard isRecording || recognitionRequest != nil || recognitionTask != nil else { return }
-        isStopping = true
+        recognitionGeneration = nil
+        let hadRecognitionResources = isRecording || recognitionRequest != nil || recognitionTask != nil
+        guard hadRecognitionResources else { return }
+
         if audioEngine.isRunning {
             audioEngine.stop()
         }
@@ -113,6 +120,5 @@ final class VoiceInputController: NSObject, ObservableObject {
         recognitionTask = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         isRecording = false
-        isStopping = false
     }
 }
