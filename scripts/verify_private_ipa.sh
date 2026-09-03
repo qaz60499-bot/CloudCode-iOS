@@ -85,11 +85,20 @@ codesign -d --entitlements :- "$APP_PATH" > "$ENTITLEMENTS" 2>/dev/null
 plutil -lint "$ENTITLEMENTS" >/dev/null
 
 NO_SANDBOX="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.private.security.no-sandbox' "$ENTITLEMENTS" 2>/dev/null || true)"
+PLATFORM_APP="$(/usr/libexec/PlistBuddy -c 'Print :platform-application' "$ENTITLEMENTS" 2>/dev/null || true)"
 APP_DATA="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.private.security.storage.AppDataContainers' "$ENTITLEMENTS" 2>/dev/null || true)"
-if [[ "$NO_SANDBOX" != "true" || "$APP_DATA" != "true" ]]; then
+PERSONA="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.private.persona-mgmt' "$ENTITLEMENTS" 2>/dev/null || true)"
+if [[ "$NO_SANDBOX" != "true" || "$PLATFORM_APP" != "true" || "$APP_DATA" != "true" || "$PERSONA" != "true" ]]; then
   echo "FAIL: TrollStore private entitlement set is incomplete" >&2
   exit 12
 fi
+
+for banned in com.apple.private.cs.debugger dynamic-codesigning com.apple.private.skip-library-validation; do
+  if /usr/libexec/PlistBuddy -c "Print :$banned" "$ENTITLEMENTS" >/dev/null 2>&1; then
+    echo "FAIL: banned TrollStore entitlement present: $banned" >&2
+    exit 13
+  fi
+done
 
 echo "PASS: private TrollStore IPA signature and required private entitlements verified"
 echo "SECURITY: this IPA contains private Provider credentials; distribute only through an encrypted/private channel"

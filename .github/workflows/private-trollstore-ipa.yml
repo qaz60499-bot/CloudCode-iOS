@@ -35,11 +35,12 @@ jobs:
           print("Required private build secrets are present and structurally valid; secret values were not printed.")
           PY
 
-      - name: Install XcodeGen
+      - name: Install pinned tool versions
         run: |
           set -euo pipefail
-          brew install xcodegen
+          brew install xcodegen ldid-procursus
           xcodegen --version | grep -F '2.46.0'
+          brew list --versions ldid-procursus | grep -F '2.1.5-procursus7'
 
       - name: Resolve and test core package
         run: |
@@ -86,13 +87,38 @@ jobs:
         run: |
           set -euo pipefail
           APP_PATH="build/PrivateDerivedData/Build/Products/Release-iphoneos/CloudCode.app"
-          if [[ -d "$APP_PATH/Frameworks" ]]; then
-            while IFS= read -r framework; do
-              codesign --force --sign - "$framework"
-            done < <(find "$APP_PATH/Frameworks" -maxdepth 1 -type d -name '*.framework' -print)
-          fi
+          while IFS= read -r dylib; do
+            codesign --force --sign - "$dylib"
+          done < <(find "$APP_PATH" -type f -name '*.dylib' -print)
+          while IFS= read -r framework; do
+            codesign --force --sign - "$framework"
+          done < <(find "$APP_PATH" -type d -name '*.framework' -print | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2-)
+          while IFS= read -r appex; do
+            codesign --force --sign - "$appex"
+          done < <(find "$APP_PATH" -type d -name '*.appex' -print | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2-)
           codesign --force --sign - --entitlements Entitlements/TrollStore.entitlements "$APP_PATH"
           codesign --verify --deep --strict "$APP_PATH"
+
+      - name: TrollStore ldid compatibility preflight
+        run: |
+          set -euo pipefail
+          APP_PATH="build/PrivateDerivedData/Build/Products/Release-iphoneos/CloudCode.app"
+          PREFLIGHT="$RUNNER_TEMP/CloudCode-ldid-preflight.app"
+          rm -rf "$PREFLIGHT"
+          cp -R "$APP_PATH" "$PREFLIGHT"
+          while IFS= read -r dylib; do
+            ldid -S "$dylib"
+          done < <(find "$PREFLIGHT" -type f -name '*.dylib' -print)
+          while IFS= read -r framework; do
+            framework_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$framework/Info.plist")"
+            test -f "$framework/$framework_name"
+            ldid -S "$framework/$framework_name"
+          done < <(find "$PREFLIGHT" -type d -name '*.framework' -print)
+          MAIN_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PREFLIGHT/Info.plist")"
+          ldid -SEntitlements/TrollStore.entitlements "$PREFLIGHT/$MAIN_EXECUTABLE"
+          ldid -e "$PREFLIGHT/$MAIN_EXECUTABLE" | plutil -lint - >/dev/null
+          rm -rf "$PREFLIGHT"
+          echo 'PASS: TrollStore-compatible ldid can process all embedded Mach-O bundles'
 
       - name: Package private TrollStore IPA
         run: |
