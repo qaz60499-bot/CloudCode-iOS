@@ -88,10 +88,8 @@ private final class ProviderStreamingTransport: NSObject, URLSessionDataDelegate
     func start() async throws -> (HTTPURLResponse, AsyncThrowingStream<String, Error>) {
         let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
         let dataTask = session.dataTask(with: request)
-        lock.lock()
         ownedSession = session
         task = dataTask
-        lock.unlock()
 
         let response = try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation { continuation in
@@ -475,6 +473,7 @@ private extension ProviderRequestBuilding {
                 var attempt = 1
                 while attempt <= retryPolicy.maxAttempts {
                     var responseStarted = false
+                    var successfulStreamEstablished = false
                     do {
                         let request = try makeRequest(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
                         let transport = ProviderStreamingTransport(configuration: session.configuration, request: request)
@@ -494,6 +493,7 @@ private extension ProviderRequestBuilding {
                             }
                             throw ProviderHTTPClassifier.error(for: http.statusCode, body: body) ?? ProviderError.invalidResponse(http.statusCode)
                         }
+                        successfulStreamEstablished = true
                         responseStarted = try await consume(lines: lines, continuation: continuation)
                         continuation.yield(.finished)
                         continuation.finish()
@@ -502,7 +502,8 @@ private extension ProviderRequestBuilding {
                         continuation.finish(throwing: CancellationError())
                         return
                     } catch {
-                        let mayReplay = !responseStarted
+                        let mayReplay = !successfulStreamEstablished
+                            && !responseStarted
                             && attempt < retryPolicy.maxAttempts
                             && ProviderRetryClassifier.isRetryableBeforeOutput(error)
                         guard mayReplay else {
