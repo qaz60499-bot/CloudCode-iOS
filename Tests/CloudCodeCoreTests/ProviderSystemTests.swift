@@ -45,6 +45,17 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertTrue(provider.autoRotateKeys)
     }
 
+    func testAgentRouterUsesCurrentOriginAndExplicitPerModelProtocols() throws {
+        let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-agentrouter-org" }))
+        XCTAssertEqual(provider.baseURL.absoluteString, "https://co.agentrouter.org")
+        XCTAssertEqual(provider.authMode, .bearer)
+        XCTAssertEqual(provider.protocolFor(model: "claude-opus-4-8", keySlotID: "slot-1"), .anthropic)
+        XCTAssertEqual(provider.protocolFor(model: "claude-opus-5", keySlotID: "slot-1"), .anthropic)
+        XCTAssertEqual(provider.protocolFor(model: "deepseek-v4-flash", keySlotID: "slot-1"), .openAIChat)
+        XCTAssertEqual(provider.protocolFor(model: "gpt-5.6-sol", keySlotID: "slot-1"), .openAIChat)
+        XCTAssertFalse(provider.protocols.contains(.openAIResponses))
+    }
+
     func testPerKeyModelScopeOverridesProviderCatalog() throws {
         let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-sharellm-cn" }))
         let key1 = provider.models(for: "slot-1")
@@ -145,6 +156,18 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertThrowsError(try ProviderCheckpointConfigurationResolver.resolve(payload: endpointTampered, profiles: profiles)) { error in
             XCTAssertEqual(error as? ProviderCheckpointConfigurationError, .endpointMismatch)
         }
+
+        let agentRouter = try XCTUnwrap(profiles.first(where: { $0.id == "https-agentrouter-org" }))
+        let agentRouterReference = ProviderCatalog.keyReference(providerID: agentRouter.id, keySlotID: "slot-1")
+        let migratedAgentRouter = try ProviderCheckpointConfigurationResolver.resolve(payload: [
+            "provider.id": agentRouter.id,
+            "provider.baseURL": "https://agentrouter.org",
+            "provider.model": "deepseek-v4-flash",
+            "provider.keyReference": agentRouterReference,
+            "provider.sameProviderFailover": "false"
+        ], profiles: profiles)
+        XCTAssertEqual(migratedAgentRouter.baseURL.absoluteString, "https://co.agentrouter.org")
+        XCTAssertEqual(migratedAgentRouter.protocolName, ProviderProtocol.openAIChat.rawValue)
 
         let otherProvider = try XCTUnwrap(profiles.first(where: { $0.id != provider.id }))
         var crossProvider = payload
@@ -490,6 +513,59 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
         XCTAssertEqual(request.value(forHTTPHeaderField: "x-api-key"), "test-secret")
         XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-version"), "2023-06-01")
+    }
+
+    func testAgentRouterDeepSeekUsesOpenAIChatCurrentOriginAndBearerAuth() async throws {
+        let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-agentrouter-org" }))
+        let protocolName = provider.protocolFor(model: "deepseek-v4-flash", keySlotID: "slot-1")
+        XCTAssertEqual(protocolName, .openAIChat)
+        ProviderTestURLProtocol.install(
+            status: 200,
+            body: Data("data: [DONE]\n\n".utf8),
+            headers: ["Content-Type": "text/event-stream"]
+        )
+        let client = OpenAICompatibleProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let configuration = ProviderConfiguration(
+            name: provider.displayName,
+            baseURL: provider.baseURL,
+            model: "deepseek-v4-flash",
+            apiKeyReference: ProviderCatalog.keyReference(providerID: provider.id, keySlotID: "slot-1"),
+            providerID: provider.id,
+            protocolName: protocolName.rawValue,
+            authModeName: provider.authMode.rawValue
+        )
+        for try await _ in client.stream(configuration: configuration, apiKey: "test-secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
+        let request = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
+        XCTAssertEqual(request.url?.absoluteString, "https://co.agentrouter.org/v1/chat/completions")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
+        XCTAssertNil(request.value(forHTTPHeaderField: "x-api-key"))
+        XCTAssertNil(request.value(forHTTPHeaderField: "anthropic-version"))
+    }
+
+    func testProviderEndpointReplacesFullProtocolEndpointWithoutDuplicatingV1() async throws {
+        ProviderTestURLProtocol.install(status: 200, body: Data("data: [DONE]\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let chat = OpenAICompatibleProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let chatConfiguration = ProviderConfiguration(
+            name: "chat",
+            baseURL: URL(string: "https://example.com/v1/messages")!,
+            model: "m",
+            apiKeyReference: "key",
+            protocolName: ProviderProtocol.openAIChat.rawValue
+        )
+        for try await _ in chat.stream(configuration: chatConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://example.com/v1/chat/completions")
+
+        ProviderTestURLProtocol.install(status: 200, body: Data("data: {\"type\":\"message_stop\"}\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let anthropic = AnthropicProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let anthropicConfiguration = ProviderConfiguration(
+            name: "anthropic",
+            baseURL: URL(string: "https://example.com/v1/chat/completions")!,
+            model: "m",
+            apiKeyReference: "key",
+            protocolName: ProviderProtocol.anthropic.rawValue
+        )
+        for try await _ in anthropic.stream(configuration: anthropicConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://example.com/v1/messages")
     }
 
     func testResponsesStreamingTextAndToolCall() async throws {

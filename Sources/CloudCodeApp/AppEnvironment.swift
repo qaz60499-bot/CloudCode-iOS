@@ -1152,6 +1152,18 @@ public final class CloudCodeViewModel: ObservableObject {
         }
     }
 
+    public func clearDiagnosticLogs() async -> Bool {
+        do {
+            try await diagnosticLogStore.clearAll()
+            diagnosticLogs = []
+            diagnosticLogBytes = 0
+            return true
+        } catch {
+            lastError = "清空诊断日志失败：\(error)"
+            return false
+        }
+    }
+
     public func exportDiagnosticBundle() async throws -> URL {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -1471,7 +1483,14 @@ public final class CloudCodeViewModel: ObservableObject {
     private func importProviderBootstrapNow(from url: URL, removeSource: Bool) async throws -> Int {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        var data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        let secureMutation = SecureFileMutation()
+        let sourceIdentity = try secureMutation.identity(of: url, allowedRoot: nil)
+        var data = try secureMutation.readFile(
+            at: url,
+            allowedRoot: nil,
+            expectedIdentity: sourceIdentity,
+            maxBytes: 1_048_576
+        )
         defer { data.resetBytes(in: 0..<data.count) }
         let payload = try ProviderBootstrapPayload.decodeBootstrap(from: data)
         guard payload.schemaVersion == 1 else { throw CocoaError(.fileReadCorruptFile) }
@@ -1498,7 +1517,11 @@ public final class CloudCodeViewModel: ObservableObject {
             vault: keyVault,
             finalizer: {
                 if removeSource {
-                    try FileManager.default.removeItem(at: url)
+                    try secureMutation.removeFile(
+                        at: url,
+                        allowedRoot: nil,
+                        expectedIdentity: sourceIdentity
+                    )
                 }
             }
         )

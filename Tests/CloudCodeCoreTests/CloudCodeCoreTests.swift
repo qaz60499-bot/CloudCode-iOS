@@ -99,6 +99,23 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertLessThanOrEqual(total, maxBytes)
     }
 
+    func testDiagnosticLogStoreClearAllRemovesRuntimeLogsAndAllowsFreshWrites() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = DiagnosticLogStore(directory: root.appendingPathComponent("logs", isDirectory: true))
+        try await store.log(level: .info, subsystem: "test", action: "before-clear", result: "ok")
+        XCTAssertFalse(try await store.readAll().isEmpty)
+        XCTAssertGreaterThan(try await store.totalBytes(), 0)
+
+        try await store.clearAll()
+        XCTAssertTrue(try await store.readAll().isEmpty)
+        XCTAssertEqual(try await store.totalBytes(), 0)
+
+        try await store.log(level: .info, subsystem: "test", action: "after-clear", result: "ok")
+        let records = try await store.readAll()
+        XCTAssertEqual(records.map(\.action), ["after-clear"])
+    }
+
     func testDiagnosticLogStoreSurvivesRestartAndKeepsRecentRecords() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -373,6 +390,50 @@ final class CloudCodeCoreTests: XCTestCase {
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: parked.appendingPathComponent("new.txt").path))
+    }
+
+    func testSecureRemoveRejectsLeafReplacementAtFinalBoundary() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        try FileManager.default.createDirectory(at: allowed, withIntermediateDirectories: true)
+        let target = allowed.appendingPathComponent("source.txt")
+        let parked = allowed.appendingPathComponent("source-original.txt")
+        try Data("original".utf8).write(to: target)
+        let identity = try SecureFileMutation().identity(of: target, allowedRoot: allowed)
+        let mutation = SecureFileMutation(beforeFinalMutation: {
+            try? FileManager.default.moveItem(at: target, to: parked)
+            try? Data("replacement".utf8).write(to: target)
+        })
+
+        XCTAssertThrowsError(try mutation.removeFile(at: target, allowedRoot: allowed, expectedIdentity: identity)) { error in
+            XCTAssertEqual(error as? SecureFileMutationError, .verificationFailed)
+        }
+        XCTAssertEqual(String(data: try Data(contentsOf: parked), encoding: .utf8), "original")
+        XCTAssertEqual(String(data: try Data(contentsOf: target), encoding: .utf8), "replacement")
+    }
+
+    func testSecureRemoveRejectsParentReplacementAtFinalBoundary() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let allowed = root.appendingPathComponent("allowed", isDirectory: true)
+        let parent = allowed.appendingPathComponent("parent", isDirectory: true)
+        let parked = allowed.appendingPathComponent("parent-original", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let target = parent.appendingPathComponent("source.txt")
+        try Data("original".utf8).write(to: target)
+        let identity = try SecureFileMutation().identity(of: target, allowedRoot: allowed)
+        let mutation = SecureFileMutation(beforeFinalMutation: {
+            try? FileManager.default.moveItem(at: parent, to: parked)
+            try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+            try? Data("attacker".utf8).write(to: parent.appendingPathComponent("source.txt"))
+        })
+
+        XCTAssertThrowsError(try mutation.removeFile(at: target, allowedRoot: allowed, expectedIdentity: identity)) { error in
+            XCTAssertEqual(error as? SecureFileMutationError, .verificationFailed)
+        }
+        XCTAssertEqual(String(data: try Data(contentsOf: parked.appendingPathComponent("source.txt")), encoding: .utf8), "original")
+        XCTAssertEqual(String(data: try Data(contentsOf: parent.appendingPathComponent("source.txt")), encoding: .utf8), "attacker")
     }
 
     func testSecureCopyRejectsSourceLeafReplacement() throws {

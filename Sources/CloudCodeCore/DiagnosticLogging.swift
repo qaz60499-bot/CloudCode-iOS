@@ -330,6 +330,17 @@ public actor DiagnosticLogStore {
         return try logFileURLsWithMetadata().reduce(Int64(0)) { $0 + $1.size }
     }
 
+    public func clearAll() throws {
+        guard fileManager.fileExists(atPath: directory.path) else {
+            lastCleanupAt = Date()
+            return
+        }
+        for url in try logFileURLs() {
+            try fileManager.removeItem(at: url)
+        }
+        lastCleanupAt = Date()
+    }
+
     private func activeLogURL(at date: Date) throws -> URL {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")

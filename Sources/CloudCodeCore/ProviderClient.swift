@@ -498,8 +498,12 @@ private extension ProviderRequestBuilding {
                             metadata: [
                                 "providerID": configuration.providerID ?? "",
                                 "model": configuration.model,
+                                "protocol": configuration.protocolName ?? "",
+                                "authMode": configuration.authModeName ?? ProviderAuthMode.bearer.rawValue,
                                 "attempt": String(attempt),
                                 "maxAttempts": String(retryPolicy.maxAttempts),
+                                "host": request.url?.host ?? configuration.baseURL.host ?? "",
+                                "endpointPath": request.url?.path ?? configuration.baseURL.path,
                                 "endpoint": endpoint,
                                 "transportState": "connecting"
                             ]
@@ -516,7 +520,10 @@ private extension ProviderRequestBuilding {
                                 "statusCode": String(http.statusCode),
                                 "attempt": String(attempt),
                                 "providerID": configuration.providerID ?? "",
-                                "model": configuration.model
+                                "model": configuration.model,
+                                "protocol": configuration.protocolName ?? "",
+                                "host": http.url?.host ?? request.url?.host ?? "",
+                                "endpointPath": http.url?.path ?? request.url?.path ?? ""
                             ]
                         )
                         if !(200..<300).contains(http.statusCode) {
@@ -585,6 +592,9 @@ private extension ProviderRequestBuilding {
                                     "providerID": configuration.providerID ?? "",
                                     "model": configuration.model,
                                     "endpoint": endpoint,
+                                    "protocol": configuration.protocolName ?? "",
+                                    "host": configuration.baseURL.host ?? "",
+                                    "endpointPath": endpoint.dropFirst((configuration.baseURL.host ?? "").count).description,
                                     "responseStarted": String(responseStarted),
                                     "streamEstablished": String(successfulStreamEstablished),
                                     "transportState": successfulStreamEstablished ? "http_stream_failed" : "connect_failed",
@@ -611,6 +621,9 @@ private extension ProviderRequestBuilding {
                                 "providerID": configuration.providerID ?? "",
                                 "model": configuration.model,
                                 "endpoint": endpoint,
+                                "protocol": configuration.protocolName ?? "",
+                                "host": configuration.baseURL.host ?? "",
+                                "endpointPath": endpoint.dropFirst((configuration.baseURL.host ?? "").count).description,
                                 "responseStarted": String(responseStarted),
                                 "streamEstablished": String(successfulStreamEstablished),
                                 "transportState": successfulStreamEstablished ? "http_stream_retry" : "connect_retry",
@@ -1008,6 +1021,8 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                 var lastError: Error = ProviderError.missingAPIKey
                 for (index, candidate) in candidates.enumerated() {
                     var emittedOutput = false
+                    var emittedToken = false
+                    var emittedToolCall = false
                     try? await diagnosticLogger?.log(
                         level: .info,
                         subsystem: "provider",
@@ -1015,8 +1030,10 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                         result: "started",
                         metadata: [
                             "providerID": configuration.providerID ?? "",
+                            "protocol": configuration.protocolName ?? "",
                             "keyReference": candidate.0,
-                            "candidateIndex": String(index)
+                            "candidateIndex": String(index),
+                            "fallbackKey": index == 0 ? "false" : "true"
                         ]
                     )
                     do {
@@ -1024,8 +1041,12 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                         for try await event in stream {
                             try Task.checkCancellation()
                             switch event {
-                            case .token, .toolCall:
+                            case .token:
                                 emittedOutput = true
+                                emittedToken = true
+                            case .toolCall:
+                                emittedOutput = true
+                                emittedToolCall = true
                             case .finished:
                                 break
                             }
@@ -1037,7 +1058,14 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                             subsystem: "provider",
                             action: "key-slot.attempt",
                             result: "completed",
-                            metadata: ["providerID": configuration.providerID ?? "", "keyReference": candidate.0]
+                            metadata: [
+                                "providerID": configuration.providerID ?? "",
+                                "protocol": configuration.protocolName ?? "",
+                                "keyReference": candidate.0,
+                                "fallbackKey": index == 0 ? "false" : "true",
+                                "emittedToken": String(emittedToken),
+                                "emittedToolCall": String(emittedToolCall)
+                            ]
                         )
                         continuation.finish()
                         return
@@ -1048,6 +1076,23 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                         lastError = error
                         let hasAnother = index + 1 < candidates.count
                         let mayRotate = !emittedOutput && hasAnother && configuration.allowSameProviderKeyFailover == true && ProviderKeyRotationClassifier.shouldRotate(error)
+                        try? await diagnosticLogger?.log(
+                            level: .error,
+                            subsystem: "provider",
+                            action: "key-slot.failure",
+                            result: "failed",
+                            error: error,
+                            metadata: [
+                                "providerID": configuration.providerID ?? "",
+                                "protocol": configuration.protocolName ?? "",
+                                "keyReference": candidate.0,
+                                "candidateIndex": String(index),
+                                "fallbackKey": index == 0 ? "false" : "true",
+                                "emittedToken": String(emittedToken),
+                                "emittedToolCall": String(emittedToolCall),
+                                "rotationAllowed": String(mayRotate)
+                            ]
+                        )
                         if mayRotate {
                             try? await diagnosticLogger?.log(
                                 level: .warning,
@@ -1055,7 +1100,14 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                                 action: "key-slot.rotate",
                                 result: "rotating",
                                 error: error,
-                                metadata: ["providerID": configuration.providerID ?? "", "fromKeyReference": candidate.0]
+                                metadata: [
+                                    "providerID": configuration.providerID ?? "",
+                                    "protocol": configuration.protocolName ?? "",
+                                    "fromKeyReference": candidate.0,
+                                    "nextCandidateIndex": String(index + 1),
+                                    "emittedToken": String(emittedToken),
+                                    "emittedToolCall": String(emittedToolCall)
+                                ]
                             )
                             continue
                         }
@@ -1186,18 +1238,36 @@ private enum ProviderFailureEvidence {
     }
 }
 
-private enum ProviderEndpoint {
+enum ProviderEndpoint {
+    private static let knownEndpointSuffixes: [[String]] = [
+        ["messages"],
+        ["chat", "completions"],
+        ["responses"]
+    ]
+
     static func endpoint(baseURL: URL, path: String) throws -> URL {
         guard ProviderEndpointPolicy.allowsBaseURL(baseURL) else { throw ProviderError.invalidEndpoint }
         var url = baseURL
-        let normalizedPath = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        if normalizedPath.hasSuffix(path) { return url }
-        if normalizedPath.isEmpty {
-            url.appendPathComponent("v1")
-        } else if normalizedPath != "v1" && !normalizedPath.hasSuffix("/v1") {
-            url.appendPathComponent("v1")
+        var baseComponents = url.path
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map(String.init)
+        let requestedComponents = path
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map(String.init)
+        guard !requestedComponents.isEmpty else { throw ProviderError.invalidEndpoint }
+
+        if baseComponents.suffix(requestedComponents.count).elementsEqual(requestedComponents) {
+            return url
         }
-        url.appendPathComponent(path)
+        for suffix in knownEndpointSuffixes where baseComponents.suffix(suffix.count).elementsEqual(suffix) {
+            baseComponents.removeLast(suffix.count)
+            break
+        }
+        if baseComponents.last != "v1" {
+            baseComponents.append("v1")
+        }
+        baseComponents.append(contentsOf: requestedComponents)
+        url.path = "/" + baseComponents.joined(separator: "/")
         return url
     }
 }

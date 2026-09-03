@@ -38,11 +38,21 @@ struct ChatAttachmentStore: Sendable {
 
     func remove(_ attachment: ChatAttachment) throws {
         let fileManager = FileManager.default
-        let path = URL(fileURLWithPath: attachment.path).standardizedFileURL.path
-        let rootPath = root.standardizedFileURL.path
-        guard path == rootPath || path.hasPrefix(rootPath + "/") else { return }
-        guard fileManager.fileExists(atPath: path) else { return }
-        try fileManager.removeItem(atPath: path)
+        let candidate = URL(fileURLWithPath: attachment.path).standardizedFileURL
+        guard fileManager.fileExists(atPath: candidate.path) else { return }
+        let approved = try PathGuard().validate(
+            target: candidate,
+            allowedRoot: root,
+            rejectSymlink: true,
+            fileManager: fileManager
+        )
+        let secureMutation = SecureFileMutation()
+        let identity = try secureMutation.identity(of: approved, allowedRoot: root)
+        try secureMutation.removeFile(
+            at: approved,
+            allowedRoot: root,
+            expectedIdentity: identity
+        )
     }
 
     func removeAll(for sessionID: UUID) throws {

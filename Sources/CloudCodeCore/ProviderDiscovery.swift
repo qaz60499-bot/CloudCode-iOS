@@ -67,7 +67,7 @@ public struct ProviderDiscoveryClient: Sendable {
     }
 
     public func discoverModels(baseURL: URL, apiKey: String, authMode: ProviderAuthMode = .bearer) async throws -> [String] {
-        let url = try discoveryEndpoint(baseURL: baseURL, path: "models")
+        let url = try ProviderEndpoint.endpoint(baseURL: baseURL, path: "models")
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         applyAuth(apiKey, mode: authMode, request: &request)
@@ -99,7 +99,7 @@ public struct ProviderDiscoveryClient: Sendable {
             path = "responses"
             body = ["model": model, "max_output_tokens": 1, "input": "Reply OK"]
         }
-        let url = try discoveryEndpoint(baseURL: baseURL, path: path)
+        let url = try ProviderEndpoint.endpoint(baseURL: baseURL, path: path)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -116,17 +116,6 @@ public struct ProviderDiscoveryClient: Sendable {
         } catch let error as URLError where error.code == .timedOut || error.code == .networkConnectionLost {
             return false
         }
-    }
-
-    private func discoveryEndpoint(baseURL: URL, path: String) throws -> URL {
-        guard ProviderEndpointPolicy.allowsBaseURL(baseURL) else { throw ProviderError.invalidEndpoint }
-        var url = baseURL
-        let normalized = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        if normalized.hasSuffix(path) { return url }
-        if normalized.isEmpty { url.appendPathComponent("v1") }
-        else if normalized != "v1" && !normalized.hasSuffix("/v1") { url.appendPathComponent("v1") }
-        url.appendPathComponent(path)
-        return url
     }
 
     private func applyAuth(_ key: String, mode: ProviderAuthMode, request: inout URLRequest) {

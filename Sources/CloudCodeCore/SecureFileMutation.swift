@@ -122,6 +122,43 @@ public struct SecureFileMutation: Sendable {
         return output
     }
 
+    public func removeFile(
+        at approvedTarget: URL,
+        allowedRoot: URL?,
+        expectedIdentity: SecureFileIdentity? = nil
+    ) throws {
+        let parent = try openParent(of: approvedTarget, allowedRoot: allowedRoot, createIntermediates: false)
+        defer { close(parent.fd) }
+
+        var initialStat = stat()
+        let initialStatus = parent.leaf.withCString {
+            fstatat(parent.fd, $0, &initialStat, AT_SYMLINK_NOFOLLOW)
+        }
+        guard initialStatus == 0 else { throw SecureFileMutationError.posix(errno) }
+        guard (initialStat.st_mode & S_IFMT) == S_IFREG else { throw SecureFileMutationError.invalidPath }
+        try requireIdentity(expectedIdentity, actual: initialStat)
+        try assertPinnedDirectoryStillMatches(parent.fd, path: parent.path)
+
+        beforeFinalMutation?()
+        try assertPinnedDirectoryStillMatches(parent.fd, path: parent.path)
+        try assertLeafStillMatches(parentFD: parent.fd, leaf: parent.leaf, expected: initialStat)
+        beforeCommitMutation?()
+        try assertPinnedDirectoryStillMatches(parent.fd, path: parent.path)
+        try assertLeafStillMatches(parentFD: parent.fd, leaf: parent.leaf, expected: initialStat)
+
+        let result = parent.leaf.withCString { unlinkat(parent.fd, $0, 0) }
+        guard result == 0 else { throw SecureFileMutationError.posix(errno) }
+        try assertPinnedDirectoryStillMatches(parent.fd, path: parent.path)
+
+        var finalStat = stat()
+        let finalStatus = parent.leaf.withCString {
+            fstatat(parent.fd, $0, &finalStat, AT_SYMLINK_NOFOLLOW)
+        }
+        guard finalStatus != 0, errno == ENOENT else {
+            throw SecureFileMutationError.verificationFailed
+        }
+    }
+
     public func createFile(
         at approvedTarget: URL,
         data: Data,

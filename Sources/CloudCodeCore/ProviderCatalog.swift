@@ -265,7 +265,7 @@ public enum ProviderCheckpointConfigurationResolver {
             throw ProviderCheckpointConfigurationError.providerUnavailable(providerID)
         }
         if let storedURL = payload["provider.baseURL"], !storedURL.isEmpty,
-           storedURL != profile.baseURL.absoluteString {
+           !checkpointEndpointMatches(storedURL, profile: profile) {
             throw ProviderCheckpointConfigurationError.endpointMismatch
         }
         guard let primaryReference = payload["provider.keyReference"], !primaryReference.isEmpty,
@@ -303,6 +303,16 @@ public enum ProviderCheckpointConfigurationResolver {
             fallbackAPIKeyReferences: allowFailover ? allowedFallbacks : [],
             allowSameProviderKeyFailover: allowFailover
         )
+    }
+
+    private static func checkpointEndpointMatches(_ storedURL: String, profile: ProviderProfile) -> Bool {
+        if storedURL == profile.baseURL.absoluteString { return true }
+        // AgentRouter moved its documented API origin from agentrouter.org to
+        // co.agentrouter.org. Old checkpoints may resume only through this explicit,
+        // provider-scoped migration; arbitrary endpoint changes remain rejected.
+        return profile.id == "https-agentrouter-org"
+            && storedURL == "https://agentrouter.org"
+            && profile.baseURL.absoluteString == "https://co.agentrouter.org"
     }
 }
 
@@ -557,12 +567,24 @@ public enum ProviderCatalog {
             ProviderProfile(
                 id: "https-agentrouter-org",
                 displayName: "agentrouter.org",
-                baseURL: URL(string: "https://agentrouter.org")!,
-                protocols: [.anthropic, .openAIResponses, .openAIChat],
+                baseURL: URL(string: "https://co.agentrouter.org")!,
+                protocols: [.anthropic, .openAIChat],
                 preferredProtocol: .anthropic,
                 authMode: .bearer,
                 models: ["claude-opus-4-8", "claude-opus-5", "deepseek-v4-flash", "gpt-5.6-sol"],
-                keySlots: [ProviderKeySlot(id: "slot-1", label: "Key 1", fingerprint: "105a3fce9a105c41472b926f6448a91be2f9726d5e074adbaaa2206f4d6dbf23", models: ["claude-opus-4-8", "claude-opus-5", "deepseek-v4-flash", "gpt-5.6-sol"], protocols: [.anthropic, .openAIResponses, .openAIChat], modelProtocols: ["claude-opus-4-8": [.anthropic], "claude-opus-5": [.anthropic]])],
+                keySlots: [ProviderKeySlot(
+                    id: "slot-1",
+                    label: "Key 1",
+                    fingerprint: "105a3fce9a105c41472b926f6448a91be2f9726d5e074adbaaa2206f4d6dbf23",
+                    models: ["claude-opus-4-8", "claude-opus-5", "deepseek-v4-flash", "gpt-5.6-sol"],
+                    protocols: [.anthropic, .openAIChat],
+                    modelProtocols: [
+                        "claude-opus-4-8": [.anthropic],
+                        "claude-opus-5": [.anthropic],
+                        "deepseek-v4-flash": [.openAIChat],
+                        "gpt-5.6-sol": [.openAIChat]
+                    ]
+                )],
                 source: .desktopSnapshot,
                 customModelAllowed: true
             ),

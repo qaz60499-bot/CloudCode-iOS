@@ -1174,6 +1174,7 @@ private struct DiagnosticLogsView: View {
     @State private var statusMessage: String?
     @State private var shareItem: DiagnosticShareItem?
     @State private var isExporting = false
+    @State private var isConfirmingClear = false
 
     private var sessionIDs: [UUID] {
         Array(Set(model.diagnosticLogs.compactMap(\.sessionID))).sorted { $0.uuidString < $1.uuidString }
@@ -1229,6 +1230,9 @@ private struct DiagnosticLogsView: View {
                     }
                 }
                 .disabled(isExporting)
+                Button("清空诊断日志", role: .destructive) {
+                    isConfirmingClear = true
+                }
                 LabeledContent("当前日志占用", value: ByteCountFormatter.string(fromByteCount: model.diagnosticLogBytes, countStyle: .file))
                     .font(.caption)
                 if let statusMessage {
@@ -1315,6 +1319,26 @@ private struct DiagnosticLogsView: View {
         }
         .sheet(item: $shareItem) { item in
             DiagnosticActivityShareSheet(items: [item.url])
+        }
+        .confirmationDialog(
+            "清空诊断日志？",
+            isPresented: $isConfirmingClear,
+            titleVisibility: .visible
+        ) {
+            Button("清空诊断日志", role: .destructive) {
+                Task {
+                    if await model.clearDiagnosticLogs() {
+                        selectedSessionID = nil
+                        selectedToolCallID = nil
+                        selectedLevel = nil
+                        query = ""
+                        statusMessage = "诊断日志已清空；审计记录、事务记录和回收站日志未删除。"
+                    }
+                }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("仅清空运行时诊断日志，方便重新复现后导出更小的日志；不会删除审计、事务、回收站或会话数据。")
         }
     }
 }
