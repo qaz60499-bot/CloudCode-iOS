@@ -33,6 +33,14 @@ jobs:
           secret = provider["keys"][0]["secret"]
           base = "https://tabitoken.com/v1"
 
+          def fall_back_if_billing_blocked(label, status, expected=200):
+              if status == expected:
+                  return
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("billing_blocked=true\n")
+              print(f"::warning::{label} hit provider credit/preauthorization limits. Remaining live-generation probes are skipped; deterministic Provider regressions will run instead.")
+              raise SystemExit(0)
+
           def request(label, method, path, payload=None, extra_headers=None, expected=200, allow_billing_block=False):
               data = None if payload is None else json.dumps(payload).encode("utf-8")
               headers = {
@@ -59,7 +67,7 @@ jobs:
               if status != expected:
                   billing_blocked = status in (402, 403) and any(marker in body for marker in ("预扣费额度失败", "insufficient balance", "insufficient credit", "precharge"))
                   if allow_billing_block and billing_blocked:
-                      print(f"::warning::{label} is blocked by provider account credit/preauthorization; continuing code-path smoke tests with the base model.")
+                      print(f"::warning::{label} is blocked by provider account credit/preauthorization; the workflow will switch to deterministic Provider regressions.")
                       return status, body
                   raise SystemExit(f"FAIL: {label} expected HTTP {expected}, got {status}")
               return status, body
@@ -94,19 +102,17 @@ jobs:
               "messages": [{"role": "user", "content": "Reply OK"}],
           }
           minimal_status, _ = request("anthropic-minimal", "POST", "/messages", base_anthropic, {"anthropic-version": "2023-06-01"}, allow_billing_block=True)
-          if minimal_status != 200:
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-                  output.write("billing_blocked=true\n")
-              print("::warning::Live generation probes are skipped because the provider account cannot satisfy preauthorization. Models/auth reachability were still verified, and deterministic Provider regressions will run instead.")
-              raise SystemExit(0)
+          fall_back_if_billing_blocked("anthropic-minimal", minimal_status)
 
           thinking = dict(base_anthropic)
           thinking["model"] = "claude-opus-5-thinking"
-          request("anthropic-thinking-minimal", "POST", "/messages", thinking, {"anthropic-version": "2023-06-01"}, allow_billing_block=True)
+          thinking_status, _ = request("anthropic-thinking-minimal", "POST", "/messages", thinking, {"anthropic-version": "2023-06-01"}, allow_billing_block=True)
+          fall_back_if_billing_blocked("anthropic-thinking-minimal", thinking_status)
 
           large = dict(base_anthropic)
           large["max_tokens"] = 8192
-          request("anthropic-max8192", "POST", "/messages", large, {"anthropic-version": "2023-06-01"})
+          large_status, _ = request("anthropic-max8192", "POST", "/messages", large, {"anthropic-version": "2023-06-01"}, allow_billing_block=True)
+          fall_back_if_billing_blocked("anthropic-max8192", large_status)
 
           with_tool = dict(base_anthropic)
           with_tool["tools"] = [{
@@ -119,7 +125,8 @@ jobs:
                   "additionalProperties": False,
               },
           }]
-          request("anthropic-tool", "POST", "/messages", with_tool, {"anthropic-version": "2023-06-01"})
+          tool_status, _ = request("anthropic-tool", "POST", "/messages", with_tool, {"anthropic-version": "2023-06-01"}, allow_billing_block=True)
+          fall_back_if_billing_blocked("anthropic-tool", tool_status)
 
           dotted_tool = dict(base_anthropic)
           dotted_tool["tools"] = [{
@@ -132,16 +139,18 @@ jobs:
                   "additionalProperties": False,
               },
           }]
-          request("anthropic-tool-dotted-name", "POST", "/messages", dotted_tool, {"anthropic-version": "2023-06-01"}, expected=400)
+          dotted_status, _ = request("anthropic-tool-dotted-name", "POST", "/messages", dotted_tool, {"anthropic-version": "2023-06-01"}, expected=400, allow_billing_block=True)
+          fall_back_if_billing_blocked("anthropic-tool-dotted-name", dotted_status, expected=400)
 
-          request("openai-chat-minimal", "POST", "/chat/completions", {
+          openai_minimal_status, _ = request("openai-chat-minimal", "POST", "/chat/completions", {
               "model": "claude-opus-5",
               "max_tokens": 1,
               "stream": False,
               "messages": [{"role": "user", "content": "Reply OK"}],
-          })
+          }, allow_billing_block=True)
+          fall_back_if_billing_blocked("openai-chat-minimal", openai_minimal_status)
 
-          request("openai-chat-tool", "POST", "/chat/completions", {
+          openai_tool_status, _ = request("openai-chat-tool", "POST", "/chat/completions", {
               "model": "claude-opus-5",
               "max_tokens": 1,
               "stream": False,
@@ -159,9 +168,10 @@ jobs:
                       },
                   },
               }],
-          })
+          }, allow_billing_block=True)
+          fall_back_if_billing_blocked("openai-chat-tool", openai_tool_status)
 
-          request("openai-chat-tool-dotted-name", "POST", "/chat/completions", {
+          openai_dotted_status, _ = request("openai-chat-tool-dotted-name", "POST", "/chat/completions", {
               "model": "claude-opus-5",
               "max_tokens": 1,
               "stream": False,
@@ -179,7 +189,8 @@ jobs:
                       },
                   },
               }],
-          }, expected=400)
+          }, expected=400, allow_billing_block=True)
+          fall_back_if_billing_blocked("openai-chat-tool-dotted-name", openai_dotted_status, expected=400)
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write("billing_blocked=false\n")
           PY
