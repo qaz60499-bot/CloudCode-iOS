@@ -486,14 +486,17 @@ jobs:
                       "/messages",
                       probe_payload,
                       {"anthropic-version": "2023-06-01"},
-                      allow_billing_block=True,
+                      allow_billing_block=False,
                       fail_on_mismatch=False,
                   )
-                  enter_billing_fallback(f"anthropic-model-candidate-key{key_index}", probe_status, probe_body)
                   if 200 <= probe_status < 300:
                       selected_model = candidate
                       base_anthropic = probe_payload
                       selected_key_index = key_index
+                      break
+                  if is_billing_block(probe_status, probe_body):
+                      inference_auth_rejected = True
+                      print(f"::warning::Tabitoken key {key_index} has explicit key-scoped credit/capacity exhaustion; rotating to the next configured key instead of marking the whole provider blocked.")
                       break
                   if probe_status in (401, 403):
                       inference_auth_rejected = True

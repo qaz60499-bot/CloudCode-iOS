@@ -1582,7 +1582,21 @@ private final class ProviderEmptyCatalogLiveInferenceURLProtocol: URLProtocol, @
             status = 200
             body = Data(#"{"data":[],"success":true}"#.utf8)
         } else if url.path.hasSuffix("/v1/messages") {
-            let requestBody = request.httpBody.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            var rawRequestBody = request.httpBody
+            if rawRequestBody == nil, let stream = request.httpBodyStream {
+                stream.open()
+                defer { stream.close() }
+                var data = Data()
+                let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+                defer { buffer.deallocate() }
+                while true {
+                    let count = stream.read(buffer, maxLength: 4096)
+                    if count <= 0 { break }
+                    data.append(buffer, count: count)
+                }
+                rawRequestBody = data
+            }
+            let requestBody = rawRequestBody.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             let model = requestBody?["model"] as? String
             if model == "claude-opus-live",
                request.value(forHTTPHeaderField: "Authorization") == "Bearer test-secret",
