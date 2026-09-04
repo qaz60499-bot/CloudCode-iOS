@@ -526,7 +526,8 @@ private extension ProviderRequestBuilding {
                                 "model": configuration.model,
                                 "protocol": configuration.protocolName ?? "",
                                 "host": http.url?.host ?? request.url?.host ?? "",
-                                "endpointPath": http.url?.path ?? request.url?.path ?? ""
+                                "endpointPath": http.url?.path ?? request.url?.path ?? "",
+                                "contentType": http.value(forHTTPHeaderField: "Content-Type") ?? ""
                             ]
                         )
                         if !(200..<300).contains(http.statusCode) {
@@ -1418,6 +1419,7 @@ private enum ProviderRequestFactory {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream, application/json", forHTTPHeaderField: "Accept")
         switch authMode {
         case .bearer:
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")

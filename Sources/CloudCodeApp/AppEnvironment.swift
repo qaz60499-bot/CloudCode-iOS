@@ -83,6 +83,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private var backgroundWindowTask: Task<Void, Never>?
     private var didBootstrap = false
     private static let providerKeyMutationOperationKey = "provider-key:mutation"
+    private static let bundledProviderBootstrapFingerprintDefaultsKey = "provider.bootstrap.bundle.fingerprint"
     private static let autoResumeTaskDefaultsKey = "task.autoResumeUnlessStopped"
     private static let backgroundContinuationWindow: TimeInterval = 90 * 60
 
@@ -1540,15 +1541,20 @@ public final class CloudCodeViewModel: ObservableObject {
             return
         }
 
-        let bundledCatalogFullyConfigured = ProviderCatalog.desktopSnapshot.allSatisfy { provider in
-            provider.keySlots.allSatisfy { slot in
-                isKeyInstalled(providerID: provider.id, keySlotID: slot.id)
-            }
+        guard let bundled = Bundle.main.url(forResource: "CloudCode-Provider-Bootstrap", withExtension: "json") else { return }
+        var bundledData = try Data(contentsOf: bundled, options: [.mappedIfSafe])
+        defer { bundledData.resetBytes(in: 0..<bundledData.count) }
+        guard bundledData.count <= 1_048_576 else { throw CocoaError(.fileReadTooLarge) }
+        let bundledFingerprint = ProviderFingerprint.sha256(bundledData)
+        let defaults = UserDefaults.standard
+        if defaults.string(forKey: Self.bundledProviderBootstrapFingerprintDefaultsKey) == bundledFingerprint {
+            let payload = try ProviderBootstrapPayload.decodeBootstrap(from: bundledData)
+            try applyProviderBootstrapFingerprints(payload, status: nil)
+            return
         }
-        guard !bundledCatalogFullyConfigured,
-              let bundled = Bundle.main.url(forResource: "CloudCode-Provider-Bootstrap", withExtension: "json") else { return }
         let count = try await importProviderBootstrapNow(from: bundled, removeSource: false)
-        activityLines.append("检测到私有 Key 版 IPA，已自动配置 \(count) 个 Key 到 iOS Keychain。")
+        defaults.set(bundledFingerprint, forKey: Self.bundledProviderBootstrapFingerprintDefaultsKey)
+        activityLines.append("检测到新的私有 Key 配置，已同步 \(count) 个 Key 到 iOS Keychain。")
     }
 
     private func importProviderBootstrapNow(from url: URL, removeSource: Bool) async throws -> Int {
@@ -1574,7 +1580,6 @@ public final class CloudCodeViewModel: ObservableObject {
             for key in providerKeys.keys {
                 guard let slot = profile.keySlots.first(where: { $0.id == key.slotID }), !key.secret.isEmpty else { continue }
                 let fingerprint = ProviderFingerprint.sha256(key.secret)
-                if !slot.fingerprint.isEmpty, slot.fingerprint != fingerprint { throw CocoaError(.fileReadCorruptFile) }
                 if let declared = key.fingerprint, !declared.isEmpty, declared != fingerprint { throw CocoaError(.fileReadCorruptFile) }
                 let reference = ProviderCatalog.keyReference(providerID: profile.id, keySlotID: slot.id)
                 guard plannedReferences.insert(reference).inserted else { throw CocoaError(.fileReadCorruptFile) }
@@ -1607,7 +1612,26 @@ public final class CloudCodeViewModel: ObservableObject {
                 }
             }
         )
+        try applyProviderBootstrapFingerprints(payload, status: .needsValidation)
         return importedCount
+    }
+
+    private func applyProviderBootstrapFingerprints(_ payload: ProviderBootstrapPayload, status: ProviderKeyStatus?) throws {
+        var customProviderChanged = false
+        for providerKeys in payload.providers {
+            guard let providerIndex = providerProfiles.firstIndex(where: { $0.id == providerKeys.providerID && $0.enabled }) else { continue }
+            for key in providerKeys.keys where !key.secret.isEmpty {
+                guard let slotIndex = providerProfiles[providerIndex].keySlots.firstIndex(where: { $0.id == key.slotID }) else { continue }
+                let fingerprint = ProviderFingerprint.sha256(key.secret)
+                if let declared = key.fingerprint, !declared.isEmpty, declared != fingerprint {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                providerProfiles[providerIndex].keySlots[slotIndex].fingerprint = fingerprint
+                if let status { providerProfiles[providerIndex].keySlots[slotIndex].status = status }
+                customProviderChanged = customProviderChanged || providerProfiles[providerIndex].source == .custom
+            }
+        }
+        if customProviderChanged { try? persistCustomProviders() }
     }
 
     private func restoreSessionState() async throws {
@@ -1784,7 +1808,7 @@ public final class CloudCodeViewModel: ObservableObject {
               let slotIndex = providerProfiles[providerIndex].keySlots.firstIndex(where: {
                   ProviderCatalog.keyReference(providerID: providerID, keySlotID: $0.id) == configuration.apiKeyReference
               }) else { return }
-        if providerProfiles[providerIndex].keySlots[slotIndex].status == .needsValidation {
+        if providerProfiles[providerIndex].keySlots[slotIndex].status != .verified {
             providerProfiles[providerIndex].keySlots[slotIndex].status = .verified
             if providerProfiles[providerIndex].source == .custom {
                 try? persistCustomProviders()

@@ -513,6 +513,7 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
         XCTAssertEqual(request.value(forHTTPHeaderField: "x-api-key"), "test-secret")
         XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-version"), "2023-06-01")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "text/event-stream, application/json")
     }
 
     func testAnthropicAcceptsNonSSEFullJSONResponseFromCompatibleProxy() async throws {
