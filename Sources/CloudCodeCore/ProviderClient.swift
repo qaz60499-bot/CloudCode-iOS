@@ -575,9 +575,17 @@ private extension ProviderRequestBuilding {
                         } else {
                             effectiveError = error
                         }
-                        let retryableBeforeOutput = ProviderRetryClassifier.isRetryableBeforeOutput(effectiveError)
-                        let replaySafeAfterHTTPResponse = ProviderRetryClassifier.isReplaySafeAfterHTTPResponseBeforeOutput(effectiveError)
-                        let bodyBlocksReplay = successfulStreamEstablished && bodyDataReceived
+                        // A malformed provider event is retried only when an HTTP 2xx body was actually received
+                        // and no token/tool output was emitted. This covers compatible proxies that occasionally
+                        // emit a truncated/non-terminal SSE response without turning an empty HTTP 200 into a
+                        // retry storm. Once real output starts, consume(...) normalizes the failure to
+                        // streamInterrupted, which remains non-replayable.
+                        let malformedBodyReplay = successfulStreamEstablished
+                            && bodyDataReceived
+                            && (effectiveError as? ProviderError) == .malformedEvent
+                        let retryableBeforeOutput = ProviderRetryClassifier.isRetryableBeforeOutput(effectiveError) || malformedBodyReplay
+                        let replaySafeAfterHTTPResponse = ProviderRetryClassifier.isReplaySafeAfterHTTPResponseBeforeOutput(effectiveError) || malformedBodyReplay
+                        let bodyBlocksReplay = successfulStreamEstablished && bodyDataReceived && !replaySafeAfterHTTPResponse
                         let mayReplay = !responseStarted
                             && !bodyBlocksReplay
                             && attempt < retryPolicy.maxAttempts
@@ -1336,6 +1344,9 @@ public enum ProviderRetryClassifier {
     }
 
     public static func isReplaySafeAfterHTTPResponseBeforeOutput(_ error: Error) -> Bool {
+        if let providerError = error as? ProviderError {
+            return providerError == .malformedEvent
+        }
         guard let urlError = error as? URLError else { return false }
         return urlError.code == .cannotParseResponse
     }

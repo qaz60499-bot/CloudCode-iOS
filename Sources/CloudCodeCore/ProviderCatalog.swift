@@ -54,10 +54,10 @@ public enum ProviderEndpointHealthClassifier {
                 return true
             case .invalidResponse(let code):
                 return (500...599).contains(code)
-            case .streamInterrupted:
+            case .streamInterrupted, .malformedEvent, .authenticationFailed:
                 return true
-            case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .capacityExhausted,
-                 .malformedEvent, .attachmentUnavailable, .attachmentTooLarge,
+            case .missingAPIKey, .invalidEndpoint, .capacityExhausted,
+                 .attachmentUnavailable, .attachmentTooLarge,
                  .unsupportedAttachmentType, .transport:
                 return false
             }

@@ -2831,6 +2831,30 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(ScriptedURLProtocol.requestCount(), 1)
     }
 
+    func testProviderRetriesMalformedAnthropicBodyBeforeOutputAndSucceeds() async throws {
+        let malformed = Data("data: {\"type\":\"ping\"}\n\n".utf8)
+        let recovered = Data("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"recovered-malformed\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n".utf8)
+        ScriptedURLProtocol.reset(steps: [
+            .http(status: 200, body: malformed),
+            .http(status: 200, body: recovered)
+        ])
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ScriptedURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let provider = AnthropicProviderClient(session: session, retryPolicy: RetryPolicy(maxAttempts: 2, initialDelayNanoseconds: 1))
+        let config = ProviderConfiguration(
+            name: "justwoker-like",
+            baseURL: URL(string: "https://example.invalid/v1")!,
+            model: "claude-test",
+            apiKeyReference: "key",
+            protocolName: ProviderProtocol.anthropic.rawValue
+        )
+        let text = try await collectProviderTokenText(provider.stream(configuration: config, apiKey: "ok", messages: [ChatMessage(role: .user, content: "hi")], tools: []))
+        XCTAssertEqual(text, "recovered-malformed")
+        XCTAssertEqual(ScriptedURLProtocol.requestCount(), 2)
+    }
+
     func testProviderRetriesUpstreamResponseEmpty502BeforeOutputAndSucceeds() async throws {
         let recovered = Data("data: {\"choices\":[{\"delta\":{\"content\":\"recovered-502\"}}]}\n\ndata: [DONE]\n\n".utf8)
         ScriptedURLProtocol.reset(steps: [
@@ -3041,6 +3065,8 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(ProviderRetryClassifier.isRetryableBeforeOutput(URLError(.notConnectedToInternet)))
         XCTAssertTrue(ProviderRetryClassifier.isRetryableBeforeOutput(URLError(.cannotParseResponse)))
         XCTAssertTrue(ProviderRetryClassifier.isReplaySafeAfterHTTPResponseBeforeOutput(URLError(.cannotParseResponse)))
+        XCTAssertTrue(ProviderRetryClassifier.isReplaySafeAfterHTTPResponseBeforeOutput(ProviderError.malformedEvent))
+        XCTAssertFalse(ProviderRetryClassifier.isRetryableBeforeOutput(ProviderError.malformedEvent))
         XCTAssertFalse(ProviderRetryClassifier.isReplaySafeAfterHTTPResponseBeforeOutput(URLError(.networkConnectionLost)))
         XCTAssertFalse(ProviderRetryClassifier.isRetryableBeforeOutput(URLError(.cancelled)))
         XCTAssertFalse(ProviderRetryClassifier.isRetryableBeforeOutput(URLError(.secureConnectionFailed)))

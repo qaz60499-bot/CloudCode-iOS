@@ -1004,14 +1004,17 @@ public final class CloudCodeViewModel: ObservableObject {
                 capabilityRefreshTask = nil
                 isRefreshingCapabilities = false
             }
-            let extended = await capabilityProbe.probeExtendedDevice()
+            _ = await capabilityProbe.probeExtendedDevice()
             recordStartupBreadcrumb("extendedProbe.end")
             guard !Task.isCancelled else {
                 capabilityRefreshMessage = "设备能力检测已取消。"
                 return
             }
-            capabilities = extended
-            capabilityGraph = CapabilityGraphBuilder().build(profile: extended, tools: await toolRegistry.all())
+            // Do not publish the intermediate extended profile. On TrollStore devices it can
+            // legitimately contain device_validation_required placeholders immediately before
+            // the privileged probe proves the same capabilities available, which made SwiftUI
+            // rows and aggregate status visibly jump during one refresh.
+            capabilityRefreshMessage = "基础检测完成，正在验证高权限能力…"
 
             recordStartupBreadcrumb("privilegedProbe.begin")
             await appResolver.forceRefresh()
@@ -1759,7 +1762,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private static func isSafeProviderRetry(_ error: Error) -> Bool {
         if let providerError = error as? ProviderError {
             switch providerError {
-            case .rateLimited:
+            case .rateLimited, .malformedEvent:
                 return true
             case .invalidResponse(let code):
                 return (500...599).contains(code)

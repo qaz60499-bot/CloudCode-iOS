@@ -6,7 +6,7 @@ import CloudCodeCore
 
 struct ContentView: View {
     private enum RootTab: Hashable {
-        case chat, tasks, device, apps, files, memory, activity, trash, settings
+        case chat, tasks, device, settings, more
     }
 
     @ObservedObject var model: CloudCodeViewModel
@@ -29,24 +29,12 @@ struct ContentView: View {
             PhoneView(model: model)
                 .tabItem { Label("设备", systemImage: "iphone") }
                 .tag(RootTab.device)
-            AppsView(model: model)
-                .tabItem { Label("应用", systemImage: "square.grid.2x2") }
-                .tag(RootTab.apps)
             SettingsView(model: model)
                 .tabItem { Label("设置", systemImage: "gearshape") }
                 .tag(RootTab.settings)
-            FilesView(model: model)
-                .tabItem { Label("文件", systemImage: "folder") }
-                .tag(RootTab.files)
-            HermesVaultView(model: model)
-                .tabItem { Label("记忆", systemImage: "books.vertical") }
-                .tag(RootTab.memory)
-            ActivityView(model: model)
-                .tabItem { Label("记录", systemImage: "waveform.path.ecg") }
-                .tag(RootTab.activity)
-            TrashView(model: model)
-                .tabItem { Label("回收站", systemImage: "trash") }
-                .tag(RootTab.trash)
+            MoreView(model: model)
+                .tabItem { Label("更多", systemImage: "ellipsis.circle") }
+                .tag(RootTab.more)
         }
         .sheet(isPresented: Binding(
             get: { approval.pending != nil },
@@ -78,6 +66,72 @@ struct ContentView: View {
         } message: {
             Text(model.lastError ?? "")
         }
+    }
+}
+
+private struct MoreView: View {
+    private enum Destination: String, Identifiable {
+        case apps, files, memory, activity, trash
+
+        var id: String { rawValue }
+    }
+
+    @ObservedObject var model: CloudCodeViewModel
+    @State private var destination: Destination?
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("工具") {
+                    moreButton(.apps, title: "应用", systemImage: "square.grid.2x2", subtitle: "查看已安装应用与应用能力")
+                    moreButton(.files, title: "文件", systemImage: "folder", subtitle: "浏览当前可访问的文件系统")
+                    moreButton(.memory, title: "Hermes 记忆", systemImage: "books.vertical", subtitle: "查看、检索和维护本地记忆")
+                }
+                Section("维护") {
+                    moreButton(.activity, title: "记录", systemImage: "waveform.path.ecg", subtitle: "查看任务与事务活动")
+                    moreButton(.trash, title: "回收站", systemImage: "trash", subtitle: "恢复或永久删除回收内容")
+                }
+            }
+            .navigationTitle("更多")
+            .sheet(item: $destination) { item in
+                switch item {
+                case .apps:
+                    AppsView(model: model)
+                case .files:
+                    FilesView(model: model)
+                case .memory:
+                    HermesVaultView(model: model)
+                case .activity:
+                    ActivityView(model: model)
+                case .trash:
+                    TrashView(model: model)
+                }
+            }
+        }
+    }
+
+    private func moreButton(_ target: Destination, title: String, systemImage: String, subtitle: String) -> some View {
+        Button {
+            destination = target
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: systemImage)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .foregroundStyle(.primary)
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption.bold())
+                    .foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 
