@@ -673,6 +673,7 @@ public final class CloudCodeViewModel: ObservableObject {
                     session: requestSession,
                     providerConfiguration: config,
                     allowedRoot: allowedRoot,
+                    capabilityProfile: capabilities,
                     appendUserMessage: false
                 )
                 var sawAgentEvent = false
@@ -1038,6 +1039,7 @@ public final class CloudCodeViewModel: ObservableObject {
                     session: resumedSession,
                     providerConfiguration: config,
                     allowedRoot: allowedRoot,
+                    capabilityProfile: capabilities,
                     appendUserMessage: false,
                     resumeCheckpoint: checkpoint
                 )

@@ -92,6 +92,24 @@ public actor ToolExecutionLedger {
         return nil
     }
 
+    /// Returns a previously completed result without creating a pending marker or executing anything.
+    /// Recovery paths use this to reconcile historical dangling calls without replaying side effects.
+    public func completedResult(for call: ToolCall) throws -> ToolResult? {
+        loadIfNeeded()
+        guard !loadFailed else { throw ToolExecutionLedgerError.corruptLedger }
+        guard let record = records[call.id] else { return nil }
+        let fingerprint = Self.fingerprint(call)
+        guard record.toolName == call.name, record.fingerprint == fingerprint else {
+            throw ToolExecutionLedgerError.idempotencyConflict(call.id)
+        }
+        switch record.state {
+        case .completed:
+            return record.result
+        case .pending:
+            throw ToolExecutionLedgerError.priorExecutionUncertain(call.id)
+        }
+    }
+
     public func complete(_ result: ToolResult, for call: ToolCall) throws {
         loadIfNeeded()
         guard !loadFailed else { throw ToolExecutionLedgerError.corruptLedger }

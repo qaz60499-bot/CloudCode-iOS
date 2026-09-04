@@ -369,6 +369,7 @@ public actor AgentCore {
         session initialSession: AgentSession,
         providerConfiguration: ProviderConfiguration,
         allowedRoot: URL? = nil,
+        capabilityProfile: CapabilityProfile? = nil,
         appendUserMessage: Bool = true,
         resumeCheckpoint: TaskCheckpoint? = nil
     ) -> AsyncThrowingStream<AgentEvent, Error> {
@@ -472,16 +473,19 @@ public actor AgentCore {
                     continuation.yield(.status("正在检测设备能力…"))
                     runtimeBreadcrumb?("runtime.agent.capability.begin")
                     try? await diagnosticLogger?.log(level: .debug, subsystem: "agent", action: "capability-probe", result: "started", sessionID: session.id)
-                    var capabilities = await DiagnosticContext.$sessionID.withValue(session.id) {
-                        await capabilityProbe.probeStartupSafe()
+                    let capabilities: CapabilityProfile
+                    if let capabilityProfile {
+                        capabilities = capabilityProfile
+                    } else {
+                        capabilities = await DiagnosticContext.$sessionID.withValue(session.id) {
+                            await capabilityProbe.probeStartupSafe()
+                        }
                     }
                     runtimeBreadcrumb?("runtime.agent.capability.end")
                     try? await diagnosticLogger?.log(level: .debug, subsystem: "agent", action: "capability-probe", result: "completed", sessionID: session.id)
-                    session = try await reconcileDanglingToolCalls(
-                        in: session,
-                        capabilities: capabilities,
-                        allowedRoot: allowedRoot
-                    )
+                    runtimeBreadcrumb?("runtime.agent.reconcile.begin")
+                    session = try await reconcileDanglingToolCalls(in: session)
+                    runtimeBreadcrumb?("runtime.agent.reconcile.end")
                     runtimeBreadcrumb?("runtime.agent.keychain.begin")
                     try? await diagnosticLogger?.log(level: .debug, subsystem: "agent", action: "keychain-read", result: "started", sessionID: session.id)
                     let key = try await keyVault.key(for: providerConfiguration.apiKeyReference)
@@ -719,7 +723,6 @@ public actor AgentCore {
                                     let rawContent = String(data: data, encoding: .utf8) ?? result.summary
                                     let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name)", content: rawContent).promptSafeRepresentation
                                     session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: ["tool_call_id": providerCallID, "tool_name": name, "provider_tool_name": providerToolName]))
-                                    if name == "capability.probe" { capabilities = await capabilityProbe.probePrivileged() }
                                     if let stateChangeSignature {
                                         lastStateChangeSignature = stateChangeSignature
                                         lastStateChangeScope = Self.semanticToolScope(name: name, arguments: arguments)
@@ -866,73 +869,89 @@ public actor AgentCore {
         return pending.count
     }
 
-    private func reconcileDanglingToolCalls(
-        in input: AgentSession,
-        capabilities: CapabilityProfile,
-        allowedRoot: URL?
-    ) async throws -> AgentSession {
+    private func reconcileDanglingToolCalls(in input: AgentSession) async throws -> AgentSession {
         var session = input
         let completedToolCallIDs = Set(session.messages.compactMap { message -> String? in
             guard message.role == .tool else { return nil }
             return message.providerMetadata["tool_call_id"]
         })
-        let danglingMessages = session.messages.filter { message in
+        let danglingMessages = session.messages.enumerated().filter { pair in
+            let message = pair.element
             guard message.role == .assistant,
                   let providerCallID = message.providerMetadata["tool_call_id"],
                   message.providerMetadata["tool_name"] != nil else { return false }
             return !completedToolCallIDs.contains(providerCallID)
         }
+        guard !danglingMessages.isEmpty else { return session }
 
-        for message in danglingMessages {
+        var recoveries: [(index: Int, message: ChatMessage)] = []
+        for pair in danglingMessages {
+            let message = pair.element
             guard let providerCallID = message.providerMetadata["tool_call_id"],
                   let name = message.providerMetadata["tool_name"] else { continue }
+            var metadata = ["tool_call_id": providerCallID, "tool_name": name]
+            if let providerToolName = message.providerMetadata["provider_tool_name"] {
+                metadata["provider_tool_name"] = providerToolName
+            }
             let argumentsJSON = message.providerMetadata["tool_arguments"] ?? "{}"
             let arguments: [String: String]
             do {
                 arguments = try Self.validatedArguments(fromJSON: argumentsJSON, toolName: name)
             } catch {
-                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):recovery_argument_error", content: "恢复流程拒绝了持久化工具参数：\(error)").promptSafeRepresentation
-                session.messages.append(ChatMessage(
-                    role: .tool,
-                    content: content,
-                    providerMetadata: ["tool_call_id": providerCallID, "tool_name": name, "recovery": "rejected"]
-                ))
-                session.updatedAt = Date()
-                try await sessionStore.save(session)
+                metadata["recovery"] = "rejected"
+                let content = ToolOutputEnvelope(
+                    trust: .untrustedData,
+                    source: "tool:\(name):recovery_argument_error",
+                    content: "恢复流程拒绝了持久化工具参数：\(error)"
+                ).promptSafeRepresentation
+                recoveries.append((pair.offset, ChatMessage(role: .tool, content: content, providerMetadata: metadata)))
                 continue
             }
+
             let call = ToolCall(
                 id: ToolCall.stableID(sessionID: session.id, providerCallID: providerCallID),
                 name: name,
                 arguments: arguments,
                 sessionID: session.id
             )
-            let context = ToolExecutionContext(
-                permissionMode: session.permissionMode,
-                capabilityProfile: capabilities,
-                allowedRoot: allowedRoot
-            )
+            let recoveryMessage: ChatMessage
             do {
-                let result = try await toolRouter.execute(call, context: context)
-                let data = try JSONEncoder.pretty.encode(result)
-                let rawContent = String(data: data, encoding: .utf8) ?? result.summary
-                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):recovery", content: rawContent).promptSafeRepresentation
-                session.messages.append(ChatMessage(
-                    role: .tool,
-                    content: content,
-                    providerMetadata: ["tool_call_id": providerCallID, "tool_name": name]
-                ))
+                if let result = try await toolRouter.recoverPersistedResult(for: call) {
+                    metadata["recovery"] = "cached"
+                    let data = try JSONEncoder.pretty.encode(result)
+                    let rawContent = String(data: data, encoding: .utf8) ?? result.summary
+                    let content = ToolOutputEnvelope(
+                        trust: .untrustedData,
+                        source: "tool:\(name):recovery",
+                        content: rawContent
+                    ).promptSafeRepresentation
+                    recoveryMessage = ChatMessage(role: .tool, content: content, providerMetadata: metadata)
+                } else {
+                    metadata["recovery"] = "skipped"
+                    let content = ToolOutputEnvelope(
+                        trust: .untrustedData,
+                        source: "tool:\(name):recovery_skipped",
+                        content: "上一个进程留下的未完成工具调用不会在新消息发送时自动重放。请根据当前状态重新规划；如果仍有必要，由本轮显式发起新的工具调用。"
+                    ).promptSafeRepresentation
+                    recoveryMessage = ChatMessage(role: .tool, content: content, providerMetadata: metadata)
+                }
             } catch {
-                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):recovery_error", content: "恢复流程没有盲目重放该工具调用：\(error)").promptSafeRepresentation
-                session.messages.append(ChatMessage(
-                    role: .tool,
-                    content: content,
-                    providerMetadata: ["tool_call_id": providerCallID, "tool_name": name, "recovery": "uncertain"]
-                ))
+                metadata["recovery"] = "uncertain"
+                let content = ToolOutputEnvelope(
+                    trust: .untrustedData,
+                    source: "tool:\(name):recovery_error",
+                    content: "恢复流程没有重放该历史工具调用：\(error)"
+                ).promptSafeRepresentation
+                recoveryMessage = ChatMessage(role: .tool, content: content, providerMetadata: metadata)
             }
-            session.updatedAt = Date()
-            try await sessionStore.save(session)
+            recoveries.append((pair.offset, recoveryMessage))
         }
+
+        for recovery in recoveries.reversed() {
+            session.messages.insert(recovery.message, at: recovery.index + 1)
+        }
+        session.updatedAt = Date()
+        try await sessionStore.save(session)
         return session
     }
 

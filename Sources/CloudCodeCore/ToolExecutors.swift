@@ -64,9 +64,12 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
     public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
         switch call.name {
         case "capability.probe":
-            let profile = await capabilityProbe.probePrivileged()
+            // Model-driven tool calls must never initiate privileged/private probing. The
+            // session context already contains the capability profile established by the app:
+            // startup-safe by default, or privileged only after an explicit user validation.
+            let profile = context.capabilityProfile
             let payload = Dictionary(profile.records.map { ($0.id, $0.status.rawValue) }, uniquingKeysWith: { _, latest in latest })
-            return ToolResult(toolCallID: call.id, success: true, summary: "能力检测完成", payload: payload)
+            return ToolResult(toolCallID: call.id, success: true, summary: "当前会话能力快照", payload: payload)
 
         case "apps.list":
             let apps = await appResolver.installedApps()

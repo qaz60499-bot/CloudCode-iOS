@@ -54,7 +54,7 @@ public actor ToolRegistry {
     public func register(_ descriptor: ToolDescriptor) { descriptors[descriptor.name] = descriptor }
 
     public static let phaseOneDefaults: [ToolDescriptor] = [
-        ToolDescriptor(name: "capability.probe", summary: "Probe actual device capabilities before planning.", risk: .readOnly),
+        ToolDescriptor(name: "capability.probe", summary: "Return the capability snapshot already validated for this session; never initiates privileged probing.", risk: .readOnly),
         ToolDescriptor(name: "apps.list", summary: "Enumerate installed apps when the runtime permits it.", risk: .readOnly, requiredCapabilities: ["apps.enumerate"]),
         ToolDescriptor(name: "apps.inspect", summary: "Inspect an installed app by bundle ID.", risk: .readOnly, requiredCapabilities: ["apps.resolve_bundle_path"]),
         ToolDescriptor(name: "container.resolve", summary: "Resolve the current data container for a bundle ID without caching UUID paths.", risk: .readOnly, requiredCapabilities: ["apps.resolve_data_container"]),
@@ -121,6 +121,17 @@ public actor ToolRouter {
             }
         }
         throw ToolRouterError.noExecutionRoute(call.name)
+    }
+
+    /// Recovery-only lookup for a historical dangling call. This never selects an executor,
+    /// never runs a tool, and never creates a new ledger pending marker.
+    public func recoverPersistedResult(for call: ToolCall) async throws -> ToolResult? {
+        guard let descriptor = await registry.descriptor(named: call.name) else {
+            throw ToolRouterError.unknownTool(call.name)
+        }
+        guard descriptor.risk != .readOnly else { return nil }
+        guard let executionLedger else { return nil }
+        return try await executionLedger.completedResult(for: call)
     }
 
     public func execute(_ call: ToolCall, context: ToolExecutionContext) async throws -> ToolResult {

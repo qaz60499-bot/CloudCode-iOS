@@ -374,6 +374,45 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(classifier.isSensitive(path: "/tmp/new-note.txt", operation: "files.create"))
     }
 
+    func testStructuredCapabilityProbeReturnsSessionSnapshotWithoutPrivilegedReprobe() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let resolver = StaticAppResolver()
+        let audit = AuditLogStore(fileURL: root.appendingPathComponent("audit/audit.jsonl"))
+        let journal = TransactionJournal(fileURL: root.appendingPathComponent("transactions/transactions.json"))
+        let policy = PolicyEngine()
+        let probeProfile = CapabilityProfile(records: [
+            CapabilityRecord(id: "probe.marker", domain: .execution, status: .available, detail: "must not be used")
+        ])
+        let sessionProfile = CapabilityProfile(records: [
+            CapabilityRecord(id: "session.marker", domain: .execution, status: .deviceValidationRequired, detail: "current session snapshot")
+        ])
+        let executor = StructuredToolExecutor(
+            capabilityProbe: FixedCapabilityProbe(profile: probeProfile),
+            appResolver: resolver,
+            resourceResolver: ResourceResolver(appResolver: resolver),
+            fileService: FileService(),
+            ipaService: IPAService(),
+            trashService: TrashService(root: root.appendingPathComponent("trash", isDirectory: true)),
+            transactionEngine: TransactionEngine(
+                backupRoot: root.appendingPathComponent("backups", isDirectory: true),
+                policy: policy,
+                journal: journal,
+                audit: audit
+            ),
+            policy: policy,
+            audit: audit,
+            approval: FixedApprovalRequester(approved: false)
+        )
+        let descriptor = ToolDescriptor(name: "capability.probe", summary: "", risk: .readOnly)
+        let call = ToolCall(name: "capability.probe", arguments: [:], sessionID: UUID())
+        let context = ToolExecutionContext(permissionMode: .safe, capabilityProfile: sessionProfile, allowedRoot: root)
+
+        let result = try await executor.execute(call, descriptor: descriptor, context: context)
+        XCTAssertEqual(result.payload["session.marker"], CapabilityStatus.deviceValidationRequired.rawValue)
+        XCTAssertNil(result.payload["probe.marker"], "Model-driven capability.probe must not invoke the privileged probe backend")
+    }
+
     func testStructuredCreateSensitivePathRequiresApprovalBeforeWrite() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1899,6 +1938,46 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(saved.title, "create it")
     }
 
+    func testAgentUsesExplicitlyValidatedSessionCapabilitySnapshotForToolRouting() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let counter = InvocationCounter()
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "files.read", summary: "", risk: .readOnly, requiredCapabilities: ["session.validated"])
+        ])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let agent = AgentCore(
+            provider: ToolThenFinishProvider(events: [
+                .toolCall(id: "read-validated", name: "files_read", argumentsJSON: "{\"path\":\"/tmp/a\"}"),
+                .finished
+            ]),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(
+                registry: registry,
+                executors: [CountingExecutor(route: .structuredTool, names: ["files.read"], counter: counter)]
+            ),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 3
+        )
+        let validated = CapabilityProfile(records: [
+            CapabilityRecord(id: "session.validated", domain: .filesystem, status: .available, detail: "explicit same-process validation")
+        ])
+        let session = AgentSession(permissionMode: .full)
+        let stream = await agent.send(
+            text: "read",
+            session: session,
+            providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key"),
+            capabilityProfile: validated
+        )
+        for try await _ in stream {}
+
+        let executionCount = await counter.value()
+        XCTAssertEqual(executionCount, 1)
+    }
+
     func testMultipleProviderToolCallsInOneRoundMapToDistinctInternalTools() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2297,6 +2376,108 @@ final class CloudCodeCoreTests: XCTestCase {
         })
         let pendingInvocationCount = await counter.value()
         XCTAssertEqual(pendingInvocationCount, 0)
+    }
+
+    func testDanglingMissingStateChangingToolCallDoesNotCreateRecoveryLedgerMarker() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionID = UUID()
+        let providerCallID = "call-missing-ledger-recovery"
+        let call = ToolCall(
+            id: ToolCall.stableID(sessionID: sessionID, providerCallID: providerCallID),
+            name: "files.create",
+            arguments: ["path": "/tmp/a", "content": "x"],
+            sessionID: sessionID
+        )
+        let ledger = ToolExecutionLedger(fileURL: root.appendingPathComponent("ledger.json"))
+        let counter = InvocationCounter()
+        let registry = ToolRegistry(descriptors: [ToolDescriptor(name: "files.create", summary: "", risk: .safeWrite)])
+        let router = ToolRouter(
+            registry: registry,
+            executors: [CountingExecutor(route: .structuredTool, names: ["files.create"], counter: counter)],
+            executionLedger: ledger
+        )
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let agent = AgentCore(
+            provider: FinishingProvider(),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: router,
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 2
+        )
+        let dangling = ChatMessage(role: .assistant, content: "", providerMetadata: [
+            "tool_call_id": providerCallID,
+            "tool_name": "files.create",
+            "tool_arguments": "{\"path\":\"/tmp/a\",\"content\":\"x\"}"
+        ])
+        let initial = AgentSession(id: sessionID, title: "restart", messages: [dangling], permissionMode: .full)
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        let stream = await agent.send(text: "resume", session: initial, providerConfiguration: config, appendUserMessage: false)
+        for try await _ in stream {}
+
+        let saved = try await sessions.load(sessionID)
+        XCTAssertTrue(saved.messages.contains {
+            $0.role == .tool && $0.providerMetadata["tool_call_id"] == providerCallID && $0.providerMetadata["recovery"] == "skipped"
+        })
+        let invocationCount = await counter.value()
+        XCTAssertEqual(invocationCount, 0)
+        let recoveryRecord = await ledger.record(for: call.id)
+        XCTAssertNil(recoveryRecord, "Recovery lookup must not create a new pending execution marker")
+    }
+
+    func testDanglingReadOnlyToolCallIsNotReexecutedDuringNewSend() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionID = UUID()
+        let providerCallID = "call-capability-crash-recovery"
+        let counter = InvocationCounter()
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "capability.probe", summary: "", risk: .readOnly)
+        ])
+        let router = ToolRouter(
+            registry: registry,
+            executors: [CountingExecutor(route: .structuredTool, names: ["capability.probe"], counter: counter)]
+        )
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let agent = AgentCore(
+            provider: FinishingProvider(),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: router,
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 2
+        )
+        let dangling = ChatMessage(role: .assistant, content: "", providerMetadata: [
+            "tool_call_id": providerCallID,
+            "tool_name": "capability.probe",
+            "tool_arguments": "{}"
+        ])
+        let newUserMessage = ChatMessage(role: .user, content: "new message")
+        let initial = AgentSession(id: sessionID, title: "restart", messages: [dangling, newUserMessage], permissionMode: .full)
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        let stream = await agent.send(text: "new message", session: initial, providerConfiguration: config, appendUserMessage: false)
+        for try await _ in stream {}
+
+        let saved = try await sessions.load(sessionID)
+        XCTAssertTrue(saved.messages.contains {
+            $0.role == .tool &&
+            $0.providerMetadata["tool_call_id"] == providerCallID &&
+            $0.providerMetadata["recovery"] == "skipped"
+        })
+        let recoveryIndex = try XCTUnwrap(saved.messages.firstIndex(where: {
+            $0.role == .tool && $0.providerMetadata["tool_call_id"] == providerCallID
+        }))
+        let userIndex = try XCTUnwrap(saved.messages.firstIndex(where: {
+            $0.role == .user && $0.content == "new message"
+        }))
+        XCTAssertLessThan(recoveryIndex, userIndex, "Recovered tool result must be inserted before the new user turn")
+        let invocationCount = await counter.value()
+        XCTAssertEqual(invocationCount, 0)
     }
 
     func testSemanticDuplicateVerificationMustBeBoundToTheChangedTarget() {
