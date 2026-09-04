@@ -195,19 +195,21 @@ jobs:
           ids = []
           if isinstance(items, list):
               for item in items:
-                  value = (item.get("id") or item.get("name")) if isinstance(item, dict) else item
+                  value = (item.get("id") or item.get("name") or item.get("model")) if isinstance(item, dict) else item
                   if isinstance(value, str):
                       value = value.strip()
                   if isinstance(value, str) and value and "\n" not in value and "\r" not in value and value not in ids:
                       ids.append(value)
-          claude_candidates = [model for model in ids if "claude" in model.lower()]
-          if not claude_candidates:
-              raise SystemExit("FAIL: Tabitoken /models returned no current Claude model candidates")
-          print(f"TABITOKEN_CLAUDE_CANDIDATE_COUNT={len(claude_candidates)}")
+          if not ids:
+              raise SystemExit("FAIL: Tabitoken /models returned an empty usable model catalog")
+          named_claude = [model for model in ids if "claude" in model.lower()]
+          other_models = [model for model in ids if model not in named_claude]
+          anthropic_candidates = named_claude + other_models
+          print(f"TABITOKEN_MODEL_CANDIDATE_COUNT={len(anthropic_candidates)}")
 
           selected_model = None
           base_anthropic = None
-          for candidate in claude_candidates[:16]:
+          for candidate in anthropic_candidates[:32]:
               probe_payload = {
                   "model": candidate,
                   "max_tokens": 1,
@@ -274,7 +276,7 @@ jobs:
           if dotted_status not in (400, 422):
               raise SystemExit(f"FAIL: dotted Anthropic tool name was not rejected; HTTP {dotted_status}")
 
-          thinking_candidates = [model for model in claude_candidates if "thinking" in model.lower()]
+          thinking_candidates = [model for model in anthropic_candidates if "thinking" in model.lower()]
           if thinking_candidates:
               thinking_payload = dict(base_anthropic)
               thinking_payload["model"] = thinking_candidates[0]
