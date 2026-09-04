@@ -1030,8 +1030,8 @@ private struct SettingsView: View {
                         set: { model.selectKey($0) }
                     )) {
                         ForEach(model.availableKeySlots) { slot in
-                            let installed = model.isKeyInstalled(providerID: model.selectedProviderID, keySlotID: slot.id)
-                            Text("\(slot.label) · \(installed ? "已配置" : "未配置") · \(localizedKeyStatus(slot.status.rawValue))").tag(slot.id)
+                            let presence = model.keyPresenceLabel(providerID: model.selectedProviderID, keySlotID: slot.id)
+                            Text("\(slot.label) · \(presence) · \(localizedKeyStatus(slot.status.rawValue))").tag(slot.id)
                         }
                     }
                     .disabled(model.availableKeySlots.isEmpty)
@@ -1059,7 +1059,7 @@ private struct SettingsView: View {
                                 : "异常 / 需检查" + (health.errorCode.map { " · \($0)" } ?? "")
                             LabeledContent("接口健康", value: detail)
                         }
-                        LabeledContent("当前 Key", value: model.selectedKeyIsInstalled ? "已配置" : "未配置")
+                        LabeledContent("当前 Key", value: model.selectedKeyIsInstalled ? "本次已确认" : "启动未扫描")
                     }
                     LabeledContent("配置规模", value: "\(model.providerProfiles.filter(\.enabled).count) 个厂商 · \(model.providerProfiles.filter(\.enabled).reduce(0) { $0 + $1.keySlots.count }) 个 Key")
                 }
@@ -1081,6 +1081,12 @@ private struct SettingsView: View {
                     }
                     .disabled(selectedKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isProviderKeyMutationInFlight)
 
+                    Button("检查当前 Key") {
+                        keyInputFocused = false
+                        Task { _ = await model.verifySelectedKeyPresence() }
+                    }
+                    .disabled(model.availableKeySlots.isEmpty || model.isProviderKeyMutationInFlight)
+
                     if model.bundledPrivateBootstrapAvailable {
                         Button("一键导入预配置 Key") {
                             keyInputFocused = false
@@ -1095,10 +1101,10 @@ private struct SettingsView: View {
                     }
                     .disabled(model.isProviderKeyMutationInFlight)
 
-                    LabeledContent("已配置 Key", value: "\(model.configuredCatalogKeyCount) / \(model.totalCatalogKeyCount)")
+                    LabeledContent("本次已确认 Key", value: "\(model.configuredCatalogKeyCount) / \(model.totalCatalogKeyCount)")
                     Text(model.bundledPrivateBootstrapAvailable
-                         ? "当前是私有 Key 版 IPA：首次启动会自动把预配置 Key 写入 iOS Keychain；也可以点上方按钮重新一键导入。厂商、Key 和模型仍由你手动选择。"
-                         : "当前安装包未内置预配置 Key。可以从文件导入；导入后写入 iOS Keychain。真实 Key 不写入 UserDefaults。")
+                         ? "当前是私有 Key 版 IPA。为避免 TrollStore 真机启动阶段触发 Keychain 崩溃，升级启动不会遍历或覆盖 Keychain；首次安装可自动导入，后续替换请使用“检查当前 Key”或“一键导入预配置 Key”。"
+                         : "当前安装包未内置预配置 Key。启动阶段不会遍历 Keychain；可以手动检查当前 Key 或从文件导入。真实 Key 不写入 UserDefaults。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

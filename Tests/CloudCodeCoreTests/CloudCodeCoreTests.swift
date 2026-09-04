@@ -40,7 +40,11 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(previous.runID, firstRun)
         XCTAssertEqual(previous.lastStage, "bootstrap.safe.begin")
         XCTAssertEqual(previous.entryCount, 3)
-        XCTAssertTrue(store.exportText(limitRuns: 4).contains("stage=bootstrap.safe.begin"))
+        XCTAssertTrue(store.runContainsStage(firstRun, stage: "bootstrap.safe.begin"))
+        XCTAssertFalse(store.runContainsStage(firstRun, stage: "bootstrap.completed"))
+        store.append(runID: firstRun, stage: "bootstrap.completed", at: firstStart.addingTimeInterval(3))
+        XCTAssertTrue(store.runContainsStage(firstRun, stage: "bootstrap.completed"))
+        XCTAssertTrue(store.exportText(limitRuns: 4).contains("stage=bootstrap.completed"))
     }
 
     func testCapabilityProfileDuplicateRecordsRemainReadableWithoutTrap() {

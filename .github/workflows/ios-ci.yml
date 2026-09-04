@@ -207,9 +207,15 @@ jobs:
           for marker in ('app.main.enter', 'firstScene.rendered'):
               if marker not in app_entry:
                   raise SystemExit(f'FAIL: startup breadcrumb marker missing: {marker}')
-          for marker in ('viewModel.init.begin', 'viewModel.init.end', 'bootstrap.safe.begin', 'bootstrap.safe.end'):
+          for marker in ('viewModel.init.begin', 'viewModel.init.end', 'bootstrap.safe.begin', 'bootstrap.safe.end', 'bootstrap.recovery.begin', 'bootstrap.recovery.ready'):
               if marker not in app:
                   raise SystemExit(f'FAIL: startup breadcrumb marker missing: {marker}')
+          if 'previousStartupCompleted' not in app or 'runContainsStage($0.runID, stage: "bootstrap.completed")' not in app:
+              raise SystemExit('FAIL: crash-loop recovery no longer checks whether the previous startup reached the stable completion point')
+          recovery = bootstrap.split('if previousStartupRun != nil && !previousStartupCompleted', 1)[1].split('isRefreshingCapabilities = true', 1)[0]
+          for forbidden in ('probeStartupSafe()', 'probeExtendedDevice()', 'probePrivileged()', 'importBootstrapIfPresent()', 'hermesStore.bootstrap()', 'recoverInterruptedTransactions()'):
+              if forbidden in recovery:
+                  raise SystemExit(f'FAIL: startup recovery mode contains unsafe/nonessential work: {forbidden}')
 
           content = Path('Sources/CloudCodeApp/ContentView.swift').read_text(encoding='utf-8')
           root_tabs = content.split('private struct MoreView', 1)[0]
@@ -235,6 +241,14 @@ jobs:
           for marker in ('ProviderKeyProvisioner.apply(', 'manualProviderKeyOverrides', 'provider.key.save.begin', 'installedKeyReferences'):
               if marker not in app:
                   raise SystemExit(f'FAIL: hardened Provider Key replacement marker missing: {marker}')
+          bootstrap_import = app.split('private func importBootstrapIfPresent()', 1)[1].split('private func importProviderBootstrapNow(', 1)[0]
+          if 'ProviderBootstrapAutomaticImportPolicy.shouldImportBundledBootstrap' not in bootstrap_import:
+              raise SystemExit('FAIL: bundled Provider bootstrap lost first-install-only launch policy')
+          for forbidden in ('inferManualProviderKeyOverrides', 'refreshInstalledKeyReferences', 'Task.detached'):
+              if forbidden in bootstrap_import:
+                  raise SystemExit(f'FAIL: upgrade bootstrap reintroduced launch-time Keychain scanning: {forbidden}')
+          if 'storedFingerprint' not in bootstrap_import or 'guard ProviderBootstrapAutomaticImportPolicy.shouldImportBundledBootstrap' not in bootstrap_import:
+              raise SystemExit('FAIL: upgrade bootstrap must preserve existing Keychain before any bundled import')
           if 'readAll(limit: 12_000)' in app:
               raise SystemExit('FAIL: diagnostics view reintroduced an unbounded/high-memory 12k record refresh')
           if 'while !Task.isCancelled' in content.split('private struct DiagnosticLogsView', 1)[1].split('private struct DiagnosticShareItem', 1)[0]:

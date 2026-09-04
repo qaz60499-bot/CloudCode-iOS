@@ -94,6 +94,21 @@ public struct StartupBreadcrumbStore: Sendable {
         recentRuns(limit: retainedRunCount + 1).first { $0.runID != runID }
     }
 
+    public func runContainsStage(_ runID: UUID, stage: String) -> Bool {
+        let expected = Self.sanitizeStage(stage)
+        guard !expected.isEmpty,
+              let data = try? Data(contentsOf: fileURL(for: runID)),
+              let text = String(data: data, encoding: .utf8) else { return false }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard let line = String(raw).data(using: .utf8),
+                  let entry = try? decoder.decode(StartupBreadcrumbEntry.self, from: line) else { continue }
+            if entry.runID == runID && entry.stage == expected { return true }
+        }
+        return false
+    }
+
     public func recentRuns(limit: Int = 8) -> [StartupBreadcrumbRunSummary] {
         guard limit > 0,
               let urls = try? fileManager.contentsOfDirectory(
