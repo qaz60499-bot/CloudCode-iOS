@@ -1580,19 +1580,26 @@ public final class CloudCodeViewModel: ObservableObject {
         }
     }
 
-    private func refreshLiveProviderMetadataIfNeeded(providerID: String, keySlotID: String, apiKey: String) async {
+    @discardableResult
+    private func refreshLiveProviderMetadataIfNeeded(providerID: String, keySlotID: String, apiKey: String) async -> Bool {
         guard providerID == ProviderCatalog.tabitokenID,
               let providerIndex = providerProfiles.firstIndex(where: { $0.id == providerID }),
               !keySlotID.isEmpty,
-              !apiKey.isEmpty else { return }
+              !apiKey.isEmpty else { return false }
         let baseURL = providerProfiles[providerIndex].baseURL
         let preferredAuthMode = providerProfiles[providerIndex].authMode
+        let inferenceProtocols = providerProfiles[providerIndex].protocols
+        let fallbackInferenceCandidates = ProviderCatalog.desktopSnapshot
+            .first(where: { $0.id == providerID })?
+            .models(for: keySlotID) ?? []
         do {
             let discovery = try await ProviderDiscoveryClient().discover(
                 baseURL: baseURL,
                 apiKey: apiKey,
                 preferredAuthMode: preferredAuthMode,
-                allowPricingCatalogFallback: true
+                allowPricingCatalogFallback: true,
+                fallbackInferenceCandidates: fallbackInferenceCandidates,
+                inferenceProtocols: inferenceProtocols
             )
             providerProfiles[providerIndex].applyDiscovery(discovery, keySlotID: keySlotID)
             let reconciled = ProviderSelectionResolver.reconcile(
@@ -1603,16 +1610,17 @@ public final class CloudCodeViewModel: ObservableObject {
             let emptyCatalog = discovery.models.isEmpty && discovery.readiness == .unavailable
             activityLines.append(
                 emptyCatalog
-                    ? "Tabitoken 当前返回空模型目录；已移除静态旧模型并标记厂商暂不可用。"
-                    : "Tabitoken 已按当前 Key 刷新可用模型：\(discovery.models.count) 个。"
+                    ? "Tabitoken 当前 Key 返回空目录且已验证不到可用推理模型；仅将该 Key 标记为暂不可用，其他 Key 保持可继续验证。"
+                    : "Tabitoken 已按当前 Key 实时验证可用模型：\(discovery.models.count) 个。"
             )
             try? await diagnosticLogStore.log(
                 level: emptyCatalog ? .warning : .info,
                 subsystem: "provider-discovery",
                 action: "refresh",
-                result: emptyCatalog ? "empty-catalog" : "updated",
+                result: emptyCatalog ? "empty-catalog-key-scoped" : "updated",
                 metadata: ["providerID": providerID, "keySlotID": keySlotID, "modelCount": String(discovery.models.count)]
             )
+            return !discovery.models.isEmpty
         } catch {
             try? await diagnosticLogStore.log(
                 level: .warning,
@@ -1623,6 +1631,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 metadata: ["providerID": providerID, "keySlotID": keySlotID]
             )
             activityLines.append("Tabitoken 当前模型目录刷新失败；Key 已保留，可稍后重新检查当前 Key。")
+            return false
         }
     }
 
@@ -1763,12 +1772,21 @@ public final class CloudCodeViewModel: ObservableObject {
         }
         let skippedForFingerprint = manualOverridePolicy == .preserveManual ? manualOverrides : []
         try applyProviderBootstrapFingerprints(payload, status: .needsValidation, skippingReferences: skippedForFingerprint)
-        if let tabitoken = pending.first(where: { $0.providerID == ProviderCatalog.tabitokenID }) {
-            await refreshLiveProviderMetadataIfNeeded(
+        let tabitokenKeys = pending.filter { $0.providerID == ProviderCatalog.tabitokenID }
+        for tabitoken in tabitokenKeys {
+            let usable = await refreshLiveProviderMetadataIfNeeded(
                 providerID: tabitoken.providerID,
                 keySlotID: tabitoken.keySlotID,
                 apiKey: tabitoken.secret
             )
+            if usable {
+                let preferred = ProviderSelectionResolver.reconcile(
+                    ProviderSelectionState(providerID: tabitoken.providerID, keySlotID: tabitoken.keySlotID, model: selectedModel),
+                    profiles: providerProfiles
+                )
+                applySelection(preferred)
+                break
+            }
         }
         return importedCount
     }

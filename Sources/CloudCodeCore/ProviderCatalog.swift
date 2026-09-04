@@ -169,11 +169,13 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
 
     public func models(for keySlotID: String?) -> [String] {
         guard let keySlotID,
-              let slot = keySlots.first(where: { $0.id == keySlotID }),
-              !slot.models.isEmpty else {
+              let slot = keySlots.first(where: { $0.id == keySlotID }) else {
             return models
         }
-        return Self.unique(slot.models)
+        if slot.status == .unavailable || slot.status == .authFailed {
+            return []
+        }
+        return slot.models.isEmpty ? models : Self.unique(slot.models)
     }
 
     public func protocolFor(model: String, keySlotID: String?) -> ProviderProtocol {
@@ -204,10 +206,26 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
     public mutating func applyDiscovery(_ discovery: ProviderDiscoveryResult, keySlotID: String) {
         let discoveredModels = Self.unique(discovery.models)
         guard !discoveredModels.isEmpty || discovery.readiness == .unavailable else { return }
+        guard let targetSlotIndex = keySlots.firstIndex(where: { $0.id == keySlotID }) else { return }
+
+        authMode = discovery.authMode
+        if discoveredModels.isEmpty, discovery.readiness == .unavailable {
+            // An authenticated empty catalog is authoritative for the Key that produced it,
+            // not for sibling credentials. Do not let one empty/limited Key erase the model
+            // scope of every other configured Key before rotation has a chance to run.
+            keySlots[targetSlotIndex].models = []
+            keySlots[targetSlotIndex].status = .unavailable
+            keySlots[targetSlotIndex].modelProtocols.removeAll()
+            let aggregateModels = Self.unique(keySlots.flatMap { slot in
+                (slot.status == .unavailable || slot.status == .authFailed) ? [] : slot.models
+            })
+            models = aggregateModels
+            readiness = aggregateModels.isEmpty ? .unavailable : .partial
+            return
+        }
 
         let previousProviderModels = models
         models = discoveredModels
-        authMode = discovery.authMode
         readiness = discovery.readiness
         if !discovery.protocols.isEmpty {
             protocols = discovery.protocols
@@ -220,10 +238,26 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
             let sharesProviderCatalog = keySlots[slotIndex].models == previousProviderModels
             guard keySlots[slotIndex].id == keySlotID || sharesProviderCatalog else { continue }
             keySlots[slotIndex].models = discoveredModels
+            keySlots[slotIndex].status = Self.keyStatus(for: discovery.readiness)
             if !discovery.protocols.isEmpty {
                 keySlots[slotIndex].protocols = discovery.protocols
             }
             keySlots[slotIndex].modelProtocols = keySlots[slotIndex].modelProtocols.filter { discoveredModels.contains($0.key) }
+        }
+    }
+
+    private static func keyStatus(for readiness: ProviderReadiness) -> ProviderKeyStatus {
+        switch readiness {
+        case .ready:
+            return .verified
+        case .capacity:
+            return .capacity
+        case .authFailed:
+            return .authFailed
+        case .unavailable:
+            return .unavailable
+        case .partial, .needsValidation:
+            return .needsValidation
         }
     }
 
@@ -251,7 +285,13 @@ public enum ProviderSelectionResolver {
         guard let profile = available.first(where: { $0.id == state.providerID }) ?? available.first else {
             return ProviderSelectionState()
         }
-        let selectedSlot = profile.keySlots.first(where: { $0.id == state.keySlotID }) ?? profile.keySlots.first
+        let requestedSlot = profile.keySlots.first(where: { $0.id == state.keySlotID }) ?? profile.keySlots.first
+        let selectedSlot: ProviderKeySlot?
+        if let requestedSlot, !profile.models(for: requestedSlot.id).isEmpty || profile.customModelAllowed {
+            selectedSlot = requestedSlot
+        } else {
+            selectedSlot = profile.keySlots.first(where: { !profile.models(for: $0.id).isEmpty }) ?? requestedSlot
+        }
         let models = profile.models(for: selectedSlot?.id)
         let selectedModel = models.contains(state.model) ? state.model : (models.first ?? (profile.customModelAllowed ? state.model : ""))
         return ProviderSelectionState(

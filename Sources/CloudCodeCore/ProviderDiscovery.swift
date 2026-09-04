@@ -28,7 +28,9 @@ public struct ProviderDiscoveryClient: Sendable {
         baseURL: URL,
         apiKey: String,
         preferredAuthMode: ProviderAuthMode? = nil,
-        allowPricingCatalogFallback: Bool = false
+        allowPricingCatalogFallback: Bool = false,
+        fallbackInferenceCandidates: [String] = [],
+        inferenceProtocols: [ProviderProtocol] = ProviderProtocol.allCases
     ) async throws -> ProviderDiscoveryResult {
         var lastError: Error = ProviderError.missingAPIKey
         var sawAuthoritativeEmptyCatalog = false
@@ -107,6 +109,43 @@ public struct ProviderDiscoveryClient: Sendable {
                 }
             } catch {
                 lastError = error
+            }
+        }
+
+        if discoveredCatalog == nil,
+           sawAuthoritativeEmptyCatalog,
+           !fallbackInferenceCandidates.isEmpty {
+            // A successful empty /models response is authoritative for catalog visibility,
+            // but some compatible gateways still allow inference for explicitly configured
+            // model IDs. Candidates are never accepted as a catalog seed: each one must pass
+            // a real inference probe first, and only live-validated IDs are returned.
+            let candidates = Self.unique(fallbackInferenceCandidates)
+            let protocolsToProbe = Self.uniqueProtocols(inferenceProtocols)
+            for inferenceAuthMode in authModes {
+                var validatedModels: [String] = []
+                var validatedProtocols: [ProviderProtocol] = []
+                for model in candidates.prefix(12) {
+                    var modelSupported = false
+                    for protocolName in protocolsToProbe {
+                        if try await probe(protocolName, baseURL: baseURL, apiKey: apiKey, authMode: inferenceAuthMode, model: model) {
+                            modelSupported = true
+                            if !validatedProtocols.contains(protocolName) {
+                                validatedProtocols.append(protocolName)
+                            }
+                        }
+                    }
+                    if modelSupported {
+                        validatedModels.append(model)
+                    }
+                }
+                if !validatedModels.isEmpty {
+                    return ProviderDiscoveryResult(
+                        models: validatedModels,
+                        protocols: validatedProtocols,
+                        authMode: inferenceAuthMode,
+                        readiness: .ready
+                    )
+                }
             }
         }
 
@@ -237,6 +276,16 @@ public struct ProviderDiscoveryClient: Sendable {
         }
         guard !result.isEmpty else { throw ProviderError.malformedEvent }
         return result
+    }
+
+    private static func unique(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        return values.filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
+
+    private static func uniqueProtocols(_ values: [ProviderProtocol]) -> [ProviderProtocol] {
+        var seen = Set<String>()
+        return values.filter { seen.insert($0.rawValue).inserted }
     }
 
     private static func extractModelIdentifiers(from value: Any) -> [String] {

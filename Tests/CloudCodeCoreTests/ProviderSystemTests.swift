@@ -547,22 +547,46 @@ final class ProviderDiscoveryTests: XCTestCase {
         XCTAssertEqual(result.readiness, .unavailable)
     }
 
-    func testProviderProfileClearsStaleModelsWhenLiveCatalogIsUnavailable() throws {
+    func testProviderProfileScopesAuthoritativeEmptyCatalogToTheKeyThatReturnedIt() throws {
         var profile = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.tabitokenID }))
         let staleSelection = ProviderSelectionState(providerID: profile.id, keySlotID: "slot-1", model: profile.models[0])
+        let siblingModels = profile.models(for: "slot-2")
 
         profile.applyDiscovery(
             ProviderDiscoveryResult(models: [], protocols: [], authMode: .both, readiness: .unavailable),
             keySlotID: "slot-1"
         )
 
-        XCTAssertTrue(profile.models.isEmpty)
-        XCTAssertTrue(profile.keySlots.allSatisfy { $0.models.isEmpty })
-        XCTAssertEqual(profile.readiness, .unavailable)
+        XCTAssertEqual(profile.models(for: "slot-1"), [])
+        XCTAssertEqual(profile.keySlots.first(where: { $0.id == "slot-1" })?.status, .unavailable)
+        XCTAssertEqual(profile.models(for: "slot-2"), siblingModels)
+        XCTAssertFalse(profile.models.isEmpty)
+        XCTAssertEqual(profile.readiness, .partial)
         let reconciled = ProviderSelectionResolver.reconcile(staleSelection, profiles: [profile])
         XCTAssertEqual(reconciled.providerID, profile.id)
-        XCTAssertEqual(reconciled.keySlotID, "slot-1")
-        XCTAssertEqual(reconciled.model, "")
+        XCTAssertEqual(reconciled.keySlotID, "slot-2")
+        XCTAssertEqual(reconciled.model, staleSelection.model)
+    }
+
+    func testDiscoveryUsesConfiguredCandidateOnlyAfterLiveInferenceValidationWhenCatalogIsEmpty() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProviderEmptyCatalogLiveInferenceURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let result = try await ProviderDiscoveryClient(session: session).discover(
+            baseURL: URL(string: "https://tabitoken.com")!,
+            apiKey: "test-secret",
+            preferredAuthMode: .both,
+            allowPricingCatalogFallback: true,
+            fallbackInferenceCandidates: ["stale-model", "claude-opus-live"],
+            inferenceProtocols: [.anthropic]
+        )
+
+        XCTAssertEqual(result.models, ["claude-opus-live"])
+        XCTAssertEqual(result.protocols, [.anthropic])
+        XCTAssertEqual(result.authMode, .both)
+        XCTAssertEqual(result.readiness, .ready)
     }
 
     func testDiscoveryFallsBackToRatioConfigWhenModelsAndPricingAreEmpty() async throws {
@@ -1095,10 +1119,12 @@ final class ProviderLiveIntegrationTests: XCTestCase {
         }
         let payload = try ProviderBootstrapPayload.decodeBootstrap(from: bootstrapData)
         let tabitoken = try XCTUnwrap(payload.providers.first(where: { $0.providerID == ProviderCatalog.tabitokenID }))
-        let key = try XCTUnwrap(tabitoken.keys.first?.secret)
+        let liveKeyIndex = Int(ProcessInfo.processInfo.environment["CLOUDCODE_TABITOKEN_LIVE_KEY_INDEX"] ?? "") ?? 0
+        XCTAssertTrue((1...tabitoken.keys.count).contains(liveKeyIndex), "workflow must pass the exact Tabitoken Key slot that completed live inference")
+        let key = try XCTUnwrap(tabitoken.keys[liveKeyIndex - 1].secret)
         let liveModel = ProcessInfo.processInfo.environment["CLOUDCODE_TABITOKEN_LIVE_MODEL"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         XCTAssertFalse(key.isEmpty)
-        XCTAssertFalse(liveModel.isEmpty, "CLOUDCODE_TABITOKEN_LIVE_MODEL must come from the workflow's validated /v1/models probe")
+        XCTAssertFalse(liveModel.isEmpty, "CLOUDCODE_TABITOKEN_LIVE_MODEL must come from a real live inference validation")
 
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeLiveSmoke-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1525,6 +1551,48 @@ private final class ProviderEmptyDiscoveryURLProtocol: URLProtocol, @unchecked S
         if url.path.hasSuffix("/v1/models") || url.path == "/api/pricing" {
             status = 200
             body = Data(#"{"data":[],"success":true}"#.utf8)
+        } else {
+            status = 404
+            body = Data(#"{"error":"unsupported"}"#.utf8)
+        }
+        guard let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"]) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class ProviderEmptyCatalogLiveInferenceURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let status: Int
+        let body: Data
+        if url.path.hasSuffix("/v1/models") || url.path == "/api/pricing" {
+            status = 200
+            body = Data(#"{"data":[],"success":true}"#.utf8)
+        } else if url.path.hasSuffix("/v1/messages") {
+            let requestBody = request.httpBody.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            let model = requestBody?["model"] as? String
+            if model == "claude-opus-live",
+               request.value(forHTTPHeaderField: "Authorization") == "Bearer test-secret",
+               request.value(forHTTPHeaderField: "x-api-key") == "test-secret" {
+                status = 200
+                body = Data(#"{"content":[{"type":"text","text":"OK"}]}"#.utf8)
+            } else {
+                status = 503
+                body = Data(#"{"error":{"type":"model_not_found","message":"model unavailable"}}"#.utf8)
+            }
         } else {
             status = 404
             body = Data(#"{"error":"unsupported"}"#.utf8)
