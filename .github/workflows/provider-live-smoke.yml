@@ -295,6 +295,69 @@ jobs:
               pricing_ids, _ = parse_model_catalog(pricing_body)
           print(f"TABITOKEN_PUBLIC_PRICING status={pricing_status} model_count={len(pricing_ids)}")
 
+          authenticated_pricing_ids = []
+          secret = provider_secrets[0]
+          auth_pricing_status, auth_pricing_body = request(
+              "authenticated-pricing-key1",
+              "GET",
+              "",
+              fail_on_mismatch=False,
+              auth_mode="bearer",
+              absolute_url="https://tabitoken.com/api/pricing",
+          )
+          if auth_pricing_status == 200:
+              authenticated_pricing_ids, _ = parse_model_catalog(auth_pricing_body)
+          elif auth_pricing_status == 429:
+              print("::warning::Authenticated Tabitoken pricing is rate-limited; continuing with /v1/models without treating 429 as credit.")
+          elif auth_pricing_status not in (401, 403):
+              raise SystemExit(f"FAIL: authenticated Tabitoken pricing returned HTTP {auth_pricing_status}")
+          print(f"TABITOKEN_AUTH_PRICING status={auth_pricing_status} model_count={len(authenticated_pricing_ids)}")
+
+          shared_pricing_ids = authenticated_pricing_ids or pricing_ids
+
+          def parse_ratio_catalog(body):
+              try:
+                  parsed = json.loads(body)
+              except json.JSONDecodeError as exc:
+                  raise SystemExit(f"FAIL: Tabitoken ratio catalog returned malformed JSON: {exc.msg}")
+              data = parsed.get("data") if isinstance(parsed, dict) else None
+              if not isinstance(data, dict):
+                  return []
+              ids = []
+              for key in ("model_ratio", "model_price", "completion_ratio"):
+                  values = data.get(key)
+                  if not isinstance(values, dict):
+                      continue
+                  for model in sorted(values.keys()):
+                      if isinstance(model, str) and model and model not in ids:
+                          ids.append(model)
+              return ids
+
+          ratio_ids = []
+          ratio_status, ratio_body = request(
+              "authenticated-ratio-models-key1",
+              "GET",
+              "",
+              fail_on_mismatch=False,
+              auth_mode="bearer",
+              absolute_url="https://tabitoken.com/api/ratio_config",
+          )
+          if ratio_status == 200:
+              ratio_ids = parse_ratio_catalog(ratio_body)
+          elif ratio_status == 429:
+              print("::warning::Authenticated Tabitoken ratio catalog is rate-limited; continuing without treating 429 as credit.")
+          elif ratio_status not in (401, 403, 404):
+              raise SystemExit(f"FAIL: Tabitoken ratio catalog returned HTTP {ratio_status}")
+          print(f"TABITOKEN_RATIO_CATALOG status={ratio_status} model_count={len(ratio_ids)}")
+
+          shared_catalog_ids = shared_pricing_ids or ratio_ids
+          shared_catalog_source = (
+              "authenticated-pricing" if authenticated_pricing_ids
+              else "public-pricing" if pricing_ids
+              else "ratio-config" if ratio_ids
+              else None
+          )
+
           selected_model = None
           base_anthropic = None
           anthropic_candidates = []
@@ -307,9 +370,12 @@ jobs:
               catalog = []
               catalog_auth_mode = None
               catalog_statuses = {}
-              if key_index > 1 and pricing_ids:
-                  ids = list(pricing_ids)
-                  catalog_auth_mode = "public-pricing"
+              if key_index > 1 and shared_catalog_ids:
+                  ids = list(shared_catalog_ids)
+                  catalog_auth_mode = shared_catalog_source
+              elif key_index > 1:
+                  catalog_attempts.append({"key": key_index, "statuses": {}, "pricingStatus": pricing_status, "authPricingStatus": auth_pricing_status, "ratioStatus": ratio_status, "modelCount": 0})
+                  continue
               else:
                   for models_auth_mode in ("both",):
                       models_status, models_body = request(
@@ -332,11 +398,11 @@ jobs:
                           catalog_auth_mode = models_auth_mode
                           break
 
-                  if not ids and pricing_ids:
-                      ids = list(pricing_ids)
-                      catalog_auth_mode = "public-pricing"
+                  if not ids and shared_catalog_ids:
+                      ids = list(shared_catalog_ids)
+                      catalog_auth_mode = shared_catalog_source
 
-              catalog_attempts.append({"key": key_index, "statuses": catalog_statuses, "pricingStatus": pricing_status, "modelCount": len(ids)})
+              catalog_attempts.append({"key": key_index, "statuses": catalog_statuses, "pricingStatus": pricing_status, "authPricingStatus": auth_pricing_status, "ratioStatus": ratio_status, "modelCount": len(ids)})
               if not ids:
                   continue
 

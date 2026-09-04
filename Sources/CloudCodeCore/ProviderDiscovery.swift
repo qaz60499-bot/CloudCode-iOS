@@ -52,6 +52,31 @@ public struct ProviderDiscoveryClient: Sendable {
                 }
                 sawAuthoritativeEmptyCatalog = true
                 lastError = ProviderError.malformedEvent
+                if allowPricingCatalogFallback {
+                    break
+                }
+            } catch {
+                lastError = error
+                if allowPricingCatalogFallback,
+                   let providerError = error as? ProviderError,
+                   providerError == .rateLimited {
+                    break
+                }
+            }
+        }
+
+        if discoveredCatalog == nil, allowPricingCatalogFallback {
+            do {
+                let models = try await discoverModelsFromPricing(
+                    baseURL: baseURL,
+                    apiKey: apiKey,
+                    authMode: .bearer
+                )
+                if !models.isEmpty {
+                    discoveredCatalog = (models, preferredAuthMode ?? .both)
+                } else {
+                    sawAuthoritativeEmptyCatalog = true
+                }
             } catch {
                 lastError = error
             }
@@ -64,6 +89,21 @@ public struct ProviderDiscoveryClient: Sendable {
                     discoveredCatalog = (models, preferredAuthMode ?? .both)
                 } else {
                     sawAuthoritativeEmptyCatalog = true
+                }
+            } catch {
+                lastError = error
+            }
+        }
+
+        if discoveredCatalog == nil, allowPricingCatalogFallback {
+            do {
+                let models = try await discoverModelsFromRatioConfig(
+                    baseURL: baseURL,
+                    apiKey: apiKey,
+                    authMode: .bearer
+                )
+                if !models.isEmpty {
+                    discoveredCatalog = (models, preferredAuthMode ?? .both)
                 }
             } catch {
                 lastError = error
@@ -129,7 +169,11 @@ public struct ProviderDiscoveryClient: Sendable {
         return Self.extractModelIdentifiers(from: catalog)
     }
 
-    private func discoverModelsFromPricing(baseURL: URL) async throws -> [String] {
+    private func discoverModelsFromPricing(
+        baseURL: URL,
+        apiKey: String? = nil,
+        authMode: ProviderAuthMode = .bearer
+    ) async throws -> [String] {
         guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
             throw ProviderError.invalidEndpoint
         }
@@ -141,6 +185,9 @@ public struct ProviderDiscoveryClient: Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let apiKey, !apiKey.isEmpty {
+            applyAuth(apiKey, mode: authMode, request: &request)
+        }
         request.timeoutInterval = 30
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("缺少 HTTP 响应") }
@@ -157,6 +204,39 @@ public struct ProviderDiscoveryClient: Sendable {
         }
         if sawCatalogField { return [] }
         throw ProviderError.malformedEvent
+    }
+
+    private func discoverModelsFromRatioConfig(baseURL: URL, apiKey: String, authMode: ProviderAuthMode) async throws -> [String] {
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            throw ProviderError.invalidEndpoint
+        }
+        components.path = "/api/ratio_config"
+        components.query = nil
+        components.fragment = nil
+        guard let url = components.url else { throw ProviderError.invalidEndpoint }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyAuth(apiKey, mode: authMode, request: &request)
+        request.timeoutInterval = 30
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("缺少 HTTP 响应") }
+        if let error = ProviderHTTPClassifier.error(for: http.statusCode, body: data) { throw error }
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let ratioData = object["data"] as? [String: Any] else {
+            throw ProviderError.malformedEvent
+        }
+
+        var result: [String] = []
+        for key in ["model_ratio", "model_price", "completion_ratio"] {
+            guard let values = ratioData[key] as? [String: Any] else { continue }
+            for model in values.keys.sorted() where !model.isEmpty && !result.contains(model) {
+                result.append(model)
+            }
+        }
+        guard !result.isEmpty else { throw ProviderError.malformedEvent }
+        return result
     }
 
     private static func extractModelIdentifiers(from value: Any) -> [String] {

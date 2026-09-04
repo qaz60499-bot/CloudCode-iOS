@@ -565,6 +565,25 @@ final class ProviderDiscoveryTests: XCTestCase {
         XCTAssertEqual(reconciled.model, "")
     }
 
+    func testDiscoveryFallsBackToRatioConfigWhenModelsAndPricingAreEmpty() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProviderRatioDiscoveryURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let result = try await ProviderDiscoveryClient(session: session).discover(
+            baseURL: URL(string: "https://tabitoken.com")!,
+            apiKey: "test-secret",
+            preferredAuthMode: .both,
+            allowPricingCatalogFallback: true
+        )
+
+        XCTAssertEqual(result.models, ["claude-opus-live"])
+        XCTAssertEqual(result.authMode, .both)
+        XCTAssertEqual(result.protocols, [.anthropic])
+        XCTAssertEqual(result.readiness, .ready)
+    }
+
     func testProviderProfileAppliesLiveDiscoveryAndDropsStaleModelMetadata() throws {
         var profile = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.tabitokenID }))
         let discovery = ProviderDiscoveryResult(
@@ -1506,6 +1525,44 @@ private final class ProviderEmptyDiscoveryURLProtocol: URLProtocol, @unchecked S
         if url.path.hasSuffix("/v1/models") || url.path == "/api/pricing" {
             status = 200
             body = Data(#"{"data":[],"success":true}"#.utf8)
+        } else {
+            status = 404
+            body = Data(#"{"error":"unsupported"}"#.utf8)
+        }
+        guard let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"]) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class ProviderRatioDiscoveryURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let hasBearer = request.value(forHTTPHeaderField: "Authorization") == "Bearer test-secret"
+        let hasXAPIKey = request.value(forHTTPHeaderField: "x-api-key") == "test-secret"
+        let status: Int
+        let body: Data
+        if url.path.hasSuffix("/v1/models") || url.path == "/api/pricing" {
+            status = 200
+            body = Data(#"{"data":[],"success":true}"#.utf8)
+        } else if url.path == "/api/ratio_config", hasBearer, !hasXAPIKey {
+            status = 200
+            body = Data(#"{"data":{"model_ratio":{"claude-opus-live":1},"model_price":{},"completion_ratio":{}},"success":true}"#.utf8)
+        } else if url.path.hasSuffix("/v1/messages"), hasBearer, hasXAPIKey {
+            status = 200
+            body = Data(#"{"content":[{"type":"text","text":"OK"}]}"#.utf8)
         } else {
             status = 404
             body = Data(#"{"error":"unsupported"}"#.utf8)
