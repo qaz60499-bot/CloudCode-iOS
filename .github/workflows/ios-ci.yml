@@ -205,12 +205,13 @@ jobs:
             echo "FAIL: public Runner build must not use TrollStore private entitlements" >&2
             exit 1
           fi
-          if grep -E '<key>(platform-application|com\.apple\.private\.security\.storage\.AppDataContainers)</key>' Entitlements/TrollStore.entitlements; then
-            echo "FAIL: privileged SwiftUI host must not carry unnecessary platform/container escalation entitlements" >&2
-            exit 1
-          fi
-          grep -F '<key>com.apple.private.security.no-sandbox</key>' Entitlements/TrollStore.entitlements >/dev/null
-          grep -F '<key>com.apple.private.persona-mgmt</key>' Entitlements/TrollStore.entitlements >/dev/null
+          for required_trollstore_host_entitlement in \
+            '<key>com.apple.private.security.no-sandbox</key>' \
+            '<key>platform-application</key>' \
+            '<key>com.apple.private.security.storage.AppDataContainers</key>' \
+            '<key>com.apple.private.persona-mgmt</key>'; do
+            grep -F "$required_trollstore_host_entitlement" Entitlements/TrollStore.entitlements >/dev/null
+          done
           grep -F 'CODE_SIGN_ENTITLEMENTS: Entitlements/CloudCode.entitlements' project.yml >/dev/null
           grep -F 'kSecAttrAccessibleWhenUnlockedThisDeviceOnly' Sources/CloudCodeCore/KeychainAPIKeyVault.swift >/dev/null
           if grep -F 'kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly' Sources/CloudCodeCore/KeychainAPIKeyVault.swift; then
