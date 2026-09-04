@@ -50,9 +50,6 @@ public struct ProviderDiscoveryClient: Sendable {
                     break
                 }
                 lastError = ProviderError.malformedEvent
-                if allowPricingCatalogFallback {
-                    break
-                }
             } catch {
                 lastError = error
             }
@@ -181,6 +178,17 @@ public struct ProviderDiscoveryClient: Sendable {
                 }
             }
             if matchedPreferredKey { return }
+
+            // Pricing catalogs sometimes use the model identifier as the dictionary key
+            // and put price metadata in the value. Accept only keys that look like model
+            // identifiers; do not ingest generic metadata keys such as `default` or vendor names.
+            let modelMarkers = ["claude", "opus", "sonnet", "haiku", "gpt", "gemini", "deepseek", "glm", "kimi", "qwen", "grok", "minimax", "step"]
+            for (key, child) in dictionary where child is [Any] || child is [String: Any] {
+                let lowered = key.lowercased()
+                if modelMarkers.contains(where: { lowered.contains($0) }) {
+                    append(key)
+                }
+            }
 
             // Some compatible gateways wrap each model in a provider-specific object.
             // Traverse nested containers, but do not treat unrelated top-level metadata
