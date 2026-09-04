@@ -232,9 +232,16 @@ jobs:
           agent_router = catalog.split('id: "https-agentrouter-org"', 1)[1].split('source: .desktopSnapshot', 1)[0]
           if 'authMode: .bearer' not in agent_router:
               raise SystemExit('FAIL: AgentRouter catalog auth mode drifted without live evidence')
-          if '已按你的明确操作替换当前厂商 Key' not in app:
-              raise SystemExit('FAIL: explicit rotated-key replacement path is missing')
-          print('PASS: startup-safe, provider-compatibility, rotated-key and settings-navigation guardrails are present')
+          for marker in ('ProviderKeyProvisioner.apply(', 'manualProviderKeyOverrides', 'provider.key.save.begin', 'installedKeyReferences'):
+              if marker not in app:
+                  raise SystemExit(f'FAIL: hardened Provider Key replacement marker missing: {marker}')
+          if 'readAll(limit: 12_000)' in app:
+              raise SystemExit('FAIL: diagnostics view reintroduced an unbounded/high-memory 12k record refresh')
+          if 'while !Task.isCancelled' in content.split('private struct DiagnosticLogsView', 1)[1].split('private struct DiagnosticShareItem', 1)[0]:
+              raise SystemExit('FAIL: diagnostics view reintroduced continuous full-refresh polling')
+          if '复制闪退线索' not in content or 'crashRecoveryDiagnosticText' not in app:
+              raise SystemExit('FAIL: lightweight crash-recovery diagnostics path is missing')
+          print('PASS: startup-safe, provider-compatibility, hardened key replacement, diagnostics and settings-navigation guardrails are present')
           PY
           grep -F 'backgroundContinuationWindow: TimeInterval = 90 * 60' Sources/CloudCodeApp/AppEnvironment.swift >/dev/null
           grep -F 'type: library.static' project.yml >/dev/null
