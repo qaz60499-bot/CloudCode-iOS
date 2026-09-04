@@ -15,6 +15,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Probe Justwoker and AgentRouter compatibility without exposing response content
+        id: compatibility_probe
         env:
           CLOUDCODE_PROVIDER_BOOTSTRAP: ${{ secrets.CLOUDCODE_PROVIDER_BOOTSTRAP }}
         run: |
@@ -64,7 +65,7 @@ jobs:
               if status not in (402, 403, 429):
                   return False
               text = body.decode("utf-8", "replace").lower()
-              return any(marker in text for marker in ("预扣费额度失败", "insufficient balance", "insufficient credit", "precharge", "quota"))
+              return any(marker in text for marker in ("预扣费额度失败", "insufficient balance", "insufficient credit", "precharge", "quota", "capacity"))
 
           agent_key = provider_key("https-agentrouter-org")
           agent_payload = {
@@ -96,29 +97,54 @@ jobs:
               "stream": True,
               "messages": [{"role": "user", "content": "Reply OK"}],
           }
-          status, body, content_type = request(
-              "https://api.justwoker.icu/v1/messages",
-              just_key,
-              "bearer",
-              just_payload,
-              anthropic=True,
-          )
-          if not (200 <= status < 300) and not capacity_blocked(status, body):
-              raise SystemExit(f"FAIL: Justwoker Anthropic endpoint returned HTTP {status}")
-          text = body.decode("utf-8", "replace")
-          stripped = text.lstrip()
-          has_data_prefix = "data:" in text
-          has_message_stop = '"message_stop"' in text
-          has_message_delta = '"message_delta"' in text
-          raw_json = stripped.startswith("{")
-          print(
-              "JUSTWOKER_STREAM_SHAPE "
-              f"status={status} content_type={content_type.split(';')[0]} body_bytes={len(body)} "
-              f"has_data_prefix={has_data_prefix} "
-              f"has_message_stop={has_message_stop} "
-              f"has_message_delta={has_message_delta} "
-              f"raw_json={raw_json}"
-          )
+          just_statuses = {}
+          just_response = None
+          just_capacity_blocked = False
+          for mode in ("both", "bearer", "x-api-key"):
+              status, body, content_type = request(
+                  "https://api.justwoker.icu/v1/messages",
+                  just_key,
+                  mode,
+                  just_payload,
+                  anthropic=True,
+              )
+              just_statuses[mode] = status
+              print(f"JUSTWOKER_AUTH_PROBE auth={mode} status={status} content_type={content_type.split(';')[0]} body_bytes={len(body)}")
+              if 200 <= status < 300:
+                  just_response = (mode, status, body, content_type)
+                  break
+              if capacity_blocked(status, body):
+                  just_capacity_blocked = True
+                  break
+          if just_response is None:
+              if just_capacity_blocked:
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                      output.write("justwoker_capacity_blocked=true\n")
+                  print("::warning::Justwoker is explicitly blocked by provider credit/capacity; live shape/tool probes are skipped and deterministic Provider regressions will run.")
+              else:
+                  raise SystemExit(f"FAIL: Justwoker Anthropic endpoint rejected all supported auth modes: {just_statuses}")
+          else:
+              mode, status, body, content_type = just_response
+              text = body.decode("utf-8", "replace")
+              stripped = text.lstrip()
+              has_data_prefix = "data:" in text
+              has_message_stop = '\"message_stop\"' in text
+              has_message_delta = '\"message_delta\"' in text
+              raw_json = stripped.startswith("{")
+              media_type = content_type.split(";")[0].strip().lower()
+              print(
+                  "JUSTWOKER_STREAM_SHAPE "
+                  f"auth={mode} status={status} content_type={media_type} body_bytes={len(body)} "
+                  f"has_data_prefix={has_data_prefix} "
+                  f"has_message_stop={has_message_stop} "
+                  f"has_message_delta={has_message_delta} "
+                  f"raw_json={raw_json}"
+              )
+              if media_type != "text/event-stream" or not has_data_prefix or not has_message_stop or not has_message_delta or raw_json:
+                  raise SystemExit("FAIL: Justwoker returned HTTP 2xx but not the expected Anthropic SSE message_delta/message_stop shape")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("justwoker_capacity_blocked=false\n")
+                  output.write(f"justwoker_auth_mode={mode}\n")
           PY
 
       - name: Probe Tabitoken request compatibility without exposing secrets
@@ -388,6 +414,7 @@ jobs:
           test "$(git -C .build/checkouts/ZIPFoundation rev-parse HEAD)" = "22787ffb59de99e5dc1fbfe80b19c97a904ad48d"
 
       - name: Run real Cloud Code Agent two-round tool smoke against Justwoker
+        if: steps.compatibility_probe.outputs.justwoker_capacity_blocked != 'true'
         env:
           CLOUDCODE_JUSTWOKER_LIVE_SMOKE: "1"
           CLOUDCODE_PROVIDER_BOOTSTRAP: ${{ secrets.CLOUDCODE_PROVIDER_BOOTSTRAP }}
@@ -406,7 +433,7 @@ jobs:
           swift test --filter testTabitokenAgentUsesFullCloudCodeToolSchemaExecutesToolAndContinuesAfterResult
 
       - name: Run deterministic Provider regressions when account credit blocks live generation
-        if: steps.live_probe.outputs.billing_blocked == 'true'
+        if: steps.live_probe.outputs.billing_blocked == 'true' || steps.compatibility_probe.outputs.justwoker_capacity_blocked == 'true'
         run: |
           set -euo pipefail
           swift test --filter Provider
