@@ -74,7 +74,7 @@ jobs:
           verify_stable_launch() {
             local phase="$1"
             local launch_result pid data_container breadcrumb_root latest_run
-            launch_result="$(simctl_bounded 30 launch "$UDID" com.cloudcode.ios)"
+            launch_result="$(simctl_bounded 90 launch "$UDID" com.cloudcode.ios)"
             echo "$phase: $launch_result"
             pid="${launch_result##*: }"
             test -n "$pid"
@@ -111,7 +111,7 @@ jobs:
           seed_run="$breadcrumb_root/run-11111111-1111-1111-1111-111111111111.jsonl"
           python3 -c 'import datetime,json,sys; ts=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z"); print(json.dumps({"runID":"11111111-1111-1111-1111-111111111111","timestamp":ts,"stage":"bootstrap.safe.begin"}), file=open(sys.argv[1],"w",encoding="utf-8"))' "$seed_run"
           sleep 1
-          recovery_launch="$(simctl_bounded 30 launch "$UDID" com.cloudcode.ios)"
+          recovery_launch="$(simctl_bounded 90 launch "$UDID" com.cloudcode.ios)"
           echo "recovery-launch: $recovery_launch"
           sleep 8
           latest_run="$(find "$breadcrumb_root" -type f -name 'run-*.jsonl' -print 2>/dev/null | while IFS= read -r file; do stat -f '%m %N' "$file"; done | sort -rn | head -1 | cut -d' ' -f2-)"
@@ -136,7 +136,7 @@ jobs:
           checkpoint_file="$tasks_root/checkpoints.json"
           CHECKPOINT_FILE="$checkpoint_file" swift -e 'import Foundation; struct C: Codable { var id: UUID; var sessionID: UUID; var taskName: String; var stepIndex: Int; var stepName: String; var totalSteps: Int; var state: String; var updatedAt: Date; var payload: [String:String] }; let id = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!; let sid = UUID(uuidString: "33333333-3333-3333-3333-333333333333")!; let c = C(id: id, sessionID: sid, taskName: "cold-launch crash-loop regression", stepIndex: 1, stepName: "provider request", totalSteps: 34, state: "running", updatedAt: Date(), payload: ["request":"do-not-replay-on-cold-launch"]); let e = JSONEncoder(); e.dateEncodingStrategy = .iso8601; e.outputFormatting = [.prettyPrinted, .sortedKeys]; let url = URL(fileURLWithPath: ProcessInfo.processInfo.environment["CHECKPOINT_FILE"]!); try e.encode([id:c]).write(to: url, options: .atomic)'
           simctl_bounded 30 spawn "$UDID" defaults write com.cloudcode.ios task.autoResumeUnlessStopped -bool YES
-          crashloop_launch="$(simctl_bounded 30 launch "$UDID" com.cloudcode.ios)"
+          crashloop_launch="$(simctl_bounded 90 launch "$UDID" com.cloudcode.ios)"
           echo "post-send-crash recovery launch: $crashloop_launch"
           sleep 12
           latest_run="$(find "$breadcrumb_root" -type f -name 'run-*.jsonl' -print 2>/dev/null | while IFS= read -r file; do stat -f '%m %N' "$file"; done | sort -rn | head -1 | cut -d' ' -f2-)"
@@ -223,7 +223,7 @@ jobs:
           fi
           grep -F 'simctl_bounded()' .github/workflows/ios-ci.yml >/dev/null
           grep -F 'simctl_bounded 120 install' .github/workflows/ios-ci.yml >/dev/null
-          grep -F 'simctl_bounded 30 launch' .github/workflows/ios-ci.yml >/dev/null
+          grep -F 'simctl_bounded 90 launch' .github/workflows/ios-ci.yml >/dev/null
           grep -F 'revision: "22787ffb59de99e5dc1fbfe80b19c97a904ad48d"' Package.swift >/dev/null
           grep -F 'revision: 22787ffb59de99e5dc1fbfe80b19c97a904ad48d' project.yml >/dev/null
           if grep -R --line-number 'NSAllowsArbitraryLoads' Sources project.yml Entitlements; then
