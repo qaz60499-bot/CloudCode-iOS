@@ -127,8 +127,37 @@ jobs:
           simctl_bounded 30 terminate "$UDID" com.cloudcode.ios
           rm -f "$seed_run"
 
+          # Reproduce the user-reported post-bootstrap crash-loop precursor: a previous
+          # process left an active Agent checkpoint plus the persisted auto-resume bit.
+          # A fresh process must recover the checkpoint to interrupted state but MUST NOT
+          # automatically replay the Provider request during cold launch.
+          tasks_root="$data_container/Library/Application Support/CloudCode/Tasks"
+          mkdir -p "$tasks_root"
+          checkpoint_file="$tasks_root/checkpoints.json"
+          CHECKPOINT_FILE="$checkpoint_file" swift -e 'import Foundation; struct C: Codable { var id: UUID; var sessionID: UUID; var taskName: String; var stepIndex: Int; var stepName: String; var totalSteps: Int; var state: String; var updatedAt: Date; var payload: [String:String] }; let id = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!; let sid = UUID(uuidString: "33333333-3333-3333-3333-333333333333")!; let c = C(id: id, sessionID: sid, taskName: "cold-launch crash-loop regression", stepIndex: 1, stepName: "provider request", totalSteps: 34, state: "running", updatedAt: Date(), payload: ["request":"do-not-replay-on-cold-launch"]); let e = JSONEncoder(); e.dateEncodingStrategy = .iso8601; e.outputFormatting = [.prettyPrinted, .sortedKeys]; let url = URL(fileURLWithPath: ProcessInfo.processInfo.environment["CHECKPOINT_FILE"]!); try e.encode([id:c]).write(to: url, options: .atomic)'
+          simctl_bounded 30 spawn "$UDID" defaults write com.cloudcode.ios task.autoResumeUnlessStopped -bool YES
+          crashloop_launch="$(simctl_bounded 30 launch "$UDID" com.cloudcode.ios)"
+          echo "post-send-crash recovery launch: $crashloop_launch"
+          sleep 12
+          latest_run="$(find "$breadcrumb_root" -type f -name 'run-*.jsonl' -print 2>/dev/null | while IFS= read -r file; do stat -f '%m %N' "$file"; done | sort -rn | head -1 | cut -d' ' -f2-)"
+          test -n "$latest_run"
+          if ! grep -F 'runtime.autoresume.coldlaunch.suppressed' "$latest_run" >/dev/null || ! grep -F 'bootstrap.completed' "$latest_run" >/dev/null; then
+            echo "FAIL: cold launch did not suppress persisted Agent auto-resume after a process-level interruption" >&2
+            cat "$latest_run" >&2 || true
+            simctl_bounded 45 spawn "$UDID" log show --last 45s --style compact --predicate 'process == "CloudCode"' || true
+            simctl_bounded 30 shutdown "$UDID" >/dev/null 2>&1 || true
+            exit 1
+          fi
+          grep -F 'interrupted' "$checkpoint_file" >/dev/null
+          if ! simctl_bounded 30 terminate "$UDID" com.cloudcode.ios; then
+            echo "FAIL: Cloud Code exited while suppressing the stale post-send auto-resume state" >&2
+            simctl_bounded 45 spawn "$UDID" log show --last 45s --style compact --predicate 'process == "CloudCode"' || true
+            simctl_bounded 30 shutdown "$UDID" >/dev/null 2>&1 || true
+            exit 1
+          fi
+
           simctl_bounded 30 shutdown "$UDID" >/dev/null 2>&1 || true
-          echo 'PASS: Release cold launch, five relaunches, and simulated prior-crash recovery all remained stable'
+          echo 'PASS: Release cold launch, five relaunches, bootstrap crash recovery, and post-send crash-loop suppression remained stable'
 
       - name: Run iOS settings/provider UI regression smoke
         run: |
@@ -331,6 +360,15 @@ jobs:
 
           if 'previousStartupCompleted' not in app or 'runContainsStage($0.runID, stage: "bootstrap.completed")' not in app:
               raise SystemExit('FAIL: crash-loop recovery no longer checks whether the previous startup reached the stable completion point')
+          for marker in ('inheritedAutoResumeIntentAtLaunch', 'autoResumeArmedInCurrentProcess', 'runtime.autoresume.coldlaunch.suppressed'):
+              if marker not in app:
+                  raise SystemExit(f'FAIL: post-send cold-launch crash-loop guard missing: {marker}')
+          auto_resume = app.split('private func resumeMostRecentInterruptedTaskIfRequested()', 1)[1].split('private func clearAutoResumeIntentIfNoPendingTask()', 1)[0]
+          if 'guard autoResumeArmedInCurrentProcess else' not in auto_resume:
+              raise SystemExit('FAIL: persisted Agent auto-resume state can cross a process boundary and replay a crash-triggering request')
+          for marker in ('runtime.agent.capability.begin', 'runtime.agent.keychain.begin', 'runtime.agent.provider.begin', 'runtime.agent.provider.firstEvent', 'runtime.agent.tool.'):
+              if marker not in agent:
+                  raise SystemExit(f'FAIL: first-send crash breadcrumb missing: {marker}')
           recovery = bootstrap.split('if previousStartupRun != nil && !previousStartupCompleted', 1)[1].split('if let previousStartupRun', 1)[0]
           for forbidden in ('probeStartupSafe()', 'probeExtendedDevice()', 'probePrivileged()', 'importBootstrapIfPresent()', 'hermesStore.bootstrap()', 'recoverInterruptedTransactions()', 'diagnosticLogStore.', 'refreshDiagnosticLogs('):
               if forbidden in recovery:

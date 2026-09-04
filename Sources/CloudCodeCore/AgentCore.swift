@@ -71,9 +71,13 @@ public actor SessionStore {
     }
 
     public func save(_ session: AgentSession) throws {
+        let data = try JSONEncoder.pretty.encode(session)
+        guard Int64(data.count) <= Self.maxSerializedBytes else {
+            throw SessionStoreError.oversizedSession(session.id)
+        }
         try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
         let url = root.appendingPathComponent(session.id.uuidString).appendingPathExtension("json")
-        try JSONEncoder.pretty.encode(session).write(to: url, options: .atomic)
+        try data.write(to: url, options: .atomic)
     }
 
     public func delete(_ id: UUID) throws {
@@ -128,6 +132,7 @@ public actor SessionStore {
 
 public enum TaskCheckpointStoreError: Error, Equatable {
     case corruptStore
+    case oversizedStore
 }
 
 public actor TaskCheckpointStore {
@@ -225,8 +230,12 @@ public actor TaskCheckpointStore {
     }
 
     private func persist() throws {
+        let data = try JSONEncoder.pretty.encode(checkpoints)
+        guard Int64(data.count) <= Self.maxSerializedBytes else {
+            throw TaskCheckpointStoreError.oversizedStore
+        }
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try JSONEncoder.pretty.encode(checkpoints).write(to: fileURL, options: .atomic)
+        try data.write(to: fileURL, options: .atomic)
     }
 }
 
@@ -322,6 +331,7 @@ public actor AgentCore {
     private let steeringMailbox: AgentSteeringMailbox
     private let memoryProvider: HermesMemoryProviding
     private let diagnosticLogger: DiagnosticLogStore?
+    private let runtimeBreadcrumb: (@Sendable (String) -> Void)?
     private let maxToolRounds: Int
     private var activeSessionRuns: [UUID: UUID] = [:]
 
@@ -336,6 +346,7 @@ public actor AgentCore {
         steeringMailbox: AgentSteeringMailbox = AgentSteeringMailbox(),
         memoryProvider: HermesMemoryProviding = NullHermesMemoryProvider(),
         diagnosticLogger: DiagnosticLogStore? = nil,
+        runtimeBreadcrumb: (@Sendable (String) -> Void)? = nil,
         maxToolRounds: Int = 32
     ) {
         self.provider = provider
@@ -348,6 +359,7 @@ public actor AgentCore {
         self.steeringMailbox = steeringMailbox
         self.memoryProvider = memoryProvider
         self.diagnosticLogger = diagnosticLogger
+        self.runtimeBreadcrumb = runtimeBreadcrumb
         self.maxToolRounds = max(1, maxToolRounds)
     }
 
@@ -425,6 +437,7 @@ public actor AgentCore {
                     ]
                 )
                 do {
+                    runtimeBreadcrumb?("runtime.agent.persist.begin")
                     session.messages.removeAll { $0.role == .system }
                     session.messages.insert(ChatMessage(role: .system, content: Self.agentSafetyInstruction), at: 0)
                     if appendUserMessage {
@@ -454,17 +467,26 @@ public actor AgentCore {
                     session.updatedAt = Date()
                     try await sessionStore.save(session)
                     try await checkpointStore.upsert(checkpoint)
+                    runtimeBreadcrumb?("runtime.agent.persist.end")
 
                     continuation.yield(.status("正在检测设备能力…"))
+                    runtimeBreadcrumb?("runtime.agent.capability.begin")
+                    try? await diagnosticLogger?.log(level: .debug, subsystem: "agent", action: "capability-probe", result: "started", sessionID: session.id)
                     var capabilities = await DiagnosticContext.$sessionID.withValue(session.id) {
                         await capabilityProbe.probeStartupSafe()
                     }
+                    runtimeBreadcrumb?("runtime.agent.capability.end")
+                    try? await diagnosticLogger?.log(level: .debug, subsystem: "agent", action: "capability-probe", result: "completed", sessionID: session.id)
                     session = try await reconcileDanglingToolCalls(
                         in: session,
                         capabilities: capabilities,
                         allowedRoot: allowedRoot
                     )
+                    runtimeBreadcrumb?("runtime.agent.keychain.begin")
+                    try? await diagnosticLogger?.log(level: .debug, subsystem: "agent", action: "keychain-read", result: "started", sessionID: session.id)
                     let key = try await keyVault.key(for: providerConfiguration.apiKeyReference)
+                    runtimeBreadcrumb?("runtime.agent.keychain.end")
+                    try? await diagnosticLogger?.log(level: .debug, subsystem: "agent", action: "keychain-read", result: "completed", sessionID: session.id)
                     let descriptors = await registry.all()
                     let toolNameMap = try ProviderToolNameMap(internalNames: descriptors.map(\.name))
                     session = try Self.normalizeProviderToolMetadata(in: session, using: toolNameMap)
@@ -506,6 +528,15 @@ public actor AgentCore {
                         var steeringInterruptedProviderStream = false
 
                         let providerMessages = HarnessContextManager.providerMessages(from: session.messages)
+                        runtimeBreadcrumb?("runtime.agent.provider.begin")
+                        try? await diagnosticLogger?.log(
+                            level: .debug,
+                            subsystem: "provider",
+                            action: "stream",
+                            result: "started",
+                            sessionID: session.id,
+                            metadata: ["round": String(round + 1)]
+                        )
                         let stream = DiagnosticContext.$sessionID.withValue(session.id) {
                             provider.stream(
                                 configuration: providerConfiguration,
@@ -515,8 +546,13 @@ public actor AgentCore {
                             )
                         }
 
+                        var sawProviderEvent = false
                         for try await event in stream {
                             try Task.checkCancellation()
+                            if !sawProviderEvent {
+                                sawProviderEvent = true
+                                runtimeBreadcrumb?("runtime.agent.provider.firstEvent")
+                            }
                             switch event {
                             case .token(let token):
                                 assistantText += token
@@ -534,6 +570,15 @@ public actor AgentCore {
                                 break
                             }
                         }
+                        runtimeBreadcrumb?("runtime.agent.provider.end")
+                        try? await diagnosticLogger?.log(
+                            level: .debug,
+                            subsystem: "provider",
+                            action: "stream",
+                            result: "completed",
+                            sessionID: session.id,
+                            metadata: ["round": String(round + 1), "receivedEvent": sawProviderEvent ? "true" : "false"]
+                        )
 
                         try Task.checkCancellation()
 
@@ -580,6 +625,7 @@ public actor AgentCore {
                                 sessionID: session.id,
                                 metadata: ["roundsUsed": String(round + 1)]
                             )
+                            runtimeBreadcrumb?("runtime.agent.completed")
                             continuation.yield(.finished)
                             continuation.finish()
                             return
@@ -664,8 +710,10 @@ public actor AgentCore {
                                 try await sessionStore.save(session)
                             } else {
                                 let context = ToolExecutionContext(permissionMode: session.permissionMode, capabilityProfile: capabilities, allowedRoot: allowedRoot)
+                                runtimeBreadcrumb?("runtime.agent.tool.\(name).begin")
                                 do {
                                     let result = try await toolRouter.execute(call, context: context)
+                                    runtimeBreadcrumb?("runtime.agent.tool.\(name).end")
                                     continuation.yield(.toolFinished(result))
                                     let data = try JSONEncoder.pretty.encode(result)
                                     let rawContent = String(data: data, encoding: .utf8) ?? result.summary
@@ -694,6 +742,7 @@ public actor AgentCore {
                                         try await checkpointStore.upsert(checkpoint)
                                     }
                                 } catch {
+                                    runtimeBreadcrumb?("runtime.agent.tool.\(name).error")
                                     if let stateChangeSignature {
                                         lastStateChangeSignature = stateChangeSignature
                                         lastStateChangeScope = Self.semanticToolScope(name: name, arguments: arguments)
@@ -750,6 +799,7 @@ public actor AgentCore {
 
                     throw ProviderError.transport("Agent 已达到单任务安全工具轮次上限：\(maxToolRounds)。这不是消息数量限制；任务已保留检查点，可继续或追加指令。")
                 } catch is CancellationError {
+                    runtimeBreadcrumb?("runtime.agent.cancelled")
                     try? await diagnosticLogger?.log(
                         level: .warning,
                         subsystem: "agent",
@@ -763,6 +813,7 @@ public actor AgentCore {
                     try? await checkpointStore.upsert(checkpoint)
                     continuation.finish()
                 } catch {
+                    runtimeBreadcrumb?("runtime.agent.error")
                     try? await diagnosticLogger?.log(
                         level: .error,
                         subsystem: "agent",

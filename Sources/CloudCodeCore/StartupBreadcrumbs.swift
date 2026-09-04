@@ -33,11 +33,12 @@ public struct StartupBreadcrumbRunSummary: Equatable, Sendable {
 /// Every launch gets its own tiny JSONL file so the next launch can report the last
 /// stage reached by the previous process even when the previous process terminated
 /// before the normal diagnostics stack was ready.
-public struct StartupBreadcrumbStore: Sendable {
+public struct StartupBreadcrumbStore: @unchecked Sendable {
     private let directory: URL
     private let fileManager: FileManager
     private let retainedRunCount: Int
     private static let maxRunFileBytes: Int64 = 64 * 1024
+    private static let ioLock = NSLock()
 
     public init(
         directory: URL = StartupBreadcrumbStore.defaultDirectory(),
@@ -69,6 +70,8 @@ public struct StartupBreadcrumbStore: Sendable {
     public func append(runID: UUID, stage: String, at timestamp: Date = Date()) {
         let boundedStage = Self.sanitizeStage(stage)
         guard !boundedStage.isEmpty else { return }
+        Self.ioLock.lock()
+        defer { Self.ioLock.unlock() }
         do {
             try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
             let url = fileURL(for: runID)

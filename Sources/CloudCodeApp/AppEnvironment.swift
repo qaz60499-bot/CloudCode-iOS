@@ -71,6 +71,8 @@ public final class CloudCodeViewModel: ObservableObject {
     private let startupRunID: UUID
     private let previousStartupRun: StartupBreadcrumbRunSummary?
     private let previousStartupCompleted: Bool
+    private let inheritedAutoResumeIntentAtLaunch: Bool
+    private var autoResumeArmedInCurrentProcess = false
     private var activeTasks: [UUID: Task<Void, Never>] = [:]
     private var activeRunTokens: [UUID: UUID] = [:]
     private var activeConfigurations: [UUID: ProviderConfiguration] = [:]
@@ -174,10 +176,23 @@ public final class CloudCodeViewModel: ObservableObject {
             checkpointStore: checkpoints,
             steeringMailbox: steeringMailbox,
             memoryProvider: hermesStore,
-            diagnosticLogger: diagnosticLogStore
+            diagnosticLogger: diagnosticLogStore,
+            runtimeBreadcrumb: { stage in
+                startupBreadcrumbStore.append(runID: resolvedStartupRunID, stage: stage)
+            }
         )
 
         let defaults = UserDefaults.standard
+        let inheritedAutoResumeIntentAtLaunch = defaults.bool(forKey: Self.autoResumeTaskDefaultsKey)
+        self.inheritedAutoResumeIntentAtLaunch = inheritedAutoResumeIntentAtLaunch
+        if inheritedAutoResumeIntentAtLaunch {
+            // Never trust a persisted auto-resume bit across a process boundary. A previous
+            // process may have died in Keychain, Provider parsing, or tool execution; blindly
+            // replaying that request on cold launch can turn one send-time crash into a
+            // permanent launch crash loop. Same-process background recovery is tracked by the
+            // in-memory gate and remains available.
+            defaults.set(false, forKey: Self.autoResumeTaskDefaultsKey)
+        }
         let initialPermissionMode = PermissionMode(rawValue: defaults.string(forKey: "permission.mode") ?? "safe") ?? .safe
         let customProviderFileURL = support.appendingPathComponent("Provider/custom-providers.json")
         let customProfiles = Self.loadCustomProviders(from: customProviderFileURL)
@@ -306,6 +321,20 @@ public final class CloudCodeViewModel: ObservableObject {
                 trash = try await trashService.records()
                 auditEvents = Array((try await auditStore.readNewest(limit: 200)).reversed())
                 interruptedTasks = await checkpointStore.interrupted()
+                if inheritedAutoResumeIntentAtLaunch && !interruptedTasks.isEmpty {
+                    recordStartupBreadcrumb("runtime.autoresume.coldlaunch.suppressed")
+                    let message = "检测到上一个进程在任务执行期间中断。为避免重复闪退或重复执行状态变更，本次冷启动已暂停自动续跑；界面会先保持可用，可在“活动/中断任务”中手动继续。"
+                    for checkpoint in interruptedTasks {
+                        sessionActivityLines[checkpoint.sessionID, default: []].append(message)
+                    }
+                    try? await diagnosticLogStore.log(
+                        level: .warning,
+                        subsystem: "agent",
+                        action: "cold-launch-auto-resume",
+                        result: "suppressed",
+                        metadata: ["interruptedTaskCount": String(interruptedTasks.count)]
+                    )
+                }
                 try await restoreSessionState()
                 try refreshFiles()
                 if bundledPrivateBootstrapAvailable {
@@ -606,10 +635,13 @@ public final class CloudCodeViewModel: ObservableObject {
         retryableProviderFailureSessionIDs.remove(sessionID)
         sessionActivityLines[sessionID, default: []].append("正在使用 \(config.name) / \(config.model) 规划请求…")
         syncVisibleSessionState(sessionID)
+        autoResumeArmedInCurrentProcess = true
         UserDefaults.standard.set(true, forKey: Self.autoResumeTaskDefaultsKey)
+        recordStartupBreadcrumb("runtime.agent.request.scheduled")
 
         let task = Task {
             do {
+                recordStartupBreadcrumb("runtime.agent.request.prepare")
                 var requestSession = initialSession
                 var attachments: [ChatAttachment] = []
                 if let imageData {
@@ -635,6 +667,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 syncVisibleSessionState(sessionID)
 
                 let requestText = trimmed.isEmpty && !attachments.isEmpty ? "请处理这张图片。" : trimmed
+                recordStartupBreadcrumb("runtime.agent.stream.attach")
                 let stream = await agentCore.send(
                     text: requestText,
                     session: requestSession,
@@ -642,10 +675,16 @@ public final class CloudCodeViewModel: ObservableObject {
                     allowedRoot: allowedRoot,
                     appendUserMessage: false
                 )
+                var sawAgentEvent = false
                 for try await event in stream {
                     guard activeRunTokens[sessionID] == runToken else { break }
+                    if !sawAgentEvent {
+                        sawAgentEvent = true
+                        recordStartupBreadcrumb("runtime.agent.stream.firstEvent")
+                    }
                     handleAgentEvent(event, sessionID: sessionID)
                 }
+                recordStartupBreadcrumb("runtime.agent.stream.closed")
                 if activeRunTokens[sessionID] == runToken,
                    let saved = try? await sessionStore.load(sessionID) {
                     liveSessions[sessionID] = saved
@@ -657,6 +696,7 @@ public final class CloudCodeViewModel: ObservableObject {
                     syncVisibleSessionState(sessionID)
                 }
             } catch {
+                recordStartupBreadcrumb("runtime.agent.request.failed")
                 if activeRunTokens[sessionID] == runToken {
                     recordProviderFailure(error, configuration: config, sessionID: sessionID)
                     sessionErrors[sessionID] = Self.userFacingRunError(error)
@@ -726,6 +766,7 @@ public final class CloudCodeViewModel: ObservableObject {
         Task { await steeringMailbox.clear(sessionID: sessionID) }
         sessionActivityLines[sessionID, default: []].append("任务已按你的明确命令停止；检查点已保留，但这个会话不会自动继续。")
         if runningSessionIDs.isEmpty {
+            autoResumeArmedInCurrentProcess = false
             UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
             endBackgroundExecutionIfNeeded()
         }
@@ -823,12 +864,23 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private func resumeMostRecentInterruptedTaskIfRequested() {
+        // The persisted bit is only a same-process lifecycle hint. A newly constructed
+        // process must never replay a pre-crash Provider/tool request automatically.
+        guard autoResumeArmedInCurrentProcess else {
+            if UserDefaults.standard.bool(forKey: Self.autoResumeTaskDefaultsKey) {
+                UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
+            }
+            return
+        }
         guard UserDefaults.standard.bool(forKey: Self.autoResumeTaskDefaultsKey) else { return }
         let automaticCandidates = interruptedTasks.filter {
             !runningSessionIDs.contains($0.sessionID) && $0.payload["resume.mode"] != "manual_provider_failure"
         }
         guard let checkpoint = automaticCandidates.first else {
-            if runningSessionIDs.isEmpty { UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey) }
+            if runningSessionIDs.isEmpty {
+                autoResumeArmedInCurrentProcess = false
+                UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
+            }
             return
         }
         sessionActivityLines[checkpoint.sessionID, default: []].append("检测到未明确停止的中断任务；正在从最近检查点自动继续。")
@@ -837,6 +889,7 @@ public final class CloudCodeViewModel: ObservableObject {
 
     private func clearAutoResumeIntentIfNoPendingTask() {
         guard runningSessionIDs.isEmpty, interruptedTasks.isEmpty else { return }
+        autoResumeArmedInCurrentProcess = false
         UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
     }
 
@@ -951,6 +1004,7 @@ public final class CloudCodeViewModel: ObservableObject {
         sessionErrors.removeValue(forKey: sessionID)
         retryableProviderFailureSessionIDs.remove(sessionID)
         sessionActivityLines[sessionID, default: []].append("正在继续检查点 \(checkpoint.stepIndex)/\(checkpoint.totalSteps)…")
+        autoResumeArmedInCurrentProcess = true
         UserDefaults.standard.set(true, forKey: Self.autoResumeTaskDefaultsKey)
         syncVisibleSessionState(sessionID)
 
@@ -2158,6 +2212,8 @@ public final class CloudCodeViewModel: ObservableObject {
         runningSessionIDs.remove(sessionID)
         streamingAssistantMessageIDs.removeValue(forKey: sessionID)
         if runningSessionIDs.isEmpty {
+            autoResumeArmedInCurrentProcess = false
+            UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
             endBackgroundExecutionIfNeeded()
         }
         syncVisibleSessionState(sessionID)
