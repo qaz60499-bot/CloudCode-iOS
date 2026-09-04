@@ -49,6 +49,10 @@ public struct ProviderDiscoveryClient: Sendable {
                     discoveredCatalog = (models, catalogAuthMode)
                     break
                 }
+                lastError = ProviderError.malformedEvent
+                if allowPricingCatalogFallback {
+                    break
+                }
             } catch {
                 lastError = error
             }
@@ -111,9 +115,7 @@ public struct ProviderDiscoveryClient: Sendable {
         if let error = ProviderHTTPClassifier.error(for: http.statusCode, body: data) { throw error }
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let catalog = object["data"] ?? object["models"] else { throw ProviderError.malformedEvent }
-        let result = Self.extractModelIdentifiers(from: catalog)
-        guard !result.isEmpty else { throw ProviderError.malformedEvent }
-        return result
+        return Self.extractModelIdentifiers(from: catalog)
     }
 
     private func discoverModelsFromPricing(baseURL: URL) async throws -> [String] {
@@ -132,11 +134,15 @@ public struct ProviderDiscoveryClient: Sendable {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("缺少 HTTP 响应") }
         if let error = ProviderHTTPClassifier.error(for: http.statusCode, body: data) { throw error }
-        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let catalog = object["data"] ?? object["models"] else { throw ProviderError.malformedEvent }
-        let result = Self.extractModelIdentifiers(from: catalog)
-        guard !result.isEmpty else { throw ProviderError.malformedEvent }
-        return result
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ProviderError.malformedEvent
+        }
+        for key in ["data", "priced_model_details", "priced_models", "models"] {
+            guard let catalog = object[key] else { continue }
+            let result = Self.extractModelIdentifiers(from: catalog)
+            if !result.isEmpty { return result }
+        }
+        throw ProviderError.malformedEvent
     }
 
     private static func extractModelIdentifiers(from value: Any) -> [String] {

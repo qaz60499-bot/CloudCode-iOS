@@ -224,7 +224,7 @@ jobs:
                   parsed = json.loads(models_body)
               except json.JSONDecodeError as exc:
                   raise SystemExit(f"FAIL: Tabitoken /models returned malformed JSON: {exc.msg}")
-              catalog = (parsed.get("data") or parsed.get("models") or []) if isinstance(parsed, dict) else []
+              catalog = (parsed.get("data") or parsed.get("priced_model_details") or parsed.get("priced_models") or parsed.get("models") or []) if isinstance(parsed, dict) else []
               ids = []
 
               def append_candidate(value):
@@ -290,27 +290,34 @@ jobs:
               catalog = []
               catalog_auth_mode = None
               catalog_statuses = {}
-              for models_auth_mode in ("both", "bearer", "x-api-key"):
-                  models_status, models_body = request(
-                      f"models-key{key_index}-{models_auth_mode}",
-                      "GET",
-                      "/models",
-                      fail_on_mismatch=False,
-                      auth_mode=models_auth_mode,
-                  )
-                  catalog_statuses[models_auth_mode] = models_status
-                  if models_status in (401, 403):
-                      continue
-                  if models_status != 200:
-                      raise SystemExit(f"FAIL: Tabitoken /models returned HTTP {models_status} for key={key_index} auth={models_auth_mode}")
-                  ids, catalog = parse_model_catalog(models_body)
-                  if ids:
-                      catalog_auth_mode = models_auth_mode
-                      break
-
-              if not ids and pricing_ids:
+              if key_index > 1 and pricing_ids:
                   ids = list(pricing_ids)
                   catalog_auth_mode = "public-pricing"
+              else:
+                  for models_auth_mode in ("both", "bearer", "x-api-key"):
+                      models_status, models_body = request(
+                          f"models-key{key_index}-{models_auth_mode}",
+                          "GET",
+                          "/models",
+                          fail_on_mismatch=False,
+                          auth_mode=models_auth_mode,
+                      )
+                      catalog_statuses[models_auth_mode] = models_status
+                      if models_status in (401, 403):
+                          continue
+                      if models_status == 429:
+                          print(f"::warning::Tabitoken /models is rate-limited for key={key_index} auth={models_auth_mode}; using another live catalog source instead of treating 429 as credit.")
+                          break
+                      if models_status != 200:
+                          raise SystemExit(f"FAIL: Tabitoken /models returned HTTP {models_status} for key={key_index} auth={models_auth_mode}")
+                      ids, catalog = parse_model_catalog(models_body)
+                      if ids:
+                          catalog_auth_mode = models_auth_mode
+                          break
+
+                  if not ids and pricing_ids:
+                      ids = list(pricing_ids)
+                      catalog_auth_mode = "public-pricing"
 
               catalog_attempts.append({"key": key_index, "statuses": catalog_statuses, "pricingStatus": pricing_status, "modelCount": len(ids)})
               if not ids:

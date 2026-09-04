@@ -1416,7 +1416,7 @@ private final class ProviderDiscoveryURLProtocol: URLProtocol, @unchecked Sendab
             body = Data("{\"data\":[]}".utf8)
         } else if path == "/api/pricing" {
             status = 200
-            body = Data("{\"data\":[{\"provider_record\":{\"model_name\":\"model-a\"}}]}".utf8)
+            body = Data("{\"data\":[],\"priced_models\":[\"model-a\"]}".utf8)
         } else if path.hasSuffix("/v1/messages"), hasBearer, hasXAPIKey {
             status = 200
             body = Data("{\"content\":[{\"type\":\"text\",\"text\":\"OK\"}]}".utf8)
