@@ -2480,6 +2480,109 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(invocationCount, 0)
     }
 
+    func testRepeatedHistoricalProviderCallIDStillReconcilesTheLaterUnpairedCall() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionID = UUID()
+        let providerCallID = "reused-call-id"
+        let counter = InvocationCounter()
+        let registry = ToolRegistry(descriptors: [ToolDescriptor(name: "capability.probe", summary: "", risk: .readOnly)])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let agent = AgentCore(
+            provider: FinishingProvider(),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(
+                registry: registry,
+                executors: [CountingExecutor(route: .structuredTool, names: ["capability.probe"], counter: counter)]
+            ),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 2
+        )
+        let firstCall = ChatMessage(role: .assistant, content: "", providerMetadata: [
+            "tool_call_id": providerCallID,
+            "tool_name": "capability.probe",
+            "tool_arguments": "{}"
+        ])
+        let firstResult = ChatMessage(role: .tool, content: "old paired result", providerMetadata: [
+            "tool_call_id": providerCallID,
+            "tool_name": "capability.probe"
+        ])
+        let laterCall = ChatMessage(role: .assistant, content: "", providerMetadata: [
+            "tool_call_id": providerCallID,
+            "tool_name": "capability.probe",
+            "tool_arguments": "{}"
+        ])
+        let newUserMessage = ChatMessage(role: .user, content: "continue")
+        let initial = AgentSession(
+            id: sessionID,
+            title: "reused id",
+            messages: [firstCall, firstResult, laterCall, newUserMessage],
+            permissionMode: .full
+        )
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        let stream = await agent.send(text: "continue", session: initial, providerConfiguration: config, appendUserMessage: false)
+        for try await _ in stream {}
+
+        let saved = try await sessions.load(sessionID)
+        let callIndexes = saved.messages.indices.filter {
+            saved.messages[$0].role == .assistant && saved.messages[$0].providerMetadata["tool_call_id"] == providerCallID
+        }
+        XCTAssertEqual(callIndexes.count, 2)
+        let firstIndex = try XCTUnwrap(callIndexes.first)
+        let secondIndex = try XCTUnwrap(callIndexes.last)
+        XCTAssertEqual(saved.messages[firstIndex + 1].role, .tool)
+        XCTAssertNil(saved.messages[firstIndex + 1].providerMetadata["recovery"])
+        XCTAssertEqual(saved.messages[secondIndex + 1].role, .tool)
+        XCTAssertEqual(saved.messages[secondIndex + 1].providerMetadata["recovery"], "skipped")
+        let invocationCount = await counter.value()
+        XCTAssertEqual(invocationCount, 0)
+    }
+
+    func testSkippedStateChangingRecoveryDoesNotPoisonSemanticDuplicateTracking() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionID = UUID()
+        let counter = InvocationCounter()
+        let registry = ToolRegistry(descriptors: [ToolDescriptor(name: "files.create", summary: "", risk: .safeWrite)])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let agent = AgentCore(
+            provider: DuplicateStateChangeProvider(),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(
+                registry: registry,
+                executors: [CountingExecutor(route: .structuredTool, names: ["files.create"], counter: counter)],
+                executionLedger: ToolExecutionLedger(fileURL: root.appendingPathComponent("ledger.json"))
+            ),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 3
+        )
+        let dangling = ChatMessage(role: .assistant, content: "", providerMetadata: [
+            "tool_call_id": "missing-old-call",
+            "tool_name": "files.create",
+            "tool_arguments": "{\"path\":\"/tmp/semantic-once\",\"content\":\"x\"}"
+        ])
+        let initial = AgentSession(id: sessionID, title: "retry", messages: [dangling], permissionMode: .full)
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        let stream = await agent.send(text: "retry safely", session: initial, providerConfiguration: config, appendUserMessage: false)
+        for try await _ in stream {}
+
+        let saved = try await sessions.load(sessionID)
+        XCTAssertTrue(saved.messages.contains {
+            $0.role == .tool && $0.providerMetadata["recovery"] == "skipped"
+        })
+        XCTAssertFalse(saved.messages.contains {
+            $0.role == .tool && $0.providerMetadata["idempotency"] == "semantic_duplicate_blocked"
+        })
+        let invocationCount = await counter.value()
+        XCTAssertEqual(invocationCount, 1)
+    }
+
     func testSemanticDuplicateVerificationMustBeBoundToTheChangedTarget() {
         let fileScope = AgentCore.semanticToolScope(name: "files.delete", arguments: ["path": "/tmp/work/note.txt"])
         XCTAssertEqual(fileScope, "file:/tmp/work/note.txt")

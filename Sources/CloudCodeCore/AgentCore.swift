@@ -871,16 +871,20 @@ public actor AgentCore {
 
     private func reconcileDanglingToolCalls(in input: AgentSession) async throws -> AgentSession {
         var session = input
-        let completedToolCallIDs = Set(session.messages.compactMap { message -> String? in
-            guard message.role == .tool else { return nil }
-            return message.providerMetadata["tool_call_id"]
-        })
         let danglingMessages = session.messages.enumerated().filter { pair in
             let message = pair.element
             guard message.role == .assistant,
                   let providerCallID = message.providerMetadata["tool_call_id"],
-                  message.providerMetadata["tool_name"] != nil else { return false }
-            return !completedToolCallIDs.contains(providerCallID)
+                  let toolName = message.providerMetadata["tool_name"] else { return false }
+            let nextIndex = pair.offset + 1
+            guard session.messages.indices.contains(nextIndex) else { return true }
+            let next = session.messages[nextIndex]
+            guard next.role == .tool,
+                  next.providerMetadata["tool_call_id"] == providerCallID else { return true }
+            if let resultToolName = next.providerMetadata["tool_name"], resultToolName != toolName {
+                return true
+            }
+            return false
         }
         guard !danglingMessages.isEmpty else { return session }
 
@@ -1042,7 +1046,9 @@ public actor AgentCore {
         descriptorsByName: [String: ToolDescriptor]
     ) -> (signature: String, scope: String?)? {
         for message in session.messages.reversed() where message.role == .tool {
+            let recovery = message.providerMetadata["recovery"]
             guard message.providerMetadata["idempotency"] != "semantic_duplicate_blocked",
+                  recovery == nil || recovery == "cached",
                   let providerCallID = message.providerMetadata["tool_call_id"],
                   let name = message.providerMetadata["tool_name"],
                   let descriptor = descriptorsByName[name],
