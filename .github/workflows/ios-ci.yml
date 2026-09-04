@@ -212,7 +212,7 @@ jobs:
                   raise SystemExit(f'FAIL: startup breadcrumb marker missing: {marker}')
           if 'previousStartupCompleted' not in app or 'runContainsStage($0.runID, stage: "bootstrap.completed")' not in app:
               raise SystemExit('FAIL: crash-loop recovery no longer checks whether the previous startup reached the stable completion point')
-          recovery = bootstrap.split('if previousStartupRun != nil && !previousStartupCompleted', 1)[1].split('isRefreshingCapabilities = true', 1)[0]
+          recovery = bootstrap.split('if previousStartupRun != nil && !previousStartupCompleted', 1)[1].split('if let previousStartupRun', 1)[0]
           for forbidden in ('probeStartupSafe()', 'probeExtendedDevice()', 'probePrivileged()', 'importBootstrapIfPresent()', 'hermesStore.bootstrap()', 'recoverInterruptedTransactions()', 'diagnosticLogStore.', 'refreshDiagnosticLogs('):
               if forbidden in recovery:
                   raise SystemExit(f'FAIL: startup recovery mode contains unsafe/nonessential work: {forbidden}')
