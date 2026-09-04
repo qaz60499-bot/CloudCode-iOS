@@ -22,6 +22,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(profile.status("apps.launch"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("apps.terminate"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("apps.uninstall"), .deviceValidationRequired)
+        XCTAssertEqual(profile.status("data.keychain_scope"), .deviceValidationRequired)
         let resolverCalls = await resolver.totalCalls()
         XCTAssertEqual(resolverCalls, 0, "startup-safe probing must not call app/private capability providers")
     }

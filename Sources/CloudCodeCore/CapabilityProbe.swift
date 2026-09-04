@@ -83,8 +83,8 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
                               "Contacts access is authorization-gated and is not requested automatically."))
         records.append(record("data.calendar", .data, .deviceValidationRequired,
                               "Calendar access is authorization-gated and is not requested automatically."))
-        let keychainProbe = Self.probeOwnKeychain()
-        records.append(record("data.keychain_scope", .data, keychainProbe.status, keychainProbe.detail))
+        records.append(record("data.keychain_scope", .data, .deviceValidationRequired,
+                              "Keychain write/read/delete probing is deferred during automatic startup and runs only during explicit device validation."))
 
         records.append(record("automation.url_scheme", .automation, .unavailable,
                               "The current URL-scheme executor is a disabled placeholder and cannot execute app actions."))

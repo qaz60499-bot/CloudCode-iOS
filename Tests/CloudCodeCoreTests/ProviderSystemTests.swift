@@ -14,12 +14,6 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertNotNil(profiles.first(where: { $0.id == ProviderCatalog.tabitokenID }))
     }
 
-    func testBundledBootstrapAutomaticImportRunsOnlyOnTrueFirstInstall() {
-        XCTAssertTrue(ProviderBootstrapAutomaticImportPolicy.shouldImportBundledBootstrap(previousFingerprint: nil))
-        XCTAssertFalse(ProviderBootstrapAutomaticImportPolicy.shouldImportBundledBootstrap(previousFingerprint: "legacy-raw-fingerprint"))
-        XCTAssertFalse(ProviderBootstrapAutomaticImportPolicy.shouldImportBundledBootstrap(previousFingerprint: "stable-fingerprint"))
-    }
-
     func testBootstrapStableFingerprintIgnoresGeneratedAtButTracksKeyMaterial() {
         let original = ProviderBootstrapPayload(
             generatedAt: Date(timeIntervalSince1970: 100),

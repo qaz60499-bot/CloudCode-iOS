@@ -1103,8 +1103,8 @@ private struct SettingsView: View {
 
                     LabeledContent("本次已确认 Key", value: "\(model.configuredCatalogKeyCount) / \(model.totalCatalogKeyCount)")
                     Text(model.bundledPrivateBootstrapAvailable
-                         ? "当前是私有 Key 版 IPA。为避免 TrollStore 真机启动阶段触发 Keychain 崩溃，升级启动不会遍历或覆盖 Keychain；首次安装可自动导入，后续替换请使用“检查当前 Key”或“一键导入预配置 Key”。"
-                         : "当前安装包未内置预配置 Key。启动阶段不会遍历 Keychain；可以手动检查当前 Key 或从文件导入。真实 Key 不写入 UserDefaults。")
+                         ? "当前是私有 Key 版 IPA。为避免 TrollStore 真机启动阶段触发 Keychain 问题，任何启动都不会自动读取、遍历、迁移或覆盖 Provider Keychain。需要使用安装包内置 Key 时，请显式点“一键导入预配置 Key”；已有 Key 可先点“检查当前 Key”。"
+                         : "当前安装包未内置预配置 Key。任何启动都不会自动扫描 Provider Keychain；可以手动检查当前 Key 或从文件导入。真实 Key 不写入 UserDefaults。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

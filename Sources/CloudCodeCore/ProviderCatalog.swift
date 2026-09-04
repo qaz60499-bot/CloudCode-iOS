@@ -316,15 +316,6 @@ public enum ProviderCheckpointConfigurationResolver {
     }
 }
 
-public enum ProviderBootstrapAutomaticImportPolicy {
-    /// Automatic bundled Keychain import is allowed only on a true first install.
-    /// Once any bundled bootstrap fingerprint has been persisted, upgrades must preserve the
-    /// owner's existing Keychain state and require an explicit import action for replacement.
-    public static func shouldImportBundledBootstrap(previousFingerprint: String?) -> Bool {
-        previousFingerprint == nil
-    }
-}
-
 public enum ProviderFingerprint {
     public static func sha256(_ secret: String) -> String {
         sha256(Data(secret.utf8))

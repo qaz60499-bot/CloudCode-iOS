@@ -150,7 +150,7 @@ jobs:
 
           capability = Path('Sources/CloudCodeCore/CapabilityProbe.swift').read_text(encoding='utf-8')
           safe = capability.split('public func probeStartupSafe()', 1)[1].split('public func probeExtendedDevice()', 1)[0]
-          for forbidden in ('URL(fileURLWithPath: "/var/mobile', 'unrestrictedFilesystemProbe(', 'hasDynamicSymbol(', 'rootHelperCapability()', 'installedApps()', 'probePrivileged('):
+          for forbidden in ('URL(fileURLWithPath: "/var/mobile', 'unrestrictedFilesystemProbe(', 'hasDynamicSymbol(', 'rootHelperCapability()', 'installedApps()', 'probePrivileged(', 'probeOwnKeychain('):
               if forbidden in safe:
                   raise SystemExit(f'FAIL: startup-safe capability probe contains forbidden operation: {forbidden}')
 
@@ -213,7 +213,7 @@ jobs:
           if 'previousStartupCompleted' not in app or 'runContainsStage($0.runID, stage: "bootstrap.completed")' not in app:
               raise SystemExit('FAIL: crash-loop recovery no longer checks whether the previous startup reached the stable completion point')
           recovery = bootstrap.split('if previousStartupRun != nil && !previousStartupCompleted', 1)[1].split('isRefreshingCapabilities = true', 1)[0]
-          for forbidden in ('probeStartupSafe()', 'probeExtendedDevice()', 'probePrivileged()', 'importBootstrapIfPresent()', 'hermesStore.bootstrap()', 'recoverInterruptedTransactions()'):
+          for forbidden in ('probeStartupSafe()', 'probeExtendedDevice()', 'probePrivileged()', 'importBootstrapIfPresent()', 'hermesStore.bootstrap()', 'recoverInterruptedTransactions()', 'diagnosticLogStore.', 'refreshDiagnosticLogs('):
               if forbidden in recovery:
                   raise SystemExit(f'FAIL: startup recovery mode contains unsafe/nonessential work: {forbidden}')
 
@@ -241,14 +241,11 @@ jobs:
           for marker in ('ProviderKeyProvisioner.apply(', 'manualProviderKeyOverrides', 'provider.key.save.begin', 'installedKeyReferences'):
               if marker not in app:
                   raise SystemExit(f'FAIL: hardened Provider Key replacement marker missing: {marker}')
-          bootstrap_import = app.split('private func importBootstrapIfPresent()', 1)[1].split('private func importProviderBootstrapNow(', 1)[0]
-          if 'ProviderBootstrapAutomaticImportPolicy.shouldImportBundledBootstrap' not in bootstrap_import:
-              raise SystemExit('FAIL: bundled Provider bootstrap lost first-install-only launch policy')
-          for forbidden in ('inferManualProviderKeyOverrides', 'refreshInstalledKeyReferences', 'Task.detached'):
-              if forbidden in bootstrap_import:
-                  raise SystemExit(f'FAIL: upgrade bootstrap reintroduced launch-time Keychain scanning: {forbidden}')
-          if 'storedFingerprint' not in bootstrap_import or 'guard ProviderBootstrapAutomaticImportPolicy.shouldImportBundledBootstrap' not in bootstrap_import:
-              raise SystemExit('FAIL: upgrade bootstrap must preserve existing Keychain before any bundled import')
+          if 'private func importBootstrapIfPresent()' in app:
+              raise SystemExit('FAIL: launch-time Provider bootstrap importer must not exist; Provider Keychain changes require explicit user action')
+          for forbidden in ('keyVault.key(', 'keyVault.set(', 'ProviderKeyProvisioner.apply(', 'importProviderBootstrapNow(', 'refreshInstalledKeyReferences(', 'inferManualProviderKeyOverrides('):
+              if forbidden in bootstrap:
+                  raise SystemExit(f'FAIL: automatic bootstrap reintroduced Provider Keychain work: {forbidden}')
           if 'readAll(limit: 12_000)' in app:
               raise SystemExit('FAIL: diagnostics view reintroduced an unbounded/high-memory 12k record refresh')
           if 'while !Task.isCancelled' in content.split('private struct DiagnosticLogsView', 1)[1].split('private struct DiagnosticShareItem', 1)[0]:

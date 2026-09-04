@@ -85,7 +85,6 @@ public final class CloudCodeViewModel: ObservableObject {
     private var backgroundWindowTask: Task<Void, Never>?
     private var didBootstrap = false
     private static let providerKeyMutationOperationKey = "provider-key:mutation"
-    private static let bundledProviderBootstrapFingerprintDefaultsKey = "provider.bootstrap.bundle.fingerprint"
     private static let manualProviderKeyOverridesDefaultsKey = "provider.key.manualOverrides"
     private static let autoResumeTaskDefaultsKey = "task.autoResumeUnlessStopped"
     private static let backgroundContinuationWindow: TimeInterval = 90 * 60
@@ -237,6 +236,23 @@ public final class CloudCodeViewModel: ObservableObject {
     public func bootstrap() {
         guard !didBootstrap, bootstrapTask == nil else { return }
         bootstrapTask = Task {
+            defer {
+                bootstrapTask = nil
+                isRefreshingCapabilities = false
+            }
+
+            // Crash-loop recovery must execute before the normal diagnostics stack or any other
+            // bootstrap subsystem. StartupBreadcrumbStore is intentionally tiny and independent.
+            if previousStartupRun != nil && !previousStartupCompleted {
+                recordStartupBreadcrumb("bootstrap.recovery.begin")
+                capabilityRefreshMessage = "检测到上一轮启动未完成，已进入安全恢复模式。设备能力、日志扫描、Hermes、事务恢复和 Provider Keychain 自动处理已暂时跳过。"
+                activityLines.append("安全恢复模式：上一轮启动没有到达稳定完成点。本次先保证界面可打开；需要诊断时可在界面稳定后手动打开“日志”，再检测设备能力或 Key。")
+                didBootstrap = true
+                recordStartupBreadcrumb("bootstrap.recovery.ready")
+                recordStartupBreadcrumb("bootstrap.completed")
+                return
+            }
+
             if let previousStartupRun {
                 try? await diagnosticLogStore.log(
                     level: .warning,
@@ -261,28 +277,6 @@ public final class CloudCodeViewModel: ObservableObject {
                     "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
                 ]
             )
-            defer {
-                bootstrapTask = nil
-                isRefreshingCapabilities = false
-            }
-
-            if previousStartupRun != nil && !previousStartupCompleted {
-                recordStartupBreadcrumb("bootstrap.recovery.begin")
-                capabilityRefreshMessage = "检测到上一轮启动未完成，已进入安全恢复模式。设备能力、Hermes、事务恢复和 Provider Keychain 自动处理已暂时跳过。"
-                activityLines.append("安全恢复模式：上一轮启动没有到达稳定完成点。本次先保证界面可打开；可从“日志”复制闪退线索，再手动检测设备能力或 Key。")
-                didBootstrap = true
-                await refreshDiagnosticLogs(limit: 250)
-                recordStartupBreadcrumb("bootstrap.recovery.ready")
-                recordStartupBreadcrumb("bootstrap.completed")
-                try? await diagnosticLogStore.log(
-                    level: .warning,
-                    subsystem: "app",
-                    action: "bootstrap-recovery",
-                    result: "completed",
-                    metadata: ["previousLastStage": previousStartupRun?.lastStage ?? "unknown"]
-                )
-                return
-            }
 
             isRefreshingCapabilities = true
             capabilityRefreshMessage = "正在执行安全启动检测…"
@@ -314,18 +308,12 @@ public final class CloudCodeViewModel: ObservableObject {
                 interruptedTasks = await checkpointStore.interrupted()
                 try await restoreSessionState()
                 try refreshFiles()
-                if capabilities.status("data.keychain_scope") == .available {
-                    do {
-                        try await importBootstrapIfPresent()
-                    } catch {
-                        let message = Self.userFacingProviderBootstrapError(error)
-                        activityLines.append("预配置 Key 自动导入未完成：\(message)")
-                    }
-                } else if bundledPrivateBootstrapAvailable {
-                    activityLines.append("检测到私有 Key 版 IPA，但当前设备的 Keychain 实际探测未通过，因此已跳过自动导入，避免反复弹出失败提示。")
+                if bundledPrivateBootstrapAvailable {
+                    activityLines.append("检测到私有 Key 配置。为保证 TrollStore 真机启动稳定，启动阶段不会自动读取、写入或迁移 Provider Keychain；需要导入时请到“设置 → Key 管理”显式执行。")
                 }
-                // P0 launch-safety rule: never enumerate/read all Provider Keychain entries during automatic startup.
-                // TrollStore/private entitlement combinations are validated only on explicit user actions or actual Provider use.
+                // P0 launch-safety rule: automatic startup must never read, write, enumerate, migrate,
+                // or otherwise touch Provider Keychain state. TrollStore/private entitlement combinations
+                // are exercised only by an explicit user action or the actual Provider request path.
                 didBootstrap = true
                 recordStartupBreadcrumb("bootstrap.local-state.end")
                 try? await diagnosticLogStore.log(level: .info, subsystem: "app", action: "bootstrap", result: "completed")
@@ -1644,55 +1632,6 @@ public final class CloudCodeViewModel: ObservableObject {
         guard let data = try? Data(contentsOf: url),
               let profiles = try? JSONDecoder().decode([ProviderProfile].self, from: data) else { return [] }
         return profiles.filter { $0.enabled && $0.source == .custom }
-    }
-
-    private func importBootstrapIfPresent() async throws {
-        let operationKey = Self.providerKeyMutationOperationKey
-        guard beginExclusiveOperation(operationKey) else {
-            throw ProviderError.transport("另一个厂商 Key 操作正在进行中")
-        }
-        defer { endExclusiveOperation(operationKey) }
-
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-        if let url = documents?.appendingPathComponent("CloudCode-Provider-Bootstrap.json"),
-           FileManager.default.fileExists(atPath: url.path) {
-            let count = try await importProviderBootstrapNow(
-                from: url,
-                removeSource: true,
-                manualOverridePolicy: .markImportedAsManual
-            )
-            activityLines.append("已自动导入私有 Key 配置：\(count) 个 Key；这些 Key 会优先于后续安装包内置 Key。")
-            return
-        }
-
-        guard let bundled = Bundle.main.url(forResource: "CloudCode-Provider-Bootstrap", withExtension: "json") else { return }
-        var bundledData = try Data(contentsOf: bundled, options: [.mappedIfSafe])
-        defer { bundledData.resetBytes(in: 0..<bundledData.count) }
-        guard bundledData.count <= 1_048_576 else { throw CocoaError(.fileReadTooLarge) }
-        let payload = try ProviderBootstrapPayload.decodeBootstrap(from: bundledData)
-        let stableBundledFingerprint = payload.stableContentFingerprint
-        let defaults = UserDefaults.standard
-        let storedFingerprint = defaults.string(forKey: Self.bundledProviderBootstrapFingerprintDefaultsKey)
-
-        // P0 launch-safety migration: upgrades must never inspect or rewrite Provider Keychain state.
-        // Earlier builds persisted a timestamp-sensitive raw bundle fingerprint, so a perfectly normal
-        // rebuild could look like a Key rotation and trigger many Security.framework calls during launch.
-        // Any previously-seen bundle therefore means "preserve owner Keychain; explicit replacement only".
-        guard ProviderBootstrapAutomaticImportPolicy.shouldImportBundledBootstrap(previousFingerprint: storedFingerprint) else {
-            defaults.set(stableBundledFingerprint, forKey: Self.bundledProviderBootstrapFingerprintDefaultsKey)
-            activityLines.append("已检测到历史私有 Key 配置；升级启动不会读取或覆盖 Keychain。需要替换时请在设置中手动执行“一键导入预配置 Key”。")
-            return
-        }
-
-        // Fresh install only: import the bundled private bootstrap once. Subsequent launches/upgrades
-        // always take the non-Keychain path above.
-        let count = try await importProviderBootstrapNow(
-            from: bundled,
-            removeSource: false,
-            manualOverridePolicy: .replaceManual
-        )
-        defaults.set(stableBundledFingerprint, forKey: Self.bundledProviderBootstrapFingerprintDefaultsKey)
-        activityLines.append("首次安装已导入 \(count) 个预配置 Key 到 iOS Keychain。")
     }
 
     private func importProviderBootstrapNow(
