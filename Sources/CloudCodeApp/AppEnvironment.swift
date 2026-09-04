@@ -1803,7 +1803,11 @@ public final class CloudCodeViewModel: ObservableObject {
 
     private func markProviderEndpointHealthy(_ configuration: ProviderConfiguration) {
         providerEndpointHealth[providerEndpointHealthKey(configuration)] = ProviderEndpointHealth(state: .healthy)
-        guard let providerID = configuration.providerID,
+        // The router can transparently succeed with a fallback Key. Without exposing the winning
+        // Key reference in ProviderEvent, only mutate per-Key validation state when this request
+        // had exactly one possible Key; otherwise we would risk marking the failed primary as good.
+        guard configuration.fallbackAPIKeyReferences?.isEmpty != false,
+              let providerID = configuration.providerID,
               let providerIndex = providerProfiles.firstIndex(where: { $0.id == providerID }),
               let slotIndex = providerProfiles[providerIndex].keySlots.firstIndex(where: {
                   ProviderCatalog.keyReference(providerID: providerID, keySlotID: $0.id) == configuration.apiKeyReference
@@ -1818,6 +1822,7 @@ public final class CloudCodeViewModel: ObservableObject {
 
     private func recordProviderFailure(_ error: Error, configuration: ProviderConfiguration, sessionID: UUID) {
         providerFailureSessionIDs.insert(sessionID)
+        updateSingleKeyStatusAfterProviderFailure(error, configuration: configuration)
         if Self.isSafeProviderRetry(error) {
             retryableProviderFailureSessionIDs.insert(sessionID)
         } else {
@@ -1846,6 +1851,30 @@ public final class CloudCodeViewModel: ObservableObject {
                     "retryAllowed": Self.isSafeProviderRetry(error) ? "true" : "false"
                 ]
             )
+        }
+    }
+
+    private func updateSingleKeyStatusAfterProviderFailure(_ error: Error, configuration: ProviderConfiguration) {
+        guard configuration.fallbackAPIKeyReferences?.isEmpty != false,
+              let providerError = error as? ProviderError,
+              let providerID = configuration.providerID,
+              let providerIndex = providerProfiles.firstIndex(where: { $0.id == providerID }),
+              let slotIndex = providerProfiles[providerIndex].keySlots.firstIndex(where: {
+                  ProviderCatalog.keyReference(providerID: providerID, keySlotID: $0.id) == configuration.apiKeyReference
+              }) else { return }
+
+        let status: ProviderKeyStatus
+        switch providerError {
+        case .authenticationFailed:
+            status = .authFailed
+        case .capacityExhausted:
+            status = .capacity
+        default:
+            return
+        }
+        providerProfiles[providerIndex].keySlots[slotIndex].status = status
+        if providerProfiles[providerIndex].source == .custom {
+            try? persistCustomProviders()
         }
     }
 

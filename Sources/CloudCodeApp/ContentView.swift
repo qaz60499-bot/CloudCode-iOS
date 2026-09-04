@@ -1056,7 +1056,7 @@ private struct SettingsView: View {
                         if let health = model.selectedProviderEndpointHealth {
                             let detail = health.state == .healthy
                                 ? "正常"
-                                : "临时异常" + (health.errorCode.map { " · \($0)" } ?? "")
+                                : "异常 / 需检查" + (health.errorCode.map { " · \($0)" } ?? "")
                             LabeledContent("接口健康", value: detail)
                         }
                         LabeledContent("当前 Key", value: model.selectedKeyIsInstalled ? "已配置" : "未配置")
