@@ -1591,7 +1591,8 @@ public final class CloudCodeViewModel: ObservableObject {
             let discovery = try await ProviderDiscoveryClient().discover(
                 baseURL: baseURL,
                 apiKey: apiKey,
-                preferredAuthMode: preferredAuthMode
+                preferredAuthMode: preferredAuthMode,
+                allowPricingCatalogFallback: true
             )
             guard !discovery.models.isEmpty else { return }
             providerProfiles[providerIndex].applyDiscovery(discovery, keySlotID: keySlotID)

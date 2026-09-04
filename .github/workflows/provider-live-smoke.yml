@@ -169,7 +169,7 @@ jobs:
           secret = provider_secrets[0]
           base = "https://tabitoken.com/v1"
 
-          def request(label, method, path, payload=None, extra_headers=None, expected=200, allow_billing_block=False, fail_on_mismatch=True, auth_mode="both"):
+          def request(label, method, path, payload=None, extra_headers=None, expected=200, allow_billing_block=False, fail_on_mismatch=True, auth_mode="both", absolute_url=None):
               data = None if payload is None else json.dumps(payload).encode("utf-8")
               headers = {
                   "Accept": "application/json",
@@ -183,7 +183,7 @@ jobs:
                   headers["Content-Type"] = "application/json"
               if extra_headers:
                   headers.update(extra_headers)
-              req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+              req = urllib.request.Request(absolute_url or (base + path), data=data, headers=headers, method=method)
               try:
                   with urllib.request.urlopen(req, timeout=20) as response:
                       body = response.read(65536).decode("utf-8", "replace")
@@ -265,6 +265,19 @@ jobs:
               extract_candidates(catalog)
               return ids, catalog
 
+          pricing_ids = []
+          pricing_status, pricing_body = request(
+              "public-pricing-models",
+              "GET",
+              "",
+              fail_on_mismatch=False,
+              auth_mode="none",
+              absolute_url="https://tabitoken.com/api/pricing",
+          )
+          if pricing_status == 200:
+              pricing_ids, _ = parse_model_catalog(pricing_body)
+          print(f"TABITOKEN_PUBLIC_PRICING status={pricing_status} model_count={len(pricing_ids)}")
+
           selected_model = None
           base_anthropic = None
           anthropic_candidates = []
@@ -295,11 +308,15 @@ jobs:
                       catalog_auth_mode = models_auth_mode
                       break
 
-              catalog_attempts.append({"key": key_index, "statuses": catalog_statuses, "modelCount": len(ids)})
+              if not ids and pricing_ids:
+                  ids = list(pricing_ids)
+                  catalog_auth_mode = "public-pricing"
+
+              catalog_attempts.append({"key": key_index, "statuses": catalog_statuses, "pricingStatus": pricing_status, "modelCount": len(ids)})
               if not ids:
                   continue
 
-              print(f"TABITOKEN_CATALOG_AUTH key={key_index} auth={catalog_auth_mode} model_count={len(ids)}")
+              print(f"TABITOKEN_CATALOG_SOURCE key={key_index} source={catalog_auth_mode} model_count={len(ids)}")
               named_claude = [model for model in ids if "claude" in model.lower()]
               other_models = [model for model in ids if model not in named_claude]
               anthropic_candidates = named_claude + other_models

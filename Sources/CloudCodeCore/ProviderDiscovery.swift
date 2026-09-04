@@ -27,7 +27,8 @@ public struct ProviderDiscoveryClient: Sendable {
     public func discover(
         baseURL: URL,
         apiKey: String,
-        preferredAuthMode: ProviderAuthMode? = nil
+        preferredAuthMode: ProviderAuthMode? = nil,
+        allowPricingCatalogFallback: Bool = false
     ) async throws -> ProviderDiscoveryResult {
         var lastError: Error = ProviderError.missingAPIKey
         var authModes = [ProviderAuthMode.bearer, .xAPIKey, .both]
@@ -47,6 +48,17 @@ public struct ProviderDiscoveryClient: Sendable {
                 if !models.isEmpty {
                     discoveredCatalog = (models, catalogAuthMode)
                     break
+                }
+            } catch {
+                lastError = error
+            }
+        }
+
+        if discoveredCatalog == nil, allowPricingCatalogFallback {
+            do {
+                let models = try await discoverModelsFromPricing(baseURL: baseURL)
+                if !models.isEmpty {
+                    discoveredCatalog = (models, preferredAuthMode ?? .both)
                 }
             } catch {
                 lastError = error
@@ -93,6 +105,29 @@ public struct ProviderDiscoveryClient: Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         applyAuth(apiKey, mode: authMode, request: &request)
+        request.timeoutInterval = 30
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("缺少 HTTP 响应") }
+        if let error = ProviderHTTPClassifier.error(for: http.statusCode, body: data) { throw error }
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let catalog = object["data"] ?? object["models"] else { throw ProviderError.malformedEvent }
+        let result = Self.extractModelIdentifiers(from: catalog)
+        guard !result.isEmpty else { throw ProviderError.malformedEvent }
+        return result
+    }
+
+    private func discoverModelsFromPricing(baseURL: URL) async throws -> [String] {
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            throw ProviderError.invalidEndpoint
+        }
+        components.path = "/api/pricing"
+        components.query = nil
+        components.fragment = nil
+        guard let url = components.url else { throw ProviderError.invalidEndpoint }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.timeoutInterval = 30
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("缺少 HTTP 响应") }
