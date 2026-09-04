@@ -16,10 +16,14 @@
     </array>
     <key>com.apple.private.security.no-sandbox</key>
     <true/>
-    <!-- Keep the SwiftUI host on the smallest documented TrollStore privilege set.
-         Do not add platform-application: TrollStore documents that it tightens parts
-         of the sandbox. AppDataContainers is only needed as a companion workaround
-         for that platform-application path, so it is intentionally omitted here. -->
+    <!-- TrollStore documents that no-sandbox apps may also require platform-application.
+         This exact host combination was present in the last device build known to reach
+         the UI. AppDataContainers is paired with platform-application so the SwiftUI host
+         keeps access to its own data container instead of dying during early startup. -->
+    <key>platform-application</key>
+    <true/>
+    <key>com.apple.private.security.storage.AppDataContainers</key>
+    <true/>
     <key>com.apple.private.persona-mgmt</key>
     <true/>
 </dict>

@@ -49,14 +49,18 @@ private final class CloudCodeAppLauncher: ObservableObject {
         guard !didStart else { return }
         didStart = true
 
-        // Render the minimal SwiftUI shell before constructing the full runtime graph.
-        // This keeps filesystem caches, AVFoundation/Speech, CFNetwork, private adapters,
-        // and recovery state away from the process' pre-first-frame launch boundary.
+        // Render and commit a minimal SwiftUI shell before constructing the full runtime graph.
+        // A single Task.yield() is not a first-frame guarantee: the main actor may resume before
+        // CoreAnimation commits anything to screen. Keep a short launch-safe window so a device
+        // crash in the heavier runtime cannot masquerade as a pre-UI/dyld failure.
         Task { @MainActor in
             await Task.yield()
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            guard model == nil else { return }
+
             let startupBreadcrumbs = StartupBreadcrumbStore()
             let startupRunID = startupBreadcrumbs.beginRun(initialStage: "app.main.enter")
-            startupBreadcrumbs.append(runID: startupRunID, stage: "firstScene.rendered")
+            startupBreadcrumbs.append(runID: startupRunID, stage: "firstScene.visibleWindow")
             model = CloudCodeViewModel(
                 startupBreadcrumbStore: startupBreadcrumbs,
                 startupRunID: startupRunID

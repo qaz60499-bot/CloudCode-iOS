@@ -73,18 +73,12 @@ plutil -lint "$ENTITLEMENTS" >/dev/null
 
 for key in \
   'com.apple.private.security.no-sandbox' \
+  'platform-application' \
+  'com.apple.private.security.storage.AppDataContainers' \
   'com.apple.private.persona-mgmt'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$ENTITLEMENTS" 2>/dev/null || true)"
   if [[ "$value" != "true" ]]; then
     echo "FAIL: privileged entitlement missing or false: $key" >&2
-    exit 11
-  fi
-done
-for forbidden_host_entitlement in \
-  'platform-application' \
-  'com.apple.private.security.storage.AppDataContainers'; do
-  if /usr/libexec/PlistBuddy -c "Print :$forbidden_host_entitlement" "$ENTITLEMENTS" >/dev/null 2>&1; then
-    echo "FAIL: privileged SwiftUI host carries unnecessary launch-risk entitlement: $forbidden_host_entitlement" >&2
     exit 11
   fi
 done
@@ -130,6 +124,6 @@ for banned in \
   fi
 done
 
-echo "PASS: privileged TrollStore entitlement set is embedded without platform-application launch side effects"
+echo "PASS: privileged TrollStore host entitlement set matches the device-compatible no-sandbox/platform/container profile"
 echo "SECURITY: this IPA contains private Provider credentials and privileged entitlements; use only on the user's own TrollStore test device"
 echo "NOTE: entitlement presence does not prove device runtime support; capability probes must still verify each operation on-device."

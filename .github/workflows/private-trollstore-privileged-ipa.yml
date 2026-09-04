@@ -120,13 +120,12 @@ jobs:
           ENTITLEMENTS="$RUNNER_TEMP/cloudcode-privileged-entitlements.plist"
           ldid -e "$APP_PATH/$MAIN_EXECUTABLE" > "$ENTITLEMENTS"
           plutil -lint "$ENTITLEMENTS" >/dev/null
-          /usr/libexec/PlistBuddy -c 'Print :com.apple.private.security.no-sandbox' "$ENTITLEMENTS" | grep -F 'true'
-          /usr/libexec/PlistBuddy -c 'Print :com.apple.private.persona-mgmt' "$ENTITLEMENTS" | grep -F 'true'
-          for forbidden_host_entitlement in platform-application com.apple.private.security.storage.AppDataContainers; do
-            if /usr/libexec/PlistBuddy -c "Print :$forbidden_host_entitlement" "$ENTITLEMENTS" >/dev/null 2>&1; then
-              echo "FAIL: SwiftUI host carries unnecessary launch-risk entitlement: $forbidden_host_entitlement" >&2
-              exit 1
-            fi
+          for required_host_entitlement in \
+            com.apple.private.security.no-sandbox \
+            platform-application \
+            com.apple.private.security.storage.AppDataContainers \
+            com.apple.private.persona-mgmt; do
+            /usr/libexec/PlistBuddy -c "Print :$required_host_entitlement" "$ENTITLEMENTS" | grep -F 'true'
           done
           rm -f "$ENTITLEMENTS"
           echo 'PASS: privileged validation entitlement set embedded'
