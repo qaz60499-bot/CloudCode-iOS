@@ -56,9 +56,14 @@ public struct RetryPolicy: Sendable {
     }
 }
 
+public enum SessionStoreError: Error, Equatable {
+    case oversizedSession(UUID)
+}
+
 public actor SessionStore {
     private let root: URL
     private let fileManager: FileManager
+    private static let maxSerializedBytes: Int64 = 8 * 1024 * 1024
 
     public init(root: URL, fileManager: FileManager = .default) {
         self.root = root
@@ -79,7 +84,7 @@ public actor SessionStore {
 
     public func load(_ id: UUID) throws -> AgentSession {
         let url = root.appendingPathComponent(id.uuidString).appendingPathExtension("json")
-        let data = try Data(contentsOf: url)
+        let data = try boundedData(at: url, sessionID: id)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode(AgentSession.self, from: data)
@@ -87,13 +92,24 @@ public actor SessionStore {
 
     public func all() throws -> [AgentSession] {
         guard fileManager.fileExists(atPath: root.path) else { return [] }
-        let urls = try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        let urls = try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles])
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return urls.compactMap { url in
-            guard url.pathExtension == "json", let data = try? Data(contentsOf: url) else { return nil }
+            guard url.pathExtension == "json",
+                  let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
+                  let data = try? boundedData(at: url, sessionID: id) else { return nil }
             return try? decoder.decode(AgentSession.self, from: data)
         }.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private func boundedData(at url: URL, sessionID: UUID) throws -> Data {
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values.isRegularFile == true else { throw CocoaError(.fileReadUnknown) }
+        if let size = values.fileSize, Int64(size) > Self.maxSerializedBytes {
+            throw SessionStoreError.oversizedSession(sessionID)
+        }
+        return try Data(contentsOf: url, options: [.mappedIfSafe])
     }
 
     public func search(_ query: String) throws -> [AgentSession] {

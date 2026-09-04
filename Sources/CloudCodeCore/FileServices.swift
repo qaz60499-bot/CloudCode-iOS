@@ -7,6 +7,7 @@ public actor AuditLogStore {
     private let fileURL: URL
     private let encoder: JSONEncoder
     private let fileManager: FileManager
+    private static let maxTailReadBytes: UInt64 = 4 * 1024 * 1024
 
     public init(fileURL: URL, fileManager: FileManager = .default) {
         self.fileURL = fileURL
@@ -36,6 +37,24 @@ public actor AuditLogStore {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return data.split(separator: 0x0A).compactMap { try? decoder.decode(AuditEvent.self, from: Data($0)) }
+    }
+
+    public func readNewest(limit: Int = 200) throws -> [AuditEvent] {
+        guard limit > 0, fileManager.fileExists(atPath: fileURL.path) else { return [] }
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+        let end = try handle.seekToEnd()
+        let start = end > Self.maxTailReadBytes ? end - Self.maxTailReadBytes : 0
+        try handle.seek(toOffset: start)
+        let data = try handle.readToEnd() ?? Data()
+        let lines = data.split(separator: 0x0A, omittingEmptySubsequences: true)
+        let completeLines = start > 0 ? Array(lines.dropFirst()) : lines
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let boundedLimit = min(limit, 2_000)
+        return completeLines.suffix(boundedLimit).compactMap {
+            try? decoder.decode(AuditEvent.self, from: Data($0))
+        }
     }
 
     public func exportSnapshotData() throws -> Data {
@@ -207,12 +226,17 @@ public struct FileService: @unchecked Sendable {
     }
 }
 
+public enum TrashServiceError: Error, Equatable {
+    case oversizedJournal
+}
+
 public actor TrashService {
     private let root: URL
     private let journalURL: URL
     private let fileManager: FileManager
     private let pathGuard: PathGuard
     private let secureFileMutation: SecureFileMutation
+    private static let maxJournalBytes: Int64 = 8 * 1024 * 1024
 
     public init(
         root: URL,
@@ -334,7 +358,10 @@ public actor TrashService {
 
     private func loadRecords() throws -> [TrashRecord] {
         guard fileManager.fileExists(atPath: journalURL.path) else { return [] }
-        let data = try Data(contentsOf: journalURL)
+        let attributes = try fileManager.attributesOfItem(atPath: journalURL.path)
+        guard let size = attributes[.size] as? NSNumber else { throw CocoaError(.fileReadUnknown) }
+        guard size.int64Value <= Self.maxJournalBytes else { throw TrashServiceError.oversizedJournal }
+        let data = try Data(contentsOf: journalURL, options: [.mappedIfSafe])
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode([TrashRecord].self, from: data)

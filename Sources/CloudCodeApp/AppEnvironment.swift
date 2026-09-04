@@ -304,7 +304,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 }
                 try await resourceIndex.seedLightweight(apps: apps, capabilityProfile: capabilities)
                 trash = try await trashService.records()
-                auditEvents = Array((try await auditStore.readAll()).suffix(200).reversed())
+                auditEvents = Array((try await auditStore.readNewest(limit: 200)).reversed())
                 interruptedTasks = await checkpointStore.interrupted()
                 try await restoreSessionState()
                 try refreshFiles()
@@ -1246,7 +1246,7 @@ public final class CloudCodeViewModel: ObservableObject {
             lastError = "回收站状态刷新失败：\(error)"
         }
         do {
-            auditEvents = Array((try await auditStore.readAll()).suffix(200).reversed())
+            auditEvents = Array((try await auditStore.readNewest(limit: 200)).reversed())
         } catch {
             lastError = "审计记录刷新失败：\(error)"
         }

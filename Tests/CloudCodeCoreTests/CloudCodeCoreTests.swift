@@ -68,6 +68,67 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(sessions.isEmpty)
     }
 
+    func testSessionStoreRejectsOversizedPersistedSessionWithoutReadingIt() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionsRoot = root.appendingPathComponent("Sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessionsRoot, withIntermediateDirectories: true)
+        let sessionID = UUID()
+        let url = sessionsRoot.appendingPathComponent(sessionID.uuidString).appendingPathExtension("json")
+        FileManager.default.createFile(atPath: url.path, contents: Data())
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: UInt64(8 * 1024 * 1024 + 1))
+        try handle.close()
+
+        let store = SessionStore(root: sessionsRoot)
+        let sessions = try await store.all()
+        XCTAssertTrue(sessions.isEmpty)
+        do {
+            _ = try await store.load(sessionID)
+            XCTFail("oversized persisted session must not be loaded into memory")
+        } catch let error as SessionStoreError {
+            XCTAssertEqual(error, .oversizedSession(sessionID))
+        }
+    }
+
+    func testAuditLogReadNewestUsesBoundedTailAndKeepsRecentEvents() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let auditURL = root.appendingPathComponent("Audit/audit.jsonl")
+        try FileManager.default.createDirectory(at: auditURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var oversizedPrefix = Data(repeating: 0x58, count: 5 * 1024 * 1024)
+        oversizedPrefix.append(0x0A)
+        try oversizedPrefix.write(to: auditURL)
+        let store = AuditLogStore(fileURL: auditURL)
+        let sessionID = UUID()
+        for index in 0..<5 {
+            try await store.append(AuditEvent(sessionID: sessionID, action: "event-\(index)", result: "ok"))
+        }
+
+        let newest = try await store.readNewest(limit: 2)
+        XCTAssertEqual(newest.map(\.action), ["event-3", "event-4"])
+    }
+
+    func testTrashServiceRejectsOversizedJournalBeforeDecode() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let trashRoot = root.appendingPathComponent("Trash", isDirectory: true)
+        try FileManager.default.createDirectory(at: trashRoot, withIntermediateDirectories: true)
+        let journal = trashRoot.appendingPathComponent("trash-index.json")
+        FileManager.default.createFile(atPath: journal.path, contents: Data())
+        let handle = try FileHandle(forWritingTo: journal)
+        try handle.truncate(atOffset: UInt64(8 * 1024 * 1024 + 1))
+        try handle.close()
+
+        let service = TrashService(root: trashRoot)
+        do {
+            _ = try await service.records()
+            XCTFail("oversized Trash journal must be rejected before decoding")
+        } catch let error as TrashServiceError {
+            XCTAssertEqual(error, .oversizedJournal)
+        }
+    }
+
     func testHermesCorruptDatabaseFailsRecoverablyWithoutTrap() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
