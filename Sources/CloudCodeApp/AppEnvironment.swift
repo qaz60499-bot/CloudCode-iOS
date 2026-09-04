@@ -35,6 +35,8 @@ public final class CloudCodeViewModel: ObservableObject {
     @Published public private(set) var hermesStatusMessage: String?
 
     @Published public private(set) var providerProfiles: [ProviderProfile]
+    @Published public private(set) var installedKeyReferences: Set<String> = []
+    @Published public private(set) var providerKeyCacheReady = false
     @Published public var selectedProviderID: String
     @Published public var selectedKeySlotID: String
     @Published public var selectedModel: String
@@ -84,8 +86,16 @@ public final class CloudCodeViewModel: ObservableObject {
     private var didBootstrap = false
     private static let providerKeyMutationOperationKey = "provider-key:mutation"
     private static let bundledProviderBootstrapFingerprintDefaultsKey = "provider.bootstrap.bundle.fingerprint"
+    private static let bundledProviderKeyFingerprintsDefaultsKey = "provider.bootstrap.bundle.keyFingerprints"
+    private static let manualProviderKeyOverridesDefaultsKey = "provider.key.manualOverrides"
     private static let autoResumeTaskDefaultsKey = "task.autoResumeUnlessStopped"
     private static let backgroundContinuationWindow: TimeInterval = 90 * 60
+
+    private enum BootstrapManualOverridePolicy: Equatable {
+        case preserveManual
+        case markImportedAsManual
+        case replaceManual
+    }
 
     public init(
         startupBreadcrumbStore: StartupBreadcrumbStore = StartupBreadcrumbStore(),
@@ -292,6 +302,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 } else if bundledPrivateBootstrapAvailable {
                     activityLines.append("检测到私有 Key 版 IPA，但当前设备的 Keychain 实际探测未通过，因此已跳过自动导入，避免反复弹出失败提示。")
                 }
+                await refreshInstalledKeyReferences()
                 didBootstrap = true
                 recordStartupBreadcrumb("bootstrap.local-state.end")
                 recordStartupBreadcrumb("bootstrap.completed")
@@ -376,7 +387,7 @@ public final class CloudCodeViewModel: ObservableObject {
 
     public func isKeyInstalled(providerID: String, keySlotID: String) -> Bool {
         guard !providerID.isEmpty, !keySlotID.isEmpty else { return false }
-        return keyVault.contains(ProviderCatalog.keyReference(providerID: providerID, keySlotID: keySlotID))
+        return installedKeyReferences.contains(ProviderCatalog.keyReference(providerID: providerID, keySlotID: keySlotID))
     }
 
     public func selectProvider(_ providerID: String) {
@@ -404,40 +415,73 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     @discardableResult
-    public func setKey(_ secret: String, providerID: String? = nil, keySlotID: String? = nil) -> Bool {
+    public func setKey(_ secret: String, providerID: String? = nil, keySlotID: String? = nil) async -> Bool {
         let providerID = providerID ?? selectedProviderID
         let keySlotID = keySlotID ?? selectedKeySlotID
-        guard !providerID.isEmpty, !keySlotID.isEmpty, !secret.isEmpty else {
+        let normalizedSecret = secret.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !providerID.isEmpty, !keySlotID.isEmpty, !normalizedSecret.isEmpty else {
             lastError = "厂商、Key 槽位或 Key 内容缺失。"
             return false
         }
         let reference = ProviderCatalog.keyReference(providerID: providerID, keySlotID: keySlotID)
+        guard !isProviderKeyReferenceInUse(reference) else {
+            lastError = "当前仍有任务正在使用这个 Key。请等待任务完成或先停止任务，再替换 Key，避免同一任务中途切换凭据。"
+            return false
+        }
         guard beginExclusiveOperation(Self.providerKeyMutationOperationKey) else {
             lastError = "另一个厂商 Key 操作正在进行中。"
             return false
         }
         defer { endExclusiveOperation(Self.providerKeyMutationOperationKey) }
-        let incomingFingerprint = ProviderFingerprint.sha256(secret)
-        let existingFingerprint = providerProfiles
-            .first(where: { $0.id == providerID })?
-            .keySlots.first(where: { $0.id == keySlotID })?
-            .fingerprint
-        let replacesCatalogFingerprint = existingFingerprint.map { !$0.isEmpty && $0 != incomingFingerprint } ?? false
+
+        recordStartupBreadcrumb("provider.key.save.begin")
+        let incomingFingerprint = ProviderFingerprint.sha256(normalizedSecret)
         do {
-            try keyVault.set(secret, for: reference)
-            if replacesCatalogFingerprint,
-               let providerIndex = providerProfiles.firstIndex(where: { $0.id == providerID }),
+            _ = try await ProviderKeyProvisioner.apply(
+                [ProviderKeyMutation(reference: reference, secret: normalizedSecret)],
+                vault: keyVault
+            )
+            installedKeyReferences.insert(reference)
+            providerKeyCacheReady = true
+            updateManualProviderKeyOverrides { overrides in
+                _ = overrides.insert(reference)
+            }
+
+            if let providerIndex = providerProfiles.firstIndex(where: { $0.id == providerID }),
                let slotIndex = providerProfiles[providerIndex].keySlots.firstIndex(where: { $0.id == keySlotID }) {
                 providerProfiles[providerIndex].keySlots[slotIndex].fingerprint = incomingFingerprint
                 providerProfiles[providerIndex].keySlots[slotIndex].status = .needsValidation
                 if providerProfiles[providerIndex].source == .custom {
                     try? persistCustomProviders()
                 }
-                activityLines.append("已按你的明确操作替换当前厂商 Key；新 Key 与随安装包保存的旧指纹不同，已标记为待验证。")
             }
+
+            providerEndpointHealth.removeValue(forKey: providerID)
+            providerFailureSessionIDs.remove(session.id)
+            retryableProviderFailureSessionIDs.remove(session.id)
+            sessionErrors.removeValue(forKey: session.id)
+            lastError = nil
+            activityLines.append("当前 Key 已写入 Keychain 并完成回读校验；旧的认证/接口状态已清除，新 Key 标记为待验证。")
+            try? await diagnosticLogStore.log(
+                level: .info,
+                subsystem: "provider-key",
+                action: "replace",
+                result: "verified-local-write",
+                metadata: ["providerID": providerID, "keySlotID": keySlotID]
+            )
+            recordStartupBreadcrumb("provider.key.save.end")
             return true
         } catch {
-            lastError = "Keychain 错误：\(error)"
+            try? await diagnosticLogStore.log(
+                level: .error,
+                subsystem: "provider-key",
+                action: "replace",
+                result: "failed",
+                error: error,
+                metadata: ["providerID": providerID, "keySlotID": keySlotID]
+            )
+            recordStartupBreadcrumb("provider.key.save.failed")
+            lastError = "Keychain 写入或回读校验失败：\(error)"
             return false
         }
     }
@@ -503,6 +547,10 @@ public final class CloudCodeViewModel: ObservableObject {
 
         guard saveProviderSelection(), let config = currentProviderConfiguration() else {
             if lastError == nil { lastError = "厂商 / Key / 模型选择无效。" }
+            return
+        }
+        guard providerKeyCacheReady else {
+            lastError = "Keychain 状态仍在初始化，请稍后再发送。"
             return
         }
         guard selectedKeyIsInstalled else {
@@ -1175,9 +1223,10 @@ public final class CloudCodeViewModel: ObservableObject {
         await refreshDiagnosticLogs()
     }
 
-    public func refreshDiagnosticLogs() async {
+    public func refreshDiagnosticLogs(limit: Int = 1_500) async {
         do {
-            diagnosticLogs = Array((try await diagnosticLogStore.readAll(limit: 12_000)).reversed())
+            let boundedLimit = max(100, min(limit, 2_000))
+            diagnosticLogs = Array((try await diagnosticLogStore.readAll(limit: boundedLimit)).reversed())
             diagnosticLogBytes = try await diagnosticLogStore.totalBytes()
         } catch {
             lastError = "诊断日志读取失败：\(error)"
@@ -1214,12 +1263,28 @@ public final class CloudCodeViewModel: ObservableObject {
 
     public func diagnosticTextForMostRecentTask(limit: Int = 1_500) async -> String {
         do {
-            let recent = try await diagnosticLogStore.readAll(limit: max(limit * 4, 4_000))
+            let recent = try await diagnosticLogStore.readAll(limit: max(limit * 2, 2_000))
             let taskSessionID = recent.reversed().compactMap(\.sessionID).first ?? session.id
             return try await diagnosticLogStore.text(sessionID: taskSessionID, limit: limit)
         } catch {
             return ""
         }
+    }
+
+    public func crashRecoveryDiagnosticText(limitLogs: Int = 250) async -> String {
+        let breadcrumbs = startupBreadcrumbStore.exportText(limitRuns: 8)
+        let logs = (try? await diagnosticLogStore.text(limit: max(50, min(limitLogs, 500)))) ?? ""
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
+        return [
+            "Cloud Code crash-recovery diagnostics",
+            "version=\(version) build=\(build)",
+            "provider=\(selectedProviderID) model=\(selectedModel)",
+            "--- startup breadcrumbs ---",
+            breadcrumbs.isEmpty ? "<none>" : breadcrumbs,
+            "--- recent runtime logs ---",
+            logs.isEmpty ? "<none>" : logs
+        ].joined(separator: "\n")
     }
 
     public func clearDiagnosticLogs() async -> Bool {
@@ -1412,6 +1477,11 @@ public final class CloudCodeViewModel: ObservableObject {
                 try keyVault.set(apiKey, for: reference)
                 let stored = try await keyVault.key(for: reference)
                 guard stored == apiKey else { throw ProviderKeyProvisioningError.verificationFailed(reference) }
+                installedKeyReferences.insert(reference)
+                providerKeyCacheReady = true
+                updateManualProviderKeyOverrides { overrides in
+                    _ = overrides.insert(reference)
+                }
 
                 providerProfiles.append(profile)
                 do {
@@ -1441,7 +1511,12 @@ public final class CloudCodeViewModel: ObservableObject {
         Task {
             defer { endExclusiveOperation(operationKey) }
             do {
-                let count = try await importProviderBootstrapNow(from: url, removeSource: true)
+                let count = try await importProviderBootstrapNow(
+                    from: url,
+                    removeSource: true,
+                    manualOverridePolicy: .markImportedAsManual
+                )
+                await refreshInstalledKeyReferences()
                 activityLines.append("已将 \(count) 个厂商 Key 导入 Keychain，并删除明文配置源。")
             } catch {
                 lastError = "私有 Key 配置导入失败：\(Self.userFacingProviderBootstrapError(error))"
@@ -1462,7 +1537,12 @@ public final class CloudCodeViewModel: ObservableObject {
         Task {
             defer { endExclusiveOperation(operationKey) }
             do {
-                let count = try await importProviderBootstrapNow(from: url, removeSource: false)
+                let count = try await importProviderBootstrapNow(
+                    from: url,
+                    removeSource: false,
+                    manualOverridePolicy: .replaceManual
+                )
+                await refreshInstalledKeyReferences()
                 activityLines.append("已一键导入预配置 Key：\(count) 个 Key 已写入 iOS Keychain。")
             } catch {
                 lastError = "预配置 Key 导入失败：\(Self.userFacingProviderBootstrapError(error))"
@@ -1536,8 +1616,12 @@ public final class CloudCodeViewModel: ObservableObject {
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
         if let url = documents?.appendingPathComponent("CloudCode-Provider-Bootstrap.json"),
            FileManager.default.fileExists(atPath: url.path) {
-            let count = try await importProviderBootstrapNow(from: url, removeSource: true)
-            activityLines.append("已自动导入私有 Key 配置：\(count) 个 Key。")
+            let count = try await importProviderBootstrapNow(
+                from: url,
+                removeSource: true,
+                manualOverridePolicy: .markImportedAsManual
+            )
+            activityLines.append("已自动导入私有 Key 配置：\(count) 个 Key；这些 Key 会优先于后续安装包内置 Key。")
             return
         }
 
@@ -1545,19 +1629,35 @@ public final class CloudCodeViewModel: ObservableObject {
         var bundledData = try Data(contentsOf: bundled, options: [.mappedIfSafe])
         defer { bundledData.resetBytes(in: 0..<bundledData.count) }
         guard bundledData.count <= 1_048_576 else { throw CocoaError(.fileReadTooLarge) }
-        let bundledFingerprint = ProviderFingerprint.sha256(bundledData)
+        let payload = try ProviderBootstrapPayload.decodeBootstrap(from: bundledData)
+        let stableBundledFingerprint = payload.stableContentFingerprint
+        let legacyRawFingerprint = ProviderFingerprint.sha256(bundledData)
         let defaults = UserDefaults.standard
-        if defaults.string(forKey: Self.bundledProviderBootstrapFingerprintDefaultsKey) == bundledFingerprint {
-            let payload = try ProviderBootstrapPayload.decodeBootstrap(from: bundledData)
-            try applyProviderBootstrapFingerprints(payload, status: nil)
+        let manualOverrides = await inferManualProviderKeyOverrides(from: payload)
+        let storedFingerprint = defaults.string(forKey: Self.bundledProviderBootstrapFingerprintDefaultsKey)
+        if storedFingerprint == stableBundledFingerprint || storedFingerprint == legacyRawFingerprint {
+            try applyProviderBootstrapFingerprints(payload, status: nil, skippingReferences: manualOverrides)
+            storeBundledProviderKeyFingerprints(payload)
+            if storedFingerprint != stableBundledFingerprint {
+                defaults.set(stableBundledFingerprint, forKey: Self.bundledProviderBootstrapFingerprintDefaultsKey)
+            }
             return
         }
-        let count = try await importProviderBootstrapNow(from: bundled, removeSource: false)
-        defaults.set(bundledFingerprint, forKey: Self.bundledProviderBootstrapFingerprintDefaultsKey)
+        let count = try await importProviderBootstrapNow(
+            from: bundled,
+            removeSource: false,
+            manualOverridePolicy: .preserveManual
+        )
+        defaults.set(stableBundledFingerprint, forKey: Self.bundledProviderBootstrapFingerprintDefaultsKey)
+        storeBundledProviderKeyFingerprints(payload)
         activityLines.append("检测到新的私有 Key 配置，已同步 \(count) 个 Key 到 iOS Keychain。")
     }
 
-    private func importProviderBootstrapNow(from url: URL, removeSource: Bool) async throws -> Int {
+    private func importProviderBootstrapNow(
+        from url: URL,
+        removeSource: Bool,
+        manualOverridePolicy: BootstrapManualOverridePolicy = .preserveManual
+    ) async throws -> Int {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         let secureMutation = SecureFileMutation()
@@ -1573,6 +1673,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let payload = try ProviderBootstrapPayload.decodeBootstrap(from: data)
         guard payload.schemaVersion == 1 else { throw CocoaError(.fileReadCorruptFile) }
 
+        let manualOverrides = manualProviderKeyOverrides()
         var pending: [(reference: String, secret: String)] = []
         var plannedReferences = Set<String>()
         for providerKeys in payload.providers {
@@ -1583,10 +1684,14 @@ public final class CloudCodeViewModel: ObservableObject {
                 if let declared = key.fingerprint, !declared.isEmpty, declared != fingerprint { throw CocoaError(.fileReadCorruptFile) }
                 let reference = ProviderCatalog.keyReference(providerID: profile.id, keySlotID: slot.id)
                 guard plannedReferences.insert(reference).inserted else { throw CocoaError(.fileReadCorruptFile) }
+                if manualOverridePolicy == .preserveManual && manualOverrides.contains(reference) { continue }
                 pending.append((reference, key.secret))
             }
         }
-        guard !pending.isEmpty else { throw ProviderError.missingAPIKey }
+        guard !pending.isEmpty else {
+            if manualOverridePolicy == .preserveManual, !manualOverrides.isEmpty { return 0 }
+            throw ProviderError.missingAPIKey
+        }
 
         let mutations = pending.map { ProviderKeyMutation(reference: $0.reference, secret: $0.secret) }
         let importedCount = try await ProviderKeyProvisioner.apply(
@@ -1612,16 +1717,32 @@ public final class CloudCodeViewModel: ObservableObject {
                 }
             }
         )
-        try applyProviderBootstrapFingerprints(payload, status: .needsValidation)
+        let importedReferences = Set(pending.map { $0.reference })
+        switch manualOverridePolicy {
+        case .preserveManual:
+            break
+        case .markImportedAsManual:
+            updateManualProviderKeyOverrides { $0.formUnion(importedReferences) }
+        case .replaceManual:
+            updateManualProviderKeyOverrides { $0.subtract(importedReferences) }
+        }
+        let skippedForFingerprint = manualOverridePolicy == .preserveManual ? manualOverrides : []
+        try applyProviderBootstrapFingerprints(payload, status: .needsValidation, skippingReferences: skippedForFingerprint)
         return importedCount
     }
 
-    private func applyProviderBootstrapFingerprints(_ payload: ProviderBootstrapPayload, status: ProviderKeyStatus?) throws {
+    private func applyProviderBootstrapFingerprints(
+        _ payload: ProviderBootstrapPayload,
+        status: ProviderKeyStatus?,
+        skippingReferences: Set<String> = []
+    ) throws {
         var customProviderChanged = false
         for providerKeys in payload.providers {
             guard let providerIndex = providerProfiles.firstIndex(where: { $0.id == providerKeys.providerID && $0.enabled }) else { continue }
             for key in providerKeys.keys where !key.secret.isEmpty {
                 guard let slotIndex = providerProfiles[providerIndex].keySlots.firstIndex(where: { $0.id == key.slotID }) else { continue }
+                let reference = ProviderCatalog.keyReference(providerID: providerProfiles[providerIndex].id, keySlotID: key.slotID)
+                if skippingReferences.contains(reference) { continue }
                 let fingerprint = ProviderFingerprint.sha256(key.secret)
                 if let declared = key.fingerprint, !declared.isEmpty, declared != fingerprint {
                     throw CocoaError(.fileReadCorruptFile)
@@ -1875,6 +1996,84 @@ public final class CloudCodeViewModel: ObservableObject {
         providerProfiles[providerIndex].keySlots[slotIndex].status = status
         if providerProfiles[providerIndex].source == .custom {
             try? persistCustomProviders()
+        }
+    }
+
+    private func manualProviderKeyOverrides() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: Self.manualProviderKeyOverridesDefaultsKey) ?? [])
+    }
+
+    private func updateManualProviderKeyOverrides(_ mutate: (inout Set<String>) -> Void) {
+        var overrides = manualProviderKeyOverrides()
+        mutate(&overrides)
+        UserDefaults.standard.set(overrides.sorted(), forKey: Self.manualProviderKeyOverridesDefaultsKey)
+    }
+
+    private func inferManualProviderKeyOverrides(from payload: ProviderBootstrapPayload) async -> Set<String> {
+        var overrides = manualProviderKeyOverrides()
+        let original = overrides
+        let previousBundledFingerprints = bundledProviderKeyFingerprints()
+        for providerKeys in payload.providers {
+            guard let provider = providerProfiles.first(where: { $0.id == providerKeys.providerID && $0.enabled }) else { continue }
+            for key in providerKeys.keys where !key.secret.isEmpty {
+                let reference = ProviderCatalog.keyReference(providerID: providerKeys.providerID, keySlotID: key.slotID)
+                if overrides.contains(reference) { continue }
+                guard let stored = try? await keyVault.key(for: reference), !stored.isEmpty else { continue }
+
+                let storedFingerprint = ProviderFingerprint.sha256(stored)
+                let incomingFingerprint = ProviderFingerprint.sha256(key.secret)
+                if storedFingerprint == incomingFingerprint { continue }
+
+                let catalogFingerprint = provider.keySlots.first(where: { $0.id == key.slotID })?.fingerprint
+                let previousBundledFingerprint = previousBundledFingerprints[reference] ?? catalogFingerprint
+                if let previousBundledFingerprint,
+                   !previousBundledFingerprint.isEmpty,
+                   storedFingerprint == previousBundledFingerprint {
+                    continue
+                }
+                _ = overrides.insert(reference)
+            }
+        }
+        if overrides != original {
+            UserDefaults.standard.set(overrides.sorted(), forKey: Self.manualProviderKeyOverridesDefaultsKey)
+            activityLines.append("检测到现有 Key 与安装包内置 Key 不同；已按手动覆盖保护，升级不会把它自动改回。")
+        }
+        return overrides
+    }
+
+    private func bundledProviderKeyFingerprints() -> [String: String] {
+        UserDefaults.standard.dictionary(forKey: Self.bundledProviderKeyFingerprintsDefaultsKey) as? [String: String] ?? [:]
+    }
+
+    private func storeBundledProviderKeyFingerprints(_ payload: ProviderBootstrapPayload) {
+        var fingerprints: [String: String] = [:]
+        for provider in payload.providers {
+            for key in provider.keys where !key.secret.isEmpty {
+                let reference = ProviderCatalog.keyReference(providerID: provider.providerID, keySlotID: key.slotID)
+                fingerprints[reference] = ProviderFingerprint.sha256(key.secret)
+            }
+        }
+        UserDefaults.standard.set(fingerprints, forKey: Self.bundledProviderKeyFingerprintsDefaultsKey)
+    }
+
+    private func refreshInstalledKeyReferences() async {
+        let references = providerProfiles
+            .filter(\.enabled)
+            .flatMap { provider in
+                provider.keySlots.map { ProviderCatalog.keyReference(providerID: provider.id, keySlotID: $0.id) }
+            }
+        let vault = keyVault
+        let installed = await Task.detached(priority: .utility) {
+            Set(references.filter { vault.contains($0) })
+        }.value
+        installedKeyReferences = installed
+        providerKeyCacheReady = true
+    }
+
+    private func isProviderKeyReferenceInUse(_ reference: String) -> Bool {
+        activeConfigurations.values.contains { configuration in
+            if configuration.apiKeyReference == reference { return true }
+            return configuration.fallbackAPIKeyReferences?.contains(reference) == true
         }
     }
 

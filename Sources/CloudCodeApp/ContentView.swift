@@ -1073,10 +1073,13 @@ private struct SettingsView: View {
                         .onSubmit { keyInputFocused = false }
                     Button("保存当前 Key 到 Keychain") {
                         keyInputFocused = false
-                        guard model.setKey(selectedKeyInput) else { return }
-                        selectedKeyInput = ""
+                        let value = selectedKeyInput
+                        Task {
+                            guard await model.setKey(value) else { return }
+                            selectedKeyInput = ""
+                        }
                     }
-                    .disabled(selectedKeyInput.isEmpty || model.isProviderKeyMutationInFlight)
+                    .disabled(selectedKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isProviderKeyMutationInFlight)
 
                     if model.bundledPrivateBootstrapAvailable {
                         Button("一键导入预配置 Key") {
@@ -1162,7 +1165,9 @@ private struct SettingsView: View {
                 }
             }
             .navigationTitle("设置")
+            .onAppear { model.recordStartupBreadcrumb("settings.appear") }
             .onDisappear {
+                model.recordStartupBreadcrumb("settings.disappear")
                 keyInputFocused = false
                 selectedKeyInput = ""
             }
@@ -1281,6 +1286,12 @@ private struct DiagnosticLogsView: View {
                         }
                     }
                 }
+                Button("复制闪退线索") {
+                    Task {
+                        UIPasteboard.general.string = await model.crashRecoveryDiagnosticText()
+                        statusMessage = "已复制轻量闪退线索（启动 breadcrumbs + 最近日志）。"
+                    }
+                }
                 Button {
                     guard !isExporting else { return }
                     isExporting = true
@@ -1379,15 +1390,10 @@ private struct DiagnosticLogsView: View {
         .searchable(text: $query, prompt: "搜索动作、结果、错误或 diagnostic")
         .refreshable { await model.refreshDiagnosticLogs() }
         .task {
-            while !Task.isCancelled {
-                await model.refreshDiagnosticLogs()
-                do {
-                    try await Task.sleep(nanoseconds: 3_000_000_000)
-                } catch {
-                    break
-                }
-            }
+            model.recordStartupBreadcrumb("diagnostics.appear")
+            await model.refreshDiagnosticLogs()
         }
+        .onDisappear { model.recordStartupBreadcrumb("diagnostics.disappear") }
         .sheet(item: $shareItem) { item in
             DiagnosticActivityShareSheet(items: [item.url])
         }

@@ -14,6 +14,36 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertNotNil(profiles.first(where: { $0.id == ProviderCatalog.tabitokenID }))
     }
 
+    func testBootstrapStableFingerprintIgnoresGeneratedAtButTracksKeyMaterial() {
+        let original = ProviderBootstrapPayload(
+            generatedAt: Date(timeIntervalSince1970: 100),
+            providers: [
+                .init(providerID: "provider-a", keys: [
+                    .init(slotID: "slot-1", label: "Key 1", secret: "secret-a")
+                ])
+            ]
+        )
+        let rebuilt = ProviderBootstrapPayload(
+            generatedAt: Date(timeIntervalSince1970: 999),
+            providers: [
+                .init(providerID: "provider-a", keys: [
+                    .init(slotID: "slot-1", label: "Renamed Key", secret: "secret-a", fingerprint: "cosmetic-metadata")
+                ])
+            ]
+        )
+        let rotated = ProviderBootstrapPayload(
+            generatedAt: rebuilt.generatedAt,
+            providers: [
+                .init(providerID: "provider-a", keys: [
+                    .init(slotID: "slot-1", label: "Key 1", secret: "secret-b")
+                ])
+            ]
+        )
+
+        XCTAssertEqual(original.stableContentFingerprint, rebuilt.stableContentFingerprint)
+        XCTAssertNotEqual(original.stableContentFingerprint, rotated.stableContentFingerprint)
+    }
+
     func testDesktopSnapshotKeyCountsMatchCurrentEnabledRegistrySnapshot() {
         let counts = Dictionary(uniqueKeysWithValues: ProviderCatalog.desktopSnapshot.map { ($0.id, $0.keySlots.count) })
         XCTAssertEqual(counts["tabitoken"], 5)
@@ -43,6 +73,13 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-5", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.authMode, .both)
         XCTAssertTrue(provider.autoRotateKeys)
+    }
+
+    func testJustwokerUsesDualAuthForRotatedKeyCompatibility() throws {
+        let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-api-justwoker-icu" }))
+        XCTAssertEqual(provider.authMode, .both)
+        XCTAssertEqual(provider.protocolFor(model: "claude-opus-5", keySlotID: "slot-1"), .anthropic)
+        XCTAssertEqual(provider.protocolFor(model: "claude-opus-5-thinking", keySlotID: "slot-1"), .anthropic)
     }
 
     func testAgentRouterUsesCurrentOriginAndExplicitPerModelProtocols() throws {
@@ -908,7 +945,7 @@ final class ProviderLiveIntegrationTests: XCTestCase {
             apiKeyReference: "live-justwoker",
             providerID: "https-api-justwoker-icu",
             protocolName: ProviderProtocol.anthropic.rawValue,
-            authModeName: ProviderAuthMode.bearer.rawValue
+            authModeName: ProviderAuthMode.both.rawValue
         )
 
         var sawCapabilityTool = false

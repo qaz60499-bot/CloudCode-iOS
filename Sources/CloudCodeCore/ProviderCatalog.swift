@@ -373,6 +373,20 @@ public struct ProviderBootstrapPayload: Codable, Equatable, Sendable {
         return ProviderBootstrapPayload(schemaVersion: wire.schemaVersion, generatedAt: generatedAt, providers: wire.providers)
     }
 
+    /// Stable across rebuild timestamps. Only actual provider/key material and schema identity
+    /// participate so regenerating the same private bootstrap does not look like a key rotation.
+    public var stableContentFingerprint: String {
+        var canonical = "schema=\(schemaVersion)\n"
+        for provider in providers.sorted(by: { $0.providerID < $1.providerID }) {
+            canonical += "provider=\(provider.providerID)\n"
+            for key in provider.keys.sorted(by: { $0.slotID < $1.slotID }) {
+                canonical += "slot=\(key.slotID)\n"
+                canonical += "secret=\(ProviderFingerprint.sha256(key.secret))\n"
+            }
+        }
+        return ProviderFingerprint.sha256(canonical)
+    }
+
     private static func parseBootstrapDate(_ value: String) -> Date? {
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -547,7 +561,7 @@ public enum ProviderCatalog {
                 baseURL: URL(string: "https://api.justwoker.icu")!,
                 protocols: [.anthropic, .openAIChat],
                 preferredProtocol: .anthropic,
-                authMode: .bearer,
+                authMode: .both,
                 models: ["claude-opus-5", "claude-opus-5-thinking"],
                 keySlots: [ProviderKeySlot(id: "slot-1", label: "Key 1", fingerprint: "4b311d96d45555d663e567e0e82b8cddc46d90f02a834ea81a78ed716e690184", models: ["claude-opus-5", "claude-opus-5-thinking"], protocols: [.anthropic, .openAIChat], modelProtocols: ["claude-opus-5": [.anthropic], "claude-opus-5-thinking": [.anthropic]])],
                 source: .desktopSnapshot,
