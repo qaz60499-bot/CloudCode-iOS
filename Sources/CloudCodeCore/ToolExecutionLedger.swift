@@ -53,31 +53,21 @@ public struct ToolExecutionRecord: Codable, Equatable, Sendable {
 
 public actor ToolExecutionLedger {
     private let fileURL: URL
-    private var records: [UUID: ToolExecutionRecord]
-    private var loadFailed: Bool
+    private var records: [UUID: ToolExecutionRecord] = [:]
+    private var loadFailed = false
+    private var didLoad = false
+    private static let maxSerializedBytes: Int64 = 24 * 1024 * 1024
 
     public init(fileURL: URL) {
+        // Loading is deferred until the first ledger operation. The app entry path
+        // must never decode an unbounded historical ledger before rendering UI.
         self.fileURL = fileURL
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            if let data = try? Data(contentsOf: fileURL),
-               let decoded = try? decoder.decode([UUID: ToolExecutionRecord].self, from: data) {
-                records = decoded
-                loadFailed = false
-            } else {
-                records = [:]
-                loadFailed = true
-            }
-        } else {
-            records = [:]
-            loadFailed = false
-        }
     }
 
     /// Returns a previously committed result, or persists a pending marker before a new write executes.
     /// A pending marker from a previous process is treated conservatively as an uncertain prior execution.
     public func prepare(_ call: ToolCall) throws -> ToolResult? {
+        loadIfNeeded()
         guard !loadFailed else { throw ToolExecutionLedgerError.corruptLedger }
         let fingerprint = Self.fingerprint(call)
         if let record = records[call.id] {
@@ -103,6 +93,7 @@ public actor ToolExecutionLedger {
     }
 
     public func complete(_ result: ToolResult, for call: ToolCall) throws {
+        loadIfNeeded()
         guard !loadFailed else { throw ToolExecutionLedgerError.corruptLedger }
         let fingerprint = Self.fingerprint(call)
         if let existing = records[call.id] {
@@ -122,17 +113,49 @@ public actor ToolExecutionLedger {
         try persist()
     }
 
-    public func record(for id: UUID) -> ToolExecutionRecord? { records[id] }
+    public func record(for id: UUID) -> ToolExecutionRecord? {
+        loadIfNeeded()
+        guard !loadFailed else { return nil }
+        return records[id]
+    }
 
     public func all() -> [ToolExecutionRecord] {
-        records.values.sorted { ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt) }
+        loadIfNeeded()
+        guard !loadFailed else { return [] }
+        return records.values.sorted { ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt) }
     }
 
     public func exportSnapshotData() throws -> Data {
+        loadIfNeeded()
         if loadFailed, FileManager.default.fileExists(atPath: fileURL.path) {
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+               let size = attributes[.size] as? NSNumber,
+               size.int64Value > Self.maxSerializedBytes {
+                throw ToolExecutionLedgerError.corruptLedger
+            }
             return try Data(contentsOf: fileURL)
         }
         return try JSONEncoder.pretty.encode(records)
+    }
+
+    private func loadIfNeeded() {
+        guard !didLoad else { return }
+        didLoad = true
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+           let size = attributes[.size] as? NSNumber,
+           size.int64Value > Self.maxSerializedBytes {
+            loadFailed = true
+            return
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        if let data = try? Data(contentsOf: fileURL),
+           let decoded = try? decoder.decode([UUID: ToolExecutionRecord].self, from: data) {
+            records = decoded
+        } else {
+            loadFailed = true
+        }
     }
 
     private func persist() throws {

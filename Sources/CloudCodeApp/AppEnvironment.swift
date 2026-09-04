@@ -158,9 +158,9 @@ public final class CloudCodeViewModel: ObservableObject {
         let hermesStore = HermesMemoryStore(root: support.appendingPathComponent("Hermes", isDirectory: true))
         let provider = ProviderClientRouter(
             keyVault: keyVault,
-            anthropic: AnthropicProviderClient(diagnosticLogger: diagnosticLogStore),
-            openAIChat: OpenAICompatibleProviderClient(diagnosticLogger: diagnosticLogStore),
-            responses: OpenAIResponsesProviderClient(diagnosticLogger: diagnosticLogStore),
+            anthropic: DeferredProviderClient { AnthropicProviderClient(diagnosticLogger: diagnosticLogStore) },
+            openAIChat: DeferredProviderClient { OpenAICompatibleProviderClient(diagnosticLogger: diagnosticLogStore) },
+            responses: DeferredProviderClient { OpenAIResponsesProviderClient(diagnosticLogger: diagnosticLogStore) },
             diagnosticLogger: diagnosticLogStore
         )
         let steeringMailbox = AgentSteeringMailbox()
@@ -1629,7 +1629,12 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private static func loadCustomProviders(from url: URL) -> [ProviderProfile] {
-        guard let data = try? Data(contentsOf: url),
+        guard FileManager.default.fileExists(atPath: url.path),
+              let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber,
+              size.int64Value >= 0,
+              size.int64Value <= 2 * 1024 * 1024,
+              let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
               let profiles = try? JSONDecoder().decode([ProviderProfile].self, from: data) else { return [] }
         return profiles.filter { $0.enabled && $0.source == .custom }
     }

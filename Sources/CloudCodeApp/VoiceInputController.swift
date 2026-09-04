@@ -8,8 +8,13 @@ final class VoiceInputController: NSObject, ObservableObject {
     @Published private(set) var recognizedText = ""
     @Published private(set) var errorMessage: String?
 
-    private let speechRecognizer = SFSpeechRecognizer(locale: Locale.current)
-    private let audioEngine = AVAudioEngine()
+    // Keep AVFoundation/Speech service construction off the app's first-frame path.
+    // Legacy/over-privileged TrollStore builds may tighten service access. These
+    // objects are needed only after the user explicitly starts
+    // dictation, so constructing them while ChatView is being created is unnecessary
+    // launch risk.
+    private var speechRecognizer: SFSpeechRecognizer?
+    private var audioEngine: AVAudioEngine?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var recognitionGeneration: UUID?
@@ -51,18 +56,22 @@ final class VoiceInputController: NSObject, ObservableObject {
 
     private func beginRecording(generation: UUID) {
         guard recognitionGeneration == generation, !isRecording else { return }
-        guard let speechRecognizer, speechRecognizer.isAvailable else {
+        let recognizer = speechRecognizer ?? SFSpeechRecognizer(locale: Locale.current)
+        speechRecognizer = recognizer
+        guard let recognizer, recognizer.isAvailable else {
             recognitionGeneration = nil
             errorMessage = "语音识别当前不可用。"
             return
         }
+        let engine = audioEngine ?? AVAudioEngine()
+        audioEngine = engine
 
         let audioSession = AVAudioSession.sharedInstance()
         do {
             try audioSession.setCategory(.record, mode: .measurement, options: [.duckOthers])
             try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
 
-            let inputNode = audioEngine.inputNode
+            let inputNode = engine.inputNode
             let recordingFormat = inputNode.outputFormat(forBus: 0)
             guard recordingFormat.sampleRate > 0 else {
                 throw CocoaError(.fileReadUnknown)
@@ -77,7 +86,7 @@ final class VoiceInputController: NSObject, ObservableObject {
                 request.append(buffer)
             }
 
-            recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
+            recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
                 let text = result?.bestTranscription.formattedString
                 let isFinal = result?.isFinal == true
                 Task { @MainActor [weak self] in
@@ -96,8 +105,8 @@ final class VoiceInputController: NSObject, ObservableObject {
                 }
             }
 
-            audioEngine.prepare()
-            try audioEngine.start()
+            engine.prepare()
+            try engine.start()
             isRecording = true
         } catch {
             stopRecording()
@@ -110,10 +119,12 @@ final class VoiceInputController: NSObject, ObservableObject {
         let hadRecognitionResources = isRecording || recognitionRequest != nil || recognitionTask != nil
         guard hadRecognitionResources else { return }
 
-        if audioEngine.isRunning {
-            audioEngine.stop()
+        if let engine = audioEngine {
+            if engine.isRunning {
+                engine.stop()
+            }
+            engine.inputNode.removeTap(onBus: 0)
         }
-        audioEngine.inputNode.removeTap(onBus: 0)
         recognitionRequest?.endAudio()
         recognitionRequest = nil
         recognitionTask?.cancel()

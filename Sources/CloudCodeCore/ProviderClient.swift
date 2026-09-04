@@ -1096,6 +1096,26 @@ public actor ProviderRequestKeyState {
     }
 }
 
+public struct DeferredProviderClient: ProviderStreaming, Sendable {
+    private let factory: @Sendable () -> any ProviderStreaming
+
+    public init(factory: @escaping @Sendable () -> any ProviderStreaming) {
+        self.factory = factory
+    }
+
+    public func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        // Network/session objects are intentionally materialized only when an
+        // actual Provider request begins. This keeps CFNetwork/XPC work out of the
+        // iOS app's first-frame path, including privileged TrollStore builds.
+        factory().stream(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
+    }
+}
+
 public struct ProviderClientRouter: ProviderStreaming, Sendable {
     private let keyVault: APIKeyVault
     private let anthropic: ProviderStreaming
@@ -1106,9 +1126,9 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
 
     public init(
         keyVault: APIKeyVault,
-        anthropic: ProviderStreaming = AnthropicProviderClient(),
-        openAIChat: ProviderStreaming = OpenAICompatibleProviderClient(),
-        responses: ProviderStreaming = OpenAIResponsesProviderClient(),
+        anthropic: ProviderStreaming = DeferredProviderClient { AnthropicProviderClient() },
+        openAIChat: ProviderStreaming = DeferredProviderClient { OpenAICompatibleProviderClient() },
+        responses: ProviderStreaming = DeferredProviderClient { OpenAIResponsesProviderClient() },
         requestKeyState: ProviderRequestKeyState = ProviderRequestKeyState(),
         diagnosticLogger: DiagnosticLogStore? = nil
     ) {

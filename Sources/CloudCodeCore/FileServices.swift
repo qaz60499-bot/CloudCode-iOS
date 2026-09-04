@@ -47,30 +47,53 @@ public actor AuditLogStore {
 public actor AppKnowledgeRegistry {
     private let fileURL: URL
     private var entries: [String: AppKnowledge] = [:]
+    private var didLoad = false
+    private static let maxSerializedBytes: Int64 = 8 * 1024 * 1024
 
     public init(fileURL: URL) {
+        // This registry is a rebuildable heuristic cache. Defer all disk reads until
+        // after launch so corrupt/oversized history can never kill the first frame.
         self.fileURL = fileURL
-        if let data = try? Data(contentsOf: fileURL),
-           let decoded = try? JSONDecoder().decode([String: AppKnowledge].self, from: data) {
-            self.entries = decoded
-        }
     }
 
     public func all() -> [AppKnowledge] {
-        entries.values.sorted { lhs, rhs in
+        loadIfNeeded()
+        return entries.values.sorted { lhs, rhs in
             if lhs.estimatedCost == rhs.estimatedCost { return lhs.successRate > rhs.successRate }
             return lhs.estimatedCost < rhs.estimatedCost
         }
     }
 
-    public func knowledge(for bundleID: String) -> AppKnowledge? { entries[bundleID] }
+    public func knowledge(for bundleID: String) -> AppKnowledge? {
+        loadIfNeeded()
+        return entries[bundleID]
+    }
 
     public func upsert(_ value: AppKnowledge) throws {
+        loadIfNeeded()
         entries[value.bundleID] = value
         let parent = fileURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
         let data = try JSONEncoder.pretty.encode(entries)
         try data.write(to: fileURL, options: .atomic)
+    }
+
+    private func loadIfNeeded() {
+        guard !didLoad else { return }
+        didLoad = true
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+           let size = attributes[.size] as? NSNumber,
+           size.int64Value > Self.maxSerializedBytes {
+            entries = [:]
+            return
+        }
+        if let data = try? Data(contentsOf: fileURL),
+           let decoded = try? JSONDecoder().decode([String: AppKnowledge].self, from: data) {
+            entries = decoded
+        } else {
+            entries = [:]
+        }
     }
 }
 

@@ -73,7 +73,6 @@ plutil -lint "$ENTITLEMENTS" >/dev/null
 
 for key in \
   'com.apple.private.security.no-sandbox' \
-  'platform-application' \
   'com.apple.private.security.storage.AppDataContainers' \
   'com.apple.private.persona-mgmt'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$ENTITLEMENTS" 2>/dev/null || true)"
@@ -82,6 +81,10 @@ for key in \
     exit 11
   fi
 done
+if /usr/libexec/PlistBuddy -c 'Print :platform-application' "$ENTITLEMENTS" >/dev/null 2>&1; then
+  echo "FAIL: privileged SwiftUI host must not carry platform-application" >&2
+  exit 11
+fi
 
 test "$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$ENTITLEMENTS")" = 'TROLLTROLL.*'
 test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$ENTITLEMENTS")" = 'TROLLTROLL'
@@ -94,7 +97,6 @@ ldid -e "$HELPER" > "$HELPER_ENTITLEMENTS"
 plutil -lint "$HELPER_ENTITLEMENTS" >/dev/null
 for key in \
   'com.apple.private.security.no-sandbox' \
-  'platform-application' \
   'com.apple.private.persona-mgmt'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$HELPER_ENTITLEMENTS" 2>/dev/null || true)"
   if [[ "$value" != "true" ]]; then
@@ -102,7 +104,11 @@ for key in \
     exit 12
   fi
 done
+if /usr/libexec/PlistBuddy -c 'Print :platform-application' "$HELPER_ENTITLEMENTS" >/dev/null 2>&1; then
+  echo "FAIL: root helper must not carry unnecessary platform-application" >&2
+  exit 12
+fi
 
-echo "PASS: privileged TrollStore entitlement set is embedded in the main executable and root helper"
+echo "PASS: privileged TrollStore entitlement set is embedded without platform-application launch side effects"
 echo "SECURITY: this IPA contains private Provider credentials and privileged entitlements; use only on the user's own TrollStore test device"
 echo "NOTE: entitlement presence does not prove device runtime support; capability probes must still verify each operation on-device."

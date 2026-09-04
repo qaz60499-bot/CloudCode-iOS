@@ -36,22 +36,17 @@ public actor TransactionJournal {
     private let fileURL: URL
     private var recordsByID: [UUID: TransactionRecord] = [:]
     private var loadFailed = false
+    private var didLoad = false
+    private static let maxSerializedBytes: Int64 = 16 * 1024 * 1024
 
     public init(fileURL: URL) {
+        // Defer journal I/O until an actual transaction operation. Launch must not
+        // decode persistent transaction history before the first scene is visible.
         self.fileURL = fileURL
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            if let data = try? Data(contentsOf: fileURL),
-               let decoded = try? decoder.decode([UUID: TransactionRecord].self, from: data) {
-                self.recordsByID = decoded
-            } else {
-                loadFailed = true
-            }
-        }
     }
 
     public func assertHealthy() throws {
+        loadIfNeeded()
         guard !loadFailed else { throw TransactionJournalError.corruptJournal }
     }
 
@@ -61,17 +56,49 @@ public actor TransactionJournal {
         try persist()
     }
 
-    public func record(_ id: UUID) -> TransactionRecord? { recordsByID[id] }
+    public func record(_ id: UUID) -> TransactionRecord? {
+        loadIfNeeded()
+        guard !loadFailed else { return nil }
+        return recordsByID[id]
+    }
 
     public func all() -> [TransactionRecord] {
-        recordsByID.values.sorted { $0.startedAt > $1.startedAt }
+        loadIfNeeded()
+        guard !loadFailed else { return [] }
+        return recordsByID.values.sorted { $0.startedAt > $1.startedAt }
     }
 
     public func exportSnapshotData() throws -> Data {
+        loadIfNeeded()
         if loadFailed, FileManager.default.fileExists(atPath: fileURL.path) {
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+               let size = attributes[.size] as? NSNumber,
+               size.int64Value > Self.maxSerializedBytes {
+                throw TransactionJournalError.corruptJournal
+            }
             return try Data(contentsOf: fileURL)
         }
         return try JSONEncoder.pretty.encode(recordsByID)
+    }
+
+    private func loadIfNeeded() {
+        guard !didLoad else { return }
+        didLoad = true
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+           let size = attributes[.size] as? NSNumber,
+           size.int64Value > Self.maxSerializedBytes {
+            loadFailed = true
+            return
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        if let data = try? Data(contentsOf: fileURL),
+           let decoded = try? decoder.decode([UUID: TransactionRecord].self, from: data) {
+            recordsByID = decoded
+        } else {
+            loadFailed = true
+        }
     }
 
     private func persist() throws {

@@ -118,22 +118,17 @@ public actor TaskCheckpointStore {
     private let fileURL: URL
     private var checkpoints: [UUID: TaskCheckpoint] = [:]
     private var loadFailed = false
+    private var didLoad = false
+    private static let maxSerializedBytes: Int64 = 16 * 1024 * 1024
 
     public init(fileURL: URL) {
+        // Constructor must stay side-effect free so app launch never synchronously
+        // reads an arbitrarily large/corrupt checkpoint file before the first frame.
         self.fileURL = fileURL
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            if let data = try? Data(contentsOf: fileURL),
-               let decoded = try? decoder.decode([UUID: TaskCheckpoint].self, from: data) {
-                checkpoints = decoded
-            } else {
-                loadFailed = true
-            }
-        }
     }
 
     public func assertHealthy() throws {
+        loadIfNeeded()
         guard !loadFailed else { throw TaskCheckpointStoreError.corruptStore }
     }
 
@@ -144,11 +139,15 @@ public actor TaskCheckpointStore {
     }
 
     public func checkpoint(_ id: UUID) -> TaskCheckpoint? {
-        checkpoints[id]
+        loadIfNeeded()
+        guard !loadFailed else { return nil }
+        return checkpoints[id]
     }
 
     public func interrupted() -> [TaskCheckpoint] {
-        checkpoints.values.filter { !["completed", "cancelled", "rolled_back"].contains($0.state) }.sorted { $0.updatedAt > $1.updatedAt }
+        loadIfNeeded()
+        guard !loadFailed else { return [] }
+        return checkpoints.values.filter { !["completed", "cancelled", "rolled_back"].contains($0.state) }.sorted { $0.updatedAt > $1.updatedAt }
     }
 
     public func recoverUnfinishedAfterRestart() throws {
@@ -182,10 +181,31 @@ public actor TaskCheckpointStore {
     }
 
     public func exportSnapshotData() throws -> Data {
+        loadIfNeeded()
         if loadFailed, FileManager.default.fileExists(atPath: fileURL.path) {
             return try Data(contentsOf: fileURL)
         }
         return try JSONEncoder.pretty.encode(checkpoints)
+    }
+
+    private func loadIfNeeded() {
+        guard !didLoad else { return }
+        didLoad = true
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+           let size = attributes[.size] as? NSNumber,
+           size.int64Value > Self.maxSerializedBytes {
+            loadFailed = true
+            return
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        if let data = try? Data(contentsOf: fileURL),
+           let decoded = try? decoder.decode([UUID: TaskCheckpoint].self, from: data) {
+            checkpoints = decoded
+        } else {
+            loadFailed = true
+        }
     }
 
     private func persist() throws {
@@ -195,33 +215,55 @@ public actor TaskCheckpointStore {
 }
 
 public actor ProgressiveResourceIndex {
-    private var graph: ResourceGraph
+    private var graph = ResourceGraph()
     private let fileURL: URL
+    private var didLoad = false
+    private static let maxSerializedBytes: Int64 = 16 * 1024 * 1024
 
     public init(fileURL: URL) {
+        // Resource graph is a rebuildable cache. Never read/decode it from the
+        // app's synchronous construction path.
         self.fileURL = fileURL
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        if let data = try? Data(contentsOf: fileURL), let value = try? decoder.decode(ResourceGraph.self, from: data) {
-            graph = value
-        } else {
-            graph = ResourceGraph()
-        }
     }
 
-    public func snapshot() -> ResourceGraph { graph }
+    public func snapshot() -> ResourceGraph {
+        loadIfNeeded()
+        return graph
+    }
 
     public func seedLightweight(apps: [ResourceNode], capabilityProfile: CapabilityProfile) throws {
+        loadIfNeeded()
         for app in apps { graph.upsert(app) }
         graph.indexedAt = Date()
         try persist()
     }
 
     public func add(_ node: ResourceNode, deep: Bool = false) throws {
+        loadIfNeeded()
         graph.upsert(node)
         if deep { graph.deepIndexedResourceIDs.insert(node.id) }
         graph.indexedAt = Date()
         try persist()
+    }
+
+    private func loadIfNeeded() {
+        guard !didLoad else { return }
+        didLoad = true
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+           let size = attributes[.size] as? NSNumber,
+           size.int64Value > Self.maxSerializedBytes {
+            graph = ResourceGraph()
+            return
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        if let data = try? Data(contentsOf: fileURL),
+           let value = try? decoder.decode(ResourceGraph.self, from: data) {
+            graph = value
+        } else {
+            graph = ResourceGraph()
+        }
     }
 
     private func persist() throws {

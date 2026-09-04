@@ -16,8 +16,10 @@
     </array>
     <key>com.apple.private.security.no-sandbox</key>
     <true/>
-    <key>platform-application</key>
-    <true/>
+    <!-- Do not set platform-application on the SwiftUI host. TrollStore documents
+         that it tightens parts of the sandbox and can require extra IOKit/XPC
+         exceptions. Cloud Code only needs an unsandboxed host plus persona-mgmt
+         to spawn its isolated root helper. -->
     <key>com.apple.private.security.storage.AppDataContainers</key>
     <true/>
     <key>com.apple.private.persona-mgmt</key>

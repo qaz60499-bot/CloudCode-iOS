@@ -43,7 +43,7 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
-      - name: Build app for iOS Simulator
+      - name: Build release app for iOS Simulator
         run: |
           set -euo pipefail
           rm -rf build/SimulatorDerivedData
@@ -51,15 +51,15 @@ jobs:
             -project CloudCodeIOS.xcodeproj \
             -scheme CloudCodeIOS \
             -sdk iphonesimulator \
-            -configuration Debug \
+            -configuration Release \
             -derivedDataPath build/SimulatorDerivedData \
             CODE_SIGNING_ALLOWED=NO \
             build
 
-      - name: Launch app in iOS Simulator
+      - name: Launch release app in iOS Simulator
         run: |
           set -euo pipefail
-          APP_PATH="build/SimulatorDerivedData/Build/Products/Debug-iphonesimulator/CloudCode.app"
+          APP_PATH="build/SimulatorDerivedData/Build/Products/Release-iphonesimulator/CloudCode.app"
           test -d "$APP_PATH"
           UDID="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ { print $2; exit }')"
           test -n "$UDID"
@@ -134,6 +134,12 @@ jobs:
             echo "FAIL: public Runner build must not use TrollStore private entitlements" >&2
             exit 1
           fi
+          if grep -F '<key>platform-application</key>' Entitlements/TrollStore.entitlements; then
+            echo "FAIL: privileged SwiftUI host must not use platform-application; TrollStore documents device-service side effects" >&2
+            exit 1
+          fi
+          grep -F '<key>com.apple.private.security.no-sandbox</key>' Entitlements/TrollStore.entitlements >/dev/null
+          grep -F '<key>com.apple.private.persona-mgmt</key>' Entitlements/TrollStore.entitlements >/dev/null
           grep -F 'CODE_SIGN_ENTITLEMENTS: Entitlements/CloudCode.entitlements' project.yml >/dev/null
           grep -F 'kSecAttrAccessibleWhenUnlockedThisDeviceOnly' Sources/CloudCodeCore/KeychainAPIKeyVault.swift >/dev/null
           if grep -F 'kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly' Sources/CloudCodeCore/KeychainAPIKeyVault.swift; then
@@ -210,6 +216,41 @@ jobs:
           for marker in ('viewModel.init.begin', 'viewModel.init.end', 'bootstrap.safe.begin', 'bootstrap.safe.end', 'bootstrap.recovery.begin', 'bootstrap.recovery.ready'):
               if marker not in app:
                   raise SystemExit(f'FAIL: startup breadcrumb marker missing: {marker}')
+
+          voice = Path('Sources/CloudCodeApp/VoiceInputController.swift').read_text(encoding='utf-8')
+          for forbidden in ('private let speechRecognizer = SFSpeechRecognizer', 'private let audioEngine = AVAudioEngine()'):
+              if forbidden in voice:
+                  raise SystemExit(f'FAIL: first-frame voice service construction reintroduced: {forbidden}')
+          if 'let recognizer = speechRecognizer ?? SFSpeechRecognizer' not in voice or 'let engine = audioEngine ?? AVAudioEngine()' not in voice:
+              raise SystemExit('FAIL: voice services must remain lazy until explicit dictation')
+
+          provider_source = Path('Sources/CloudCodeCore/ProviderClient.swift').read_text(encoding='utf-8')
+          for marker in ('public struct DeferredProviderClient', 'DeferredProviderClient { AnthropicProviderClient()', 'DeferredProviderClient { OpenAICompatibleProviderClient()', 'DeferredProviderClient { OpenAIResponsesProviderClient()'):
+              if marker not in provider_source:
+                  raise SystemExit(f'FAIL: Provider networking lost first-request lazy construction: {marker}')
+          if 'DeferredProviderClient { AnthropicProviderClient(diagnosticLogger: diagnosticLogStore) }' not in app:
+              raise SystemExit('FAIL: app init eagerly constructs Provider URLSession clients')
+
+          constructor_checks = [
+              ('Sources/CloudCodeCore/AgentCore.swift', 'public actor TaskCheckpointStore', 'public init(fileURL: URL)', 'public func assertHealthy'),
+              ('Sources/CloudCodeCore/AgentCore.swift', 'public actor ProgressiveResourceIndex', 'public init(fileURL: URL)', 'public func snapshot'),
+              ('Sources/CloudCodeCore/ToolExecutionLedger.swift', 'public actor ToolExecutionLedger', 'public init(fileURL: URL)', '/// Returns a previously committed result'),
+              ('Sources/CloudCodeCore/TransactionEngine.swift', 'public actor TransactionJournal', 'public init(fileURL: URL)', 'public func assertHealthy'),
+              ('Sources/CloudCodeCore/FileServices.swift', 'public actor AppKnowledgeRegistry', 'public init(fileURL: URL)', 'public func all()'),
+          ]
+          for path, type_marker, init_marker, end_marker in constructor_checks:
+              text = Path(path).read_text(encoding='utf-8')
+              section = text.split(type_marker, 1)[1]
+              init_body = section.split(init_marker, 1)[1].split(end_marker, 1)[0]
+              for forbidden in ('Data(contentsOf:', 'contentsOfDirectory(', 'fileExists(atPath:'):
+                  if forbidden in init_body:
+                      raise SystemExit(f'FAIL: {type_marker} performs disk I/O before first frame: {forbidden}')
+
+          breadcrumbs = Path('Sources/CloudCodeCore/StartupBreadcrumbs.swift').read_text(encoding='utf-8')
+          for marker in ('maxRunFileBytes', 'runFileURLsSortedByModificationDate()', 'isBoundedRunFile'):
+              if marker not in breadcrumbs:
+                  raise SystemExit(f'FAIL: startup breadcrumb scan lost bounded-I/O guard: {marker}')
+
           if 'previousStartupCompleted' not in app or 'runContainsStage($0.runID, stage: "bootstrap.completed")' not in app:
               raise SystemExit('FAIL: crash-loop recovery no longer checks whether the previous startup reached the stable completion point')
           recovery = bootstrap.split('if previousStartupRun != nil && !previousStartupCompleted', 1)[1].split('if let previousStartupRun', 1)[0]

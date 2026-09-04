@@ -37,6 +37,7 @@ public struct StartupBreadcrumbStore: Sendable {
     private let directory: URL
     private let fileManager: FileManager
     private let retainedRunCount: Int
+    private static let maxRunFileBytes: Int64 = 64 * 1024
 
     public init(
         directory: URL = StartupBreadcrumbStore.defaultDirectory(),
@@ -96,8 +97,10 @@ public struct StartupBreadcrumbStore: Sendable {
 
     public func runContainsStage(_ runID: UUID, stage: String) -> Bool {
         let expected = Self.sanitizeStage(stage)
+        let url = fileURL(for: runID)
         guard !expected.isEmpty,
-              let data = try? Data(contentsOf: fileURL(for: runID)),
+              Self.isBoundedRunFile(url, fileManager: fileManager),
+              let data = try? Data(contentsOf: url),
               let text = String(data: data, encoding: .utf8) else { return false }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -110,14 +113,14 @@ public struct StartupBreadcrumbStore: Sendable {
     }
 
     public func recentRuns(limit: Int = 8) -> [StartupBreadcrumbRunSummary] {
-        guard limit > 0,
-              let urls = try? fileManager.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: [.contentModificationDateKey],
-                options: [.skipsHiddenFiles]
-              ) else { return [] }
+        guard limit > 0 else { return [] }
+        let urls = runFileURLsSortedByModificationDate()
+        guard !urls.isEmpty else { return [] }
 
-        let summaries = urls.compactMap(summary(for:))
+        // Never decode an unbounded crash-loop history during app construction.
+        // The newest files contain the only startup state relevant to recovery.
+        let scanLimit = min(urls.count, max(retainedRunCount + 8, min(limit, 64) * 4))
+        let summaries = urls.prefix(scanLimit).compactMap(summary(for:))
         return Array(summaries.sorted { lhs, rhs in
             if lhs.lastTimestamp == rhs.lastTimestamp { return lhs.runID.uuidString > rhs.runID.uuidString }
             return lhs.lastTimestamp > rhs.lastTimestamp
@@ -131,7 +134,7 @@ public struct StartupBreadcrumbStore: Sendable {
     }
 
     private func summary(for url: URL) -> StartupBreadcrumbRunSummary? {
-        guard url.pathExtension == "jsonl",
+        guard Self.isBoundedRunFile(url, fileManager: fileManager),
               let data = try? Data(contentsOf: url),
               let text = String(data: data, encoding: .utf8) else { return nil }
         let decoder = JSONDecoder()
@@ -151,11 +154,35 @@ public struct StartupBreadcrumbStore: Sendable {
     }
 
     private func pruneOldRuns(keeping currentRunID: UUID) {
-        let summaries = recentRuns(limit: Int.max)
-        guard summaries.count > retainedRunCount else { return }
-        for summary in summaries.dropFirst(retainedRunCount) where summary.runID != currentRunID {
-            try? fileManager.removeItem(at: fileURL(for: summary.runID))
+        let urls = runFileURLsSortedByModificationDate()
+        guard urls.count > retainedRunCount else { return }
+        let currentURL = fileURL(for: currentRunID).standardizedFileURL
+        for url in urls.dropFirst(retainedRunCount) where url.standardizedFileURL != currentURL {
+            try? fileManager.removeItem(at: url)
         }
+    }
+
+    private func runFileURLsSortedByModificationDate() -> [URL] {
+        guard let urls = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        return urls
+            .filter { $0.pathExtension == "jsonl" && $0.lastPathComponent.hasPrefix("run-") }
+            .sorted { lhs, rhs in
+                let l = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let r = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                if l == r { return lhs.lastPathComponent > rhs.lastPathComponent }
+                return l > r
+            }
+    }
+
+    private static func isBoundedRunFile(_ url: URL, fileManager: FileManager) -> Bool {
+        guard url.pathExtension == "jsonl" else { return false }
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber else { return false }
+        return size.int64Value >= 0 && size.int64Value <= maxRunFileBytes
     }
 
     private func fileURL(for runID: UUID) -> URL {

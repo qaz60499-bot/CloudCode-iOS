@@ -104,9 +104,12 @@ jobs:
           ldid -e "$APP_PATH/$MAIN_EXECUTABLE" > "$ENTITLEMENTS"
           plutil -lint "$ENTITLEMENTS" >/dev/null
           /usr/libexec/PlistBuddy -c 'Print :com.apple.private.security.no-sandbox' "$ENTITLEMENTS" | grep -F 'true'
-          /usr/libexec/PlistBuddy -c 'Print :platform-application' "$ENTITLEMENTS" | grep -F 'true'
           /usr/libexec/PlistBuddy -c 'Print :com.apple.private.security.storage.AppDataContainers' "$ENTITLEMENTS" | grep -F 'true'
           /usr/libexec/PlistBuddy -c 'Print :com.apple.private.persona-mgmt' "$ENTITLEMENTS" | grep -F 'true'
+          if /usr/libexec/PlistBuddy -c 'Print :platform-application' "$ENTITLEMENTS" >/dev/null 2>&1; then
+            echo 'FAIL: SwiftUI host must not carry platform-application; it tightens normal app service access and can cause device-only launch failures' >&2
+            exit 1
+          fi
           rm -f "$ENTITLEMENTS"
           echo 'PASS: privileged validation entitlement set embedded'
 
