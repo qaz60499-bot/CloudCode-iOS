@@ -173,8 +173,8 @@ jobs:
             echo "FAIL: public Runner build must not use TrollStore private entitlements" >&2
             exit 1
           fi
-          if grep -F '<key>platform-application</key>' Entitlements/TrollStore.entitlements; then
-            echo "FAIL: privileged SwiftUI host must not use platform-application; TrollStore documents device-service side effects" >&2
+          if grep -E '<key>(platform-application|com\.apple\.private\.security\.storage\.AppDataContainers)</key>' Entitlements/TrollStore.entitlements; then
+            echo "FAIL: privileged SwiftUI host must not carry unnecessary platform/container escalation entitlements" >&2
             exit 1
           fi
           grep -F '<key>com.apple.private.security.no-sandbox</key>' Entitlements/TrollStore.entitlements >/dev/null

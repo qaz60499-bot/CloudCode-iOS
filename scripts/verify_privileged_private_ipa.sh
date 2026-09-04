@@ -73,7 +73,6 @@ plutil -lint "$ENTITLEMENTS" >/dev/null
 
 for key in \
   'com.apple.private.security.no-sandbox' \
-  'com.apple.private.security.storage.AppDataContainers' \
   'com.apple.private.persona-mgmt'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$ENTITLEMENTS" 2>/dev/null || true)"
   if [[ "$value" != "true" ]]; then
@@ -81,10 +80,14 @@ for key in \
     exit 11
   fi
 done
-if /usr/libexec/PlistBuddy -c 'Print :platform-application' "$ENTITLEMENTS" >/dev/null 2>&1; then
-  echo "FAIL: privileged SwiftUI host must not carry platform-application" >&2
-  exit 11
-fi
+for forbidden_host_entitlement in \
+  'platform-application' \
+  'com.apple.private.security.storage.AppDataContainers'; do
+  if /usr/libexec/PlistBuddy -c "Print :$forbidden_host_entitlement" "$ENTITLEMENTS" >/dev/null 2>&1; then
+    echo "FAIL: privileged SwiftUI host carries unnecessary launch-risk entitlement: $forbidden_host_entitlement" >&2
+    exit 11
+  fi
+done
 for banned in \
   'com.apple.private.cs.debugger' \
   'dynamic-codesigning' \
