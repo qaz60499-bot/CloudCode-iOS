@@ -65,7 +65,11 @@ jobs:
               if status not in (402, 403, 429):
                   return False
               text = body.decode("utf-8", "replace").lower()
-              return any(marker in text for marker in ("预扣费额度失败", "insufficient balance", "insufficient credit", "precharge", "quota", "capacity"))
+              credit_markers = ("预扣费额度失败", "insufficient balance", "insufficient credit", "precharge", "credit exhausted", "balance exhausted")
+              capacity_markers = ("account capacity", "capacity exhausted", "quota exhausted")
+              return any(marker in text for marker in credit_markers) or (
+                  status in (402, 403) and any(marker in text for marker in capacity_markers)
+              )
 
           agent_key = provider_key("https-agentrouter-org")
           agent_payload = {
@@ -195,7 +199,7 @@ jobs:
               compact = " ".join(body.split())[:1200]
               print(f"PROBE {label}: HTTP {status} BODY {compact}")
               if status != expected:
-                  billing_blocked = status in (402, 403, 429) and any(marker in body.lower() for marker in ("预扣费额度失败", "insufficient balance", "insufficient credit", "precharge", "quota", "capacity"))
+                  billing_blocked = is_billing_block(status, body)
                   if allow_billing_block and billing_blocked:
                       print(f"::warning::{label} is blocked by provider account credit/preauthorization; the workflow will switch to deterministic Provider regressions.")
                       return status, body
@@ -204,9 +208,13 @@ jobs:
               return status, body
 
           def is_billing_block(status, body):
-              return status in (402, 403, 429) and any(
-                  marker in body.lower()
-                  for marker in ("预扣费额度失败", "insufficient balance", "insufficient credit", "precharge", "quota", "capacity")
+              if status not in (402, 403, 429):
+                  return False
+              text = body.lower()
+              credit_markers = ("预扣费额度失败", "insufficient balance", "insufficient credit", "precharge", "credit exhausted", "balance exhausted")
+              capacity_markers = ("account capacity", "capacity exhausted", "quota exhausted")
+              return any(marker in text for marker in credit_markers) or (
+                  status in (402, 403) and any(marker in text for marker in capacity_markers)
               )
 
           def enter_billing_fallback(label, status, body):
@@ -280,6 +288,19 @@ jobs:
                   if ids:
                       print(f"TABITOKEN_CATALOG_FIELD={catalog_key}")
                       return ids, catalog
+
+              shape = []
+              for catalog_key, catalog in catalogs:
+                  if isinstance(catalog, list):
+                      first_type = type(catalog[0]).__name__ if catalog else "none"
+                      first_keys = sorted(catalog[0].keys())[:32] if catalog and isinstance(catalog[0], dict) else []
+                      shape.append({"field": catalog_key, "type": "list", "count": len(catalog), "firstType": first_type, "firstKeys": first_keys})
+                  elif isinstance(catalog, dict):
+                      sample_keys = sorted(str(key) for key in catalog.keys())[:32]
+                      shape.append({"field": catalog_key, "type": "dict", "count": len(catalog), "sampleKeys": sample_keys})
+                  else:
+                      shape.append({"field": catalog_key, "type": type(catalog).__name__})
+              print(f"TABITOKEN_CATALOG_SCHEMA={shape}")
               return [], first_catalog
 
           pricing_ids = []
@@ -350,11 +371,40 @@ jobs:
               raise SystemExit(f"FAIL: Tabitoken ratio catalog returned HTTP {ratio_status}")
           print(f"TABITOKEN_RATIO_CATALOG status={ratio_status} model_count={len(ratio_ids)}")
 
-          shared_catalog_ids = shared_pricing_ids or ratio_ids
+          dashboard_ids = []
+          dashboard_status, dashboard_body = request(
+              "authenticated-dashboard-models-key1",
+              "GET",
+              "",
+              fail_on_mismatch=False,
+              auth_mode="bearer",
+              absolute_url="https://tabitoken.com/api/models",
+          )
+          if dashboard_status == 200:
+              try:
+                  dashboard_parsed = json.loads(dashboard_body)
+              except json.JSONDecodeError as exc:
+                  raise SystemExit(f"FAIL: Tabitoken /api/models returned malformed JSON: {exc.msg}")
+              dashboard_data = dashboard_parsed.get("data") if isinstance(dashboard_parsed, dict) else None
+              if isinstance(dashboard_data, dict):
+                  for models in dashboard_data.values():
+                      if not isinstance(models, list):
+                          continue
+                      for model in models:
+                          if isinstance(model, str) and model.strip() and model.strip() not in dashboard_ids:
+                              dashboard_ids.append(model.strip())
+          elif dashboard_status == 429:
+              print("::warning::Authenticated Tabitoken /api/models is rate-limited; continuing without treating 429 as credit.")
+          elif dashboard_status not in (401, 403, 404):
+              raise SystemExit(f"FAIL: Tabitoken /api/models returned HTTP {dashboard_status}")
+          print(f"TABITOKEN_DASHBOARD_MODELS status={dashboard_status} model_count={len(dashboard_ids)}")
+
+          shared_catalog_ids = authenticated_pricing_ids or dashboard_ids or ratio_ids or pricing_ids
           shared_catalog_source = (
               "authenticated-pricing" if authenticated_pricing_ids
-              else "public-pricing" if pricing_ids
+              else "dashboard-models" if dashboard_ids
               else "ratio-config" if ratio_ids
+              else "public-pricing" if pricing_ids
               else None
           )
 
@@ -402,7 +452,7 @@ jobs:
                       ids = list(shared_catalog_ids)
                       catalog_auth_mode = shared_catalog_source
 
-              catalog_attempts.append({"key": key_index, "statuses": catalog_statuses, "pricingStatus": pricing_status, "authPricingStatus": auth_pricing_status, "ratioStatus": ratio_status, "modelCount": len(ids)})
+              catalog_attempts.append({"key": key_index, "statuses": catalog_statuses, "pricingStatus": pricing_status, "authPricingStatus": auth_pricing_status, "ratioStatus": ratio_status, "dashboardStatus": dashboard_status, "modelCount": len(ids)})
               if not ids:
                   continue
 
