@@ -286,9 +286,11 @@ jobs:
                   raise SystemExit(f'FAIL: approval cancellation-safety marker missing: {marker}')
 
           app_entry = Path('Sources/CloudCodeApp/CloudCodeIOSApp.swift').read_text(encoding='utf-8')
-          for marker in ('app.main.enter', 'firstScene.rendered'):
+          for marker in ('app.main.enter', 'firstScene.visibleWindow'):
               if marker not in app_entry:
                   raise SystemExit(f'FAIL: startup breadcrumb marker missing: {marker}')
+          if 'Task.sleep(nanoseconds: 450_000_000)' not in app_entry:
+              raise SystemExit('FAIL: privileged startup must preserve a real first-frame visibility window before constructing CloudCodeViewModel')
           for marker in ('viewModel.init.begin', 'viewModel.init.end', 'bootstrap.safe.begin', 'bootstrap.safe.end', 'bootstrap.recovery.begin', 'bootstrap.recovery.ready'):
               if marker not in app:
                   raise SystemExit(f'FAIL: startup breadcrumb marker missing: {marker}')
