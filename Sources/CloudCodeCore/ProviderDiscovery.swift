@@ -50,6 +50,9 @@ public struct ProviderDiscoveryClient: Sendable {
                     break
                 }
                 lastError = ProviderError.malformedEvent
+                if allowPricingCatalogFallback {
+                    break
+                }
             } catch {
                 lastError = error
             }

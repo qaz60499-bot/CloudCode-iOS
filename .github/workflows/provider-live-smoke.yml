@@ -223,51 +223,64 @@ jobs:
               try:
                   parsed = json.loads(models_body)
               except json.JSONDecodeError as exc:
-                  raise SystemExit(f"FAIL: Tabitoken /models returned malformed JSON: {exc.msg}")
-              catalog = (parsed.get("data") or parsed.get("priced_model_details") or parsed.get("priced_models") or parsed.get("models") or []) if isinstance(parsed, dict) else []
-              ids = []
+                  raise SystemExit(f"FAIL: Tabitoken catalog returned malformed JSON: {exc.msg}")
 
-              def append_candidate(value):
-                  if not isinstance(value, str):
-                      return
-                  value = value.strip()
-                  if not value or len(value) > 256 or "\n" in value or "\r" in value or value in ids:
-                      return
-                  ids.append(value)
+              catalogs = []
+              if isinstance(parsed, dict):
+                  for catalog_key in ("data", "priced_model_details", "priced_models", "models"):
+                      if catalog_key in parsed:
+                          catalogs.append((catalog_key, parsed[catalog_key]))
+              elif isinstance(parsed, list):
+                  catalogs.append(("root", parsed))
 
-              def extract_candidates(node, allow_scalar=True):
-                  if isinstance(node, str):
-                      if allow_scalar:
-                          append_candidate(node)
-                      return
-                  if isinstance(node, list):
-                      for child in node:
-                          extract_candidates(child, True)
-                      return
-                  if not isinstance(node, dict):
-                      return
-                  matched = False
-                  for key in preferred_keys:
-                      if key not in node:
-                          continue
-                      matched = True
-                      child = node[key]
-                      if isinstance(child, str):
-                          append_candidate(child)
-                      else:
-                          extract_candidates(child, True)
-                  if matched:
-                      return
-                  model_markers = ("claude", "opus", "sonnet", "haiku", "gpt", "gemini", "deepseek", "glm", "kimi", "qwen", "grok", "minimax", "step")
-                  for key, child in node.items():
-                      if isinstance(child, (dict, list)) and any(marker in key.lower() for marker in model_markers):
-                          append_candidate(key)
-                  for child in node.values():
-                      if isinstance(child, (dict, list)):
-                          extract_candidates(child, False)
+              first_catalog = catalogs[0][1] if catalogs else []
+              for catalog_key, catalog in catalogs:
+                  ids = []
 
-              extract_candidates(catalog)
-              return ids, catalog
+                  def append_candidate(value):
+                      if not isinstance(value, str):
+                          return
+                      value = value.strip()
+                      if not value or len(value) > 256 or "\n" in value or "\r" in value or value in ids:
+                          return
+                      ids.append(value)
+
+                  def extract_candidates(node, allow_scalar=True):
+                      if isinstance(node, str):
+                          if allow_scalar:
+                              append_candidate(node)
+                          return
+                      if isinstance(node, list):
+                          for child in node:
+                              extract_candidates(child, True)
+                          return
+                      if not isinstance(node, dict):
+                          return
+                      matched = False
+                      for key in preferred_keys:
+                          if key not in node:
+                              continue
+                          matched = True
+                          child = node[key]
+                          if isinstance(child, str):
+                              append_candidate(child)
+                          else:
+                              extract_candidates(child, True)
+                      if matched:
+                          return
+                      model_markers = ("claude", "opus", "sonnet", "haiku", "gpt", "gemini", "deepseek", "glm", "kimi", "qwen", "grok", "minimax", "step")
+                      for key, child in node.items():
+                          if isinstance(child, (dict, list)) and any(marker in key.lower() for marker in model_markers):
+                              append_candidate(key)
+                      for child in node.values():
+                          if isinstance(child, (dict, list)):
+                              extract_candidates(child, False)
+
+                  extract_candidates(catalog)
+                  if ids:
+                      print(f"TABITOKEN_CATALOG_FIELD={catalog_key}")
+                      return ids, catalog
+              return [], first_catalog
 
           pricing_ids = []
           pricing_status, pricing_body = request(
@@ -298,7 +311,7 @@ jobs:
                   ids = list(pricing_ids)
                   catalog_auth_mode = "public-pricing"
               else:
-                  for models_auth_mode in ("both", "bearer", "x-api-key"):
+                  for models_auth_mode in ("both",):
                       models_status, models_body = request(
                           f"models-key{key_index}-{models_auth_mode}",
                           "GET",
