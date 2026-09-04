@@ -21,7 +21,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.core
         PRODUCT_NAME: CloudCodeCore
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 21
+        CURRENT_PROJECT_VERSION: 22
         VERSIONING_SYSTEM: apple-generic
         DEFINES_MODULE: YES
         GENERATE_INFOPLIST_FILE: YES
@@ -41,7 +41,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios
         PRODUCT_NAME: CloudCode
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 21
+        CURRENT_PROJECT_VERSION: 22
         VERSIONING_SYSTEM: apple-generic
         SWIFT_VERSION: 5.9
         SWIFT_OBJC_BRIDGING_HEADER: Sources/CloudCodeApp/RootHelperBridge.h
@@ -90,6 +90,7 @@ targets:
     scheme:
       testTargets:
         - CloudCodeIOSTests
+        - CloudCodeIOSUITests
   CloudCodeIOSTests:
     type: bundle.unit-test
     platform: iOS
@@ -103,3 +104,16 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.tests
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_VERSION: 5.9
+  CloudCodeIOSUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - Tests/CloudCodeUITests
+    dependencies:
+      - target: CloudCodeIOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: 5.9
+        TEST_TARGET_NAME: CloudCodeIOS

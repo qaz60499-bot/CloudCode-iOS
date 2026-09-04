@@ -95,9 +95,29 @@ jobs:
           }
 
           verify_stable_launch 'cold-launch'
-          verify_stable_launch 'relaunch'
+          for iteration in 1 2 3 4 5; do
+            verify_stable_launch "relaunch-$iteration"
+          done
           xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true
-          echo 'PASS: Cloud Code Release cold launch and relaunch both remained alive and reached bootstrap.completed'
+          echo 'PASS: Cloud Code Release cold launch plus five relaunches remained alive and reached bootstrap.completed'
+
+      - name: Run iOS settings/provider UI regression smoke
+        run: |
+          set -euo pipefail
+          UDID="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ { print $2; exit }')"
+          test -n "$UDID"
+          xcrun simctl boot "$UDID" >/dev/null 2>&1 || true
+          python3 -c 'import subprocess,sys; subprocess.run(["xcrun","simctl","bootstatus",sys.argv[1],"-b"], check=True, timeout=180)' "$UDID"
+          xcodebuild \
+            -project CloudCodeIOS.xcodeproj \
+            -scheme CloudCodeIOS \
+            -configuration Release \
+            -destination "platform=iOS Simulator,id=$UDID" \
+            -derivedDataPath build/UITestDerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            test \
+            -only-testing:CloudCodeIOSUITests
+          xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true
 
       - name: Build unsigned device app
         run: |
@@ -312,6 +332,10 @@ jobs:
               raise SystemExit('FAIL: diagnostics view reintroduced continuous full-refresh polling')
           if '复制闪退线索' not in content or 'crashRecoveryDiagnosticText' not in app:
               raise SystemExit('FAIL: lightweight crash-recovery diagnostics path is missing')
+          ui_smoke = Path('Tests/CloudCodeUITests/CloudCodeLaunchUITests.swift').read_text(encoding='utf-8')
+          for marker in ('testSettingsAndProviderControlsRemainReachableAfterColdLaunch', 'testRepeatedRelaunchKeepsRootNavigationUsable', '替换当前选择的 Key', '添加自定义厂商', '诊断日志'):
+              if marker not in ui_smoke:
+                  raise SystemExit(f'FAIL: settings/provider UI smoke coverage missing marker: {marker}')
           print('PASS: startup-safe, provider-compatibility, hardened key replacement, diagnostics and settings-navigation guardrails are present')
           PY
           grep -F 'backgroundContinuationWindow: TimeInterval = 90 * 60' Sources/CloudCodeApp/AppEnvironment.swift >/dev/null
