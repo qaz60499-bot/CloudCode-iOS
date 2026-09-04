@@ -546,25 +546,50 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
 public final class ApprovalCenter: ObservableObject, ApprovalRequesting, @unchecked Sendable {
     @Published public private(set) var pending: ApprovalPreview?
     private var continuation: CheckedContinuation<Bool, Never>?
+    private var continuationID: UUID?
 
     public init() {}
 
     public func requestApproval(_ preview: ApprovalPreview) async -> Bool {
         if continuation != nil { return false }
+        let requestID = UUID()
         pending = preview
-        return await withCheckedContinuation { continuation = $0 }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    pending = nil
+                    continuation.resume(returning: false)
+                    return
+                }
+                self.continuation = continuation
+                continuationID = requestID
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.cancelPendingApproval(requestID: requestID)
+            }
+        }
     }
 
     public func approve() {
-        pending = nil
-        continuation?.resume(returning: true)
-        continuation = nil
+        finishPendingApproval(returning: true)
     }
 
     public func deny() {
-        pending = nil
-        continuation?.resume(returning: false)
+        finishPendingApproval(returning: false)
+    }
+
+    private func cancelPendingApproval(requestID: UUID) {
+        guard continuationID == requestID else { return }
+        finishPendingApproval(returning: false)
+    }
+
+    private func finishPendingApproval(returning value: Bool) {
+        let pendingContinuation = continuation
         continuation = nil
+        continuationID = nil
+        pending = nil
+        pendingContinuation?.resume(returning: value)
     }
 }
 

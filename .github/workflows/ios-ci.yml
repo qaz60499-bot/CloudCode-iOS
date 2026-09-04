@@ -265,6 +265,10 @@ jobs:
           bridge = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
           if 'CLOUDCODE_HELPER_CAPTURE_LIMIT (1024 * 1024)' not in bridge or 'WIFSIGNALED(status)' not in bridge:
               raise SystemExit('FAIL: root helper bridge lost bounded output capture or signal isolation')
+          approval = adapters.split('public final class ApprovalCenter', 1)[1].split('public struct IOSSystemExecutor', 1)[0]
+          for marker in ('withTaskCancellationHandler', 'continuationID', 'cancelPendingApproval(requestID:', 'finishPendingApproval(returning:'):
+              if marker not in approval:
+                  raise SystemExit(f'FAIL: approval cancellation-safety marker missing: {marker}')
 
           app_entry = Path('Sources/CloudCodeApp/CloudCodeIOSApp.swift').read_text(encoding='utf-8')
           for marker in ('app.main.enter', 'firstScene.rendered'):
