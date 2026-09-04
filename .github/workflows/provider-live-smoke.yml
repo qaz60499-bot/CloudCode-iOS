@@ -163,7 +163,10 @@ jobs:
           provider = next((p for p in bootstrap.get("providers", []) if p.get("providerID") == "tabitoken"), None)
           if not provider or not provider.get("keys"):
               raise SystemExit("FAIL: Tabitoken key missing from private bootstrap")
-          secret = provider["keys"][0]["secret"]
+          provider_secrets = [entry.get("secret", "").strip() for entry in provider["keys"] if isinstance(entry, dict) and entry.get("secret", "").strip()]
+          if not provider_secrets:
+              raise SystemExit("FAIL: Tabitoken bootstrap contains no non-empty keys")
+          secret = provider_secrets[0]
           base = "https://tabitoken.com/v1"
 
           def request(label, method, path, payload=None, extra_headers=None, expected=200, allow_billing_block=False, fail_on_mismatch=True, auth_mode="both"):
@@ -262,68 +265,84 @@ jobs:
               extract_candidates(catalog)
               return ids, catalog
 
-          ids = []
-          catalog = []
-          catalog_auth_mode = None
-          catalog_statuses = {}
-          for models_auth_mode in ("both", "bearer", "x-api-key"):
-              models_status, models_body = request(
-                  f"models-{models_auth_mode}",
-                  "GET",
-                  "/models",
-                  fail_on_mismatch=False,
-                  auth_mode=models_auth_mode,
-              )
-              catalog_statuses[models_auth_mode] = models_status
-              if models_status in (401, 403):
-                  continue
-              if models_status != 200:
-                  raise SystemExit(f"FAIL: Tabitoken /models returned HTTP {models_status} for auth={models_auth_mode}")
-              ids, catalog = parse_model_catalog(models_body)
-              if ids:
-                  catalog_auth_mode = models_auth_mode
-                  break
-          if not ids:
-              top_type = type(catalog).__name__
-              item_type = type(catalog[0]).__name__ if isinstance(catalog, list) and catalog else "none"
-              item_keys = sorted(catalog[0].keys()) if isinstance(catalog, list) and catalog and isinstance(catalog[0], dict) else []
-              raise SystemExit(f"FAIL: Tabitoken /models has no non-empty model catalog across supported auth modes (statuses={catalog_statuses}, catalog_type={top_type}, first_item_type={item_type}, first_item_keys={item_keys})")
-          print(f"TABITOKEN_CATALOG_AUTH={catalog_auth_mode}")
-          named_claude = [model for model in ids if "claude" in model.lower()]
-          other_models = [model for model in ids if model not in named_claude]
-          anthropic_candidates = named_claude + other_models
-          print(f"TABITOKEN_MODEL_CANDIDATE_COUNT={len(anthropic_candidates)}")
-
           selected_model = None
           base_anthropic = None
-          for candidate in anthropic_candidates[:32]:
-              probe_payload = {
-                  "model": candidate,
-                  "max_tokens": 1,
-                  "stream": False,
-                  "messages": [{"role": "user", "content": "Reply OK"}],
-              }
-              probe_status, probe_body = request(
-                  "anthropic-model-candidate",
-                  "POST",
-                  "/messages",
-                  probe_payload,
-                  {"anthropic-version": "2023-06-01"},
-                  allow_billing_block=True,
-                  fail_on_mismatch=False,
-              )
-              enter_billing_fallback("anthropic-model-candidate", probe_status, probe_body)
-              if 200 <= probe_status < 300:
-                  selected_model = candidate
-                  base_anthropic = probe_payload
+          anthropic_candidates = []
+          selected_key_index = None
+          catalog_attempts = []
+
+          for key_index, candidate_secret in enumerate(provider_secrets, start=1):
+              secret = candidate_secret
+              ids = []
+              catalog = []
+              catalog_auth_mode = None
+              catalog_statuses = {}
+              for models_auth_mode in ("both", "bearer", "x-api-key"):
+                  models_status, models_body = request(
+                      f"models-key{key_index}-{models_auth_mode}",
+                      "GET",
+                      "/models",
+                      fail_on_mismatch=False,
+                      auth_mode=models_auth_mode,
+                  )
+                  catalog_statuses[models_auth_mode] = models_status
+                  if models_status in (401, 403):
+                      continue
+                  if models_status != 200:
+                      raise SystemExit(f"FAIL: Tabitoken /models returned HTTP {models_status} for key={key_index} auth={models_auth_mode}")
+                  ids, catalog = parse_model_catalog(models_body)
+                  if ids:
+                      catalog_auth_mode = models_auth_mode
+                      break
+
+              catalog_attempts.append({"key": key_index, "statuses": catalog_statuses, "modelCount": len(ids)})
+              if not ids:
+                  continue
+
+              print(f"TABITOKEN_CATALOG_AUTH key={key_index} auth={catalog_auth_mode} model_count={len(ids)}")
+              named_claude = [model for model in ids if "claude" in model.lower()]
+              other_models = [model for model in ids if model not in named_claude]
+              anthropic_candidates = named_claude + other_models
+              print(f"TABITOKEN_MODEL_CANDIDATE_COUNT key={key_index} count={len(anthropic_candidates)}")
+
+              inference_auth_rejected = False
+              for candidate in anthropic_candidates[:32]:
+                  probe_payload = {
+                      "model": candidate,
+                      "max_tokens": 1,
+                      "stream": False,
+                      "messages": [{"role": "user", "content": "Reply OK"}],
+                  }
+                  probe_status, probe_body = request(
+                      f"anthropic-model-candidate-key{key_index}",
+                      "POST",
+                      "/messages",
+                      probe_payload,
+                      {"anthropic-version": "2023-06-01"},
+                      allow_billing_block=True,
+                      fail_on_mismatch=False,
+                  )
+                  enter_billing_fallback(f"anthropic-model-candidate-key{key_index}", probe_status, probe_body)
+                  if 200 <= probe_status < 300:
+                      selected_model = candidate
+                      base_anthropic = probe_payload
+                      selected_key_index = key_index
+                      break
+                  if probe_status in (401, 403):
+                      inference_auth_rejected = True
+                      print(f"::warning::Tabitoken key {key_index} catalog was readable but inference auth returned HTTP {probe_status}; trying the next configured key.")
+                      break
+                  if probe_status not in (400, 404, 422):
+                      raise SystemExit(f"FAIL: Tabitoken candidate probe returned non-model HTTP {probe_status} for key={key_index}")
+
+              if selected_model is not None:
                   break
-              if probe_status in (401, 403):
-                  raise SystemExit(f"FAIL: Tabitoken inference authentication rejected current bootstrap key with HTTP {probe_status}")
-              if probe_status not in (400, 404, 422):
-                  raise SystemExit(f"FAIL: Tabitoken candidate probe returned non-model HTTP {probe_status}")
-          if not selected_model or base_anthropic is None:
-              raise SystemExit("FAIL: no current Tabitoken Claude model accepted Anthropic /v1/messages")
-          print("TABITOKEN_DYNAMIC_ANTHROPIC_MODEL_VALIDATED=true")
+              if inference_auth_rejected:
+                  continue
+
+          if not selected_model or base_anthropic is None or selected_key_index is None:
+              raise SystemExit(f"FAIL: no configured Tabitoken key exposed a non-empty catalog plus a working Anthropic model; catalog_attempts={catalog_attempts}")
+          print(f"TABITOKEN_DYNAMIC_ANTHROPIC_MODEL_VALIDATED=true key={selected_key_index}")
 
           with_tool = dict(base_anthropic)
           with_tool["tools"] = [{
