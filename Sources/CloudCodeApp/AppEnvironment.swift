@@ -417,6 +417,7 @@ public final class CloudCodeViewModel: ObservableObject {
             let value = try await keyVault.key(for: reference)
             guard !value.isEmpty else { throw ProviderError.missingAPIKey }
             installedKeyReferences.insert(reference)
+            await refreshLiveProviderMetadataIfNeeded(providerID: provider.id, keySlotID: selectedKeySlotID, apiKey: value)
             lastError = nil
             recordStartupBreadcrumb("provider.key.explicit-check.end")
             return true
@@ -493,6 +494,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 }
             }
 
+            await refreshLiveProviderMetadataIfNeeded(providerID: providerID, keySlotID: keySlotID, apiKey: normalizedSecret)
             providerEndpointHealth.removeValue(forKey: providerID)
             providerFailureSessionIDs.remove(session.id)
             retryableProviderFailureSessionIDs.remove(session.id)
@@ -1578,6 +1580,47 @@ public final class CloudCodeViewModel: ObservableObject {
         }
     }
 
+    private func refreshLiveProviderMetadataIfNeeded(providerID: String, keySlotID: String, apiKey: String) async {
+        guard providerID == ProviderCatalog.tabitokenID,
+              let providerIndex = providerProfiles.firstIndex(where: { $0.id == providerID }),
+              !keySlotID.isEmpty,
+              !apiKey.isEmpty else { return }
+        let baseURL = providerProfiles[providerIndex].baseURL
+        let preferredAuthMode = providerProfiles[providerIndex].authMode
+        do {
+            let discovery = try await ProviderDiscoveryClient().discover(
+                baseURL: baseURL,
+                apiKey: apiKey,
+                preferredAuthMode: preferredAuthMode
+            )
+            guard !discovery.models.isEmpty else { return }
+            providerProfiles[providerIndex].applyDiscovery(discovery, keySlotID: keySlotID)
+            let reconciled = ProviderSelectionResolver.reconcile(
+                ProviderSelectionState(providerID: selectedProviderID, keySlotID: selectedKeySlotID, model: selectedModel),
+                profiles: providerProfiles
+            )
+            applySelection(reconciled)
+            activityLines.append("Tabitoken 已按当前 Key 刷新可用模型：\(discovery.models.count) 个。")
+            try? await diagnosticLogStore.log(
+                level: .info,
+                subsystem: "provider-discovery",
+                action: "refresh",
+                result: "updated",
+                metadata: ["providerID": providerID, "keySlotID": keySlotID, "modelCount": String(discovery.models.count)]
+            )
+        } catch {
+            try? await diagnosticLogStore.log(
+                level: .warning,
+                subsystem: "provider-discovery",
+                action: "refresh",
+                result: "failed",
+                error: error,
+                metadata: ["providerID": providerID, "keySlotID": keySlotID]
+            )
+            activityLines.append("Tabitoken 当前模型目录刷新失败；Key 已保留，可稍后重新检查当前 Key。")
+        }
+    }
+
     private func keySlotID(for configuration: ProviderConfiguration) -> String? {
         guard let providerID = configuration.providerID,
               let provider = providerProfiles.first(where: { $0.id == providerID }) else { return nil }
@@ -1660,7 +1703,7 @@ public final class CloudCodeViewModel: ObservableObject {
         guard payload.schemaVersion == 1 else { throw CocoaError(.fileReadCorruptFile) }
 
         let manualOverrides = manualProviderKeyOverrides()
-        var pending: [(reference: String, secret: String)] = []
+        var pending: [(providerID: String, keySlotID: String, reference: String, secret: String)] = []
         var plannedReferences = Set<String>()
         for providerKeys in payload.providers {
             guard let profile = providerProfiles.first(where: { $0.id == providerKeys.providerID && $0.enabled }) else { continue }
@@ -1671,7 +1714,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 let reference = ProviderCatalog.keyReference(providerID: profile.id, keySlotID: slot.id)
                 guard plannedReferences.insert(reference).inserted else { throw CocoaError(.fileReadCorruptFile) }
                 if manualOverridePolicy == .preserveManual && manualOverrides.contains(reference) { continue }
-                pending.append((reference, key.secret))
+                pending.append((profile.id, slot.id, reference, key.secret))
             }
         }
         guard !pending.isEmpty else {
@@ -1715,6 +1758,13 @@ public final class CloudCodeViewModel: ObservableObject {
         }
         let skippedForFingerprint = manualOverridePolicy == .preserveManual ? manualOverrides : []
         try applyProviderBootstrapFingerprints(payload, status: .needsValidation, skippingReferences: skippedForFingerprint)
+        if let tabitoken = pending.first(where: { $0.providerID == ProviderCatalog.tabitokenID }) {
+            await refreshLiveProviderMetadataIfNeeded(
+                providerID: tabitoken.providerID,
+                keySlotID: tabitoken.keySlotID,
+                apiKey: tabitoken.secret
+            )
+        }
         return importedCount
     }
 

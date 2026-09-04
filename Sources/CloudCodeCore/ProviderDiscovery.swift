@@ -24,11 +24,20 @@ public struct ProviderDiscoveryClient: Sendable {
         self.session = session
     }
 
-    public func discover(baseURL: URL, apiKey: String) async throws -> ProviderDiscoveryResult {
+    public func discover(
+        baseURL: URL,
+        apiKey: String,
+        preferredAuthMode: ProviderAuthMode? = nil
+    ) async throws -> ProviderDiscoveryResult {
         var firstCatalog: (models: [String], authMode: ProviderAuthMode)?
         var lastError: Error = ProviderError.missingAPIKey
+        var authModes = [ProviderAuthMode.bearer, .xAPIKey, .both]
+        if let preferredAuthMode {
+            authModes.removeAll { $0.rawValue == preferredAuthMode.rawValue }
+            authModes.insert(preferredAuthMode, at: 0)
+        }
 
-        for authMode in [ProviderAuthMode.bearer, .xAPIKey, .both] {
+        for authMode in authModes {
             let models: [String]
             do {
                 models = try await discoverModels(baseURL: baseURL, apiKey: apiKey, authMode: authMode)
@@ -37,21 +46,28 @@ public struct ProviderDiscoveryClient: Sendable {
                 continue
             }
             if firstCatalog == nil { firstCatalog = (models, authMode) }
-            guard let model = models.first else { continue }
+            guard !models.isEmpty else { continue }
 
-            var supported: [ProviderProtocol] = []
-            for protocolName in ProviderProtocol.allCases {
-                if try await probe(protocolName, baseURL: baseURL, apiKey: apiKey, authMode: authMode, model: model) {
-                    supported.append(protocolName)
+            // Model catalogs from compatible gateways can mix chat, image, embedding,
+            // and legacy entries. Do not assume the first row is inference-compatible.
+            // Probe a bounded prefix and move the first working model to the front so
+            // selection defaults to a model that was actually accepted by the gateway.
+            for model in models.prefix(12) {
+                var supported: [ProviderProtocol] = []
+                for protocolName in ProviderProtocol.allCases {
+                    if try await probe(protocolName, baseURL: baseURL, apiKey: apiKey, authMode: authMode, model: model) {
+                        supported.append(protocolName)
+                    }
                 }
-            }
-            if !supported.isEmpty {
-                return ProviderDiscoveryResult(
-                    models: models,
-                    protocols: supported,
-                    authMode: authMode,
-                    readiness: .ready
-                )
+                if !supported.isEmpty {
+                    let orderedModels = [model] + models.filter { $0 != model }
+                    return ProviderDiscoveryResult(
+                        models: orderedModels,
+                        protocols: supported,
+                        authMode: authMode,
+                        readiness: .ready
+                    )
+                }
             }
         }
 

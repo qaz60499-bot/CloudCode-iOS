@@ -499,12 +499,41 @@ final class ProviderDiscoveryTests: XCTestCase {
 
         let result = try await ProviderDiscoveryClient(session: session).discover(
             baseURL: URL(string: "https://custom.example")!,
-            apiKey: "test-secret"
+            apiKey: "test-secret",
+            preferredAuthMode: .both
         )
         XCTAssertEqual(result.models, ["model-a"])
         XCTAssertEqual(result.authMode, .both)
         XCTAssertEqual(result.protocols, [.anthropic])
         XCTAssertEqual(result.readiness, .ready)
+    }
+
+    func testProviderProfileAppliesLiveDiscoveryAndDropsStaleModelMetadata() throws {
+        var profile = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.tabitokenID }))
+        let discovery = ProviderDiscoveryResult(
+            models: ["live-model-a", "live-model-b", "live-model-a"],
+            protocols: [.anthropic],
+            authMode: .both,
+            readiness: .ready
+        )
+
+        profile.applyDiscovery(discovery, keySlotID: "slot-1")
+
+        XCTAssertEqual(profile.models, ["live-model-a", "live-model-b"])
+        XCTAssertEqual(profile.models(for: "slot-1"), ["live-model-a", "live-model-b"])
+        XCTAssertEqual(profile.models(for: "slot-2"), ["live-model-a", "live-model-b"])
+        XCTAssertEqual(profile.protocols, [.anthropic])
+        XCTAssertEqual(profile.authMode, .both)
+        XCTAssertEqual(profile.readiness, .ready)
+        XCTAssertTrue(profile.keySlots.first(where: { $0.id == "slot-1" })?.modelProtocols.isEmpty == true)
+
+        let reconciled = ProviderSelectionResolver.reconcile(
+            ProviderSelectionState(providerID: profile.id, keySlotID: "slot-3", model: "claude-opus-5"),
+            profiles: [profile]
+        )
+        XCTAssertEqual(reconciled.providerID, profile.id)
+        XCTAssertEqual(reconciled.keySlotID, "slot-3")
+        XCTAssertEqual(reconciled.model, "live-model-a")
     }
 }
 
@@ -948,7 +977,7 @@ final class ProviderLiveIntegrationTests: XCTestCase {
             authModeName: ProviderAuthMode.both.rawValue
         )
 
-        var sawCapabilityTool = false
+        var capabilityToolCallCount = 0
         var sawSuccessfulToolResult = false
         var assistantText = ""
         let stream = await agent.send(
@@ -959,7 +988,7 @@ final class ProviderLiveIntegrationTests: XCTestCase {
         for try await event in stream {
             switch event {
             case .toolStarted(let name, _):
-                if name == "capability.probe" { sawCapabilityTool = true }
+                if name == "capability.probe" { capabilityToolCallCount += 1 }
             case .toolFinished(let result):
                 if result.success { sawSuccessfulToolResult = true }
             case .token(let token):
@@ -969,7 +998,7 @@ final class ProviderLiveIntegrationTests: XCTestCase {
             }
         }
 
-        XCTAssertTrue(sawCapabilityTool, "Justwoker live model did not call the mapped capability_probe tool")
+        XCTAssertEqual(capabilityToolCallCount, 1, "Justwoker live model must execute capability_probe exactly once")
         XCTAssertTrue(sawSuccessfulToolResult, "Justwoker live tool result was not produced")
         XCTAssertTrue(assistantText.contains("JUSTWOKER_TOOL_ROUND_OK"), "Justwoker live model did not continue after the tool result")
         let saved = try await sessions.load(session.id)
@@ -991,7 +1020,9 @@ final class ProviderLiveIntegrationTests: XCTestCase {
         let payload = try ProviderBootstrapPayload.decodeBootstrap(from: bootstrapData)
         let tabitoken = try XCTUnwrap(payload.providers.first(where: { $0.providerID == ProviderCatalog.tabitokenID }))
         let key = try XCTUnwrap(tabitoken.keys.first?.secret)
+        let liveModel = ProcessInfo.processInfo.environment["CLOUDCODE_TABITOKEN_LIVE_MODEL"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         XCTAssertFalse(key.isEmpty)
+        XCTAssertFalse(liveModel.isEmpty, "CLOUDCODE_TABITOKEN_LIVE_MODEL must come from the workflow's validated /v1/models probe")
 
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeLiveSmoke-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1018,14 +1049,14 @@ final class ProviderLiveIntegrationTests: XCTestCase {
         let configuration = ProviderConfiguration(
             name: "Tabitoken",
             baseURL: URL(string: "https://tabitoken.com")!,
-            model: "claude-opus-5",
+            model: liveModel,
             apiKeyReference: "live-tabitoken",
             providerID: ProviderCatalog.tabitokenID,
             protocolName: ProviderProtocol.anthropic.rawValue,
             authModeName: ProviderAuthMode.both.rawValue
         )
 
-        var sawCapabilityTool = false
+        var capabilityToolCallCount = 0
         var sawSuccessfulToolResult = false
         var assistantText = ""
         let stream = await agent.send(
@@ -1036,7 +1067,7 @@ final class ProviderLiveIntegrationTests: XCTestCase {
         for try await event in stream {
             switch event {
             case .toolStarted(let name, _):
-                if name == "capability.probe" { sawCapabilityTool = true }
+                if name == "capability.probe" { capabilityToolCallCount += 1 }
             case .toolFinished(let result):
                 if result.success { sawSuccessfulToolResult = true }
             case .token(let token):
@@ -1046,7 +1077,7 @@ final class ProviderLiveIntegrationTests: XCTestCase {
             }
         }
 
-        XCTAssertTrue(sawCapabilityTool, "Live model did not call the mapped capability_probe tool")
+        XCTAssertEqual(capabilityToolCallCount, 1, "Live Tabitoken model must execute capability_probe exactly once")
         XCTAssertTrue(sawSuccessfulToolResult, "Live tool result was not produced")
         XCTAssertTrue(assistantText.contains("LIVE_TOOL_ROUND_OK"), "Live model did not continue after tool result")
         let saved = try await sessions.load(session.id)

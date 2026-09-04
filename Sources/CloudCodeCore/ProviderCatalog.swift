@@ -201,6 +201,32 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
         }
     }
 
+    public mutating func applyDiscovery(_ discovery: ProviderDiscoveryResult, keySlotID: String) {
+        let discoveredModels = Self.unique(discovery.models)
+        guard !discoveredModels.isEmpty else { return }
+
+        let previousProviderModels = models
+        models = discoveredModels
+        authMode = discovery.authMode
+        readiness = discovery.readiness
+        if !discovery.protocols.isEmpty {
+            protocols = discovery.protocols
+            if !protocols.contains(preferredProtocol), let first = protocols.first {
+                preferredProtocol = first
+            }
+        }
+
+        for slotIndex in keySlots.indices {
+            let sharesProviderCatalog = keySlots[slotIndex].models == previousProviderModels
+            guard keySlots[slotIndex].id == keySlotID || sharesProviderCatalog else { continue }
+            keySlots[slotIndex].models = discoveredModels
+            if !discovery.protocols.isEmpty {
+                keySlots[slotIndex].protocols = discovery.protocols
+            }
+            keySlots[slotIndex].modelProtocols = keySlots[slotIndex].modelProtocols.filter { discoveredModels.contains($0.key) }
+        }
+    }
+
     private static func unique(_ values: [String]) -> [String] {
         var seen = Set<String>()
         return values.filter { !$0.isEmpty && seen.insert($0).inserted }
