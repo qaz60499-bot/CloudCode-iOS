@@ -29,7 +29,6 @@ public struct ProviderDiscoveryClient: Sendable {
         apiKey: String,
         preferredAuthMode: ProviderAuthMode? = nil
     ) async throws -> ProviderDiscoveryResult {
-        var firstCatalog: (models: [String], authMode: ProviderAuthMode)?
         var lastError: Error = ProviderError.missingAPIKey
         var authModes = [ProviderAuthMode.bearer, .xAPIKey, .both]
         if let preferredAuthMode {
@@ -37,25 +36,35 @@ public struct ProviderDiscoveryClient: Sendable {
             authModes.insert(preferredAuthMode, at: 0)
         }
 
-        for authMode in authModes {
-            let models: [String]
+        // Catalog auth and inference auth are deliberately independent. Some compatible
+        // gateways expose /models with one header mode while requiring a different mode
+        // for /messages. Never downgrade inference auth just because catalog discovery
+        // succeeded with a weaker/different header shape.
+        var discoveredCatalog: (models: [String], authMode: ProviderAuthMode)?
+        for catalogAuthMode in authModes {
             do {
-                models = try await discoverModels(baseURL: baseURL, apiKey: apiKey, authMode: authMode)
+                let models = try await discoverModels(baseURL: baseURL, apiKey: apiKey, authMode: catalogAuthMode)
+                if !models.isEmpty {
+                    discoveredCatalog = (models, catalogAuthMode)
+                    break
+                }
             } catch {
                 lastError = error
-                continue
             }
-            if firstCatalog == nil { firstCatalog = (models, authMode) }
-            guard !models.isEmpty else { continue }
+        }
 
-            // Model catalogs from compatible gateways can mix chat, image, embedding,
-            // and legacy entries. Do not assume the first row is inference-compatible.
-            // Probe a bounded prefix and move the first working model to the front so
-            // selection defaults to a model that was actually accepted by the gateway.
+        guard let discoveredCatalog else { throw lastError }
+        let models = discoveredCatalog.models
+
+        // Model catalogs from compatible gateways can mix chat, image, embedding,
+        // and legacy entries. Do not assume the first row is inference-compatible.
+        // Probe a bounded prefix under each inference auth mode, keeping the provider's
+        // existing auth mode first when supplied by the caller.
+        for inferenceAuthMode in authModes {
             for model in models.prefix(12) {
                 var supported: [ProviderProtocol] = []
                 for protocolName in ProviderProtocol.allCases {
-                    if try await probe(protocolName, baseURL: baseURL, apiKey: apiKey, authMode: authMode, model: model) {
+                    if try await probe(protocolName, baseURL: baseURL, apiKey: apiKey, authMode: inferenceAuthMode, model: model) {
                         supported.append(protocolName)
                     }
                 }
@@ -64,22 +73,19 @@ public struct ProviderDiscoveryClient: Sendable {
                     return ProviderDiscoveryResult(
                         models: orderedModels,
                         protocols: supported,
-                        authMode: authMode,
+                        authMode: inferenceAuthMode,
                         readiness: .ready
                     )
                 }
             }
         }
 
-        if let firstCatalog {
-            return ProviderDiscoveryResult(
-                models: firstCatalog.models,
-                protocols: [],
-                authMode: firstCatalog.authMode,
-                readiness: .needsValidation
-            )
-        }
-        throw lastError
+        return ProviderDiscoveryResult(
+            models: models,
+            protocols: [],
+            authMode: preferredAuthMode ?? discoveredCatalog.authMode,
+            readiness: .needsValidation
+        )
     }
 
     public func discoverModels(baseURL: URL, apiKey: String, authMode: ProviderAuthMode = .bearer) async throws -> [String] {

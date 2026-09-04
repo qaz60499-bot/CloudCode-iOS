@@ -1410,9 +1410,12 @@ private final class ProviderDiscoveryURLProtocol: URLProtocol, @unchecked Sendab
         let hasXAPIKey = request.value(forHTTPHeaderField: "x-api-key") == "test-secret"
         let status: Int
         let body: Data
-        if path.hasSuffix("/v1/models") {
+        if path.hasSuffix("/v1/models"), hasBearer, !hasXAPIKey {
             status = 200
             body = Data("{\"data\":[{\"provider_record\":{\"model_id\":\"model-a\"}}]}".utf8)
+        } else if path.hasSuffix("/v1/models") {
+            status = 200
+            body = Data("{\"data\":[]}".utf8)
         } else if path.hasSuffix("/v1/messages"), hasBearer, hasXAPIKey {
             status = 200
             body = Data("{\"content\":[{\"type\":\"text\",\"text\":\"OK\"}]}".utf8)
