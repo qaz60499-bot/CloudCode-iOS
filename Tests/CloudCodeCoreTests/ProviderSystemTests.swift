@@ -48,7 +48,7 @@ final class ProviderCatalogTests: XCTestCase {
     func testAgentRouterUsesCurrentOriginAndExplicitPerModelProtocols() throws {
         let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-agentrouter-org" }))
         XCTAssertEqual(provider.baseURL.absoluteString, "https://co.agentrouter.org")
-        XCTAssertEqual(provider.authMode, .bearer)
+        XCTAssertEqual(provider.authMode, .both)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-4-8", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-5", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.protocolFor(model: "deepseek-v4-flash", keySlotID: "slot-1"), .openAIChat)
@@ -515,7 +515,79 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-version"), "2023-06-01")
     }
 
-    func testAgentRouterDeepSeekUsesOpenAIChatCurrentOriginAndBearerAuth() async throws {
+    func testAnthropicAcceptsNonSSEFullJSONResponseFromCompatibleProxy() async throws {
+        let body = Data("""
+        {"id":"msg-proxy","type":"message","role":"assistant","content":[{"type":"text","text":"proxy-ok"}],"stop_reason":"end_turn"}
+        """.utf8)
+        ProviderTestURLProtocol.install(status: 200, body: body, headers: ["Content-Type": "application/json"])
+        let client = AnthropicProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let configuration = ProviderConfiguration(
+            name: "proxy",
+            baseURL: URL(string: "https://proxy.example")!,
+            model: "claude-test",
+            apiKeyReference: "key",
+            protocolName: ProviderProtocol.anthropic.rawValue,
+            authModeName: ProviderAuthMode.bearer.rawValue
+        )
+        var events: [ProviderEvent] = []
+        for try await event in client.stream(configuration: configuration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {
+            events.append(event)
+        }
+        XCTAssertTrue(events.contains(.token("proxy-ok")))
+        XCTAssertEqual(events.last, .finished)
+    }
+
+    func testAnthropicAcceptsMessageDeltaTerminalWithoutMessageStop() async throws {
+        let body = Data("""
+        data: {"type":"message_start","message":{"id":"m1"}}
+
+        data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}
+
+        data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+
+        """.utf8)
+        ProviderTestURLProtocol.install(status: 200, body: body, headers: ["Content-Type": "text/event-stream"])
+        let client = AnthropicProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let configuration = ProviderConfiguration(name: "proxy", baseURL: URL(string: "https://proxy.example")!, model: "m", apiKeyReference: "key", protocolName: ProviderProtocol.anthropic.rawValue)
+        var events: [ProviderEvent] = []
+        for try await event in client.stream(configuration: configuration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {
+            events.append(event)
+        }
+        XCTAssertTrue(events.contains(.token("ok")))
+        XCTAssertEqual(events.last, .finished)
+    }
+
+    func testOpenAIChatAcceptsNonSSEFullJSONResponseFromCompatibleProxy() async throws {
+        let body = Data("""
+        {"id":"chatcmpl-proxy","choices":[{"index":0,"message":{"role":"assistant","content":"chat-ok"},"finish_reason":"stop"}]}
+        """.utf8)
+        ProviderTestURLProtocol.install(status: 200, body: body, headers: ["Content-Type": "application/json"])
+        let client = OpenAICompatibleProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let configuration = ProviderConfiguration(name: "proxy", baseURL: URL(string: "https://proxy.example")!, model: "m", apiKeyReference: "key", protocolName: ProviderProtocol.openAIChat.rawValue)
+        var events: [ProviderEvent] = []
+        for try await event in client.stream(configuration: configuration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {
+            events.append(event)
+        }
+        XCTAssertTrue(events.contains(.token("chat-ok")))
+        XCTAssertEqual(events.last, .finished)
+    }
+
+    func testResponsesAcceptsNonSSEFullJSONResponseFromCompatibleProxy() async throws {
+        let body = Data("""
+        {"id":"resp-proxy","object":"response","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"responses-ok"}]}]}
+        """.utf8)
+        ProviderTestURLProtocol.install(status: 200, body: body, headers: ["Content-Type": "application/json"])
+        let client = OpenAIResponsesProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let configuration = ProviderConfiguration(name: "proxy", baseURL: URL(string: "https://proxy.example")!, model: "m", apiKeyReference: "key", protocolName: ProviderProtocol.openAIResponses.rawValue)
+        var events: [ProviderEvent] = []
+        for try await event in client.stream(configuration: configuration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {
+            events.append(event)
+        }
+        XCTAssertTrue(events.contains(.token("responses-ok")))
+        XCTAssertEqual(events.last, .finished)
+    }
+
+    func testAgentRouterDeepSeekUsesOpenAIChatCurrentOriginAndDualAuth() async throws {
         let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-agentrouter-org" }))
         let protocolName = provider.protocolFor(model: "deepseek-v4-flash", keySlotID: "slot-1")
         XCTAssertEqual(protocolName, .openAIChat)
@@ -538,7 +610,7 @@ final class ProviderProtocolClientTests: XCTestCase {
         let request = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
         XCTAssertEqual(request.url?.absoluteString, "https://co.agentrouter.org/v1/chat/completions")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
-        XCTAssertNil(request.value(forHTTPHeaderField: "x-api-key"))
+        XCTAssertEqual(request.value(forHTTPHeaderField: "x-api-key"), "test-secret")
         XCTAssertNil(request.value(forHTTPHeaderField: "anthropic-version"))
     }
 

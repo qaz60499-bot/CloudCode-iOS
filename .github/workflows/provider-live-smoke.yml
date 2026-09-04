@@ -14,6 +14,113 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Probe Justwoker and AgentRouter compatibility without exposing response content
+        env:
+          CLOUDCODE_PROVIDER_BOOTSTRAP: ${{ secrets.CLOUDCODE_PROVIDER_BOOTSTRAP }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          bootstrap = json.loads(os.environ["CLOUDCODE_PROVIDER_BOOTSTRAP"])
+
+          def provider_key(provider_id):
+              provider = next((p for p in bootstrap.get("providers", []) if p.get("providerID") == provider_id), None)
+              if not provider or not provider.get("keys"):
+                  raise SystemExit(f"FAIL: private bootstrap is missing {provider_id}")
+              secret = provider["keys"][0].get("secret", "")
+              if not secret:
+                  raise SystemExit(f"FAIL: private bootstrap has an empty key for {provider_id}")
+              return secret
+
+          def auth_headers(secret, mode):
+              headers = {"Accept": "application/json", "User-Agent": "CloudCode-iOS-live-smoke/2"}
+              if mode in ("bearer", "both"):
+                  headers["Authorization"] = f"Bearer {secret}"
+              if mode in ("x-api-key", "both"):
+                  headers["x-api-key"] = secret
+              return headers
+
+          def request(url, secret, mode, payload=None, anthropic=False):
+              headers = auth_headers(secret, mode)
+              data = None
+              if payload is not None:
+                  headers["Content-Type"] = "application/json"
+                  data = json.dumps(payload).encode("utf-8")
+              if anthropic:
+                  headers["anthropic-version"] = "2023-06-01"
+              req = urllib.request.Request(url, data=data, headers=headers, method="POST" if payload is not None else "GET")
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      body = response.read(262144)
+                      return response.status, body, response.headers.get("Content-Type", "")
+              except urllib.error.HTTPError as exc:
+                  return exc.code, exc.read(262144), exc.headers.get("Content-Type", "")
+
+          def capacity_blocked(status, body):
+              if status not in (402, 403, 429):
+                  return False
+              text = body.decode("utf-8", "replace").lower()
+              return any(marker in text for marker in ("预扣费额度失败", "insufficient balance", "insufficient credit", "precharge", "quota"))
+
+          agent_key = provider_key("https-agentrouter-org")
+          agent_payload = {
+              "model": "deepseek-v4-flash",
+              "max_tokens": 1,
+              "stream": False,
+              "messages": [{"role": "user", "content": "Reply OK"}],
+          }
+          agent_statuses = {}
+          for mode in ("both", "bearer", "x-api-key"):
+              status, body, content_type = request(
+                  "https://co.agentrouter.org/v1/chat/completions",
+                  agent_key,
+                  mode,
+                  agent_payload,
+              )
+              agent_statuses[mode] = status
+              print(f"AGENTROUTER_CHAT auth={mode} status={status} content_type={content_type.split(';')[0]} body_bytes={len(body)}")
+              if 200 <= status < 300 or capacity_blocked(status, body):
+                  print(f"AGENTROUTER_COMPATIBLE_AUTH={mode}")
+                  break
+          else:
+              raise SystemExit(f"FAIL: AgentRouter chat endpoint rejected all supported auth modes: {agent_statuses}")
+
+          just_key = provider_key("https-api-justwoker-icu")
+          just_payload = {
+              "model": "claude-opus-5",
+              "max_tokens": 4,
+              "stream": True,
+              "messages": [{"role": "user", "content": "Reply OK"}],
+          }
+          status, body, content_type = request(
+              "https://api.justwoker.icu/v1/messages",
+              just_key,
+              "bearer",
+              just_payload,
+              anthropic=True,
+          )
+          if not (200 <= status < 300) and not capacity_blocked(status, body):
+              raise SystemExit(f"FAIL: Justwoker Anthropic endpoint returned HTTP {status}")
+          text = body.decode("utf-8", "replace")
+          stripped = text.lstrip()
+          has_data_prefix = "data:" in text
+          has_message_stop = '"message_stop"' in text
+          has_message_delta = '"message_delta"' in text
+          raw_json = stripped.startswith("{")
+          print(
+              "JUSTWOKER_STREAM_SHAPE "
+              f"status={status} content_type={content_type.split(';')[0]} body_bytes={len(body)} "
+              f"has_data_prefix={has_data_prefix} "
+              f"has_message_stop={has_message_stop} "
+              f"has_message_delta={has_message_delta} "
+              f"raw_json={raw_json}"
+          )
+          PY
+
       - name: Probe Tabitoken request compatibility without exposing secrets
         id: live_probe
         env:

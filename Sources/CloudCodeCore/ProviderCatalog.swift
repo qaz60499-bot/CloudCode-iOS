@@ -574,7 +574,7 @@ public enum ProviderCatalog {
                 baseURL: URL(string: "https://co.agentrouter.org")!,
                 protocols: [.anthropic, .openAIChat],
                 preferredProtocol: .anthropic,
-                authMode: .bearer,
+                authMode: .both,
                 models: ["claude-opus-4-8", "claude-opus-5", "deepseek-v4-flash", "gpt-5.6-sol"],
                 keySlots: [ProviderKeySlot(
                     id: "slot-1",

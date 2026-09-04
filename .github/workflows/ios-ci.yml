@@ -208,7 +208,23 @@ jobs:
           for marker in ('viewModel.init.begin', 'viewModel.init.end', 'bootstrap.safe.begin', 'bootstrap.safe.end'):
               if marker not in app:
                   raise SystemExit(f'FAIL: startup breadcrumb marker missing: {marker}')
-          print('PASS: startup-safe path excludes privileged/private probes and keeps single-flight refresh guard')
+
+          content = Path('Sources/CloudCodeApp/ContentView.swift').read_text(encoding='utf-8')
+          root_tabs = content.split('private struct ChatView', 1)[0]
+          if root_tabs.find('SettingsView(model: model)') > root_tabs.find('FilesView(model: model)'):
+              raise SystemExit('FAIL: Settings must remain in the first five iPhone root tabs instead of the system More bucket')
+          if 'showDiagnostics = true' not in content or 'Label("日志", systemImage: "doc.text.magnifyingglass")' not in content:
+              raise SystemExit('FAIL: direct chat-to-diagnostics entry point is missing')
+
+          provider_client = Path('Sources/CloudCodeCore/ProviderClient.swift').read_text(encoding='utf-8')
+          for marker in ('providerPayload(from: line)', 'case "message":', 'case "message_delta":', 'case "response":'):
+              if marker not in provider_client:
+                  raise SystemExit(f'FAIL: provider proxy/non-SSE compatibility marker missing: {marker}')
+          catalog = Path('Sources/CloudCodeCore/ProviderCatalog.swift').read_text(encoding='utf-8')
+          agent_router = catalog.split('id: "https-agentrouter-org"', 1)[1].split('source: .desktopSnapshot', 1)[0]
+          if 'authMode: .both' not in agent_router:
+              raise SystemExit('FAIL: AgentRouter dual-auth compatibility guard regressed')
+          print('PASS: startup-safe, provider-compatibility and settings-navigation guardrails are present')
           PY
           grep -F 'backgroundContinuationWindow: TimeInterval = 90 * 60' Sources/CloudCodeApp/AppEnvironment.swift >/dev/null
           grep -F 'type: library.static' project.yml >/dev/null

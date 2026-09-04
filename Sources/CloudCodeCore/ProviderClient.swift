@@ -271,6 +271,9 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
             if (500...599).contains(code) {
                 return "上游厂商服务暂时不可用（HTTP \(code)）；这不是设备权限或卸载链路错误"
             }
+            if code == 404 || code == 405 {
+                return "厂商接口路径或协议不匹配（HTTP \(code)）。这不等于厂商不可用；请核对当前模型对应的 API 协议和 endpoint。"
+            }
             return "厂商返回 HTTP \(code)"
         case .malformedEvent: return "厂商返回了格式错误的流数据"
         case .streamInterrupted: return "厂商流在完成事件前中断"
@@ -645,6 +648,30 @@ private extension ProviderRequestBuilding {
     }
 }
 
+private func providerPayload(from line: String) -> String? {
+    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    if trimmed.hasPrefix(":") || trimmed.hasPrefix("event:") { return nil }
+    if trimmed.hasPrefix("data:") {
+        return String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+    }
+    if trimmed.first == "{" || trimmed.first == "[" {
+        return trimmed
+    }
+    return nil
+}
+
+private func providerText(from content: Any?) -> String? {
+    if let text = content as? String { return text }
+    guard let blocks = content as? [[String: Any]] else { return nil }
+    let text = blocks.compactMap { block -> String? in
+        if let value = block["text"] as? String { return value }
+        if let value = block["content"] as? String { return value }
+        return nil
+    }.joined()
+    return text.isEmpty ? nil : text
+}
+
 public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, ProviderRequestBuilding {
     fileprivate let session: URLSession
     fileprivate let retryPolicy: RetryPolicy
@@ -685,36 +712,60 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
         var outputStarted = false
         do {
             for try await line in lines {
-            try Task.checkCancellation()
-            guard line.hasPrefix("data:") else { continue }
-            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-            if payload == "[DONE]" {
-                sawEvent = true
-                terminal = true
-                break
-            }
-            guard let data = payload.data(using: .utf8),
-                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let choices = object["choices"] as? [[String: Any]],
-                  let delta = choices.first?["delta"] as? [String: Any] else { continue }
-            sawEvent = true
-            if let content = delta["content"] as? String, !content.isEmpty {
-                outputStarted = true
-                continuation.yield(.token(content))
-            }
-            if let toolCalls = delta["tool_calls"] as? [[String: Any]], !toolCalls.isEmpty {
-                outputStarted = true
-                for raw in toolCalls {
-                    let index = raw["index"] as? Int ?? 0
-                    var accumulator = toolCallState[index] ?? ToolCallAccumulator()
-                    if let id = raw["id"] as? String { accumulator.id = id }
-                    if let function = raw["function"] as? [String: Any] {
-                        if let name = function["name"] as? String { accumulator.name += name }
-                        if let arguments = function["arguments"] as? String { accumulator.arguments += arguments }
-                    }
-                    toolCallState[index] = accumulator
+                try Task.checkCancellation()
+                guard let payload = providerPayload(from: line) else { continue }
+                if payload == "[DONE]" {
+                    sawEvent = true
+                    terminal = true
+                    break
                 }
-            }
+                guard let data = payload.data(using: .utf8),
+                      let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let choices = object["choices"] as? [[String: Any]],
+                      let choice = choices.first else { continue }
+                sawEvent = true
+
+                if let delta = choice["delta"] as? [String: Any] {
+                    if let content = providerText(from: delta["content"]), !content.isEmpty {
+                        outputStarted = true
+                        continuation.yield(.token(content))
+                    }
+                    if let toolCalls = delta["tool_calls"] as? [[String: Any]], !toolCalls.isEmpty {
+                        outputStarted = true
+                        for raw in toolCalls {
+                            let index = raw["index"] as? Int ?? 0
+                            var accumulator = toolCallState[index] ?? ToolCallAccumulator()
+                            if let id = raw["id"] as? String { accumulator.id = id }
+                            if let function = raw["function"] as? [String: Any] {
+                                if let name = function["name"] as? String { accumulator.name += name }
+                                if let arguments = function["arguments"] as? String { accumulator.arguments += arguments }
+                            }
+                            toolCallState[index] = accumulator
+                        }
+                    }
+                } else if let message = choice["message"] as? [String: Any] {
+                    if let content = providerText(from: message["content"]), !content.isEmpty {
+                        outputStarted = true
+                        continuation.yield(.token(content))
+                    }
+                    if let toolCalls = message["tool_calls"] as? [[String: Any]], !toolCalls.isEmpty {
+                        outputStarted = true
+                        for (index, raw) in toolCalls.enumerated() {
+                            var accumulator = toolCallState[index] ?? ToolCallAccumulator()
+                            if let id = raw["id"] as? String { accumulator.id = id }
+                            if let function = raw["function"] as? [String: Any] {
+                                if let name = function["name"] as? String { accumulator.name = name }
+                                if let arguments = function["arguments"] as? String { accumulator.arguments = arguments }
+                            }
+                            toolCallState[index] = accumulator
+                        }
+                    }
+                    terminal = true
+                }
+
+                if let finishReason = choice["finish_reason"] as? String, !finishReason.isEmpty {
+                    terminal = true
+                }
             }
         } catch is CancellationError {
             throw CancellationError()
@@ -777,47 +828,93 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
         var outputStarted = false
         do {
             for try await line in lines {
-            try Task.checkCancellation()
-            guard line.hasPrefix("data:") else { continue }
-            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-            guard let data = payload.data(using: .utf8),
-                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let type = object["type"] as? String else { continue }
-            sawEvent = true
-            switch type {
-            case "content_block_start":
-                let index = object["index"] as? Int ?? 0
-                if let block = object["content_block"] as? [String: Any], block["type"] as? String == "tool_use" {
-                    var call = ToolCallAccumulator()
-                    call.id = block["id"] as? String ?? ""
-                    call.name = block["name"] as? String ?? ""
-                    if let input = block["input"], JSONSerialization.isValidJSONObject(input),
-                       let inputData = try? JSONSerialization.data(withJSONObject: input),
-                       let inputJSON = String(data: inputData, encoding: .utf8), inputJSON != "{}" {
-                        call.arguments = inputJSON
+                try Task.checkCancellation()
+                guard let payload = providerPayload(from: line) else { continue }
+                if payload == "[DONE]" {
+                    sawEvent = true
+                    terminal = true
+                    break
+                }
+                guard let data = payload.data(using: .utf8),
+                      let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let type = object["type"] as? String else { continue }
+                sawEvent = true
+                switch type {
+                case "content_block_start":
+                    let index = object["index"] as? Int ?? 0
+                    if let block = object["content_block"] as? [String: Any] {
+                        if block["type"] as? String == "tool_use" {
+                            var call = ToolCallAccumulator()
+                            call.id = block["id"] as? String ?? ""
+                            call.name = block["name"] as? String ?? ""
+                            if let input = block["input"], JSONSerialization.isValidJSONObject(input),
+                               let inputData = try? JSONSerialization.data(withJSONObject: input),
+                               let inputJSON = String(data: inputData, encoding: .utf8), inputJSON != "{}" {
+                                call.arguments = inputJSON
+                            }
+                            calls[index] = call
+                            outputStarted = true
+                        } else if block["type"] as? String == "text",
+                                  let text = block["text"] as? String,
+                                  !text.isEmpty {
+                            outputStarted = true
+                            continuation.yield(.token(text))
+                        }
                     }
-                    calls[index] = call
-                    outputStarted = true
+                case "content_block_delta":
+                    let index = object["index"] as? Int ?? 0
+                    guard let delta = object["delta"] as? [String: Any], let deltaType = delta["type"] as? String else { continue }
+                    if deltaType == "text_delta", let text = delta["text"] as? String, !text.isEmpty {
+                        outputStarted = true
+                        continuation.yield(.token(text))
+                    } else if deltaType == "input_json_delta", let partial = delta["partial_json"] as? String {
+                        var call = calls[index] ?? ToolCallAccumulator()
+                        call.arguments += partial
+                        calls[index] = call
+                        outputStarted = true
+                    }
+                case "message_delta":
+                    if let delta = object["delta"] as? [String: Any],
+                       let stopReason = delta["stop_reason"] as? String,
+                       !stopReason.isEmpty {
+                        terminal = true
+                    }
+                case "message_stop":
+                    terminal = true
+                case "message":
+                    if let blocks = object["content"] as? [[String: Any]] {
+                        for (index, block) in blocks.enumerated() {
+                            switch block["type"] as? String {
+                            case "text":
+                                if let text = block["text"] as? String, !text.isEmpty {
+                                    outputStarted = true
+                                    continuation.yield(.token(text))
+                                }
+                            case "tool_use":
+                                var call = ToolCallAccumulator()
+                                call.id = block["id"] as? String ?? ""
+                                call.name = block["name"] as? String ?? ""
+                                if let input = block["input"], JSONSerialization.isValidJSONObject(input),
+                                   let inputData = try? JSONSerialization.data(withJSONObject: input),
+                                   let inputJSON = String(data: inputData, encoding: .utf8) {
+                                    call.arguments = inputJSON
+                                }
+                                calls[index] = call
+                                outputStarted = true
+                            default:
+                                break
+                            }
+                        }
+                    } else if let text = providerText(from: object["content"]), !text.isEmpty {
+                        outputStarted = true
+                        continuation.yield(.token(text))
+                    }
+                    terminal = true
+                case "error":
+                    throw ProviderError.transport("Anthropic 流返回错误事件")
+                default:
+                    break
                 }
-            case "content_block_delta":
-                let index = object["index"] as? Int ?? 0
-                guard let delta = object["delta"] as? [String: Any], let deltaType = delta["type"] as? String else { continue }
-                if deltaType == "text_delta", let text = delta["text"] as? String, !text.isEmpty {
-                    outputStarted = true
-                    continuation.yield(.token(text))
-                } else if deltaType == "input_json_delta", let partial = delta["partial_json"] as? String {
-                    var call = calls[index] ?? ToolCallAccumulator()
-                    call.arguments += partial
-                    calls[index] = call
-                    outputStarted = true
-                }
-            case "message_stop":
-                terminal = true
-            case "error":
-                throw ProviderError.transport("Anthropic 流返回错误事件")
-            default:
-                break
-            }
             }
         } catch is CancellationError {
             throw CancellationError()
@@ -873,12 +970,11 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
         do {
             for try await line in lines {
             try Task.checkCancellation()
-            guard line.hasPrefix("data:") else { continue }
-            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            guard let payload = providerPayload(from: line) else { continue }
             if payload == "[DONE]" { terminal = true; sawEvent = true; break }
             guard let data = payload.data(using: .utf8),
                   let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let type = object["type"] as? String else { continue }
+                  let type = (object["type"] as? String) ?? (object["object"] as? String) else { continue }
             sawEvent = true
             switch type {
             case "response.output_text.delta":
@@ -911,6 +1007,33 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
                     calls[itemID] = call
                 }
             case "response.completed":
+                terminal = true
+            case "response":
+                if let output = object["output"] as? [[String: Any]] {
+                    for item in output {
+                        switch item["type"] as? String {
+                        case "message":
+                            if let content = item["content"] as? [[String: Any]] {
+                                for block in content where block["type"] as? String == "output_text" {
+                                    if let text = block["text"] as? String, !text.isEmpty {
+                                        outputStarted = true
+                                        continuation.yield(.token(text))
+                                    }
+                                }
+                            }
+                        case "function_call":
+                            let itemID = item["id"] as? String ?? UUID().uuidString
+                            var call = ToolCallAccumulator()
+                            call.id = item["call_id"] as? String ?? itemID
+                            call.name = item["name"] as? String ?? ""
+                            call.arguments = item["arguments"] as? String ?? "{}"
+                            calls[itemID] = call
+                            outputStarted = true
+                        default:
+                            break
+                        }
+                    }
+                }
                 terminal = true
             case "response.failed", "error":
                 throw ProviderError.transport("Responses 流返回错误事件")

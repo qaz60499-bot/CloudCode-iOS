@@ -32,6 +32,9 @@ struct ContentView: View {
             AppsView(model: model)
                 .tabItem { Label("应用", systemImage: "square.grid.2x2") }
                 .tag(RootTab.apps)
+            SettingsView(model: model)
+                .tabItem { Label("设置", systemImage: "gearshape") }
+                .tag(RootTab.settings)
             FilesView(model: model)
                 .tabItem { Label("文件", systemImage: "folder") }
                 .tag(RootTab.files)
@@ -44,9 +47,6 @@ struct ContentView: View {
             TrashView(model: model)
                 .tabItem { Label("回收站", systemImage: "trash") }
                 .tag(RootTab.trash)
-            SettingsView(model: model)
-                .tabItem { Label("设置", systemImage: "gearshape") }
-                .tag(RootTab.settings)
         }
         .sheet(isPresented: Binding(
             get: { approval.pending != nil },
@@ -86,6 +86,7 @@ private struct ChatView: View {
     @StateObject private var voice = VoiceInputController()
     @State private var input = ""
     @State private var showSessionHistory = false
+    @State private var showDiagnostics = false
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var pendingImageData: Data?
     @State private var pendingImagePreview: UIImage?
@@ -102,6 +103,16 @@ private struct ChatView: View {
                 .toolbar { chatToolbar }
                 .sheet(isPresented: $showSessionHistory) {
                     SessionHistoryView(model: model, isPresented: $showSessionHistory)
+                }
+                .sheet(isPresented: $showDiagnostics) {
+                    NavigationStack {
+                        DiagnosticLogsView(model: model)
+                            .toolbar {
+                                ToolbarItem(placement: .cancellationAction) {
+                                    Button("关闭") { showDiagnostics = false }
+                                }
+                            }
+                    }
                 }
                 .onChange(of: voice.recognizedText) { value in
                     if !value.isEmpty { input = value }
@@ -239,6 +250,12 @@ private struct ChatView: View {
     @ToolbarContentBuilder
     private var chatToolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .topBarTrailing) {
+            Button {
+                showDiagnostics = true
+            } label: {
+                Label("日志", systemImage: "doc.text.magnifyingglass")
+            }
+
             Button {
                 showSessionHistory = true
             } label: {
