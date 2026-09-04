@@ -1594,19 +1594,23 @@ public final class CloudCodeViewModel: ObservableObject {
                 preferredAuthMode: preferredAuthMode,
                 allowPricingCatalogFallback: true
             )
-            guard !discovery.models.isEmpty else { return }
             providerProfiles[providerIndex].applyDiscovery(discovery, keySlotID: keySlotID)
             let reconciled = ProviderSelectionResolver.reconcile(
                 ProviderSelectionState(providerID: selectedProviderID, keySlotID: selectedKeySlotID, model: selectedModel),
                 profiles: providerProfiles
             )
             applySelection(reconciled)
-            activityLines.append("Tabitoken 已按当前 Key 刷新可用模型：\(discovery.models.count) 个。")
+            let emptyCatalog = discovery.models.isEmpty && discovery.readiness == .unavailable
+            activityLines.append(
+                emptyCatalog
+                    ? "Tabitoken 当前返回空模型目录；已移除静态旧模型并标记厂商暂不可用。"
+                    : "Tabitoken 已按当前 Key 刷新可用模型：\(discovery.models.count) 个。"
+            )
             try? await diagnosticLogStore.log(
-                level: .info,
+                level: emptyCatalog ? .warning : .info,
                 subsystem: "provider-discovery",
                 action: "refresh",
-                result: "updated",
+                result: emptyCatalog ? "empty-catalog" : "updated",
                 metadata: ["providerID": providerID, "keySlotID": keySlotID, "modelCount": String(discovery.models.count)]
             )
         } catch {

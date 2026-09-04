@@ -31,6 +31,7 @@ public struct ProviderDiscoveryClient: Sendable {
         allowPricingCatalogFallback: Bool = false
     ) async throws -> ProviderDiscoveryResult {
         var lastError: Error = ProviderError.missingAPIKey
+        var sawAuthoritativeEmptyCatalog = false
         var authModes = [ProviderAuthMode.bearer, .xAPIKey, .both]
         if let preferredAuthMode {
             authModes.removeAll { $0.rawValue == preferredAuthMode.rawValue }
@@ -49,10 +50,8 @@ public struct ProviderDiscoveryClient: Sendable {
                     discoveredCatalog = (models, catalogAuthMode)
                     break
                 }
+                sawAuthoritativeEmptyCatalog = true
                 lastError = ProviderError.malformedEvent
-                if allowPricingCatalogFallback {
-                    break
-                }
             } catch {
                 lastError = error
             }
@@ -63,13 +62,25 @@ public struct ProviderDiscoveryClient: Sendable {
                 let models = try await discoverModelsFromPricing(baseURL: baseURL)
                 if !models.isEmpty {
                     discoveredCatalog = (models, preferredAuthMode ?? .both)
+                } else {
+                    sawAuthoritativeEmptyCatalog = true
                 }
             } catch {
                 lastError = error
             }
         }
 
-        guard let discoveredCatalog else { throw lastError }
+        guard let discoveredCatalog else {
+            if sawAuthoritativeEmptyCatalog {
+                return ProviderDiscoveryResult(
+                    models: [],
+                    protocols: [],
+                    authMode: preferredAuthMode ?? .both,
+                    readiness: .unavailable
+                )
+            }
+            throw lastError
+        }
         let models = discoveredCatalog.models
 
         // Model catalogs from compatible gateways can mix chat, image, embedding,
@@ -137,11 +148,14 @@ public struct ProviderDiscoveryClient: Sendable {
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ProviderError.malformedEvent
         }
+        var sawCatalogField = false
         for key in ["data", "priced_model_details", "priced_models", "models"] {
             guard let catalog = object[key] else { continue }
+            sawCatalogField = true
             let result = Self.extractModelIdentifiers(from: catalog)
             if !result.isEmpty { return result }
         }
+        if sawCatalogField { return [] }
         throw ProviderError.malformedEvent
     }
 

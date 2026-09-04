@@ -203,7 +203,7 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
 
     public mutating func applyDiscovery(_ discovery: ProviderDiscoveryResult, keySlotID: String) {
         let discoveredModels = Self.unique(discovery.models)
-        guard !discoveredModels.isEmpty else { return }
+        guard !discoveredModels.isEmpty || discovery.readiness == .unavailable else { return }
 
         let previousProviderModels = models
         models = discoveredModels

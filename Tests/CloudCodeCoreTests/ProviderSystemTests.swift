@@ -528,6 +528,43 @@ final class ProviderDiscoveryTests: XCTestCase {
         XCTAssertEqual(result.readiness, .ready)
     }
 
+    func testDiscoveryTreatsSuccessfulEmptyCatalogAsUnavailable() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProviderEmptyDiscoveryURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let result = try await ProviderDiscoveryClient(session: session).discover(
+            baseURL: URL(string: "https://tabitoken.com")!,
+            apiKey: "test-secret",
+            preferredAuthMode: .both,
+            allowPricingCatalogFallback: true
+        )
+
+        XCTAssertEqual(result.models, [])
+        XCTAssertEqual(result.protocols, [])
+        XCTAssertEqual(result.authMode, .both)
+        XCTAssertEqual(result.readiness, .unavailable)
+    }
+
+    func testProviderProfileClearsStaleModelsWhenLiveCatalogIsUnavailable() throws {
+        var profile = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.tabitokenID }))
+        let staleSelection = ProviderSelectionState(providerID: profile.id, keySlotID: "slot-1", model: profile.models[0])
+
+        profile.applyDiscovery(
+            ProviderDiscoveryResult(models: [], protocols: [], authMode: .both, readiness: .unavailable),
+            keySlotID: "slot-1"
+        )
+
+        XCTAssertTrue(profile.models.isEmpty)
+        XCTAssertTrue(profile.keySlots.allSatisfy { $0.models.isEmpty })
+        XCTAssertEqual(profile.readiness, .unavailable)
+        let reconciled = ProviderSelectionResolver.reconcile(staleSelection, profiles: [profile])
+        XCTAssertEqual(reconciled.providerID, profile.id)
+        XCTAssertEqual(reconciled.keySlotID, "slot-1")
+        XCTAssertEqual(reconciled.model, "")
+    }
+
     func testProviderProfileAppliesLiveDiscoveryAndDropsStaleModelMetadata() throws {
         var profile = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.tabitokenID }))
         let discovery = ProviderDiscoveryResult(
@@ -1442,6 +1479,36 @@ private final class ProviderDiscoveryURLProtocol: URLProtocol, @unchecked Sendab
         } else {
             status = 401
             body = Data("{\"error\":\"authentication failed\"}".utf8)
+        }
+        guard let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"]) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class ProviderEmptyDiscoveryURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let status: Int
+        let body: Data
+        if url.path.hasSuffix("/v1/models") || url.path == "/api/pricing" {
+            status = 200
+            body = Data(#"{"data":[],"success":true}"#.utf8)
+        } else {
+            status = 404
+            body = Data(#"{"error":"unsupported"}"#.utf8)
         }
         guard let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"]) else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
