@@ -77,6 +77,128 @@ static id Workspace(void)
     return sendObject(cls, selector);
 }
 
+static id SafeValue(id object, NSString *key)
+{
+    if (!object || key.length == 0 || ![object respondsToSelector:NSSelectorFromString(key)]) { return nil; }
+    @try {
+        return [object valueForKey:key];
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
+static NSArray *InstalledApplicationProxies(id workspace, NSString **backend)
+{
+    if (!workspace) { return @[]; }
+    id (*sendObject)(id, SEL) = (void *)objc_msgSend;
+    for (NSString *selectorName in @[@"allInstalledApplications", @"allApplications"]) {
+        SEL selector = NSSelectorFromString(selectorName);
+        if (![workspace respondsToSelector:selector]) { continue; }
+        id raw = sendObject(workspace, selector);
+        if ([raw isKindOfClass:NSArray.class] && [raw count] > 0) {
+            if (backend) { *backend = [@"LaunchServices " stringByAppendingString:selectorName]; }
+            return raw;
+        }
+    }
+
+    SEL enumerateSelector = NSSelectorFromString(@"enumerateApplicationsOfType:block:");
+    if ([workspace respondsToSelector:enumerateSelector]) {
+        void (*enumerate)(id, SEL, NSUInteger, void (^)(id)) = (void *)objc_msgSend;
+        NSMutableArray *collected = [NSMutableArray array];
+        void (^block)(id) = ^(id object) {
+            if (object) { [collected addObject:object]; }
+        };
+        enumerate(workspace, enumerateSelector, 0, block);
+        enumerate(workspace, enumerateSelector, 1, block);
+        if (collected.count > 0) {
+            if (backend) { *backend = @"LaunchServices enumerateApplicationsOfType"; }
+            return collected.copy;
+        }
+    }
+    return @[];
+}
+
+static BOOL ApplicationIsInstalled(id workspace, NSString *bundleID, BOOL *known);
+
+static int PrintInstalledApplicationsJSON(void)
+{
+    id workspace = Workspace();
+    if (!workspace) { return 23; }
+    NSString *backend = @"LaunchServices";
+    NSArray *proxies = InstalledApplicationProxies(workspace, &backend);
+    if (proxies.count == 0) { return 40; }
+
+    NSMutableDictionary<NSString *, NSDictionary *> *byBundleID = [NSMutableDictionary dictionary];
+    for (id proxy in proxies) {
+        NSString *bundleID = SafeValue(proxy, @"applicationIdentifier");
+        if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0) {
+            bundleID = SafeValue(proxy, @"bundleIdentifier");
+        }
+        if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0) { continue; }
+        NSString *name = SafeValue(proxy, @"localizedName");
+        if (![name isKindOfClass:NSString.class] || name.length == 0) { name = SafeValue(proxy, @"itemName"); }
+        if (![name isKindOfClass:NSString.class] || name.length == 0) { name = bundleID; }
+        NSString *version = SafeValue(proxy, @"shortVersionString");
+        if (![version isKindOfClass:NSString.class]) { version = @""; }
+        NSURL *bundleURL = SafeValue(proxy, @"bundleURL");
+        NSURL *dataURL = SafeValue(proxy, @"dataContainerURL");
+        NSString *bundlePath = [bundleURL isKindOfClass:NSURL.class] ? bundleURL.path : @"";
+        NSString *dataPath = [dataURL isKindOfClass:NSURL.class] ? dataURL.path : @"";
+        byBundleID[bundleID] = @{
+            @"bundleID": bundleID,
+            @"name": name,
+            @"version": version,
+            @"bundlePath": bundlePath ?: @"",
+            @"dataContainerPath": dataPath ?: @""
+        };
+    }
+    if (byBundleID.count == 0) { return 40; }
+    NSArray *apps = [[byBundleID allValues] sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *lhs, NSDictionary *rhs) {
+        return [lhs[@"name"] localizedCaseInsensitiveCompare:rhs[@"name"]];
+    }];
+    NSDictionary *payload = @{@"backend": backend ?: @"LaunchServices", @"apps": apps};
+    NSError *error = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
+    if (!data || error) { return 41; }
+    fwrite(data.bytes, 1, data.length, stdout);
+    fputc('\n', stdout);
+    return 0;
+}
+
+static int ProbeLaunchCapability(void)
+{
+    id workspace = Workspace();
+    if (!workspace) { return 23; }
+    return [workspace respondsToSelector:NSSelectorFromString(@"openApplicationWithBundleID:")] ? 0 : 42;
+}
+
+static int LaunchApplication(NSString *bundleID)
+{
+    if (bundleID.length == 0 || [bundleID isEqualToString:@"com.cloudcode.ios"]) { return 10; }
+    id workspace = Workspace();
+    if (!workspace) { return 23; }
+    SEL selector = NSSelectorFromString(@"openApplicationWithBundleID:");
+    if (![workspace respondsToSelector:selector]) { return 42; }
+    BOOL (*sendBool)(id, SEL, id) = (void *)objc_msgSend;
+    return sendBool(workspace, selector, bundleID) ? 0 : 46;
+}
+
+static int ProbeUninstallCapability(NSString *bundleID)
+{
+    id workspace = Workspace();
+    if (!workspace) { return 23; }
+    BOOL known = NO;
+    BOOL installed = ApplicationIsInstalled(workspace, bundleID, &known);
+    if (!known) { return 43; }
+    if (!installed) { return 44; }
+    BOOL hasLaunchServices = [workspace respondsToSelector:NSSelectorFromString(@"uninstallApplication:withOptions:error:")]
+        || [workspace respondsToSelector:NSSelectorFromString(@"uninstallApplication:withOptions:")];
+    void *handle = dlopen("/System/Library/PrivateFrameworks/MobileInstallation.framework/MobileInstallation", RTLD_LAZY | RTLD_LOCAL);
+    BOOL hasMobileInstallation = handle && dlsym(handle, "MobileInstallationUninstall") != NULL;
+    if (handle) { dlclose(handle); }
+    return (hasLaunchServices || hasMobileInstallation) ? 0 : 45;
+}
+
 static BOOL ApplicationIsInstalled(id workspace, NSString *bundleID, BOOL *known)
 {
     SEL selector = NSSelectorFromString(@"applicationIsInstalled:");
@@ -87,6 +209,17 @@ static BOOL ApplicationIsInstalled(id workspace, NSString *bundleID, BOOL *known
     BOOL (*sendBool)(id, SEL, id) = (void *)objc_msgSend;
     if (known) { *known = YES; }
     return sendBool(workspace, selector, bundleID);
+}
+
+static int InstalledState(NSString *bundleID)
+{
+    if (bundleID.length == 0) { return 10; }
+    id workspace = Workspace();
+    if (!workspace) { return 23; }
+    BOOL known = NO;
+    BOOL installed = ApplicationIsInstalled(workspace, bundleID, &known);
+    if (!known) { return 43; }
+    return installed ? 0 : 47;
 }
 
 static BOOL UnregisterApplication(id workspace, NSString *appPath)
@@ -355,7 +488,31 @@ int main(int argc, const char *argv[])
             if (getuid() != 0 || geteuid() != 0) { return 11; }
             return HasProcessInspectionBackend() ? 0 : 33;
         }
+        if ([command isEqualToString:@"enumerate-json"]) {
+            if (getuid() != 0 || geteuid() != 0) { return 11; }
+            return PrintInstalledApplicationsJSON();
+        }
+        if ([command isEqualToString:@"probe-launch"]) {
+            if (getuid() != 0 || geteuid() != 0) { return 11; }
+            return ProbeLaunchCapability();
+        }
+        if ([command isEqualToString:@"probe-uninstall"]) {
+            if (getuid() != 0 || geteuid() != 0 || argc < 3) { return 11; }
+            NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
+            return ProbeUninstallCapability(bundleID);
+        }
+        if ([command isEqualToString:@"is-installed"]) {
+            if (getuid() != 0 || geteuid() != 0 || argc < 3) { return 11; }
+            NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
+            return InstalledState(bundleID);
+        }
+        if ([command isEqualToString:@"launch"]) {
+            if (getuid() != 0 || geteuid() != 0 || argc < 3) { return 11; }
+            NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
+            return LaunchApplication(bundleID);
+        }
         if ([command isEqualToString:@"uninstall"]) {
+            if (getuid() != 0 || geteuid() != 0) { return 11; }
             if (argc < 5) { return 10; }
             NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
             NSString *bundlePath = [NSString stringWithUTF8String:argv[3]];

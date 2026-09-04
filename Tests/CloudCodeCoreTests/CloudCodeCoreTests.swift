@@ -7,17 +7,86 @@ final class CloudCodeCoreTests: XCTestCase {
     func testStartupSafeCapabilityProbeDefersPrivilegedDeviceOperations() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
-        let probe = CapabilityProbe(appResolver: VerifiedAppManagementResolver(), homeDirectory: root)
+        let resolver = SafeStartupResolverSpy()
+        let probe = CapabilityProbe(appResolver: resolver, homeDirectory: root)
 
         let profile = await probe.probeStartupSafe()
 
         XCTAssertEqual(profile.status("filesystem.own_container"), .available)
+        XCTAssertEqual(profile.status("filesystem.shared_user_files"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("filesystem.unrestricted"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("apps.enumerate"), .deviceValidationRequired)
+        XCTAssertEqual(profile.status("execution.ios_system"), .deviceValidationRequired)
+        XCTAssertEqual(profile.status("execution.posix_spawn_symbol"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("execution.root_helper"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("apps.launch"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("apps.terminate"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("apps.uninstall"), .deviceValidationRequired)
+        let resolverCalls = await resolver.totalCalls()
+        XCTAssertEqual(resolverCalls, 0, "startup-safe probing must not call app/private capability providers")
+    }
+
+    func testStartupBreadcrumbStoreReportsPreviousRunLastStageAndIgnoresCorruptTail() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = StartupBreadcrumbStore(directory: root.appendingPathComponent("breadcrumbs", isDirectory: true), retainedRunCount: 4)
+        let firstStart = Date(timeIntervalSince1970: 1_700_000_000)
+        let firstRun = store.beginRun(initialStage: "app.main.enter", at: firstStart)
+        store.append(runID: firstRun, stage: "viewModel.init.begin", at: firstStart.addingTimeInterval(1))
+        store.append(runID: firstRun, stage: "bootstrap.safe.begin", at: firstStart.addingTimeInterval(2))
+        let secondRun = store.beginRun(initialStage: "app.main.enter", at: firstStart.addingTimeInterval(10))
+
+        let previous = try XCTUnwrap(store.previousRun(excluding: secondRun))
+        XCTAssertEqual(previous.runID, firstRun)
+        XCTAssertEqual(previous.lastStage, "bootstrap.safe.begin")
+        XCTAssertEqual(previous.entryCount, 3)
+        XCTAssertTrue(store.exportText(limitRuns: 4).contains("stage=bootstrap.safe.begin"))
+    }
+
+    func testCapabilityProfileDuplicateRecordsRemainReadableWithoutTrap() {
+        let profile = CapabilityProfile(records: [
+            CapabilityRecord(id: "apps.enumerate", domain: .apps, status: .unavailable, detail: "first"),
+            CapabilityRecord(id: "apps.enumerate", domain: .apps, status: .available, detail: "duplicate")
+        ])
+        XCTAssertEqual(profile.records.count, 2)
+        XCTAssertEqual(profile.status("apps.enumerate"), .unavailable)
+    }
+
+    func testSessionStoreSkipsCorruptPersistedSessionDuringEnumeration() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionsRoot = root.appendingPathComponent("Sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessionsRoot, withIntermediateDirectories: true)
+        try Data("{not-valid-json".utf8).write(to: sessionsRoot.appendingPathComponent(UUID().uuidString).appendingPathExtension("json"))
+        let store = SessionStore(root: sessionsRoot)
+        let sessions = try await store.all()
+        XCTAssertTrue(sessions.isEmpty)
+    }
+
+    func testHermesCorruptDatabaseFailsRecoverablyWithoutTrap() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let hermesRoot = root.appendingPathComponent("Hermes", isDirectory: true)
+        try FileManager.default.createDirectory(at: hermesRoot, withIntermediateDirectories: true)
+        try Data("not-a-sqlite-database".utf8).write(to: hermesRoot.appendingPathComponent("hermes.sqlite"))
+        let store = HermesMemoryStore(root: hermesRoot)
+        do {
+            try await store.bootstrap()
+            XCTFail("corrupt Hermes database should fail recoverably")
+        } catch {
+            XCTAssertFalse(String(describing: error).isEmpty)
+        }
+    }
+
+    func testDiagnosticStoreSkipsCorruptPersistedLines() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let logsRoot = root.appendingPathComponent("Diagnostics", isDirectory: true)
+        try FileManager.default.createDirectory(at: logsRoot, withIntermediateDirectories: true)
+        try Data("{not-json}\n".utf8).write(to: logsRoot.appendingPathComponent("runtime-20990101-00-000.jsonl"))
+        let store = DiagnosticLogStore(directory: logsRoot)
+        let records = try await store.readAll(limit: 20)
+        XCTAssertTrue(records.isEmpty)
     }
 
     func testDiagnosticLogDefaultRetentionAndCapacityPolicy() {
@@ -3359,6 +3428,31 @@ private final class ScriptedURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+private actor SafeStartupResolverSpy: AppContainerResolving, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, RootHelperCapabilityProviding, AppLifecycleCapabilityProviding {
+    private var calls = 0
+
+    func installedApps() async -> [ResourceNode] { calls += 1; return [] }
+    func bundlePath(for bundleID: String) async -> String? { calls += 1; return nil }
+    func dataContainerPath(for bundleID: String) async -> String? { calls += 1; return nil }
+    func canEnumerateInstalledApps() async -> Bool { calls += 1; return false }
+    func installedAppEnumerationDetail() async -> String { calls += 1; return "unexpected" }
+    func canUninstallInstalledApps() async -> Bool { calls += 1; return false }
+    func installedAppUninstallDetail() async -> String { calls += 1; return "unexpected" }
+    func rootHelperCapability() async -> RootHelperCapabilitySnapshot {
+        calls += 1
+        return RootHelperCapabilitySnapshot(available: false, detail: "unexpected")
+    }
+    func appLaunchCapability() async -> AppLifecycleCapabilitySnapshot {
+        calls += 1
+        return AppLifecycleCapabilitySnapshot(available: false, detail: "unexpected")
+    }
+    func appTerminateCapability() async -> AppLifecycleCapabilitySnapshot {
+        calls += 1
+        return AppLifecycleCapabilitySnapshot(available: false, detail: "unexpected")
+    }
+    func totalCalls() -> Int { calls }
 }
 
 private struct VerifiedAppManagementResolver: AppContainerResolving, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, RootHelperCapabilityProviding, Sendable {

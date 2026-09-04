@@ -66,6 +66,9 @@ public final class CloudCodeViewModel: ObservableObject {
     private let resourceIndex: ProgressiveResourceIndex
     private let appKnowledge: AppKnowledgeRegistry
     private let customProviderFileURL: URL
+    private let startupBreadcrumbStore: StartupBreadcrumbStore
+    private let startupRunID: UUID
+    private let previousStartupRun: StartupBreadcrumbRunSummary?
     private var activeTasks: [UUID: Task<Void, Never>] = [:]
     private var activeRunTokens: [UUID: UUID] = [:]
     private var activeConfigurations: [UUID: ProviderConfiguration] = [:]
@@ -83,7 +86,21 @@ public final class CloudCodeViewModel: ObservableObject {
     private static let autoResumeTaskDefaultsKey = "task.autoResumeUnlessStopped"
     private static let backgroundContinuationWindow: TimeInterval = 90 * 60
 
-    public init() {
+    public init(
+        startupBreadcrumbStore: StartupBreadcrumbStore = StartupBreadcrumbStore(),
+        startupRunID: UUID? = nil
+    ) {
+        let resolvedStartupRunID: UUID
+        if let startupRunID {
+            resolvedStartupRunID = startupRunID
+            startupBreadcrumbStore.append(runID: startupRunID, stage: "viewModel.init.begin")
+        } else {
+            resolvedStartupRunID = startupBreadcrumbStore.beginRun(initialStage: "viewModel.init.begin")
+        }
+        self.startupBreadcrumbStore = startupBreadcrumbStore
+        self.startupRunID = resolvedStartupRunID
+        self.previousStartupRun = startupBreadcrumbStore.previousRun(excluding: resolvedStartupRunID)
+
         let support = Self.supportRoot()
         let approval = ApprovalCenter()
         let diagnosticLogStore = DiagnosticLogStore(directory: support.appendingPathComponent("Diagnostics/Runtime", isDirectory: true))
@@ -196,11 +213,29 @@ public final class CloudCodeViewModel: ObservableObject {
         self.resourceIndex = ProgressiveResourceIndex(fileURL: support.appendingPathComponent("Index/resource-graph.json"))
         self.appKnowledge = AppKnowledgeRegistry(fileURL: support.appendingPathComponent("Index/app-knowledge.json"))
         self.customProviderFileURL = customProviderFileURL
+        startupBreadcrumbStore.append(runID: resolvedStartupRunID, stage: "viewModel.init.end")
+    }
+
+    public func recordStartupBreadcrumb(_ stage: String) {
+        startupBreadcrumbStore.append(runID: startupRunID, stage: stage)
     }
 
     public func bootstrap() {
         guard !didBootstrap, bootstrapTask == nil else { return }
         bootstrapTask = Task {
+            if let previousStartupRun {
+                try? await diagnosticLogStore.log(
+                    level: .warning,
+                    subsystem: "startup-breadcrumb",
+                    action: "previous-startup-last-stage",
+                    result: previousStartupRun.lastStage,
+                    metadata: [
+                        "runID": previousStartupRun.runID.uuidString,
+                        "entryCount": String(previousStartupRun.entryCount),
+                        "lastTimestamp": ISO8601DateFormatter().string(from: previousStartupRun.lastTimestamp)
+                    ]
+                )
+            }
             try? await diagnosticLogStore.log(
                 level: .info,
                 subsystem: "app",
@@ -218,12 +253,15 @@ public final class CloudCodeViewModel: ObservableObject {
             }
             isRefreshingCapabilities = true
             capabilityRefreshMessage = "正在执行安全启动检测…"
+            recordStartupBreadcrumb("bootstrap.safe.begin")
             apps = await appResolver.startupSafeApps()
             capabilities = await capabilityProbe.probeStartupSafe()
             lastCapabilityRefreshAt = capabilities.generatedAt
             capabilityRefreshMessage = Self.capabilitySummary(capabilities) + " · 特权/私有 API 检测已延后"
             capabilityGraph = CapabilityGraphBuilder().build(profile: capabilities, tools: await toolRegistry.all())
+            recordStartupBreadcrumb("bootstrap.safe.end")
             await seedKnowledgeIfNeeded(apps)
+            recordStartupBreadcrumb("bootstrap.local-state.begin")
             do {
                 try await checkpointStore.recoverUnfinishedAfterRestart()
                 do {
@@ -254,12 +292,16 @@ public final class CloudCodeViewModel: ObservableObject {
                     activityLines.append("检测到私有 Key 版 IPA，但当前设备的 Keychain 实际探测未通过，因此已跳过自动导入，避免反复弹出失败提示。")
                 }
                 didBootstrap = true
+                recordStartupBreadcrumb("bootstrap.local-state.end")
+                recordStartupBreadcrumb("bootstrap.completed")
                 try? await diagnosticLogStore.log(level: .info, subsystem: "app", action: "bootstrap", result: "completed")
                 await refreshDiagnosticLogs()
                 resumeMostRecentInterruptedTaskIfRequested()
             } catch {
+                recordStartupBreadcrumb("bootstrap.local-state.failed")
                 try? await diagnosticLogStore.log(level: .error, subsystem: "app", action: "bootstrap", result: "failed", error: error)
                 lastError = "初始化失败：\(error)"
+                await refreshDiagnosticLogs()
             }
         }
     }
@@ -947,17 +989,30 @@ public final class CloudCodeViewModel: ObservableObject {
         isRefreshingCapabilities = true
         capabilityRefreshMessage = "正在检测设备能力…"
         let previous = capabilities
+        recordStartupBreadcrumb("extendedProbe.begin")
         capabilityRefreshTask = Task {
             defer {
                 capabilityRefreshTask = nil
                 isRefreshingCapabilities = false
             }
-            await appResolver.forceRefresh()
+            let extended = await capabilityProbe.probeExtendedDevice()
+            recordStartupBreadcrumb("extendedProbe.end")
             guard !Task.isCancelled else {
                 capabilityRefreshMessage = "设备能力检测已取消。"
                 return
             }
-            let refreshed = await capabilityProbe.probe()
+            capabilities = extended
+            capabilityGraph = CapabilityGraphBuilder().build(profile: extended, tools: await toolRegistry.all())
+
+            recordStartupBreadcrumb("privilegedProbe.begin")
+            await appResolver.forceRefresh()
+            guard !Task.isCancelled else {
+                recordStartupBreadcrumb("privilegedProbe.cancelled")
+                capabilityRefreshMessage = "设备能力检测已取消。"
+                return
+            }
+            let refreshed = await capabilityProbe.probePrivileged()
+            recordStartupBreadcrumb("privilegedProbe.end")
             guard !Task.isCancelled else {
                 capabilityRefreshMessage = "设备能力检测已取消。"
                 return
@@ -1188,6 +1243,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let toolResultsData = try await executionLedger.exportSnapshotData()
         let checkpointData = try await checkpointStore.exportSnapshotData()
         let transactionData = try await transactionJournal.exportSnapshotData()
+        let startupBreadcrumbData = Data(startupBreadcrumbStore.exportText(limitRuns: 8).utf8)
         let destination = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeDiagnostics", isDirectory: true)
         let url = try await diagnosticBundleExporter.export(
             destinationDirectory: destination,
@@ -1198,7 +1254,8 @@ public final class CloudCodeViewModel: ObservableObject {
                 "audit/audit.jsonl": auditData,
                 "tool-results/tool-results.json": toolResultsData,
                 "checkpoints/checkpoints.json": checkpointData,
-                "transactions/transactions.json": transactionData
+                "transactions/transactions.json": transactionData,
+                "startup/breadcrumbs.txt": startupBreadcrumbData
             ]
         )
         try? await diagnosticLogStore.log(

@@ -9,12 +9,14 @@ import Darwin
 public protocol CapabilityProbing: Sendable {
     func probe() async -> CapabilityProfile
     func probeStartupSafe() async -> CapabilityProfile
+    func probeExtendedDevice() async -> CapabilityProfile
+    func probePrivileged() async -> CapabilityProfile
 }
 
 public extension CapabilityProbing {
-    func probeStartupSafe() async -> CapabilityProfile {
-        await probe()
-    }
+    func probeStartupSafe() async -> CapabilityProfile { await probe() }
+    func probeExtendedDevice() async -> CapabilityProfile { await probeStartupSafe() }
+    func probePrivileged() async -> CapabilityProfile { await probe() }
 }
 
 public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
@@ -41,9 +43,8 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
 
         records.append(record("filesystem.own_container", .filesystem, canReadAndWrite(homeDirectory) ? .available : .unavailable,
                               "Startup-safe read/write check against the app's own home directory."))
-        let sharedCandidate = URL(fileURLWithPath: "/var/mobile/Media", isDirectory: true)
-        records.append(record("filesystem.shared_user_files", .filesystem, fileManager.isReadableFile(atPath: sharedCandidate.path) ? .available : .unavailable,
-                              "Startup-safe read-only visibility check for the user media area."))
+        records.append(record("filesystem.shared_user_files", .filesystem, .deviceValidationRequired,
+                              "Deferred during automatic startup. No /var/mobile or cross-container path is touched by the startup-safe probe."))
         records.append(record("filesystem.unrestricted", .filesystem, .deviceValidationRequired,
                               "Deferred during automatic startup. A privileged write outside the app container is never attempted automatically."))
 
@@ -58,10 +59,10 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         records.append(record("apps.resolve_data_container", .apps, .deviceValidationRequired,
                               "Cross-app data-container resolution is deferred during automatic startup."))
 
-        records.append(record("execution.ios_system", .execution, Self.hasDynamicSymbol("ios_system") ? .available : .unavailable,
-                              "Dynamic symbol presence only; no command is executed during startup."))
-        records.append(record("execution.posix_spawn_symbol", .execution, Self.hasDynamicSymbol("posix_spawn") ? .available : .unavailable,
-                              "Dynamic symbol presence only; no helper is spawned during startup."))
+        records.append(record("execution.ios_system", .execution, .deviceValidationRequired,
+                              "Dynamic execution symbols are not inspected during automatic startup."))
+        records.append(record("execution.posix_spawn_symbol", .execution, .deviceValidationRequired,
+                              "Spawn/persona symbols are not inspected during automatic startup."))
         records.append(record("execution.spawn_helper", .execution, .deviceValidationRequired,
                               "Embedded root-helper spawning is deferred until explicit device validation."))
         records.append(record("execution.root_helper", .execution, .deviceValidationRequired,
@@ -122,8 +123,40 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         return profile
     }
 
+    public func probeExtendedDevice() async -> CapabilityProfile {
+        try? await diagnosticLogger?.log(level: .info, subsystem: "capability", action: "probe.extended.start", result: "running")
+        var records = await probeStartupSafe().records
+
+        func replacing(_ item: CapabilityRecord) {
+            records.removeAll { $0.id == item.id }
+            records.append(item)
+        }
+
+        let sharedCandidate = URL(fileURLWithPath: "/var/mobile/Media", isDirectory: true)
+        replacing(record("filesystem.shared_user_files", .filesystem, fileManager.isReadableFile(atPath: sharedCandidate.path) ? .available : .unavailable,
+                         "Explicit extended read-only visibility check for the user media area."))
+        replacing(record("execution.ios_system", .execution, Self.hasDynamicSymbol("ios_system") ? .available : .unavailable,
+                         "Explicit extended dynamic-symbol presence check; no command is executed."))
+        replacing(record("execution.posix_spawn_symbol", .execution, Self.hasDynamicSymbol("posix_spawn") ? .available : .unavailable,
+                         "Explicit extended spawn-symbol presence check; no helper is spawned."))
+
+        let profile = CapabilityProfile(records: records)
+        try? await diagnosticLogger?.log(
+            level: .info,
+            subsystem: "capability",
+            action: "probe.extended.finish",
+            result: "completed",
+            metadata: ["count": String(records.count)]
+        )
+        return profile
+    }
+
     public func probe() async -> CapabilityProfile {
-        try? await diagnosticLogger?.log(level: .info, subsystem: "capability", action: "probe.start", result: "running")
+        await probePrivileged()
+    }
+
+    public func probePrivileged() async -> CapabilityProfile {
+        try? await diagnosticLogger?.log(level: .info, subsystem: "capability", action: "probe.privileged.start", result: "running")
         var records: [CapabilityRecord] = []
 
         records.append(record("filesystem.own_container", .filesystem, canReadAndWrite(homeDirectory) ? .available : .unavailable,
@@ -275,7 +308,7 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         try? await diagnosticLogger?.log(
             level: .info,
             subsystem: "capability",
-            action: "probe.finish",
+            action: "probe.privileged.finish",
             result: "completed",
             metadata: ["count": String(records.count)]
         )

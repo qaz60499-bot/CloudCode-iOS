@@ -406,9 +406,6 @@ public actor AgentCore {
                         capabilities: capabilities,
                         allowedRoot: allowedRoot
                     )
-                    capabilities = await DiagnosticContext.$sessionID.withValue(session.id) {
-                        await capabilityProbe.probeStartupSafe()
-                    }
                     let key = try await keyVault.key(for: providerConfiguration.apiKeyReference)
                     let descriptors = await registry.all()
                     let toolNameMap = try ProviderToolNameMap(internalNames: descriptors.map(\.name))
@@ -616,7 +613,7 @@ public actor AgentCore {
                                     let rawContent = String(data: data, encoding: .utf8) ?? result.summary
                                     let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name)", content: rawContent).promptSafeRepresentation
                                     session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: ["tool_call_id": providerCallID, "tool_name": name, "provider_tool_name": providerToolName]))
-                                    if name == "capability.probe" { capabilities = await capabilityProbe.probe() }
+                                    if name == "capability.probe" { capabilities = await capabilityProbe.probePrivileged() }
                                     if let stateChangeSignature {
                                         lastStateChangeSignature = stateChangeSignature
                                         lastStateChangeScope = Self.semanticToolScope(name: name, arguments: arguments)

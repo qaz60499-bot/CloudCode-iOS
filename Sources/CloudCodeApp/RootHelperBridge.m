@@ -9,6 +9,7 @@
 #import <unistd.h>
 
 #define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE 1
+#define CLOUDCODE_HELPER_CAPTURE_LIMIT (1024 * 1024)
 
 typedef int (*PersonaSetFn)(const posix_spawnattr_t * _Nonnull __restrict, uid_t, uint32_t);
 typedef int (*PersonaUIDFn)(const posix_spawnattr_t * _Nonnull __restrict, uid_t);
@@ -80,8 +81,8 @@ static NSInteger CloudCodeSpawnRootHelperInternal(NSString *path, NSArray<NSStri
                 uint8_t buffer[1024];
                 ssize_t readCount = 0;
                 while ((readCount = read(diagnosticPipe[0], buffer, sizeof(buffer))) > 0) {
-                    if (captured.length < 16384) {
-                        NSUInteger remaining = 16384 - captured.length;
+                    if (captured.length < CLOUDCODE_HELPER_CAPTURE_LIMIT) {
+                        NSUInteger remaining = CLOUDCODE_HELPER_CAPTURE_LIMIT - captured.length;
                         [captured appendBytes:buffer length:MIN((NSUInteger)readCount, remaining)];
                     }
                 }

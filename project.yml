@@ -21,7 +21,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.core
         PRODUCT_NAME: CloudCodeCore
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 15
+        CURRENT_PROJECT_VERSION: 16
         VERSIONING_SYSTEM: apple-generic
         DEFINES_MODULE: YES
         GENERATE_INFOPLIST_FILE: YES
@@ -41,7 +41,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios
         PRODUCT_NAME: CloudCode
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 15
+        CURRENT_PROJECT_VERSION: 16
         VERSIONING_SYSTEM: apple-generic
         SWIFT_VERSION: 5.9
         SWIFT_OBJC_BRIDGING_HEADER: Sources/CloudCodeApp/RootHelperBridge.h
@@ -75,6 +75,7 @@ targets:
           HELPER="$TARGET_BUILD_DIR/$WRAPPER_NAME/CloudCodeRootHelper"
           xcrun --sdk iphoneos clang \
             -fobjc-arc \
+            -fblocks \
             -fmodules \
             -target arm64-apple-ios16.0 \
             "$SRCROOT/Sources/CloudCodeRootHelper/main.m" \

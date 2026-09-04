@@ -145,6 +145,71 @@ jobs:
             exit 1
           fi
           grep -F 'probeOwnKeychain()' Sources/CloudCodeCore/CapabilityProbe.swift >/dev/null
+          python3 - <<'PY'
+          from pathlib import Path
+
+          capability = Path('Sources/CloudCodeCore/CapabilityProbe.swift').read_text(encoding='utf-8')
+          safe = capability.split('public func probeStartupSafe()', 1)[1].split('public func probeExtendedDevice()', 1)[0]
+          for forbidden in ('URL(fileURLWithPath: "/var/mobile', 'unrestrictedFilesystemProbe(', 'hasDynamicSymbol(', 'rootHelperCapability()', 'installedApps()', 'probePrivileged('):
+              if forbidden in safe:
+                  raise SystemExit(f'FAIL: startup-safe capability probe contains forbidden operation: {forbidden}')
+
+          app = Path('Sources/CloudCodeApp/AppEnvironment.swift').read_text(encoding='utf-8')
+          bootstrap = app.split('public func bootstrap()', 1)[1].split('public var isRunning', 1)[0]
+          for forbidden in ('appResolver.forceRefresh()', 'capabilityProbe.probe()', 'capabilityProbe.probePrivileged()', 'capabilityProbe.probeExtendedDevice()'):
+              if forbidden in bootstrap:
+                  raise SystemExit(f'FAIL: automatic bootstrap contains privileged/full probe: {forbidden}')
+          if 'capabilityProbe.probeStartupSafe()' not in bootstrap:
+              raise SystemExit('FAIL: automatic bootstrap must use startup-safe capability probe')
+          refresh = app.split('public func refreshCapabilities()', 1)[1].split('public func refreshFiles()', 1)[0]
+          if 'guard capabilityRefreshTask == nil' not in refresh:
+              raise SystemExit('FAIL: explicit capability refresh lost duplicate/concurrency guard')
+          if 'capabilityProbe.probeExtendedDevice()' not in refresh or 'capabilityProbe.probePrivileged()' not in refresh:
+              raise SystemExit('FAIL: explicit refresh must stage extended-device then privileged probing')
+          if 'extendedProbe.begin' not in refresh or 'extendedProbe.end' not in refresh or 'privilegedProbe.begin' not in refresh or 'privilegedProbe.end' not in refresh:
+              raise SystemExit('FAIL: explicit capability refresh lost breadcrumb boundaries')
+
+          agent = Path('Sources/CloudCodeCore/AgentCore.swift').read_text(encoding='utf-8')
+          if 'await capabilityProbe.probeStartupSafe()' not in agent:
+              raise SystemExit('FAIL: ordinary Agent run lost startup-safe capability probe')
+          if agent.count('capabilityProbe.probePrivileged()') != 1 or 'if name == "capability.probe" { capabilities = await capabilityProbe.probePrivileged() }' not in agent:
+              raise SystemExit('FAIL: privileged Agent probe must remain exclusive to explicit capability.probe tool execution')
+
+          adapters = Path('Sources/CloudCodeApp/PlatformAdapters.swift').read_text(encoding='utf-8')
+          resolver = adapters.split('public actor IOSAppResolver', 1)[1].split('@MainActor\npublic final class ApprovalCenter', 1)[0]
+          for forbidden in ('LSApplicationWorkspace', 'MobileInstallation.framework', 'mobileInstallationUninstallSymbol', 'NSClassFromString', 'class_getInstanceMethod', 'class_getClassMethod', 'method_getImplementation', 'unsafeBitCast'):
+              if forbidden in resolver:
+                  raise SystemExit(f'FAIL: IOSAppResolver reintroduced main-process private ABI execution: {forbidden}')
+          resolver_refresh = resolver.split('private func refresh()', 1)[1].split('private static func isUserApplicationBundlePath', 1)[0]
+          if 'EmbeddedRootHelper.enumerateInstalledApps()' not in resolver_refresh:
+              raise SystemExit('FAIL: installed-app refresh is no longer isolated in root helper')
+          launch = resolver.split('public func launchApplication(bundleID:', 1)[1].split('public func terminateApplication', 1)[0]
+          if 'EmbeddedRootHelper.launch(bundleID: bundleID)' not in launch:
+              raise SystemExit('FAIL: app launch must execute through the isolated root helper')
+          uninstall = resolver.split('public func uninstallApplication(bundleID:', 1)[1].split('private enum UninstallReconciliation', 1)[0]
+          if 'EmbeddedRootHelper.uninstall(bundleID: bundleID' not in uninstall or 'EmbeddedRootHelper.installationState(bundleID: bundleID)' not in uninstall:
+              raise SystemExit('FAIL: app uninstall and registration verification must execute through the isolated root helper')
+
+          helper = Path('Sources/CloudCodeRootHelper/main.m')
+          if not helper.exists():
+              raise SystemExit('FAIL: CloudCodeRootHelper source is missing')
+          helper_text = helper.read_text(encoding='utf-8')
+          for marker in ('enumerate-json', 'probe-launch', 'probe-uninstall', 'is-installed', 'launch', 'uninstall'):
+              if marker not in helper_text:
+                  raise SystemExit(f'FAIL: root helper command missing: {marker}')
+          bridge = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
+          if 'CLOUDCODE_HELPER_CAPTURE_LIMIT (1024 * 1024)' not in bridge or 'WIFSIGNALED(status)' not in bridge:
+              raise SystemExit('FAIL: root helper bridge lost bounded output capture or signal isolation')
+
+          app_entry = Path('Sources/CloudCodeApp/CloudCodeIOSApp.swift').read_text(encoding='utf-8')
+          for marker in ('app.main.enter', 'firstScene.rendered'):
+              if marker not in app_entry:
+                  raise SystemExit(f'FAIL: startup breadcrumb marker missing: {marker}')
+          for marker in ('viewModel.init.begin', 'viewModel.init.end', 'bootstrap.safe.begin', 'bootstrap.safe.end'):
+              if marker not in app:
+                  raise SystemExit(f'FAIL: startup breadcrumb marker missing: {marker}')
+          print('PASS: startup-safe path excludes privileged/private probes and keeps single-flight refresh guard')
+          PY
           grep -F 'backgroundContinuationWindow: TimeInterval = 90 * 60' Sources/CloudCodeApp/AppEnvironment.swift >/dev/null
           grep -F 'type: library.static' project.yml >/dev/null
           if unzip -l build/CloudCode-iOS-unsigned.ipa | grep -F 'Payload/CloudCode.app/Frameworks/CloudCodeCore.framework/'; then

@@ -1,8 +1,6 @@
 import Foundation
 import SwiftUI
 import CloudCodeCore
-import Security
-import ObjectiveC.runtime
 #if canImport(Darwin)
 import Darwin
 #endif
@@ -15,6 +13,19 @@ public enum AppUninstallOutcome: Sendable, Equatable {
 }
 
 private enum EmbeddedRootHelper {
+    struct EnumeratedApp: Decodable {
+        var bundleID: String
+        var name: String
+        var version: String
+        var bundlePath: String
+        var dataContainerPath: String
+    }
+
+    struct EnumerationPayload: Decodable {
+        var backend: String
+        var apps: [EnumeratedApp]
+    }
+
     static let executableName = "CloudCodeRootHelper"
 
     static var executablePath: String {
@@ -41,10 +52,76 @@ private enum EmbeddedRootHelper {
         case 33: meaning = "进程检查后端不可用"
         case 34: meaning = "Bundle 容器删除失败，数据容器保持未动"
         case 35: meaning = "App Bundle 已移除，但已知数据容器仍有残留"
+        case 40: meaning = "隔离 LaunchServices 枚举没有返回有效应用"
+        case 41: meaning = "隔离枚举结果无法序列化"
+        case 42: meaning = "App 启动 selector 不可用"
+        case 43: meaning = "权威安装状态查询 selector 不可用"
+        case 44: meaning = "用于卸载能力验证的目标 App 已不在安装状态"
+        case 45: meaning = "LaunchServices/MobileInstallation 卸载后端均不可用"
+        case 46: meaning = "LaunchServices 拒绝启动目标 App"
+        case 47: meaning = "目标 App 已确认不在安装状态"
         default: meaning = ""
         }
         let suffix = meaning.isEmpty ? "" : "（\(meaning)）"
         return diagnostic.isEmpty ? "\(prefix)退出码 \(code)\(suffix)。" : "\(prefix)退出码 \(code)\(suffix)：\(diagnostic)"
+    }
+
+    static func enumerateInstalledApps() -> (payload: EnumerationPayload?, detail: String) {
+        let path = executablePath
+        guard FileManager.default.fileExists(atPath: path), FileManager.default.isExecutableFile(atPath: path) else {
+            return (nil, "\(executableName) 不可执行；跨 App 枚举保持不可用。")
+        }
+        let result = run(["enumerate-json"])
+        guard result.code == 0 else {
+            return (nil, failureDetail(prefix: "\(executableName) 隔离枚举", code: result.code, diagnostic: result.diagnostic))
+        }
+        let decoder = JSONDecoder()
+        if let data = result.diagnostic.data(using: .utf8), let payload = try? decoder.decode(EnumerationPayload.self, from: data) {
+            return (payload, "\(payload.backend) 已在 helper 子进程内完成枚举。")
+        }
+        if let start = result.diagnostic.firstIndex(of: "{"), let end = result.diagnostic.lastIndex(of: "}") {
+            let json = String(result.diagnostic[start...end])
+            if let data = json.data(using: .utf8), let payload = try? decoder.decode(EnumerationPayload.self, from: data) {
+                return (payload, "\(payload.backend) 已在 helper 子进程内完成枚举。")
+            }
+        }
+        return (nil, "\(executableName) 枚举输出无法解析；已按 fail-closed 处理。")
+    }
+
+    static func launchCapability() -> RootHelperCapabilitySnapshot {
+        let result = run(["probe-launch"])
+        if result.code == 0 {
+            return RootHelperCapabilitySnapshot(available: true, detail: "LaunchServices 启动 selector 已在 helper 子进程内验证。")
+        }
+        return RootHelperCapabilitySnapshot(available: false, detail: failureDetail(prefix: "helper 启动能力探测", code: result.code, diagnostic: result.diagnostic))
+    }
+
+    static func uninstallCapability(bundleID: String) -> RootHelperCapabilitySnapshot {
+        let result = run(["probe-uninstall", bundleID])
+        if result.code == 0 {
+            return RootHelperCapabilitySnapshot(available: true, detail: "卸载 selector/symbol 与权威安装状态查询已在 helper 子进程内验证。")
+        }
+        return RootHelperCapabilitySnapshot(available: false, detail: failureDetail(prefix: "helper 卸载能力探测", code: result.code, diagnostic: result.diagnostic))
+    }
+
+    static func installationState(bundleID: String) -> (installed: Bool?, detail: String) {
+        let result = run(["is-installed", bundleID])
+        switch result.code {
+        case 0:
+            return (true, "helper 已确认目标 App 处于安装状态。")
+        case 47:
+            return (false, "helper 已确认目标 App 不在安装状态。")
+        default:
+            return (nil, failureDetail(prefix: "helper 安装状态查询", code: result.code, diagnostic: result.diagnostic))
+        }
+    }
+
+    static func launch(bundleID: String) -> (success: Bool, detail: String) {
+        let result = run(["launch", bundleID])
+        if result.code == 0 {
+            return (true, "Embedded root helper 已在隔离子进程中提交 App 启动请求。")
+        }
+        return (false, failureDetail(prefix: "Embedded root helper 启动 App", code: result.code, diagnostic: result.diagnostic))
     }
 
     static func probe() -> RootHelperCapabilitySnapshot {
@@ -164,15 +241,15 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         guard enumerationProven else {
             return AppLifecycleCapabilitySnapshot(available: false, detail: "跨 App 枚举尚未验证，不能安全启动任意目标 App。")
         }
-        guard let (_, workspaceClass) = launchServicesWorkspace() else {
-            return AppLifecycleCapabilitySnapshot(available: false, detail: "无法取得 LaunchServices workspace。")
-        }
-        let selector = NSSelectorFromString("openApplicationWithBundleID:")
-        let available = class_getInstanceMethod(workspaceClass, selector) != nil
-        return AppLifecycleCapabilitySnapshot(
-            available: available,
-            detail: available ? "LaunchServices openApplicationWithBundleID: selector 可用。" : "当前系统未暴露 openApplicationWithBundleID:。"
+        let snapshot = EmbeddedRootHelper.launchCapability()
+        try? await diagnosticLogger?.log(
+            level: snapshot.available ? .info : .warning,
+            subsystem: "root-helper",
+            action: "launch-capability",
+            result: snapshot.available ? "available" : "unavailable",
+            diagnostic: snapshot.detail
         )
+        return AppLifecycleCapabilitySnapshot(available: snapshot.available, detail: snapshot.detail)
     }
 
     public func appTerminateCapability() async -> AppLifecycleCapabilitySnapshot {
@@ -203,18 +280,16 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         guard capability.available else {
             return (false, "启动能力不可用：\(capability.detail)")
         }
-        guard let (workspace, workspaceClass) = launchServicesWorkspace() else {
-            return (false, "无法取得 LaunchServices workspace。")
-        }
-        let selector = NSSelectorFromString("openApplicationWithBundleID:")
-        guard let method = class_getInstanceMethod(workspaceClass, selector) else {
-            return (false, "当前系统没有暴露 openApplicationWithBundleID:。")
-        }
-        typealias OpenApplicationMethod = @convention(c) (AnyObject, Selector, AnyObject) -> Bool
-        let implementation = method_getImplementation(method)
-        let openApplication = unsafeBitCast(implementation, to: OpenApplicationMethod.self)
-        let success = openApplication(workspace, selector, bundleID as NSString)
-        return (success, success ? "LaunchServices 已接受启动请求。" : "LaunchServices 拒绝启动请求。")
+        let outcome = EmbeddedRootHelper.launch(bundleID: bundleID)
+        try? await diagnosticLogger?.log(
+            level: outcome.success ? .info : .error,
+            subsystem: "root-helper",
+            action: "launch",
+            result: outcome.success ? "accepted" : "rejected",
+            diagnostic: outcome.detail,
+            metadata: ["bundleID": bundleID, "bundlePath": path]
+        )
+        return outcome
     }
 
     public func terminateApplication(bundleID: String) async -> (success: Bool, detail: String) {
@@ -239,24 +314,15 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     public func canUninstallInstalledApps() async -> Bool {
         if Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
         guard enumerationProven else {
-            uninstallDetail = "必须先验证跨 App 的 LaunchServices 可见性。"
+            uninstallDetail = "必须先通过 helper 子进程验证跨 App 可见性。"
             return false
         }
         if let pendingBundleID = pendingUninstallBundleID {
-            guard let (workspace, workspaceClass) = launchServicesWorkspace(),
-                  let installed = applicationIsInstalled(pendingBundleID, workspace: workspace, workspaceClass: workspaceClass) else {
-                uninstallDetail = "上一次卸载请求 \(pendingBundleID) 的最终状态仍无法权威确认；在完成状态核对前不会开启新的卸载。"
-                return false
-            }
-            if installed {
-                // 这里已经完成了“先核对最终状态”：权威查询确认目标仍然安装，说明上一轮
-                // 没有观察到删除生效。清除本轮内存态 pending，允许之后由新的、显式确认过的
-                // Tool Call 再次尝试；持久化 execution ledger 仍会阻止旧 Tool Call ID 的盲目重放。
-                pendingUninstallBundleID = nil
-                uninstallDetail = "上一次卸载请求 \(pendingBundleID) 已完成状态核对：目标仍处于已安装状态；旧 Tool Call 不会重放，新的卸载仍需重新确认。"
+            let stillInstalled = cachedApps.contains { $0.ownerBundleID == pendingBundleID }
+            pendingUninstallBundleID = nil
+            if stillInstalled {
+                uninstallDetail = "上一次卸载请求 \(pendingBundleID) 已通过隔离枚举核对：目标仍处于已安装状态；旧 Tool Call 不会重放，新的卸载仍需重新确认。"
             } else {
-                pendingUninstallBundleID = nil
-                cachedApps.removeAll { $0.ownerBundleID == pendingBundleID }
                 bundlePaths.removeValue(forKey: pendingBundleID)
                 containerPaths.removeValue(forKey: pendingBundleID)
             }
@@ -268,31 +334,12 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             uninstallDetail = "没有可用于无损验证的普通用户 App。"
             return false
         }
-        guard let (workspace, workspaceClass) = launchServicesWorkspace() else {
-            uninstallDetail = "无法取得 LaunchServices workspace。"
+        let isolated = EmbeddedRootHelper.uninstallCapability(bundleID: targetBundleID)
+        guard isolated.available else {
+            uninstallDetail = "卸载能力的私有 selector/symbol 探测在 helper 子进程中失败：\(isolated.detail)"
             return false
         }
-        let hasLaunchServicesUninstall = class_getInstanceMethod(workspaceClass, NSSelectorFromString("uninstallApplication:withOptions:error:")) != nil
-            || class_getInstanceMethod(workspaceClass, NSSelectorFromString("uninstallApplication:withOptions:")) != nil
-        let hasMobileInstallationFallback = Self.mobileInstallationUninstallSymbol() != nil
-        let rootHelper = EmbeddedRootHelper.probe()
-        guard hasLaunchServicesUninstall || hasMobileInstallationFallback || rootHelper.available else {
-            uninstallDetail = "当前系统卸载 SPI 不可用，且嵌入式 root helper 未通过探测：\(rootHelper.detail)"
-            return false
-        }
-        guard hasAuthoritativeInstallationQuery(workspaceClass) else {
-            uninstallDetail = "当前系统没有暴露 applicationIsInstalled:，无法对卸载结果做权威校验。"
-            return false
-        }
-        guard applicationIsInstalled(targetBundleID, workspace: workspace, workspaceClass: workspaceClass) == true else {
-            uninstallDetail = "LaunchServices 无损安装状态查询未通过。"
-            return false
-        }
-        var backends: [String] = []
-        if hasLaunchServicesUninstall { backends.append("LaunchServices") }
-        if hasMobileInstallationFallback { backends.append("MobileInstallation") }
-        if rootHelper.available { backends.append("Embedded root helper") }
-        uninstallDetail = "已验证跨 App 枚举和权威安装状态查询；可用卸载后端：\(backends.joined(separator: " + "))。root helper 状态：\(rootHelper.detail) 实际卸载仍会验证注册状态、Bundle 和数据容器。"
+        uninstallDetail = "跨 App 枚举、权威安装状态查询和卸载后端均已在 helper 子进程内验证。实际卸载仍会执行最终状态校验。\(isolated.detail)"
         return true
     }
 
@@ -313,11 +360,13 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             return .rejected("目标不是当前可验证的普通用户 App，或已经不存在。")
         }
         let dataPath = containerPaths[bundleID]
-        guard await canUninstallInstalledApps(), let (workspace, workspaceClass) = launchServicesWorkspace() else {
+        guard await canUninstallInstalledApps() else {
             return .rejected(uninstallDetail)
         }
-        guard applicationIsInstalled(bundleID, workspace: workspace, workspaceClass: workspaceClass) == true else {
-            return .rejected("LaunchServices 在执行前未确认目标仍处于已安装状态。")
+
+        let preflight = EmbeddedRootHelper.installationState(bundleID: bundleID)
+        guard preflight.installed == true else {
+            return .rejected("helper 未能在执行前确认目标仍处于已安装状态：\(preflight.detail)")
         }
 
         try? await diagnosticLogger?.log(
@@ -327,72 +376,52 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             result: "started",
             metadata: ["bundleID": bundleID, "bundlePath": bundlePath]
         )
-        var request = performUninstallRequest(bundleID: bundleID, workspace: workspace, workspaceClass: workspaceClass)
+        let request = EmbeddedRootHelper.uninstall(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath)
+        try? await diagnosticLogger?.log(
+            level: request.accepted ? .info : .warning,
+            subsystem: "root-helper",
+            action: "uninstall",
+            result: request.accepted ? "accepted" : "rejected",
+            diagnostic: request.detail,
+            metadata: ["bundleID": bundleID]
+        )
+
         if !request.accepted {
-            let rootFallback = EmbeddedRootHelper.uninstall(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath)
-            try? await diagnosticLogger?.log(
-                level: rootFallback.accepted ? .info : .warning,
-                subsystem: "root-helper",
-                action: "uninstall-fallback",
-                result: rootFallback.accepted ? "accepted" : "rejected",
-                diagnostic: rootFallback.detail,
-                metadata: ["bundleID": bundleID]
-            )
-            if rootFallback.accepted {
-                request = rootFallback
-            } else {
-                let reconciliation = reconcileUninstallState(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath, workspace: workspace, workspaceClass: workspaceClass)
-                switch reconciliation {
-                case .removed:
-                    return .removed
-                case .removedWithResidualData(let detail):
-                    return .removedWithResidualData(detail)
-                case .stillInstalled:
-                    uninstallDetail = "系统卸载 SPI 被拒绝，root helper fallback 也未成功。系统后端：\(request.detail)；root helper：\(rootFallback.detail)"
-                    return .rejected(uninstallDetail)
-                case .inconsistent(let detail):
-                    uninstallDetail = "卸载 fallback 返回失败且最终状态不一致：\(detail)。系统后端：\(request.detail)；root helper：\(rootFallback.detail)"
-                    pendingUninstallBundleID = bundleID
-                    return .verificationTimedOut(uninstallDetail)
-                }
+            let reconciliation = reconcileUninstallState(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath)
+            switch reconciliation {
+            case .removed:
+                return .removed
+            case .removedWithResidualData(let detail):
+                return .removedWithResidualData(detail)
+            case .stillInstalled:
+                uninstallDetail = "隔离 root helper 未接受卸载，且最终核对确认目标仍处于安装状态：\(request.detail)"
+                return .rejected(uninstallDetail)
+            case .inconsistent(let detail):
+                uninstallDetail = "隔离 root helper 返回失败，最终状态不一致：\(detail)。helper：\(request.detail)"
+                pendingUninstallBundleID = bundleID
+                return .verificationTimedOut(uninstallDetail)
             }
         }
 
         pendingUninstallBundleID = bundleID
-        uninstallDetail = "卸载请求已由 \(request.detail) 接受；正在同时验证 LaunchServices 注册状态、Bundle 目录和数据容器。"
+        uninstallDetail = "卸载已完全委托给隔离 root helper；主 App 仅核对 helper 安装状态与 Bundle/数据容器最终文件系统状态。"
         if await verifyUninstallPostconditions(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath, attempts: 31) {
             finalizeVerifiedUninstall(bundleID: bundleID)
             try? await diagnosticLogger?.log(level: .info, subsystem: "verification", action: "apps.uninstall", result: "passed", diagnostic: uninstallDetail, metadata: ["bundleID": bundleID])
             return .removed
         }
 
-        // 有些系统会先接受 LaunchServices 请求但迟迟不执行删除。只要这是同一个已经确认过的
-        // Tool Call，就允许在完成第一次最终状态核对后升级到嵌入式 root helper；这不是盲目重放。
-        if !request.detail.contains("root helper") {
-            let rootFallback = EmbeddedRootHelper.uninstall(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath)
-            try? await diagnosticLogger?.log(
-                level: rootFallback.accepted ? .info : .error,
-                subsystem: "root-helper",
-                action: "uninstall-escalation",
-                result: rootFallback.accepted ? "accepted" : "failed",
-                diagnostic: rootFallback.detail,
-                metadata: ["bundleID": bundleID]
-            )
-            if rootFallback.accepted {
-                uninstallDetail = "LaunchServices 接受请求但未完成删除，已在同一确认操作内切换到 root helper fallback；正在再次验证最终状态。"
-                if await verifyUninstallPostconditions(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath, attempts: 20) {
-                    finalizeVerifiedUninstall(bundleID: bundleID)
-                    try? await diagnosticLogger?.log(level: .info, subsystem: "verification", action: "apps.uninstall", result: "passed_after_root_fallback", diagnostic: uninstallDetail, metadata: ["bundleID": bundleID])
-                    return .removed
-                }
-            } else {
-                uninstallDetail = "LaunchServices 请求未在约 12 秒内完成；root helper fallback 也失败：\(rootFallback.detail)"
-            }
+        let reconciliation = reconcileUninstallState(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath)
+        switch reconciliation {
+        case .removed:
+            return .removed
+        case .removedWithResidualData(let detail):
+            return .removedWithResidualData(detail)
+        case .stillInstalled, .inconsistent:
+            let timeoutDetail = uninstallDetail + "。目标最终状态仍未满足‘helper 确认未安装 + Bundle 消失 + 已知数据容器消失’，因此不会误报卸载成功。"
+            try? await diagnosticLogger?.log(level: .error, subsystem: "verification", action: "apps.uninstall", result: "timed_out", diagnostic: timeoutDetail, metadata: ["bundleID": bundleID])
+            return .verificationTimedOut(timeoutDetail)
         }
-
-        let timeoutDetail = uninstallDetail + "。目标最终状态仍未满足‘注册消失 + Bundle 消失 + 已知数据容器消失’，因此不会误报卸载成功。"
-        try? await diagnosticLogger?.log(level: .error, subsystem: "verification", action: "apps.uninstall", result: "timed_out", diagnostic: timeoutDetail, metadata: ["bundleID": bundleID])
-        return .verificationTimedOut(timeoutDetail)
     }
 
     private enum UninstallReconciliation {
@@ -402,25 +431,25 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         case inconsistent(String)
     }
 
-    private func reconcileUninstallState(bundleID: String, bundlePath: String, dataPath: String?, workspace: NSObject, workspaceClass: AnyClass) -> UninstallReconciliation {
+    private func reconcileUninstallState(bundleID: String, bundlePath: String, dataPath: String?) -> UninstallReconciliation {
         let fileManager = FileManager.default
-        let installed = applicationIsInstalled(bundleID, workspace: workspace, workspaceClass: workspaceClass)
+        let installation = EmbeddedRootHelper.installationState(bundleID: bundleID)
         let bundleExists = fileManager.fileExists(atPath: bundlePath)
         let dataExists = dataPath.map { fileManager.fileExists(atPath: $0) } ?? false
 
-        if installed == false && !bundleExists {
+        if installation.installed == false && !bundleExists {
             finalizeVerifiedUninstall(bundleID: bundleID)
             if dataExists {
-                let detail = "目标 App 已从 LaunchServices 注册和 Bundle 路径移除，但已知数据容器仍存在：\(dataPath ?? "未知")。不会把残留数据误报为完整卸载。"
+                let detail = "目标 App 已由 helper 确认未安装且 Bundle 已移除，但已知数据容器仍存在：\(dataPath ?? "未知")。不会把残留数据误报为完整卸载。"
                 uninstallDetail = detail
                 return .removedWithResidualData(detail)
             }
             return .removed
         }
-        if installed == true && bundleExists {
+        if installation.installed == true && bundleExists {
             return .stillInstalled
         }
-        return .inconsistent("LaunchServices installed=\(installed.map { String(describing: $0) } ?? "unknown"), bundleExists=\(bundleExists), dataExists=\(dataExists)")
+        return .inconsistent("helper installed=\(installation.installed.map { String(describing: $0) } ?? "unknown"), bundleExists=\(bundleExists), dataExists=\(dataExists), detail=\(installation.detail)")
     }
 
     private func verifyUninstallPostconditions(bundleID: String, bundlePath: String, dataPath: String?, attempts: Int) async -> Bool {
@@ -428,8 +457,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         for attempt in 0..<attempts {
             if Task.isCancelled { return false }
             if attempt > 0 { try? await Task.sleep(nanoseconds: 400_000_000) }
-            guard let (verificationWorkspace, verificationClass) = launchServicesWorkspace() else { continue }
-            let registrationGone = applicationIsInstalled(bundleID, workspace: verificationWorkspace, workspaceClass: verificationClass) == false
+            let registrationGone = EmbeddedRootHelper.installationState(bundleID: bundleID).installed == false
             let bundleGone = !fileManager.fileExists(atPath: bundlePath)
             let dataGone = dataPath.map { !fileManager.fileExists(atPath: $0) } ?? true
             if registrationGone && bundleGone && dataGone { return true }
@@ -456,34 +484,13 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
 
         enumerationProven = false
         enumerationDetail = "已安装 App 枚举尚未得到跨 App 可见性的有效证据。"
-        uninstallDetail = "正在根据本次 LaunchServices 探测重新判断卸载后端。"
+        uninstallDetail = "正在根据本次 helper 隔离探测重新判断卸载后端。"
         bundlePaths = [:]
         containerPaths = [:]
 
-        Self.loadLaunchServicesIfNeeded()
-        guard let workspaceClass = NSClassFromString("LSApplicationWorkspace") else {
-            enumerationDetail = "LSApplicationWorkspace 在当前运行环境中不可用。"
-            cachedApps = fallbackOwnApp()
-            return
-        }
-        let defaultSelector = NSSelectorFromString("defaultWorkspace")
-        guard let classMethod = class_getClassMethod(workspaceClass, defaultSelector) else {
-            enumerationDetail = "LSApplicationWorkspace.defaultWorkspace 不可用。"
-            cachedApps = fallbackOwnApp()
-            return
-        }
-        typealias ClassObjectMethod = @convention(c) (AnyClass, Selector) -> Unmanaged<AnyObject>?
-        let classIMP = method_getImplementation(classMethod)
-        let getDefaultWorkspace = unsafeBitCast(classIMP, to: ClassObjectMethod.self)
-        guard let workspace = getDefaultWorkspace(workspaceClass, defaultSelector)?.takeUnretainedValue() as? NSObject else {
-            enumerationDetail = "无法取得 LaunchServices 默认 workspace。"
-            cachedApps = fallbackOwnApp()
-            return
-        }
-
-        let (rawApps, backend) = collectInstalledApplicationProxies(workspace: workspace, workspaceClass: workspaceClass)
-        guard !rawApps.isEmpty else {
-            enumerationDetail = "\(backend) 未返回任何应用；不能把空数组视为可用能力。"
+        let isolated = EmbeddedRootHelper.enumerateInstalledApps()
+        guard let payload = isolated.payload, !payload.apps.isEmpty else {
+            enumerationDetail = isolated.detail
             cachedApps = fallbackOwnApp()
             return
         }
@@ -491,22 +498,17 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         var appsByBundleID: [String: ResourceNode] = [:]
         var bundles: [String: String] = [:]
         var containers: [String: String] = [:]
-        for proxy in rawApps {
-            guard let bundleID = safeString(proxy, key: "applicationIdentifier") ?? safeString(proxy, key: "bundleIdentifier"), !bundleID.isEmpty else { continue }
-            let name = safeString(proxy, key: "localizedName") ?? safeString(proxy, key: "itemName") ?? bundleID
-            let version = safeString(proxy, key: "shortVersionString")
-            let bundleURL = safeURL(proxy, key: "bundleURL")
-            let containerURL = safeURL(proxy, key: "dataContainerURL")
-            if let bundleURL { bundles[bundleID] = bundleURL.path }
-            if let containerURL { containers[bundleID] = containerURL.path }
-            appsByBundleID[bundleID] = ResourceNode(
-                id: ResourceID("app://\(bundleID)"),
+        for app in payload.apps where !app.bundleID.isEmpty {
+            if !app.bundlePath.isEmpty { bundles[app.bundleID] = app.bundlePath }
+            if !app.dataContainerPath.isEmpty { containers[app.bundleID] = app.dataContainerPath }
+            appsByBundleID[app.bundleID] = ResourceNode(
+                id: ResourceID("app://\(app.bundleID)"),
                 kind: .app,
-                displayName: name,
-                logicalLocation: "app://\(bundleID)",
-                resolvedPath: bundleURL?.path,
-                ownerBundleID: bundleID,
-                metadata: ["version": version ?? "", "containerKnown": containerURL == nil ? "false" : "true"]
+                displayName: app.name.isEmpty ? app.bundleID : app.name,
+                logicalLocation: "app://\(app.bundleID)",
+                resolvedPath: app.bundlePath.isEmpty ? nil : app.bundlePath,
+                ownerBundleID: app.bundleID,
+                metadata: ["version": app.version, "containerKnown": app.dataContainerPath.isEmpty ? "false" : "true"]
             )
         }
 
@@ -514,138 +516,21 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         let ownBundleID = Bundle.main.bundleIdentifier
         let crossAppCount = parsedApps.filter { $0.ownerBundleID != nil && $0.ownerBundleID != ownBundleID }.count
         guard crossAppCount > 0 else {
-            enumerationDetail = "\(backend) 只暴露了 Cloud Code 自身或无法解析的记录；跨 App 枚举未通过。"
+            enumerationDetail = "\(payload.backend) helper 只返回 Cloud Code 自身或无法解析的记录；跨 App 枚举未通过。"
             cachedApps = fallbackOwnApp()
             return
         }
 
         enumerationProven = true
-        enumerationDetail = "\(backend) 返回 \(parsedApps.count) 个有效应用，其中 \(crossAppCount) 个不是 Cloud Code 自身。"
+        enumerationDetail = "\(payload.backend) 已在 helper 子进程内返回 \(parsedApps.count) 个有效应用，其中 \(crossAppCount) 个不是 Cloud Code 自身。"
         cachedApps = parsedApps
         bundlePaths = bundles
         containerPaths = containers
     }
 
-    private func launchServicesWorkspace() -> (NSObject, AnyClass)? {
-        Self.loadLaunchServicesIfNeeded()
-        guard let workspaceClass = NSClassFromString("LSApplicationWorkspace") else { return nil }
-        let defaultSelector = NSSelectorFromString("defaultWorkspace")
-        guard let classMethod = class_getClassMethod(workspaceClass, defaultSelector) else { return nil }
-        typealias ClassObjectMethod = @convention(c) (AnyClass, Selector) -> Unmanaged<AnyObject>?
-        let implementation = method_getImplementation(classMethod)
-        let getDefaultWorkspace = unsafeBitCast(implementation, to: ClassObjectMethod.self)
-        guard let workspace = getDefaultWorkspace(workspaceClass, defaultSelector)?.takeUnretainedValue() as? NSObject else { return nil }
-        return (workspace, workspaceClass)
-    }
-
-    private func hasAuthoritativeInstallationQuery(_ workspaceClass: AnyClass) -> Bool {
-        class_getInstanceMethod(workspaceClass, NSSelectorFromString("applicationIsInstalled:")) != nil
-    }
-
-    private func applicationIsInstalled(_ bundleID: String, workspace: NSObject, workspaceClass: AnyClass) -> Bool? {
-        let selector = NSSelectorFromString("applicationIsInstalled:")
-        guard let method = class_getInstanceMethod(workspaceClass, selector) else { return nil }
-        typealias IsInstalledMethod = @convention(c) (AnyObject, Selector, AnyObject) -> Bool
-        let implementation = method_getImplementation(method)
-        let isInstalled = unsafeBitCast(implementation, to: IsInstalledMethod.self)
-        return isInstalled(workspace, selector, bundleID as NSString)
-    }
-
-    private func performUninstallRequest(bundleID: String, workspace: NSObject, workspaceClass: AnyClass) -> (accepted: Bool, detail: String) {
-        let errorSelector = NSSelectorFromString("uninstallApplication:withOptions:error:")
-        if let method = class_getInstanceMethod(workspaceClass, errorSelector) {
-            typealias UninstallErrorMethod = @convention(c) (AnyObject, Selector, AnyObject, AnyObject, UnsafeMutablePointer<AnyObject?>?) -> Bool
-            let implementation = method_getImplementation(method)
-            let uninstall = unsafeBitCast(implementation, to: UninstallErrorMethod.self)
-            var errorObject: AnyObject?
-            let accepted = uninstall(workspace, errorSelector, bundleID as NSString, NSDictionary(), &errorObject)
-            if accepted { return (true, "LaunchServices(error-aware)") }
-            if let error = errorObject as? NSError {
-                uninstallDetail = "LaunchServices(error-aware) 拒绝：\(error.domain) \(error.code) · \(error.localizedDescription)"
-            } else {
-                uninstallDetail = "LaunchServices(error-aware) 返回 rejected，未提供 NSError。"
-            }
-        }
-
-        let legacySelector = NSSelectorFromString("uninstallApplication:withOptions:")
-        if let method = class_getInstanceMethod(workspaceClass, legacySelector) {
-            typealias UninstallMethod = @convention(c) (AnyObject, Selector, AnyObject, AnyObject) -> Bool
-            let implementation = method_getImplementation(method)
-            let uninstall = unsafeBitCast(implementation, to: UninstallMethod.self)
-            if uninstall(workspace, legacySelector, bundleID as NSString, NSDictionary()) {
-                return (true, "LaunchServices(legacy)")
-            }
-            uninstallDetail += uninstallDetail.isEmpty ? "LaunchServices(legacy) 返回 rejected。" : "；LaunchServices(legacy) 也返回 rejected。"
-        }
-
-        #if canImport(Darwin)
-        if let symbol = Self.mobileInstallationUninstallSymbol() {
-            typealias MobileInstallationUninstall = @convention(c) (UnsafeRawPointer?, UnsafeRawPointer?, UnsafeRawPointer?) -> Int32
-            let uninstall = unsafeBitCast(symbol, to: MobileInstallationUninstall.self)
-            let identifier = bundleID as NSString
-            let identifierPointer = UnsafeRawPointer(Unmanaged.passUnretained(identifier).toOpaque())
-            let code = uninstall(identifierPointer, nil, nil)
-            if code == 0 { return (true, "MobileInstallationUninstall") }
-            uninstallDetail += uninstallDetail.isEmpty ? "MobileInstallationUninstall 返回 \(code)。" : "；MobileInstallationUninstall 返回 \(code)。"
-        }
-        #endif
-
-        return (false, uninstallDetail.isEmpty ? "没有可执行的卸载后端。" : uninstallDetail)
-    }
-
-    private static func mobileInstallationUninstallSymbol() -> UnsafeMutableRawPointer? {
-        #if canImport(Darwin)
-        guard let handle = dlopen("/System/Library/PrivateFrameworks/MobileInstallation.framework/MobileInstallation", RTLD_LAZY | RTLD_LOCAL) else { return nil }
-        return dlsym(handle, "MobileInstallationUninstall")
-        #else
-        return nil
-        #endif
-    }
-
-    private func collectInstalledApplicationProxies(workspace: NSObject, workspaceClass: AnyClass) -> ([NSObject], String) {
-        let enumerateSelector = NSSelectorFromString("enumerateApplicationsOfType:block:")
-        if let enumerateMethod = class_getInstanceMethod(workspaceClass, enumerateSelector) {
-            typealias EnumerationBlock = @convention(block) (AnyObject) -> Void
-            typealias EnumerateMethod = @convention(c) (AnyObject, Selector, UInt, EnumerationBlock) -> Void
-            let implementation = method_getImplementation(enumerateMethod)
-            let enumerate = unsafeBitCast(implementation, to: EnumerateMethod.self)
-            var collected: [NSObject] = []
-            let block: EnumerationBlock = { object in
-                if let proxy = object as? NSObject { collected.append(proxy) }
-            }
-            enumerate(workspace, enumerateSelector, 0, block)
-            enumerate(workspace, enumerateSelector, 1, block)
-            if !collected.isEmpty {
-                return (collected, "LaunchServices enumerateApplicationsOfType")
-            }
-        }
-
-        typealias ObjectMethod = @convention(c) (AnyObject, Selector) -> Unmanaged<AnyObject>?
-        for selectorName in ["allInstalledApplications", "allApplications"] {
-            let selector = NSSelectorFromString(selectorName)
-            guard let instanceMethod = class_getInstanceMethod(workspaceClass, selector) else { continue }
-            let implementation = method_getImplementation(instanceMethod)
-            let getApplications = unsafeBitCast(implementation, to: ObjectMethod.self)
-            if let raw = getApplications(workspace, selector)?.takeUnretainedValue() as? [NSObject], !raw.isEmpty {
-                return (raw, "LaunchServices \(selectorName)")
-            }
-        }
-        return ([], "LaunchServices")
-    }
-
     private static func isUserApplicationBundlePath(_ path: String?) -> Bool {
         guard let normalized = path?.replacingOccurrences(of: "//", with: "/") else { return false }
         return normalized.hasPrefix("/var/containers/Bundle/Application/") || normalized.hasPrefix("/private/var/containers/Bundle/Application/")
-    }
-
-    private static func loadLaunchServicesIfNeeded() {
-        #if canImport(Darwin)
-        guard NSClassFromString("LSApplicationWorkspace") == nil else { return }
-        _ = dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_LAZY | RTLD_LOCAL)
-        if NSClassFromString("LSApplicationWorkspace") == nil {
-            _ = dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY | RTLD_LOCAL)
-        }
-        #endif
     }
 
     private func fallbackOwnApp() -> [ResourceNode] {
@@ -655,15 +540,6 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         return [ResourceNode(id: ResourceID("app://\(bundleID)"), kind: .app, displayName: Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "Cloud Code", logicalLocation: "app://\(bundleID)", resolvedPath: Bundle.main.bundleURL.path, ownerBundleID: bundleID)]
     }
 
-    private func safeString(_ object: NSObject, key: String) -> String? {
-        guard object.responds(to: NSSelectorFromString(key)) else { return nil }
-        return object.value(forKey: key) as? String
-    }
-
-    private func safeURL(_ object: NSObject, key: String) -> URL? {
-        guard object.responds(to: NSSelectorFromString(key)) else { return nil }
-        return object.value(forKey: key) as? URL
-    }
 }
 
 @MainActor

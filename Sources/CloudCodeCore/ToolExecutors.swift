@@ -64,7 +64,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
     public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
         switch call.name {
         case "capability.probe":
-            let profile = await capabilityProbe.probe()
+            let profile = await capabilityProbe.probePrivileged()
             let payload = Dictionary(profile.records.map { ($0.id, $0.status.rawValue) }, uniquingKeysWith: { _, latest in latest })
             return ToolResult(toolCallID: call.id, success: true, summary: "能力检测完成", payload: payload)
 
