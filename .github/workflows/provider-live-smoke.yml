@@ -191,17 +191,51 @@ jobs:
               parsed = json.loads(models_body)
           except json.JSONDecodeError as exc:
               raise SystemExit(f"FAIL: Tabitoken /models returned malformed JSON: {exc.msg}")
-          items = (parsed.get("data") or parsed.get("models") or []) if isinstance(parsed, dict) else []
+          catalog = (parsed.get("data") or parsed.get("models") or []) if isinstance(parsed, dict) else []
           ids = []
-          if isinstance(items, list):
-              for item in items:
-                  value = (item.get("id") or item.get("name") or item.get("model")) if isinstance(item, dict) else item
-                  if isinstance(value, str):
-                      value = value.strip()
-                  if isinstance(value, str) and value and "\n" not in value and "\r" not in value and value not in ids:
-                      ids.append(value)
+          preferred_keys = ("id", "model", "model_id", "modelId", "model_name", "modelName", "name", "slug", "value")
+
+          def append_candidate(value):
+              if not isinstance(value, str):
+                  return
+              value = value.strip()
+              if not value or len(value) > 256 or "\n" in value or "\r" in value or value in ids:
+                  return
+              ids.append(value)
+
+          def extract_candidates(node, allow_scalar=True):
+              if isinstance(node, str):
+                  if allow_scalar:
+                      append_candidate(node)
+                  return
+              if isinstance(node, list):
+                  for child in node:
+                      extract_candidates(child, True)
+                  return
+              if not isinstance(node, dict):
+                  return
+              matched = False
+              for key in preferred_keys:
+                  if key not in node:
+                      continue
+                  matched = True
+                  child = node[key]
+                  if isinstance(child, str):
+                      append_candidate(child)
+                  else:
+                      extract_candidates(child, True)
+              if matched:
+                  return
+              for child in node.values():
+                  if isinstance(child, (dict, list)):
+                      extract_candidates(child, False)
+
+          extract_candidates(catalog)
           if not ids:
-              raise SystemExit("FAIL: Tabitoken /models returned an empty usable model catalog")
+              top_type = type(catalog).__name__
+              item_type = type(catalog[0]).__name__ if isinstance(catalog, list) and catalog else "none"
+              item_keys = sorted(catalog[0].keys()) if isinstance(catalog, list) and catalog and isinstance(catalog[0], dict) else []
+              raise SystemExit(f"FAIL: Tabitoken /models has no extractable model IDs (catalog_type={top_type}, first_item_type={item_type}, first_item_keys={item_keys})")
           named_claude = [model for model in ids if "claude" in model.lower()]
           other_models = [model for model in ids if model not in named_claude]
           anthropic_candidates = named_claude + other_models

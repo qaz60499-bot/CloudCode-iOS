@@ -92,12 +92,58 @@ public struct ProviderDiscoveryClient: Sendable {
         guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("缺少 HTTP 响应") }
         if let error = ProviderHTTPClassifier.error(for: http.statusCode, body: data) { throw error }
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let rows = object["data"] as? [[String: Any]] else { throw ProviderError.malformedEvent }
+              let catalog = object["data"] ?? object["models"] else { throw ProviderError.malformedEvent }
+        let result = Self.extractModelIdentifiers(from: catalog)
+        guard !result.isEmpty else { throw ProviderError.malformedEvent }
+        return result
+    }
+
+    private static func extractModelIdentifiers(from value: Any) -> [String] {
         var result: [String] = []
-        for row in rows {
-            let value = (row["id"] as? String ?? row["name"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !value.isEmpty, !result.contains(value) { result.append(value) }
+        let preferredKeys = ["id", "model", "model_id", "modelId", "model_name", "modelName", "name", "slug", "value"]
+
+        func append(_ raw: String) {
+            let candidate = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !candidate.isEmpty,
+                  candidate.count <= 256,
+                  !candidate.contains("\n"),
+                  !candidate.contains("\r"),
+                  !result.contains(candidate) else { return }
+            result.append(candidate)
         }
+
+        func visit(_ node: Any, allowScalar: Bool) {
+            if let string = node as? String {
+                if allowScalar { append(string) }
+                return
+            }
+            if let array = node as? [Any] {
+                for item in array { visit(item, allowScalar: true) }
+                return
+            }
+            guard let dictionary = node as? [String: Any] else { return }
+
+            var matchedPreferredKey = false
+            for key in preferredKeys {
+                guard let child = dictionary[key] else { continue }
+                matchedPreferredKey = true
+                if let string = child as? String {
+                    append(string)
+                } else {
+                    visit(child, allowScalar: true)
+                }
+            }
+            if matchedPreferredKey { return }
+
+            // Some compatible gateways wrap each model in a provider-specific object.
+            // Traverse nested containers, but do not treat unrelated top-level metadata
+            // scalars as model IDs unless they are the row itself.
+            for child in dictionary.values where child is [Any] || child is [String: Any] {
+                visit(child, allowScalar: false)
+            }
+        }
+
+        visit(value, allowScalar: true)
         return result
     }
 

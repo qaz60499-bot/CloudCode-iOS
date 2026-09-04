@@ -1412,7 +1412,7 @@ private final class ProviderDiscoveryURLProtocol: URLProtocol, @unchecked Sendab
         let body: Data
         if path.hasSuffix("/v1/models") {
             status = 200
-            body = Data("{\"data\":[{\"id\":\"model-a\"}]}".utf8)
+            body = Data("{\"data\":[{\"provider_record\":{\"model_id\":\"model-a\"}}]}".utf8)
         } else if path.hasSuffix("/v1/messages"), hasBearer, hasXAPIKey {
             status = 200
             body = Data("{\"content\":[{\"type\":\"text\",\"text\":\"OK\"}]}".utf8)
