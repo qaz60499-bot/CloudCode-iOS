@@ -416,15 +416,24 @@ public final class CloudCodeViewModel: ObservableObject {
             return false
         }
         defer { endExclusiveOperation(Self.providerKeyMutationOperationKey) }
-        if let profile = providerProfiles.first(where: { $0.id == providerID }),
-           let slot = profile.keySlots.first(where: { $0.id == keySlotID }),
-           !slot.fingerprint.isEmpty,
-           ProviderFingerprint.sha256(secret) != slot.fingerprint {
-            lastError = "该 Key 与当前槽位的指纹不匹配，原有 Key 未被修改。"
-            return false
-        }
+        let incomingFingerprint = ProviderFingerprint.sha256(secret)
+        let existingFingerprint = providerProfiles
+            .first(where: { $0.id == providerID })?
+            .keySlots.first(where: { $0.id == keySlotID })?
+            .fingerprint
+        let replacesCatalogFingerprint = existingFingerprint.map { !$0.isEmpty && $0 != incomingFingerprint } ?? false
         do {
             try keyVault.set(secret, for: reference)
+            if replacesCatalogFingerprint,
+               let providerIndex = providerProfiles.firstIndex(where: { $0.id == providerID }),
+               let slotIndex = providerProfiles[providerIndex].keySlots.firstIndex(where: { $0.id == keySlotID }) {
+                providerProfiles[providerIndex].keySlots[slotIndex].fingerprint = incomingFingerprint
+                providerProfiles[providerIndex].keySlots[slotIndex].status = .needsValidation
+                if providerProfiles[providerIndex].source == .custom {
+                    try? persistCustomProviders()
+                }
+                activityLines.append("已按你的明确操作替换当前厂商 Key；新 Key 与随安装包保存的旧指纹不同，已标记为待验证。")
+            }
             return true
         } catch {
             lastError = "Keychain 错误：\(error)"
@@ -1767,6 +1776,17 @@ public final class CloudCodeViewModel: ObservableObject {
 
     private func markProviderEndpointHealthy(_ configuration: ProviderConfiguration) {
         providerEndpointHealth[providerEndpointHealthKey(configuration)] = ProviderEndpointHealth(state: .healthy)
+        guard let providerID = configuration.providerID,
+              let providerIndex = providerProfiles.firstIndex(where: { $0.id == providerID }),
+              let slotIndex = providerProfiles[providerIndex].keySlots.firstIndex(where: {
+                  ProviderCatalog.keyReference(providerID: providerID, keySlotID: $0.id) == configuration.apiKeyReference
+              }) else { return }
+        if providerProfiles[providerIndex].keySlots[slotIndex].status == .needsValidation {
+            providerProfiles[providerIndex].keySlots[slotIndex].status = .verified
+            if providerProfiles[providerIndex].source == .custom {
+                try? persistCustomProviders()
+            }
+        }
     }
 
     private func recordProviderFailure(_ error: Error, configuration: ProviderConfiguration, sessionID: UUID) {

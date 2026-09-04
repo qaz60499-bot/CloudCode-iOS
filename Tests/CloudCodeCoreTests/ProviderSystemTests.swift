@@ -48,7 +48,7 @@ final class ProviderCatalogTests: XCTestCase {
     func testAgentRouterUsesCurrentOriginAndExplicitPerModelProtocols() throws {
         let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-agentrouter-org" }))
         XCTAssertEqual(provider.baseURL.absoluteString, "https://co.agentrouter.org")
-        XCTAssertEqual(provider.authMode, .both)
+        XCTAssertEqual(provider.authMode, .bearer)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-4-8", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-5", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.protocolFor(model: "deepseek-v4-flash", keySlotID: "slot-1"), .openAIChat)
@@ -587,7 +587,7 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(events.last, .finished)
     }
 
-    func testAgentRouterDeepSeekUsesOpenAIChatCurrentOriginAndDualAuth() async throws {
+    func testAgentRouterDeepSeekUsesOpenAIChatCurrentOriginAndBearerAuth() async throws {
         let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-agentrouter-org" }))
         let protocolName = provider.protocolFor(model: "deepseek-v4-flash", keySlotID: "slot-1")
         XCTAssertEqual(protocolName, .openAIChat)
@@ -610,7 +610,7 @@ final class ProviderProtocolClientTests: XCTestCase {
         let request = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
         XCTAssertEqual(request.url?.absoluteString, "https://co.agentrouter.org/v1/chat/completions")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
-        XCTAssertEqual(request.value(forHTTPHeaderField: "x-api-key"), "test-secret")
+        XCTAssertNil(request.value(forHTTPHeaderField: "x-api-key"))
         XCTAssertNil(request.value(forHTTPHeaderField: "anthropic-version"))
     }
 

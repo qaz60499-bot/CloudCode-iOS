@@ -222,9 +222,11 @@ jobs:
                   raise SystemExit(f'FAIL: provider proxy/non-SSE compatibility marker missing: {marker}')
           catalog = Path('Sources/CloudCodeCore/ProviderCatalog.swift').read_text(encoding='utf-8')
           agent_router = catalog.split('id: "https-agentrouter-org"', 1)[1].split('source: .desktopSnapshot', 1)[0]
-          if 'authMode: .both' not in agent_router:
-              raise SystemExit('FAIL: AgentRouter dual-auth compatibility guard regressed')
-          print('PASS: startup-safe, provider-compatibility and settings-navigation guardrails are present')
+          if 'authMode: .bearer' not in agent_router:
+              raise SystemExit('FAIL: AgentRouter catalog auth mode drifted without live evidence')
+          if '已按你的明确操作替换当前厂商 Key' not in app:
+              raise SystemExit('FAIL: explicit rotated-key replacement path is missing')
+          print('PASS: startup-safe, provider-compatibility, rotated-key and settings-navigation guardrails are present')
           PY
           grep -F 'backgroundContinuationWindow: TimeInterval = 90 * 60' Sources/CloudCodeApp/AppEnvironment.swift >/dev/null
           grep -F 'type: library.static' project.yml >/dev/null
