@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: cloudcode-ios-private-trollstore-privileged-${{ github.ref }}
@@ -17,6 +18,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Require successful release-launch CI for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RUNS_JSON="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ios-ci.yml --commit "$GITHUB_SHA" --status completed --limit 10 --json conclusion,headSha,databaseId)"
+          python3 - "$GITHUB_SHA" "$RUNS_JSON" <<'PY'
+          import json
+          import sys
+          head = sys.argv[1]
+          runs = json.loads(sys.argv[2])
+          if not any(run.get("headSha") == head and run.get("conclusion") == "success" for run in runs):
+              raise SystemExit("FAIL: privileged IPA cannot be produced until iOS CI and IPA succeeds for this exact commit")
+          print("PASS: exact commit already passed release-simulator cold-launch/relaunch CI")
+          PY
 
       - name: Validate required secrets
         env:

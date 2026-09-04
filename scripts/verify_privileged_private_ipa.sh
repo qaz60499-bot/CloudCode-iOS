@@ -85,6 +85,15 @@ if /usr/libexec/PlistBuddy -c 'Print :platform-application' "$ENTITLEMENTS" >/de
   echo "FAIL: privileged SwiftUI host must not carry platform-application" >&2
   exit 11
 fi
+for banned in \
+  'com.apple.private.cs.debugger' \
+  'dynamic-codesigning' \
+  'com.apple.private.skip-library-validation'; do
+  if /usr/libexec/PlistBuddy -c "Print :$banned" "$ENTITLEMENTS" >/dev/null 2>&1; then
+    echo "FAIL: TrollStore launch-crashing entitlement present on main executable: $banned" >&2
+    exit 11
+  fi
+done
 
 test "$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$ENTITLEMENTS")" = 'TROLLTROLL.*'
 test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$ENTITLEMENTS")" = 'TROLLTROLL'
@@ -108,6 +117,15 @@ if /usr/libexec/PlistBuddy -c 'Print :platform-application' "$HELPER_ENTITLEMENT
   echo "FAIL: root helper must not carry unnecessary platform-application" >&2
   exit 12
 fi
+for banned in \
+  'com.apple.private.cs.debugger' \
+  'dynamic-codesigning' \
+  'com.apple.private.skip-library-validation'; do
+  if /usr/libexec/PlistBuddy -c "Print :$banned" "$HELPER_ENTITLEMENTS" >/dev/null 2>&1; then
+    echo "FAIL: TrollStore launch-crashing entitlement present on root helper: $banned" >&2
+    exit 12
+  fi
+done
 
 echo "PASS: privileged TrollStore entitlement set is embedded without platform-application launch side effects"
 echo "SECURITY: this IPA contains private Provider credentials and privileged entitlements; use only on the user's own TrollStore test device"
