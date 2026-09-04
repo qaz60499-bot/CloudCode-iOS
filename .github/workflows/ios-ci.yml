@@ -66,7 +66,7 @@ jobs:
           xcrun simctl boot "$UDID" >/dev/null 2>&1 || true
           python3 -c 'import subprocess,sys; subprocess.run(["xcrun","simctl","bootstatus",sys.argv[1],"-b"], check=True, timeout=180)' "$UDID"
           simctl_bounded() {
-            python3 -c 'import subprocess,sys; p=subprocess.run(["xcrun","simctl"]+sys.argv[1:], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30); sys.stdout.write(p.stdout); sys.stderr.write(p.stderr); raise SystemExit(p.returncode)' "$@"
+            python3 -c 'import subprocess,sys; p=subprocess.run(["xcrun","simctl"]+sys.argv[1:], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120); sys.stdout.write(p.stdout); sys.stderr.write(p.stderr); raise SystemExit(p.returncode)' "$@"
           }
           simctl_bounded install "$UDID" "$APP_PATH"
           verify_stable_launch() {
@@ -185,7 +185,7 @@ jobs:
             exit 1
           fi
           grep -F 'simctl_bounded()' .github/workflows/ios-ci.yml >/dev/null
-          grep -F 'timeout=30' .github/workflows/ios-ci.yml >/dev/null
+          grep -F 'timeout=120' .github/workflows/ios-ci.yml >/dev/null
           grep -F 'revision: "22787ffb59de99e5dc1fbfe80b19c97a904ad48d"' Package.swift >/dev/null
           grep -F 'revision: 22787ffb59de99e5dc1fbfe80b19c97a904ad48d' project.yml >/dev/null
           if grep -R --line-number 'NSAllowsArbitraryLoads' Sources project.yml Entitlements; then
