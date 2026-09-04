@@ -308,6 +308,14 @@ jobs:
           swift package resolve
           test "$(git -C .build/checkouts/ZIPFoundation rev-parse HEAD)" = "22787ffb59de99e5dc1fbfe80b19c97a904ad48d"
 
+      - name: Run real Cloud Code Agent two-round tool smoke against Justwoker
+        env:
+          CLOUDCODE_JUSTWOKER_LIVE_SMOKE: "1"
+          CLOUDCODE_PROVIDER_BOOTSTRAP: ${{ secrets.CLOUDCODE_PROVIDER_BOOTSTRAP }}
+        run: |
+          set -euo pipefail
+          swift test --filter testJustwokerAgentUsesFullCloudCodeToolSchemaExecutesToolAndContinuesAfterResult
+
       - name: Run real Cloud Code Agent tool round against Tabitoken
         if: steps.live_probe.outputs.billing_blocked != 'true'
         env:
@@ -315,7 +323,7 @@ jobs:
           CLOUDCODE_PROVIDER_BOOTSTRAP: ${{ secrets.CLOUDCODE_PROVIDER_BOOTSTRAP }}
         run: |
           set -euo pipefail
-          swift test --filter ProviderLiveIntegrationTests
+          swift test --filter testTabitokenAgentUsesFullCloudCodeToolSchemaExecutesToolAndContinuesAfterResult
 
       - name: Run deterministic Provider regressions when account credit blocks live generation
         if: steps.live_probe.outputs.billing_blocked == 'true'

@@ -864,6 +864,83 @@ final class ProviderProtocolClientTests: XCTestCase {
 }
 
 final class ProviderLiveIntegrationTests: XCTestCase {
+    func testJustwokerAgentUsesFullCloudCodeToolSchemaExecutesToolAndContinuesAfterResult() async throws {
+        guard ProcessInfo.processInfo.environment["CLOUDCODE_JUSTWOKER_LIVE_SMOKE"] == "1" else {
+            throw XCTSkip("Justwoker live smoke is enabled only in the dedicated GitHub Actions workflow")
+        }
+        guard let bootstrapText = ProcessInfo.processInfo.environment["CLOUDCODE_PROVIDER_BOOTSTRAP"],
+              let bootstrapData = bootstrapText.data(using: .utf8) else {
+            XCTFail("CLOUDCODE_PROVIDER_BOOTSTRAP is missing")
+            return
+        }
+        let payload = try ProviderBootstrapPayload.decodeBootstrap(from: bootstrapData)
+        let provider = try XCTUnwrap(payload.providers.first(where: { $0.providerID == "https-api-justwoker-icu" }))
+        let key = try XCTUnwrap(provider.keys.first?.secret)
+        XCTAssertFalse(key.isEmpty)
+
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeJustwokerLiveSmoke-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let vault = MemoryKeyVault(keys: ["live-justwoker": key])
+        let registry = ToolRegistry()
+        let probe = LiveSmokeCapabilityProbe()
+        let router = ToolRouter(
+            registry: registry,
+            executors: [LiveSmokeCapabilityExecutor()],
+            executionLedger: ToolExecutionLedger(fileURL: root.appendingPathComponent("execution-ledger.json"))
+        )
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let agent = AgentCore(
+            provider: AnthropicProviderClient(retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0)),
+            keyVault: vault,
+            toolRouter: router,
+            registry: registry,
+            capabilityProbe: probe,
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 4
+        )
+        let session = AgentSession(permissionMode: .full)
+        let configuration = ProviderConfiguration(
+            name: "api.justwoker.icu",
+            baseURL: URL(string: "https://api.justwoker.icu")!,
+            model: "claude-opus-5",
+            apiKeyReference: "live-justwoker",
+            providerID: "https-api-justwoker-icu",
+            protocolName: ProviderProtocol.anthropic.rawValue,
+            authModeName: ProviderAuthMode.bearer.rawValue
+        )
+
+        var sawCapabilityTool = false
+        var sawSuccessfulToolResult = false
+        var assistantText = ""
+        let stream = await agent.send(
+            text: "You must call the capability_probe tool exactly once before answering. Do not call any other tool. After receiving its tool result, reply exactly JUSTWOKER_TOOL_ROUND_OK.",
+            session: session,
+            providerConfiguration: configuration
+        )
+        for try await event in stream {
+            switch event {
+            case .toolStarted(let name, _):
+                if name == "capability.probe" { sawCapabilityTool = true }
+            case .toolFinished(let result):
+                if result.success { sawSuccessfulToolResult = true }
+            case .token(let token):
+                assistantText += token
+            default:
+                break
+            }
+        }
+
+        XCTAssertTrue(sawCapabilityTool, "Justwoker live model did not call the mapped capability_probe tool")
+        XCTAssertTrue(sawSuccessfulToolResult, "Justwoker live tool result was not produced")
+        XCTAssertTrue(assistantText.contains("JUSTWOKER_TOOL_ROUND_OK"), "Justwoker live model did not continue after the tool result")
+        let saved = try await sessions.load(session.id)
+        XCTAssertTrue(saved.messages.contains { $0.role == .assistant && $0.content.contains("JUSTWOKER_TOOL_ROUND_OK") })
+        let toolCall = saved.messages.first(where: { $0.role == .assistant && $0.providerMetadata["tool_call_id"] != nil })
+        XCTAssertEqual(toolCall?.providerMetadata["tool_name"], "capability.probe")
+        XCTAssertEqual(toolCall?.providerMetadata["provider_tool_name"], "capability_probe")
+    }
+
     func testTabitokenAgentUsesFullCloudCodeToolSchemaExecutesToolAndContinuesAfterResult() async throws {
         guard ProcessInfo.processInfo.environment["CLOUDCODE_LIVE_SMOKE"] == "1" else {
             throw XCTSkip("Live Provider smoke is enabled only in the dedicated GitHub Actions workflow")
