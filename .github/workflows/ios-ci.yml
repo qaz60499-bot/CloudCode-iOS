@@ -166,6 +166,8 @@ jobs:
               raise SystemExit('FAIL: explicit capability refresh lost duplicate/concurrency guard')
           if 'capabilityProbe.probeExtendedDevice()' not in refresh or 'capabilityProbe.probePrivileged()' not in refresh:
               raise SystemExit('FAIL: explicit refresh must stage extended-device then privileged probing')
+          if 'capabilities = extended' in refresh:
+              raise SystemExit('FAIL: intermediate extended capability state must not be published before privileged validation completes')
           if 'extendedProbe.begin' not in refresh or 'extendedProbe.end' not in refresh or 'privilegedProbe.begin' not in refresh or 'privilegedProbe.end' not in refresh:
               raise SystemExit('FAIL: explicit capability refresh lost breadcrumb boundaries')
 
@@ -210,9 +212,15 @@ jobs:
                   raise SystemExit(f'FAIL: startup breadcrumb marker missing: {marker}')
 
           content = Path('Sources/CloudCodeApp/ContentView.swift').read_text(encoding='utf-8')
-          root_tabs = content.split('private struct ChatView', 1)[0]
-          if root_tabs.find('SettingsView(model: model)') > root_tabs.find('FilesView(model: model)'):
-              raise SystemExit('FAIL: Settings must remain in the first five iPhone root tabs instead of the system More bucket')
+          root_tabs = content.split('private struct MoreView', 1)[0]
+          if root_tabs.count('.tabItem { Label(') != 5:
+              raise SystemExit('FAIL: iPhone root TabView must contain exactly five tabs to avoid UIKit automatic More remapping')
+          for required in ('SettingsView(model: model)', 'MoreView(model: model)', '.tag(RootTab.settings)', '.tag(RootTab.more)'):
+              if required not in root_tabs:
+                  raise SystemExit(f'FAIL: stable root navigation marker missing: {required}')
+          for forbidden in ('AppsView(model: model)', 'FilesView(model: model)', 'HermesVaultView(model: model)', 'ActivityView(model: model)', 'TrashView(model: model)'):
+              if forbidden in root_tabs:
+                  raise SystemExit(f'FAIL: overflow view leaked back into iPhone root TabView: {forbidden}')
           if 'showDiagnostics = true' not in content or 'Label("日志", systemImage: "doc.text.magnifyingglass")' not in content:
               raise SystemExit('FAIL: direct chat-to-diagnostics entry point is missing')
 
