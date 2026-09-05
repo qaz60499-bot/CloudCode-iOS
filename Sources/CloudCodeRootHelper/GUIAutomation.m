@@ -448,9 +448,13 @@ int CloudCodeGUIProbeJSON(void)
     @autoreleasepool {
         CloudCodeHIDRuntime hid = CloudCodeResolveHID();
         CloudCodeIOHIDEventSystemClientRef client = NULL;
-        BOOL touch = CloudCodeHIDReady(hid, &client);
+        BOOL hidReady = CloudCodeHIDReady(hid, &client);
         if (client) { CFRelease(client); }
-        BOOL text = touch && hid.createUnicode != NULL;
+        CGSize screenSize = CloudCodeScreenSize();
+        BOOL coordinateSpaceReady = isfinite(screenSize.width) && isfinite(screenSize.height)
+            && screenSize.width > 1 && screenSize.height > 1;
+        BOOL touch = hidReady && coordinateSpaceReady;
+        BOOL text = hidReady && hid.createUnicode != NULL;
         NSData *screenshot = CloudCodeScreenshotJPEG();
         NSData *tree = CloudCodeFrontmostTreeData();
         NSDictionary *payload = @{
@@ -461,8 +465,8 @@ int CloudCodeGUIProbeJSON(void)
             @"screenshot": @(screenshot.length > 0),
             @"tree": @(tree.length > 0),
             @"verify": @(tree.length > 0),
-            @"screenWidth": @(CloudCodeScreenSize().width),
-            @"screenHeight": @(CloudCodeScreenSize().height)
+            @"screenWidth": @(screenSize.width),
+            @"screenHeight": @(screenSize.height)
         };
         NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
         if (!data) { return 61; }

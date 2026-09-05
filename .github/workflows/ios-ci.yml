@@ -332,7 +332,7 @@ jobs:
           if not gui_helper.exists():
               raise SystemExit('FAIL: TrollStore GUI helper source is missing')
           gui_text = gui_helper.read_text(encoding='utf-8')
-          for marker in ('CLOUDCODE_GUI_MAX_TREE_NODES', 'CLOUDCODE_GUI_MAX_TREE_BYTES', 'CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES', 'IOHIDEventSystemClientCreate', '_UICreateScreenUIImage', 'AXUIElementCopyAttributeValue', 'SBSCopyFrontmostApplicationDisplayIdentifier'):
+          for marker in ('CLOUDCODE_GUI_MAX_TREE_NODES', 'CLOUDCODE_GUI_MAX_TREE_BYTES', 'CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES', 'IOHIDEventSystemClientCreate', '_UICreateScreenUIImage', 'AXUIElementCopyAttributeValue', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'coordinateSpaceReady'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: GUI helper lost bounded/runtime marker: {marker}')
           for marker in ('guiProbe()', 'run(["gui-probe-json"], privilege: .root, timeout: 6)', 'run(["gui-tree-json"], privilege: .root, timeout: 5)', 'run(["gui-screenshot-base64"], privilege: .root, timeout: 6)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
