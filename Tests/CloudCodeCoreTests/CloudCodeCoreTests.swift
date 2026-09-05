@@ -1743,6 +1743,50 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(interrupted.isEmpty)
     }
 
+    func testAgentResumeContinuesCheckpointProgressInsteadOfResettingToZero() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let session = AgentSession(messages: [ChatMessage(role: .user, content: "original request")], permissionMode: .safe)
+        let checkpointStore = TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json"))
+        let checkpoint = TaskCheckpoint(
+            sessionID: session.id,
+            taskName: "Agent request",
+            stepIndex: 7,
+            stepName: "agent round 7",
+            totalSteps: 34,
+            state: "interrupted",
+            payload: ["request": "original request", "inputSource": InputSource.text.rawValue]
+        )
+        try await checkpointStore.upsert(checkpoint)
+        let registry = ToolRegistry(descriptors: [])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        try await sessions.save(session)
+        let agent = AgentCore(
+            provider: FinishingProvider(),
+            keyVault: MemoryKeyVault(keys: ["key": "secret"]),
+            toolRouter: ToolRouter(registry: registry, executors: []),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: checkpointStore,
+            maxToolRounds: 4
+        )
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "m", apiKeyReference: "key")
+        let stream = await agent.send(
+            text: "original request",
+            session: session,
+            providerConfiguration: config,
+            appendUserMessage: false,
+            resumeCheckpoint: checkpoint
+        )
+        for try await _ in stream {}
+
+        let resumed = await checkpointStore.checkpoint(checkpoint.id)
+        XCTAssertEqual(resumed?.state, "completed")
+        XCTAssertEqual(resumed?.stepIndex, 8)
+        XCTAssertEqual(resumed?.totalSteps, 8)
+    }
+
     func testIPARepackInspectAndExtractRoundTrip() throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
