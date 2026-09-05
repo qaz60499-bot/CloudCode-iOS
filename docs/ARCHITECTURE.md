@@ -66,6 +66,8 @@ Custom Providers are added with Label, HTTPS Base URL and API Key. The app disco
 
 The core does not use screenshots as the default observation mechanism. A request such as “why is Telegram using so much storage?” should resolve the app, dynamically resolve its current container, analyze directory/file metadata and return a structured result. GUI automation is only selected if typed/native/CLI/private/intent paths cannot satisfy the task and a GUI backend has proven availability.
 
+Startup capability probing is deliberately conservative and never enters root/persona or private LaunchServices paths. App discovery, app inspection, container resolution, and app launch are special bounded self-validating tools: when explicitly requested they may invoke an isolated helper process with a hard timeout, validate the backend/target at runtime, and fail closed without promoting unrelated privileges. Root-required operations such as terminate/uninstall remain capability-gated and are never auto-probed by ordinary model execution.
+
 The GUI interface is backend-neutral: open app, tree, screenshot, tap, type, scroll, swipe and verify. The phase-1 app ships with an unavailable backend rather than claiming XCTest/WDA support on a device where it was not proven.
 
 ## Resource identity

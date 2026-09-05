@@ -27,6 +27,18 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(resolverCalls, 0, "startup-safe probing must not call app/private capability providers")
     }
 
+    func testExtendedCapabilityProbeRebuildsHomeOSAggregatesWithoutDuplicateStaleRecords() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let probe = CapabilityProbe(appResolver: StaticAppResolver(), homeDirectory: root)
+
+        let profile = await probe.probeExtendedDevice()
+
+        for id in HomeOSCapabilityID.allCases.map(\.rawValue) {
+            XCTAssertEqual(profile.records.filter { $0.id == id }.count, 1, "extended probe must rebuild each HomeOS aggregate exactly once")
+        }
+    }
+
     func testStartupBreadcrumbStoreReportsPreviousRunLastStageAndIgnoresCorruptTail() throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -410,6 +422,7 @@ final class CloudCodeCoreTests: XCTestCase {
 
         let result = try await executor.execute(call, descriptor: descriptor, context: context)
         XCTAssertEqual(result.payload["session.marker"], CapabilityStatus.deviceValidationRequired.rawValue)
+        XCTAssertEqual(result.payload["runtime_validation.apps.launch"], "bounded_isolated")
         XCTAssertNil(result.payload["probe.marker"], "Model-driven capability.probe must not invoke the privileged probe backend")
     }
 
@@ -2686,7 +2699,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(systemMessages.first?.content.contains("untrusted data") == true)
     }
 
-    func testToolRegistryDoesNotExposePermissionMutationAndPrivilegedToolsStayCapabilityGated() async throws {
+    func testToolRegistryKeepsRootMutationsCapabilityGatedWhileBoundedAppReadsAndLaunchSelfValidate() async throws {
         let tools = await ToolRegistry().all()
         XCTAssertFalse(tools.contains { $0.name.lowercased().contains("permission") })
 
@@ -2695,9 +2708,16 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(shell.requiredCapabilities, ["execution.ios_system"])
         XCTAssertEqual(shell.preferredRoute, .cli)
 
+        let appList = try XCTUnwrap(tools.first(where: { $0.name == "apps.list" }))
+        XCTAssertTrue(appList.requiredCapabilities.isEmpty)
+        let inspect = try XCTUnwrap(tools.first(where: { $0.name == "apps.inspect" }))
+        XCTAssertTrue(inspect.requiredCapabilities.isEmpty)
+        let container = try XCTUnwrap(tools.first(where: { $0.name == "container.resolve" }))
+        XCTAssertTrue(container.requiredCapabilities.isEmpty)
+
         let launch = try XCTUnwrap(tools.first(where: { $0.name == "apps.launch" }))
         XCTAssertEqual(launch.risk, .safeWrite)
-        XCTAssertEqual(launch.requiredCapabilities, ["apps.launch"])
+        XCTAssertTrue(launch.requiredCapabilities.isEmpty)
         XCTAssertEqual(launch.preferredRoute, .privateFramework)
 
         let terminate = try XCTUnwrap(tools.first(where: { $0.name == "apps.terminate" }))
@@ -3110,14 +3130,14 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(snapshots.first(where: { $0.id == .network })?.status, .unknown)
     }
 
-    func testHomeOSBroadAppCapabilityDoesNotPromotePartialPrimitiveAvailability() {
+    func testHomeOSAppFacadeShowsPartialUsabilityWithoutElevatingExactPrimitiveChecks() {
         let partial = HomeOSCapabilityLayer.snapshots(from: [
             CapabilityRecord(id: "apps.enumerate", domain: .apps, status: .available, detail: "yes"),
             CapabilityRecord(id: "apps.launch", domain: .apps, status: .available, detail: "yes"),
             CapabilityRecord(id: "apps.terminate", domain: .apps, status: .unavailable, detail: "no"),
             CapabilityRecord(id: "apps.uninstall", domain: .apps, status: .deviceValidationRequired, detail: "pending")
         ])
-        XCTAssertEqual(partial.first(where: { $0.id == .app })?.status, .deviceValidationRequired)
+        XCTAssertEqual(partial.first(where: { $0.id == .app })?.status, .available)
 
         let complete = HomeOSCapabilityLayer.snapshots(from: [
             CapabilityRecord(id: "apps.enumerate", domain: .apps, status: .available, detail: "yes"),

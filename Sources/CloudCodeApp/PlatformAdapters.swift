@@ -32,9 +32,20 @@ private enum EmbeddedRootHelper {
         Bundle.main.bundleURL.appendingPathComponent(executableName, isDirectory: false).path
     }
 
-    private static func run(_ arguments: [String]) -> (code: Int, diagnostic: String) {
+    private enum PrivilegeMode {
+        case isolatedUser
+        case root
+    }
+
+    private static func run(_ arguments: [String], privilege: PrivilegeMode, timeout: TimeInterval = 6) -> (code: Int, diagnostic: String) {
         var diagnostic: NSString?
-        let code = CloudCodeSpawnRootHelperWithOutput(executablePath, arguments, &diagnostic)
+        let code = CloudCodeSpawnHelperWithOutput(
+            executablePath,
+            arguments,
+            privilege == .root,
+            timeout,
+            &diagnostic
+        )
         let text = (diagnostic as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return (code, text)
     }
@@ -71,7 +82,7 @@ private enum EmbeddedRootHelper {
         guard FileManager.default.fileExists(atPath: path), FileManager.default.isExecutableFile(atPath: path) else {
             return (nil, "\(executableName) 不可执行；跨 App 枚举保持不可用。")
         }
-        let result = run(["enumerate-json"])
+        let result = run(["enumerate-json"], privilege: .isolatedUser, timeout: 5)
         guard result.code == 0 else {
             return (nil, failureDetail(prefix: "\(executableName) 隔离枚举", code: result.code, diagnostic: result.diagnostic))
         }
@@ -89,7 +100,7 @@ private enum EmbeddedRootHelper {
     }
 
     static func launchCapability() -> RootHelperCapabilitySnapshot {
-        let result = run(["probe-launch"])
+        let result = run(["probe-launch"], privilege: .isolatedUser, timeout: 4)
         if result.code == 0 {
             return RootHelperCapabilitySnapshot(available: true, detail: "LaunchServices 启动 selector 已在 helper 子进程内验证。")
         }
@@ -97,7 +108,7 @@ private enum EmbeddedRootHelper {
     }
 
     static func uninstallCapability(bundleID: String) -> RootHelperCapabilitySnapshot {
-        let result = run(["probe-uninstall", bundleID])
+        let result = run(["probe-uninstall", bundleID], privilege: .root, timeout: 6)
         if result.code == 0 {
             return RootHelperCapabilitySnapshot(available: true, detail: "卸载 selector/symbol 与权威安装状态查询已在 helper 子进程内验证。")
         }
@@ -105,7 +116,7 @@ private enum EmbeddedRootHelper {
     }
 
     static func installationState(bundleID: String) -> (installed: Bool?, detail: String) {
-        let result = run(["is-installed", bundleID])
+        let result = run(["is-installed", bundleID], privilege: .root, timeout: 4)
         switch result.code {
         case 0:
             return (true, "helper 已确认目标 App 处于安装状态。")
@@ -117,11 +128,11 @@ private enum EmbeddedRootHelper {
     }
 
     static func launch(bundleID: String) -> (success: Bool, detail: String) {
-        let result = run(["launch", bundleID])
+        let result = run(["launch", bundleID], privilege: .isolatedUser, timeout: 5)
         if result.code == 0 {
-            return (true, "Embedded root helper 已在隔离子进程中提交 App 启动请求。")
+            return (true, "隔离 helper 已验证目标安装状态并提交 App 启动请求。")
         }
-        return (false, failureDetail(prefix: "Embedded root helper 启动 App", code: result.code, diagnostic: result.diagnostic))
+        return (false, failureDetail(prefix: "隔离 helper 启动 App", code: result.code, diagnostic: result.diagnostic))
     }
 
     static func probe() -> RootHelperCapabilitySnapshot {
@@ -132,7 +143,7 @@ private enum EmbeddedRootHelper {
         guard FileManager.default.isExecutableFile(atPath: path) else {
             return RootHelperCapabilitySnapshot(available: false, detail: "\(executableName) 存在但没有可执行权限。")
         }
-        let result = run(["probe"])
+        let result = run(["probe"], privilege: .root, timeout: 5)
         if result.code == 0 {
             return RootHelperCapabilitySnapshot(available: true, detail: "\(executableName) 已通过 persona 99 / UID 0 / GID 0 探测。")
         }
@@ -142,7 +153,7 @@ private enum EmbeddedRootHelper {
     static func uninstall(bundleID: String, bundlePath: String, dataPath: String?) -> (accepted: Bool, detail: String) {
         let capability = probe()
         guard capability.available else { return (false, capability.detail) }
-        let result = run(["uninstall", bundleID, bundlePath, dataPath ?? "-"])
+        let result = run(["uninstall", bundleID, bundlePath, dataPath ?? "-"], privilege: .root, timeout: 15)
         if result.code == 0 {
             let detail = result.diagnostic.isEmpty ? "Embedded root helper 已执行受限卸载流程" : "Embedded root helper 已执行受限卸载流程：\(result.diagnostic)"
             return (true, detail)
@@ -153,7 +164,7 @@ private enum EmbeddedRootHelper {
     static func terminateCapability() -> RootHelperCapabilitySnapshot {
         let root = probe()
         guard root.available else { return root }
-        let result = run(["probe-terminate"])
+        let result = run(["probe-terminate"], privilege: .root, timeout: 5)
         if result.code == 0 {
             return RootHelperCapabilitySnapshot(available: true, detail: "Embedded root helper 已验证 root 身份及按进程路径定位能力。")
         }
@@ -163,7 +174,7 @@ private enum EmbeddedRootHelper {
     static func terminate(bundlePath: String) -> (success: Bool, detail: String) {
         let capability = terminateCapability()
         guard capability.available else { return (false, capability.detail) }
-        let result = run(["terminate", bundlePath])
+        let result = run(["terminate", bundlePath], privilege: .root, timeout: 6)
         if result.code == 0 {
             return (true, result.diagnostic.isEmpty ? "Embedded root helper 已确认目标 App 进程停止" : "Embedded root helper 已确认目标 App 进程停止：\(result.diagnostic)")
         }
@@ -198,17 +209,25 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     }
 
     public func installedApps() async -> [ResourceNode] {
-        if Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
+        if !enumerationProven || Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
         return cachedApps
     }
 
     public func bundlePath(for bundleID: String) async -> String? {
-        if Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
+        if bundleID != Bundle.main.bundleIdentifier, bundlePaths[bundleID] == nil {
+            refresh()
+        } else if Date().timeIntervalSince(lastRefresh) > 30 {
+            refresh()
+        }
         return bundlePaths[bundleID]
     }
 
     public func dataContainerPath(for bundleID: String) async -> String? {
-        if Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
+        if bundleID != Bundle.main.bundleIdentifier, containerPaths[bundleID] == nil {
+            refresh()
+        } else if Date().timeIntervalSince(lastRefresh) > 30 {
+            refresh()
+        }
         if let value = containerPaths[bundleID] { return value }
         if bundleID == Bundle.main.bundleIdentifier { return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).path }
         return nil
@@ -237,10 +256,6 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     }
 
     public func appLaunchCapability() async -> AppLifecycleCapabilitySnapshot {
-        if Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
-        guard enumerationProven else {
-            return AppLifecycleCapabilitySnapshot(available: false, detail: "跨 App 枚举尚未验证，不能安全启动任意目标 App。")
-        }
         let snapshot = EmbeddedRootHelper.launchCapability()
         try? await diagnosticLogger?.log(
             level: snapshot.available ? .info : .warning,
@@ -272,22 +287,23 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     }
 
     public func launchApplication(bundleID: String) async -> (success: Bool, detail: String) {
-        forceRefresh()
-        guard let path = bundlePaths[bundleID], Self.isUserApplicationBundlePath(path) else {
-            return (false, "目标不是当前可验证的普通用户 App，或已经不存在。")
+        guard !bundleID.isEmpty, bundleID != Bundle.main.bundleIdentifier else {
+            return (false, "目标 Bundle ID 无效，或目标是 Cloud Code 自身。")
         }
         let capability = await appLaunchCapability()
         guard capability.available else {
             return (false, "启动能力不可用：\(capability.detail)")
         }
         let outcome = EmbeddedRootHelper.launch(bundleID: bundleID)
+        var metadata = ["bundleID": bundleID]
+        if let path = bundlePaths[bundleID] { metadata["bundlePath"] = path }
         try? await diagnosticLogger?.log(
             level: outcome.success ? .info : .error,
             subsystem: "root-helper",
             action: "launch",
             result: outcome.success ? "accepted" : "rejected",
             diagnostic: outcome.detail,
-            metadata: ["bundleID": bundleID, "bundlePath": path]
+            metadata: metadata
         )
         return outcome
     }
@@ -643,7 +659,10 @@ public struct IOSPrivateAppExecutor: ToolExecuting, Sendable {
 
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
         switch tool.name {
-        case "apps.launch": return capabilities.isAvailable("apps.launch")
+        case "apps.launch":
+            if capabilities.isAvailable("apps.launch") { return true }
+            guard capabilities.status("apps.launch") != .unavailable else { return false }
+            return await appResolver.appLaunchCapability().available
         case "apps.terminate": return capabilities.isAvailable("apps.terminate")
         case "apps.uninstall": return capabilities.isAvailable("apps.uninstall")
         default: return false

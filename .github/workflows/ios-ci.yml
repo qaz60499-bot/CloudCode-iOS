@@ -313,8 +313,15 @@ jobs:
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: root helper command missing: {marker}')
           bridge = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
-          if 'CLOUDCODE_HELPER_CAPTURE_LIMIT (1024 * 1024)' not in bridge or 'WIFSIGNALED(status)' not in bridge:
-              raise SystemExit('FAIL: root helper bridge lost bounded output capture or signal isolation')
+          for marker in ('CLOUDCODE_HELPER_CAPTURE_LIMIT (1024 * 1024)', 'WIFSIGNALED(status)', 'WNOHANG', 'O_NONBLOCK', 'ETIMEDOUT', 'kill(pid, SIGKILL)', 'CloudCodeSpawnHelperInternal'):
+              if marker not in bridge:
+                  raise SystemExit(f'FAIL: root helper bridge lost timeout/isolation marker: {marker}')
+          if 'CloudCodeSpawnHelperWithOutput' not in Path('Sources/CloudCodeApp/RootHelperBridge.h').read_text(encoding='utf-8'):
+              raise SystemExit('FAIL: bounded helper bridge API is missing')
+          if 'run(["enumerate-json"], privilege: .isolatedUser' not in adapters or 'run(["probe-launch"], privilege: .isolatedUser' not in adapters or 'run(["launch", bundleID], privilege: .isolatedUser' not in adapters:
+              raise SystemExit('FAIL: app discovery/launch must use the bounded non-root isolated helper path')
+          if 'run(["probe-uninstall", bundleID], privilege: .root' not in adapters or 'run(["terminate", bundlePath], privilege: .root' not in adapters:
+              raise SystemExit('FAIL: destructive/root-required app operations lost root helper gating')
           approval = adapters.split('public final class ApprovalCenter', 1)[1].split('public struct IOSSystemExecutor', 1)[0]
           for marker in ('withTaskCancellationHandler', 'continuationID', 'cancelPendingApproval(requestID:', 'finishPendingApproval(returning:'):
               if marker not in approval:

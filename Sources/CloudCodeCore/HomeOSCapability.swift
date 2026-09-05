@@ -49,9 +49,16 @@ public enum HomeOSCapabilityLayer {
             if candidates.contains(.unknown) { return .unknown }
             return .unavailable
         }
+        func anyUsable(_ candidates: [CapabilityStatus]) -> CapabilityStatus {
+            guard !candidates.isEmpty else { return .unavailable }
+            if candidates.contains(.available) { return .available }
+            if candidates.contains(.deviceValidationRequired) { return .deviceValidationRequired }
+            if candidates.contains(.unknown) { return .unknown }
+            return .unavailable
+        }
         return [
             .init(id: .file, status: status("filesystem.own_container"), detail: "File facade is proven only for Cloud Code's own container here. Unrestricted access remains a separate primitive and is never inferred from this aggregate.", backingCapabilities: ["filesystem.own_container"]),
-            .init(id: .app, status: allRequired([status("apps.enumerate"), status("apps.launch"), status("apps.terminate"), status("apps.uninstall")]), detail: "Broad app control is available only when every underlying lifecycle primitive is verified; individual operations must still check their exact primitive.", backingCapabilities: ["apps.enumerate", "apps.launch", "apps.terminate", "apps.uninstall"]),
+            .init(id: .app, status: anyUsable([status("apps.enumerate"), status("apps.launch"), status("apps.terminate"), status("apps.uninstall")]), detail: "App facade reflects whether at least one app operation is currently usable. Each concrete operation remains gated by its exact primitive, so an unavailable uninstall backend does not hide a verified launch or enumeration path.", backingCapabilities: ["apps.enumerate", "apps.launch", "apps.terminate", "apps.uninstall"]),
             .init(id: .process, status: allRequired([status("apps.terminate"), status("execution.root_helper")]), detail: "Broad process control is available only when both lifecycle and root-helper primitives are verified; exact operations remain separately gated.", backingCapabilities: ["apps.terminate", "execution.root_helper"]),
             .init(id: .shell, status: status("execution.ios_system"), detail: "Existing semantic ios_system route; not a privileged escape hatch.", backingCapabilities: ["execution.ios_system"]),
             .init(id: .git, status: .unavailable, detail: "No libgit2/MiniGit backend is linked yet; do not expose a fake Git capability.", backingCapabilities: []),

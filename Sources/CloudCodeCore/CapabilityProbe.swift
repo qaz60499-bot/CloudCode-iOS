@@ -125,7 +125,7 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
 
     public func probeExtendedDevice() async -> CapabilityProfile {
         try? await diagnosticLogger?.log(level: .info, subsystem: "capability", action: "probe.extended.start", result: "running")
-        var records = await probeStartupSafe().records
+        var records = (await probeStartupSafe().records).filter { !$0.id.hasPrefix("homeos.") }
 
         func replacing(_ item: CapabilityRecord) {
             records.removeAll { $0.id == item.id }
@@ -140,6 +140,55 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         replacing(record("execution.posix_spawn_symbol", .execution, Self.hasDynamicSymbol("posix_spawn") ? .available : .unavailable,
                          "Explicit extended spawn-symbol presence check; no helper is spawned."))
 
+        let apps = await appResolver.installedApps()
+        let ownBundle = Bundle.main.bundleIdentifier ?? ""
+        let enumerationProven: Bool
+        let enumerationDetail: String
+        if let provider = appResolver as? any AppEnumerationCapabilityProviding {
+            enumerationProven = await provider.canEnumerateInstalledApps()
+            enumerationDetail = await provider.installedAppEnumerationDetail()
+        } else {
+            let crossAppCount = apps.filter { node in
+                guard let bundleID = node.ownerBundleID, !bundleID.isEmpty else { return false }
+                return ownBundle.isEmpty || bundleID != ownBundle
+            }.count
+            enumerationProven = crossAppCount > 0
+            enumerationDetail = enumerationProven
+                ? "Resolver returned \(apps.count) app records including \(crossAppCount) non-own apps."
+                : "Resolver did not prove visibility of any non-own installed app."
+        }
+        replacing(record("apps.enumerate", .apps, enumerationProven ? .available : .unavailable,
+                         enumerationProven ? "Bounded isolated app enumeration verified: \(enumerationDetail)" : "Bounded isolated app enumeration not proven: \(enumerationDetail)"))
+
+        let ownBundlePath = ownBundle.isEmpty ? nil : await appResolver.bundlePath(for: ownBundle)
+        replacing(record("apps.resolve_own_bundle_path", .apps, ownBundlePath == nil ? .unknown : .available,
+                         "Resolution of Cloud Code's own bundle path after explicit extended validation."))
+        let ownDataPath = ownBundle.isEmpty ? nil : await appResolver.dataContainerPath(for: ownBundle)
+        replacing(record("apps.resolve_own_data_container", .apps, ownDataPath == nil ? .unknown : .available,
+                         "Resolution of Cloud Code's own data container after explicit extended validation."))
+
+        var otherBundleResolved = false
+        var otherContainerResolved = false
+        if enumerationProven {
+            for app in apps where app.ownerBundleID != ownBundle {
+                guard let bundleID = app.ownerBundleID else { continue }
+                if await appResolver.bundlePath(for: bundleID) != nil { otherBundleResolved = true }
+                if await appResolver.dataContainerPath(for: bundleID) != nil { otherContainerResolved = true }
+                if otherBundleResolved && otherContainerResolved { break }
+            }
+        }
+        replacing(record("apps.resolve_bundle_path", .apps, otherBundleResolved ? .available : (enumerationProven ? .deviceValidationRequired : .unavailable),
+                         otherBundleResolved ? "Resolved at least one non-own installed-app bundle path through the bounded resolver." : "Cross-app bundle path resolution is not currently proven."))
+        replacing(record("apps.resolve_data_container", .apps, otherContainerResolved ? .available : (enumerationProven ? .deviceValidationRequired : .unavailable),
+                         otherContainerResolved ? "Resolved at least one non-own installed-app data container through the bounded resolver." : "Cross-app data-container resolution is not currently proven."))
+
+        if let lifecycle = appResolver as? any AppLifecycleCapabilityProviding {
+            let launch = await lifecycle.appLaunchCapability()
+            replacing(record("apps.launch", .apps, launch.available ? .available : .deviceValidationRequired,
+                             launch.available ? "Bounded isolated app-launch backend verified: \(launch.detail)" : "App launch still requires device validation: \(launch.detail)"))
+        }
+
+        records.append(contentsOf: HomeOSCapabilityLayer.records(from: records))
         let profile = CapabilityProfile(records: records)
         try? await diagnosticLogger?.log(
             level: .info,

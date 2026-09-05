@@ -55,9 +55,9 @@ public actor ToolRegistry {
 
     public static let phaseOneDefaults: [ToolDescriptor] = [
         ToolDescriptor(name: "capability.probe", summary: "Return the capability snapshot already validated for this session; never initiates privileged probing.", risk: .readOnly),
-        ToolDescriptor(name: "apps.list", summary: "Enumerate installed apps when the runtime permits it.", risk: .readOnly, requiredCapabilities: ["apps.enumerate"]),
-        ToolDescriptor(name: "apps.inspect", summary: "Inspect an installed app by bundle ID.", risk: .readOnly, requiredCapabilities: ["apps.resolve_bundle_path"]),
-        ToolDescriptor(name: "container.resolve", summary: "Resolve the current data container for a bundle ID without caching UUID paths.", risk: .readOnly, requiredCapabilities: ["apps.resolve_data_container"]),
+        ToolDescriptor(name: "apps.list", summary: "Enumerate installed apps through the bounded isolated helper; failures stay read-only and fail closed.", risk: .readOnly),
+        ToolDescriptor(name: "apps.inspect", summary: "Inspect an installed app by bundle ID through the bounded resolver; missing targets fail closed.", risk: .readOnly),
+        ToolDescriptor(name: "container.resolve", summary: "Resolve the current data container for a bundle ID without caching UUID paths; missing targets fail closed.", risk: .readOnly),
         ToolDescriptor(name: "files.list", summary: "List a directory through structured filesystem access.", risk: .readOnly),
         ToolDescriptor(name: "files.search", summary: "Search a bounded directory progressively.", risk: .readOnly),
         ToolDescriptor(name: "files.read", summary: "Read a bounded text file.", risk: .readOnly),
@@ -72,7 +72,7 @@ public actor ToolRegistry {
         ToolDescriptor(name: "ipa.extract", summary: "Safely extract an IPA with path traversal protections.", risk: .safeWrite),
         ToolDescriptor(name: "ipa.repack", summary: "Repack a modified IPA.", risk: .sensitiveWrite),
         ToolDescriptor(name: "ipa.install", summary: "Install an IPA through an available privileged adapter.", risk: .systemChange, requiredCapabilities: ["ipa.install"], preferredRoute: .privateFramework),
-        ToolDescriptor(name: "apps.launch", summary: "Launch an installed app.", risk: .safeWrite, requiredCapabilities: ["apps.launch"], preferredRoute: .privateFramework),
+        ToolDescriptor(name: "apps.launch", summary: "Launch an installed app after a bounded, isolated runtime validation of the LaunchServices backend and target installation state.", risk: .safeWrite, preferredRoute: .privateFramework),
         ToolDescriptor(name: "apps.uninstall", summary: "Uninstall an app.", risk: .permanentDestructive, requiredCapabilities: ["apps.uninstall"], preferredRoute: .privateFramework),
         ToolDescriptor(name: "apps.terminate", summary: "Terminate an app/process.", risk: .systemChange, requiredCapabilities: ["apps.terminate"], preferredRoute: .privateFramework),
         ToolDescriptor(name: "advanced.shell", summary: "Execute an advanced shell command. High risk and never the default tool path.", risk: .systemChange, requiredCapabilities: ["execution.ios_system"], preferredRoute: .cli),

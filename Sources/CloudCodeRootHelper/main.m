@@ -177,10 +177,18 @@ static int LaunchApplication(NSString *bundleID)
     if (bundleID.length == 0 || [bundleID isEqualToString:@"com.cloudcode.ios"]) { return 10; }
     id workspace = Workspace();
     if (!workspace) { return 23; }
+    BOOL known = NO;
+    BOOL installed = ApplicationIsInstalled(workspace, bundleID, &known);
+    if (!known) { return 43; }
+    if (!installed) { return 47; }
     SEL selector = NSSelectorFromString(@"openApplicationWithBundleID:");
     if (![workspace respondsToSelector:selector]) { return 42; }
     BOOL (*sendBool)(id, SEL, id) = (void *)objc_msgSend;
-    return sendBool(workspace, selector, bundleID) ? 0 : 46;
+    @try {
+        return sendBool(workspace, selector, bundleID) ? 0 : 46;
+    } @catch (__unused NSException *exception) {
+        return 46;
+    }
 }
 
 static int ProbeUninstallCapability(NSString *bundleID)
@@ -489,11 +497,9 @@ int main(int argc, const char *argv[])
             return HasProcessInspectionBackend() ? 0 : 33;
         }
         if ([command isEqualToString:@"enumerate-json"]) {
-            if (getuid() != 0 || geteuid() != 0) { return 11; }
             return PrintInstalledApplicationsJSON();
         }
         if ([command isEqualToString:@"probe-launch"]) {
-            if (getuid() != 0 || geteuid() != 0) { return 11; }
             return ProbeLaunchCapability();
         }
         if ([command isEqualToString:@"probe-uninstall"]) {
@@ -507,7 +513,7 @@ int main(int argc, const char *argv[])
             return InstalledState(bundleID);
         }
         if ([command isEqualToString:@"launch"]) {
-            if (getuid() != 0 || geteuid() != 0 || argc < 3) { return 11; }
+            if (argc < 3) { return 10; }
             NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
             return LaunchApplication(bundleID);
         }

@@ -68,8 +68,12 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             // session context already contains the capability profile established by the app:
             // startup-safe by default, or privileged only after an explicit user validation.
             let profile = context.capabilityProfile
-            let payload = Dictionary(profile.records.map { ($0.id, $0.status.rawValue) }, uniquingKeysWith: { _, latest in latest })
-            return ToolResult(toolCallID: call.id, success: true, summary: "当前会话能力快照", payload: payload)
+            var payload = Dictionary(profile.records.map { ($0.id, $0.status.rawValue) }, uniquingKeysWith: { _, latest in latest })
+            payload["runtime_validation.apps.list"] = "bounded_isolated"
+            payload["runtime_validation.apps.inspect"] = "bounded_isolated"
+            payload["runtime_validation.container.resolve"] = "bounded_isolated"
+            payload["runtime_validation.apps.launch"] = "bounded_isolated"
+            return ToolResult(toolCallID: call.id, success: true, summary: "当前会话能力快照；部分 App 读取/启动工具会在执行时做有界隔离验证", payload: payload)
 
         case "apps.list":
             let apps = await appResolver.installedApps()
