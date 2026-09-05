@@ -55,18 +55,25 @@ No decryption/install/uninstall result is considered PASS from the GitHub Runner
 
 ## GUI fallback
 
-If XCTest/WDA is configured:
+Build 36 has two distinct GUI backend classes and they must never be conflated:
 
-1. Probe backend readiness.
-2. Open a harmless test app.
-3. Read UI tree.
-4. Capture screenshot.
-5. Tap a deterministic element.
-6. Enter harmless text.
-7. Scroll/swipe.
-8. Verify a postcondition.
+1. The preferred self-contained TrollStore path runs private GUI work only in the bounded embedded root helper. Runtime readiness is reported independently for `automation.gui.open_app`, `.tree`, `.screenshot`, `.touch`, `.text_input`, `.gestures`, and `.verify`.
+2. XCTest/WDA may be added as a replaceable external adapter. A missing WDA service must not affect Cloud Code startup/chat and must never be treated as proof that the TrollStore-native backend is ready.
 
-If WDA is not configured, `automation.gui` must remain unavailable/unproven and the Agent must continue using structured tools.
+The TrollStore-native device test sequence is:
+
+1. Explicitly or lazily perform the bounded GUI readiness handshake; cold launch and ordinary message startup probing must not run it.
+2. Open a harmless deterministic test app.
+3. Require a real frontmost-app AX tree before promoting `automation.gui.tree`.
+4. Require a real global screenshot before promoting `automation.gui.screenshot`.
+5. Require the entitled IOHID runtime/client handshake before promoting touch/gesture/text-input features.
+6. Tap a deterministic element, then observe the UI again.
+7. Enter harmless text and verify the plaintext never appears in approval, diagnostic, or audit logs.
+8. Scroll/swipe, observe again, and verify a postcondition from a fresh tree.
+
+The aggregate `automation.gui` becomes `available` only when open-app, tree, screenshot, touch, text input, gestures, and verification are all actually available on that device. Partial success stays partial; for example, a working IOHID tap backend does not prove AX observation or full autonomous GUI automation. Simulator/mock tests and GitHub Runner compilation are not TrollStore on-device proof.
+
+Protected confirmation surfaces (Face ID, Touch ID, Apple Pay/payment approval, passcode/password confirmation, system permission prompts, and equivalent OS security confirmation UI) are manual boundaries. The Agent must stop and request user confirmation instead of trying to automate them.
 
 ## Safety tests on device
 
