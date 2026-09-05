@@ -72,6 +72,8 @@
     <true/>
     <key>com.apple.accessibility.api</key>
     <true/>
+    <key>com.apple.QuartzCore.cache-asynchronous</key>
+    <true/>
     <key>com.apple.QuartzCore.displayable-context</key>
     <true/>
     <key>com.apple.QuartzCore.global-capture</key>
@@ -89,6 +91,7 @@
     <key>com.apple.security.iokit-user-client-class</key>
     <array>
         <string>IOSurfaceRootUserClient</string>
+        <string>IOSurfaceAcceleratorClient</string>
         <string>IOHIDEventServiceFastPathUserClient</string>
         <string>IOHIDLibUserClient</string>
         <string>IOAccelDevice</string>
@@ -100,6 +103,7 @@
     <key>com.apple.security.exception.iokit-user-client-class</key>
     <array>
         <string>IOSurfaceRootUserClient</string>
+        <string>IOSurfaceAcceleratorClient</string>
         <string>IOHIDEventServiceFastPathUserClient</string>
         <string>IOHIDLibUserClient</string>
         <string>IOAccelDevice</string>

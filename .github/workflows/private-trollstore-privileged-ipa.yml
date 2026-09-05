@@ -143,6 +143,7 @@ jobs:
             com.apple.private.hid.client.service-protected \
             com.apple.private.hid.manager.client \
             com.apple.accessibility.api \
+            com.apple.QuartzCore.cache-asynchronous \
             com.apple.QuartzCore.displayable-context \
             com.apple.QuartzCore.global-capture \
             com.apple.QuartzCore.secure-capture \
@@ -153,6 +154,7 @@ jobs:
             /usr/libexec/PlistBuddy -c "Print :$required_helper_entitlement" "$HELPER_ENTITLEMENTS" | grep -F 'true'
           done
           for required_helper_iokit_class in \
+            IOSurfaceAcceleratorClient \
             IOHIDEventServiceFastPathUserClient \
             IOHIDLibUserClient; do
             for iokit_entitlement in \

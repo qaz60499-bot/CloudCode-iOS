@@ -67,7 +67,10 @@ typedef Boolean (*CloudCodeAXValueGetValueFn)(CFTypeRef, int, void *);
 
 typedef UIImage *(*CloudCodeCreateScreenImageFn)(void);
 typedef CFTypeRef CloudCodeIOSurfaceRef;
+typedef CFTypeRef CloudCodeIOSurfaceAcceleratorRef;
 typedef CloudCodeIOSurfaceRef (*CloudCodeIOSurfaceCreateFn)(CFDictionaryRef);
+typedef int32_t (*CloudCodeIOSurfaceAcceleratorCreateFn)(CFAllocatorRef, CFTypeRef, CloudCodeIOSurfaceAcceleratorRef *);
+typedef int32_t (*CloudCodeIOSurfaceAcceleratorTransferFn)(CloudCodeIOSurfaceAcceleratorRef, CloudCodeIOSurfaceRef, CloudCodeIOSurfaceRef, CFDictionaryRef, void *);
 typedef int32_t (*CloudCodeIOSurfaceLockFn)(CloudCodeIOSurfaceRef, uint32_t, uint32_t *);
 typedef int32_t (*CloudCodeIOSurfaceUnlockFn)(CloudCodeIOSurfaceRef, uint32_t, uint32_t *);
 typedef void *(*CloudCodeIOSurfaceGetBaseAddressFn)(CloudCodeIOSurfaceRef);
@@ -528,12 +531,18 @@ static UIImage *CloudCodeScreenshotImageFromRenderServer(void)
         @"/System/Library/Frameworks/IOSurface.framework/IOSurface",
         @"/rootfs/System/Library/Frameworks/IOSurface.framework/IOSurface"
     ]);
+    void *ioSurfaceAccelerator = CloudCodeOpenFramework(@[
+        @"/System/Library/PrivateFrameworks/IOSurfaceAccelerator.framework/IOSurfaceAccelerator",
+        @"/rootfs/System/Library/PrivateFrameworks/IOSurfaceAccelerator.framework/IOSurfaceAccelerator"
+    ]);
     CloudCodeRenderServerRenderDisplayFn render = (CloudCodeRenderServerRenderDisplayFn)CloudCodeResolve(quartzCore, "CARenderServerRenderDisplay");
     CloudCodeIOSurfaceCreateFn createSurface = (CloudCodeIOSurfaceCreateFn)CloudCodeResolve(ioSurface, "IOSurfaceCreate");
     CloudCodeIOSurfaceLockFn lockSurface = (CloudCodeIOSurfaceLockFn)CloudCodeResolve(ioSurface, "IOSurfaceLock");
     CloudCodeIOSurfaceUnlockFn unlockSurface = (CloudCodeIOSurfaceUnlockFn)CloudCodeResolve(ioSurface, "IOSurfaceUnlock");
     CloudCodeIOSurfaceGetBaseAddressFn getBaseAddress = (CloudCodeIOSurfaceGetBaseAddressFn)CloudCodeResolve(ioSurface, "IOSurfaceGetBaseAddress");
     CloudCodeIOSurfaceGetBytesPerRowFn getBytesPerRow = (CloudCodeIOSurfaceGetBytesPerRowFn)CloudCodeResolve(ioSurface, "IOSurfaceGetBytesPerRow");
+    CloudCodeIOSurfaceAcceleratorCreateFn createAccelerator = (CloudCodeIOSurfaceAcceleratorCreateFn)CloudCodeResolve(ioSurfaceAccelerator, "IOSurfaceAcceleratorCreate");
+    CloudCodeIOSurfaceAcceleratorTransferFn transferSurface = (CloudCodeIOSurfaceAcceleratorTransferFn)CloudCodeResolve(ioSurfaceAccelerator, "IOSurfaceAcceleratorTransferSurface");
     CGSize pixels = CloudCodeScreenPixelSize();
     if (!render || !createSurface || !lockSurface || !unlockSurface || !getBaseAddress || !getBytesPerRow || pixels.width <= 1 || pixels.height <= 1) {
         fprintf(stderr, "gui-screenshot/render-server: prerequisites unavailable render=%d create=%d lock=%d unlock=%d base=%d row=%d pixels=%.0fx%.0f\n", !!render, !!createSurface, !!lockSurface, !!unlockSurface, !!getBaseAddress, !!getBytesPerRow, pixels.width, pixels.height);
@@ -556,18 +565,56 @@ static UIImage *CloudCodeScreenshotImageFromRenderServer(void)
         @"IOSurfacePixelFormat": @(0x42475241),
         @"IOSurfaceIsGlobal": @YES
     };
-    CloudCodeIOSurfaceRef surface = createSurface((__bridge CFDictionaryRef)properties);
-    if (!surface) {
+    CloudCodeIOSurfaceRef renderSurface = createSurface((__bridge CFDictionaryRef)properties);
+    if (!renderSurface) {
         fprintf(stderr, "gui-screenshot/render-server: IOSurfaceCreate returned null for %zux%zu\n", width, height);
         return nil;
     }
 
+    int32_t renderLockCode = lockSurface(renderSurface, 0, NULL);
+    if (renderLockCode != 0) {
+        fprintf(stderr, "gui-screenshot/render-server: render IOSurfaceLock failed code=%d\n", renderLockCode);
+        CFRelease(renderSurface);
+        return nil;
+    }
+    @try { render(0, CFSTR("LCD"), renderSurface, 0, 0); } @catch (__unused NSException *exception) {}
+    unlockSurface(renderSurface, 0, NULL);
+
+    // RenderServer can expose a protected or GPU-owned surface whose backing bytes are not directly
+    // CPU-readable even though the render call itself succeeds. When IOSurfaceAccelerator is
+    // available, copy that frame into a second local BGRA surface before sampling/encoding it.
+    // This mirrors the architecture used by system capture clients without importing private SDK
+    // headers; all symbols remain runtime-resolved and the direct surface remains a fallback.
+    CloudCodeIOSurfaceRef readableSurface = renderSurface;
+    CloudCodeIOSurfaceRef copiedSurface = NULL;
+    CloudCodeIOSurfaceAcceleratorRef accelerator = NULL;
+    int32_t acceleratorCreateCode = -1;
+    int32_t transferCode = -1;
+    if (createAccelerator && transferSurface) {
+        copiedSurface = createSurface((__bridge CFDictionaryRef)properties);
+        if (copiedSurface) {
+            acceleratorCreateCode = createAccelerator(kCFAllocatorDefault, NULL, &accelerator);
+            if (acceleratorCreateCode == 0 && accelerator) {
+                transferCode = transferSurface(accelerator, renderSurface, copiedSurface, NULL, NULL);
+                if (transferCode == 0) {
+                    readableSurface = copiedSurface;
+                    fprintf(stderr, "gui-screenshot/render-server: route=iosurface-accelerator transfer=success size=%zux%zu\n", width, height);
+                } else {
+                    fprintf(stderr, "gui-screenshot/render-server: IOSurfaceAcceleratorTransferSurface failed code=%d; falling back to direct surface\n", transferCode);
+                }
+            } else {
+                fprintf(stderr, "gui-screenshot/render-server: IOSurfaceAcceleratorCreate failed code=%d; falling back to direct surface\n", acceleratorCreateCode);
+            }
+        }
+    } else {
+        fprintf(stderr, "gui-screenshot/render-server: IOSurfaceAccelerator symbols unavailable; falling back to direct surface\n");
+    }
+
     UIImage *detached = nil;
-    int32_t lockCode = lockSurface(surface, 0, NULL);
+    int32_t lockCode = lockSurface(readableSurface, 0, NULL);
     if (lockCode == 0) {
-        @try { render(0, CFSTR("LCD"), surface, 0, 0); } @catch (__unused NSException *exception) {}
-        void *baseAddress = getBaseAddress(surface);
-        size_t surfaceBytesPerRow = getBytesPerRow(surface);
+        void *baseAddress = getBaseAddress(readableSurface);
+        size_t surfaceBytesPerRow = getBytesPerRow(readableSurface);
         if (baseAddress && surfaceBytesPerRow >= width * 4) {
             CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, baseAddress, surfaceBytesPerRow * height, NULL);
             CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
@@ -577,7 +624,9 @@ static UIImage *CloudCodeScreenshotImageFromRenderServer(void)
                 provider, NULL, true, kCGRenderingIntentDefault
             ) : NULL;
             if (cgImage) {
-                UIImage *surfaceImage = [UIImage imageWithCGImage:cgImage scale:UIScreen.mainScreen.scale orientation:UIImageOrientationUp];
+                CGFloat imageScale = UIScreen.mainScreen.scale;
+                if (!isfinite(imageScale) || imageScale < 1.0) { imageScale = 1.0; }
+                UIImage *surfaceImage = [UIImage imageWithCGImage:cgImage scale:imageScale orientation:UIImageOrientationUp];
                 if (surfaceImage) {
                     UIGraphicsBeginImageContextWithOptions(surfaceImage.size, YES, 1.0);
                     [surfaceImage drawAtPoint:CGPointZero];
@@ -589,12 +638,15 @@ static UIImage *CloudCodeScreenshotImageFromRenderServer(void)
             if (colorSpace) { CGColorSpaceRelease(colorSpace); }
             if (provider) { CGDataProviderRelease(provider); }
         }
-        unlockSurface(surface, 0, NULL);
+        unlockSurface(readableSurface, 0, NULL);
     } else {
-        fprintf(stderr, "gui-screenshot/render-server: IOSurfaceLock failed code=%d\n", lockCode);
+        fprintf(stderr, "gui-screenshot/render-server: readable IOSurfaceLock failed code=%d acceleratorTransfer=%d\n", lockCode, transferCode);
     }
-    CFRelease(surface);
-    if (!detached) { fprintf(stderr, "gui-screenshot/render-server: render completed without a readable detached image\n"); }
+
+    if (accelerator) { CFRelease(accelerator); }
+    if (copiedSurface) { CFRelease(copiedSurface); }
+    CFRelease(renderSurface);
+    if (!detached) { fprintf(stderr, "gui-screenshot/render-server: render completed without a readable detached image acceleratorCreate=%d transfer=%d\n", acceleratorCreateCode, transferCode); }
     return detached;
 }
 

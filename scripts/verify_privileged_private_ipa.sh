@@ -91,6 +91,7 @@ for helper_only in \
   'com.apple.private.hid.client.service-protected' \
   'com.apple.private.hid.manager.client' \
   'com.apple.accessibility.api' \
+  'com.apple.QuartzCore.cache-asynchronous' \
   'com.apple.QuartzCore.displayable-context' \
   'com.apple.QuartzCore.global-capture' \
   'com.apple.QuartzCore.secure-capture' \
@@ -147,6 +148,7 @@ for key in \
   'com.apple.private.hid.client.service-protected' \
   'com.apple.private.hid.manager.client' \
   'com.apple.accessibility.api' \
+  'com.apple.QuartzCore.cache-asynchronous' \
   'com.apple.QuartzCore.displayable-context' \
   'com.apple.QuartzCore.global-capture' \
   'com.apple.QuartzCore.secure-capture' \
@@ -176,6 +178,7 @@ for iokit_key in \
   'com.apple.security.exception.iokit-user-client-class'; do
   for iokit_class in \
     'IOSurfaceRootUserClient' \
+    'IOSurfaceAcceleratorClient' \
     'IOHIDEventServiceFastPathUserClient' \
     'IOHIDLibUserClient' \
     'IOAccelDevice' \
