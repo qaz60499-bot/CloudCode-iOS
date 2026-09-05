@@ -5,6 +5,15 @@ final class CloudCodeLaunchUITests: XCTestCase {
         continueAfterFailure = false
     }
 
+    private func reveal(_ element: XCUIElement, in app: XCUIApplication, attempts: Int = 6) -> Bool {
+        if element.waitForExistence(timeout: 1) { return true }
+        for _ in 0..<attempts {
+            app.swipeUp()
+            if element.waitForExistence(timeout: 1) { return true }
+        }
+        return element.exists
+    }
+
     func testSettingsAndProviderControlsRemainReachableAfterColdLaunch() throws {
         let app = XCUIApplication()
         app.launch()
@@ -15,9 +24,10 @@ final class CloudCodeLaunchUITests: XCTestCase {
 
         XCTAssertTrue(app.navigationBars["设置"].waitForExistence(timeout: 10), "设置页未能稳定打开")
         XCTAssertTrue(app.secureTextFields["替换当前选择的 Key"].waitForExistence(timeout: 10), "Key 输入框不可用")
-        XCTAssertTrue(app.buttons["添加自定义厂商"].waitForExistence(timeout: 10), "自定义厂商入口不可用")
+        let addProvider = app.buttons["添加自定义厂商"]
+        XCTAssertTrue(reveal(addProvider, in: app), "自定义厂商入口不可用")
 
-        app.buttons["添加自定义厂商"].tap()
+        addProvider.tap()
         XCTAssertTrue(app.navigationBars["添加厂商"].waitForExistence(timeout: 10), "自定义厂商配置页未能打开")
         XCTAssertTrue(app.textFields["名称"].exists)
         XCTAssertTrue(app.textFields["Base URL"].exists)
@@ -25,7 +35,7 @@ final class CloudCodeLaunchUITests: XCTestCase {
         app.buttons["取消"].tap()
 
         let logs = app.buttons["日志"].firstMatch
-        XCTAssertTrue(logs.waitForExistence(timeout: 10), "诊断日志入口不可用")
+        XCTAssertTrue(reveal(logs, in: app), "诊断日志入口不可用")
         logs.tap()
         XCTAssertTrue(app.navigationBars["诊断日志"].waitForExistence(timeout: 10), "诊断日志页未能打开")
     }
