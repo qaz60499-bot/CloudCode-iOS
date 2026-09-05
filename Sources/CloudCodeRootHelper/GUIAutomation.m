@@ -237,8 +237,12 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
     if (!CloudCodeValidPoint(x, y, size)) { return NULL; }
     double nx = x / size.width;
     double ny = y / size.height;
+    // Keep the parent digitizer event aligned with the established global-IOHID pattern used
+    // for iOS touch injection: the parent is born with Position in its event mask before the
+    // display-integrated / digitizer bookkeeping fields below are applied. Creating it with a
+    // zero mask can yield a structurally valid event that the system silently ignores.
     CloudCodeIOHIDEventRef parent = runtime.createDigitizer(
-        kCFAllocatorDefault, mach_absolute_time(), 3, 99, 1, 0, 0,
+        kCFAllocatorDefault, mach_absolute_time(), 3, 99, 1, (1u << 2), 0,
         0, 0, 0, 0, 0, 0, false, false, 0
     );
     if (!parent) { return NULL; }
