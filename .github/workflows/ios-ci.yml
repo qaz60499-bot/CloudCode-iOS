@@ -71,9 +71,20 @@ jobs:
             python3 -c 'import subprocess,sys; p=subprocess.run(["xcrun","simctl"]+sys.argv[2:], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=float(sys.argv[1])); sys.stdout.write(p.stdout); sys.stderr.write(p.stderr); raise SystemExit(p.returncode)' "$timeout_seconds" "$@"
           }
           simctl_bounded 120 install "$UDID" "$APP_PATH"
+          data_container=""
+          for attempt in 1 2 3; do
+            if data_container="$(simctl_bounded 60 get_app_container "$UDID" com.cloudcode.ios data)"; then
+              break
+            fi
+            echo "WARN: get_app_container attempt $attempt failed; retrying the same installed app without rebuilding" >&2
+            sleep 2
+          done
+          test -n "$data_container"
+          breadcrumb_root="$data_container/Library/Application Support/CloudCode/StartupBreadcrumbs"
+
           verify_stable_launch() {
             local phase="$1"
-            local launch_result pid data_container breadcrumb_root latest_run
+            local launch_result pid latest_run
             launch_result="$(simctl_bounded 90 launch "$UDID" com.cloudcode.ios)"
             echo "$phase: $launch_result"
             pid="${launch_result##*: }"
@@ -82,8 +93,6 @@ jobs:
             # A successful launch syscall is not enough: keep the Release process alive long
             # enough to execute bootstrap and require its crash-survivable stable marker.
             sleep 15
-            data_container="$(simctl_bounded 30 get_app_container "$UDID" com.cloudcode.ios data)"
-            breadcrumb_root="$data_container/Library/Application Support/CloudCode/StartupBreadcrumbs"
             latest_run="$(find "$breadcrumb_root" -type f -name 'run-*.jsonl' -print 2>/dev/null | while IFS= read -r file; do stat -f '%m %N' "$file"; done | sort -rn | head -1 | cut -d' ' -f2-)"
             if [[ -z "$latest_run" ]] || ! grep -F 'bootstrap.completed' "$latest_run" >/dev/null; then
               echo "FAIL: $phase did not reach bootstrap.completed" >&2
@@ -105,8 +114,8 @@ jobs:
           done
 
           # Exercise the real crash-loop recovery branch instead of only checking it statically.
-          data_container="$(simctl_bounded 30 get_app_container "$UDID" com.cloudcode.ios data)"
-          breadcrumb_root="$data_container/Library/Application Support/CloudCode/StartupBreadcrumbs"
+          # Reuse the container resolved once after install; repeated simctl container lookups are
+          # unnecessary and can hang while CoreSimulator is settling after a launch.
           mkdir -p "$breadcrumb_root"
           seed_run="$breadcrumb_root/run-11111111-1111-1111-1111-111111111111.jsonl"
           python3 -c 'import datetime,json,sys; ts=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z"); print(json.dumps({"runID":"11111111-1111-1111-1111-111111111111","timestamp":ts,"stage":"bootstrap.safe.begin"}), file=open(sys.argv[1],"w",encoding="utf-8"))' "$seed_run"
