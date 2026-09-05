@@ -3334,6 +3334,47 @@ final class CloudCodeCoreTests: XCTestCase {
         _ = await firstConsumer.result
     }
 
+    func testAgentCoreWaitsForCancelledSessionToBecomeIdleBeforeResume() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = ToolRegistry(descriptors: [])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let checkpoints = TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json"))
+        let agent = AgentCore(
+            provider: BlockingProvider(),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(registry: registry, executors: []),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: checkpoints,
+            maxToolRounds: 2
+        )
+        let session = AgentSession(permissionMode: .safe)
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        let stream = await agent.send(text: "background-task", session: session, providerConfiguration: config)
+        let consumer = Task {
+            do { for try await _ in stream {} } catch { }
+        }
+
+        let idleWhileRunning = await agent.waitUntilSessionIdle(session.id, timeoutNanoseconds: 50_000_000)
+        XCTAssertFalse(idleWhileRunning)
+
+        consumer.cancel()
+        _ = await consumer.result
+        let idleAfterCancellation = await agent.waitUntilSessionIdle(session.id, timeoutNanoseconds: 1_000_000_000)
+        XCTAssertTrue(idleAfterCancellation)
+
+        let resumedStream = await agent.send(text: "resumed", session: session, providerConfiguration: config)
+        let resumedConsumer = Task {
+            do { for try await _ in resumedStream {} } catch { }
+        }
+        resumedConsumer.cancel()
+        _ = await resumedConsumer.result
+        let idleAfterSecondCancellation = await agent.waitUntilSessionIdle(session.id, timeoutNanoseconds: 1_000_000_000)
+        XCTAssertTrue(idleAfterSecondCancellation)
+    }
+
     func testAgentCoreProviderFailureResumeDoesNotDuplicateUserMessage() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

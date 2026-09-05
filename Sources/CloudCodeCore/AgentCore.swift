@@ -382,6 +382,16 @@ public actor AgentCore {
     private let maxToolRounds: Int
     private var activeSessionRuns: [UUID: UUID] = [:]
 
+    public func waitUntilSessionIdle(_ sessionID: UUID, timeoutNanoseconds: UInt64 = 2_000_000_000) async -> Bool {
+        let timeout = TimeInterval(timeoutNanoseconds) / 1_000_000_000
+        let deadline = Date().addingTimeInterval(timeout)
+        while activeSessionRuns[sessionID] != nil {
+            if Date() >= deadline { return false }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        return true
+    }
+
     public init(
         provider: ProviderStreaming,
         keyVault: APIKeyVault,

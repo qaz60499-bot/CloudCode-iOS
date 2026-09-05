@@ -454,6 +454,15 @@ jobs:
           for marker in ('inheritedAutoResumeIntentAtLaunch', 'autoResumeArmedInCurrentProcess', 'runtime.autoresume.coldlaunch.suppressed'):
               if marker not in app:
                   raise SystemExit(f'FAIL: post-send cold-launch crash-loop guard missing: {marker}')
+          for marker in ('lifecycleInterruptedSessionIDs', 'settleLifecycleInterruptedRunsBeforeResume()', 'await agentCore.waitUntilSessionIdle(sessionID)', 'foreground.lifecycle-settle'):
+              if marker not in app:
+                  raise SystemExit(f'FAIL: same-process background resume synchronization missing: {marker}')
+          background_interrupt = app.split('private func interruptActiveRunForBackground(reason:', 1)[1].split('private func settleLifecycleInterruptedRunsBeforeResume()', 1)[0]
+          for forbidden in ('activeTasks.removeValue(forKey: sessionID)', 'activeRunTokens.removeValue(forKey: sessionID)', 'runningSessionIDs.remove(sessionID)'):
+              if forbidden in background_interrupt:
+                  raise SystemExit(f'FAIL: background expiration clears App run state before AgentCore has released the session: {forbidden}')
+          if 'waitUntilSessionIdle(_ sessionID:' not in agent:
+              raise SystemExit('FAIL: AgentCore lacks an idle barrier for lifecycle-safe checkpoint resume')
           auto_resume = app.split('private func resumeMostRecentInterruptedTaskIfRequested()', 1)[1].split('private func clearAutoResumeIntentIfNoPendingTask()', 1)[0]
           if 'guard autoResumeArmedInCurrentProcess else' not in auto_resume:
               raise SystemExit('FAIL: persisted Agent auto-resume state can cross a process boundary and replay a crash-triggering request')

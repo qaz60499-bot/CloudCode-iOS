@@ -74,6 +74,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private let previousStartupCompleted: Bool
     private let inheritedAutoResumeIntentAtLaunch: Bool
     private var autoResumeArmedInCurrentProcess = false
+    private var lifecycleInterruptedSessionIDs: Set<UUID> = []
     private var activeTasks: [UUID: Task<Void, Never>] = [:]
     private var activeRunTokens: [UUID: UUID] = [:]
     private var activeConfigurations: [UUID: ProviderConfiguration] = [:]
@@ -807,19 +808,12 @@ public final class CloudCodeViewModel: ObservableObject {
     public func cancelCurrentTask() {
         let sessionID = session.id
         guard let task = activeTasks[sessionID] else { return }
+        lifecycleInterruptedSessionIDs.remove(sessionID)
+        autoResumeArmedInCurrentProcess = false
+        UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
         task.cancel()
-        activeTasks.removeValue(forKey: sessionID)
-        activeRunTokens.removeValue(forKey: sessionID)
-        activeConfigurations.removeValue(forKey: sessionID)
-        runningSessionIDs.remove(sessionID)
-        streamingAssistantMessageIDs.removeValue(forKey: sessionID)
         Task { await steeringMailbox.clear(sessionID: sessionID) }
-        sessionActivityLines[sessionID, default: []].append("任务已按你的明确命令停止；检查点已保留，但这个会话不会自动继续。")
-        if runningSessionIDs.isEmpty {
-            autoResumeArmedInCurrentProcess = false
-            UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
-            endBackgroundExecutionIfNeeded()
-        }
+        sessionActivityLines[sessionID, default: []].append("任务已按你的明确命令停止；正在收束当前执行步骤。检查点会保留，但这个会话不会自动继续。")
         syncVisibleSessionState(sessionID)
     }
 
@@ -832,7 +826,7 @@ public final class CloudCodeViewModel: ObservableObject {
         // 立即取消会把已经被系统接受的状态变更卡在“请求已发出、结果未校验”的窗口。
         // 申请一段有界后台时间，让当前步骤优先完成结果校验；只有系统明确收回后台时间时
         // 才取消并依赖持久化检查点恢复。
-        let message = "App 已进入后台；Cloud Code 将以 90 分钟为连续任务保留窗口。iOS 若更早收回后台执行时间，会安全中断并保留检查点，回到可执行状态后自动继续。"
+        let message = "App 已进入后台；系统允许的后台时间内任务会继续执行。90 分钟仅是 Cloud Code 的恢复意图保留窗口，不代表 iOS 会连续放行 90 分钟；系统若收回执行时间，会安全暂停并保留检查点，重新进入 App 后自动收束旧 run 再继续。"
         for sessionID in runningSessionIDs {
             sessionActivityLines[sessionID, default: []].append(message)
         }
@@ -843,7 +837,8 @@ public final class CloudCodeViewModel: ObservableObject {
     public func refreshAfterForeground() {
         endBackgroundExecutionIfNeeded()
         Task {
-            try? await diagnosticLogStore.log(level: .info, subsystem: "app", action: "foreground", result: "entered", metadata: ["runningSessions": String(runningSessionIDs.count)])
+            try? await diagnosticLogStore.log(level: .info, subsystem: "app", action: "foreground", result: "entered", metadata: ["runningSessions": String(runningSessionIDs.count), "lifecycleInterruptedSessions": String(lifecycleInterruptedSessionIDs.count)])
+            await settleLifecycleInterruptedRunsBeforeResume()
             await reloadActivity()
             refreshFilesFromDisk()
             try? await reloadSessionHistory()
@@ -898,19 +893,35 @@ public final class CloudCodeViewModel: ObservableObject {
     private func interruptActiveRunForBackground(reason: String) {
         guard isRunning else { return }
         let sessionIDs = Array(runningSessionIDs)
+        autoResumeArmedInCurrentProcess = true
+        UserDefaults.standard.set(true, forKey: Self.autoResumeTaskDefaultsKey)
         for sessionID in sessionIDs {
+            lifecycleInterruptedSessionIDs.insert(sessionID)
             activeTasks[sessionID]?.cancel()
-            activeTasks.removeValue(forKey: sessionID)
-            activeRunTokens.removeValue(forKey: sessionID)
-            activeConfigurations.removeValue(forKey: sessionID)
-            runningSessionIDs.remove(sessionID)
-            streamingAssistantMessageIDs.removeValue(forKey: sessionID)
             sessionActivityLines[sessionID, default: []].append(reason)
             Task {
                 try? await diagnosticLogStore.log(level: .warning, subsystem: "app", action: "background-run-interrupt", result: "interrupted", sessionID: sessionID, diagnostic: reason)
             }
         }
         if sessionIDs.contains(session.id) { syncVisibleSessionState(session.id) }
+    }
+
+    private func settleLifecycleInterruptedRunsBeforeResume() async {
+        let sessionIDs = Array(lifecycleInterruptedSessionIDs)
+        guard !sessionIDs.isEmpty else { return }
+        for sessionID in sessionIDs {
+            if let task = activeTasks[sessionID] {
+                _ = await task.result
+            }
+            let idle = await agentCore.waitUntilSessionIdle(sessionID)
+            try? await diagnosticLogStore.log(
+                level: idle ? .info : .warning,
+                subsystem: "app",
+                action: "foreground.lifecycle-settle",
+                result: idle ? "idle" : "timeout",
+                sessionID: sessionID
+            )
+        }
     }
 
     private func resumeMostRecentInterruptedTaskIfRequested() {
@@ -928,12 +939,14 @@ public final class CloudCodeViewModel: ObservableObject {
         }
         guard let checkpoint = automaticCandidates.first else {
             if runningSessionIDs.isEmpty {
+                lifecycleInterruptedSessionIDs.removeAll()
                 autoResumeArmedInCurrentProcess = false
                 UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
             }
             return
         }
-        sessionActivityLines[checkpoint.sessionID, default: []].append("检测到未明确停止的中断任务；正在从最近检查点自动继续。")
+        lifecycleInterruptedSessionIDs.remove(checkpoint.sessionID)
+        sessionActivityLines[checkpoint.sessionID, default: []].append("检测到未明确停止的中断任务；旧 Agent run 已收束，正在从最近检查点自动继续。")
         resumeTask(checkpoint)
     }
 
@@ -1082,6 +1095,9 @@ public final class CloudCodeViewModel: ObservableObject {
 
                 let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
                 let source = InputSource(rawValue: checkpoint.payload["inputSource"] ?? "text") ?? .text
+                guard await agentCore.waitUntilSessionIdle(sessionID) else {
+                    throw AgentRunError.sessionAlreadyRunning(sessionID)
+                }
                 let stream = await agentCore.send(
                     text: request,
                     inputSource: source,
@@ -1448,6 +1464,7 @@ public final class CloudCodeViewModel: ObservableObject {
             "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
             "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "",
             "activeSessionIDs": runningSessionIDs.map(\.uuidString).sorted(),
+            "lifecycleInterruptedSessionIDs": lifecycleInterruptedSessionIDs.map(\.uuidString).sorted(),
             "currentSessionID": session.id.uuidString,
             "providerID": selectedProviderID,
             "model": selectedModel,
@@ -2264,14 +2281,17 @@ public final class CloudCodeViewModel: ObservableObject {
 
     private func finishSessionRun(sessionID: UUID, runToken: UUID) {
         guard activeRunTokens[sessionID] == runToken else { return }
+        let preserveLifecycleResume = lifecycleInterruptedSessionIDs.contains(sessionID)
         activeTasks.removeValue(forKey: sessionID)
         activeRunTokens.removeValue(forKey: sessionID)
         activeConfigurations.removeValue(forKey: sessionID)
         runningSessionIDs.remove(sessionID)
         streamingAssistantMessageIDs.removeValue(forKey: sessionID)
         if runningSessionIDs.isEmpty {
-            autoResumeArmedInCurrentProcess = false
-            UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
+            if !preserveLifecycleResume {
+                autoResumeArmedInCurrentProcess = false
+                UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
+            }
             endBackgroundExecutionIfNeeded()
         }
         syncVisibleSessionState(sessionID)
