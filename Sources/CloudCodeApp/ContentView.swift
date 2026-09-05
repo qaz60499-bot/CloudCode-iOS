@@ -1200,6 +1200,19 @@ private struct SettingsView: View {
                         .disabled(model.isProviderKeyMutationInFlight)
                 }
 
+                Section("交互学习") {
+                    NavigationLink {
+                        InteractionLearningView(model: model)
+                    } label: {
+                        Label("iOS / HomeOS 交互经验", systemImage: "brain.head.profile")
+                    }
+                    LabeledContent("观测策略", value: "\(model.interactionObservationExperiences.count)")
+                    LabeledContent("导航策略", value: "\(model.interactionNavigationExperiences.count)")
+                    Text("交互经验只用于优化执行路径和耗时，并按 App 版本、iOS 主版本和设备类型隔离；不会学习密码、消息正文、永久坐标、权限或 HID 常量。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("诊断") {
                     NavigationLink {
                         DiagnosticLogsView(model: model)
@@ -1242,7 +1255,10 @@ private struct SettingsView: View {
                 }
             }
             .navigationTitle("设置")
-            .onAppear { model.recordStartupBreadcrumb("settings.appear") }
+            .onAppear {
+                model.recordStartupBreadcrumb("settings.appear")
+                Task { await model.reloadInteractionLearning() }
+            }
             .onDisappear {
                 model.recordStartupBreadcrumb("settings.disappear")
                 keyInputFocused = false
@@ -1272,6 +1288,74 @@ private struct SettingsView: View {
         case .balanced: return "普通写入可以直接执行；删除会进入 Cloud Code 回收站。重要数据和不可逆操作仍需要确认。"
         case .full: return "Agent 可以跳过大多数确认，但会尽可能保留审计记录、事务记录和备份。此模式只能由你手动选择。"
         }
+    }
+}
+
+private struct InteractionLearningView: View {
+    @ObservedObject var model: CloudCodeViewModel
+
+    private var bundleIDs: [String] {
+        let observationIDs = model.interactionObservationExperiences.map { $0.environment.bundleID }
+        let navigationIDs = model.interactionNavigationExperiences.map { $0.environment.bundleID }
+        return Array(Set(observationIDs + navigationIDs)).sorted()
+    }
+
+    var body: some View {
+        List {
+            if bundleIDs.isEmpty {
+                VStack(alignment: .center, spacing: 8) {
+                    Image(systemName: "brain.head.profile")
+                        .font(.title2)
+                    Text("暂无交互经验")
+                        .font(.headline)
+                    Text("Cloud Code 会在真实工具结果得到足够证据后，逐步学习更可靠、更快的 iOS 交互策略。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 18)
+            } else {
+                ForEach(bundleIDs, id: \.self) { bundleID in
+                    Section(bundleID) {
+                        let observations = model.interactionObservationExperiences.filter { $0.environment.bundleID == bundleID }
+                        let navigation = model.interactionNavigationExperiences.filter { $0.environment.bundleID == bundleID }
+                        ForEach(Array(observations.enumerated()), id: \.offset) { _, item in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("观测 · \(item.backend.rawValue)")
+                                Text("App \(item.environment.appVersion) · iOS \(item.environment.osMajorVersion) · \(item.environment.deviceClass) · \(item.successes)/\(item.attempts) 成功 · 平均 \(item.averageLatencyMS.map(String.init) ?? "-") ms")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        ForEach(Array(navigation.enumerated()), id: \.offset) { _, item in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("导航 · \(item.fromSurface.rawValue) → \(item.toSurface.rawValue)")
+                                Text("\(item.strategy.rawValue) · App \(item.environment.appVersion) · iOS \(item.environment.osMajorVersion) · \(item.successes)/\(item.attempts) 验证")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Button("清除此 App 的交互经验", role: .destructive) {
+                            model.clearInteractionLearning(bundleID: bundleID)
+                        }
+                    }
+                }
+            }
+
+            Section("控制") {
+                Button("清除全部交互学习数据", role: .destructive) {
+                    model.clearInteractionLearning()
+                }
+                .disabled(bundleIDs.isEmpty)
+                Text("清除经验不会影响 HomeOS 能力、Agent 权限、Hermes 记忆、Provider Key 或 GUI 底层能力；后续会重新从真实验证结果学习。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .navigationTitle("交互学习")
+        .refreshable { await model.reloadInteractionLearning() }
+        .task { await model.reloadInteractionLearning() }
     }
 }
 

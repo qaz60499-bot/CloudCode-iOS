@@ -123,12 +123,12 @@ public enum GUIApprovalTargetSanitizer {
         switch call.name {
         case "gui.openApp":
             return call.arguments["bundleId"] ?? "当前前台 App"
-        case "gui.type":
+        case "gui.type", "gui.typeObserve":
             let count = call.arguments["text"]?.count ?? 0
             return "当前前台 App · 输入 \(count) 个字符（内容已隐藏）"
-        case "gui.tap": return "当前前台 App · tap"
-        case "gui.scroll": return "当前前台 App · scroll"
-        case "gui.swipe": return "当前前台 App · swipe"
+        case "gui.tap", "gui.tapObserve": return "当前前台 App · tap"
+        case "gui.scroll", "gui.scrollObserve": return "当前前台 App · scroll"
+        case "gui.swipe", "gui.swipeObserve": return "当前前台 App · swipe"
         case "gui.swipeSequence":
             let count = call.arguments["count"] ?? "?"
             return "当前前台 App · bounded swipe sequence ×\(count)"
@@ -182,6 +182,11 @@ public actor ToolRegistry {
         ToolDescriptor(name: "gui.swipe", summary: "Swipe through the configured backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.swipeSequence", summary: "Execute an explicitly requested finite sequence of identical swipes locally. The bounded executor captures lightweight screenshots between gestures, stops early on byte-identical observations, and returns the final screenshot so the model does not need a full round-trip between every repeated swipe.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.navigateBack", summary: "Navigate back from a temporary iOS detail/media surface using one explicit bounded strategy: edge for a left-edge navigation-pop gesture, or dismissDown for a fullscreen/modal downward dismiss. The tool returns a fresh final screenshot; that screenshot, not motion/hash alone, must be inspected semantically before continuing.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.tapObserve", summary: "Execute one bounded tap and immediately capture a fresh screenshot locally. This is a one-write micro-plan; the returned image must be interpreted before any dependent write.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.typeObserve", summary: "Execute one bounded text-input action and immediately capture a fresh screenshot locally. This is a one-write micro-plan; do not send or perform another dependent write before interpreting the returned image.", risk: .sensitiveWrite, requiredCapabilities: [GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.scrollObserve", summary: "Execute one bounded scroll and immediately capture a fresh screenshot locally. This is a one-write micro-plan; interpret the returned image before another dependent write.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.swipeObserve", summary: "Execute one bounded swipe and immediately capture a fresh screenshot locally. This is a one-write micro-plan; interpret the returned image before another dependent write.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "interaction.confirmTransition", summary: "Record semantically verified navigation evidence for the adaptive iOS interaction framework after inspecting fresh observation data. This never performs a GUI action and never changes permissions.", risk: .readOnly),
         ToolDescriptor(name: "gui.verify", summary: "Verify GUI postconditions through the configured backend.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.verify.capabilityID], preferredRoute: .guiFallback)
     ]
 }

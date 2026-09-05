@@ -477,6 +477,10 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         return cachedApps
     }
 
+    public func cachedVersion(for bundleID: String) -> String? {
+        cachedApps.first(where: { $0.ownerBundleID == bundleID })?.metadata["version"]
+    }
+
     public func bundlePath(for bundleID: String) async -> String? {
         if bundleID == Bundle.main.bundleIdentifier { return bundlePaths[bundleID] ?? Bundle.main.bundleURL.path }
         if shouldRefreshIndex() { refresh() }
@@ -1056,11 +1060,12 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
                 result: outcome.success ? "launch_accepted" : "launch_rejected",
                 detail: ["diagnostic": outcome.detail]
             ))
+            let version = await appResolver.cachedVersion(for: bundleID) ?? ""
             return ToolResult(
                 toolCallID: call.id,
                 success: outcome.success,
                 summary: outcome.success ? "已请求启动 \(bundleID)" : "启动失败：\(outcome.detail)",
-                payload: ["bundleId": bundleID, "detail": outcome.detail],
+                payload: ["bundleId": bundleID, "detail": outcome.detail, "version": version],
                 verification: VerificationResult(passed: outcome.success, checks: ["LaunchServices 接受目标 App 启动请求"], failures: outcome.success ? [] : [outcome.detail])
             )
         }
@@ -1236,31 +1241,22 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         for tool: ToolDescriptor,
         capabilities: CapabilityProfile
     ) async -> Bool {
-        if tool.name == "gui.swipeSequence" || tool.name == "gui.navigateBack" {
-            let expected = Set([GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
-            let deferred = Set(capabilityIDs)
-            guard !deferred.isEmpty, deferred.isSubset(of: expected),
-                  capabilityIDs.allSatisfy({ capabilities.status($0) == .deviceValidationRequired }) else { return false }
-            return true
-        }
-        guard let feature = Self.feature(for: tool.name),
-              capabilityIDs == [feature.capabilityID],
-              capabilities.status(feature.capabilityID) == .deviceValidationRequired else { return false }
+        guard let features = Self.features(for: tool.name) else { return false }
+        let expected = Set(features.map(\.capabilityID))
+        let deferred = Set(capabilityIDs)
+        guard !deferred.isEmpty, deferred.isSubset(of: expected),
+              capabilityIDs.allSatisfy({ capabilities.status($0) == .deviceValidationRequired }) else { return false }
         // Route selection stays side-effect free. The exact requested GUI operation below runs
         // in the bounded helper and is itself the runtime proof; helper failures remain fail-closed.
         return true
     }
 
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
-        if tool.name == "gui.swipeSequence" || tool.name == "gui.navigateBack" {
-            return [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID].allSatisfy {
-                let status = capabilities.status($0)
-                return status == .available || status == .deviceValidationRequired
-            }
+        guard let features = Self.features(for: tool.name) else { return false }
+        return features.allSatisfy {
+            let status = capabilities.status($0.capabilityID)
+            return status == .available || status == .deviceValidationRequired
         }
-        guard let feature = Self.feature(for: tool.name) else { return false }
-        let status = capabilities.status(feature.capabilityID)
-        return status == .available || status == .deviceValidationRequired
     }
 
     public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
@@ -1275,23 +1271,23 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             guard let strategy = call.arguments["strategy"], strategy == "edge" || strategy == "dismissDown" else {
                 throw ToolRouterError.noExecutionRoute("navigateBack strategy must be edge or dismissDown")
             }
-        case "gui.tap":
+        case "gui.tap", "gui.tapObserve":
             guard let x = Double(call.arguments["x"] ?? ""), let y = Double(call.arguments["y"] ?? ""),
                   x.isFinite, y.isFinite, x >= 0, y >= 0, x <= 10_000, y <= 10_000 else {
                 throw ToolRouterError.noExecutionRoute("tap coordinates missing, non-finite, negative, or outside bounded range")
             }
-        case "gui.type":
+        case "gui.type", "gui.typeObserve":
             guard let text = call.arguments["text"], !text.isEmpty,
                   (text.data(using: .utf8)?.count ?? Int.max) <= 16 * 1024 else {
                 throw ToolRouterError.noExecutionRoute("text missing, empty, or exceeds 16 KiB")
             }
-        case "gui.scroll":
+        case "gui.scroll", "gui.scrollObserve":
             guard let dx = Double(call.arguments["dx"] ?? ""), let dy = Double(call.arguments["dy"] ?? ""),
                   dx.isFinite, dy.isFinite, abs(dx) <= 10_000, abs(dy) <= 10_000,
                   abs(dx) >= 0.5 || abs(dy) >= 0.5 else {
                 throw ToolRouterError.noExecutionRoute("scroll delta missing, invalid, zero, or outside bounded range")
             }
-        case "gui.swipe", "gui.swipeSequence":
+        case "gui.swipe", "gui.swipeSequence", "gui.swipeObserve":
             let keys = ["fromX", "fromY", "toX", "toY"]
             let coordinates = keys.compactMap { Double(call.arguments[$0] ?? "") }
             let duration = Double(call.arguments["duration"] ?? "0.3")
@@ -1363,6 +1359,8 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             return ToolResult(toolCallID: call.id, success: true, summary: "Swipe dispatched; foreground effect unverified", payload: ["effectVerification": "required"])
         case "gui.swipeSequence":
             return try await executeSwipeSequence(call)
+        case "gui.tapObserve", "gui.typeObserve", "gui.scrollObserve", "gui.swipeObserve":
+            return try await executeActionObserve(call)
         case "gui.navigateBack":
             let baselineData = try await backend.screenshot()
             let baselineSHA256 = GUIAutomationPayloadPolicy.sha256Hex(baselineData)
@@ -1464,6 +1462,55 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         )
     }
 
+    private func executeActionObserve(_ call: ToolCall) async throws -> ToolResult {
+        let baselineData = try await backend.screenshot()
+        let baselineSHA256 = GUIAutomationPayloadPolicy.sha256Hex(baselineData)
+
+        switch call.name {
+        case "gui.tapObserve":
+            try await backend.tap(
+                x: Double(call.arguments["x"] ?? "0") ?? 0,
+                y: Double(call.arguments["y"] ?? "0") ?? 0
+            )
+        case "gui.typeObserve":
+            try await backend.type(call.arguments["text"] ?? "")
+        case "gui.scrollObserve":
+            try await backend.scroll(
+                deltaX: Double(call.arguments["dx"] ?? "0") ?? 0,
+                deltaY: Double(call.arguments["dy"] ?? "0") ?? 0
+            )
+        case "gui.swipeObserve":
+            try await backend.swipe(
+                fromX: Double(call.arguments["fromX"] ?? "0") ?? 0,
+                fromY: Double(call.arguments["fromY"] ?? "0") ?? 0,
+                toX: Double(call.arguments["toX"] ?? "0") ?? 0,
+                toY: Double(call.arguments["toY"] ?? "0") ?? 0,
+                duration: Double(call.arguments["duration"] ?? "0.3") ?? 0.3
+            )
+        default:
+            throw ToolRouterError.noExecutionRoute(call.name)
+        }
+
+        try await Task.sleep(nanoseconds: 300_000_000)
+        try Task.checkCancellation()
+        let observed = try await backend.screenshot()
+        let observedSHA256 = GUIAutomationPayloadPolicy.sha256Hex(observed)
+        let attachment = try persistScreenshotAttachment(observed, sessionID: call.sessionID)
+        return ToolResult(
+            toolCallID: call.id,
+            success: true,
+            summary: "Bounded local action→observe micro-plan completed; final screenshot attached and semantic effect remains unverified.",
+            payload: [
+                "baselineSHA256": baselineSHA256,
+                "sha256": observedSHA256,
+                "screenChanged": observedSHA256 == baselineSHA256 ? "false" : "true",
+                "effectVerification": "semantic_required",
+                "localObservation": "final_screenshot_attached"
+            ],
+            attachments: attachment.map { [$0] }
+        )
+    }
+
     private func persistScreenshotAttachment(_ data: Data, sessionID: UUID) throws -> ChatAttachment? {
         guard let attachmentRoot else { return nil }
         guard !data.isEmpty, data.count <= ChatMessageAttachmentPolicy.maxImageBytes else {
@@ -1482,15 +1529,18 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         )
     }
 
-    private static func feature(for toolName: String) -> GUIAutomationFeature? {
+    private static func features(for toolName: String) -> [GUIAutomationFeature]? {
         switch toolName {
-        case "gui.openApp": return .openApp
-        case "gui.tree": return .tree
-        case "gui.screenshot": return .screenshot
-        case "gui.tap": return .touch
-        case "gui.type": return .textInput
-        case "gui.scroll", "gui.swipe", "gui.swipeSequence", "gui.navigateBack": return .gestures
-        case "gui.verify": return .verify
+        case "gui.openApp": return [.openApp]
+        case "gui.tree": return [.tree]
+        case "gui.screenshot": return [.screenshot]
+        case "gui.tap": return [.touch]
+        case "gui.type": return [.textInput]
+        case "gui.scroll", "gui.swipe": return [.gestures]
+        case "gui.swipeSequence", "gui.navigateBack", "gui.scrollObserve", "gui.swipeObserve": return [.gestures, .screenshot]
+        case "gui.tapObserve": return [.touch, .screenshot]
+        case "gui.typeObserve": return [.textInput, .screenshot]
+        case "gui.verify": return [.verify]
         default: return nil
         }
     }

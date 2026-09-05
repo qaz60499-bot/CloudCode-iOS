@@ -33,6 +33,8 @@ public final class CloudCodeViewModel: ObservableObject {
     @Published public private(set) var hermesProjects: [String] = []
     @Published public private(set) var hermesTags: [String] = []
     @Published public private(set) var hermesStatusMessage: String?
+    @Published public private(set) var interactionObservationExperiences: [IOSInteractionObservationExperience] = []
+    @Published public private(set) var interactionNavigationExperiences: [IOSInteractionNavigationExperience] = []
 
     @Published public private(set) var providerProfiles: [ProviderProfile]
     @Published public private(set) var installedKeyReferences: Set<String> = []
@@ -64,6 +66,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private let keyVault: KeychainAPIKeyVault
     private let steeringMailbox: AgentSteeringMailbox
     private let hermesStore: HermesMemoryStore
+    private let interactionExperienceStore: IOSInteractionExperienceStore
     private let agentCore: AgentCore
     private let resourceIndex: ProgressiveResourceIndex
     private let appKnowledge: AppKnowledgeRegistry
@@ -154,9 +157,13 @@ public final class CloudCodeViewModel: ObservableObject {
         let privateApps = IOSPrivateAppExecutor(appResolver: resolver, policy: policy, approval: approval, audit: audit)
         let attachmentRoot = support.appendingPathComponent("Attachments", isDirectory: true)
         let gui = GUIFallbackExecutor(backend: guiBackend, policy: policy, approval: approval, attachmentRoot: attachmentRoot)
+        let interactionExperienceStore = IOSInteractionExperienceStore(
+            fileURL: support.appendingPathComponent("Interaction/experience.json")
+        )
+        let interactionLearning = IOSInteractionLearningExecutor(experienceStore: interactionExperienceStore)
         let executionLedgerURL = support.appendingPathComponent("Execution/tool-results.json")
         let executionLedger = ToolExecutionLedger(fileURL: executionLedgerURL)
-        let router = ToolRouter(registry: registry, executors: [structured, cli, privateApps, URLSchemeExecutor(), gui], executionLedger: executionLedger, diagnosticLogger: diagnosticLogStore)
+        let router = ToolRouter(registry: registry, executors: [structured, interactionLearning, cli, privateApps, URLSchemeExecutor(), gui], executionLedger: executionLedger, diagnosticLogger: diagnosticLogStore)
         let keyVault = KeychainAPIKeyVault()
         let sessions = SessionStore(root: support.appendingPathComponent("Sessions", isDirectory: true))
         let attachments = ChatAttachmentStore(root: attachmentRoot)
@@ -171,9 +178,6 @@ public final class CloudCodeViewModel: ObservableObject {
             diagnosticLogger: diagnosticLogStore
         )
         let steeringMailbox = AgentSteeringMailbox()
-        let interactionExperienceStore = IOSInteractionExperienceStore(
-            fileURL: support.appendingPathComponent("Interaction/experience.json")
-        )
         let agent = AgentCore(
             provider: provider,
             keyVault: keyVault,
@@ -247,6 +251,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.keyVault = keyVault
         self.steeringMailbox = steeringMailbox
         self.hermesStore = hermesStore
+        self.interactionExperienceStore = interactionExperienceStore
         self.agentCore = agent
         self.resourceIndex = ProgressiveResourceIndex(fileURL: support.appendingPathComponent("Index/resource-graph.json"))
         self.appKnowledge = AppKnowledgeRegistry(fileURL: support.appendingPathComponent("Index/app-knowledge.json"))
@@ -1349,6 +1354,22 @@ public final class CloudCodeViewModel: ObservableObject {
         let root = URL(fileURLWithPath: browsePath, isDirectory: true)
         let allowed = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
         files = try fileService.list(directory: root, allowedRoot: allowed)
+    }
+
+    public func reloadInteractionLearning() async {
+        interactionObservationExperiences = await interactionExperienceStore.observationSnapshot()
+        interactionNavigationExperiences = await interactionExperienceStore.navigationSnapshot()
+    }
+
+    public func clearInteractionLearning(bundleID: String? = nil) {
+        Task {
+            if let bundleID, !bundleID.isEmpty {
+                await interactionExperienceStore.clear(bundleID: bundleID)
+            } else {
+                await interactionExperienceStore.clearAll()
+            }
+            await reloadInteractionLearning()
+        }
     }
 
     public func reloadHermes(query: String = "") async {

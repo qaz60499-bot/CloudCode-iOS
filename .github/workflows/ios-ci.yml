@@ -248,6 +248,13 @@ jobs:
           grep -F 'simctl_bounded 90 launch' .github/workflows/ios-ci.yml >/dev/null
           grep -F 'revision: "22787ffb59de99e5dc1fbfe80b19c97a904ad48d"' Package.swift >/dev/null
           grep -F 'revision: 22787ffb59de99e5dc1fbfe80b19c97a904ad48d' project.yml >/dev/null
+          grep -F 'case interaction = "homeos.interaction"' Sources/CloudCodeCore/HomeOSCapability.swift >/dev/null
+          grep -F 'ToolDescriptor(name: "gui.tapObserve"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
+          grep -F 'ToolDescriptor(name: "gui.typeObserve"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
+          grep -F 'ToolDescriptor(name: "gui.scrollObserve"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
+          grep -F 'ToolDescriptor(name: "gui.swipeObserve"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
+          grep -F 'ToolDescriptor(name: "interaction.confirmTransition"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
+          grep -F 'version: 2, observations: observations, navigation: navigation' Sources/CloudCodeCore/Interaction/IOSInteractionFramework.swift >/dev/null
           if grep -R --line-number 'NSAllowsArbitraryLoads' Sources project.yml Entitlements; then
             echo "FAIL: App Transport Security arbitrary loads must remain disabled" >&2
             exit 1

@@ -12,6 +12,7 @@ public enum HomeOSCapabilityID: String, Codable, CaseIterable, Sendable {
     case device = "homeos.device"
     case workspace = "homeos.workspace"
     case rootHelper = "homeos.root_helper"
+    case interaction = "homeos.interaction"
 }
 
 public struct HomeOSCapabilitySnapshot: Codable, Equatable, Sendable {
@@ -67,7 +68,22 @@ public enum HomeOSCapabilityLayer {
             .init(id: .script, status: status("execution.ios_system"), detail: "Script execution is available only through verified shell/runtime adapters.", backingCapabilities: ["execution.ios_system"]),
             .init(id: .device, status: allRequired([status("apps.enumerate"), status("data.keychain_scope")]), detail: "Device aggregate is available only when all listed read primitives are verified and never implies root by itself.", backingCapabilities: ["apps.enumerate", "data.keychain_scope"]),
             .init(id: .workspace, status: status("filesystem.own_container"), detail: "Workspace root is app-controlled unless unrestricted filesystem access is actually verified.", backingCapabilities: ["filesystem.own_container", "filesystem.unrestricted"]),
-            .init(id: .rootHelper, status: status("execution.root_helper"), detail: "Embedded root helper is exposed only after runtime UID 0/persona validation.", backingCapabilities: ["execution.root_helper"])
+            .init(id: .rootHelper, status: status("execution.root_helper"), detail: "Embedded root helper is exposed only after runtime UID 0/persona validation.", backingCapabilities: ["execution.root_helper"]),
+            .init(
+                id: .interaction,
+                status: allRequired([
+                    anyUsable([status(GUIAutomationFeature.screenshot.capabilityID), status(GUIAutomationFeature.tree.capabilityID)]),
+                    anyUsable([status(GUIAutomationFeature.touch.capabilityID), status(GUIAutomationFeature.gestures.capabilityID), status(GUIAutomationFeature.textInput.capabilityID)])
+                ]),
+                detail: "HomeOS interaction facade is available only when at least one observation path and one bounded action path are currently usable. It is a facade over granular GUI primitives, not a privilege source, and never authorizes an exact operation by itself.",
+                backingCapabilities: [
+                    GUIAutomationFeature.screenshot.capabilityID,
+                    GUIAutomationFeature.tree.capabilityID,
+                    GUIAutomationFeature.touch.capabilityID,
+                    GUIAutomationFeature.gestures.capabilityID,
+                    GUIAutomationFeature.textInput.capabilityID
+                ]
+            )
         ]
     }
 

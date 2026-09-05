@@ -1636,6 +1636,29 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(navigateBack.requiredCapabilities, [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
     }
 
+    func testGUILocalActionObserveToolsRequireActionAndScreenshotCapabilities() async throws {
+        let registry = ToolRegistry()
+        let tapObserveValue = await registry.descriptor(named: "gui.tapObserve")
+        let typeObserveValue = await registry.descriptor(named: "gui.typeObserve")
+        let scrollObserveValue = await registry.descriptor(named: "gui.scrollObserve")
+        let swipeObserveValue = await registry.descriptor(named: "gui.swipeObserve")
+        let learningValue = await registry.descriptor(named: "interaction.confirmTransition")
+        let tapObserve = try XCTUnwrap(tapObserveValue)
+        let typeObserve = try XCTUnwrap(typeObserveValue)
+        let scrollObserve = try XCTUnwrap(scrollObserveValue)
+        let swipeObserve = try XCTUnwrap(swipeObserveValue)
+        let learning = try XCTUnwrap(learningValue)
+
+        XCTAssertEqual(tapObserve.requiredCapabilities, [GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
+        XCTAssertEqual(typeObserve.requiredCapabilities, [GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
+        XCTAssertEqual(scrollObserve.requiredCapabilities, [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
+        XCTAssertEqual(swipeObserve.requiredCapabilities, [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
+        XCTAssertEqual(typeObserve.risk, .sensitiveWrite)
+        XCTAssertTrue(learning.requiredCapabilities.isEmpty)
+        XCTAssertEqual(learning.risk, .readOnly)
+        XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.typeObserve", arguments: ["text": "secret text"], sessionID: UUID())), "当前前台 App · 输入 11 个字符（内容已隐藏）")
+    }
+
     func testPartialGUICapabilityFailsClosedForUnprovenFeature() async throws {
         let registry = ToolRegistry()
         let executor = StubExecutor(route: .guiFallback, names: ["gui.tap", "gui.tree"])
@@ -3895,6 +3918,78 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(snapshot.first(where: { $0.backend == .accessibilityTree })?.failures, 3)
     }
 
+    func testIOSInteractionExperiencePartitionsByAppVersionOSAndDevice() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = IOSInteractionExperienceStore(fileURL: root.appendingPathComponent("experience.json"))
+        let v1 = IOSInteractionEnvironment(bundleID: "com.example.video", appVersion: "1.0", osMajorVersion: 16, deviceClass: "iphone")
+        let v2 = IOSInteractionEnvironment(bundleID: "com.example.video", appVersion: "2.0", osMajorVersion: 16, deviceClass: "iphone")
+
+        for _ in 0..<4 {
+            await store.recordObservation(environment: v1, backend: .screenshot, success: true, latencyMS: 300)
+        }
+        let v1Hint = await store.providerHint(environment: v1)
+        let v2Hint = await store.providerHint(environment: v2)
+        XCTAssertNotNil(v1Hint)
+        XCTAssertNil(v2Hint, "a new App version must not inherit the previous version's learned preference")
+    }
+
+    func testIOSInteractionSemanticNavigationPromotionRequiresRepeatedVerifiedEvidence() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = IOSInteractionExperienceStore(fileURL: root.appendingPathComponent("experience.json"))
+        let executor = IOSInteractionLearningExecutor(experienceStore: store)
+        let descriptor = ToolDescriptor(name: "interaction.confirmTransition", summary: "test", risk: .readOnly)
+        let context = ToolExecutionContext(permissionMode: .safe, capabilityProfile: CapabilityProfile(records: []))
+        let sessionID = UUID()
+        let args = [
+            "bundleId": "com.example.video",
+            "appVersion": "1.0",
+            "fromSurface": IOSInteractionSurface.fullscreenMedia.rawValue,
+            "toSurface": IOSInteractionSurface.chat.rawValue,
+            "strategy": IOSInteractionNavigationStrategy.dismissDown.rawValue,
+            "success": "true",
+            "confidence": "0.90"
+        ]
+
+        for index in 0..<2 {
+            _ = try await executor.execute(ToolCall(id: UUID(), name: descriptor.name, arguments: args, sessionID: sessionID), descriptor: descriptor, context: context)
+            let interim = await store.navigationSnapshot()
+            XCTAssertTrue(interim.allSatisfy { $0.attempts <= index + 1 })
+        }
+        let environment = IOSInteractionEnvironment.current(bundleID: "com.example.video", appVersion: "1.0")
+        let beforePromotionHint = await store.providerHint(environment: environment)
+        XCTAssertNil(beforePromotionHint, "two semantic confirmations are intentionally insufficient for a learned navigation hint")
+
+        _ = try await executor.execute(ToolCall(id: UUID(), name: descriptor.name, arguments: args, sessionID: sessionID), descriptor: descriptor, context: context)
+        let hint = await store.providerHint(environment: environment)
+        XCTAssertTrue(hint?.contains("fullscreenMedia→chat") == true)
+        XCTAssertTrue(hint?.contains("dismissDown") == true)
+    }
+
+    func testIOSInteractionLowConfidenceSemanticEvidenceDoesNotPromote() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = IOSInteractionExperienceStore(fileURL: root.appendingPathComponent("experience.json"))
+        let executor = IOSInteractionLearningExecutor(experienceStore: store)
+        let descriptor = ToolDescriptor(name: "interaction.confirmTransition", summary: "test", risk: .readOnly)
+        let result = try await executor.execute(
+            ToolCall(name: descriptor.name, arguments: [
+                "bundleId": "com.example.video",
+                "fromSurface": "fullscreenMedia",
+                "toSurface": "chat",
+                "strategy": "dismissDown",
+                "success": "true",
+                "confidence": "0.60"
+            ], sessionID: UUID()),
+            descriptor: descriptor,
+            context: ToolExecutionContext(permissionMode: .safe, capabilityProfile: CapabilityProfile(records: []))
+        )
+        XCTAssertEqual(result.payload["learning"], "ignored_low_confidence")
+        let navigation = await store.navigationSnapshot()
+        XCTAssertTrue(navigation.isEmpty)
+    }
+
     func testIOSInteractionExperienceRequiresEvidenceBeforeHinting() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -3935,6 +4030,24 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(snapshots.first(where: { $0.id == .shell })?.status, .unavailable)
         XCTAssertEqual(snapshots.first(where: { $0.id == .git })?.status, .unavailable)
         XCTAssertEqual(snapshots.first(where: { $0.id == .network })?.status, .unknown)
+    }
+
+    func testHomeOSInteractionFacadeRequiresObservationAndActionWithoutGrantingExactPrimitive() {
+        let missingAction = HomeOSCapabilityLayer.snapshots(from: [
+            CapabilityRecord(id: GUIAutomationFeature.screenshot.capabilityID, domain: .automation, status: .available, detail: "yes"),
+            CapabilityRecord(id: GUIAutomationFeature.tree.capabilityID, domain: .automation, status: .unavailable, detail: "no"),
+            CapabilityRecord(id: GUIAutomationFeature.touch.capabilityID, domain: .automation, status: .unavailable, detail: "no"),
+            CapabilityRecord(id: GUIAutomationFeature.gestures.capabilityID, domain: .automation, status: .unavailable, detail: "no"),
+            CapabilityRecord(id: GUIAutomationFeature.textInput.capabilityID, domain: .automation, status: .unavailable, detail: "no")
+        ])
+        XCTAssertEqual(missingAction.first(where: { $0.id == .interaction })?.status, .unavailable)
+
+        let usable = HomeOSCapabilityLayer.snapshots(from: [
+            CapabilityRecord(id: GUIAutomationFeature.screenshot.capabilityID, domain: .automation, status: .available, detail: "yes"),
+            CapabilityRecord(id: GUIAutomationFeature.touch.capabilityID, domain: .automation, status: .deviceValidationRequired, detail: "pending")
+        ])
+        XCTAssertEqual(usable.first(where: { $0.id == .interaction })?.status, .deviceValidationRequired)
+        XCTAssertFalse(usable.first(where: { $0.id == .interaction })?.backingCapabilities.isEmpty == true)
     }
 
     func testHomeOSAppFacadeShowsPartialUsabilityWithoutElevatingExactPrimitiveChecks() {
