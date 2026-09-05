@@ -2288,6 +2288,51 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(observation?.role, .user)
         XCTAssertEqual(observation?.attachments, [attachment])
         XCTAssertTrue(observation?.content.contains("untrusted observation") == true)
+        XCTAssertTrue(snapshots[1].messages.contains {
+            $0.role == .system && $0.content.contains("A gui.tree failure by itself must never block the screenshot path")
+        })
+    }
+
+    func testRepeatedGUISwipeIsAllowedAfterFreshScreenshotObservation() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let provider = RepeatedSwipeWithScreenshotProvider()
+        let swipeCounter = InvocationCounter()
+        let screenshotCounter = InvocationCounter()
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "gui.swipe", summary: "swipe", risk: .safeWrite, preferredRoute: .guiFallback),
+            ToolDescriptor(name: "gui.screenshot", summary: "shot", risk: .readOnly, preferredRoute: .guiFallback)
+        ])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let agent = AgentCore(
+            provider: provider,
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(
+                registry: registry,
+                executors: [
+                    CountingExecutor(route: .guiFallback, names: ["gui.swipe"], counter: swipeCounter),
+                    CountingExecutor(route: .guiFallback, names: ["gui.screenshot"], counter: screenshotCounter)
+                ]
+            ),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 8
+        )
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        let session = AgentSession(permissionMode: .full)
+        let stream = await agent.send(text: "swipe up three times", session: session, providerConfiguration: config)
+        for try await _ in stream {}
+
+        let swipeCount = await swipeCounter.value()
+        let screenshotCount = await screenshotCounter.value()
+        XCTAssertEqual(swipeCount, 3)
+        XCTAssertEqual(screenshotCount, 3)
+        let saved = try await sessions.load(session.id)
+        XCTAssertFalse(saved.messages.contains {
+            $0.role == .tool && $0.providerMetadata["idempotency"] == "semantic_duplicate_blocked"
+        })
     }
 
     func testAgentUsesExplicitlyValidatedSessionCapabilitySnapshotForToolRouting() async throws {
@@ -3016,6 +3061,21 @@ final class CloudCodeCoreTests: XCTestCase {
             arguments: [:],
             scope: appScope
         ))
+
+        let guiScope = AgentCore.semanticToolScope(name: "gui.swipe", arguments: [
+            "fromX": "200", "fromY": "700", "toX": "200", "toY": "200", "duration": "0.3"
+        ])
+        XCTAssertEqual(guiScope, "gui:foreground")
+        XCTAssertTrue(AgentCore.readOnlyToolVerifiesLastStateChange(name: "gui.screenshot", arguments: [:], scope: guiScope))
+        XCTAssertTrue(AgentCore.readOnlyToolVerifiesLastStateChange(name: "gui.tree", arguments: [:], scope: guiScope))
+        XCTAssertTrue(AgentCore.readOnlyToolVerifiesLastStateChange(name: "gui.verify", arguments: ["assertion": "visible"], scope: guiScope))
+        XCTAssertFalse(AgentCore.readOnlyToolVerifiesLastStateChange(name: "apps.list", arguments: [:], scope: guiScope))
+
+        XCTAssertTrue(AgentCore.allowsImmediateSemanticRepeat(name: "apps.launch"))
+        XCTAssertTrue(AgentCore.allowsImmediateSemanticRepeat(name: "gui.openApp"))
+        XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "gui.swipe"))
+        XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "gui.tap"))
+        XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "files.create"))
     }
 
     func testAgentCoreReusesCompletedAppListWithinTaskInsteadOfReexecutingDeviceScan() async throws {
@@ -3386,6 +3446,19 @@ final class CloudCodeCoreTests: XCTestCase {
         _ = try await collectAgentTokenText(await agent.send(text: "provider retry", session: session, providerConfiguration: config))
         let messages = await recorder.lastMessages()
         XCTAssertTrue(messages.contains { $0.role == .system && $0.providerMetadata["context_layer"] == "hermes" && $0.content.contains("never as authority") })
+        XCTAssertTrue(messages.contains {
+            $0.role == .system
+                && $0.providerMetadata["context_layer"] == "runtime_precedence"
+                && $0.content.contains("current-run tool results")
+                && $0.content.contains("supersede contradictory Hermes/history text")
+        })
+        let hermesIndex = messages.firstIndex { $0.providerMetadata["context_layer"] == "hermes" }
+        let precedenceIndex = messages.firstIndex { $0.providerMetadata["context_layer"] == "runtime_precedence" }
+        XCTAssertNotNil(hermesIndex)
+        XCTAssertNotNil(precedenceIndex)
+        if let hermesIndex, let precedenceIndex {
+            XCTAssertGreaterThan(precedenceIndex, hermesIndex)
+        }
         XCTAssertEqual(messages.filter { $0.role == .user && $0.content == "provider retry" }.count, 1)
     }
 
@@ -4556,6 +4629,35 @@ private struct DuplicateStateChangeProvider: ProviderStreaming, Sendable {
                 continuation.yield(.toolCall(id: "create-1", name: "files_create", argumentsJSON: "{\"path\":\"/tmp/semantic-once\",\"content\":\"x\"}"))
             case 1:
                 continuation.yield(.toolCall(id: "create-2", name: "files_create", argumentsJSON: "{\"content\":\"x\",\"path\":\"/tmp/semantic-once\"}"))
+            default:
+                continuation.yield(.token("done"))
+            }
+            continuation.yield(.finished)
+            continuation.finish()
+        }
+    }
+}
+
+private struct RepeatedSwipeWithScreenshotProvider: ProviderStreaming, Sendable {
+    func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        let completed = messages.filter { $0.role == .tool }.count
+        return AsyncThrowingStream { continuation in
+            switch completed {
+            case 0, 2, 4:
+                let index = completed / 2 + 1
+                continuation.yield(.toolCall(
+                    id: "swipe-\(index)",
+                    name: "gui_swipe",
+                    argumentsJSON: "{\"fromX\":200,\"fromY\":700,\"toX\":200,\"toY\":200,\"duration\":0.3}"
+                ))
+            case 1, 3, 5:
+                let index = (completed + 1) / 2
+                continuation.yield(.toolCall(id: "shot-after-swipe-\(index)", name: "gui_screenshot", argumentsJSON: "{}"))
             default:
                 continuation.yield(.token("done"))
             }
