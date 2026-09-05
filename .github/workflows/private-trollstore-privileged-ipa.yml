@@ -135,6 +135,7 @@ jobs:
             com.apple.private.security.no-sandbox \
             platform-application \
             com.apple.private.persona-mgmt \
+            com.apple.multitasking.unlimitedassertions \
             com.apple.hid.system.server-access \
             com.apple.private.hid.client.event-dispatch \
             com.apple.accessibility.api \

@@ -83,6 +83,7 @@ for key in \
   fi
 done
 for helper_only in \
+  'com.apple.multitasking.unlimitedassertions' \
   'com.apple.hid.system.server-access' \
   'com.apple.private.hid.client.event-dispatch' \
   'com.apple.accessibility.api' \
@@ -128,6 +129,7 @@ for key in \
   'com.apple.private.MobileInstallationHelperService.allowed' \
   'com.apple.private.uninstall.deletion' \
   'com.apple.private.persona-mgmt' \
+  'com.apple.multitasking.unlimitedassertions' \
   'com.apple.hid.system.server-access' \
   'com.apple.hid.system.user-access-service' \
   'com.apple.private.hid.client.event-dispatch' \

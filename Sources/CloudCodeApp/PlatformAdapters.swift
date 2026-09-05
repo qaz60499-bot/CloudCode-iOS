@@ -113,6 +113,11 @@ enum EmbeddedRootHelper {
         case 67: meaning = "文本输入参数无效或超出限制"
         case 68: meaning = "IOHID Unicode 文本输入后端不可用"
         case 69: meaning = "内嵌 root helper 协议/构建指纹不匹配"
+        case 73: meaning = "后台 assertion 目标进程不存在或无效"
+        case 74: meaning = "后台 assertion worker 创建失败"
+        case 75: meaning = "AssertionServices 拒绝或未建立后台保活 assertion"
+        case 76: meaning = "后台 assertion worker 停止失败"
+        case 77: meaning = "后台 assertion worker 已退出"
         default: meaning = ""
         }
         let suffix = meaning.isEmpty ? "" : "（\(meaning)）"
@@ -345,6 +350,37 @@ enum EmbeddedRootHelper {
         return result.code == 0
             ? (true, "IOHID Unicode 文本输入已提交；输入内容未写入 helper 诊断输出。")
             : (false, failureDetail(prefix: "GUI type", code: result.code, diagnostic: result.diagnostic))
+    }
+
+    static func startBackgroundAssertion(targetPID: Int32) -> (workerPID: Int32?, detail: String) {
+        guard targetPID > 1 else { return (nil, "后台 assertion 目标 PID 无效。") }
+        let result = run(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)
+        guard result.code == 0 else {
+            return (nil, failureDetail(prefix: "后台 assertion worker", code: result.code, diagnostic: result.diagnostic))
+        }
+        let marker = "workerPID="
+        guard let range = result.diagnostic.range(of: marker) else {
+            return (nil, "后台 assertion worker 已返回成功，但没有提供 worker PID；按 fail-closed 处理。")
+        }
+        let suffix = result.diagnostic[range.upperBound...]
+        let digits = suffix.prefix { $0.isNumber }
+        guard let workerPID = Int32(digits), workerPID > 1 else {
+            return (nil, "后台 assertion worker PID 无法解析；按 fail-closed 处理。")
+        }
+        return (workerPID, result.diagnostic)
+    }
+
+    static func backgroundAssertionIsAlive(workerPID: Int32) -> Bool {
+        guard workerPID > 1 else { return false }
+        return run(["background-assert-status", String(workerPID)], privilege: .root, timeout: 2).code == 0
+    }
+
+    static func stopBackgroundAssertion(workerPID: Int32) -> (success: Bool, detail: String) {
+        guard workerPID > 1 else { return (true, "没有需要停止的后台 assertion worker。") }
+        let result = run(["background-assert-stop", String(workerPID)], privilege: .root, timeout: 3)
+        return result.code == 0
+            ? (true, "后台 assertion worker 已停止。")
+            : (false, failureDetail(prefix: "停止后台 assertion worker", code: result.code, diagnostic: result.diagnostic))
     }
 }
 

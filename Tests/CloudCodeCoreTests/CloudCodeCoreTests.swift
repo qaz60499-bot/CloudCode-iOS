@@ -2293,6 +2293,60 @@ final class CloudCodeCoreTests: XCTestCase {
         })
     }
 
+    func testTreeFailureThenFreshScreenshotActivatesComputerUseFallbackAndSwipe() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let provider = TreeFailureScreenshotSwipeProvider()
+        let swipeCounter = InvocationCounter()
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "gui.tree", summary: "tree", risk: .readOnly, preferredRoute: .guiFallback),
+            ToolDescriptor(name: "gui.screenshot", summary: "shot", risk: .readOnly, preferredRoute: .guiFallback),
+            ToolDescriptor(name: "gui.swipe", summary: "swipe", risk: .safeWrite, preferredRoute: .guiFallback)
+        ])
+        let attachment = ChatAttachment(
+            filename: "gui-current.jpg",
+            path: "/tmp/gui-current.jpg",
+            mimeType: "image/jpeg",
+            byteSize: 4096
+        )
+        let agent = AgentCore(
+            provider: provider,
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(
+                registry: registry,
+                executors: [
+                    ThrowingExecutor(route: .guiFallback, names: ["gui.tree"], error: ToolRouterError.noExecutionRoute("tree unavailable")),
+                    AttachmentExecutor(route: .guiFallback, names: ["gui.screenshot"], attachment: attachment),
+                    CountingExecutor(route: .guiFallback, names: ["gui.swipe"], counter: swipeCounter)
+                ]
+            ),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true)),
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 6
+        )
+        let stream = await agent.send(
+            text: "打开抖音向上滑动一次",
+            session: AgentSession(permissionMode: .full),
+            providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "vision", apiKeyReference: "test-key")
+        )
+        for try await _ in stream {}
+
+        XCTAssertEqual(await swipeCounter.value(), 1)
+        let snapshots = await provider.snapshots()
+        XCTAssertGreaterThanOrEqual(snapshots.count, 3)
+        XCTAssertTrue(snapshots[2].messages.contains {
+            $0.role == .system
+                && $0.providerMetadata["context_layer"] == "computer_use_fallback"
+                && $0.content.contains("AX/gui.tree failed")
+                && $0.content.contains("next action should be one bounded gui.swipe")
+        })
+        XCTAssertTrue(snapshots[2].messages.contains {
+            $0.providerMetadata["internal_observation"] == "gui.screenshot" && $0.attachments == [attachment]
+        })
+    }
+
     func testRepeatedGUISwipeIsAllowedAfterFreshScreenshotObservation() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -4679,6 +4733,52 @@ private struct DuplicateStateChangeProvider: ProviderStreaming, Sendable {
     }
 }
 
+private actor TreeFailureScreenshotSwipeProvider: ProviderStreaming {
+    struct Snapshot: Sendable {
+        var messages: [ChatMessage]
+    }
+
+    private var recorded: [Snapshot] = []
+
+    func snapshots() -> [Snapshot] { recorded }
+
+    nonisolated func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                await self.record(messages)
+                let completedTools = messages.filter { $0.role == .tool }.count
+                switch completedTools {
+                case 0:
+                    continuation.yield(.toolCall(id: "tree-fail", name: "gui_tree", argumentsJSON: "{}"))
+                case 1:
+                    continuation.yield(.toolCall(id: "shot-current", name: "gui_screenshot", argumentsJSON: "{}"))
+                case 2:
+                    continuation.yield(.toolCall(
+                        id: "swipe-after-shot",
+                        name: "gui_swipe",
+                        argumentsJSON: "{\"fromX\":200,\"fromY\":700,\"toX\":200,\"toY\":200,\"duration\":0.3}"
+                    ))
+                case 3:
+                    continuation.yield(.toolCall(id: "shot-after-swipe", name: "gui_screenshot", argumentsJSON: "{}"))
+                default:
+                    continuation.yield(.token("done"))
+                }
+                continuation.yield(.finished)
+                continuation.finish()
+            }
+        }
+    }
+
+    private func record(_ messages: [ChatMessage]) {
+        recorded.append(Snapshot(messages: messages))
+    }
+}
+
 private struct RepeatedSwipeWithScreenshotProvider: ProviderStreaming, Sendable {
     func stream(
         configuration: ProviderConfiguration,
@@ -4887,6 +4987,18 @@ private struct CountingExecutor: ToolExecuting, Sendable {
     func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
         await counter.increment()
         return ToolResult(toolCallID: call.id, success: true, summary: "executed")
+    }
+}
+
+private struct ThrowingExecutor: ToolExecuting, Sendable {
+    let route: AppExecutionRoute
+    let names: Set<String>
+    let error: ToolRouterError
+
+    func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool { names.contains(tool.name) }
+
+    func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
+        throw error
     }
 }
 

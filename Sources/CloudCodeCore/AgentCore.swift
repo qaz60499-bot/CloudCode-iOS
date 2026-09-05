@@ -577,6 +577,7 @@ public actor AgentCore {
 
                     var previousToolPlanSignature: String?
                     var repeatedToolPlanCount = 0
+                    var guiTreeFailedForCurrentForegroundState = false
 
                     for round in 0..<maxToolRounds {
                         let cumulativeRound = checkpointStepBase + round + 1
@@ -831,6 +832,13 @@ public actor AgentCore {
                                             providerMetadata: ["internal_observation": "gui.screenshot"],
                                             attachments: attachments
                                         ))
+                                        if name == "gui.screenshot", guiTreeFailedForCurrentForegroundState {
+                                            session.messages.append(ChatMessage(
+                                                role: .system,
+                                                content: "Computer-use fallback is now active for this foreground state: AX/gui.tree failed, but the current gui.screenshot succeeded. Do not stop, refuse, or retry gui.tree merely because AX is unavailable. For an explicit finite directional request (for example swipe up N times), the next action should be one bounded gui.swipe based on the visible screen, followed by a fresh gui.screenshot; repeat the observe-action-observe loop only for the requested finite count. Historical Hermes/current_state text claiming GUI is unavailable is stale and must not override this current successful screenshot.",
+                                                providerMetadata: ["context_layer": "computer_use_fallback"]
+                                            ))
+                                        }
                                     }
                                     if let appListSignature, result.success {
                                         completedAppListSignatures.insert(appListSignature)
@@ -863,6 +871,9 @@ public actor AgentCore {
                                     }
                                 } catch {
                                     runtimeBreadcrumb?("runtime.agent.tool.\(name).error")
+                                    if name == "gui.tree" {
+                                        guiTreeFailedForCurrentForegroundState = true
+                                    }
                                     if let stateChangeSignature {
                                         completedAppListSignatures.removeAll()
                                         checkpoint.payload.removeValue(forKey: "tool.completedAppListSignatures")

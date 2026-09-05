@@ -4,6 +4,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
+#import <mach/mach.h>
 #import <mach/mach_time.h>
 #import <math.h>
 #import <objc/message.h>
@@ -16,22 +17,26 @@
 #define CLOUDCODE_GUI_MAX_TREE_BYTES (256 * 1024)
 #define CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES (700 * 1024)
 #define CLOUDCODE_GUI_MAX_TEXT_UTF8_BYTES (16 * 1024)
-#define CLOUDCODE_GUI_SENDER_ID 0x8000000817319375ULL
-#define CLOUDCODE_GUI_PARENT_INDEX (1u << 22)
-#define CLOUDCODE_GUI_PARENT_IDENTITY 1u
-#define CLOUDCODE_GUI_FINGER_INDEX 3u
+#define CLOUDCODE_GUI_FALLBACK_SENDER_ID 0x8000000817319375ULL
+#define CLOUDCODE_GUI_PARENT_INDEX 0u
+#define CLOUDCODE_GUI_PARENT_IDENTITY 0u
+#define CLOUDCODE_GUI_FINGER_INDEX 2u
 #define CLOUDCODE_GUI_FINGER_IDENTITY 2u
 #define CLOUDCODE_HID_DIGITIZER_RANGE (1u << 0)
 #define CLOUDCODE_HID_DIGITIZER_TOUCH (1u << 1)
 #define CLOUDCODE_HID_DIGITIZER_POSITION (1u << 2)
 #define CLOUDCODE_HID_DIGITIZER_IDENTITY (1u << 5)
+#define CLOUDCODE_HID_DIGITIZER_ATTRIBUTE (1u << 6)
 
 typedef const struct __CloudCodeIOHIDEvent *CloudCodeIOHIDEventRef;
 typedef const struct __CloudCodeIOHIDEventSystemClient *CloudCodeIOHIDEventSystemClientRef;
+typedef const struct __CloudCodeIOHIDEventSystemConnection *CloudCodeIOHIDEventSystemConnectionRef;
 typedef uint32_t CloudCodeIOOptionBits;
 
 typedef CloudCodeIOHIDEventSystemClientRef (*CloudCodeHIDClientCreateFn)(CFAllocatorRef);
 typedef void (*CloudCodeHIDDispatchFn)(CloudCodeIOHIDEventSystemClientRef, CloudCodeIOHIDEventRef);
+typedef void (*CloudCodeHIDConnectionDispatchFn)(CloudCodeIOHIDEventSystemConnectionRef, CloudCodeIOHIDEventRef);
+typedef void (*CloudCodeBKSetDigitizerInfoFn)(CloudCodeIOHIDEventRef, uint32_t, uint8_t, uint8_t, CFStringRef, CFTimeInterval, float);
 typedef CloudCodeIOHIDEventRef (*CloudCodeDigitizerEventCreateFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double, double, double, double, Boolean, Boolean, CloudCodeIOOptionBits);
 typedef CloudCodeIOHIDEventRef (*CloudCodeFingerEventCreateFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t, double, double, double, double, double, Boolean, Boolean, CloudCodeIOOptionBits);
 typedef CloudCodeIOHIDEventRef (*CloudCodeUnicodeEventCreateFn)(CFAllocatorRef, uint64_t, const uint8_t *, uint32_t, uint32_t, CloudCodeIOOptionBits);
@@ -77,6 +82,8 @@ typedef struct {
     void *handle;
     CloudCodeHIDClientCreateFn createClient;
     CloudCodeHIDDispatchFn dispatch;
+    CloudCodeHIDConnectionDispatchFn dispatchConnection;
+    CloudCodeBKSetDigitizerInfoFn setDigitizerInfo;
     CloudCodeDigitizerEventCreateFn createDigitizer;
     CloudCodeFingerEventCreateFn createFinger;
     CloudCodeUnicodeEventCreateFn createUnicode;
@@ -85,6 +92,17 @@ typedef struct {
     CloudCodeHIDSetIntegerFn setInteger;
     CloudCodeHIDSetFloatFn setFloat;
 } CloudCodeHIDRuntime;
+
+typedef struct {
+    CloudCodeIOHIDEventSystemClientRef systemClient;
+    CloudCodeIOHIDEventSystemConnectionRef routedConnection;
+    uint32_t contextID;
+    mach_port_t taskPort;
+    BOOL usesBackBoardRoute;
+    BOOL usesBundleRoute;
+} CloudCodeHIDRoute;
+
+static NSString *CloudCodeFrontmostBundleID(void);
 
 typedef struct {
     void *handle;
@@ -165,6 +183,12 @@ static CloudCodeHIDRuntime CloudCodeResolveHID(void)
     ]);
     runtime.createClient = (CloudCodeHIDClientCreateFn)CloudCodeResolve(runtime.handle, "IOHIDEventSystemClientCreate");
     runtime.dispatch = (CloudCodeHIDDispatchFn)CloudCodeResolve(runtime.handle, "IOHIDEventSystemClientDispatchEvent");
+    runtime.dispatchConnection = (CloudCodeHIDConnectionDispatchFn)CloudCodeResolve(runtime.handle, "IOHIDEventSystemConnectionDispatchEvent");
+    void *backBoard = CloudCodeOpenFramework(@[
+        @"/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices",
+        @"/rootfs/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices"
+    ]);
+    runtime.setDigitizerInfo = (CloudCodeBKSetDigitizerInfoFn)CloudCodeResolve(backBoard, "BKSHIDEventSetDigitizerInfo");
     runtime.createDigitizer = (CloudCodeDigitizerEventCreateFn)CloudCodeResolve(runtime.handle, "IOHIDEventCreateDigitizerEvent");
     runtime.createFinger = (CloudCodeFingerEventCreateFn)CloudCodeResolve(runtime.handle, "IOHIDEventCreateDigitizerFingerEvent");
     runtime.createUnicode = (CloudCodeUnicodeEventCreateFn)CloudCodeResolve(runtime.handle, "IOHIDEventCreateUnicodeEvent");
@@ -178,19 +202,103 @@ static CloudCodeHIDRuntime CloudCodeResolveHID(void)
     return runtime;
 }
 
-static BOOL CloudCodeHIDReady(CloudCodeHIDRuntime runtime, CloudCodeIOHIDEventSystemClientRef *clientOut)
+static BOOL CloudCodeResolveBackBoardRouteAtPoint(CGPoint point, CloudCodeHIDRuntime runtime, CloudCodeHIDRoute *route)
 {
-    if (!runtime.createClient || !runtime.dispatch || !runtime.createDigitizer || !runtime.createFinger || !runtime.append || !runtime.setSender || !runtime.setInteger || !runtime.setFloat) {
+    if (!route || !runtime.dispatchConnection) { return NO; }
+    dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_NOW | RTLD_GLOBAL);
+    dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW | RTLD_GLOBAL);
+
+    id (*sendObject0)(id, SEL) = (void *)objc_msgSend;
+    Class accessibilityClass = NSClassFromString(@"BKAccessibility");
+    SEL managerSelector = NSSelectorFromString(@"_eventRoutingClientConnectionManager");
+    if (!accessibilityClass || ![accessibilityClass respondsToSelector:managerSelector]) { return NO; }
+    id manager = nil;
+    @try { manager = sendObject0(accessibilityClass, managerSelector); } @catch (__unused NSException *exception) { manager = nil; }
+    if (!manager) { return NO; }
+
+    uint32_t contextID = 0;
+    mach_port_t taskPort = MACH_PORT_NULL;
+    Class serverClass = NSClassFromString(@"CAWindowServer");
+    SEL serverSelector = NSSelectorFromString(@"serverIfRunning");
+    if (serverClass && [serverClass respondsToSelector:serverSelector]) {
+        id server = nil;
+        @try { server = sendObject0(serverClass, serverSelector); } @catch (__unused NSException *exception) { server = nil; }
+        if (server && [server respondsToSelector:NSSelectorFromString(@"displays")]) {
+            NSArray *displays = nil;
+            @try { displays = sendObject0(server, NSSelectorFromString(@"displays")); } @catch (__unused NSException *exception) { displays = nil; }
+            id display = ([displays isKindOfClass:NSArray.class] && displays.count > 0) ? displays.firstObject : nil;
+            SEL contextSelector = NSSelectorFromString(@"contextIdAtPosition:");
+            SEL taskPortSelector = NSSelectorFromString(@"taskPortOfContextId:");
+            if (display && [display respondsToSelector:contextSelector]) {
+                uint32_t (*sendContext)(id, SEL, CGPoint) = (void *)objc_msgSend;
+                @try { contextID = sendContext(display, contextSelector, point); } @catch (__unused NSException *exception) { contextID = 0; }
+                if (contextID > 0 && [display respondsToSelector:taskPortSelector]) {
+                    mach_port_t (*sendTaskPort)(id, SEL, uint32_t) = (void *)objc_msgSend;
+                    @try { taskPort = sendTaskPort(display, taskPortSelector, contextID); } @catch (__unused NSException *exception) { taskPort = MACH_PORT_NULL; }
+                }
+            }
+        }
+    }
+
+    NSString *bundleID = CloudCodeFrontmostBundleID();
+    SEL bundleSelector = NSSelectorFromString(@"clientForBundleID:");
+    if (bundleID.length > 0 && [manager respondsToSelector:bundleSelector]) {
+        CloudCodeIOHIDEventSystemConnectionRef (*sendConnectionForBundle)(id, SEL, id) = (void *)objc_msgSend;
+        CloudCodeIOHIDEventSystemConnectionRef connection = NULL;
+        @try { connection = sendConnectionForBundle(manager, bundleSelector, bundleID); } @catch (__unused NSException *exception) { connection = NULL; }
+        if (connection) {
+            route->routedConnection = connection;
+            route->contextID = contextID;
+            route->taskPort = taskPort;
+            route->usesBackBoardRoute = YES;
+            route->usesBundleRoute = YES;
+            fprintf(stderr, "gui-hid-route: backboard-bundle bundle=%s contextID=%u taskPort=%u\n", bundleID.UTF8String ?: "", contextID, taskPort);
+            return YES;
+        }
+    }
+
+    SEL connectionSelector = NSSelectorFromString(@"clientForTaskPort:");
+    if (MACH_PORT_VALID(taskPort) && [manager respondsToSelector:connectionSelector]) {
+        CloudCodeIOHIDEventSystemConnectionRef (*sendConnectionForPort)(id, SEL, mach_port_t) = (void *)objc_msgSend;
+        CloudCodeIOHIDEventSystemConnectionRef connection = NULL;
+        @try { connection = sendConnectionForPort(manager, connectionSelector, taskPort); } @catch (__unused NSException *exception) { connection = NULL; }
+        if (connection) {
+            route->routedConnection = connection;
+            route->contextID = contextID;
+            route->taskPort = taskPort;
+            route->usesBackBoardRoute = YES;
+            route->usesBundleRoute = NO;
+            fprintf(stderr, "gui-hid-route: backboard-context bundle=%s contextID=%u taskPort=%u\n", bundleID.UTF8String ?: "", contextID, taskPort);
+            return YES;
+        }
+    }
+
+    fprintf(stderr, "gui-hid-route: BackBoard route unavailable bundle=%s contextID=%u taskPort=%u\n", bundleID.UTF8String ?: "", contextID, taskPort);
+    return NO;
+}
+
+static BOOL CloudCodeHIDReady(CloudCodeHIDRuntime runtime, CGPoint point, CloudCodeHIDRoute *route)
+{
+    if (!route || !runtime.createDigitizer || !runtime.createFinger || !runtime.append || !runtime.setInteger || !runtime.setFloat) {
         return NO;
     }
-    CloudCodeIOHIDEventSystemClientRef client = runtime.createClient(kCFAllocatorDefault);
-    if (!client) { return NO; }
-    if (clientOut) {
-        *clientOut = client;
-    } else {
-        CFRelease(client);
+    *route = (CloudCodeHIDRoute){0};
+    // Build 53 proved that an apparently successful generic system-client dispatch can still be
+    // ignored by the foreground app. Prefer a BackBoard connection resolved for the visible
+    // bundle/window context; retain the historical global system client only as a fallback.
+    if (CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route)) { return YES; }
+    if (runtime.createClient && runtime.dispatch) {
+        route->systemClient = runtime.createClient(kCFAllocatorDefault);
+        if (route->systemClient) { return YES; }
     }
-    return YES;
+    return NO;
+}
+
+static void CloudCodeReleaseHIDRoute(CloudCodeHIDRoute *route)
+{
+    if (!route) { return; }
+    if (route->systemClient) { CFRelease(route->systemClient); }
+    *route = (CloudCodeHIDRoute){0};
 }
 
 static CGSize CloudCodeScreenSize(void)
@@ -245,52 +353,62 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
     if (!CloudCodeValidPoint(x, y, size)) { return NULL; }
     double nx = x / size.width;
     double ny = y / size.height;
-    // Keep the collection/parent event phase-consistent with the child finger event. Established
-    // iOS IOHID generators use Range|Touch|Identity for contact begin, Position while moving, and
-    // Range|Touch|Identity|Position for contact end. A zero mask or a permanently touching parent
-    // can both produce structurally valid events that SpringBoard silently ignores.
-    uint32_t parentMask = 0;
-    if (touching && (phaseMask & CLOUDCODE_HID_DIGITIZER_POSITION) != 0) {
-        parentMask = CLOUDCODE_HID_DIGITIZER_POSITION;
-    } else if (touching) {
-        parentMask = CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH | CLOUDCODE_HID_DIGITIZER_IDENTITY;
+
+    // Match the modern iOS hand/finger shape used by current WebKit test injection and current
+    // TrollStore remote-control implementations: collection index/identity 0/0, one finger 2/2,
+    // Touch|Identity for contact transitions and Position|Attribute while moving. The older
+    // SpringBoard-tweak 1<<22 / 3,2 profile produced valid-looking packets on this device but the
+    // foreground app ignored them.
+    uint32_t eventMask = phaseMask;
+    if ((phaseMask & CLOUDCODE_HID_DIGITIZER_POSITION) != 0 && touching) {
+        eventMask = CLOUDCODE_HID_DIGITIZER_POSITION | CLOUDCODE_HID_DIGITIZER_ATTRIBUTE;
     } else {
-        parentMask = CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH | CLOUDCODE_HID_DIGITIZER_POSITION | CLOUDCODE_HID_DIGITIZER_IDENTITY;
+        eventMask = CLOUDCODE_HID_DIGITIZER_TOUCH | CLOUDCODE_HID_DIGITIZER_IDENTITY;
     }
+
     CloudCodeIOHIDEventRef parent = runtime.createDigitizer(
         kCFAllocatorDefault, mach_absolute_time(), 3,
-        CLOUDCODE_GUI_PARENT_INDEX, CLOUDCODE_GUI_PARENT_IDENTITY, parentMask, 0,
-        nx, ny, 0, 0, 0,
-        NO, NO, 0
+        CLOUDCODE_GUI_PARENT_INDEX, CLOUDCODE_GUI_PARENT_IDENTITY, eventMask, 0,
+        0, 0, 0, 0, 0,
+        NO, touching, 0
     );
     if (!parent) { return NULL; }
+
     CloudCodeIOHIDEventRef child = runtime.createFinger(
         kCFAllocatorDefault, mach_absolute_time(),
-        CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY, phaseMask,
-        nx, ny, 0, 0, 0, range, touching, 0
+        CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY, eventMask,
+        nx, ny, 0, 0, 0, range && touching, touching, 0
     );
     if (!child) {
         CFRelease(parent);
         return NULL;
     }
-    runtime.setFloat(child, 0xB0014, 0.04);
-    runtime.setFloat(child, 0xB0015, 0.04);
+    runtime.setFloat(child, 0xB0014, 5.0);
+    runtime.setFloat(child, 0xB0015, 5.0);
     runtime.append(parent, child, 0);
     CFRelease(child);
-    runtime.setInteger(parent, 0xB0019, 1);
+
     runtime.setInteger(parent, 0x4, 1);
-    // IOHID propagates child digitizer state to the collection parent when appended. Do not
-    // overwrite EventMask/Range/Touch afterward: doing so would turn move/up packets back into a
-    // permanent contact and can prevent a swipe or tap from ever completing.
-    runtime.setSender(parent, CLOUDCODE_GUI_SENDER_ID);
+    runtime.setInteger(parent, 0xB0019, 1);
     return parent;
 }
 
-static BOOL CloudCodeDispatchTouch(CloudCodeHIDRuntime runtime, CloudCodeIOHIDEventSystemClientRef client, double x, double y, uint32_t mask, BOOL range, BOOL touching)
+static BOOL CloudCodeDispatchTouch(CloudCodeHIDRuntime runtime, CloudCodeHIDRoute route, double x, double y, uint32_t mask, BOOL range, BOOL touching)
 {
     CloudCodeIOHIDEventRef event = CloudCodeCreateTouchParent(runtime, x, y, mask, range, touching);
     if (!event) { return NO; }
-    runtime.dispatch(client, event);
+    if (route.contextID > 0 && runtime.setDigitizerInfo) {
+        runtime.setDigitizerInfo(event, route.contextID, 0, 0, NULL, 0, 0);
+    }
+    if (route.usesBackBoardRoute && route.routedConnection && runtime.dispatchConnection) {
+        runtime.dispatchConnection(route.routedConnection, event);
+    } else if (route.systemClient && runtime.dispatch) {
+        if (runtime.setSender) { runtime.setSender(event, CLOUDCODE_GUI_FALLBACK_SENDER_ID); }
+        runtime.dispatch(route.systemClient, event);
+    } else {
+        CFRelease(event);
+        return NO;
+    }
     CFRelease(event);
     return YES;
 }
@@ -298,22 +416,24 @@ static BOOL CloudCodeDispatchTouch(CloudCodeHIDRuntime runtime, CloudCodeIOHIDEv
 static BOOL CloudCodePerformTap(double x, double y)
 {
     CloudCodeHIDRuntime runtime = CloudCodeResolveHID();
-    CloudCodeIOHIDEventSystemClientRef client = NULL;
-    if (!CloudCodeHIDReady(runtime, &client)) { return NO; }
+    CloudCodeHIDRoute route = {0};
+    if (!CloudCodeHIDReady(runtime, CGPointMake(x, y), &route)) { return NO; }
     CGSize size = CloudCodeScreenSize();
     double nx = size.width > 1 ? x / size.width : 0;
     double ny = size.height > 1 ? y / size.height : 0;
-    BOOL ok = CloudCodeDispatchTouch(runtime, client, x, y, CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH, YES, YES);
-    if (ok) { usleep(50000); ok = CloudCodeDispatchTouch(runtime, client, x, y, CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH, NO, NO); }
+    BOOL ok = CloudCodeDispatchTouch(runtime, route, x, y, CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH, YES, YES);
+    if (ok) { usleep(50000); ok = CloudCodeDispatchTouch(runtime, route, x, y, CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH, NO, NO); }
     if (ok) {
-        // The helper is intentionally short-lived. Keep the HID client alive briefly after the
-        // final lift packet so the last Mach delivery cannot be torn down with the process.
+        // The helper is intentionally short-lived. Keep the selected HID route alive briefly after
+        // the final lift packet so the last BackBoard/Mach delivery cannot be torn down with the process.
         usleep(100000);
-        fprintf(stderr, "gui-hid: tap submitted screen=%.0fx%.0f point=(%.2f,%.2f) normalized=(%.5f,%.5f) parentIndex=%u fingerIndex=%u fingerIdentity=%u\n",
+        fprintf(stderr, "gui-hid: tap submitted route=%s contextID=%u taskPort=%u screen=%.0fx%.0f point=(%.2f,%.2f) normalized=(%.5f,%.5f) parentIndex=%u fingerIndex=%u fingerIdentity=%u\n",
+                route.usesBackBoardRoute ? (route.usesBundleRoute ? "backboard-bundle" : "backboard-context") : "system-client-fallback",
+                route.contextID, route.taskPort,
                 size.width, size.height, x, y, nx, ny,
                 CLOUDCODE_GUI_PARENT_INDEX, CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY);
     }
-    CFRelease(client);
+    CloudCodeReleaseHIDRoute(&route);
     return ok;
 }
 
@@ -322,31 +442,33 @@ static BOOL CloudCodePerformSwipe(double fromX, double fromY, double toX, double
     CGSize size = CloudCodeScreenSize();
     if (!CloudCodeValidPoint(fromX, fromY, size) || !CloudCodeValidPoint(toX, toY, size) || !isfinite(durationSeconds) || durationSeconds < 0.05 || durationSeconds > 5.0) { return NO; }
     CloudCodeHIDRuntime runtime = CloudCodeResolveHID();
-    CloudCodeIOHIDEventSystemClientRef client = NULL;
-    if (!CloudCodeHIDReady(runtime, &client)) { return NO; }
+    CloudCodeHIDRoute route = {0};
+    if (!CloudCodeHIDReady(runtime, CGPointMake(fromX, fromY), &route)) { return NO; }
     const int steps = 20;
     useconds_t delay = (useconds_t)((durationSeconds * 1000000.0) / steps);
-    BOOL ok = CloudCodeDispatchTouch(runtime, client, fromX, fromY, CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH, YES, YES);
+    BOOL ok = CloudCodeDispatchTouch(runtime, route, fromX, fromY, CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH, YES, YES);
     for (int index = 1; ok && index <= steps; index++) {
         usleep(delay);
         double t = (double)index / (double)steps;
         double x = fromX + (toX - fromX) * t;
         double y = fromY + (toY - fromY) * t;
-        ok = CloudCodeDispatchTouch(runtime, client, x, y, CLOUDCODE_HID_DIGITIZER_POSITION, YES, YES);
+        ok = CloudCodeDispatchTouch(runtime, route, x, y, CLOUDCODE_HID_DIGITIZER_POSITION, YES, YES);
     }
     if (ok) {
         usleep(10000);
-        ok = CloudCodeDispatchTouch(runtime, client, toX, toY, CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH, NO, NO);
+        ok = CloudCodeDispatchTouch(runtime, route, toX, toY, CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH, NO, NO);
     }
     if (ok) {
         usleep(100000);
-        fprintf(stderr, "gui-hid: swipe submitted screen=%.0fx%.0f from=(%.2f,%.2f) to=(%.2f,%.2f) normalizedFrom=(%.5f,%.5f) normalizedTo=(%.5f,%.5f) duration=%.3f steps=%d parentIndex=%u fingerIndex=%u fingerIdentity=%u\n",
+        fprintf(stderr, "gui-hid: swipe submitted route=%s contextID=%u taskPort=%u screen=%.0fx%.0f from=(%.2f,%.2f) to=(%.2f,%.2f) normalizedFrom=(%.5f,%.5f) normalizedTo=(%.5f,%.5f) duration=%.3f steps=%d parentIndex=%u fingerIndex=%u fingerIdentity=%u\n",
+                route.usesBackBoardRoute ? (route.usesBundleRoute ? "backboard-bundle" : "backboard-context") : "system-client-fallback",
+                route.contextID, route.taskPort,
                 size.width, size.height, fromX, fromY, toX, toY,
                 fromX / size.width, fromY / size.height, toX / size.width, toY / size.height,
                 durationSeconds, steps,
                 CLOUDCODE_GUI_PARENT_INDEX, CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY);
     }
-    CFRelease(client);
+    CloudCodeReleaseHIDRoute(&route);
     return ok;
 }
 
@@ -521,10 +643,56 @@ static UIImage *CloudCodePointSizedScreenshot(UIImage *image)
     return scaled ?: image;
 }
 
+static BOOL CloudCodeScreenshotLooksInformative(UIImage *image)
+{
+    CGImageRef source = image.CGImage;
+    if (!source) { return NO; }
+    const size_t sampleWidth = 20;
+    const size_t sampleHeight = 20;
+    uint8_t pixels[sampleWidth * sampleHeight];
+    memset(pixels, 0, sizeof(pixels));
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceGray();
+    CGContextRef context = colorSpace ? CGBitmapContextCreate(
+        pixels, sampleWidth, sampleHeight, 8, sampleWidth, colorSpace,
+        (CGBitmapInfo)kCGImageAlphaNone
+    ) : NULL;
+    if (colorSpace) { CGColorSpaceRelease(colorSpace); }
+    if (!context) { return NO; }
+    CGContextSetInterpolationQuality(context, kCGInterpolationLow);
+    CGContextDrawImage(context, CGRectMake(0, 0, sampleWidth, sampleHeight), source);
+    CGContextRelease(context);
+
+    uint8_t minimum = 255;
+    uint8_t maximum = 0;
+    double sum = 0;
+    double sumSquares = 0;
+    for (size_t index = 0; index < sampleWidth * sampleHeight; index++) {
+        uint8_t value = pixels[index];
+        minimum = MIN(minimum, value);
+        maximum = MAX(maximum, value);
+        sum += value;
+        sumSquares += (double)value * (double)value;
+    }
+    const double count = (double)(sampleWidth * sampleHeight);
+    const double mean = sum / count;
+    const double variance = MAX(0.0, (sumSquares / count) - (mean * mean));
+    const int spread = (int)maximum - (int)minimum;
+
+    // A real fullscreen App may be dark, but even a dark video normally contains text/icons and
+    // therefore measurable luminance structure. Reject only near-uniform frames; this catches the
+    // repeated black IOSurface false-success observed on device without rejecting ordinary dark UI.
+    BOOL informative = spread >= 4 || variance >= 1.5;
+    if (!informative) {
+        fprintf(stderr, "gui-screenshot: rejected low-information frame mean=%.2f variance=%.3f spread=%d min=%u max=%u\n",
+                mean, variance, spread, minimum, maximum);
+    }
+    return informative;
+}
+
 static NSData *CloudCodeBoundedScreenshotJPEG(UIImage *image)
 {
     image = CloudCodePointSizedScreenshot(image);
-    if (!image) { return nil; }
+    if (!image || !CloudCodeScreenshotLooksInformative(image)) { return nil; }
     const CGFloat qualities[] = {0.55, 0.45, 0.36, 0.28, 0.20};
     for (NSUInteger index = 0; index < sizeof(qualities) / sizeof(qualities[0]); index++) {
         NSData *data = UIImageJPEGRepresentation(image, qualities[index]);
@@ -1156,8 +1324,9 @@ int CloudCodeGUIProbeJSON(void)
         // AXRuntime, or dispatch synthetic touch events here; each exact GUI operation validates
         // those private runtimes in its own bounded helper invocation when the user requests it.
         CloudCodeHIDRuntime hid = CloudCodeResolveHID();
-        CloudCodeIOHIDEventSystemClientRef client = NULL;
-        BOOL hidReady = CloudCodeHIDReady(hid, &client);
+        BOOL symbolsReady = hid.createClient && hid.dispatch && hid.createDigitizer && hid.createFinger && hid.append && hid.setSender && hid.setInteger && hid.setFloat;
+        CloudCodeIOHIDEventSystemClientRef client = symbolsReady ? hid.createClient(kCFAllocatorDefault) : NULL;
+        BOOL hidReady = client != NULL;
         if (client) { CFRelease(client); }
         BOOL text = hidReady && hid.createUnicode != NULL;
         NSDictionary *payload = @{
@@ -1248,18 +1417,28 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
         NSData *unicode = [text dataUsingEncoding:NSUTF16LittleEndianStringEncoding];
         if (!unicode || unicode.length == 0 || unicode.length > UINT32_MAX) { return 67; }
         CloudCodeHIDRuntime runtime = CloudCodeResolveHID();
-        CloudCodeIOHIDEventSystemClientRef client = NULL;
-        if (!CloudCodeHIDReady(runtime, &client) || !runtime.createUnicode) {
-            if (client) { CFRelease(client); }
+        CGSize size = CloudCodeScreenSize();
+        CloudCodeHIDRoute route = {0};
+        CGPoint routingPoint = CGPointMake(size.width > 1 ? size.width * 0.5 : 1, size.height > 1 ? size.height * 0.5 : 1);
+        if (!CloudCodeHIDReady(runtime, routingPoint, &route) || !runtime.createUnicode) {
+            CloudCodeReleaseHIDRoute(&route);
             return 68;
         }
         CloudCodeIOHIDEventRef event = runtime.createUnicode(kCFAllocatorDefault, mach_absolute_time(), unicode.bytes, (uint32_t)unicode.length, 1, 0);
-        if (!event) { CFRelease(client); return 68; }
+        if (!event) { CloudCodeReleaseHIDRoute(&route); return 68; }
         runtime.setInteger(event, 4, 1);
-        runtime.setSender(event, CLOUDCODE_GUI_SENDER_ID);
-        runtime.dispatch(client, event);
+        if (route.usesBackBoardRoute && route.routedConnection && runtime.dispatchConnection) {
+            runtime.dispatchConnection(route.routedConnection, event);
+        } else if (route.systemClient && runtime.dispatch) {
+            if (runtime.setSender) { runtime.setSender(event, CLOUDCODE_GUI_FALLBACK_SENDER_ID); }
+            runtime.dispatch(route.systemClient, event);
+        } else {
+            CFRelease(event);
+            CloudCodeReleaseHIDRoute(&route);
+            return 68;
+        }
         CFRelease(event);
-        CFRelease(client);
+        CloudCodeReleaseHIDRoute(&route);
         return 0;
     }
 }

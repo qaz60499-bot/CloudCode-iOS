@@ -1,5 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
+#import <errno.h>
+#import <fcntl.h>
+#import <poll.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <stdio.h>
@@ -656,6 +659,115 @@ static int Uninstall(NSString *bundleID, NSString *bundlePath, NSString *dataPat
     return 31;
 }
 
+static int StartDetachedBackgroundAssertion(pid_t targetPID)
+{
+    if (getuid() != 0 || geteuid() != 0) { return 11; }
+    if (targetPID <= 1 || kill(targetPID, 0) != 0) { return 73; }
+
+    int handshake[2] = {-1, -1};
+    if (pipe(handshake) != 0) { return 74; }
+    pid_t workerPID = fork();
+    if (workerPID < 0) {
+        close(handshake[0]);
+        close(handshake[1]);
+        return 74;
+    }
+    if (workerPID > 0) {
+        close(handshake[1]);
+        uint8_t acquired = 0;
+        struct pollfd pollFD = {.fd = handshake[0], .events = POLLIN | POLLHUP, .revents = 0};
+        int pollResult = 0;
+        do {
+            pollResult = poll(&pollFD, 1, 1800);
+        } while (pollResult < 0 && errno == EINTR);
+        ssize_t count = pollResult > 0 ? read(handshake[0], &acquired, sizeof(acquired)) : -1;
+        close(handshake[0]);
+        if (count == sizeof(acquired) && acquired == 1) {
+            fprintf(stderr, "background-assert: acquired targetPID=%d workerPID=%d flags=1 reason=10004\n", targetPID, workerPID);
+            return 0;
+        }
+        (void)kill(workerPID, SIGKILL);
+        fprintf(stderr, "background-assert: acquisition failed targetPID=%d workerPID=%d poll=%d errno=%d\n", targetPID, workerPID, pollResult, errno);
+        return 75;
+    }
+
+    close(handshake[0]);
+    (void)setsid();
+    void *assertionHandle = dlopen("/System/Library/PrivateFrameworks/AssertionServices.framework/AssertionServices", RTLD_NOW | RTLD_GLOBAL);
+    if (!assertionHandle) {
+        uint8_t failed = 0;
+        (void)write(handshake[1], &failed, sizeof(failed));
+        _exit(75);
+    }
+    Class assertionClass = NSClassFromString(@"BKSProcessAssertion");
+    SEL initSelector = NSSelectorFromString(@"initWithPID:flags:reason:name:withHandler:");
+    if (!assertionClass || ![assertionClass instancesRespondToSelector:initSelector]) {
+        uint8_t failed = 0;
+        (void)write(handshake[1], &failed, sizeof(failed));
+        _exit(75);
+    }
+
+    __block BOOL callbackCalled = NO;
+    __block BOOL acquired = NO;
+    void (^handler)(BOOL) = ^(BOOL didAcquire) {
+        acquired = didAcquire;
+        callbackCalled = YES;
+    };
+    id allocated = ((id (*)(id, SEL))objc_msgSend)(assertionClass, NSSelectorFromString(@"alloc"));
+    id (*sendInit)(id, SEL, pid_t, uint32_t, uint32_t, id, id) = (void *)objc_msgSend;
+    id assertion = nil;
+    @try {
+        assertion = sendInit(allocated, initSelector, targetPID, 1u, 10004u, @"CloudCode.BackgroundAgent", handler);
+    } @catch (__unused NSException *exception) {
+        assertion = nil;
+    }
+
+    for (int attempt = 0; assertion && !callbackCalled && attempt < 20; attempt++) { usleep(50000); }
+    BOOL valid = assertion != nil;
+    SEL validSelector = NSSelectorFromString(@"valid");
+    if (assertion && [assertion respondsToSelector:validSelector]) {
+        BOOL (*sendBool0)(id, SEL) = (void *)objc_msgSend;
+        @try { valid = sendBool0(assertion, validSelector); } @catch (__unused NSException *exception) { valid = acquired; }
+    } else if (callbackCalled) {
+        valid = acquired;
+    }
+
+    uint8_t status = valid ? 1 : 0;
+    (void)write(handshake[1], &status, sizeof(status));
+    close(handshake[1]);
+    if (!valid) { _exit(75); }
+
+    int nullFD = open("/dev/null", O_RDWR);
+    if (nullFD >= 0) {
+        (void)dup2(nullFD, STDIN_FILENO);
+        (void)dup2(nullFD, STDOUT_FILENO);
+        (void)dup2(nullFD, STDERR_FILENO);
+        if (nullFD > STDERR_FILENO) { close(nullFD); }
+    }
+
+    while (kill(targetPID, 0) == 0) { sleep(2); }
+    SEL invalidateSelector = NSSelectorFromString(@"invalidate");
+    if ([assertion respondsToSelector:invalidateSelector]) {
+        @try { ((void (*)(id, SEL))objc_msgSend)(assertion, invalidateSelector); } @catch (__unused NSException *exception) {}
+    }
+    _exit(0);
+}
+
+static int StopDetachedBackgroundAssertion(pid_t workerPID)
+{
+    if (getuid() != 0 || geteuid() != 0) { return 11; }
+    if (workerPID <= 1) { return 10; }
+    if (kill(workerPID, SIGTERM) == 0 || errno == ESRCH) { return 0; }
+    return 76;
+}
+
+static int BackgroundAssertionWorkerStatus(pid_t workerPID)
+{
+    if (getuid() != 0 || geteuid() != 0) { return 11; }
+    if (workerPID <= 1) { return 10; }
+    return kill(workerPID, 0) == 0 ? 0 : 77;
+}
+
 int main(int argc, const char *argv[])
 {
     @autoreleasepool {
@@ -720,6 +832,18 @@ int main(int argc, const char *argv[])
             if (argc < 3) { return 10; }
             NSString *encoded = [NSString stringWithUTF8String:argv[2]];
             return CloudCodeGUITypeBase64(encoded);
+        }
+        if ([command isEqualToString:@"background-assert-start"]) {
+            if (argc < 3) { return 10; }
+            return StartDetachedBackgroundAssertion((pid_t)strtol(argv[2], NULL, 10));
+        }
+        if ([command isEqualToString:@"background-assert-stop"]) {
+            if (argc < 3) { return 10; }
+            return StopDetachedBackgroundAssertion((pid_t)strtol(argv[2], NULL, 10));
+        }
+        if ([command isEqualToString:@"background-assert-status"]) {
+            if (argc < 3) { return 10; }
+            return BackgroundAssertionWorkerStatus((pid_t)strtol(argv[2], NULL, 10));
         }
         if ([command isEqualToString:@"cleanup-unregistered"]) {
             if (getuid() != 0 || geteuid() != 0) { return 11; }

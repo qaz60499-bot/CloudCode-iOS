@@ -46,6 +46,11 @@
     </array>
     <key>com.apple.private.persona-mgmt</key>
     <true/>
+    <!-- Allows this isolated privileged helper to hold a BackgroundUI process assertion for the
+         Cloud Code host while the user switches to another app. Runtime acquisition is still
+         verified on-device and fails closed when RunningBoard rejects the assertion. -->
+    <key>com.apple.multitasking.unlimitedassertions</key>
+    <true/>
 
     <!-- Exact-operation GUI backends run only in this isolated helper. Keep these private
          capabilities off the SwiftUI host so a device-specific GUI entitlement cannot destabilize
