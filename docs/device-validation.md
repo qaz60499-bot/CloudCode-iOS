@@ -62,7 +62,7 @@ Build 36 has two distinct GUI backend classes and they must never be conflated:
 
 The TrollStore-native device test sequence is:
 
-1. Explicitly or lazily perform the bounded GUI readiness handshake; cold launch and ordinary message startup probing must not run it.
+1. Explicitly perform the bounded GUI readiness handshake from device validation before GUI tools are authorized; cold launch and ordinary Agent sends must not run or lazily promote this root/persona readiness probe.
 2. Open a harmless deterministic test app.
 3. Require a real frontmost-app AX tree before promoting `automation.gui.tree`.
 4. Require a real global screenshot before promoting `automation.gui.screenshot`.

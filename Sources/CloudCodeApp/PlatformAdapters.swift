@@ -950,7 +950,7 @@ public struct URLSchemeExecutor: ToolExecuting, Sendable {
     }
 }
 
-public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor, Sendable {
+public struct GUIFallbackExecutor: ToolExecuting, Sendable {
     public let route: AppExecutionRoute = .guiFallback
     private let backend: GUIAutomationBackend
     private let policy: PolicyEngine
@@ -962,25 +962,9 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         self.approval = approval
     }
 
-    public func allowsDeferredCapabilityAttempt(
-        _ capabilityIDs: [String],
-        for tool: ToolDescriptor,
-        capabilities: CapabilityProfile
-    ) async -> Bool {
-        guard let feature = Self.feature(for: tool.name),
-              capabilityIDs == [feature.capabilityID],
-              capabilities.status(feature.capabilityID) == .deviceValidationRequired else { return false }
-        // Deliberately side-effect free: do NOT call backend.guiCapabilitySnapshot() here.
-        // The requested concrete GUI operation below is itself isolated/bounded and will fail
-        // closed if the private runtime is unavailable. This preserves one-line Agent usability
-        // without reintroducing send-time root/persona capability probing.
-        return true
-    }
-
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
         guard let feature = Self.feature(for: tool.name) else { return false }
-        let status = capabilities.status(feature.capabilityID)
-        return status == .available || status == .deviceValidationRequired
+        return capabilities.status(feature.capabilityID) == .available
     }
 
     public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
