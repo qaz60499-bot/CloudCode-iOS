@@ -237,13 +237,21 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
     if (!CloudCodeValidPoint(x, y, size)) { return NULL; }
     double nx = x / size.width;
     double ny = y / size.height;
-    // Keep the parent digitizer event aligned with the established global-IOHID pattern used
-    // for iOS touch injection: the parent is born with Position in its event mask before the
-    // display-integrated / digitizer bookkeeping fields below are applied. Creating it with a
-    // zero mask can yield a structurally valid event that the system silently ignores.
+    // Keep the collection/parent event phase-consistent with the child finger event. Established
+    // iOS IOHID generators use Range|Touch|Identity for contact begin, Position while moving, and
+    // Range|Touch|Identity|Position for contact end. A zero mask or a permanently touching parent
+    // can both produce structurally valid events that SpringBoard silently ignores.
+    uint32_t parentMask = 0;
+    if (touching && (phaseMask & (1u << 2)) != 0) {
+        parentMask = (1u << 2);
+    } else if (touching) {
+        parentMask = (1u << 0) | (1u << 1) | (1u << 5);
+    } else {
+        parentMask = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 5);
+    }
     CloudCodeIOHIDEventRef parent = runtime.createDigitizer(
-        kCFAllocatorDefault, mach_absolute_time(), 3, 99, 1, (1u << 2), 0,
-        0, 0, 0, 0, 0, 0, false, false, 0
+        kCFAllocatorDefault, mach_absolute_time(), 3, 99, 1, parentMask, 0,
+        nx, ny, 0, 0, 0, range, touching, 0
     );
     if (!parent) { return NULL; }
     CloudCodeIOHIDEventRef child = runtime.createFinger(
@@ -260,9 +268,9 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
     CFRelease(child);
     runtime.setInteger(parent, 0xB0019, 1);
     runtime.setInteger(parent, 0x4, 1);
-    runtime.setInteger(parent, 0xB0007, 0x23);
-    runtime.setInteger(parent, 0xB0008, 0x1);
-    runtime.setInteger(parent, 0xB0009, 0x1);
+    // IOHID propagates child digitizer state to the collection parent when appended. Do not
+    // overwrite EventMask/Range/Touch afterward: doing so would turn move/up packets back into a
+    // permanent contact and can prevent a swipe or tap from ever completing.
     runtime.setSender(parent, CLOUDCODE_GUI_SENDER_ID);
     return parent;
 }
@@ -283,7 +291,7 @@ static BOOL CloudCodePerformTap(double x, double y)
     if (!CloudCodeHIDReady(runtime, &client)) { return NO; }
     BOOL ok = CloudCodeDispatchTouch(runtime, client, x, y, (1u << 0) | (1u << 1), YES, YES);
     if (ok) { usleep(50000); ok = CloudCodeDispatchTouch(runtime, client, x, y, (1u << 2), YES, YES); }
-    if (ok) { usleep(50000); ok = CloudCodeDispatchTouch(runtime, client, x, y, (1u << 1), NO, NO); }
+    if (ok) { usleep(50000); ok = CloudCodeDispatchTouch(runtime, client, x, y, (1u << 0) | (1u << 1), NO, NO); }
     CFRelease(client);
     return ok;
 }
@@ -307,7 +315,7 @@ static BOOL CloudCodePerformSwipe(double fromX, double fromY, double toX, double
     }
     if (ok) {
         usleep(10000);
-        ok = CloudCodeDispatchTouch(runtime, client, toX, toY, (1u << 1), NO, NO);
+        ok = CloudCodeDispatchTouch(runtime, client, toX, toY, (1u << 0) | (1u << 1), NO, NO);
     }
     CFRelease(client);
     return ok;
