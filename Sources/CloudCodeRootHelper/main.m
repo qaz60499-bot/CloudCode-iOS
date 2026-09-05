@@ -9,6 +9,7 @@
 #import "GUIAutomation.h"
 
 #define CLOUDCODE_PROC_PATH_MAX 4096
+#define CLOUDCODE_ROOT_HELPER_PROTOCOL_MARKER "cloudcode-root-helper-protocol=42"
 typedef int (*CloudCodeProcListAllPidsFn)(void *, int);
 typedef int (*CloudCodeProcPidPathFn)(int, void *, uint32_t);
 
@@ -661,7 +662,9 @@ int main(int argc, const char *argv[])
         if (argc < 2) { return 10; }
         NSString *command = [NSString stringWithUTF8String:argv[1]];
         if ([command isEqualToString:@"probe"]) {
-            return (getuid() == 0 && geteuid() == 0) ? 0 : 11;
+            if (getuid() != 0 || geteuid() != 0) { return 11; }
+            fputs(CLOUDCODE_ROOT_HELPER_PROTOCOL_MARKER "\n", stdout);
+            return 0;
         }
         if ([command isEqualToString:@"probe-terminate"]) {
             if (getuid() != 0 || geteuid() != 0) { return 11; }

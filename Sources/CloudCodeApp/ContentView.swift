@@ -268,10 +268,11 @@ private struct ChatView: View {
                     } label: {
                         Image(systemName: "arrow.down")
                             .font(.headline.weight(.semibold))
+                            .foregroundStyle(.white)
                             .frame(width: 38, height: 38)
+                            .background(Circle().fill(Color.accentColor))
                     }
-                    .buttonStyle(.borderedProminent)
-                    .buttonBorderShape(.circle)
+                    .buttonStyle(.plain)
                     .accessibilityLabel("回到对话底部")
                     .padding(.trailing, 12)
                     .padding(.bottom, 12)

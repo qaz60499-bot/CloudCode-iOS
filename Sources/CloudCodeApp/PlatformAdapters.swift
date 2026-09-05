@@ -46,10 +46,19 @@ enum EmbeddedRootHelper {
     }
 
     static let executableName = "CloudCodeRootHelper"
+    static let expectedProtocolMarker = "cloudcode-root-helper-protocol=1"
 
     static var executablePath: String {
         Bundle.main.bundleURL.appendingPathComponent(executableName, isDirectory: false).path
     }
+
+    private static let embeddedHelperMatchesExpectedProtocol: Bool = {
+        guard let markerData = expectedProtocolMarker.data(using: .utf8),
+              let helperData = try? Data(contentsOf: URL(fileURLWithPath: executablePath), options: [.mappedIfSafe]) else {
+            return false
+        }
+        return helperData.range(of: markerData) != nil
+    }()
 
     private enum PrivilegeMode {
         case isolatedUser
@@ -57,6 +66,9 @@ enum EmbeddedRootHelper {
     }
 
     private static func run(_ arguments: [String], privilege: PrivilegeMode, timeout: TimeInterval = 6) -> (code: Int, diagnostic: String) {
+        guard embeddedHelperMatchesExpectedProtocol else {
+            return (69, "内嵌 CloudCodeRootHelper 与当前 App 协议不匹配；拒绝执行，避免误用旧 helper。")
+        }
         var diagnostic: NSString?
         let code = CloudCodeSpawnHelperWithOutput(
             executablePath,
@@ -100,6 +112,7 @@ enum EmbeddedRootHelper {
         case 66: meaning = "IOHID swipe/scroll 注入失败"
         case 67: meaning = "文本输入参数无效或超出限制"
         case 68: meaning = "IOHID Unicode 文本输入后端不可用"
+        case 69: meaning = "内嵌 root helper 协议/构建指纹不匹配"
         default: meaning = ""
         }
         let suffix = meaning.isEmpty ? "" : "（\(meaning)）"
@@ -173,8 +186,11 @@ enum EmbeddedRootHelper {
             return RootHelperCapabilitySnapshot(available: false, detail: "\(executableName) 存在但没有可执行权限。")
         }
         let result = run(["probe"], privilege: .root, timeout: 5)
+        if result.code == 0, result.diagnostic == expectedProtocolMarker {
+            return RootHelperCapabilitySnapshot(available: true, detail: "\(executableName) 已通过 persona 99 / UID 0 / GID 0 及 helper 协议指纹探测。")
+        }
         if result.code == 0 {
-            return RootHelperCapabilitySnapshot(available: true, detail: "\(executableName) 已通过 persona 99 / UID 0 / GID 0 探测。")
+            return RootHelperCapabilitySnapshot(available: false, detail: "\(executableName) root 探测返回了非预期协议指纹；拒绝使用可能过期的 helper。")
         }
         return RootHelperCapabilitySnapshot(available: false, detail: failureDetail(prefix: "\(executableName) root 探测", code: result.code, diagnostic: result.diagnostic))
     }
