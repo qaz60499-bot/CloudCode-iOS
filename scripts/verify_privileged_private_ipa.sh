@@ -123,6 +123,9 @@ test -f "$HELPER"
 HELPER_ENTITLEMENTS="$TMP_DIR/root-helper-entitlements.plist"
 ldid -e "$HELPER" > "$HELPER_ENTITLEMENTS"
 plutil -lint "$HELPER_ENTITLEMENTS" >/dev/null
+HELPER_CODESIGN_ENTITLEMENTS="$TMP_DIR/root-helper-codesign-entitlements.plist"
+codesign -d --entitlements :- "$HELPER" > "$HELPER_CODESIGN_ENTITLEMENTS" 2>/dev/null
+plutil -lint "$HELPER_CODESIGN_ENTITLEMENTS" >/dev/null
 # The helper has a dedicated privilege profile: keep GUI-only accessibility/capture
 # entitlements off the SwiftUI host and verify them only on the crash-isolated root helper.
 for key in \
@@ -162,6 +165,22 @@ for key in \
     exit 12
   fi
 done
+# Independently inspect the final embedded code signature with Apple's codesign tool. This catches
+# packaging/signing drift that a source entitlement plist check alone cannot detect.
+for key in \
+  'com.apple.private.hid.client.event-dispatch' \
+  'com.apple.private.hid.client.event-filter' \
+  'com.apple.private.hid.client.event-monitor' \
+  'com.apple.private.hid.client.service-protected' \
+  'com.apple.private.hid.manager.client' \
+  'com.apple.QuartzCore.global-capture' \
+  'com.apple.private.IOSurface.protected-access'; do
+  value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$HELPER_CODESIGN_ENTITLEMENTS" 2>/dev/null || true)"
+  if [[ "$value" != "true" ]]; then
+    echo "FAIL: final root helper code signature entitlement missing or false: $key" >&2
+    exit 12
+  fi
+done
 container_required="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.private.security.container-required' "$HELPER_ENTITLEMENTS" 2>/dev/null || true)"
 if [[ "$container_required" != "false" ]]; then
   echo "FAIL: root helper entitlement missing or not false: com.apple.private.security.container-required" >&2
@@ -191,6 +210,14 @@ for iokit_key in \
       exit 12
     fi
   done
+done
+for iokit_key in \
+  'com.apple.security.iokit-user-client-class' \
+  'com.apple.security.exception.iokit-user-client-class'; do
+  if ! /usr/libexec/PlistBuddy -c "Print :$iokit_key" "$HELPER_CODESIGN_ENTITLEMENTS" 2>/dev/null | grep -F 'IOSurfaceAcceleratorClient' >/dev/null; then
+    echo "FAIL: final root helper code signature is missing $iokit_key -> IOSurfaceAcceleratorClient" >&2
+    exit 12
+  fi
 done
 for banned in \
   'com.apple.private.cs.debugger' \

@@ -131,6 +131,9 @@ jobs:
           HELPER_ENTITLEMENTS="$RUNNER_TEMP/cloudcode-root-helper-entitlements.plist"
           ldid -e "$ROOT_HELPER" > "$HELPER_ENTITLEMENTS"
           plutil -lint "$HELPER_ENTITLEMENTS" >/dev/null
+          HELPER_CODESIGN_ENTITLEMENTS="$RUNNER_TEMP/cloudcode-root-helper-codesign-entitlements.plist"
+          codesign -d --entitlements :- "$ROOT_HELPER" > "$HELPER_CODESIGN_ENTITLEMENTS" 2>/dev/null
+          plutil -lint "$HELPER_CODESIGN_ENTITLEMENTS" >/dev/null
           for required_helper_entitlement in \
             com.apple.private.security.no-sandbox \
             platform-application \
@@ -153,6 +156,16 @@ jobs:
             com.apple.backboard.client; do
             /usr/libexec/PlistBuddy -c "Print :$required_helper_entitlement" "$HELPER_ENTITLEMENTS" | grep -F 'true'
           done
+          for required_helper_codesign_entitlement in \
+            com.apple.private.hid.client.event-dispatch \
+            com.apple.private.hid.client.event-filter \
+            com.apple.private.hid.client.event-monitor \
+            com.apple.private.hid.client.service-protected \
+            com.apple.private.hid.manager.client \
+            com.apple.QuartzCore.global-capture \
+            com.apple.private.IOSurface.protected-access; do
+            /usr/libexec/PlistBuddy -c "Print :$required_helper_codesign_entitlement" "$HELPER_CODESIGN_ENTITLEMENTS" | grep -F 'true'
+          done
           for required_helper_iokit_class in \
             IOSurfaceAcceleratorClient \
             IOHIDEventServiceFastPathUserClient \
@@ -163,8 +176,13 @@ jobs:
               /usr/libexec/PlistBuddy -c "Print :$iokit_entitlement" "$HELPER_ENTITLEMENTS" | grep -F "$required_helper_iokit_class"
             done
           done
-          rm -f "$HELPER_ENTITLEMENTS"
-          echo 'PASS: privileged host + isolated GUI helper entitlement sets embedded'
+          for iokit_entitlement in \
+            com.apple.security.iokit-user-client-class \
+            com.apple.security.exception.iokit-user-client-class; do
+            /usr/libexec/PlistBuddy -c "Print :$iokit_entitlement" "$HELPER_CODESIGN_ENTITLEMENTS" | grep -F 'IOSurfaceAcceleratorClient'
+          done
+          rm -f "$HELPER_ENTITLEMENTS" "$HELPER_CODESIGN_ENTITLEMENTS"
+          echo 'PASS: privileged host + isolated GUI helper entitlement sets embedded and readable from final helper code signature'
 
       - name: Package privileged private TrollStore IPA
         run: |

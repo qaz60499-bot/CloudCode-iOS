@@ -27,6 +27,8 @@
 #define CLOUDCODE_HID_DIGITIZER_POSITION (1u << 2)
 #define CLOUDCODE_HID_DIGITIZER_IDENTITY (1u << 5)
 #define CLOUDCODE_HID_DIGITIZER_ATTRIBUTE (1u << 6)
+#define CLOUDCODE_HID_FIELD_IS_BUILT_IN 0x4u
+#define CLOUDCODE_HID_FIELD_DIGITIZER_DISPLAY_INTEGRATED 0xB0019u
 
 typedef const struct __CloudCodeIOHIDEvent *CloudCodeIOHIDEventRef;
 typedef const struct __CloudCodeIOHIDEventSystemClient *CloudCodeIOHIDEventSystemClientRef;
@@ -70,7 +72,7 @@ typedef CFTypeRef CloudCodeIOSurfaceRef;
 typedef CFTypeRef CloudCodeIOSurfaceAcceleratorRef;
 typedef CloudCodeIOSurfaceRef (*CloudCodeIOSurfaceCreateFn)(CFDictionaryRef);
 typedef int32_t (*CloudCodeIOSurfaceAcceleratorCreateFn)(CFAllocatorRef, CFTypeRef, CloudCodeIOSurfaceAcceleratorRef *);
-typedef int32_t (*CloudCodeIOSurfaceAcceleratorTransferFn)(CloudCodeIOSurfaceAcceleratorRef, CloudCodeIOSurfaceRef, CloudCodeIOSurfaceRef, CFDictionaryRef, void *);
+typedef int32_t (*CloudCodeIOSurfaceAcceleratorTransferFn)(CloudCodeIOSurfaceAcceleratorRef, CloudCodeIOSurfaceRef, CloudCodeIOSurfaceRef, void *, void *, void *, void *);
 typedef int32_t (*CloudCodeIOSurfaceLockFn)(CloudCodeIOSurfaceRef, uint32_t, uint32_t *);
 typedef int32_t (*CloudCodeIOSurfaceUnlockFn)(CloudCodeIOSurfaceRef, uint32_t, uint32_t *);
 typedef void *(*CloudCodeIOSurfaceGetBaseAddressFn)(CloudCodeIOSurfaceRef);
@@ -364,20 +366,25 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
     // Touch|Identity for contact transitions and Position|Attribute while moving. The older
     // SpringBoard-tweak 1<<22 / 3,2 profile produced valid-looking packets on this device but the
     // foreground app ignored them.
-    uint32_t eventMask = phaseMask;
+    // Parent and finger are distinct HID records and must not share one synthetic mask. Apple's
+    // current WebKit iOS injector uses Touch|Identity on the hand for contact transitions while the
+    // finger uses Range|Touch; during movement the hand carries Position|Attribute and the finger
+    // carries Position. Reusing the hand mask for the finger can produce a well-formed event that
+    // backboardd accepts but the foreground application ignores.
+    uint32_t parentEventMask = CLOUDCODE_HID_DIGITIZER_TOUCH | CLOUDCODE_HID_DIGITIZER_IDENTITY;
+    uint32_t childEventMask = CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH;
     if ((phaseMask & CLOUDCODE_HID_DIGITIZER_POSITION) != 0 && touching) {
-        eventMask = CLOUDCODE_HID_DIGITIZER_POSITION | CLOUDCODE_HID_DIGITIZER_ATTRIBUTE;
-    } else {
-        eventMask = CLOUDCODE_HID_DIGITIZER_TOUCH | CLOUDCODE_HID_DIGITIZER_IDENTITY;
+        parentEventMask = CLOUDCODE_HID_DIGITIZER_POSITION | CLOUDCODE_HID_DIGITIZER_ATTRIBUTE;
+        childEventMask = CLOUDCODE_HID_DIGITIZER_POSITION;
     }
 
-    // Keep the collection and child on the exact same HID timestamp. Current TrollVNC and
-    // WebKit's iOS test injector both construct a complete contact frame from one mach time;
-    // using two timestamps can make the child look like it belongs to a different frame.
+    // Keep the collection and child on the exact same HID timestamp. Current WebKit constructs a
+    // complete contact frame from one mach time; using two timestamps can make the child look like
+    // it belongs to a different frame.
     uint64_t machTime = mach_absolute_time();
     CloudCodeIOHIDEventRef parent = runtime.createDigitizer(
         kCFAllocatorDefault, machTime, 3,
-        CLOUDCODE_GUI_PARENT_INDEX, CLOUDCODE_GUI_PARENT_IDENTITY, eventMask, 0,
+        CLOUDCODE_GUI_PARENT_INDEX, CLOUDCODE_GUI_PARENT_IDENTITY, parentEventMask, 0,
         0, 0, 0, 0, 0,
         NO, touching, 0
     );
@@ -385,7 +392,7 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
 
     CloudCodeIOHIDEventRef child = runtime.createFinger(
         kCFAllocatorDefault, machTime,
-        CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY, eventMask,
+        CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY, childEventMask,
         nx, ny, 0, 0, 90.0, range && touching, touching, 0
     );
     if (!child) {
@@ -398,8 +405,8 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
     runtime.append(parent, child, 0);
     CFRelease(child);
 
-    runtime.setInteger(parent, 0x4, 1);
-    runtime.setInteger(parent, 0xB0019, 1);
+    runtime.setInteger(parent, CLOUDCODE_HID_FIELD_IS_BUILT_IN, 1);
+    runtime.setInteger(parent, CLOUDCODE_HID_FIELD_DIGITIZER_DISPLAY_INTEGRATED, 1);
     return parent;
 }
 
@@ -437,7 +444,7 @@ static BOOL CloudCodePerformTap(double x, double y)
         // The helper is intentionally short-lived. Keep the selected HID route alive briefly after
         // the final lift packet so the last BackBoard/Mach delivery cannot be torn down with the process.
         usleep(100000);
-        fprintf(stderr, "gui-hid: profile=modern-trollstore result=dispatched-unverified route=%s contextID=%u taskPort=%u screen=%.0fx%.0f point=(%.2f,%.2f) normalized=(%.5f,%.5f) parentIndex=%u fingerIndex=%u fingerIdentity=%u sender=0x%llx\n",
+        fprintf(stderr, "gui-hid: profile=modern-trollstore result=dispatched-unverified route=%s contextID=%u taskPort=%u screen=%.0fx%.0f point=(%.2f,%.2f) normalized=(%.5f,%.5f) parentIndex=%u fingerIndex=%u fingerIdentity=%u builtIn=1 displayIntegrated=1 sender=0x%llx\n",
                 route.usesBackBoardRoute ? (route.usesBundleRoute ? "backboard-bundle" : "backboard-context") : "system-client",
                 route.contextID, route.taskPort,
                 size.width, size.height, x, y, nx, ny,
@@ -471,7 +478,7 @@ static BOOL CloudCodePerformSwipe(double fromX, double fromY, double toX, double
     }
     if (ok) {
         usleep(100000);
-        fprintf(stderr, "gui-hid: profile=modern-trollstore result=dispatched-unverified route=%s contextID=%u taskPort=%u screen=%.0fx%.0f from=(%.2f,%.2f) to=(%.2f,%.2f) normalizedFrom=(%.5f,%.5f) normalizedTo=(%.5f,%.5f) duration=%.3f steps=%d parentIndex=%u fingerIndex=%u fingerIdentity=%u sender=0x%llx\n",
+        fprintf(stderr, "gui-hid: profile=modern-trollstore result=dispatched-unverified route=%s contextID=%u taskPort=%u screen=%.0fx%.0f from=(%.2f,%.2f) to=(%.2f,%.2f) normalizedFrom=(%.5f,%.5f) normalizedTo=(%.5f,%.5f) duration=%.3f steps=%d parentIndex=%u fingerIndex=%u fingerIdentity=%u builtIn=1 displayIntegrated=1 sender=0x%llx\n",
                 route.usesBackBoardRoute ? (route.usesBundleRoute ? "backboard-bundle" : "backboard-context") : "system-client",
                 route.contextID, route.taskPort,
                 size.width, size.height, fromX, fromY, toX, toY,
@@ -595,7 +602,7 @@ static UIImage *CloudCodeScreenshotImageFromRenderServer(void)
         if (copiedSurface) {
             acceleratorCreateCode = createAccelerator(kCFAllocatorDefault, NULL, &accelerator);
             if (acceleratorCreateCode == 0 && accelerator) {
-                transferCode = transferSurface(accelerator, renderSurface, copiedSurface, NULL, NULL);
+                transferCode = transferSurface(accelerator, renderSurface, copiedSurface, NULL, NULL, NULL, NULL);
                 if (transferCode == 0) {
                     readableSurface = copiedSurface;
                     fprintf(stderr, "gui-screenshot/render-server: route=iosurface-accelerator transfer=success size=%zux%zu\n", width, height);

@@ -1308,7 +1308,10 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 toolCallID: call.id,
                 success: true,
                 summary: "Screenshot captured",
-                payload: ["byteCount": String(data.count)],
+                payload: [
+                    "byteCount": String(data.count),
+                    "sha256": GUIAutomationPayloadPolicy.sha256Hex(data)
+                ],
                 attachments: attachment.map { [$0] }
             )
         case "gui.tap":

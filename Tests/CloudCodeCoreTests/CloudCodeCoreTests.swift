@@ -2257,14 +2257,28 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(GUIAutomationPayloadPolicy.isValidScreenshotJPEG(Data([0xFF, 0xD8])))
         XCTAssertFalse(GUIAutomationPayloadPolicy.isValidScreenshotJPEG(Data("not-a-jpeg".utf8)))
 
+        var corruptTerminator = Data([0xFF, 0xD8, 0xFF, 0x41, 0x42])
+        XCTAssertFalse(GUIAutomationPayloadPolicy.isValidScreenshotJPEG(corruptTerminator))
+
         var bounded = Data([0xFF, 0xD8, 0xFF])
-        bounded.append(Data(repeating: 0x41, count: GUIAutomationPayloadPolicy.maxScreenshotBytes - bounded.count))
+        bounded.append(Data(repeating: 0x41, count: GUIAutomationPayloadPolicy.maxScreenshotBytes - bounded.count - 2))
+        bounded.append(contentsOf: [0xFF, 0xD9])
         XCTAssertEqual(bounded.count, GUIAutomationPayloadPolicy.maxScreenshotBytes)
         XCTAssertTrue(GUIAutomationPayloadPolicy.isValidScreenshotJPEG(bounded))
 
         var oversized = bounded
-        oversized.append(0x42)
+        oversized.insert(0x42, at: oversized.index(before: oversized.endIndex))
         XCTAssertFalse(GUIAutomationPayloadPolicy.isValidScreenshotJPEG(oversized))
+    }
+
+    func testGUIScreenshotHashGateRequiresBaselineAndDetectsNoChange() {
+        XCTAssertEqual(
+            GUIAutomationPayloadPolicy.sha256Hex(Data("abc".utf8)),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        )
+        XCTAssertNil(AgentCore.guiScreenshotChanged(currentSHA256: "after", baselineSHA256: nil))
+        XCTAssertFalse(AgentCore.guiScreenshotChanged(currentSHA256: "same", baselineSHA256: "same") ?? true)
+        XCTAssertTrue(AgentCore.guiScreenshotChanged(currentSHA256: "after", baselineSHA256: "before") ?? false)
     }
 
     func testAgentFeedsScreenshotToolAttachmentBackAsHiddenVisualObservation() async throws {
@@ -2401,6 +2415,52 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(screenshotCount, 3)
         let saved = try await sessions.load(session.id)
         XCTAssertFalse(saved.messages.contains {
+            $0.role == .tool && $0.providerMetadata["idempotency"] == "semantic_duplicate_blocked"
+        })
+    }
+
+    func testIdenticalPostActionScreenshotDoesNotVerifyOrPermitBlindRepeatedSwipe() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let swipeCounter = InvocationCounter()
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "gui.swipe", summary: "swipe", risk: .safeWrite, preferredRoute: .guiFallback),
+            ToolDescriptor(name: "gui.screenshot", summary: "shot", risk: .readOnly, preferredRoute: .guiFallback)
+        ])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let agent = AgentCore(
+            provider: UnchangedScreenshotRepeatProvider(),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(
+                registry: registry,
+                executors: [
+                    CountingExecutor(route: .guiFallback, names: ["gui.swipe"], counter: swipeCounter),
+                    StaticHashScreenshotExecutor(route: .guiFallback, hash: "same-screen")
+                ]
+            ),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 7
+        )
+        let session = AgentSession(permissionMode: .full)
+        let stream = await agent.send(
+            text: "swipe up twice, verifying the screen after each swipe",
+            session: session,
+            providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        )
+        for try await _ in stream {}
+
+        let swipeCount = await swipeCounter.value()
+        XCTAssertEqual(swipeCount, 1)
+        let saved = try await sessions.load(session.id)
+        XCTAssertTrue(saved.messages.contains {
+            $0.role == .system
+                && $0.providerMetadata["context_layer"] == "gui_effect_verification"
+                && $0.providerMetadata["screen_changed"] == "false"
+        })
+        XCTAssertTrue(saved.messages.contains {
             $0.role == .tool && $0.providerMetadata["idempotency"] == "semantic_duplicate_blocked"
         })
     }
@@ -4824,6 +4884,41 @@ private struct RepeatedSwipeWithScreenshotProvider: ProviderStreaming, Sendable 
     }
 }
 
+private struct UnchangedScreenshotRepeatProvider: ProviderStreaming, Sendable {
+    func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        let completed = messages.filter { $0.role == .tool }.count
+        return AsyncThrowingStream { continuation in
+            switch completed {
+            case 0:
+                continuation.yield(.toolCall(id: "baseline", name: "gui_screenshot", argumentsJSON: "{}"))
+            case 1:
+                continuation.yield(.toolCall(
+                    id: "swipe-1",
+                    name: "gui_swipe",
+                    argumentsJSON: "{\"fromX\":200,\"fromY\":700,\"toX\":200,\"toY\":200,\"duration\":0.3}"
+                ))
+            case 2:
+                continuation.yield(.toolCall(id: "after-1", name: "gui_screenshot", argumentsJSON: "{}"))
+            case 3:
+                continuation.yield(.toolCall(
+                    id: "swipe-2",
+                    name: "gui_swipe",
+                    argumentsJSON: "{\"fromX\":200,\"fromY\":700,\"toX\":200,\"toY\":200,\"duration\":0.3}"
+                ))
+            default:
+                continuation.yield(.token("done"))
+            }
+            continuation.yield(.finished)
+            continuation.finish()
+        }
+    }
+}
+
 private actor SequencedGUIProvider: ProviderStreaming {
     nonisolated func stream(
         configuration: ProviderConfiguration,
@@ -4897,6 +4992,24 @@ private struct AttachmentExecutor: ToolExecuting, Sendable {
 
     func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
         ToolResult(toolCallID: call.id, success: true, summary: "Screenshot captured", attachments: [attachment])
+    }
+}
+
+private struct StaticHashScreenshotExecutor: ToolExecuting, Sendable {
+    let route: AppExecutionRoute
+    let hash: String
+
+    func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
+        tool.name == "gui.screenshot"
+    }
+
+    func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
+        ToolResult(
+            toolCallID: call.id,
+            success: true,
+            summary: "Screenshot captured",
+            payload: ["sha256": hash]
+        )
     }
 }
 
