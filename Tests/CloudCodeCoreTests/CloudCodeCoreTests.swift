@@ -4351,7 +4351,7 @@ private actor SequencedGUIProvider: ProviderStreaming {
             case 0:
                 continuation.yield(.toolCall(id: "gui-observe-1", name: "gui_tree", argumentsJSON: "{}"))
             case 1:
-                continuation.yield(.toolCall(id: "gui-action-1", name: "gui_tap", argumentsJSON: "{\"x\":\"100\",\"y\":\"200\"}"))
+                continuation.yield(.toolCall(id: "gui-action-1", name: "gui_tap", argumentsJSON: "{\"x\":100,\"y\":200}"))
             case 2:
                 continuation.yield(.toolCall(id: "gui-observe-2", name: "gui_tree", argumentsJSON: "{}"))
             case 3:
