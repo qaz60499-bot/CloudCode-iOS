@@ -2,7 +2,6 @@
 
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
-#import <IOSurface/IOSurface.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <mach/mach_time.h>
@@ -50,8 +49,14 @@ typedef int (*CloudCodeAXValueGetTypeFn)(CFTypeRef);
 typedef Boolean (*CloudCodeAXValueGetValueFn)(CFTypeRef, int, void *);
 
 typedef UIImage *(*CloudCodeCreateScreenImageFn)(void);
+typedef CFTypeRef CloudCodeIOSurfaceRef;
+typedef CloudCodeIOSurfaceRef (*CloudCodeIOSurfaceCreateFn)(CFDictionaryRef);
+typedef int32_t (*CloudCodeIOSurfaceLockFn)(CloudCodeIOSurfaceRef, uint32_t, uint32_t *);
+typedef int32_t (*CloudCodeIOSurfaceUnlockFn)(CloudCodeIOSurfaceRef, uint32_t, uint32_t *);
+typedef void *(*CloudCodeIOSurfaceGetBaseAddressFn)(CloudCodeIOSurfaceRef);
+typedef size_t (*CloudCodeIOSurfaceGetBytesPerRowFn)(CloudCodeIOSurfaceRef);
 typedef CGImageRef (*CloudCodeCreateCGImageFromIOSurfaceFn)(CFTypeRef);
-typedef void (*CloudCodeRenderServerRenderDisplayFn)(uint32_t, CFStringRef, IOSurfaceRef, int, int);
+typedef void (*CloudCodeRenderServerRenderDisplayFn)(uint32_t, CFStringRef, CloudCodeIOSurfaceRef, int, int);
 typedef CFStringRef (*CloudCodeCopyFrontmostBundleIDFn)(void);
 typedef CFTypeRef (*CloudCodeMGCopyAnswerFn)(CFStringRef);
 
@@ -292,9 +297,18 @@ static CGSize CloudCodeScreenPixelSize(void)
 static UIImage *CloudCodeScreenshotImageFromRenderServer(void)
 {
     void *quartzCore = dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_LAZY | RTLD_LOCAL);
+    void *ioSurface = CloudCodeOpenFramework(@[
+        @"/System/Library/Frameworks/IOSurface.framework/IOSurface",
+        @"/rootfs/System/Library/Frameworks/IOSurface.framework/IOSurface"
+    ]);
     CloudCodeRenderServerRenderDisplayFn render = (CloudCodeRenderServerRenderDisplayFn)CloudCodeResolve(quartzCore, "CARenderServerRenderDisplay");
+    CloudCodeIOSurfaceCreateFn createSurface = (CloudCodeIOSurfaceCreateFn)CloudCodeResolve(ioSurface, "IOSurfaceCreate");
+    CloudCodeIOSurfaceLockFn lockSurface = (CloudCodeIOSurfaceLockFn)CloudCodeResolve(ioSurface, "IOSurfaceLock");
+    CloudCodeIOSurfaceUnlockFn unlockSurface = (CloudCodeIOSurfaceUnlockFn)CloudCodeResolve(ioSurface, "IOSurfaceUnlock");
+    CloudCodeIOSurfaceGetBaseAddressFn getBaseAddress = (CloudCodeIOSurfaceGetBaseAddressFn)CloudCodeResolve(ioSurface, "IOSurfaceGetBaseAddress");
+    CloudCodeIOSurfaceGetBytesPerRowFn getBytesPerRow = (CloudCodeIOSurfaceGetBytesPerRowFn)CloudCodeResolve(ioSurface, "IOSurfaceGetBytesPerRow");
     CGSize pixels = CloudCodeScreenPixelSize();
-    if (!render || pixels.width <= 1 || pixels.height <= 1) { return nil; }
+    if (!render || !createSurface || !lockSurface || !unlockSurface || !getBaseAddress || !getBytesPerRow || pixels.width <= 1 || pixels.height <= 1) { return nil; }
 
     size_t width = (size_t)llround(pixels.width);
     size_t height = (size_t)llround(pixels.height);
@@ -304,22 +318,22 @@ static UIImage *CloudCodeScreenshotImageFromRenderServer(void)
     if (allocationSize == 0 || allocationSize > 256 * 1024 * 1024) { return nil; }
 
     NSDictionary *properties = @{
-        (id)kIOSurfaceWidth: @(width),
-        (id)kIOSurfaceHeight: @(height),
-        (id)kIOSurfaceBytesPerElement: @4,
-        (id)kIOSurfaceBytesPerRow: @(bytesPerRow),
-        (id)kIOSurfaceAllocSize: @(allocationSize),
-        (id)kIOSurfacePixelFormat: @(0x42475241),
-        (id)kIOSurfaceIsGlobal: @YES
+        @"IOSurfaceWidth": @(width),
+        @"IOSurfaceHeight": @(height),
+        @"IOSurfaceBytesPerElement": @4,
+        @"IOSurfaceBytesPerRow": @(bytesPerRow),
+        @"IOSurfaceAllocSize": @(allocationSize),
+        @"IOSurfacePixelFormat": @(0x42475241),
+        @"IOSurfaceIsGlobal": @YES
     };
-    IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
+    CloudCodeIOSurfaceRef surface = createSurface((__bridge CFDictionaryRef)properties);
     if (!surface) { return nil; }
 
     UIImage *detached = nil;
-    if (IOSurfaceLock(surface, 0, NULL) == 0) {
+    if (lockSurface(surface, 0, NULL) == 0) {
         @try { render(0, CFSTR("LCD"), surface, 0, 0); } @catch (__unused NSException *exception) {}
-        void *baseAddress = IOSurfaceGetBaseAddress(surface);
-        size_t surfaceBytesPerRow = IOSurfaceGetBytesPerRow(surface);
+        void *baseAddress = getBaseAddress(surface);
+        size_t surfaceBytesPerRow = getBytesPerRow(surface);
         if (baseAddress && surfaceBytesPerRow >= width * 4) {
             CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, baseAddress, surfaceBytesPerRow * height, NULL);
             CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
@@ -341,7 +355,7 @@ static UIImage *CloudCodeScreenshotImageFromRenderServer(void)
             if (colorSpace) { CGColorSpaceRelease(colorSpace); }
             if (provider) { CGDataProviderRelease(provider); }
         }
-        IOSurfaceUnlock(surface, 0, NULL);
+        unlockSurface(surface, 0, NULL);
     }
     CFRelease(surface);
     return detached;
