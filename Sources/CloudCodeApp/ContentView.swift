@@ -146,7 +146,10 @@ private struct ChatView: View {
     @State private var pendingImagePreview: UIImage?
 
     private var visibleMessages: [ChatMessage] {
-        model.session.messages.filter { $0.role == .user || $0.role == .assistant }
+        model.session.messages.filter {
+            ($0.role == .user || $0.role == .assistant)
+                && $0.providerMetadata["internal_observation"] == nil
+        }
     }
 
     var body: some View {

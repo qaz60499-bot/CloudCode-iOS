@@ -2075,6 +2075,31 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(legacy.attachments.isEmpty)
     }
 
+    func testToolResultCanCarryScreenshotAttachmentAndLegacyResultsStillDecode() throws {
+        let attachment = ChatAttachment(
+            filename: "gui-screenshot.jpg",
+            path: "/tmp/gui-screenshot.jpg",
+            mimeType: "image/jpeg",
+            byteSize: 4321
+        )
+        let result = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "Screenshot captured",
+            payload: ["byteCount": "4321"],
+            attachments: [attachment]
+        )
+        let encoded = try JSONEncoder().encode(result)
+        let decoded = try JSONDecoder().decode(ToolResult.self, from: encoded)
+        XCTAssertEqual(decoded.attachments, [attachment])
+
+        let legacyJSON = """
+        {"toolCallID":"00000000-0000-0000-0000-000000000002","success":true,"summary":"legacy","payload":{},"verification":null}
+        """.data(using: .utf8)!
+        let legacy = try JSONDecoder().decode(ToolResult.self, from: legacyJSON)
+        XCTAssertNil(legacy.attachments)
+    }
+
     func testAgentMapsProviderSafeToolNameBackToInternalAndUsesSafeHistoryOnSecondRound() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

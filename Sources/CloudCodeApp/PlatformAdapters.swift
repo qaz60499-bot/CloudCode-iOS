@@ -1029,11 +1029,18 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
     private let backend: GUIAutomationBackend
     private let policy: PolicyEngine
     private let approval: ApprovalRequesting
+    private let attachmentRoot: URL?
 
-    public init(backend: GUIAutomationBackend, policy: PolicyEngine, approval: ApprovalRequesting) {
+    public init(
+        backend: GUIAutomationBackend,
+        policy: PolicyEngine,
+        approval: ApprovalRequesting,
+        attachmentRoot: URL? = nil
+    ) {
         self.backend = backend
         self.policy = policy
         self.approval = approval
+        self.attachmentRoot = attachmentRoot
     }
 
     public func allowsDeferredCapabilityAttempt(
@@ -1119,7 +1126,14 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             return ToolResult(toolCallID: call.id, success: true, summary: "GUI tree read", payload: ["tree": ToolOutputEnvelope(trust: .untrustedData, source: "gui.tree", content: tree).promptSafeRepresentation])
         case "gui.screenshot":
             let data = try await backend.screenshot()
-            return ToolResult(toolCallID: call.id, success: true, summary: "Screenshot captured", payload: ["byteCount": String(data.count)])
+            let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
+            return ToolResult(
+                toolCallID: call.id,
+                success: true,
+                summary: "Screenshot captured",
+                payload: ["byteCount": String(data.count)],
+                attachments: attachment.map { [$0] }
+            )
         case "gui.tap":
             try await backend.tap(x: Double(call.arguments["x"] ?? "0") ?? 0, y: Double(call.arguments["y"] ?? "0") ?? 0)
             return ToolResult(toolCallID: call.id, success: true, summary: "Tap executed")
@@ -1138,6 +1152,24 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         default:
             throw ToolRouterError.noExecutionRoute(call.name)
         }
+    }
+
+    private func persistScreenshotAttachment(_ data: Data, sessionID: UUID) throws -> ChatAttachment? {
+        guard let attachmentRoot else { return nil }
+        guard !data.isEmpty, data.count <= ChatMessageAttachmentPolicy.maxImageBytes else {
+            throw ToolRouterError.noExecutionRoute("GUI screenshot is empty or exceeds the provider image limit")
+        }
+        let sessionRoot = attachmentRoot.appendingPathComponent(sessionID.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: sessionRoot, withIntermediateDirectories: true)
+        let filename = "gui-screenshot-\(UUID().uuidString).jpg"
+        let target = sessionRoot.appendingPathComponent(filename, isDirectory: false)
+        try data.write(to: target, options: .atomic)
+        return ChatAttachment(
+            filename: "gui-screenshot.jpg",
+            path: target.path,
+            mimeType: "image/jpeg",
+            byteSize: Int64(data.count)
+        )
     }
 
     private static func feature(for toolName: String) -> GUIAutomationFeature? {

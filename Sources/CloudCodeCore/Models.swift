@@ -244,13 +244,22 @@ public struct ToolResult: Codable, Equatable, Sendable {
     public var summary: String
     public var payload: [String: String]
     public var verification: VerificationResult?
+    public var attachments: [ChatAttachment]?
 
-    public init(toolCallID: UUID, success: Bool, summary: String, payload: [String: String] = [:], verification: VerificationResult? = nil) {
+    public init(
+        toolCallID: UUID,
+        success: Bool,
+        summary: String,
+        payload: [String: String] = [:],
+        verification: VerificationResult? = nil,
+        attachments: [ChatAttachment]? = nil
+    ) {
         self.toolCallID = toolCallID
         self.success = success
         self.summary = summary
         self.payload = payload
         self.verification = verification
+        self.attachments = attachments
     }
 }
 
