@@ -447,8 +447,9 @@ jobs:
               raise SystemExit('FAIL: GUI route selection must remain side-effect free and never run a readiness probe')
           if 'status == .available || status == .deviceValidationRequired' not in gui_routing:
               raise SystemExit('FAIL: GUI route no longer admits only available or exact deferred granular capabilities')
-          if 'capabilityIDs == [feature.capabilityID]' not in gui_routing:
-              raise SystemExit('FAIL: GUI deferred routing must be limited to the exact requested granular capability')
+          for marker in ('let expected = Set(features.map(\\.capabilityID))', 'let deferred = Set(capabilityIDs)', '!deferred.isEmpty, deferred.isSubset(of: expected)', 'capabilityIDs.allSatisfy({ capabilities.status($0) == .deviceValidationRequired })'):
+              if marker not in gui_routing:
+                  raise SystemExit(f'FAIL: GUI deferred routing lost exact requested capability-set guard: {marker}')
           for marker in ('foreground effect unverified', 'effectVerification'):
               if marker not in gui_executor:
                   raise SystemExit(f'FAIL: GUI action result can be mistaken for verified foreground success: {marker}')
