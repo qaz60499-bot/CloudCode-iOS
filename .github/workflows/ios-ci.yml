@@ -451,9 +451,13 @@ jobs:
               if marker not in trollstore_gui:
                   raise SystemExit(f'FAIL: repeated AX timeout suppression missing: {marker}')
           screenshot_adapter = adapters.split('static func guiScreenshot()', 1)[1].split('static func guiTap(', 1)[0]
-          for marker in ('gui-screenshot-file', 'FileManager.default.temporaryDirectory', 'CloudCode-GUI-', 'FileManager.default.createFile(atPath: outputURL.path, contents: Data())', 'GUIAutomationPayloadPolicy.isValidScreenshotJPEG(data)', 'GUIAutomationPayloadPolicy.sha256Hex(data)'):
+          for marker in ('gui-screenshot-file', 'FileManager.default.temporaryDirectory', 'CloudCode-GUI-', 'FileManager.default.createFile(atPath: outputURL.path, contents: Data())', 'GUIAutomationPayloadPolicy.isValidScreenshotJPEG(data)'):
               if marker not in screenshot_adapter:
                   raise SystemExit(f'FAIL: screenshot payload is not isolated from merged helper diagnostics: {marker}')
+          gui_screenshot_tool = gui_executor.split('case "gui.screenshot":', 1)[1].split('case "gui.tap":', 1)[0]
+          for marker in ('GUIAutomationPayloadPolicy.sha256Hex(data)', '"sha256"', '"byteCount"'):
+              if marker not in gui_screenshot_tool:
+                  raise SystemExit(f'FAIL: screenshot tool result lost visual-effect fingerprint metadata: {marker}')
           payload_policy = Path('Sources/CloudCodeCore/GUIAutomationPayloadPolicy.swift').read_text(encoding='utf-8')
           for marker in ('maxScreenshotBytes = 700 * 1024', 'sha256Hex', 'isValidScreenshotJPEG', 'data.count <= maxScreenshotBytes', 'data[data.index(end, offsetBy: -2)] == 0xFF', 'data[data.index(before: end)] == 0xD9'):
               if marker not in payload_policy:
