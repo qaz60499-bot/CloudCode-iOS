@@ -281,8 +281,14 @@ jobs:
           agent = Path('Sources/CloudCodeCore/AgentCore.swift').read_text(encoding='utf-8')
           if 'await capabilityProbe.probeStartupSafe()' not in agent:
               raise SystemExit('FAIL: ordinary Agent run lost startup-safe capability probe')
-          if agent.count('capabilityProbe.probePrivileged()') != 1 or 'if name == "capability.probe" { capabilities = await capabilityProbe.probePrivileged() }' not in agent:
-              raise SystemExit('FAIL: privileged Agent probe must remain exclusive to explicit capability.probe tool execution')
+          if 'capabilityProbe.probePrivileged()' in agent:
+              raise SystemExit('FAIL: ordinary/model-driven Agent execution must never initiate privileged capability probing')
+          tool_executor = Path('Sources/CloudCodeCore/ToolExecutors.swift').read_text(encoding='utf-8')
+          capability_tool = tool_executor.split('case "capability.probe":', 1)[1].split('case "apps.list":', 1)[0]
+          if 'context.capabilityProfile' not in capability_tool:
+              raise SystemExit('FAIL: model-driven capability.probe must report the current session capability snapshot')
+          if 'probePrivileged()' in capability_tool or 'probeExtendedDevice()' in capability_tool or 'probeStartupSafe()' in capability_tool:
+              raise SystemExit('FAIL: model-driven capability.probe must not execute any capability backend')
 
           adapters = Path('Sources/CloudCodeApp/PlatformAdapters.swift').read_text(encoding='utf-8')
           resolver = adapters.split('public actor IOSAppResolver', 1)[1].split('@MainActor\npublic final class ApprovalCenter', 1)[0]
