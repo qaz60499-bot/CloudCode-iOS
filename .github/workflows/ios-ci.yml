@@ -309,8 +309,8 @@ jobs:
                   raise SystemExit(f'FAIL: automatic bootstrap contains privileged/full probe: {forbidden}')
           if 'capabilityProbe.probeStartupSafe()' not in bootstrap:
               raise SystemExit('FAIL: automatic bootstrap must use startup-safe capability probe')
-          if 'TrollStoreGUIBackend()' not in app or 'GUIFallbackExecutor(backend: guiBackend' not in app:
-              raise SystemExit('FAIL: AppEnvironment is not wired to the runtime GUI backend')
+          if 'TrollStoreGUIBackend(diagnosticLogger: diagnosticLogStore)' not in app or 'GUIFallbackExecutor(backend: guiBackend' not in app:
+              raise SystemExit('FAIL: AppEnvironment is not wired to the runtime GUI backend with diagnostics')
           if 'GUIFallbackExecutor(backend: UnavailableGUIBackend()' in app:
               raise SystemExit('FAIL: AppEnvironment regressed to the unavailable GUI placeholder')
           refresh = app.split('public func refreshCapabilities()', 1)[1].split('public func refreshFiles()', 1)[0]
