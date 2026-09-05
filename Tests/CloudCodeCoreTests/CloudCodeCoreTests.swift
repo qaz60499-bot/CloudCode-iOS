@@ -3343,10 +3343,11 @@ final class CloudCodeCoreTests: XCTestCase {
 
         let saved = try await sessions.load(session.id)
         let systemMessages = saved.messages.filter { $0.role == .system }
-        XCTAssertEqual(systemMessages.count, 1)
-        XCTAssertNotEqual(systemMessages.first?.content, malicious)
+        XCTAssertEqual(systemMessages.count, 2)
+        XCTAssertFalse(systemMessages.contains { $0.content == malicious })
         XCTAssertTrue(systemMessages.first?.content.contains("Cloud Code iOS") == true)
         XCTAssertTrue(systemMessages.first?.content.contains("untrusted data") == true)
+        XCTAssertTrue(systemMessages.contains { $0.providerMetadata["context_layer"] == "ios_interaction_framework" })
     }
 
     func testToolRegistryKeepsRootMutationsCapabilityGatedWhileBoundedAppReadsAndLaunchSelfValidate() async throws {
