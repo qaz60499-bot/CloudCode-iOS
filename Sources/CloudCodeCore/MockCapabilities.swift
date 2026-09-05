@@ -1,19 +1,21 @@
 import Foundation
 
 public enum MockCapabilityProfiles {
+    private static let granularGUI = GUIAutomationFeature.allCases.map(\.capabilityID)
+
     public static let sandbox = profile(
         available: ["filesystem.own_container", "data.keychain_scope", "automation.url_scheme", "ipa.inspect"],
-        unavailable: ["filesystem.unrestricted", "apps.enumerate", "apps.resolve_data_container", "execution.ios_system", "execution.root_helper", "automation.gui"]
+        unavailable: ["filesystem.unrestricted", "apps.enumerate", "apps.resolve_data_container", "execution.ios_system", "execution.root_helper", "automation.gui"] + granularGUI
     )
 
     public static let trollStoreNoSandbox = profile(
         available: ["filesystem.own_container", "filesystem.shared_user_files", "filesystem.unrestricted", "apps.enumerate", "apps.resolve_bundle_path", "apps.resolve_data_container", "execution.spawn_helper", "ipa.inspect"],
-        deviceValidation: ["execution.root_helper", "ipa.install", "automation.gui"]
+        deviceValidation: ["execution.root_helper", "ipa.install", "automation.gui"] + granularGUI
     )
 
     public static let rootHelperAvailable = profile(
         available: ["filesystem.own_container", "filesystem.unrestricted", "apps.enumerate", "apps.resolve_bundle_path", "apps.resolve_data_container", "execution.spawn_helper", "execution.root_helper", "ipa.inspect", "ipa.install"],
-        deviceValidation: ["automation.gui"]
+        deviceValidation: ["automation.gui"] + granularGUI
     )
 
     public static let rootHelperUnavailable = profile(
@@ -22,12 +24,12 @@ public enum MockCapabilityProfiles {
     )
 
     public static let guiAvailable = profile(
-        available: ["filesystem.own_container", "automation.gui", "automation.xctest_wda", "ipa.inspect"]
+        available: ["filesystem.own_container", "automation.gui", "automation.xctest_wda", "ipa.inspect"] + granularGUI
     )
 
     public static let guiUnavailable = profile(
         available: ["filesystem.own_container", "ipa.inspect"],
-        unavailable: ["automation.gui", "automation.xctest_wda"]
+        unavailable: ["automation.gui", "automation.xctest_wda"] + granularGUI
     )
 
     private static func profile(available: [String] = [], unavailable: [String] = [], deviceValidation: [String] = []) -> CapabilityProfile {

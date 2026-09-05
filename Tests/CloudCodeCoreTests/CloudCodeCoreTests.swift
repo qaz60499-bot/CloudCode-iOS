@@ -8,7 +8,11 @@ final class CloudCodeCoreTests: XCTestCase {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let resolver = SafeStartupResolverSpy()
-        let probe = CapabilityProbe(appResolver: resolver, homeDirectory: root)
+        let guiProvider = CountingGUIProvider(snapshot: GUIAutomationCapabilitySnapshot(
+            backendIdentifier: "test-gui",
+            statuses: Dictionary(uniqueKeysWithValues: GUIAutomationFeature.allCases.map { ($0, .available) })
+        ))
+        let probe = CapabilityProbe(appResolver: resolver, homeDirectory: root, guiCapabilityProvider: guiProvider)
 
         let profile = await probe.probeStartupSafe()
 
@@ -23,8 +27,62 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(profile.status("apps.terminate"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("apps.uninstall"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("data.keychain_scope"), .deviceValidationRequired)
+        XCTAssertEqual(profile.status("automation.gui"), .deviceValidationRequired)
+        for feature in GUIAutomationFeature.allCases {
+            XCTAssertEqual(profile.status(feature.capabilityID), .deviceValidationRequired)
+        }
         let resolverCalls = await resolver.totalCalls()
         XCTAssertEqual(resolverCalls, 0, "startup-safe probing must not call app/private capability providers")
+        let guiCalls = await guiProvider.totalCalls()
+        XCTAssertEqual(guiCalls, 0, "startup-safe probing must never launch a GUI/root readiness helper")
+    }
+
+    func testExtendedCapabilityProbeDefersGUIRootReadiness() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let guiProvider = CountingGUIProvider(snapshot: GUIAutomationCapabilitySnapshot(
+            backendIdentifier: "partial-gui",
+            statuses: Dictionary(uniqueKeysWithValues: GUIAutomationFeature.allCases.map { ($0, .available) })
+        ))
+        let probe = CapabilityProbe(appResolver: StaticAppResolver(), homeDirectory: root, guiCapabilityProvider: guiProvider)
+
+        let profile = await probe.probeExtendedDevice()
+
+        XCTAssertEqual(profile.status("automation.gui"), .deviceValidationRequired)
+        for feature in GUIAutomationFeature.allCases {
+            XCTAssertEqual(profile.status(feature.capabilityID), .deviceValidationRequired)
+        }
+        let guiCallCount = await guiProvider.totalCalls()
+        XCTAssertEqual(guiCallCount, 0, "extended validation must not spawn the root/persona GUI readiness helper")
+    }
+
+    func testPrivilegedCapabilityProbePublishesGranularGUIRuntimeEvidence() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let guiProvider = CountingGUIProvider(snapshot: GUIAutomationCapabilitySnapshot(
+            backendIdentifier: "partial-gui",
+            statuses: [
+                .openApp: .available,
+                .tree: .unavailable,
+                .screenshot: .available,
+                .touch: .available,
+                .textInput: .available,
+                .gestures: .available,
+                .verify: .unavailable
+            ]
+        ))
+        let probe = CapabilityProbe(appResolver: StaticAppResolver(), homeDirectory: root, guiCapabilityProvider: guiProvider)
+
+        let profile = await probe.probePrivileged()
+
+        XCTAssertEqual(profile.status(GUIAutomationFeature.openApp.capabilityID), .available)
+        XCTAssertEqual(profile.status(GUIAutomationFeature.screenshot.capabilityID), .available)
+        XCTAssertEqual(profile.status(GUIAutomationFeature.touch.capabilityID), .available)
+        XCTAssertEqual(profile.status(GUIAutomationFeature.tree.capabilityID), .unavailable)
+        XCTAssertEqual(profile.status(GUIAutomationFeature.verify.capabilityID), .unavailable)
+        XCTAssertEqual(profile.status("automation.gui"), .unavailable, "partial capability must never masquerade as complete GUI automation")
+        let guiCallCount = await guiProvider.totalCalls()
+        XCTAssertEqual(guiCallCount, 1)
     }
 
     func testExtendedCapabilityProbeRebuildsHomeOSAggregatesWithoutDuplicateStaleRecords() async throws {
@@ -377,6 +435,59 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(target.contains("super-secret"))
         XCTAssertTrue(target.contains(String(secret.count)))
         XCTAssertTrue(target.contains("内容已隐藏"))
+    }
+
+    func testGUIVisibleTextVerifierReportsSuccessAndFailureFromFreshObservation() {
+        let tree = #"{"tree":{"label":"Done","identifier":"finish-button"}}"#
+        let success = GUIVisibleTextVerifier.verify(tree: tree, assertion: "contains:Done")
+        XCTAssertTrue(success.passed)
+        XCTAssertTrue(success.failures.isEmpty)
+
+        let failure = GUIVisibleTextVerifier.verify(tree: tree, assertion: "contains:Missing")
+        XCTAssertFalse(failure.passed)
+        XCTAssertFalse(failure.failures.isEmpty)
+        XCTAssertFalse(failure.checks.joined().contains("Missing"), "verification diagnostics should describe the target without echoing its content")
+    }
+
+    func testUnavailableGUIBackendFailsClosedForEveryCapability() async throws {
+        let backend = UnavailableGUIBackend()
+        let snapshot = await backend.guiCapabilitySnapshot()
+        let backendAvailable = await backend.isAvailable()
+        XCTAssertFalse(backendAvailable)
+        for feature in GUIAutomationFeature.allCases {
+            XCTAssertEqual(snapshot.status(feature), .unavailable)
+        }
+        do {
+            _ = try await backend.tree()
+            XCTFail("Unavailable GUI tree must fail closed")
+        } catch {
+            XCTAssertEqual(error as? ToolRouterError, .noExecutionRoute("gui.tree"))
+        }
+    }
+
+    func testGUITypePlaintextDoesNotEnterToolDiagnosticLog() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let secret = "never-log-this-gui-input"
+        let logStore = DiagnosticLogStore(directory: root.appendingPathComponent("logs", isDirectory: true))
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "gui.type", summary: "", risk: .sensitiveWrite, requiredCapabilities: [GUIAutomationFeature.textInput.capabilityID], preferredRoute: .guiFallback)
+        ])
+        let router = ToolRouter(
+            registry: registry,
+            executors: [StubExecutor(route: .guiFallback, names: ["gui.type"])],
+            diagnosticLogger: logStore
+        )
+        let profile = CapabilityProfile(records: [
+            CapabilityRecord(id: GUIAutomationFeature.textInput.capabilityID, domain: .automation, status: .available, detail: "mock")
+        ])
+        let call = ToolCall(name: "gui.type", arguments: ["text": secret], sessionID: UUID())
+        _ = try await router.execute(call, context: ToolExecutionContext(permissionMode: .full, capabilityProfile: profile))
+
+        let logText = try await logStore.text(limit: 500)
+        XCTAssertFalse(logText.contains(secret))
+        XCTAssertTrue(logText.contains("argumentKeys"))
+        XCTAssertTrue(logText.contains("text"), "Only the argument key name may be logged")
     }
 
     func testDatabaseAndPlistAreSensitive() {
@@ -1411,6 +1522,127 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(MockCapabilityProfiles.guiUnavailable.isAvailable("automation.gui"))
     }
 
+    func testGUICompositeCapabilityRequiresEveryObservationActionVerificationFeature() {
+        var statuses = Dictionary(uniqueKeysWithValues: GUIAutomationFeature.allCases.map { ($0, CapabilityStatus.available) })
+        let complete = GUIAutomationCapabilitySnapshot(backendIdentifier: "complete", statuses: statuses)
+        XCTAssertEqual(complete.compositeStatus, .available)
+
+        statuses[.tree] = .unavailable
+        let partial = GUIAutomationCapabilitySnapshot(backendIdentifier: "partial", statuses: statuses)
+        XCTAssertEqual(partial.compositeStatus, .unavailable)
+
+        statuses[.tree] = .deviceValidationRequired
+        let pending = GUIAutomationCapabilitySnapshot(backendIdentifier: "pending", statuses: statuses)
+        XCTAssertEqual(pending.compositeStatus, .deviceValidationRequired)
+    }
+
+    func testGUIToolsRequireGranularCapabilityRatherThanCompositeFlag() async throws {
+        let registry = ToolRegistry()
+        let tapValue = await registry.descriptor(named: "gui.tap")
+        let treeValue = await registry.descriptor(named: "gui.tree")
+        let typeValue = await registry.descriptor(named: "gui.type")
+        let tap = try XCTUnwrap(tapValue)
+        let tree = try XCTUnwrap(treeValue)
+        let type = try XCTUnwrap(typeValue)
+        XCTAssertEqual(tap.requiredCapabilities, [GUIAutomationFeature.touch.capabilityID])
+        XCTAssertEqual(tree.requiredCapabilities, [GUIAutomationFeature.tree.capabilityID])
+        XCTAssertEqual(type.requiredCapabilities, [GUIAutomationFeature.textInput.capabilityID])
+    }
+
+    func testPartialGUICapabilityFailsClosedForUnprovenFeature() async throws {
+        let registry = ToolRegistry()
+        let executor = StubExecutor(route: .guiFallback, names: ["gui.tap", "gui.tree"])
+        let router = ToolRouter(registry: registry, executors: [executor])
+        let profile = CapabilityProfile(records: [
+            CapabilityRecord(id: GUIAutomationFeature.touch.capabilityID, domain: .automation, status: .available, detail: "touch proven"),
+            CapabilityRecord(id: GUIAutomationFeature.tree.capabilityID, domain: .automation, status: .deviceValidationRequired, detail: "tree pending")
+        ])
+        let treeCall = ToolCall(name: "gui.tree", arguments: [:], sessionID: UUID())
+        do {
+            _ = try await router.chooseRoute(for: treeCall, capabilities: profile)
+            XCTFail("Unproven GUI tree capability must fail closed")
+        } catch {
+            XCTAssertEqual(error as? ToolRouterError, .missingCapability(GUIAutomationFeature.tree.capabilityID))
+        }
+    }
+
+    func testDeviceValidationRequiredCanRouteOnlyThroughExplicitRuntimeValidator() async throws {
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "gui.tap", summary: "", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback)
+        ])
+        let validationCounter = InvocationCounter()
+        let executor = RuntimeValidatingExecutor(
+            route: .guiFallback,
+            names: ["gui.tap"],
+            validationResult: true,
+            validationCounter: validationCounter
+        )
+        let router = ToolRouter(registry: registry, executors: [executor])
+        let profile = CapabilityProfile(records: [
+            CapabilityRecord(id: GUIAutomationFeature.touch.capabilityID, domain: .automation, status: .deviceValidationRequired, detail: "deferred at startup")
+        ])
+        let call = ToolCall(name: "gui.tap", arguments: ["x": "20", "y": "30"], sessionID: UUID())
+
+        let route = try await router.chooseRoute(for: call, capabilities: profile)
+        XCTAssertEqual(route, .guiFallback)
+        let validationCount = await validationCounter.value()
+        XCTAssertEqual(validationCount, 1)
+    }
+
+    func testRuntimeValidatorFailureLeavesDeviceValidationRequiredFailClosed() async throws {
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "gui.tap", summary: "", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback)
+        ])
+        let validationCounter = InvocationCounter()
+        let executor = RuntimeValidatingExecutor(
+            route: .guiFallback,
+            names: ["gui.tap"],
+            validationResult: false,
+            validationCounter: validationCounter
+        )
+        let router = ToolRouter(registry: registry, executors: [executor])
+        let profile = CapabilityProfile(records: [
+            CapabilityRecord(id: GUIAutomationFeature.touch.capabilityID, domain: .automation, status: .deviceValidationRequired, detail: "deferred at startup")
+        ])
+        let call = ToolCall(name: "gui.tap", arguments: ["x": "20", "y": "30"], sessionID: UUID())
+
+        do {
+            _ = try await router.chooseRoute(for: call, capabilities: profile)
+            XCTFail("Failed runtime handshake must keep the GUI feature unavailable")
+        } catch {
+            XCTAssertEqual(error as? ToolRouterError, .missingCapability(GUIAutomationFeature.touch.capabilityID))
+        }
+        let validationCount = await validationCounter.value()
+        XCTAssertEqual(validationCount, 1)
+    }
+
+    func testUnavailableCapabilityNeverInvokesRuntimeValidator() async throws {
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "gui.tap", summary: "", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback)
+        ])
+        let validationCounter = InvocationCounter()
+        let executor = RuntimeValidatingExecutor(
+            route: .guiFallback,
+            names: ["gui.tap"],
+            validationResult: true,
+            validationCounter: validationCounter
+        )
+        let router = ToolRouter(registry: registry, executors: [executor])
+        let profile = CapabilityProfile(records: [
+            CapabilityRecord(id: GUIAutomationFeature.touch.capabilityID, domain: .automation, status: .unavailable, detail: "runtime already disproved")
+        ])
+        let call = ToolCall(name: "gui.tap", arguments: ["x": "20", "y": "30"], sessionID: UUID())
+
+        do {
+            _ = try await router.chooseRoute(for: call, capabilities: profile)
+            XCTFail("Unavailable capability must never be promoted by a runtime validator")
+        } catch {
+            XCTAssertEqual(error as? ToolRouterError, .missingCapability(GUIAutomationFeature.touch.capabilityID))
+        }
+        let validationCount = await validationCounter.value()
+        XCTAssertEqual(validationCount, 0)
+    }
+
     func testDeviceValidationRequiredCapabilityDoesNotAuthorizeExecution() async throws {
         let registry = ToolRegistry(descriptors: [ToolDescriptor(name: "ipa.install", summary: "", risk: .systemChange, requiredCapabilities: ["ipa.install"], preferredRoute: .privateFramework)])
         let executor = StubExecutor(route: .privateFramework, names: ["ipa.install"])
@@ -1989,6 +2221,52 @@ final class CloudCodeCoreTests: XCTestCase {
 
         let executionCount = await counter.value()
         XCTAssertEqual(executionCount, 1)
+    }
+
+    func testGUIAgentRegressionObservesActsObservesAndVerifiesAcrossRounds() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let counter = InvocationCounter()
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "gui.tree", summary: "", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID], preferredRoute: .guiFallback),
+            ToolDescriptor(name: "gui.tap", summary: "", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback),
+            ToolDescriptor(name: "gui.verify", summary: "", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.verify.capabilityID], preferredRoute: .guiFallback)
+        ])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let agent = AgentCore(
+            provider: SequencedGUIProvider(),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(
+                registry: registry,
+                executors: [CountingExecutor(route: .guiFallback, names: ["gui.tree", "gui.tap", "gui.verify"], counter: counter)]
+            ),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 6
+        )
+        let validated = CapabilityProfile(records: [
+            CapabilityRecord(id: GUIAutomationFeature.tree.capabilityID, domain: .automation, status: .available, detail: "mock tree"),
+            CapabilityRecord(id: GUIAutomationFeature.touch.capabilityID, domain: .automation, status: .available, detail: "mock touch"),
+            CapabilityRecord(id: GUIAutomationFeature.verify.capabilityID, domain: .automation, status: .available, detail: "mock verify")
+        ])
+        let session = AgentSession(permissionMode: .full)
+        let stream = await agent.send(
+            text: "open the target and complete it",
+            session: session,
+            providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key"),
+            capabilityProfile: validated
+        )
+        for try await _ in stream {}
+
+        let guiExecutionCount = await counter.value()
+        XCTAssertEqual(guiExecutionCount, 4)
+        let saved = try await sessions.load(session.id)
+        let names = saved.messages
+            .filter { $0.role == .assistant && $0.providerMetadata["tool_call_id"] != nil }
+            .compactMap { $0.providerMetadata["tool_name"] }
+        XCTAssertEqual(names, ["gui.tree", "gui.tap", "gui.tree", "gui.verify"])
     }
 
     func testMultipleProviderToolCallsInOneRoundMapToDistinctInternalTools() async throws {
@@ -3826,6 +4104,22 @@ private final class ScriptedURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
+private actor CountingGUIProvider: GUIAutomationCapabilityProviding {
+    private let snapshot: GUIAutomationCapabilitySnapshot
+    private var calls = 0
+
+    init(snapshot: GUIAutomationCapabilitySnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func guiCapabilitySnapshot() async -> GUIAutomationCapabilitySnapshot {
+        calls += 1
+        return snapshot
+    }
+
+    func totalCalls() -> Int { calls }
+}
+
 private actor SafeStartupResolverSpy: AppContainerResolving, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, RootHelperCapabilityProviding, AppLifecycleCapabilityProviding {
     private var calls = 0
 
@@ -4092,6 +4386,33 @@ private struct DuplicateStateChangeProvider: ProviderStreaming, Sendable {
     }
 }
 
+private actor SequencedGUIProvider: ProviderStreaming {
+    nonisolated func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        let completedTools = messages.filter { $0.role == .tool }.count
+        return AsyncThrowingStream { continuation in
+            switch completedTools {
+            case 0:
+                continuation.yield(.toolCall(id: "gui-observe-1", name: "gui_tree", argumentsJSON: "{}"))
+            case 1:
+                continuation.yield(.toolCall(id: "gui-action-1", name: "gui_tap", argumentsJSON: "{\"x\":\"100\",\"y\":\"200\"}"))
+            case 2:
+                continuation.yield(.toolCall(id: "gui-observe-2", name: "gui_tree", argumentsJSON: "{}"))
+            case 3:
+                continuation.yield(.toolCall(id: "gui-verify-1", name: "gui_verify", argumentsJSON: "{\"assertion\":\"contains:Done\"}"))
+            default:
+                continuation.yield(.token("done"))
+            }
+            continuation.yield(.finished)
+            continuation.finish()
+        }
+    }
+}
+
 private actor RecordingToolRoundProvider: ProviderStreaming {
     struct Snapshot: Sendable {
         var messages: [ChatMessage]
@@ -4169,6 +4490,30 @@ private actor InvocationCounter {
     private var count = 0
     func increment() { count += 1 }
     func value() -> Int { count }
+}
+
+private struct RuntimeValidatingExecutor: RuntimeCapabilityValidatingToolExecutor, Sendable {
+    let route: AppExecutionRoute
+    let names: Set<String>
+    let validationResult: Bool
+    let validationCounter: InvocationCounter
+
+    func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
+        names.contains(tool.name)
+    }
+
+    func validatesRuntimeCapabilities(
+        _ capabilityIDs: [String],
+        for tool: ToolDescriptor,
+        capabilities: CapabilityProfile
+    ) async -> Bool {
+        await validationCounter.increment()
+        return validationResult
+    }
+
+    func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
+        ToolResult(toolCallID: call.id, success: true, summary: "runtime validated")
+    }
 }
 
 private struct SlowCountingExecutor: ToolExecuting, Sendable {

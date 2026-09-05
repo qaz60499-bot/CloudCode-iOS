@@ -5,6 +5,8 @@
 #import <stdio.h>
 #import <unistd.h>
 #import <signal.h>
+#import <stdlib.h>
+#import "GUIAutomation.h"
 
 #define CLOUDCODE_PROC_PATH_MAX 4096
 typedef int (*CloudCodeProcListAllPidsFn)(void *, int);
@@ -516,6 +518,32 @@ int main(int argc, const char *argv[])
             if (argc < 3) { return 10; }
             NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
             return LaunchApplication(bundleID);
+        }
+        if ([command isEqualToString:@"gui-probe-json"]) {
+            return CloudCodeGUIProbeJSON();
+        }
+        if ([command isEqualToString:@"gui-tree-json"]) {
+            return CloudCodeGUITreeJSON();
+        }
+        if ([command isEqualToString:@"gui-screenshot-base64"]) {
+            return CloudCodeGUIScreenshotBase64();
+        }
+        if ([command isEqualToString:@"gui-tap"]) {
+            if (argc < 4) { return 10; }
+            return CloudCodeGUITap(strtod(argv[2], NULL), strtod(argv[3], NULL));
+        }
+        if ([command isEqualToString:@"gui-swipe"]) {
+            if (argc < 7) { return 10; }
+            return CloudCodeGUISwipe(strtod(argv[2], NULL), strtod(argv[3], NULL), strtod(argv[4], NULL), strtod(argv[5], NULL), strtod(argv[6], NULL));
+        }
+        if ([command isEqualToString:@"gui-scroll"]) {
+            if (argc < 4) { return 10; }
+            return CloudCodeGUIScroll(strtod(argv[2], NULL), strtod(argv[3], NULL));
+        }
+        if ([command isEqualToString:@"gui-type-base64"]) {
+            if (argc < 3) { return 10; }
+            NSString *encoded = [NSString stringWithUTF8String:argv[2]];
+            return CloudCodeGUITypeBase64(encoded);
         }
         if ([command isEqualToString:@"uninstall"]) {
             if (getuid() != 0 || geteuid() != 0) { return 11; }

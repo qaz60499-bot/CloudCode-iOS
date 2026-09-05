@@ -124,7 +124,9 @@ jobs:
             com.apple.private.security.no-sandbox \
             platform-application \
             com.apple.private.security.storage.AppDataContainers \
-            com.apple.private.persona-mgmt; do
+            com.apple.private.persona-mgmt \
+            com.apple.hid.system.server-access \
+            com.apple.private.hid.client.event-dispatch; do
             /usr/libexec/PlistBuddy -c "Print :$required_host_entitlement" "$ENTITLEMENTS" | grep -F 'true'
           done
           rm -f "$ENTITLEMENTS"

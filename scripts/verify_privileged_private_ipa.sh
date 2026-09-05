@@ -75,7 +75,9 @@ for key in \
   'com.apple.private.security.no-sandbox' \
   'platform-application' \
   'com.apple.private.security.storage.AppDataContainers' \
-  'com.apple.private.persona-mgmt'; do
+  'com.apple.private.persona-mgmt' \
+  'com.apple.hid.system.server-access' \
+  'com.apple.private.hid.client.event-dispatch'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$ENTITLEMENTS" 2>/dev/null || true)"
   if [[ "$value" != "true" ]]; then
     echo "FAIL: privileged entitlement missing or false: $key" >&2
@@ -109,7 +111,9 @@ for key in \
   'com.apple.private.security.no-sandbox' \
   'platform-application' \
   'com.apple.private.security.storage.AppDataContainers' \
-  'com.apple.private.persona-mgmt'; do
+  'com.apple.private.persona-mgmt' \
+  'com.apple.hid.system.server-access' \
+  'com.apple.private.hid.client.event-dispatch'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$HELPER_ENTITLEMENTS" 2>/dev/null || true)"
   if [[ "$value" != "true" ]]; then
     echo "FAIL: root helper entitlement missing or false: $key" >&2

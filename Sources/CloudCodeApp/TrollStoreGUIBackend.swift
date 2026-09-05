@@ -1,0 +1,141 @@
+import Foundation
+import CloudCodeCore
+
+/// TrollStore-native GUI adapter. All private runtime work is executed in the embedded,
+/// bounded helper process so a missing/blocked private API cannot wedge the SwiftUI host.
+public actor TrollStoreGUIBackend: GUIAutomationBackend {
+    public nonisolated let identifier = "trollstore-root-helper"
+    private var cachedSnapshot: GUIAutomationCapabilitySnapshot?
+    private var cachedSnapshotAt: Date?
+    private let snapshotTTL: TimeInterval = 2
+
+    public init() {}
+
+    public func isAvailable() async -> Bool {
+        // Never initiate a root/persona readiness probe from a generic availability check.
+        // Explicit privileged capability validation populates this cache; before that, GUI
+        // remains unavailable for ordinary Agent routing.
+        cachedSnapshot?.compositeStatus == .available
+    }
+
+    public func guiCapabilitySnapshot() async -> GUIAutomationCapabilitySnapshot {
+        if let cachedSnapshot, let cachedSnapshotAt,
+           Date().timeIntervalSince(cachedSnapshotAt) <= snapshotTTL {
+            return cachedSnapshot
+        }
+        let launch = EmbeddedRootHelper.launchCapability()
+        let probe = EmbeddedRootHelper.guiProbe()
+        var statuses: [GUIAutomationFeature: CapabilityStatus] = [
+            .openApp: launch.available ? .available : .deviceValidationRequired,
+            .tree: .deviceValidationRequired,
+            .screenshot: .deviceValidationRequired,
+            .touch: .deviceValidationRequired,
+            .textInput: .deviceValidationRequired,
+            .gestures: .deviceValidationRequired,
+            .verify: .deviceValidationRequired
+        ]
+        var details: [GUIAutomationFeature: String] = [
+            .openApp: launch.detail,
+            .tree: probe.detail,
+            .screenshot: probe.detail,
+            .touch: probe.detail,
+            .textInput: probe.detail,
+            .gestures: probe.detail,
+            .verify: probe.detail
+        ]
+
+        if let payload = probe.payload {
+            statuses[.tree] = payload.tree ? .available : .unavailable
+            statuses[.screenshot] = payload.screenshot ? .available : .unavailable
+            statuses[.touch] = payload.touch ? .available : .unavailable
+            statuses[.textInput] = payload.textInput ? .available : .unavailable
+            statuses[.gestures] = payload.gestures ? .available : .unavailable
+            statuses[.verify] = payload.verify ? .available : .unavailable
+            details[.tree] = payload.tree
+                ? "AXRuntime returned a bounded frontmost-app tree during the helper handshake."
+                : "AXRuntime did not return a frontmost-app tree on this runtime; tree remains unavailable."
+            details[.screenshot] = payload.screenshot
+                ? "A bounded global JPEG screenshot was captured during the helper handshake."
+                : "No global screenshot was captured during the helper handshake."
+            details[.touch] = payload.touch
+                ? "IOHIDEventSystemClient and digitizer event symbols opened successfully in the entitled helper."
+                : "IOHID touch runtime did not open successfully."
+            details[.textInput] = payload.textInput
+                ? "IOHID Unicode input runtime opened successfully; plaintext input is never emitted by helper diagnostics."
+                : "IOHID Unicode text event runtime is unavailable."
+            details[.gestures] = payload.gestures
+                ? "IOHID digitizer gesture runtime opened successfully."
+                : "IOHID gesture runtime is unavailable."
+            details[.verify] = payload.verify
+                ? "Verification is backed by a fresh bounded AX tree observation."
+                : "Verification is unavailable because a fresh AX tree cannot currently be observed."
+        }
+
+        let snapshot = GUIAutomationCapabilitySnapshot(
+            backendIdentifier: identifier,
+            statuses: statuses,
+            details: details
+        )
+        cachedSnapshot = snapshot
+        cachedSnapshotAt = Date()
+        return snapshot
+    }
+
+    public func openApp(bundleID: String) async throws {
+        let outcome = EmbeddedRootHelper.launch(bundleID: bundleID)
+        guard outcome.success else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
+    }
+
+    public func tree() async throws -> String {
+        let outcome = EmbeddedRootHelper.guiTree()
+        guard let tree = outcome.tree else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
+        guard tree.utf8.count <= 256 * 1024 else {
+            throw ToolRouterError.noExecutionRoute("GUI tree exceeded the 256 KiB app-layer output limit")
+        }
+        return tree
+    }
+
+    public func screenshot() async throws -> Data {
+        let outcome = EmbeddedRootHelper.guiScreenshot()
+        guard let data = outcome.data else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
+        return data
+    }
+
+    public func tap(x: Double, y: Double) async throws {
+        guard x.isFinite, y.isFinite, x >= 0, y >= 0 else {
+            throw ToolRouterError.noExecutionRoute("tap coordinates must be finite and non-negative")
+        }
+        let outcome = EmbeddedRootHelper.guiTap(x: x, y: y)
+        guard outcome.success else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
+    }
+
+    public func type(_ text: String) async throws {
+        guard !text.isEmpty else { throw ToolRouterError.noExecutionRoute("text must not be empty") }
+        let outcome = EmbeddedRootHelper.guiType(text)
+        guard outcome.success else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
+    }
+
+    public func scroll(deltaX: Double, deltaY: Double) async throws {
+        guard deltaX.isFinite, deltaY.isFinite, abs(deltaX) <= 10_000, abs(deltaY) <= 10_000,
+              abs(deltaX) >= 0.5 || abs(deltaY) >= 0.5 else {
+            throw ToolRouterError.noExecutionRoute("scroll delta is invalid or outside the bounded range")
+        }
+        let outcome = EmbeddedRootHelper.guiScroll(deltaX: deltaX, deltaY: deltaY)
+        guard outcome.success else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
+    }
+
+    public func swipe(fromX: Double, fromY: Double, toX: Double, toY: Double, duration: Double) async throws {
+        let values = [fromX, fromY, toX, toY, duration]
+        guard values.allSatisfy({ $0.isFinite }), fromX >= 0, fromY >= 0, toX >= 0, toY >= 0,
+              duration >= 0.05, duration <= 5.0 else {
+            throw ToolRouterError.noExecutionRoute("swipe coordinates/duration are invalid or outside the bounded range")
+        }
+        let outcome = EmbeddedRootHelper.guiSwipe(fromX: fromX, fromY: fromY, toX: toX, toY: toY, duration: duration)
+        guard outcome.success else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
+    }
+
+    public func verify(_ assertion: String) async throws -> VerificationResult {
+        let observedTree = try await tree()
+        return GUIVisibleTextVerifier.verify(tree: observedTree, assertion: assertion)
+    }
+}

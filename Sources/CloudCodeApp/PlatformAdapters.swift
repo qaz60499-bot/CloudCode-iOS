@@ -12,7 +12,7 @@ public enum AppUninstallOutcome: Sendable, Equatable {
     case verificationTimedOut(String)
 }
 
-private enum EmbeddedRootHelper {
+enum EmbeddedRootHelper {
     struct EnumeratedApp: Decodable {
         var bundleID: String
         var name: String
@@ -24,6 +24,18 @@ private enum EmbeddedRootHelper {
     struct EnumerationPayload: Decodable {
         var backend: String
         var apps: [EnumeratedApp]
+    }
+
+    struct GUIProbePayload: Decodable {
+        var backend: String
+        var touch: Bool
+        var gestures: Bool
+        var textInput: Bool
+        var screenshot: Bool
+        var tree: Bool
+        var verify: Bool
+        var screenWidth: Double
+        var screenHeight: Double
     }
 
     static let executableName = "CloudCodeRootHelper"
@@ -71,6 +83,14 @@ private enum EmbeddedRootHelper {
         case 45: meaning = "LaunchServices/MobileInstallation 卸载后端均不可用"
         case 46: meaning = "LaunchServices 拒绝启动目标 App"
         case 47: meaning = "目标 App 已确认不在安装状态"
+        case 61: meaning = "GUI readiness JSON 无法生成"
+        case 62: meaning = "AXRuntime 前台 UI tree 当前不可用"
+        case 63: meaning = "全局截图后端当前不可用或输出超限"
+        case 64: meaning = "GUI 坐标/滚动参数越界或无效"
+        case 65: meaning = "IOHID tap 注入失败"
+        case 66: meaning = "IOHID swipe/scroll 注入失败"
+        case 67: meaning = "文本输入参数无效或超出限制"
+        case 68: meaning = "IOHID Unicode 文本输入后端不可用"
         default: meaning = ""
         }
         let suffix = meaning.isEmpty ? "" : "（\(meaning)）"
@@ -179,6 +199,83 @@ private enum EmbeddedRootHelper {
             return (true, result.diagnostic.isEmpty ? "Embedded root helper 已确认目标 App 进程停止" : "Embedded root helper 已确认目标 App 进程停止：\(result.diagnostic)")
         }
         return (false, failureDetail(prefix: "Embedded root helper 停止 App", code: result.code, diagnostic: result.diagnostic))
+    }
+
+    private static func decodeGUIProbe(_ diagnostic: String) -> GUIProbePayload? {
+        let decoder = JSONDecoder()
+        if let data = diagnostic.data(using: .utf8), let payload = try? decoder.decode(GUIProbePayload.self, from: data) {
+            return payload
+        }
+        guard let start = diagnostic.firstIndex(of: "{"), let end = diagnostic.lastIndex(of: "}") else { return nil }
+        let json = String(diagnostic[start...end])
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? decoder.decode(GUIProbePayload.self, from: data)
+    }
+
+    static func guiProbe() -> (payload: GUIProbePayload?, detail: String) {
+        guard FileManager.default.isExecutableFile(atPath: executablePath) else {
+            return (nil, "\(executableName) 不可执行；GUI backend 保持不可用。")
+        }
+        let result = run(["gui-probe-json"], privilege: .root, timeout: 6)
+        guard result.code == 0, let payload = decodeGUIProbe(result.diagnostic) else {
+            return (nil, failureDetail(prefix: "隔离 GUI readiness 探测", code: result.code, diagnostic: result.diagnostic))
+        }
+        return (payload, "\(payload.backend) 已在受限 root helper 内完成只读 readiness handshake。")
+    }
+
+    static func guiTree() -> (tree: String?, detail: String) {
+        let result = run(["gui-tree-json"], privilege: .root, timeout: 5)
+        guard result.code == 0, !result.diagnostic.isEmpty else {
+            return (nil, failureDetail(prefix: "GUI tree", code: result.code, diagnostic: result.diagnostic))
+        }
+        guard result.diagnostic.utf8.count <= 256 * 1024 else {
+            return (nil, "GUI tree 输出超过 256 KiB 限制，已 fail closed。")
+        }
+        return (result.diagnostic, "AXRuntime tree 已返回。")
+    }
+
+    static func guiScreenshot() -> (data: Data?, detail: String) {
+        let result = run(["gui-screenshot-base64"], privilege: .root, timeout: 6)
+        guard result.code == 0,
+              let encoded = result.diagnostic.data(using: .utf8),
+              let data = Data(base64Encoded: encoded, options: [.ignoreUnknownCharacters]),
+              !data.isEmpty,
+              data.count <= 700 * 1024 else {
+            return (nil, failureDetail(prefix: "GUI screenshot", code: result.code, diagnostic: result.code == 0 ? "截图输出无法解码或超过 700 KiB" : result.diagnostic))
+        }
+        return (data, "全局截图已由隔离 helper 返回。")
+    }
+
+    static func guiTap(x: Double, y: Double) -> (success: Bool, detail: String) {
+        let result = run(["gui-tap", String(x), String(y)], privilege: .root, timeout: 3)
+        return result.code == 0
+            ? (true, "IOHID tap 已提交。")
+            : (false, failureDetail(prefix: "GUI tap", code: result.code, diagnostic: result.diagnostic))
+    }
+
+    static func guiSwipe(fromX: Double, fromY: Double, toX: Double, toY: Double, duration: Double) -> (success: Bool, detail: String) {
+        let result = run(["gui-swipe", String(fromX), String(fromY), String(toX), String(toY), String(duration)], privilege: .root, timeout: min(max(duration + 2.0, 3.0), 7.0))
+        return result.code == 0
+            ? (true, "IOHID swipe 已提交。")
+            : (false, failureDetail(prefix: "GUI swipe", code: result.code, diagnostic: result.diagnostic))
+    }
+
+    static func guiScroll(deltaX: Double, deltaY: Double) -> (success: Bool, detail: String) {
+        let result = run(["gui-scroll", String(deltaX), String(deltaY)], privilege: .root, timeout: 4)
+        return result.code == 0
+            ? (true, "IOHID scroll gesture 已提交。")
+            : (false, failureDetail(prefix: "GUI scroll", code: result.code, diagnostic: result.diagnostic))
+    }
+
+    static func guiType(_ text: String) -> (success: Bool, detail: String) {
+        guard !text.isEmpty, let utf8 = text.data(using: .utf8), utf8.count <= 16 * 1024 else {
+            return (false, "GUI 文本输入为空或超过 16 KiB 限制。")
+        }
+        let encoded = utf8.base64EncodedString()
+        let result = run(["gui-type-base64", encoded], privilege: .root, timeout: 6)
+        return result.code == 0
+            ? (true, "IOHID Unicode 文本输入已提交；输入内容未写入 helper 诊断输出。")
+            : (false, failureDetail(prefix: "GUI type", code: result.code, diagnostic: result.diagnostic))
     }
 }
 
@@ -866,33 +963,52 @@ public struct GUIFallbackExecutor: ToolExecuting, Sendable {
     }
 
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
-        guard tool.name.hasPrefix("gui.") else { return false }
-        return await backend.isAvailable()
+        guard let feature = Self.feature(for: tool.name) else { return false }
+        // Route selection must consume the already validated session capability snapshot only.
+        // Re-running a root/persona GUI readiness probe here would happen during ordinary model
+        // execution (and ToolRouter may ask supports more than once), recreating the build 34/35
+        // send-time privileged-probe crash class. Each concrete GUI operation still executes in
+        // the bounded helper and fails closed if the runtime has changed since validation.
+        return capabilities.status(feature.capabilityID) == .available
     }
 
     public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
         switch call.name {
         case "gui.openApp":
-            guard let bundle = call.arguments["bundleId"], !bundle.isEmpty else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
+            guard let bundle = call.arguments["bundleId"], Self.isValidBundleIdentifier(bundle) else {
+                throw ToolRouterError.noExecutionRoute("bundleId missing or invalid")
+            }
         case "gui.tree", "gui.screenshot":
             break
         case "gui.tap":
-            guard Double(call.arguments["x"] ?? "") != nil, Double(call.arguments["y"] ?? "") != nil else {
-                throw ToolRouterError.noExecutionRoute("tap coordinates missing or invalid")
+            guard let x = Double(call.arguments["x"] ?? ""), let y = Double(call.arguments["y"] ?? ""),
+                  x.isFinite, y.isFinite, x >= 0, y >= 0, x <= 10_000, y <= 10_000 else {
+                throw ToolRouterError.noExecutionRoute("tap coordinates missing, non-finite, negative, or outside bounded range")
             }
         case "gui.type":
-            guard call.arguments["text"] != nil else { throw ToolRouterError.noExecutionRoute("text missing") }
+            guard let text = call.arguments["text"], !text.isEmpty,
+                  (text.data(using: .utf8)?.count ?? Int.max) <= 16 * 1024 else {
+                throw ToolRouterError.noExecutionRoute("text missing, empty, or exceeds 16 KiB")
+            }
         case "gui.scroll":
-            guard Double(call.arguments["dx"] ?? "") != nil, Double(call.arguments["dy"] ?? "") != nil else {
-                throw ToolRouterError.noExecutionRoute("scroll delta missing or invalid")
+            guard let dx = Double(call.arguments["dx"] ?? ""), let dy = Double(call.arguments["dy"] ?? ""),
+                  dx.isFinite, dy.isFinite, abs(dx) <= 10_000, abs(dy) <= 10_000,
+                  abs(dx) >= 0.5 || abs(dy) >= 0.5 else {
+                throw ToolRouterError.noExecutionRoute("scroll delta missing, invalid, zero, or outside bounded range")
             }
         case "gui.swipe":
             let keys = ["fromX", "fromY", "toX", "toY"]
-            guard keys.allSatisfy({ Double(call.arguments[$0] ?? "") != nil }) else {
-                throw ToolRouterError.noExecutionRoute("swipe coordinates missing or invalid")
+            let coordinates = keys.compactMap { Double(call.arguments[$0] ?? "") }
+            let duration = Double(call.arguments["duration"] ?? "0.3")
+            guard coordinates.count == keys.count, coordinates.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 10_000 }),
+                  let duration, duration.isFinite, duration >= 0.05, duration <= 5.0 else {
+                throw ToolRouterError.noExecutionRoute("swipe coordinates/duration missing, invalid, or outside bounded range")
             }
         case "gui.verify":
-            guard call.arguments["assertion"] != nil else { throw ToolRouterError.noExecutionRoute("assertion missing") }
+            guard let assertion = call.arguments["assertion"], !assertion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  assertion.utf8.count <= 1_024 else {
+                throw ToolRouterError.noExecutionRoute("assertion missing, empty, or too large")
+            }
         default:
             throw ToolRouterError.noExecutionRoute(call.name)
         }
@@ -939,5 +1055,24 @@ public struct GUIFallbackExecutor: ToolExecuting, Sendable {
         default:
             throw ToolRouterError.noExecutionRoute(call.name)
         }
+    }
+
+    private static func feature(for toolName: String) -> GUIAutomationFeature? {
+        switch toolName {
+        case "gui.openApp": return .openApp
+        case "gui.tree": return .tree
+        case "gui.screenshot": return .screenshot
+        case "gui.tap": return .touch
+        case "gui.type": return .textInput
+        case "gui.scroll", "gui.swipe": return .gestures
+        case "gui.verify": return .verify
+        default: return nil
+        }
+    }
+
+    private static func isValidBundleIdentifier(_ value: String) -> Bool {
+        guard !value.isEmpty, value.count <= 255, value.contains(".") else { return false }
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: ".-"))
+        return value.unicodeScalars.allSatisfy { allowed.contains($0) }
     }
 }

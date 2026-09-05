@@ -24,17 +24,20 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
     private let fileManager: FileManager
     private let homeDirectory: URL
     private let diagnosticLogger: DiagnosticLogStore?
+    private let guiCapabilityProvider: (any GUIAutomationCapabilityProviding)?
 
     public init(
         appResolver: AppContainerResolving,
         fileManager: FileManager = .default,
         homeDirectory: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true),
-        diagnosticLogger: DiagnosticLogStore? = nil
+        diagnosticLogger: DiagnosticLogStore? = nil,
+        guiCapabilityProvider: (any GUIAutomationCapabilityProviding)? = nil
     ) {
         self.appResolver = appResolver
         self.fileManager = fileManager
         self.homeDirectory = homeDirectory
         self.diagnosticLogger = diagnosticLogger
+        self.guiCapabilityProvider = guiCapabilityProvider
     }
 
     public func probeStartupSafe() async -> CapabilityProfile {
@@ -90,8 +93,14 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
                               "The current URL-scheme executor is a disabled placeholder and cannot execute app actions."))
         records.append(record("automation.xctest_wda", .automation, .unavailable,
                               "No XCTest/WDA runtime backend is connected in this build."))
-        records.append(record("automation.gui", .automation, .unavailable,
-                              "The current GUI backend is explicitly unavailable; no automation runtime is connected."))
+        let deferredGUIStatus: CapabilityStatus = guiCapabilityProvider == nil ? .unavailable : .deviceValidationRequired
+        let deferredGUIDetail = guiCapabilityProvider == nil
+            ? "No GUI automation backend is connected in this build."
+            : "GUI private-runtime probing is deferred during automatic startup and ordinary message send. Run explicit device validation before use."
+        for feature in GUIAutomationFeature.allCases {
+            records.append(record(feature.capabilityID, .automation, deferredGUIStatus, deferredGUIDetail))
+        }
+        records.append(record("automation.gui", .automation, deferredGUIStatus, deferredGUIDetail))
         records.append(record("ipa.inspect", .ipa, .available,
                               "ZIP/Info.plist inspection is implemented in-process."))
         records.append(record("ipa.decrypt", .ipa, .unavailable,
@@ -187,6 +196,11 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
             replacing(record("apps.launch", .apps, launch.available ? .available : .deviceValidationRequired,
                              launch.available ? "Bounded isolated app-launch backend verified: \(launch.detail)" : "App launch still requires device validation: \(launch.detail)"))
         }
+
+        // GUI private-runtime readiness is intentionally not probed in the extended stage.
+        // It may require a TrollStore root/persona helper, so only the explicit privileged
+        // validation stage is allowed to promote the startup-safe device_validation_required
+        // placeholders to available/unavailable runtime evidence.
 
         records.append(contentsOf: HomeOSCapabilityLayer.records(from: records))
         let profile = CapabilityProfile(records: records)
@@ -328,8 +342,20 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
                               "The current URL-scheme executor is a disabled placeholder and cannot execute app actions."))
         records.append(record("automation.xctest_wda", .automation, .unavailable,
                               "No XCTest/WDA runtime backend is connected in this build."))
-        records.append(record("automation.gui", .automation, .unavailable,
-                              "The current GUI backend is explicitly unavailable; no automation runtime is connected."))
+        if let guiCapabilityProvider {
+            let gui = await guiCapabilityProvider.guiCapabilitySnapshot()
+            for feature in GUIAutomationFeature.allCases {
+                records.append(record(feature.capabilityID, .automation, gui.status(feature), "\(gui.backendIdentifier): \(gui.detail(feature))"))
+            }
+            records.append(record("automation.gui", .automation, gui.compositeStatus,
+                                  "Composite GUI readiness from \(gui.backendIdentifier); all observation/action/verification features must be available."))
+        } else {
+            for feature in GUIAutomationFeature.allCases {
+                records.append(record(feature.capabilityID, .automation, .unavailable, "No GUI automation backend is connected in this build."))
+            }
+            records.append(record("automation.gui", .automation, .unavailable,
+                                  "No GUI automation backend is connected in this build."))
+        }
 
         records.append(record("ipa.inspect", .ipa, .available,
                               "ZIP/Info.plist inspection is implemented in-process."))

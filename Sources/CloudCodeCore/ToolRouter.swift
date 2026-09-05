@@ -24,6 +24,87 @@ public enum ToolRouterError: Error, Equatable {
     case noExecutionRoute(String)
 }
 
+public enum GUIAutomationFeature: String, CaseIterable, Sendable {
+    case openApp = "open_app"
+    case tree
+    case screenshot
+    case touch
+    case textInput = "text_input"
+    case gestures
+    case verify
+
+    public var capabilityID: String { "automation.gui.\(rawValue)" }
+}
+
+public struct GUIAutomationCapabilitySnapshot: Sendable, Equatable {
+    public var backendIdentifier: String
+    public var statuses: [GUIAutomationFeature: CapabilityStatus]
+    public var details: [GUIAutomationFeature: String]
+
+    public init(
+        backendIdentifier: String,
+        statuses: [GUIAutomationFeature: CapabilityStatus],
+        details: [GUIAutomationFeature: String] = [:]
+    ) {
+        self.backendIdentifier = backendIdentifier
+        self.statuses = statuses
+        self.details = details
+    }
+
+    public func status(_ feature: GUIAutomationFeature) -> CapabilityStatus {
+        statuses[feature] ?? .unknown
+    }
+
+    public func detail(_ feature: GUIAutomationFeature) -> String {
+        details[feature] ?? "No runtime detail was returned for \(feature.rawValue)."
+    }
+
+    public var compositeStatus: CapabilityStatus {
+        let required: [GUIAutomationFeature] = [.openApp, .screenshot, .touch, .textInput, .gestures, .tree, .verify]
+        if required.allSatisfy({ status($0) == .available }) { return .available }
+        if required.contains(where: { status($0) == .deviceValidationRequired }) { return .deviceValidationRequired }
+        if required.contains(where: { status($0) == .unknown }) { return .unknown }
+        return .unavailable
+    }
+}
+
+public protocol GUIAutomationCapabilityProviding: Sendable {
+    func guiCapabilitySnapshot() async -> GUIAutomationCapabilitySnapshot
+}
+
+public enum GUIVisibleTextVerifier {
+    public static func verify(tree: String, assertion: String) -> VerificationResult {
+        let expected = normalizedNeedle(assertion)
+        guard !expected.isEmpty else {
+            return VerificationResult(
+                passed: false,
+                checks: ["Parse a non-empty visible-text assertion"],
+                failures: ["The assertion did not contain a verifiable text target."]
+            )
+        }
+        let passed = tree.range(of: expected, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+        return VerificationResult(
+            passed: passed,
+            checks: ["Fresh GUI observation contains requested visible text (<\(expected.count) chars>)"],
+            failures: passed ? [] : ["Fresh GUI observation did not contain the requested visible-text target."]
+        )
+    }
+
+    private static func normalizedNeedle(_ assertion: String) -> String {
+        let trimmed = assertion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        for prefix in ["contains:", "text:", "visible:"] where trimmed.lowercased().hasPrefix(prefix) {
+            return String(trimmed.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let firstQuote = trimmed.firstIndex(of: "\""),
+           let lastQuote = trimmed.lastIndex(of: "\""),
+           firstQuote < lastQuote {
+            return String(trimmed[trimmed.index(after: firstQuote)..<lastQuote])
+        }
+        return trimmed
+    }
+}
+
 public enum GUIApprovalTargetSanitizer {
     /// Builds approval text without ever embedding gui.type input contents.
     public static func target(for call: ToolCall) -> String {
@@ -76,14 +157,14 @@ public actor ToolRegistry {
         ToolDescriptor(name: "apps.uninstall", summary: "Uninstall an app.", risk: .permanentDestructive, requiredCapabilities: ["apps.uninstall"], preferredRoute: .privateFramework),
         ToolDescriptor(name: "apps.terminate", summary: "Terminate an app/process.", risk: .systemChange, requiredCapabilities: ["apps.terminate"], preferredRoute: .privateFramework),
         ToolDescriptor(name: "advanced.shell", summary: "Execute an advanced shell command. High risk and never the default tool path.", risk: .systemChange, requiredCapabilities: ["execution.ios_system"], preferredRoute: .cli),
-        ToolDescriptor(name: "gui.openApp", summary: "Open an app using the GUI automation fallback backend.", risk: .safeWrite, requiredCapabilities: ["automation.gui"], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.tree", summary: "Read the GUI accessibility tree from the configured automation backend.", risk: .readOnly, requiredCapabilities: ["automation.gui"], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.screenshot", summary: "Capture a screenshot through the GUI automation backend.", risk: .readOnly, requiredCapabilities: ["automation.gui"], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.tap", summary: "Tap a GUI coordinate/element through the configured backend.", risk: .safeWrite, requiredCapabilities: ["automation.gui"], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.type", summary: "Type text through the configured backend.", risk: .sensitiveWrite, requiredCapabilities: ["automation.gui"], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.scroll", summary: "Scroll through the configured backend.", risk: .safeWrite, requiredCapabilities: ["automation.gui"], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.swipe", summary: "Swipe through the configured backend.", risk: .safeWrite, requiredCapabilities: ["automation.gui"], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.verify", summary: "Verify GUI postconditions through the configured backend.", risk: .readOnly, requiredCapabilities: ["automation.gui"], preferredRoute: .guiFallback)
+        ToolDescriptor(name: "gui.openApp", summary: "Open an app using the GUI automation fallback backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.openApp.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.tree", summary: "Read the GUI accessibility tree from the configured automation backend.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.screenshot", summary: "Capture a screenshot through the GUI automation backend.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.tap", summary: "Tap a GUI coordinate/element through the configured backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.type", summary: "Type text through the configured backend.", risk: .sensitiveWrite, requiredCapabilities: [GUIAutomationFeature.textInput.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.scroll", summary: "Scroll through the configured backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.swipe", summary: "Swipe through the configured backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.verify", summary: "Verify GUI postconditions through the configured backend.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.verify.capabilityID], preferredRoute: .guiFallback)
     ]
 }
 
@@ -109,8 +190,7 @@ public actor ToolRouter {
     public func chooseRoute(for call: ToolCall, capabilities: CapabilityProfile) async throws -> AppExecutionRoute {
         guard let descriptor = await registry.descriptor(named: call.name) else { throw ToolRouterError.unknownTool(call.name) }
         for required in descriptor.requiredCapabilities {
-            let status = capabilities.status(required)
-            guard status == .available else {
+            guard capabilities.status(required) == .available else {
                 throw ToolRouterError.missingCapability(required)
             }
         }
@@ -234,7 +314,7 @@ public actor ToolRouter {
     }
 }
 
-public protocol GUIAutomationBackend: Sendable {
+public protocol GUIAutomationBackend: GUIAutomationCapabilityProviding, Sendable {
     var identifier: String { get }
     func isAvailable() async -> Bool
     func openApp(bundleID: String) async throws
@@ -251,6 +331,13 @@ public struct UnavailableGUIBackend: GUIAutomationBackend, Sendable {
     public let identifier = "unavailable"
     public init() {}
     public func isAvailable() async -> Bool { false }
+    public func guiCapabilitySnapshot() async -> GUIAutomationCapabilitySnapshot {
+        GUIAutomationCapabilitySnapshot(
+            backendIdentifier: identifier,
+            statuses: Dictionary(uniqueKeysWithValues: GUIAutomationFeature.allCases.map { ($0, .unavailable) }),
+            details: Dictionary(uniqueKeysWithValues: GUIAutomationFeature.allCases.map { ($0, "No GUI automation runtime is connected.") })
+        )
+    }
     public func openApp(bundleID: String) async throws { throw ToolRouterError.noExecutionRoute("gui.openApp") }
     public func tree() async throws -> String { throw ToolRouterError.noExecutionRoute("gui.tree") }
     public func screenshot() async throws -> Data { throw ToolRouterError.noExecutionRoute("gui.screenshot") }
