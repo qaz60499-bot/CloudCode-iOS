@@ -183,6 +183,22 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
         guard outcome.success else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
     }
 
+    public func navigateBack(strategy: String) async throws {
+        guard strategy == "edge" || strategy == "dismissDown" else {
+            throw ToolRouterError.noExecutionRoute("navigateBack strategy must be edge or dismissDown")
+        }
+        let outcome = EmbeddedRootHelper.guiNavigateBack(strategy: strategy)
+        try? await diagnosticLogger?.log(
+            level: outcome.success ? .info : .error,
+            subsystem: "gui",
+            action: "navigateBack.helper",
+            result: outcome.success ? "dispatched-semantic-unverified" : "failed",
+            diagnostic: outcome.detail,
+            metadata: ["strategy": strategy]
+        )
+        guard outcome.success else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
+    }
+
     public func verify(_ assertion: String) async throws -> VerificationResult {
         let observedTree = try await tree()
         return GUIVisibleTextVerifier.verify(tree: observedTree, assertion: assertion)

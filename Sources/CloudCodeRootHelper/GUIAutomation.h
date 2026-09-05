@@ -10,6 +10,7 @@ int CloudCodeGUIScreenshotFile(NSString *path);
 int CloudCodeGUITap(double x, double y);
 int CloudCodeGUISwipe(double fromX, double fromY, double toX, double toY, double durationSeconds);
 int CloudCodeGUIScroll(double deltaX, double deltaY);
+int CloudCodeGUINavigateBack(NSString *strategy);
 int CloudCodeGUITypeBase64(NSString *base64Text);
 
 NS_ASSUME_NONNULL_END

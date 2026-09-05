@@ -885,6 +885,11 @@ int main(int argc, const char *argv[])
             if (argc < 4) { return 10; }
             return CloudCodeGUIScroll(strtod(argv[2], NULL), strtod(argv[3], NULL));
         }
+        if ([command isEqualToString:@"gui-navigate-back"]) {
+            if (argc < 3) { return 10; }
+            NSString *strategy = [NSString stringWithUTF8String:argv[2]];
+            return CloudCodeGUINavigateBack(strategy);
+        }
         if ([command isEqualToString:@"gui-type-base64"]) {
             if (argc < 3) { return 10; }
             NSString *encoded = [NSString stringWithUTF8String:argv[2]];

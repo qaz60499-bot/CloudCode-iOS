@@ -509,6 +509,15 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(descriptor?.requiredCapabilities, [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
     }
 
+    func testDefaultToolRegistryIncludesNavigateBackWithGestureAndScreenshotCapabilities() async {
+        let registry = ToolRegistry()
+        let descriptor = await registry.descriptor(named: "gui.navigateBack")
+        XCTAssertEqual(descriptor?.risk, .safeWrite)
+        XCTAssertEqual(descriptor?.preferredRoute, .guiFallback)
+        XCTAssertEqual(descriptor?.requiredCapabilities, [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
+        XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.navigateBack", arguments: ["strategy": "dismissDown"], sessionID: UUID())), "当前前台 App · navigate back/dismiss (dismissDown)")
+    }
+
     func testGUIVisibleTextVerifierReportsSuccessAndFailureFromFreshObservation() {
         let tree = #"{"tree":{"label":"Done","identifier":"finish-button"}}"#
         let success = GUIVisibleTextVerifier.verify(tree: tree, assertion: "contains:Done")
@@ -1614,14 +1623,17 @@ final class CloudCodeCoreTests: XCTestCase {
         let treeValue = await registry.descriptor(named: "gui.tree")
         let typeValue = await registry.descriptor(named: "gui.type")
         let sequenceValue = await registry.descriptor(named: "gui.swipeSequence")
+        let navigateBackValue = await registry.descriptor(named: "gui.navigateBack")
         let tap = try XCTUnwrap(tapValue)
         let tree = try XCTUnwrap(treeValue)
         let type = try XCTUnwrap(typeValue)
         let sequence = try XCTUnwrap(sequenceValue)
+        let navigateBack = try XCTUnwrap(navigateBackValue)
         XCTAssertEqual(tap.requiredCapabilities, [GUIAutomationFeature.touch.capabilityID])
         XCTAssertEqual(tree.requiredCapabilities, [GUIAutomationFeature.tree.capabilityID])
         XCTAssertEqual(type.requiredCapabilities, [GUIAutomationFeature.textInput.capabilityID])
         XCTAssertEqual(sequence.requiredCapabilities, [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
+        XCTAssertEqual(navigateBack.requiredCapabilities, [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
     }
 
     func testPartialGUICapabilityFailsClosedForUnprovenFeature() async throws {
@@ -3221,6 +3233,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(AgentCore.semanticToolScope(name: "gui.swipeSequence", arguments: [
             "fromX": "200", "fromY": "700", "toX": "200", "toY": "200", "duration": "0.3", "count": "3"
         ]), "gui:foreground")
+        XCTAssertEqual(AgentCore.semanticToolScope(name: "gui.navigateBack", arguments: [:]), "gui:foreground")
         XCTAssertTrue(AgentCore.readOnlyToolVerifiesLastStateChange(name: "gui.screenshot", arguments: [:], scope: guiScope))
         XCTAssertTrue(AgentCore.readOnlyToolVerifiesLastStateChange(name: "gui.tree", arguments: [:], scope: guiScope))
         XCTAssertTrue(AgentCore.readOnlyToolVerifiesLastStateChange(name: "gui.verify", arguments: ["assertion": "visible"], scope: guiScope))
@@ -3230,6 +3243,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(AgentCore.allowsImmediateSemanticRepeat(name: "gui.openApp"))
         XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "gui.swipe"))
         XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "gui.swipeSequence"))
+        XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "gui.navigateBack"))
         XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "gui.tap"))
         XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "files.create"))
     }
@@ -3837,11 +3851,56 @@ final class CloudCodeCoreTests: XCTestCase {
         let navigation = hints.first(where: { $0.providerMetadata["execution_mode"] == "transient_navigation_return" })
         XCTAssertNotNil(navigation)
         XCTAssertTrue(navigation?.content.contains("navigate back") == true)
+        XCTAssertTrue(navigation?.content.contains("gui.navigateBack") == true)
+        XCTAssertTrue(navigation?.content.contains("strategy=dismissDown") == true)
         XCTAssertTrue(navigation?.content.contains("before locating a text field or typing") == true)
     }
 
     func testHarnessDoesNotForceTransientReturnForVideoOnlyViewingTask() {
         XCTAssertFalse(HarnessContextManager.transientNavigationNeedsReturn(in: "打开群聊里的视频看一下"))
+    }
+
+    func testIOSInteractionFrameworkEncodesStableIOSSemanticsAndLearningBoundaries() {
+        let instruction = IOSInteractionFramework.coreInstruction
+        for marker in ["return obligation", "navigation stack", "full-screen media", "sheets/modals", "tabs as peer roots", "Before text input", "Learned App-specific preferences"] {
+            XCTAssertTrue(instruction.localizedCaseInsensitiveContains(marker))
+        }
+        for forbiddenLearning in ["passwords", "message text", "permanent screen coordinates", "entitlements", "HID constants"] {
+            XCTAssertTrue(instruction.localizedCaseInsensitiveContains(forbiddenLearning))
+        }
+    }
+
+    func testIOSInteractionExperienceLearnsReliableObservationBackendAndPersists() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent("Interaction/experience.json")
+        let store = IOSInteractionExperienceStore(fileURL: fileURL)
+        let bundleID = "com.example.video"
+
+        for latency in [420, 390, 410, 405] {
+            await store.recordObservation(bundleID: bundleID, backend: .screenshot, success: true, latencyMS: latency)
+        }
+        for latency in [1_500, 1_500, 1_500] {
+            await store.recordObservation(bundleID: bundleID, backend: .accessibilityTree, success: false, latencyMS: latency)
+        }
+        let hint = await store.providerHint(bundleID: bundleID)
+        XCTAssertTrue(hint?.contains("prefer screenshot") == true)
+        XCTAssertTrue(hint?.contains("performance hint only") == true)
+
+        let restarted = IOSInteractionExperienceStore(fileURL: fileURL)
+        let snapshot = await restarted.snapshot()
+        XCTAssertEqual(snapshot.count, 2)
+        XCTAssertEqual(snapshot.first(where: { $0.backend == .screenshot })?.successes, 4)
+        XCTAssertEqual(snapshot.first(where: { $0.backend == .accessibilityTree })?.failures, 3)
+    }
+
+    func testIOSInteractionExperienceRequiresEvidenceBeforeHinting() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = IOSInteractionExperienceStore(fileURL: root.appendingPathComponent("experience.json"))
+        await store.recordObservation(bundleID: "com.example.chat", backend: .screenshot, success: true, latencyMS: 200)
+        let hint = await store.providerHint(bundleID: "com.example.chat")
+        XCTAssertNil(hint)
     }
 
     func testHarnessContextCompressionDropsAssistantToolCallWhenLargeResultDoesNotFit() {

@@ -382,6 +382,16 @@ enum EmbeddedRootHelper {
             : (false, failureDetail(prefix: "GUI scroll", code: result.code, diagnostic: result.diagnostic))
     }
 
+    static func guiNavigateBack(strategy: String) -> (success: Bool, detail: String) {
+        guard strategy == "edge" || strategy == "dismissDown" else {
+            return (false, "GUI navigate back strategy 必须是 edge 或 dismissDown。")
+        }
+        let result = run(["gui-navigate-back", strategy], privilege: .root, timeout: 4)
+        return result.code == 0
+            ? (true, result.diagnostic.isEmpty ? "iOS 返回/关闭手势已派发；语义结果等待最终截图确认。" : "iOS 返回/关闭手势已派发：\(result.diagnostic)")
+            : (false, failureDetail(prefix: "GUI navigate back", code: result.code, diagnostic: result.diagnostic))
+    }
+
     static func guiType(_ text: String) -> (success: Bool, detail: String) {
         guard !text.isEmpty, let utf8 = text.data(using: .utf8), utf8.count <= 16 * 1024 else {
             return (false, "GUI 文本输入为空或超过 16 KiB 限制。")
@@ -1226,7 +1236,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         for tool: ToolDescriptor,
         capabilities: CapabilityProfile
     ) async -> Bool {
-        if tool.name == "gui.swipeSequence" {
+        if tool.name == "gui.swipeSequence" || tool.name == "gui.navigateBack" {
             let expected = Set([GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
             let deferred = Set(capabilityIDs)
             guard !deferred.isEmpty, deferred.isSubset(of: expected),
@@ -1242,7 +1252,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
     }
 
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
-        if tool.name == "gui.swipeSequence" {
+        if tool.name == "gui.swipeSequence" || tool.name == "gui.navigateBack" {
             return [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID].allSatisfy {
                 let status = capabilities.status($0)
                 return status == .available || status == .deviceValidationRequired
@@ -1261,6 +1271,10 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             }
         case "gui.tree", "gui.screenshot":
             break
+        case "gui.navigateBack":
+            guard let strategy = call.arguments["strategy"], strategy == "edge" || strategy == "dismissDown" else {
+                throw ToolRouterError.noExecutionRoute("navigateBack strategy must be edge or dismissDown")
+            }
         case "gui.tap":
             guard let x = Double(call.arguments["x"] ?? ""), let y = Double(call.arguments["y"] ?? ""),
                   x.isFinite, y.isFinite, x >= 0, y >= 0, x <= 10_000, y <= 10_000 else {
@@ -1349,6 +1363,26 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             return ToolResult(toolCallID: call.id, success: true, summary: "Swipe dispatched; foreground effect unverified", payload: ["effectVerification": "required"])
         case "gui.swipeSequence":
             return try await executeSwipeSequence(call)
+        case "gui.navigateBack":
+            let baselineData = try await backend.screenshot()
+            let baselineSHA256 = GUIAutomationPayloadPolicy.sha256Hex(baselineData)
+            let strategy = call.arguments["strategy"] ?? ""
+            try await backend.navigateBack(strategy: strategy)
+            let data = try await backend.screenshot()
+            let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
+            return ToolResult(
+                toolCallID: call.id,
+                success: true,
+                summary: "iOS back/dismiss gesture changed the foreground frame; final screenshot attached for semantic return verification.",
+                payload: [
+                    "baselineSHA256": baselineSHA256,
+                    "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
+                    "strategy": strategy,
+                    "effectVerification": "semantic_required",
+                    "localObservation": "final_screenshot_attached"
+                ],
+                attachments: attachment.map { [$0] }
+            )
         case "gui.verify":
             let result = try await backend.verify(call.arguments["assertion"] ?? "")
             return ToolResult(toolCallID: call.id, success: result.passed, summary: "GUI verification", verification: result)
@@ -1455,7 +1489,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.screenshot": return .screenshot
         case "gui.tap": return .touch
         case "gui.type": return .textInput
-        case "gui.scroll", "gui.swipe", "gui.swipeSequence": return .gestures
+        case "gui.scroll", "gui.swipe", "gui.swipeSequence", "gui.navigateBack": return .gestures
         case "gui.verify": return .verify
         default: return nil
         }

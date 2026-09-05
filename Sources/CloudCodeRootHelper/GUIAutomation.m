@@ -1510,6 +1510,39 @@ int CloudCodeGUIScroll(double deltaX, double deltaY)
     }
 }
 
+int CloudCodeGUINavigateBack(NSString *strategy)
+{
+    @autoreleasepool {
+        if (![strategy isKindOfClass:NSString.class]) { return 64; }
+        CGSize size = CloudCodeScreenSize();
+        if (size.width <= 1 || size.height <= 1) { return 64; }
+
+        BOOL dispatched = NO;
+        if ([strategy isEqualToString:@"edge"]) {
+            dispatched = CloudCodePerformSwipe(
+                MAX(2.0, size.width * 0.015),
+                size.height * 0.50,
+                size.width * 0.72,
+                size.height * 0.50,
+                0.28
+            );
+        } else if ([strategy isEqualToString:@"dismissDown"]) {
+            dispatched = CloudCodePerformSwipe(
+                size.width * 0.50,
+                size.height * 0.24,
+                size.width * 0.50,
+                size.height * 0.84,
+                0.30
+            );
+        } else {
+            return 64;
+        }
+        if (!dispatched) { return 66; }
+        fprintf(stderr, "gui-navigate-back: strategy=%s result=dispatched-semantic-unverified\n", strategy.UTF8String ?: "unknown");
+        return 0;
+    }
+}
+
 int CloudCodeGUITypeBase64(NSString *base64Text)
 {
     @autoreleasepool {

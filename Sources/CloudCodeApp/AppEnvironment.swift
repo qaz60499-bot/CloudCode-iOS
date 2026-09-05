@@ -171,6 +171,9 @@ public final class CloudCodeViewModel: ObservableObject {
             diagnosticLogger: diagnosticLogStore
         )
         let steeringMailbox = AgentSteeringMailbox()
+        let interactionExperienceStore = IOSInteractionExperienceStore(
+            fileURL: support.appendingPathComponent("Interaction/experience.json")
+        )
         let agent = AgentCore(
             provider: provider,
             keyVault: keyVault,
@@ -181,6 +184,7 @@ public final class CloudCodeViewModel: ObservableObject {
             checkpointStore: checkpoints,
             steeringMailbox: steeringMailbox,
             memoryProvider: hermesStore,
+            interactionExperienceStore: interactionExperienceStore,
             diagnosticLogger: diagnosticLogStore,
             runtimeBreadcrumb: { stage in
                 startupBreadcrumbStore.append(runID: resolvedStartupRunID, stage: stage)

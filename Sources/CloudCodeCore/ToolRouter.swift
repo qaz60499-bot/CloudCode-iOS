@@ -132,6 +132,7 @@ public enum GUIApprovalTargetSanitizer {
         case "gui.swipeSequence":
             let count = call.arguments["count"] ?? "?"
             return "当前前台 App · bounded swipe sequence ×\(count)"
+        case "gui.navigateBack": return "当前前台 App · navigate back/dismiss (\(call.arguments["strategy"] ?? "?"))"
         case "gui.verify": return "当前 GUI 会话 · verify"
         default: return "当前 GUI 会话"
         }
@@ -180,6 +181,7 @@ public actor ToolRegistry {
         ToolDescriptor(name: "gui.scroll", summary: "Scroll through the configured backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.swipe", summary: "Swipe through the configured backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.swipeSequence", summary: "Execute an explicitly requested finite sequence of identical swipes locally. The bounded executor captures lightweight screenshots between gestures, stops early on byte-identical observations, and returns the final screenshot so the model does not need a full round-trip between every repeated swipe.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.navigateBack", summary: "Navigate back from a temporary iOS detail/media surface using one explicit bounded strategy: edge for a left-edge navigation-pop gesture, or dismissDown for a fullscreen/modal downward dismiss. The tool returns a fresh final screenshot; that screenshot, not motion/hash alone, must be inspected semantically before continuing.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.verify", summary: "Verify GUI postconditions through the configured backend.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.verify.capabilityID], preferredRoute: .guiFallback)
     ]
 }
@@ -357,6 +359,7 @@ public protocol GUIAutomationBackend: GUIAutomationCapabilityProviding, Sendable
     func type(_ text: String) async throws
     func scroll(deltaX: Double, deltaY: Double) async throws
     func swipe(fromX: Double, fromY: Double, toX: Double, toY: Double, duration: Double) async throws
+    func navigateBack(strategy: String) async throws
     func verify(_ assertion: String) async throws -> VerificationResult
 }
 
@@ -378,6 +381,7 @@ public struct UnavailableGUIBackend: GUIAutomationBackend, Sendable {
     public func type(_ text: String) async throws { throw ToolRouterError.noExecutionRoute("gui.type") }
     public func scroll(deltaX: Double, deltaY: Double) async throws { throw ToolRouterError.noExecutionRoute("gui.scroll") }
     public func swipe(fromX: Double, fromY: Double, toX: Double, toY: Double, duration: Double) async throws { throw ToolRouterError.noExecutionRoute("gui.swipe") }
+    public func navigateBack(strategy: String) async throws { throw ToolRouterError.noExecutionRoute("gui.navigateBack") }
     public func verify(_ assertion: String) async throws -> VerificationResult { throw ToolRouterError.noExecutionRoute("gui.verify") }
 }
 
