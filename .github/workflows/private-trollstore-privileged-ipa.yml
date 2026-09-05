@@ -116,6 +116,11 @@ jobs:
           ROOT_HELPER="$APP_PATH/CloudCodeRootHelper"
           test -f "$ROOT_HELPER"
           ldid -SEntitlements/CloudCodeRootHelper.entitlements "$ROOT_HELPER"
+          # Procursus ldid 2.1.5 can emit an entitlement blob that macOS codesign/Security.framework
+          # refuses to parse. Preserve the TrollStore-native ldid pass, then normalize only the
+          # embedded helper with Apple's ad-hoc signer so the packaged entitlement claim is readable
+          # through the same Security.framework path TrollStore uses when importing an IPA.
+          codesign --force --sign - --entitlements Entitlements/CloudCodeRootHelper.entitlements "$ROOT_HELPER"
           ldid -SEntitlements/TrollStore.entitlements "$APP_PATH/$MAIN_EXECUTABLE"
           ENTITLEMENTS="$RUNNER_TEMP/cloudcode-privileged-entitlements.plist"
           ldid -e "$APP_PATH/$MAIN_EXECUTABLE" > "$ENTITLEMENTS"

@@ -313,6 +313,7 @@ jobs:
             grep -F "$root_helper_storage_entitlement" Entitlements/CloudCodeRootHelper.entitlements >/dev/null
           done
           grep -F 'ldid -SEntitlements/CloudCodeRootHelper.entitlements "$ROOT_HELPER"' .github/workflows/private-trollstore-privileged-ipa.yml >/dev/null
+          grep -F 'codesign --force --sign - --entitlements Entitlements/CloudCodeRootHelper.entitlements "$ROOT_HELPER"' .github/workflows/private-trollstore-privileged-ipa.yml >/dev/null
           grep -F 'codesign -d --entitlements :- "$ROOT_HELPER"' .github/workflows/private-trollstore-privileged-ipa.yml >/dev/null
           grep -F 'codesign -d --entitlements :- "$HELPER"' scripts/verify_privileged_private_ipa.sh >/dev/null
           grep -F 'CODE_SIGN_ENTITLEMENTS: Entitlements/CloudCode.entitlements' project.yml >/dev/null
