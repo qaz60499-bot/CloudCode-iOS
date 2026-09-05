@@ -24,7 +24,7 @@ typedef uint32_t CloudCodeIOOptionBits;
 
 typedef CloudCodeIOHIDEventSystemClientRef (*CloudCodeHIDClientCreateFn)(CFAllocatorRef);
 typedef void (*CloudCodeHIDDispatchFn)(CloudCodeIOHIDEventSystemClientRef, CloudCodeIOHIDEventRef);
-typedef CloudCodeIOHIDEventRef (*CloudCodeDigitizerEventCreateFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double, double, double, double, double, Boolean, Boolean, CloudCodeIOOptionBits);
+typedef CloudCodeIOHIDEventRef (*CloudCodeDigitizerEventCreateFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double, double, double, double, Boolean, Boolean, CloudCodeIOOptionBits);
 typedef CloudCodeIOHIDEventRef (*CloudCodeFingerEventCreateFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t, double, double, double, double, double, Boolean, Boolean, CloudCodeIOOptionBits);
 typedef CloudCodeIOHIDEventRef (*CloudCodeUnicodeEventCreateFn)(CFAllocatorRef, uint64_t, const uint8_t *, uint32_t, uint32_t, CloudCodeIOOptionBits);
 typedef void (*CloudCodeHIDAppendFn)(CloudCodeIOHIDEventRef, CloudCodeIOHIDEventRef, CloudCodeIOOptionBits);
@@ -251,7 +251,7 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
     }
     CloudCodeIOHIDEventRef parent = runtime.createDigitizer(
         kCFAllocatorDefault, mach_absolute_time(), 3, 99, 1, parentMask, 0,
-        nx, ny, 0, 0, 0, 0, range, touching, 0
+        nx, ny, 0, 0, 0, range, touching, 0
     );
     if (!parent) { return NULL; }
     CloudCodeIOHIDEventRef child = runtime.createFinger(
