@@ -366,25 +366,22 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
     // Touch|Identity for contact transitions and Position|Attribute while moving. The older
     // SpringBoard-tweak 1<<22 / 3,2 profile produced valid-looking packets on this device but the
     // foreground app ignored them.
-    // Parent and finger are distinct HID records and must not share one synthetic mask. Apple's
-    // current WebKit iOS injector uses Touch|Identity on the hand for contact transitions while the
-    // finger uses Range|Touch; during movement the hand carries Position|Attribute and the finger
-    // carries Position. Reusing the hand mask for the finger can produce a well-formed event that
-    // backboardd accepts but the foreground application ignores.
-    uint32_t parentEventMask = CLOUDCODE_HID_DIGITIZER_TOUCH | CLOUDCODE_HID_DIGITIZER_IDENTITY;
-    uint32_t childEventMask = CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH;
+    // Match the active touchDown/move/lift path in current TrollVNC/WebKit: the hand and its one
+    // finger share the same phase mask. Touch transitions carry Touch|Identity, while movement
+    // carries Position|Attribute. The alternate dictionary-driven generator uses a separate child
+    // mask, but it is not the path used by TrollVNC's normal single-finger gestures.
+    uint32_t eventMask = phaseMask;
     if ((phaseMask & CLOUDCODE_HID_DIGITIZER_POSITION) != 0 && touching) {
-        parentEventMask = CLOUDCODE_HID_DIGITIZER_POSITION | CLOUDCODE_HID_DIGITIZER_ATTRIBUTE;
-        childEventMask = CLOUDCODE_HID_DIGITIZER_POSITION;
+        eventMask = CLOUDCODE_HID_DIGITIZER_POSITION | CLOUDCODE_HID_DIGITIZER_ATTRIBUTE;
+    } else {
+        eventMask = CLOUDCODE_HID_DIGITIZER_TOUCH | CLOUDCODE_HID_DIGITIZER_IDENTITY;
     }
 
-    // Keep the collection and child on the exact same HID timestamp. Current WebKit constructs a
-    // complete contact frame from one mach time; using two timestamps can make the child look like
-    // it belongs to a different frame.
+    // Keep the collection and child on the exact same HID timestamp, matching current TrollVNC.
     uint64_t machTime = mach_absolute_time();
     CloudCodeIOHIDEventRef parent = runtime.createDigitizer(
         kCFAllocatorDefault, machTime, 3,
-        CLOUDCODE_GUI_PARENT_INDEX, CLOUDCODE_GUI_PARENT_IDENTITY, parentEventMask, 0,
+        CLOUDCODE_GUI_PARENT_INDEX, CLOUDCODE_GUI_PARENT_IDENTITY, eventMask, 0,
         0, 0, 0, 0, 0,
         NO, touching, 0
     );
@@ -392,7 +389,7 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
 
     CloudCodeIOHIDEventRef child = runtime.createFinger(
         kCFAllocatorDefault, machTime,
-        CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY, childEventMask,
+        CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY, eventMask,
         nx, ny, 0, 0, 90.0, range && touching, touching, 0
     );
     if (!child) {
