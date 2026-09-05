@@ -21,7 +21,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.core
         PRODUCT_NAME: CloudCodeCore
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 38
+        CURRENT_PROJECT_VERSION: 39
         VERSIONING_SYSTEM: apple-generic
         DEFINES_MODULE: YES
         GENERATE_INFOPLIST_FILE: YES
@@ -41,7 +41,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios
         PRODUCT_NAME: CloudCode
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 38
+        CURRENT_PROJECT_VERSION: 39
         VERSIONING_SYSTEM: apple-generic
         SWIFT_VERSION: 5.9
         SWIFT_OBJC_BRIDGING_HEADER: Sources/CloudCodeApp/RootHelperBridge.h
@@ -83,6 +83,7 @@ targets:
             -framework Foundation \
             -framework UIKit \
             -framework CoreGraphics \
+            -framework IOSurface \
             -o "$HELPER"
           chmod 0755 "$HELPER"
           INFO="$TARGET_BUILD_DIR/$WRAPPER_NAME/Info.plist"

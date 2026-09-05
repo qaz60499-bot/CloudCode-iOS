@@ -39,6 +39,7 @@ public final class CloudCodeViewModel: ObservableObject {
     @Published public var selectedProviderID: String
     @Published public var selectedKeySlotID: String
     @Published public var selectedModel: String
+    @Published public var selectedReasoningEffort: ModelReasoningEffort
     @Published public var permissionMode: PermissionMode
     @Published public var browsePath: String
 
@@ -209,6 +210,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.selectedProviderID = selection.providerID
         self.selectedKeySlotID = selection.keySlotID
         self.selectedModel = selection.model
+        self.selectedReasoningEffort = ModelReasoningEffort(rawValue: defaults.string(forKey: "provider.selected.reasoningEffort") ?? "automatic") ?? .automatic
         self.permissionMode = initialPermissionMode
         self.browsePath = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).path
         self.session = AgentSession(
@@ -484,6 +486,11 @@ public final class CloudCodeViewModel: ObservableObject {
         persistProviderSelection()
     }
 
+    public func selectReasoningEffort(_ effort: ModelReasoningEffort) {
+        selectedReasoningEffort = effort
+        persistProviderSelection()
+    }
+
     @discardableResult
     public func setKey(_ secret: String, providerID: String? = nil, keySlotID: String? = nil) async -> Bool {
         let providerID = providerID ?? selectedProviderID
@@ -598,6 +605,22 @@ public final class CloudCodeViewModel: ObservableObject {
         imageMimeType: String = "image/jpeg",
         imageFilename: String = "photo.jpg"
     ) {
+        sendInternal(
+            text,
+            imageData: imageData,
+            imageMimeType: imageMimeType,
+            imageFilename: imageFilename,
+            allowCheckpointResume: true
+        )
+    }
+
+    private func sendInternal(
+        _ text: String,
+        imageData: Data?,
+        imageMimeType: String,
+        imageFilename: String,
+        allowCheckpointResume: Bool
+    ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || imageData != nil else { return }
         if let imageData, (imageData.isEmpty || imageData.count > ChatMessageAttachmentPolicy.maxImageBytes) {
@@ -612,6 +635,30 @@ public final class CloudCodeViewModel: ObservableObject {
                 imageMimeType: imageMimeType,
                 imageFilename: imageFilename
             )
+            return
+        }
+
+        if allowCheckpointResume, imageData == nil, Self.isExplicitResumeCommand(trimmed) {
+            let sessionID = session.id
+            Task { [weak self] in
+                guard let self else { return }
+                let candidates = await checkpointStore.interrupted().filter { $0.sessionID == sessionID }
+                if let checkpoint = candidates.max(by: { $0.updatedAt < $1.updatedAt }) {
+                    sessionActivityLines[sessionID, default: []].append("收到明确续跑命令；从最近有效检查点继续，不重新创建任务。")
+                    syncVisibleSessionState(sessionID)
+                    resumeTask(checkpoint)
+                } else {
+                    // "继续" only becomes a checkpoint command when an interrupted task actually exists.
+                    // Without one, preserve ordinary chat semantics instead of dropping the user's message.
+                    sendInternal(
+                        trimmed,
+                        imageData: nil,
+                        imageMimeType: imageMimeType,
+                        imageFilename: imageFilename,
+                        allowCheckpointResume: false
+                    )
+                }
+            }
             return
         }
 
@@ -1717,7 +1764,8 @@ public final class CloudCodeViewModel: ObservableObject {
             protocolName: protocolName.rawValue,
             authModeName: provider.authMode.rawValue,
             fallbackAPIKeyReferences: provider.autoRotateKeys ? Array(references.dropFirst()) : [],
-            allowSameProviderKeyFailover: provider.autoRotateKeys
+            allowSameProviderKeyFailover: provider.autoRotateKeys,
+            reasoningEffort: selectedReasoningEffort
         )
     }
 
@@ -1733,6 +1781,7 @@ public final class CloudCodeViewModel: ObservableObject {
         defaults.set(selectedProviderID, forKey: "provider.selected.id")
         defaults.set(selectedKeySlotID, forKey: "provider.selected.keySlot")
         defaults.set(selectedModel, forKey: "provider.selected.model")
+        defaults.set(selectedReasoningEffort.rawValue, forKey: "provider.selected.reasoningEffort")
     }
 
     private func persistCustomProviders() throws {
@@ -1943,6 +1992,11 @@ public final class CloudCodeViewModel: ObservableObject {
         guard !compact.isEmpty else { return "图片消息" }
         let limit = 32
         return compact.count <= limit ? compact : String(compact.prefix(limit)) + "…"
+    }
+
+    private static func isExplicitResumeCommand(_ text: String) -> Bool {
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["继续", "继续执行", "接着执行", "接着继续", "resume", "continue"].contains(normalized)
     }
 
     private static func capabilitySummary(_ profile: CapabilityProfile) -> String {

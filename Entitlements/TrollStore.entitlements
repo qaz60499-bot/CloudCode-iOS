@@ -26,11 +26,8 @@
     <true/>
     <key>com.apple.private.persona-mgmt</key>
     <true/>
-    <!-- Required by the TrollStore-native IOHID GUI backend. The backend still performs
-         an isolated runtime handshake and stays unavailable if IOHID cannot be opened. -->
-    <key>com.apple.hid.system.server-access</key>
-    <true/>
-    <key>com.apple.private.hid.client.event-dispatch</key>
-    <true/>
+    <!-- GUI-only HID / AX / global-capture entitlements intentionally live on the embedded
+         crash-isolated root helper, not on the SwiftUI host. This keeps ordinary app launch on
+         the smaller entitlement profile while exact GUI operations self-validate in the helper. -->
 </dict>
 </plist>

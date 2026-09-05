@@ -323,7 +323,9 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     private var cachedApps: [ResourceNode] = []
     private var bundlePaths: [String: String] = [:]
     private var containerPaths: [String: String] = [:]
-    private var lastRefresh: Date = .distantPast
+    private var appIndexNeedsRefresh = true
+    private var failedIndexRetryAfter: Date?
+    private var negativeBundleIDs: Set<String> = []
     private var enumerationProven = false
     private var enumerationDetail = "尚未检测已安装 App 枚举能力。"
     private var uninstallDetail = "尚未检测 App 卸载后端。"
@@ -341,42 +343,56 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         bundlePaths = [:]
         containerPaths = [:]
         cachedApps = fallbackOwnApp()
-        lastRefresh = Date()
+        appIndexNeedsRefresh = true
+        failedIndexRetryAfter = nil
+        negativeBundleIDs.removeAll()
         return cachedApps
     }
 
     public func installedApps() async -> [ResourceNode] {
-        if !enumerationProven || Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
+        // Installed-app discovery is relatively expensive on TrollStore devices and the result is
+        // effectively an index. Do not rescan on a wall-clock TTL: a model that calls apps.list in
+        // several tool rounds would otherwise enumerate hundreds of apps over and over. Refresh only
+        // on the first cross-app read, an explicit invalidation, or after a bounded retry delay when
+        // the previous helper enumeration failed.
+        if shouldRefreshIndex() { refresh() }
         return cachedApps
     }
 
     public func bundlePath(for bundleID: String) async -> String? {
-        if bundleID != Bundle.main.bundleIdentifier, bundlePaths[bundleID] == nil {
-            refresh()
-        } else if Date().timeIntervalSince(lastRefresh) > 30 {
-            refresh()
-        }
-        return bundlePaths[bundleID]
+        if bundleID == Bundle.main.bundleIdentifier { return bundlePaths[bundleID] ?? Bundle.main.bundleURL.path }
+        if shouldRefreshIndex() { refresh() }
+        if let value = bundlePaths[bundleID] { return value }
+        guard enumerationProven, !negativeBundleIDs.contains(bundleID) else { return nil }
+        // A cache miss can mean a newly installed App. Permit one refresh for that bundle ID, then
+        // remember a negative lookup so a stale/invalid ID cannot trigger a full 385-App scan forever.
+        refresh()
+        if let value = bundlePaths[bundleID] { return value }
+        negativeBundleIDs.insert(bundleID)
+        return nil
     }
 
     public func dataContainerPath(for bundleID: String) async -> String? {
-        if bundleID != Bundle.main.bundleIdentifier, containerPaths[bundleID] == nil {
-            refresh()
-        } else if Date().timeIntervalSince(lastRefresh) > 30 {
-            refresh()
-        }
-        if let value = containerPaths[bundleID] { return value }
         if bundleID == Bundle.main.bundleIdentifier { return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).path }
+        if shouldRefreshIndex() { refresh() }
+        if let value = containerPaths[bundleID] { return value }
+        // If the bundle itself is already in the index, an absent container path is a known value,
+        // not evidence that the whole App index is stale.
+        if bundlePaths[bundleID] != nil { return nil }
+        guard enumerationProven, !negativeBundleIDs.contains(bundleID) else { return nil }
+        refresh()
+        if let value = containerPaths[bundleID] { return value }
+        if bundlePaths[bundleID] == nil { negativeBundleIDs.insert(bundleID) }
         return nil
     }
 
     public func canEnumerateInstalledApps() async -> Bool {
-        if Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
+        if shouldRefreshIndex() { refresh() }
         return enumerationProven
     }
 
     public func installedAppEnumerationDetail() async -> String {
-        if Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
+        if shouldRefreshIndex() { refresh() }
         return enumerationDetail
     }
 
@@ -421,7 +437,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     }
 
     public func appTerminateCapability() async -> AppLifecycleCapabilitySnapshot {
-        if Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
+        if shouldRefreshIndex() { refresh() }
         guard enumerationProven else {
             return AppLifecycleCapabilitySnapshot(available: false, detail: "跨 App 枚举尚未验证，不能安全定位待停止的 App。")
         }
@@ -481,7 +497,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     }
 
     public func canUninstallInstalledApps() async -> Bool {
-        if Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
+        if shouldRefreshIndex() { refresh() }
         guard enumerationProven else {
             uninstallDetail = "必须先通过 helper 子进程验证跨 App 可见性。"
             return false
@@ -513,7 +529,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     }
 
     public func installedAppUninstallDetail() async -> String {
-        if Date().timeIntervalSince(lastRefresh) > 30 { refresh() }
+        if shouldRefreshIndex() { refresh() }
         return uninstallDetail
     }
 
@@ -639,17 +655,27 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         cachedApps.removeAll { $0.ownerBundleID == bundleID }
         bundlePaths.removeValue(forKey: bundleID)
         containerPaths.removeValue(forKey: bundleID)
-        lastRefresh = .distantPast
+        appIndexNeedsRefresh = false
+        negativeBundleIDs.insert(bundleID)
         uninstallDetail = "最近一次卸载已通过三项最终校验：LaunchServices 未安装、Bundle 已移除、已知数据容器已移除。"
     }
 
     public func forceRefresh() {
-        lastRefresh = .distantPast
+        appIndexNeedsRefresh = true
+        failedIndexRetryAfter = nil
+        negativeBundleIDs.removeAll()
         refresh()
     }
 
+    private func shouldRefreshIndex(now: Date = Date()) -> Bool {
+        if appIndexNeedsRefresh { return true }
+        if enumerationProven { return false }
+        guard let failedIndexRetryAfter else { return true }
+        return now >= failedIndexRetryAfter
+    }
+
     private func refresh() {
-        defer { lastRefresh = Date() }
+        defer { appIndexNeedsRefresh = false }
 
         enumerationProven = false
         enumerationDetail = "已安装 App 枚举尚未得到跨 App 可见性的有效证据。"
@@ -659,8 +685,9 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
 
         let isolated = EmbeddedRootHelper.enumerateInstalledApps()
         guard let payload = isolated.payload, !payload.apps.isEmpty else {
-            enumerationDetail = isolated.detail
+            enumerationDetail = isolated.detail + " 失败结果会缓存 30 秒，避免模型循环触发全量枚举。"
             cachedApps = fallbackOwnApp()
+            failedIndexRetryAfter = Date().addingTimeInterval(30)
             return
         }
 
@@ -691,7 +718,9 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         }
 
         enumerationProven = true
-        enumerationDetail = "\(payload.backend) 已在 helper 子进程内返回 \(parsedApps.count) 个有效应用，其中 \(crossAppCount) 个不是 Cloud Code 自身。"
+        failedIndexRetryAfter = nil
+        negativeBundleIDs.removeAll()
+        enumerationDetail = "\(payload.backend) 已在 helper 子进程内返回 \(parsedApps.count) 个有效应用，其中 \(crossAppCount) 个不是 Cloud Code 自身；后续沿用内存索引直到显式失效。"
         cachedApps = parsedApps
         bundlePaths = bundles
         containerPaths = containers

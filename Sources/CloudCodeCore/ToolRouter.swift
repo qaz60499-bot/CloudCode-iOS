@@ -148,7 +148,7 @@ public actor ToolRegistry {
 
     public static let phaseOneDefaults: [ToolDescriptor] = [
         ToolDescriptor(name: "capability.probe", summary: "Return the capability snapshot already validated for this session; never initiates privileged probing.", risk: .readOnly),
-        ToolDescriptor(name: "apps.list", summary: "Enumerate installed apps through the bounded isolated helper; failures stay read-only and fail closed.", risk: .readOnly),
+        ToolDescriptor(name: "apps.list", summary: "Search or page the cached installed-app index. Optional query matches app name/bundle ID; offset/limit are bounded. Device enumeration is reused until explicitly invalidated.", risk: .readOnly),
         ToolDescriptor(name: "apps.inspect", summary: "Inspect an installed app by bundle ID through the bounded resolver; missing targets fail closed.", risk: .readOnly),
         ToolDescriptor(name: "container.resolve", summary: "Resolve the current data container for a bundle ID without caching UUID paths; missing targets fail closed.", risk: .readOnly),
         ToolDescriptor(name: "files.list", summary: "List a directory through structured filesystem access.", risk: .readOnly),

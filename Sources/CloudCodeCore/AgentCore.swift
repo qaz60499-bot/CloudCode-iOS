@@ -64,6 +64,7 @@ public actor SessionStore {
     private let root: URL
     private let fileManager: FileManager
     private static let maxSerializedBytes: Int64 = 8 * 1024 * 1024
+    private static let maxRecoverableSerializedBytes: Int64 = 32 * 1024 * 1024
 
     public init(root: URL, fileManager: FileManager = .default) {
         self.root = root
@@ -71,13 +72,10 @@ public actor SessionStore {
     }
 
     public func save(_ session: AgentSession) throws {
-        let data = try JSONEncoder.pretty.encode(session)
-        guard Int64(data.count) <= Self.maxSerializedBytes else {
-            throw SessionStoreError.oversizedSession(session.id)
-        }
+        let persisted = try persistenceRepresentation(for: session)
         try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
         let url = root.appendingPathComponent(session.id.uuidString).appendingPathExtension("json")
-        try data.write(to: url, options: .atomic)
+        try persisted.data.write(to: url, options: .atomic)
     }
 
     public func delete(_ id: UUID) throws {
@@ -88,32 +86,81 @@ public actor SessionStore {
 
     public func load(_ id: UUID) throws -> AgentSession {
         let url = root.appendingPathComponent(id.uuidString).appendingPathExtension("json")
-        let data = try boundedData(at: url, sessionID: id)
+        let data = try boundedData(at: url, sessionID: id, maximumBytes: Self.maxRecoverableSerializedBytes)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode(AgentSession.self, from: data)
+        let decoded = try decoder.decode(AgentSession.self, from: data)
+        let persisted = try persistenceRepresentation(for: decoded)
+        if Int64(data.count) > Self.maxSerializedBytes || persisted.session != decoded {
+            try persisted.data.write(to: url, options: .atomic)
+        }
+        return persisted.session
     }
 
     public func all() throws -> [AgentSession] {
         guard fileManager.fileExists(atPath: root.path) else { return [] }
         let urls = try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles])
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return urls.compactMap { url in
-            guard url.pathExtension == "json",
-                  let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
-                  let data = try? boundedData(at: url, sessionID: id) else { return nil }
-            return try? decoder.decode(AgentSession.self, from: data)
-        }.sorted { $0.updatedAt > $1.updatedAt }
+        var sessions: [AgentSession] = []
+        for url in urls where url.pathExtension == "json" {
+            guard let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
+                  let session = try? load(id) else { continue }
+            sessions.append(session)
+        }
+        return sessions.sorted { $0.updatedAt > $1.updatedAt }
     }
 
-    private func boundedData(at url: URL, sessionID: UUID) throws -> Data {
+    private func boundedData(at url: URL, sessionID: UUID, maximumBytes: Int64 = Self.maxSerializedBytes) throws -> Data {
         let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
         guard values.isRegularFile == true else { throw CocoaError(.fileReadUnknown) }
-        if let size = values.fileSize, Int64(size) > Self.maxSerializedBytes {
+        if let size = values.fileSize, Int64(size) > maximumBytes {
             throw SessionStoreError.oversizedSession(sessionID)
         }
         return try Data(contentsOf: url, options: [.mappedIfSafe])
+    }
+
+    private func persistenceRepresentation(for session: AgentSession) throws -> (session: AgentSession, data: Data) {
+        var compacted = session
+        var data = try JSONEncoder.pretty.encode(compacted)
+        if Int64(data.count) <= Self.maxSerializedBytes { return (compacted, data) }
+
+        // Historical tool payloads are observations, not user-authored conversation. In particular,
+        // old apps.list responses can contain hundreds of bundle/container paths and were the source
+        // of repeated 8 MiB session failures. Compact those first while preserving role, call ID,
+        // tool name, ordering, user messages, assistant text, and attachments.
+        for index in compacted.messages.indices where compacted.messages[index].role == .tool {
+            let toolName = compacted.messages[index].providerMetadata["tool_name"] ?? "unknown"
+            guard toolName == "apps.list" else { continue }
+            compactToolMessage(&compacted.messages[index], reason: "stale_app_index")
+        }
+        data = try JSONEncoder.pretty.encode(compacted)
+        if Int64(data.count) <= Self.maxSerializedBytes { return (compacted, data) }
+
+        // Recovery fallback: compact the largest remaining tool observations until the session fits.
+        // State-changing truth remains available in the execution ledger/audit log; the transcript
+        // retains the tool identity and instructs the Agent to re-read final state before another write.
+        let candidates = compacted.messages.indices
+            .filter { compacted.messages[$0].role == .tool && compacted.messages[$0].providerMetadata["storage_compacted"] != "true" }
+            .sorted { compacted.messages[$0].content.count > compacted.messages[$1].content.count }
+        for index in candidates {
+            guard compacted.messages[index].content.count > 8_192 else { continue }
+            compactToolMessage(&compacted.messages[index], reason: "size_recovery")
+            data = try JSONEncoder.pretty.encode(compacted)
+            if Int64(data.count) <= Self.maxSerializedBytes { return (compacted, data) }
+        }
+
+        throw SessionStoreError.oversizedSession(session.id)
+    }
+
+    private func compactToolMessage(_ message: inout ChatMessage, reason: String) {
+        let originalCharacters = message.content.count
+        let toolName = message.providerMetadata["tool_name"] ?? "unknown"
+        message.content = ToolOutputEnvelope(
+            trust: .untrustedData,
+            source: "session-storage-recovery",
+            content: "Historical tool observation compacted (tool=\(toolName), reason=\(reason), originalCharacters=\(originalCharacters)). Re-read the target before relying on stale observational data or repeating a state change."
+        ).promptSafeRepresentation
+        message.providerMetadata["storage_compacted"] = "true"
+        message.providerMetadata["storage_compaction_reason"] = reason
     }
 
     public func search(_ query: String) throws -> [AgentSession] {
@@ -405,7 +452,8 @@ public actor AgentCore {
                         "provider.authMode": providerConfiguration.authModeName ?? "",
                         "provider.keyReference": providerConfiguration.apiKeyReference,
                         "provider.fallbackKeyReferences": (providerConfiguration.fallbackAPIKeyReferences ?? []).joined(separator: ","),
-                        "provider.sameProviderFailover": providerConfiguration.allowSameProviderKeyFailover == true ? "true" : "false"
+                        "provider.sameProviderFailover": providerConfiguration.allowSameProviderKeyFailover == true ? "true" : "false",
+                        "provider.reasoningEffort": providerConfiguration.reasoningEffort?.rawValue ?? ModelReasoningEffort.automatic.rawValue
                     ]
                 )
                 checkpoint.sessionID = session.id
@@ -424,6 +472,7 @@ public actor AgentCore {
                 checkpoint.payload["provider.keyReference"] = providerConfiguration.apiKeyReference
                 checkpoint.payload["provider.fallbackKeyReferences"] = (providerConfiguration.fallbackAPIKeyReferences ?? []).joined(separator: ",")
                 checkpoint.payload["provider.sameProviderFailover"] = providerConfiguration.allowSameProviderKeyFailover == true ? "true" : "false"
+                checkpoint.payload["provider.reasoningEffort"] = providerConfiguration.reasoningEffort?.rawValue ?? ModelReasoningEffort.automatic.rawValue
                 try? await diagnosticLogger?.log(
                     level: .info,
                     subsystem: "agent",
@@ -433,6 +482,7 @@ public actor AgentCore {
                     metadata: [
                         "providerID": providerConfiguration.providerID ?? "",
                         "model": providerConfiguration.model,
+                        "reasoningEffort": providerConfiguration.reasoningEffort?.rawValue ?? ModelReasoningEffort.automatic.rawValue,
                         "protocol": providerConfiguration.protocolName ?? "",
                         "maxToolRounds": String(maxToolRounds)
                     ]
@@ -502,6 +552,11 @@ public actor AgentCore {
                     var lastStateChangeScope = checkpoint.payload["tool.lastStateChangeScope"]
                         ?? Self.lastCompletedStateChangeScope(in: session, descriptorsByName: descriptorsByName)
                     var verificationSinceLastStateChange = checkpoint.payload["tool.verificationSinceLastStateChange"] == "true"
+                    var completedAppListSignatures = Set(
+                        (checkpoint.payload["tool.completedAppListSignatures"] ?? "")
+                            .split(separator: ",")
+                            .map(String.init)
+                    )
 
                     var previousToolPlanSignature: String?
                     var repeatedToolPlanCount = 0
@@ -689,9 +744,33 @@ public actor AgentCore {
                                 throw ToolArgumentValidationError.unknownTool(name)
                             }
                             let stateChangeSignature = descriptor.risk == .readOnly ? nil : Self.semanticToolSignature(name: name, arguments: arguments)
+                            let appListSignature = descriptor.risk == .readOnly && name == "apps.list"
+                                ? Self.semanticToolSignature(name: name, arguments: arguments)
+                                : nil
                             continuation.yield(.toolStarted(name: name, id: call.id))
 
-                            if let stateChangeSignature,
+                            if let appListSignature, completedAppListSignatures.contains(appListSignature) {
+                                let duplicate = ToolResult(
+                                    toolCallID: call.id,
+                                    success: true,
+                                    summary: "已沿用本任务先前的 App 索引；没有再次扫描设备。",
+                                    payload: ["cache": "checkpoint_app_index_hit"]
+                                )
+                                continuation.yield(.toolFinished(duplicate))
+                                let content = ToolOutputEnvelope(
+                                    trust: .untrustedData,
+                                    source: "tool:\(name):cached",
+                                    content: "相同的 apps.list 已在本任务中成功完成；沿用先前 App 索引，不要重复调用。仅在用户显式要求重新检测设备或安装状态发生变化后才需要刷新。"
+                                ).promptSafeRepresentation
+                                session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: [
+                                    "tool_call_id": providerCallID,
+                                    "tool_name": name,
+                                    "provider_tool_name": providerToolName,
+                                    "idempotency": "read_only_checkpoint_cache"
+                                ]))
+                                session.updatedAt = Date()
+                                try await sessionStore.save(session)
+                            } else if let stateChangeSignature,
                                stateChangeSignature == lastStateChangeSignature,
                                !verificationSinceLastStateChange {
                                 let failure = ToolResult(
@@ -731,7 +810,15 @@ public actor AgentCore {
                                             attachments: attachments
                                         ))
                                     }
+                                    if let appListSignature, result.success {
+                                        completedAppListSignatures.insert(appListSignature)
+                                        checkpoint.payload["tool.completedAppListSignatures"] = completedAppListSignatures.sorted().joined(separator: ",")
+                                        checkpoint.updatedAt = Date()
+                                        try await checkpointStore.upsert(checkpoint)
+                                    }
                                     if let stateChangeSignature {
+                                        completedAppListSignatures.removeAll()
+                                        checkpoint.payload.removeValue(forKey: "tool.completedAppListSignatures")
                                         lastStateChangeSignature = stateChangeSignature
                                         lastStateChangeScope = Self.semanticToolScope(name: name, arguments: arguments)
                                         verificationSinceLastStateChange = false
@@ -755,6 +842,8 @@ public actor AgentCore {
                                 } catch {
                                     runtimeBreadcrumb?("runtime.agent.tool.\(name).error")
                                     if let stateChangeSignature {
+                                        completedAppListSignatures.removeAll()
+                                        checkpoint.payload.removeValue(forKey: "tool.completedAppListSignatures")
                                         lastStateChangeSignature = stateChangeSignature
                                         lastStateChangeScope = Self.semanticToolScope(name: name, arguments: arguments)
                                         verificationSinceLastStateChange = false
@@ -1123,8 +1212,10 @@ public actor AgentCore {
 
     private static func toolArgumentSpec(for name: String) -> ToolArgumentSpec? {
         switch name {
-        case "capability.probe", "apps.list", "gui.tree", "gui.screenshot":
+        case "capability.probe", "gui.tree", "gui.screenshot":
             return ToolArgumentSpec(properties: [:], required: [])
+        case "apps.list":
+            return ToolArgumentSpec(properties: ["query": "string", "offset": "number", "limit": "number"], required: [])
         case "apps.inspect", "container.resolve", "apps.launch", "apps.terminate", "apps.uninstall", "gui.openApp":
             return ToolArgumentSpec(properties: ["bundleId": "string"], required: ["bundleId"])
         case "files.list", "files.read", "ipa.inspect":

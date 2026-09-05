@@ -1054,6 +1054,15 @@ private struct SettingsView: View {
                     }
                     .disabled(model.availableModels.isEmpty)
 
+                    Picker("推理强度", selection: Binding(
+                        get: { model.selectedReasoningEffort },
+                        set: { model.selectReasoningEffort($0) }
+                    )) {
+                        ForEach(ModelReasoningEffort.allCases, id: \.self) { effort in
+                            Text(localizedReasoningEffort(effort)).tag(effort)
+                        }
+                    }
+
                     if let provider = model.selectedProvider {
                         LabeledContent("厂商状态", value: localizedProviderStatus(provider.readiness.rawValue))
                         if let health = model.selectedProviderEndpointHealth {
@@ -1615,6 +1624,17 @@ private func localizedCapabilityDetail(_ id: String, detail: String) -> String {
     case "ipa.install":
         return detail.contains("No IPA installation executor") ? "当前版本没有接入 IPA 安装执行器，因此不可用。" : "安装 IPA 依赖 TrollStore 或其他已验证的高权限安装能力。"
     default: return detail
+    }
+}
+
+private func localizedReasoningEffort(_ effort: ModelReasoningEffort) -> String {
+    switch effort {
+    case .automatic: return "自动（兼容优先）"
+    case .low: return "低"
+    case .medium: return "中"
+    case .high: return "高"
+    case .xhigh: return "超高"
+    case .max: return "最高"
     }
 }
 

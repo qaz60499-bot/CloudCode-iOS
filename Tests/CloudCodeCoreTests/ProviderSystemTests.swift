@@ -177,7 +177,8 @@ final class ProviderCatalogTests: XCTestCase {
             "provider.model": "claude-opus-5",
             "provider.keyReference": primary,
             "provider.fallbackKeyReferences": fallback,
-            "provider.sameProviderFailover": "true"
+            "provider.sameProviderFailover": "true",
+            "provider.reasoningEffort": "xhigh"
         ]
 
         let resolved = try ProviderCheckpointConfigurationResolver.resolve(payload: payload, profiles: profiles)
@@ -187,6 +188,7 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(resolved.fallbackAPIKeyReferences, [fallback])
         XCTAssertEqual(resolved.protocolName, ProviderProtocol.anthropic.rawValue)
         XCTAssertEqual(resolved.authModeName, ProviderAuthMode.both.rawValue)
+        XCTAssertEqual(resolved.reasoningEffort, .xhigh)
 
         var endpointTampered = payload
         endpointTampered["provider.baseURL"] = "https://attacker.example"
@@ -724,6 +726,52 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(events.last, .finished)
     }
 
+    func testAnthropicCompatibleProxyAcceptsOpenAIStyleChoiceEnvelopeAndBOM() async throws {
+        let body = Data("""
+        \u{feff}data: {"choices":[{"index":0,"delta":{"content":"compat-ok"},"finish_reason":null}]}
+
+        data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+        """.utf8)
+        ProviderTestURLProtocol.install(status: 200, body: body, headers: ["Content-Type": "text/event-stream"])
+        let client = AnthropicProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let configuration = ProviderConfiguration(name: "proxy", baseURL: URL(string: "https://proxy.example")!, model: "claude-opus-5", apiKeyReference: "key", protocolName: ProviderProtocol.anthropic.rawValue)
+        var events: [ProviderEvent] = []
+        for try await event in client.stream(configuration: configuration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {
+            events.append(event)
+        }
+        XCTAssertTrue(events.contains(.token("compat-ok")))
+        XCTAssertEqual(events.last, .finished)
+    }
+
+    func testReasoningEffortMapsToEachProtocolRequestBody() async throws {
+        ProviderTestURLProtocol.install(status: 200, body: Data("data: [DONE]\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let chat = OpenAICompatibleProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let chatConfig = ProviderConfiguration(name: "chat", baseURL: URL(string: "https://example.com/v1")!, model: "gpt-5.6-sol", apiKeyReference: "k", protocolName: ProviderProtocol.openAIChat.rawValue, reasoningEffort: .xhigh)
+        for try await _ in chat.stream(configuration: chatConfig, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
+        let chatData = try XCTUnwrap(ProviderTestURLProtocol.lastRequestBody())
+        let chatBody = try XCTUnwrap(JSONSerialization.jsonObject(with: chatData) as? [String: Any])
+        XCTAssertEqual(chatBody["reasoning_effort"] as? String, "xhigh")
+
+        ProviderTestURLProtocol.install(status: 200, body: Data("data: {\"type\":\"message_stop\"}\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let anthropic = AnthropicProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let anthropicConfig = ProviderConfiguration(name: "anthropic", baseURL: URL(string: "https://example.com/v1")!, model: "claude-opus-5", apiKeyReference: "k", protocolName: ProviderProtocol.anthropic.rawValue, reasoningEffort: .max)
+        for try await _ in anthropic.stream(configuration: anthropicConfig, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
+        let anthropicData = try XCTUnwrap(ProviderTestURLProtocol.lastRequestBody())
+        let anthropicBody = try XCTUnwrap(JSONSerialization.jsonObject(with: anthropicData) as? [String: Any])
+        let outputConfig = try XCTUnwrap(anthropicBody["output_config"] as? [String: Any])
+        XCTAssertEqual(outputConfig["effort"] as? String, "max")
+
+        ProviderTestURLProtocol.install(status: 200, body: Data("data: {\"type\":\"response.completed\"}\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let responses = OpenAIResponsesProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let responsesConfig = ProviderConfiguration(name: "responses", baseURL: URL(string: "https://example.com/v1")!, model: "gpt-5.6-sol", apiKeyReference: "k", protocolName: ProviderProtocol.openAIResponses.rawValue, reasoningEffort: .high)
+        for try await _ in responses.stream(configuration: responsesConfig, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
+        let responsesData = try XCTUnwrap(ProviderTestURLProtocol.lastRequestBody())
+        let responsesBody = try XCTUnwrap(JSONSerialization.jsonObject(with: responsesData) as? [String: Any])
+        let reasoning = try XCTUnwrap(responsesBody["reasoning"] as? [String: Any])
+        XCTAssertEqual(reasoning["effort"] as? String, "high")
+    }
+
     func testOpenAIChatAcceptsNonSSEFullJSONResponseFromCompatibleProxy() async throws {
         let body = Data("""
         {"id":"chatcmpl-proxy","choices":[{"index":0,"message":{"role":"assistant","content":"chat-ok"},"finish_reason":"stop"}]}
@@ -943,6 +991,25 @@ final class ProviderProtocolClientTests: XCTestCase {
         let responsesBody = try XCTUnwrap(JSONSerialization.jsonObject(with: responsesData) as? [String: Any])
         let input = try XCTUnwrap(responsesBody["input"] as? [[String: Any]])
         XCTAssertEqual(input[1]["name"] as? String, "files_read")
+    }
+
+    func testReasoningEffortCompatibilityFallbackRequiresExplicitUnsupportedFieldEvidence() {
+        XCTAssertTrue(ProviderCompatibilityClassifier.shouldRetryWithoutReasoningEffort(
+            statusCode: 400,
+            body: Data("{\"error\":\"unknown field output_config.effort\"}".utf8)
+        ))
+        XCTAssertTrue(ProviderCompatibilityClassifier.shouldRetryWithoutReasoningEffort(
+            statusCode: 422,
+            body: Data("{\"error\":\"unsupported reasoning_effort parameter\"}".utf8)
+        ))
+        XCTAssertFalse(ProviderCompatibilityClassifier.shouldRetryWithoutReasoningEffort(
+            statusCode: 401,
+            body: Data("{\"error\":\"unknown reasoning_effort\"}".utf8)
+        ))
+        XCTAssertFalse(ProviderCompatibilityClassifier.shouldRetryWithoutReasoningEffort(
+            statusCode: 400,
+            body: Data("{\"error\":\"model not found\"}".utf8)
+        ))
     }
 
     func testHTTP403QuotaIsCapacityNotCredentialFailure() {

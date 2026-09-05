@@ -77,7 +77,49 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
 
         case "apps.list":
             let apps = await appResolver.installedApps()
-            return try untrustedResult(call.id, summary: "发现 \(apps.count) 个应用", key: "apps", value: apps, source: "apps.list")
+            let query = call.arguments["query"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let filtered: [ResourceNode]
+            if query.isEmpty {
+                filtered = apps
+            } else {
+                filtered = apps.filter { app in
+                    app.displayName.localizedCaseInsensitiveContains(query)
+                        || (app.ownerBundleID?.localizedCaseInsensitiveContains(query) ?? false)
+                }
+            }
+            let offset = max(0, Int(call.arguments["offset"] ?? "0") ?? 0)
+            let limit = min(50, max(1, Int(call.arguments["limit"] ?? "24") ?? 24))
+            let boundedOffset = min(offset, filtered.count)
+            let page = filtered.dropFirst(boundedOffset).prefix(limit)
+            // apps.list is a discovery/index tool, not a container dump. Return a bounded page and
+            // keep bundle/data paths behind apps.inspect/container.resolve. This prevents a device
+            // with hundreds of apps from repeatedly injecting the entire inventory into the Agent
+            // transcript while still allowing exact search by display name or bundle ID.
+            let compactApps: [[String: String]] = page.map { app in
+                var item: [String: String] = ["name": app.displayName]
+                if let bundleID = app.ownerBundleID, !bundleID.isEmpty { item["bundleId"] = bundleID }
+                if let version = app.metadata["version"], !version.isEmpty { item["version"] = version }
+                return item
+            }
+            let encoded = try JSONEncoder.pretty.encode(compactApps)
+            let content = String(data: encoded, encoding: .utf8) ?? "[]"
+            let envelope = ToolOutputEnvelope(trust: .untrustedData, source: "apps.list", content: content)
+            let hasMore = boundedOffset + compactApps.count < filtered.count
+            return ToolResult(
+                toolCallID: call.id,
+                success: true,
+                summary: query.isEmpty
+                    ? "App 索引共 \(apps.count) 项；返回 \(compactApps.count) 项"
+                    : "App 索引共 \(apps.count) 项；“\(query)”匹配 \(filtered.count) 项，返回 \(compactApps.count) 项",
+                payload: [
+                    "apps": envelope.promptSafeRepresentation,
+                    "totalCount": String(apps.count),
+                    "matchedCount": String(filtered.count),
+                    "offset": String(boundedOffset),
+                    "limit": String(limit),
+                    "hasMore": String(hasMore)
+                ]
+            )
 
         case "apps.inspect":
             guard let bundleID = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }

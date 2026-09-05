@@ -115,7 +115,7 @@ jobs:
           MAIN_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
           ROOT_HELPER="$APP_PATH/CloudCodeRootHelper"
           test -f "$ROOT_HELPER"
-          ldid -SEntitlements/TrollStore.entitlements "$ROOT_HELPER"
+          ldid -SEntitlements/CloudCodeRootHelper.entitlements "$ROOT_HELPER"
           ldid -SEntitlements/TrollStore.entitlements "$APP_PATH/$MAIN_EXECUTABLE"
           ENTITLEMENTS="$RUNNER_TEMP/cloudcode-privileged-entitlements.plist"
           ldid -e "$APP_PATH/$MAIN_EXECUTABLE" > "$ENTITLEMENTS"
@@ -124,13 +124,26 @@ jobs:
             com.apple.private.security.no-sandbox \
             platform-application \
             com.apple.private.security.storage.AppDataContainers \
-            com.apple.private.persona-mgmt \
-            com.apple.hid.system.server-access \
-            com.apple.private.hid.client.event-dispatch; do
+            com.apple.private.persona-mgmt; do
             /usr/libexec/PlistBuddy -c "Print :$required_host_entitlement" "$ENTITLEMENTS" | grep -F 'true'
           done
           rm -f "$ENTITLEMENTS"
-          echo 'PASS: privileged validation entitlement set embedded'
+          HELPER_ENTITLEMENTS="$RUNNER_TEMP/cloudcode-root-helper-entitlements.plist"
+          ldid -e "$ROOT_HELPER" > "$HELPER_ENTITLEMENTS"
+          plutil -lint "$HELPER_ENTITLEMENTS" >/dev/null
+          for required_helper_entitlement in \
+            com.apple.private.security.no-sandbox \
+            platform-application \
+            com.apple.private.persona-mgmt \
+            com.apple.hid.system.server-access \
+            com.apple.private.hid.client.event-dispatch \
+            com.apple.accessibility.api \
+            com.apple.QuartzCore.displayable-context \
+            com.apple.QuartzCore.global-capture; do
+            /usr/libexec/PlistBuddy -c "Print :$required_helper_entitlement" "$HELPER_ENTITLEMENTS" | grep -F 'true'
+          done
+          rm -f "$HELPER_ENTITLEMENTS"
+          echo 'PASS: privileged host + isolated GUI helper entitlement sets embedded'
 
       - name: Package privileged private TrollStore IPA
         run: |

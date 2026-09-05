@@ -138,7 +138,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(sessions.isEmpty)
     }
 
-    func testSessionStoreRejectsOversizedPersistedSessionWithoutReadingIt() async throws {
+    func testSessionStoreRejectsUnrecoverablyLargePersistedSessionWithoutReadingIt() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let sessionsRoot = root.appendingPathComponent("Sessions", isDirectory: true)
@@ -147,7 +147,7 @@ final class CloudCodeCoreTests: XCTestCase {
         let url = sessionsRoot.appendingPathComponent(sessionID.uuidString).appendingPathExtension("json")
         FileManager.default.createFile(atPath: url.path, contents: Data())
         let handle = try FileHandle(forWritingTo: url)
-        try handle.truncate(atOffset: UInt64(8 * 1024 * 1024 + 1))
+        try handle.truncate(atOffset: UInt64(32 * 1024 * 1024 + 1))
         try handle.close()
 
         let store = SessionStore(root: sessionsRoot)
@@ -155,10 +155,63 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(sessions.isEmpty)
         do {
             _ = try await store.load(sessionID)
-            XCTFail("oversized persisted session must not be loaded into memory")
+            XCTFail("unrecoverably large persisted session must not be loaded into memory")
         } catch let error as SessionStoreError {
             XCTAssertEqual(error, .oversizedSession(sessionID))
         }
+    }
+
+    func testSessionStoreRecoversLegacyOversizedAppListHistoryWithoutDroppingConversation() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionsRoot = root.appendingPathComponent("Sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessionsRoot, withIntermediateDirectories: true)
+
+        let sessionID = UUID()
+        let originalUserText = "继续执行上一次任务，不要重新开始"
+        var messages = [ChatMessage(role: .user, content: originalUserText)]
+        for index in 0..<40 {
+            let providerCallID = "legacy-app-list-\(index)"
+            messages.append(ChatMessage(
+                role: .assistant,
+                content: "",
+                providerMetadata: [
+                    "tool_call_id": providerCallID,
+                    "tool_name": "apps.list",
+                    "provider_tool_name": "apps_list",
+                    "tool_arguments": "{}"
+                ]
+            ))
+            messages.append(ChatMessage(
+                role: .tool,
+                content: String(repeating: "legacy-app-index-payload-", count: 12_000),
+                providerMetadata: [
+                    "tool_call_id": providerCallID,
+                    "tool_name": "apps.list",
+                    "provider_tool_name": "apps_list"
+                ]
+            ))
+        }
+        messages.append(ChatMessage(role: .assistant, content: "仍然从原任务断点继续。"))
+        let original = AgentSession(id: sessionID, title: "GUI automation", messages: messages, permissionMode: .safe)
+        let url = sessionsRoot.appendingPathComponent(sessionID.uuidString).appendingPathExtension("json")
+        let legacyData = try JSONEncoder.pretty.encode(original)
+        XCTAssertGreaterThan(legacyData.count, 8 * 1024 * 1024)
+        XCTAssertLessThan(legacyData.count, 32 * 1024 * 1024)
+        try legacyData.write(to: url, options: .atomic)
+
+        let store = SessionStore(root: sessionsRoot)
+        let recovered = try await store.load(sessionID)
+        XCTAssertEqual(recovered.messages.first(where: { $0.role == .user })?.content, originalUserText)
+        XCTAssertEqual(recovered.messages.last?.content, "仍然从原任务断点继续。")
+        let compactedAppLists = recovered.messages.filter {
+            $0.role == .tool
+                && $0.providerMetadata["tool_name"] == "apps.list"
+                && $0.providerMetadata["storage_compacted"] == "true"
+        }
+        XCTAssertEqual(compactedAppLists.count, 40)
+        let repairedSize = try XCTUnwrap((try url.resourceValues(forKeys: [.fileSizeKey])).fileSize)
+        XCTAssertLessThanOrEqual(repairedSize, 8 * 1024 * 1024)
     }
 
     func testAuditLogReadNewestUsesBoundedTailAndKeepsRecentEvents() async throws {
@@ -2921,6 +2974,41 @@ final class CloudCodeCoreTests: XCTestCase {
         ))
     }
 
+    func testAgentCoreReusesCompletedAppListWithinTaskInsteadOfReexecutingDeviceScan() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let counter = InvocationCounter()
+        let registry = ToolRegistry(descriptors: [ToolDescriptor(name: "apps.list", summary: "list apps", risk: .readOnly)])
+        let router = ToolRouter(
+            registry: registry,
+            executors: [CountingExecutor(route: .structuredTool, names: ["apps.list"], counter: counter)],
+            executionLedger: ToolExecutionLedger(fileURL: root.appendingPathComponent("ledger.json"))
+        )
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let agent = AgentCore(
+            provider: RepeatingAppListProvider(),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: router,
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 5
+        )
+        let session = AgentSession(permissionMode: .safe)
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        let stream = await agent.send(text: "find app", session: session, providerConfiguration: config)
+        for try await _ in stream {}
+
+        let executionCount = await counter.value()
+        XCTAssertEqual(executionCount, 1)
+        let saved = try await sessions.load(session.id)
+        XCTAssertGreaterThanOrEqual(saved.messages.filter { $0.role == .tool && $0.providerMetadata["tool_name"] == "apps.list" }.count, 3)
+        XCTAssertTrue(saved.messages.contains {
+            $0.role == .tool && $0.providerMetadata["idempotency"] == "read_only_checkpoint_cache"
+        })
+    }
+
     func testAgentCoreBlocksImmediateSemanticDuplicateStateChangeWithDifferentProviderCallIDs() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -3400,6 +3488,23 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(compressed.contains { $0.role == .assistant && $0.providerMetadata["tool_call_id"] == "call-final" })
         XCTAssertTrue(compressed.contains { $0.role == .tool && $0.providerMetadata["tool_call_id"] == "call-final" })
         XCTAssertLessThan(compressed.count, messages.count)
+    }
+
+    func testHarnessContextCompressionDropsAssistantToolCallWhenLargeResultDoesNotFit() {
+        let messages = [
+            ChatMessage(role: .system, content: "safety"),
+            ChatMessage(role: .user, content: "list apps"),
+            ChatMessage(role: .assistant, content: "", providerMetadata: ["tool_call_id": "call-apps", "tool_name": "apps.list"]),
+            ChatMessage(role: .tool, content: String(repeating: "z", count: 20_000), providerMetadata: ["tool_call_id": "call-apps", "tool_name": "apps.list"]),
+            ChatMessage(role: .user, content: "continue")
+        ]
+
+        let compressed = HarnessContextManager.providerMessages(
+            from: messages,
+            policy: HarnessContextPolicy(maxCharacters: 8_000, maxMessages: 12)
+        )
+        XCTAssertFalse(compressed.contains { $0.providerMetadata["tool_call_id"] == "call-apps" })
+        XCTAssertTrue(compressed.contains { $0.role == .user && $0.content == "continue" })
     }
 
     func testHomeOSCapabilityLayerNeverElevatesUnverifiedPrimitiveCapabilities() {
@@ -4368,6 +4473,26 @@ private struct ToolThenFinishProvider: ProviderStreaming, Sendable {
             } else {
                 for event in events { continuation.yield(event) }
             }
+            continuation.finish()
+        }
+    }
+}
+
+private struct RepeatingAppListProvider: ProviderStreaming, Sendable {
+    func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        let completed = messages.filter { $0.role == .tool && $0.providerMetadata["tool_name"] == "apps.list" }.count
+        return AsyncThrowingStream { continuation in
+            if completed < 3 {
+                continuation.yield(.toolCall(id: "apps-list-\(completed + 1)", name: "apps_list", argumentsJSON: "{}"))
+            } else {
+                continuation.yield(.token("done"))
+            }
+            continuation.yield(.finished)
             continuation.finish()
         }
     }

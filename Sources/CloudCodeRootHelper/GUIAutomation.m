@@ -2,6 +2,7 @@
 
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <IOSurface/IOSurface.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <mach/mach_time.h>
@@ -35,6 +36,8 @@ typedef void (*CloudCodeHIDSetFloatFn)(CloudCodeIOHIDEventRef, uint32_t, double)
 typedef const struct __CloudCodeAXUIElement *CloudCodeAXUIElementRef;
 typedef int32_t CloudCodeAXError;
 typedef CloudCodeAXUIElementRef (*CloudCodeAXCreateApplicationFn)(pid_t);
+typedef CloudCodeAXUIElementRef (*CloudCodeAXCreateSystemWideFn)(void);
+typedef CloudCodeAXError (*CloudCodeAXGetPidFn)(CloudCodeAXUIElementRef, pid_t *);
 typedef CloudCodeAXError (*CloudCodeAXCopyAttributeFn)(CloudCodeAXUIElementRef, CFStringRef, CFTypeRef *);
 typedef CloudCodeAXError (*CloudCodeAXSetTimeoutFn)(CloudCodeAXUIElementRef, float);
 typedef void (*CloudCodeAXAddAssociatedPidFn)(pid_t, pid_t, int);
@@ -47,6 +50,8 @@ typedef int (*CloudCodeAXValueGetTypeFn)(CFTypeRef);
 typedef Boolean (*CloudCodeAXValueGetValueFn)(CFTypeRef, int, void *);
 
 typedef UIImage *(*CloudCodeCreateScreenImageFn)(void);
+typedef CGImageRef (*CloudCodeCreateCGImageFromIOSurfaceFn)(CFTypeRef);
+typedef void (*CloudCodeRenderServerRenderDisplayFn)(uint32_t, CFStringRef, IOSurfaceRef, int, int);
 typedef CFStringRef (*CloudCodeCopyFrontmostBundleIDFn)(void);
 typedef CFTypeRef (*CloudCodeMGCopyAnswerFn)(CFStringRef);
 
@@ -66,6 +71,9 @@ typedef struct {
 typedef struct {
     void *handle;
     CloudCodeAXCreateApplicationFn createApplication;
+    CloudCodeAXCreateApplicationFn createAppElementWithPid;
+    CloudCodeAXCreateSystemWideFn createSystemWide;
+    CloudCodeAXGetPidFn getPid;
     CloudCodeAXCopyAttributeFn copyAttribute;
     CloudCodeAXSetTimeoutFn setTimeout;
     CloudCodeAXAddAssociatedPidFn addAssociatedPid;
@@ -73,6 +81,13 @@ typedef struct {
     CloudCodeAXValueGetTypeIDFn valueGetTypeID;
     CloudCodeAXValueGetTypeFn valueGetType;
     CloudCodeAXValueGetValueFn valueGetValue;
+    CFStringRef attributeChildren;
+    CFStringRef attributeFrame;
+    CFStringRef attributeLabel;
+    CFStringRef attributeIdentifier;
+    CFStringRef attributeValue;
+    CFStringRef attributePlaceholder;
+    CFStringRef attributeElementType;
 } CloudCodeAXRuntime;
 
 static void *CloudCodeOpenFramework(NSArray<NSString *> *paths)
@@ -88,6 +103,14 @@ static void *CloudCodeResolve(void *handle, const char *name)
 {
     void *symbol = handle ? dlsym(handle, name) : NULL;
     return symbol ?: dlsym(RTLD_DEFAULT, name);
+}
+
+static CFStringRef CloudCodeResolveCFString(void *handle, const char *name, CFStringRef fallback)
+{
+    void *symbol = CloudCodeResolve(handle, name);
+    if (!symbol) { return fallback; }
+    CFStringRef value = *(CFStringRef *)symbol;
+    return value ?: fallback;
 }
 
 static CloudCodeHIDRuntime CloudCodeResolveHID(void)
@@ -251,21 +274,153 @@ static BOOL CloudCodePerformSwipe(double fromX, double fromY, double toX, double
     return ok;
 }
 
+static CGSize CloudCodeScreenPixelSize(void)
+{
+    @try {
+        CGRect nativeBounds = UIScreen.mainScreen.nativeBounds;
+        if (nativeBounds.size.width > 1 && nativeBounds.size.height > 1) { return nativeBounds.size; }
+        CGRect bounds = UIScreen.mainScreen.bounds;
+        CGFloat scale = UIScreen.mainScreen.scale;
+        if (bounds.size.width > 1 && bounds.size.height > 1 && scale >= 1) {
+            return CGSizeMake(bounds.size.width * scale, bounds.size.height * scale);
+        }
+    } @catch (__unused NSException *exception) {
+    }
+    return CGSizeZero;
+}
+
+static UIImage *CloudCodeScreenshotImageFromRenderServer(void)
+{
+    void *quartzCore = dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_LAZY | RTLD_LOCAL);
+    CloudCodeRenderServerRenderDisplayFn render = (CloudCodeRenderServerRenderDisplayFn)CloudCodeResolve(quartzCore, "CARenderServerRenderDisplay");
+    CGSize pixels = CloudCodeScreenPixelSize();
+    if (!render || pixels.width <= 1 || pixels.height <= 1) { return nil; }
+
+    size_t width = (size_t)llround(pixels.width);
+    size_t height = (size_t)llround(pixels.height);
+    if (width == 0 || height == 0 || width > 8192 || height > 8192) { return nil; }
+    size_t bytesPerRow = width * 4;
+    size_t allocationSize = bytesPerRow * height;
+    if (allocationSize == 0 || allocationSize > 256 * 1024 * 1024) { return nil; }
+
+    NSDictionary *properties = @{
+        (id)kIOSurfaceWidth: @(width),
+        (id)kIOSurfaceHeight: @(height),
+        (id)kIOSurfaceBytesPerElement: @4,
+        (id)kIOSurfaceBytesPerRow: @(bytesPerRow),
+        (id)kIOSurfaceAllocSize: @(allocationSize),
+        (id)kIOSurfacePixelFormat: @(0x42475241),
+        (id)kIOSurfaceIsGlobal: @YES
+    };
+    IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
+    if (!surface) { return nil; }
+
+    UIImage *detached = nil;
+    if (IOSurfaceLock(surface, 0, NULL) == 0) {
+        @try { render(0, CFSTR("LCD"), surface, 0, 0); } @catch (__unused NSException *exception) {}
+        void *baseAddress = IOSurfaceGetBaseAddress(surface);
+        size_t surfaceBytesPerRow = IOSurfaceGetBytesPerRow(surface);
+        if (baseAddress && surfaceBytesPerRow >= width * 4) {
+            CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, baseAddress, surfaceBytesPerRow * height, NULL);
+            CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+            CGImageRef cgImage = provider && colorSpace ? CGImageCreate(
+                width, height, 8, 32, surfaceBytesPerRow, colorSpace,
+                kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little,
+                provider, NULL, true, kCGRenderingIntentDefault
+            ) : NULL;
+            if (cgImage) {
+                UIImage *surfaceImage = [UIImage imageWithCGImage:cgImage scale:UIScreen.mainScreen.scale orientation:UIImageOrientationUp];
+                if (surfaceImage) {
+                    UIGraphicsBeginImageContextWithOptions(surfaceImage.size, YES, 1.0);
+                    [surfaceImage drawAtPoint:CGPointZero];
+                    detached = UIGraphicsGetImageFromCurrentImageContext();
+                    UIGraphicsEndImageContext();
+                }
+                CGImageRelease(cgImage);
+            }
+            if (colorSpace) { CGColorSpaceRelease(colorSpace); }
+            if (provider) { CGDataProviderRelease(provider); }
+        }
+        IOSurfaceUnlock(surface, 0, NULL);
+    }
+    CFRelease(surface);
+    return detached;
+}
+
+static UIImage *CloudCodeScreenshotImageFromIOSurface(void)
+{
+    SEL selector = NSSelectorFromString(@"createScreenIOSurface");
+    if (![UIWindow respondsToSelector:selector]) { return nil; }
+    void *uikit = dlopen("/System/Library/Frameworks/UIKit.framework/UIKit", RTLD_LAZY | RTLD_LOCAL);
+    CloudCodeCreateCGImageFromIOSurfaceFn createCGImage = (CloudCodeCreateCGImageFromIOSurfaceFn)CloudCodeResolve(uikit, "UICreateCGImageFromIOSurface");
+    if (!createCGImage) { return nil; }
+    id surfaceObject = nil;
+    @try {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        surfaceObject = [UIWindow performSelector:selector];
+#pragma clang diagnostic pop
+    } @catch (__unused NSException *exception) {
+        surfaceObject = nil;
+    }
+    if (!surfaceObject) { return nil; }
+    CGImageRef cgImage = NULL;
+    @try { cgImage = createCGImage((__bridge CFTypeRef)surfaceObject); } @catch (__unused NSException *exception) { cgImage = NULL; }
+    if (!cgImage) { return nil; }
+    UIImage *image = [UIImage imageWithCGImage:cgImage scale:1.0 orientation:UIImageOrientationUp];
+    CGImageRelease(cgImage);
+    return image;
+}
+
+static UIImage *CloudCodePointSizedScreenshot(UIImage *image)
+{
+    if (!image) { return nil; }
+    CGSize screen = CloudCodeScreenSize();
+    if (screen.width <= 1 || screen.height <= 1) { return image; }
+    BOOL imageLandscape = image.size.width > image.size.height;
+    BOOL screenLandscape = screen.width > screen.height;
+    CGSize target = imageLandscape == screenLandscape ? screen : CGSizeMake(screen.height, screen.width);
+    if (target.width <= 1 || target.height <= 1) { return image; }
+    if (image.size.width <= target.width * 1.05 && image.size.height <= target.height * 1.05) { return image; }
+    UIGraphicsBeginImageContextWithOptions(target, YES, 1.0);
+    [image drawInRect:CGRectMake(0, 0, target.width, target.height)];
+    UIImage *scaled = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return scaled ?: image;
+}
+
+static NSData *CloudCodeBoundedScreenshotJPEG(UIImage *image)
+{
+    image = CloudCodePointSizedScreenshot(image);
+    if (!image) { return nil; }
+    const CGFloat qualities[] = {0.55, 0.45, 0.36, 0.28, 0.20};
+    for (NSUInteger index = 0; index < sizeof(qualities) / sizeof(qualities[0]); index++) {
+        NSData *data = UIImageJPEGRepresentation(image, qualities[index]);
+        if (data.length > 0 && data.length <= CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES) { return data; }
+    }
+    return nil;
+}
+
 static NSData *CloudCodeScreenshotJPEG(void)
 {
+    UIImage *image = CloudCodeScreenshotImageFromRenderServer();
+    if (image) {
+        NSData *data = CloudCodeBoundedScreenshotJPEG(image);
+        if (data) { return data; }
+    }
+
     void *uikit = dlopen("/System/Library/Frameworks/UIKit.framework/UIKit", RTLD_LAZY | RTLD_LOCAL);
     CloudCodeCreateScreenImageFn createImage = (CloudCodeCreateScreenImageFn)CloudCodeResolve(uikit, "_UICreateScreenUIImage");
-    if (!createImage) { return nil; }
-    UIImage *image = nil;
-    @try {
-        image = createImage();
-    } @catch (__unused NSException *exception) {
-        image = nil;
+    if (createImage) {
+        @try { image = createImage(); } @catch (__unused NSException *exception) { image = nil; }
+        if (image) {
+            NSData *data = CloudCodeBoundedScreenshotJPEG(image);
+            if (data) { return data; }
+        }
     }
-    if (!image) { return nil; }
-    NSData *data = UIImageJPEGRepresentation(image, 0.55);
-    if (data.length == 0 || data.length > CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES) { return nil; }
-    return data;
+
+    image = CloudCodeScreenshotImageFromIOSurface();
+    return CloudCodeBoundedScreenshotJPEG(image);
 }
 
 static NSString *CloudCodeFrontmostBundleID(void)
@@ -343,16 +498,29 @@ static CloudCodeAXRuntime CloudCodeResolveAX(void)
     ];
     runtime.handle = CloudCodeOpenFramework(paths);
     runtime.createApplication = (CloudCodeAXCreateApplicationFn)CloudCodeResolve(runtime.handle, "AXUIElementCreateApplication");
-    if (!runtime.createApplication) {
-        runtime.createApplication = (CloudCodeAXCreateApplicationFn)CloudCodeResolve(runtime.handle, "_AXUIElementCreateAppElementWithPid");
+    runtime.createAppElementWithPid = (CloudCodeAXCreateApplicationFn)CloudCodeResolve(runtime.handle, "_AXUIElementCreateAppElementWithPid");
+    runtime.createSystemWide = (CloudCodeAXCreateSystemWideFn)CloudCodeResolve(runtime.handle, "AXUIElementCreateSystemWide");
+    runtime.getPid = (CloudCodeAXGetPidFn)CloudCodeResolve(runtime.handle, "AXUIElementGetPid");
+    if (!runtime.getPid) {
+        runtime.getPid = (CloudCodeAXGetPidFn)CloudCodeResolve(runtime.handle, "_AXUIElementGetPid");
     }
     runtime.copyAttribute = (CloudCodeAXCopyAttributeFn)CloudCodeResolve(runtime.handle, "AXUIElementCopyAttributeValue");
     runtime.setTimeout = (CloudCodeAXSetTimeoutFn)CloudCodeResolve(runtime.handle, "AXUIElementSetMessagingTimeout");
-    runtime.addAssociatedPid = (CloudCodeAXAddAssociatedPidFn)CloudCodeResolve(runtime.handle, "AXAddAssociatedPid");
+    runtime.addAssociatedPid = (CloudCodeAXAddAssociatedPidFn)CloudCodeResolve(runtime.handle, "_AXAddAssociatedPid");
+    if (!runtime.addAssociatedPid) {
+        runtime.addAssociatedPid = (CloudCodeAXAddAssociatedPidFn)CloudCodeResolve(runtime.handle, "AXAddAssociatedPid");
+    }
     runtime.setRequestingClient = (CloudCodeAXSetRequestingClientFn)CloudCodeResolve(runtime.handle, "__AXSetRequestingClient");
     runtime.valueGetTypeID = (CloudCodeAXValueGetTypeIDFn)CloudCodeResolve(runtime.handle, "AXValueGetTypeID");
     runtime.valueGetType = (CloudCodeAXValueGetTypeFn)CloudCodeResolve(runtime.handle, "AXValueGetType");
     runtime.valueGetValue = (CloudCodeAXValueGetValueFn)CloudCodeResolve(runtime.handle, "AXValueGetValue");
+    runtime.attributeChildren = CloudCodeResolveCFString(runtime.handle, "kAXXCAttributeChildren", CFSTR("AXChildren"));
+    runtime.attributeFrame = CloudCodeResolveCFString(runtime.handle, "kAXXCAttributeFrame", CFSTR("AXFrame"));
+    runtime.attributeLabel = CloudCodeResolveCFString(runtime.handle, "kAXXCAttributeLabel", CFSTR("AXLabel"));
+    runtime.attributeIdentifier = CloudCodeResolveCFString(runtime.handle, "kAXXCAttributeIdentifier", CFSTR("AXIdentifier"));
+    runtime.attributeValue = CloudCodeResolveCFString(runtime.handle, "kAXXCAttributeValue", CFSTR("AXValue"));
+    runtime.attributePlaceholder = CloudCodeResolveCFString(runtime.handle, "kAXXCAttributePlaceholderValue", CFSTR("AXPlaceholderValue"));
+    runtime.attributeElementType = CloudCodeResolveCFString(runtime.handle, "kAXXCAttributeElementType", CFSTR("AXRole"));
     return runtime;
 }
 
@@ -411,20 +579,24 @@ static NSDictionary *CloudCodeAXNode(CloudCodeAXRuntime runtime, CloudCodeAXUIEl
     if (!element || depth > 20 || !nodeCount || *nodeCount >= CLOUDCODE_GUI_MAX_TREE_NODES) { return nil; }
     (*nodeCount)++;
     NSMutableDictionary *node = [NSMutableDictionary dictionary];
-    NSArray<NSArray *> *attributes = @[
-        @[@"role", @"AXRole"], @[@"label", @"AXLabel"], @[@"value", @"AXValue"],
-        @[@"title", @"AXTitle"], @[@"identifier", @"AXIdentifier"], @[@"placeholder", @"AXPlaceholderValue"]
+    NSArray<NSDictionary *> *attributes = @[
+        @{@"key": @"role", @"attribute": (__bridge id)(runtime.attributeElementType ?: CFSTR("AXRole"))},
+        @{@"key": @"label", @"attribute": (__bridge id)(runtime.attributeLabel ?: CFSTR("AXLabel"))},
+        @{@"key": @"value", @"attribute": (__bridge id)(runtime.attributeValue ?: CFSTR("AXValue"))},
+        @{@"key": @"title", @"attribute": @"AXTitle"},
+        @{@"key": @"identifier", @"attribute": (__bridge id)(runtime.attributeIdentifier ?: CFSTR("AXIdentifier"))},
+        @{@"key": @"placeholder", @"attribute": (__bridge id)(runtime.attributePlaceholder ?: CFSTR("AXPlaceholderValue"))}
     ];
-    for (NSArray *pair in attributes) {
-        id raw = CloudCodeAXCopy(runtime, element, (__bridge CFStringRef)pair[1]);
+    for (NSDictionary *pair in attributes) {
+        id raw = CloudCodeAXCopy(runtime, element, (__bridge CFStringRef)pair[@"attribute"]);
         NSString *text = CloudCodeBoundedString(raw);
-        if (text) { node[pair[0]] = text; }
+        if (text) { node[pair[@"key"]] = text; }
     }
-    id frameValue = CloudCodeAXCopy(runtime, element, CFSTR("AXFrame"));
+    id frameValue = CloudCodeAXCopy(runtime, element, runtime.attributeFrame ?: CFSTR("AXFrame"));
     NSDictionary *frame = CloudCodeFrameDictionary(runtime, frameValue);
     if (frame) { node[@"frame"] = frame; }
 
-    id childrenValue = CloudCodeAXCopy(runtime, element, CFSTR("AXChildren"));
+    id childrenValue = CloudCodeAXCopy(runtime, element, runtime.attributeChildren ?: CFSTR("AXChildren"));
     if ([childrenValue isKindOfClass:NSArray.class] && depth < 20) {
         NSMutableArray *children = [NSMutableArray array];
         for (id child in (NSArray *)childrenValue) {
@@ -438,14 +610,76 @@ static NSDictionary *CloudCodeAXNode(CloudCodeAXRuntime runtime, CloudCodeAXUIEl
     return node;
 }
 
+static CloudCodeAXUIElementRef CloudCodeAXFindElementForPid(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef element, pid_t targetPid, NSUInteger depth, NSUInteger *visited)
+{
+    if (!element || targetPid <= 0 || !visited || depth > 8 || *visited >= CLOUDCODE_GUI_MAX_TREE_NODES) { return NULL; }
+    (*visited)++;
+    if (runtime.getPid) {
+        pid_t candidatePid = 0;
+        CloudCodeAXError code = -1;
+        @try { code = runtime.getPid(element, &candidatePid); } @catch (__unused NSException *exception) { code = -1; }
+        if (code == 0 && candidatePid == targetPid) {
+            CFRetain(element);
+            return element;
+        }
+    }
+    id childrenValue = CloudCodeAXCopy(runtime, element, runtime.attributeChildren ?: CFSTR("AXChildren"));
+    if (![childrenValue isKindOfClass:NSArray.class]) { return NULL; }
+    for (id child in (NSArray *)childrenValue) {
+        CloudCodeAXUIElementRef childElement = (CloudCodeAXUIElementRef)(__bridge CFTypeRef)child;
+        CloudCodeAXUIElementRef match = CloudCodeAXFindElementForPid(runtime, childElement, targetPid, depth + 1, visited);
+        if (match) { return match; }
+    }
+    return NULL;
+}
+
+static CloudCodeAXUIElementRef CloudCodeAXRootForPid(CloudCodeAXRuntime runtime, pid_t pid, NSString **backend)
+{
+    CloudCodeAXUIElementRef root = NULL;
+    if (runtime.createApplication) {
+        @try { root = runtime.createApplication(pid); } @catch (__unused NSException *exception) { root = NULL; }
+        if (root) { if (backend) *backend = @"AXRuntime.application"; return root; }
+    }
+    if (runtime.createAppElementWithPid) {
+        @try { root = runtime.createAppElementWithPid(pid); } @catch (__unused NSException *exception) { root = NULL; }
+        if (root) { if (backend) *backend = @"AXRuntime.privateAppElement"; return root; }
+    }
+    if (runtime.createSystemWide && runtime.getPid) {
+        CloudCodeAXUIElementRef systemWide = NULL;
+        @try { systemWide = runtime.createSystemWide(); } @catch (__unused NSException *exception) { systemWide = NULL; }
+        if (systemWide) {
+            if (runtime.setTimeout) { @try { runtime.setTimeout(systemWide, 1.5f); } @catch (__unused NSException *exception) {} }
+            NSUInteger visited = 0;
+            root = CloudCodeAXFindElementForPid(runtime, systemWide, pid, 0, &visited);
+            CFRelease(systemWide);
+            if (root) { if (backend) *backend = @"AXRuntime.systemWide"; return root; }
+        }
+    }
+    return NULL;
+}
+
 static NSData *CloudCodeFrontmostTreeData(void)
 {
     NSString *bundleID = CloudCodeFrontmostBundleID();
+    if (bundleID.length == 0) {
+        fprintf(stderr, "gui-tree: SpringBoardServices did not return a frontmost bundle identifier\n");
+        return nil;
+    }
     NSString *bundlePath = CloudCodeBundlePathForIdentifier(bundleID);
+    if (bundlePath.length == 0) {
+        fprintf(stderr, "gui-tree: LaunchServices could not resolve the frontmost bundle path\n");
+        return nil;
+    }
     pid_t pid = CloudCodePIDForBundlePath(bundlePath);
-    if (bundleID.length == 0 || pid <= 0) { return nil; }
+    if (pid <= 0) {
+        fprintf(stderr, "gui-tree: no running PID matched the frontmost application bundle path\n");
+        return nil;
+    }
     CloudCodeAXRuntime runtime = CloudCodeResolveAX();
-    if (!runtime.createApplication || !runtime.copyAttribute) { return nil; }
+    if ((!runtime.createApplication && !runtime.createAppElementWithPid && !runtime.createSystemWide) || !runtime.copyAttribute) {
+        fprintf(stderr, "gui-tree: required AXRuntime creation/copy symbols are unavailable\n");
+        return nil;
+    }
     if (runtime.setRequestingClient) { runtime.setRequestingClient(2); }
     if (runtime.addAssociatedPid) {
         runtime.addAssociatedPid(getpid(), pid, 0);
@@ -453,18 +687,31 @@ static NSData *CloudCodeFrontmostTreeData(void)
         runtime.addAssociatedPid(pid, getpid(), 0);
         runtime.addAssociatedPid(pid, getpid(), 1);
     }
-    CloudCodeAXUIElementRef root = NULL;
-    @try { root = runtime.createApplication(pid); } @catch (__unused NSException *exception) { root = NULL; }
-    if (!root) { return nil; }
+    NSString *backend = nil;
+    CloudCodeAXUIElementRef root = CloudCodeAXRootForPid(runtime, pid, &backend);
+    if (!root) {
+        fprintf(stderr, "gui-tree: AXRuntime could not create or locate an element for pid %d\n", pid);
+        return nil;
+    }
     if (runtime.setTimeout) { @try { runtime.setTimeout(root, 1.5f); } @catch (__unused NSException *exception) {} }
     NSUInteger nodeCount = 0;
     NSDictionary *rootNode = CloudCodeAXNode(runtime, root, 0, &nodeCount);
     CFRelease(root);
-    if (!rootNode || nodeCount == 0) { return nil; }
-    NSDictionary *payload = @{@"backend": @"AXRuntime", @"bundleId": bundleID, @"pid": @(pid), @"nodeCount": @(nodeCount), @"tree": rootNode};
+    if (!rootNode || nodeCount == 0) {
+        fprintf(stderr, "gui-tree: AX root existed but no readable UI nodes were returned\n");
+        return nil;
+    }
+    NSDictionary *payload = @{@"backend": backend ?: @"AXRuntime", @"bundleId": bundleID, @"pid": @(pid), @"nodeCount": @(nodeCount), @"tree": rootNode};
     NSError *error = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
-    if (!data || error || data.length == 0 || data.length > CLOUDCODE_GUI_MAX_TREE_BYTES) { return nil; }
+    if (!data || error || data.length == 0) {
+        fprintf(stderr, "gui-tree: AX tree JSON serialization failed\n");
+        return nil;
+    }
+    if (data.length > CLOUDCODE_GUI_MAX_TREE_BYTES) {
+        fprintf(stderr, "gui-tree: AX tree output exceeded %d bytes\n", CLOUDCODE_GUI_MAX_TREE_BYTES);
+        return nil;
+    }
     return data;
 }
 
@@ -518,10 +765,16 @@ int CloudCodeGUIScreenshotBase64(void)
 {
     @autoreleasepool {
         NSData *data = CloudCodeScreenshotJPEG();
-        if (!data) { return 63; }
+        if (!data) {
+            fprintf(stderr, "gui-screenshot: render-server IOSurface, _UICreateScreenUIImage, and UIWindow IOSurface backends all failed or could not produce a bounded JPEG\n");
+            return 63;
+        }
         NSString *encoded = [data base64EncodedStringWithOptions:0];
         NSData *output = [encoded dataUsingEncoding:NSUTF8StringEncoding];
-        if (!output || output.length > (CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES * 2)) { return 63; }
+        if (!output || output.length > (CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES * 2)) {
+            fprintf(stderr, "gui-screenshot: base64 output exceeded the app-layer capture bound\n");
+            return 63;
+        }
         CloudCodePrintData(output);
         return 0;
     }

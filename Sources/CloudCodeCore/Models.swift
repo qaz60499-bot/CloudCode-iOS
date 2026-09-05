@@ -424,6 +424,19 @@ public struct TaskCheckpoint: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+public enum ModelReasoningEffort: String, Codable, CaseIterable, Hashable, Sendable {
+    case automatic
+    case low
+    case medium
+    case high
+    case xhigh
+    case max
+
+    public var providerValue: String? {
+        self == .automatic ? nil : rawValue
+    }
+}
+
 public struct ProviderConfiguration: Codable, Equatable, Identifiable, Sendable {
     public var id: UUID
     public var name: String
@@ -435,6 +448,7 @@ public struct ProviderConfiguration: Codable, Equatable, Identifiable, Sendable 
     public var authModeName: String?
     public var fallbackAPIKeyReferences: [String]?
     public var allowSameProviderKeyFailover: Bool?
+    public var reasoningEffort: ModelReasoningEffort?
 
     public init(
         id: UUID = UUID(),
@@ -446,7 +460,8 @@ public struct ProviderConfiguration: Codable, Equatable, Identifiable, Sendable 
         protocolName: String? = nil,
         authModeName: String? = nil,
         fallbackAPIKeyReferences: [String]? = nil,
-        allowSameProviderKeyFailover: Bool? = nil
+        allowSameProviderKeyFailover: Bool? = nil,
+        reasoningEffort: ModelReasoningEffort? = nil
     ) {
         self.id = id
         self.name = name
@@ -458,6 +473,7 @@ public struct ProviderConfiguration: Codable, Equatable, Identifiable, Sendable 
         self.authModeName = authModeName
         self.fallbackAPIKeyReferences = fallbackAPIKeyReferences
         self.allowSameProviderKeyFailover = allowSameProviderKeyFailover
+        self.reasoningEffort = reasoningEffort
     }
 }
 

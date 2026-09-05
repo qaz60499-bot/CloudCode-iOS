@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>application-identifier</key>
+    <string>TROLLTROLL.*</string>
+    <key>com.apple.developer.team-identifier</key>
+    <string>TROLLTROLL</string>
+    <key>get-task-allow</key>
+    <true/>
+    <key>keychain-access-groups</key>
+    <array>
+        <string>TROLLTROLL.*</string>
+        <string>com.apple.token</string>
+    </array>
+    <key>com.apple.private.security.no-sandbox</key>
+    <true/>
+    <key>platform-application</key>
+    <true/>
+    <key>com.apple.private.security.storage.AppDataContainers</key>
+    <true/>
+    <key>com.apple.private.persona-mgmt</key>
+    <true/>
+
+    <!-- Exact-operation GUI backends run only in this isolated helper. Keep these private
+         capabilities off the SwiftUI host so a device-specific GUI entitlement cannot destabilize
+         ordinary app startup. Presence is never treated as proof: tree/screenshot/touch still
+         perform bounded runtime validation and fail closed on unsupported iOS builds. -->
+    <key>com.apple.hid.system.server-access</key>
+    <true/>
+    <key>com.apple.private.hid.client.event-dispatch</key>
+    <true/>
+    <key>com.apple.accessibility.api</key>
+    <true/>
+    <key>com.apple.QuartzCore.displayable-context</key>
+    <true/>
+    <key>com.apple.QuartzCore.global-capture</key>
+    <true/>
+</dict>
+</plist>

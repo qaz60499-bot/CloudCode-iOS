@@ -358,6 +358,7 @@ public enum ProviderCheckpointConfigurationResolver {
         let ordered = profile.orderedKeyReferences(selectedKeySlotID: slot.id)
         let allowedFallbacks = storedFallbacks.filter { $0 != primaryReference && ordered.contains($0) }
         let allowFailover = profile.autoRotateKeys && payload["provider.sameProviderFailover"] == "true"
+        let reasoningEffort = ModelReasoningEffort(rawValue: payload["provider.reasoningEffort"] ?? ModelReasoningEffort.automatic.rawValue) ?? .automatic
         return ProviderConfiguration(
             name: profile.displayName,
             baseURL: profile.baseURL,
@@ -367,7 +368,8 @@ public enum ProviderCheckpointConfigurationResolver {
             protocolName: profile.protocolFor(model: model, keySlotID: slot.id).rawValue,
             authModeName: profile.authMode.rawValue,
             fallbackAPIKeyReferences: allowFailover ? allowedFallbacks : [],
-            allowSameProviderKeyFailover: allowFailover
+            allowSameProviderKeyFailover: allowFailover,
+            reasoningEffort: reasoningEffort
         )
     }
 

@@ -485,13 +485,15 @@ private extension ProviderRequestBuilding {
         AsyncThrowingStream { continuation in
             let task = Task {
                 var attempt = 1
+                var requestConfiguration = configuration
+                var didDropReasoningEffortForCompatibility = false
                 while attempt <= retryPolicy.maxAttempts {
                     var responseStarted = false
                     var successfulStreamEstablished = false
                     var transport: ProviderStreamingTransport?
                     var endpoint = (configuration.baseURL.host ?? "") + configuration.baseURL.path
                     do {
-                        let request = try makeRequest(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
+                        let request = try makeRequest(configuration: requestConfiguration, apiKey: apiKey, messages: messages, tools: tools)
                         endpoint = (request.url?.host ?? configuration.baseURL.host ?? "") + (request.url?.path ?? configuration.baseURL.path)
                         try? await diagnosticLogger?.log(
                             level: .info,
@@ -501,6 +503,7 @@ private extension ProviderRequestBuilding {
                             metadata: [
                                 "providerID": configuration.providerID ?? "",
                                 "model": configuration.model,
+                                "reasoningEffort": requestConfiguration.reasoningEffort?.rawValue ?? ModelReasoningEffort.automatic.rawValue,
                                 "protocol": configuration.protocolName ?? "",
                                 "authMode": configuration.authModeName ?? ProviderAuthMode.bearer.rawValue,
                                 "attempt": String(attempt),
@@ -524,6 +527,7 @@ private extension ProviderRequestBuilding {
                                 "attempt": String(attempt),
                                 "providerID": configuration.providerID ?? "",
                                 "model": configuration.model,
+                                "reasoningEffort": requestConfiguration.reasoningEffort?.rawValue ?? ModelReasoningEffort.automatic.rawValue,
                                 "protocol": configuration.protocolName ?? "",
                                 "host": http.url?.host ?? request.url?.host ?? "",
                                 "endpointPath": http.url?.path ?? request.url?.path ?? "",
@@ -542,6 +546,26 @@ private extension ProviderRequestBuilding {
                             } catch {
                                 // HTTP status is authoritative for classification; a truncated
                                 // error body must not turn a known 4xx/5xx into a transport replay.
+                            }
+                            if requestConfiguration.reasoningEffort?.providerValue != nil,
+                               !didDropReasoningEffortForCompatibility,
+                               ProviderCompatibilityClassifier.shouldRetryWithoutReasoningEffort(statusCode: http.statusCode, body: body) {
+                                didDropReasoningEffortForCompatibility = true
+                                requestConfiguration.reasoningEffort = .automatic
+                                try? await diagnosticLogger?.log(
+                                    level: .warning,
+                                    subsystem: "provider",
+                                    action: "request.compatibility-fallback",
+                                    result: "retry_without_reasoning_effort",
+                                    diagnostic: "中转站明确拒绝当前 effort/reasoning 字段；本次请求回退到自动档，不判定厂商不可用。",
+                                    metadata: [
+                                        "providerID": configuration.providerID ?? "",
+                                        "model": configuration.model,
+                                        "statusCode": String(http.statusCode),
+                                        "protocol": configuration.protocolName ?? ""
+                                    ]
+                                )
+                                continue
                             }
                             throw ProviderHTTPClassifier.error(for: http.statusCode, body: body) ?? ProviderError.invalidResponse(http.statusCode)
                         }
@@ -658,7 +682,8 @@ private extension ProviderRequestBuilding {
 }
 
 private func providerPayload(from line: String) -> String? {
-    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+    let boundaryWhitespace = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{feff}"))
+    let trimmed = line.trimmingCharacters(in: boundaryWhitespace)
     guard !trimmed.isEmpty else { return nil }
     if trimmed.hasPrefix(":") || trimmed.hasPrefix("event:") { return nil }
     if trimmed.hasPrefix("data:") {
@@ -710,6 +735,9 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
         if !tools.isEmpty {
             body["tools"] = tools.map(\.openAIChatObject)
             body["tool_choice"] = "auto"
+        }
+        if let effort = configuration.reasoningEffort?.providerValue {
+            body["reasoning_effort"] = effort
         }
         return try ProviderRequestFactory.jsonPOST(url: url, apiKey: apiKey, authMode: ProviderRequestFactory.authMode(configuration), body: body)
     }
@@ -825,6 +853,9 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
         ]
         if !systemText.isEmpty { body["system"] = systemText }
         if !tools.isEmpty { body["tools"] = tools.map(\.anthropicObject) }
+        if let effort = configuration.reasoningEffort?.providerValue {
+            body["output_config"] = ["effort": effort]
+        }
         var request = try ProviderRequestFactory.jsonPOST(url: url, apiKey: apiKey, authMode: ProviderRequestFactory.authMode(configuration), body: body)
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         return request
@@ -845,8 +876,46 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
                     break
                 }
                 guard let data = payload.data(using: .utf8),
-                      let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let type = object["type"] as? String else { continue }
+                      let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+
+                // Some Anthropic-compatible gateways occasionally proxy a valid HTTP 200 stream
+                // using OpenAI-style `choices` envelopes even though the selected endpoint is
+                // /v1/messages. Treat that shape as a compatibility envelope instead of reporting
+                // the vendor as down; once any token/tool output is emitted normal replay safety
+                // rules still apply.
+                if let choices = object["choices"] as? [[String: Any]], let choice = choices.first {
+                    sawEvent = true
+                    if let delta = choice["delta"] as? [String: Any] {
+                        if let content = providerText(from: delta["content"]), !content.isEmpty {
+                            outputStarted = true
+                            continuation.yield(.token(content))
+                        }
+                        if let toolCalls = delta["tool_calls"] as? [[String: Any]] {
+                            for raw in toolCalls {
+                                let index = raw["index"] as? Int ?? 0
+                                var call = calls[index] ?? ToolCallAccumulator()
+                                if let id = raw["id"] as? String { call.id = id }
+                                if let function = raw["function"] as? [String: Any] {
+                                    if let name = function["name"] as? String { call.name += name }
+                                    if let arguments = function["arguments"] as? String { call.arguments += arguments }
+                                }
+                                calls[index] = call
+                                outputStarted = true
+                            }
+                        }
+                    }
+                    if let finishReason = choice["finish_reason"] as? String, !finishReason.isEmpty {
+                        terminal = true
+                    }
+                    continue
+                }
+
+                if let errorObject = object["error"] {
+                    let detail = providerText(from: errorObject) ?? "Anthropic 兼容流返回错误对象"
+                    throw ProviderError.transport(detail)
+                }
+
+                guard let type = object["type"] as? String else { continue }
                 sawEvent = true
                 switch type {
                 case "content_block_start":
@@ -968,6 +1037,9 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
             "input": try responsesInput(messages)
         ]
         if !tools.isEmpty { body["tools"] = tools.map(\.openAIResponsesObject) }
+        if let effort = configuration.reasoningEffort?.providerValue {
+            body["reasoning"] = ["effort": effort]
+        }
         return try ProviderRequestFactory.jsonPOST(url: url, apiKey: apiKey, authMode: ProviderRequestFactory.authMode(configuration), body: body)
     }
 
@@ -1279,6 +1351,26 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
         case .openAIResponses: return responses
         case .openAIChat, .none: return openAIChat
         }
+    }
+}
+
+public enum ProviderCompatibilityClassifier {
+    public static func shouldRetryWithoutReasoningEffort(statusCode: Int, body: Data) -> Bool {
+        guard statusCode == 400 || statusCode == 422 else { return false }
+        let text = String(data: body.prefix(262_144), encoding: .utf8)?.lowercased() ?? ""
+        guard !text.isEmpty else { return false }
+        let mentionsEffortField = text.contains("reasoning_effort")
+            || text.contains("output_config")
+            || text.contains("reasoning.effort")
+            || (text.contains("effort") && text.contains("reasoning"))
+        let indicatesUnsupportedField = text.contains("unknown")
+            || text.contains("unsupported")
+            || text.contains("unrecognized")
+            || text.contains("not allowed")
+            || text.contains("extra field")
+            || text.contains("invalid field")
+            || text.contains("invalid parameter")
+        return mentionsEffortField && indicatesUnsupportedField
     }
 }
 

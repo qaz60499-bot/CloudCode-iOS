@@ -55,6 +55,32 @@ public enum HarnessContextManager {
             selectedIndexes.insert(latestUser)
         }
 
+        // Tool calls/results are one logical provider-history unit. The reverse budget pass
+        // already forces an assistant call in when its selected tool result needs it, but the
+        // opposite can still happen: a small assistant tool-call record may fit while the large
+        // tool result immediately after it does not. Remove either side unless both survived.
+        let selectedToolResultIDs = Set(selectedIndexes.compactMap { index -> String? in
+            let message = messages[index]
+            guard message.role == .tool else { return nil }
+            let id = message.providerMetadata["tool_call_id"]
+            return (id?.isEmpty == false) ? id : nil
+        })
+        let selectedAssistantToolIDs = Set(selectedIndexes.compactMap { index -> String? in
+            let message = messages[index]
+            guard message.role == .assistant else { return nil }
+            let id = message.providerMetadata["tool_call_id"]
+            return (id?.isEmpty == false) ? id : nil
+        })
+        let completeToolCallIDs = selectedToolResultIDs.intersection(selectedAssistantToolIDs)
+        selectedIndexes = Set(selectedIndexes.filter { index in
+            let message = messages[index]
+            guard let id = message.providerMetadata["tool_call_id"], !id.isEmpty else { return true }
+            if message.role == .assistant || message.role == .tool {
+                return completeToolCallIDs.contains(id)
+            }
+            return true
+        })
+
         var result = systemMessages
         let omitted = conversational.count - selectedIndexes.count
         if omitted > 0 {
