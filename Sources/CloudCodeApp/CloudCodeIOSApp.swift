@@ -31,7 +31,7 @@ struct CloudCodeIOSApp: App {
                 case .active:
                     model.refreshAfterForeground()
                 case .inactive:
-                    break
+                    model.prepareForBackgroundTransition()
                 @unknown default:
                     break
                 }

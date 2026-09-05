@@ -17,7 +17,7 @@
 #define CLOUDCODE_GUI_MAX_TREE_BYTES (256 * 1024)
 #define CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES (700 * 1024)
 #define CLOUDCODE_GUI_MAX_TEXT_UTF8_BYTES (16 * 1024)
-#define CLOUDCODE_GUI_FALLBACK_SENDER_ID 0x8000000817319375ULL
+#define CLOUDCODE_GUI_SENDER_ID 0x8000000817319371ULL
 #define CLOUDCODE_GUI_PARENT_INDEX 0u
 #define CLOUDCODE_GUI_PARENT_IDENTITY 0u
 #define CLOUDCODE_GUI_FINGER_INDEX 2u
@@ -252,7 +252,7 @@ static BOOL CloudCodeResolveBackBoardRouteAtPoint(CGPoint point, CloudCodeHIDRun
             route->taskPort = taskPort;
             route->usesBackBoardRoute = YES;
             route->usesBundleRoute = YES;
-            fprintf(stderr, "gui-hid-route: backboard-bundle bundle=%s contextID=%u taskPort=%u\n", bundleID.UTF8String ?: "", contextID, taskPort);
+            fprintf(stderr, "gui-hid-route: profile=modern-trollstore route=backboard-bundle bundle=%s contextID=%u taskPort=%u\n", bundleID.UTF8String ?: "", contextID, taskPort);
             return YES;
         }
     }
@@ -268,12 +268,12 @@ static BOOL CloudCodeResolveBackBoardRouteAtPoint(CGPoint point, CloudCodeHIDRun
             route->taskPort = taskPort;
             route->usesBackBoardRoute = YES;
             route->usesBundleRoute = NO;
-            fprintf(stderr, "gui-hid-route: backboard-context bundle=%s contextID=%u taskPort=%u\n", bundleID.UTF8String ?: "", contextID, taskPort);
+            fprintf(stderr, "gui-hid-route: profile=modern-trollstore route=backboard-context bundle=%s contextID=%u taskPort=%u\n", bundleID.UTF8String ?: "", contextID, taskPort);
             return YES;
         }
     }
 
-    fprintf(stderr, "gui-hid-route: BackBoard route unavailable bundle=%s contextID=%u taskPort=%u\n", bundleID.UTF8String ?: "", contextID, taskPort);
+    fprintf(stderr, "gui-hid-route: profile=modern-trollstore route=backboard-unavailable bundle=%s contextID=%u taskPort=%u\n", bundleID.UTF8String ?: "", contextID, taskPort);
     return NO;
 }
 
@@ -283,15 +283,17 @@ static BOOL CloudCodeHIDReady(CloudCodeHIDRuntime runtime, CGPoint point, CloudC
         return NO;
     }
     *route = (CloudCodeHIDRoute){0};
-    // Build 53 proved that an apparently successful generic system-client dispatch can still be
-    // ignored by the foreground app. Prefer a BackBoard connection resolved for the visible
-    // bundle/window context; retain the historical global system client only as a fallback.
-    if (CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route)) { return YES; }
+    // Current TrollVNC uses the global IOHID event-system client with sender 0x8000000817319371.
+    // Prefer that route first for TrollStore/root-helper injection. BackBoard targeted routing is
+    // retained only as a compatibility fallback when a system client cannot be created.
     if (runtime.createClient && runtime.dispatch) {
         route->systemClient = runtime.createClient(kCFAllocatorDefault);
-        if (route->systemClient) { return YES; }
+        if (route->systemClient) {
+            fprintf(stderr, "gui-hid-route: profile=modern-trollstore route=system-client\n");
+            return YES;
+        }
     }
-    return NO;
+    return CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route);
 }
 
 static void CloudCodeReleaseHIDRoute(CloudCodeHIDRoute *route)
@@ -377,7 +379,7 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
     CloudCodeIOHIDEventRef child = runtime.createFinger(
         kCFAllocatorDefault, mach_absolute_time(),
         CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY, eventMask,
-        nx, ny, 0, 0, 0, range && touching, touching, 0
+        nx, ny, 0, 0, 90.0, range && touching, touching, 0
     );
     if (!child) {
         CFRelease(parent);
@@ -403,7 +405,7 @@ static BOOL CloudCodeDispatchTouch(CloudCodeHIDRuntime runtime, CloudCodeHIDRout
     if (route.usesBackBoardRoute && route.routedConnection && runtime.dispatchConnection) {
         runtime.dispatchConnection(route.routedConnection, event);
     } else if (route.systemClient && runtime.dispatch) {
-        if (runtime.setSender) { runtime.setSender(event, CLOUDCODE_GUI_FALLBACK_SENDER_ID); }
+        if (runtime.setSender) { runtime.setSender(event, CLOUDCODE_GUI_SENDER_ID); }
         runtime.dispatch(route.systemClient, event);
     } else {
         CFRelease(event);
@@ -427,11 +429,12 @@ static BOOL CloudCodePerformTap(double x, double y)
         // The helper is intentionally short-lived. Keep the selected HID route alive briefly after
         // the final lift packet so the last BackBoard/Mach delivery cannot be torn down with the process.
         usleep(100000);
-        fprintf(stderr, "gui-hid: tap submitted route=%s contextID=%u taskPort=%u screen=%.0fx%.0f point=(%.2f,%.2f) normalized=(%.5f,%.5f) parentIndex=%u fingerIndex=%u fingerIdentity=%u\n",
-                route.usesBackBoardRoute ? (route.usesBundleRoute ? "backboard-bundle" : "backboard-context") : "system-client-fallback",
+        fprintf(stderr, "gui-hid: profile=modern-trollstore result=dispatched-unverified route=%s contextID=%u taskPort=%u screen=%.0fx%.0f point=(%.2f,%.2f) normalized=(%.5f,%.5f) parentIndex=%u fingerIndex=%u fingerIdentity=%u sender=0x%llx\n",
+                route.usesBackBoardRoute ? (route.usesBundleRoute ? "backboard-bundle" : "backboard-context") : "system-client",
                 route.contextID, route.taskPort,
                 size.width, size.height, x, y, nx, ny,
-                CLOUDCODE_GUI_PARENT_INDEX, CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY);
+                CLOUDCODE_GUI_PARENT_INDEX, CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY,
+                (unsigned long long)CLOUDCODE_GUI_SENDER_ID);
     }
     CloudCodeReleaseHIDRoute(&route);
     return ok;
@@ -460,13 +463,14 @@ static BOOL CloudCodePerformSwipe(double fromX, double fromY, double toX, double
     }
     if (ok) {
         usleep(100000);
-        fprintf(stderr, "gui-hid: swipe submitted route=%s contextID=%u taskPort=%u screen=%.0fx%.0f from=(%.2f,%.2f) to=(%.2f,%.2f) normalizedFrom=(%.5f,%.5f) normalizedTo=(%.5f,%.5f) duration=%.3f steps=%d parentIndex=%u fingerIndex=%u fingerIdentity=%u\n",
-                route.usesBackBoardRoute ? (route.usesBundleRoute ? "backboard-bundle" : "backboard-context") : "system-client-fallback",
+        fprintf(stderr, "gui-hid: profile=modern-trollstore result=dispatched-unverified route=%s contextID=%u taskPort=%u screen=%.0fx%.0f from=(%.2f,%.2f) to=(%.2f,%.2f) normalizedFrom=(%.5f,%.5f) normalizedTo=(%.5f,%.5f) duration=%.3f steps=%d parentIndex=%u fingerIndex=%u fingerIdentity=%u sender=0x%llx\n",
+                route.usesBackBoardRoute ? (route.usesBundleRoute ? "backboard-bundle" : "backboard-context") : "system-client",
                 route.contextID, route.taskPort,
                 size.width, size.height, fromX, fromY, toX, toY,
                 fromX / size.width, fromY / size.height, toX / size.width, toY / size.height,
                 durationSeconds, steps,
-                CLOUDCODE_GUI_PARENT_INDEX, CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY);
+                CLOUDCODE_GUI_PARENT_INDEX, CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY,
+                (unsigned long long)CLOUDCODE_GUI_SENDER_ID);
     }
     CloudCodeReleaseHIDRoute(&route);
     return ok;
@@ -1430,7 +1434,7 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
         if (route.usesBackBoardRoute && route.routedConnection && runtime.dispatchConnection) {
             runtime.dispatchConnection(route.routedConnection, event);
         } else if (route.systemClient && runtime.dispatch) {
-            if (runtime.setSender) { runtime.setSender(event, CLOUDCODE_GUI_FALLBACK_SENDER_ID); }
+            if (runtime.setSender) { runtime.setSender(event, CLOUDCODE_GUI_SENDER_ID); }
             runtime.dispatch(route.systemClient, event);
         } else {
             CFRelease(event);

@@ -361,10 +361,13 @@ jobs:
           if not helper.exists():
               raise SystemExit('FAIL: CloudCodeRootHelper source is missing')
           helper_text = helper.read_text(encoding='utf-8')
-          for marker in ('targetPID, 1u, 10004u', 'initWithPID:flags:reason:name:withHandler:', 'poll(&pollFD, 1, 1800)', 'background-assert: acquired', 'flags=1 reason=10004', 'BackgroundAssertionWorkerStatus'):
+          for marker in ('background-assert-worker', 'posix_spawn(&workerPID', 'targetPID, 1u, 10004u', 'initWithPID:flags:reason:name:withHandler:acquire:', 'initWithPID:flags:reason:name:withHandler:', 'poll(&pollFD, 1, 2500)', 'background-assert: acquired', 'spawn=posix_spawn flags=1 reason=10004', 'BackgroundAssertionWorkerStatus'):
               if marker not in helper_text:
-                  raise SystemExit(f'FAIL: privileged background assertion worker lost WebKit-aligned safety/runtime marker: {marker}')
-          for marker in ('enumerate-json', 'probe-filesystem-json', 'probe-launch', 'probe-uninstall', 'is-installed', 'launch', 'uninstall', 'cleanup-unregistered', 'MCMMetadataIdentifier', 'BundleFilesystemOrphans', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-type-base64', 'background-assert-start', 'background-assert-status', 'background-assert-stop', 'BKSProcessAssertion', 'CloudCode.BackgroundAgent'):
+                  raise SystemExit(f'FAIL: privileged background assertion worker lost detached-spawn/runtime marker: {marker}')
+          background_section = helper_text.split('static int BackgroundAssertionWorker(', 1)[1].split('static int StopDetachedBackgroundAssertion(', 1)[0]
+          if 'fork(' in background_section:
+              raise SystemExit('FAIL: background assertion worker must not initialize Objective-C/private frameworks after fork')
+          for marker in ('enumerate-json', 'probe-filesystem-json', 'probe-launch', 'probe-uninstall', 'is-installed', 'launch', 'uninstall', 'cleanup-unregistered', 'MCMMetadataIdentifier', 'BundleFilesystemOrphans', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-type-base64', 'background-assert-worker', 'background-assert-start', 'background-assert-status', 'background-assert-stop', 'BKSProcessAssertion', 'CloudCode.BackgroundAgent'):
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: root helper command missing: {marker}')
           bridge = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
@@ -387,10 +390,15 @@ jobs:
           gui_text = gui_helper.read_text(encoding='utf-8')
           if '#import <IOSurface/IOSurface.h>' in gui_text or '-framework IOSurface' in Path('project.yml').read_text(encoding='utf-8'):
               raise SystemExit('FAIL: GUI helper must resolve IOSurface at runtime because the iPhoneOS SDK does not expose IOSurface headers')
-          for marker in ('CLOUDCODE_GUI_MAX_TREE_NODES', 'CLOUDCODE_GUI_MAX_TREE_BYTES', 'CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES', 'CLOUDCODE_GUI_PARENT_INDEX 0u', 'CLOUDCODE_GUI_FINGER_INDEX 2u', 'CLOUDCODE_GUI_FALLBACK_SENDER_ID', 'IOHIDEventSystemClientCreate', 'IOHIDEventSystemConnectionDispatchEvent', 'BKSHIDEventSetDigitizerInfo', '_eventRoutingClientConnectionManager', 'clientForBundleID:', 'clientForTaskPort:', 'contextIdAtPosition:', 'taskPortOfContextId:', 'gui-hid-route: backboard-bundle', 'gui-hid-route: backboard-context', 'CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route)', 'CloudCodeScreenshotLooksInformative', 'rejected low-information frame', '_UICreateScreenUIImage', 'createScreenIOSurface', 'UICreateCGImageFromIOSurface', 'CARenderServerRenderDisplay', 'IOSurfaceCreate', 'IOSurfaceLock', 'IOSurfaceUnlock', 'IOSurfaceGetBaseAddress', 'IOSurfaceGetBytesPerRow', 'CloudCodeResolveAcrossFrameworks', 'ApplicationServices.framework/Frameworks/HIServices.framework/HIServices', 'RTLD_GLOBAL', 'AXUIElementCopyAttributeValue', 'AXUIElementSetAttributeValue', 'AXUIElementCreateSystemWide', '_AXUIElementCreateAppElementWithPid', 'AXUIElementCopyElementAtPosition', 'AXUIElementCopyApplicationAtPosition', 'AXUIElementCopyApplicationAndContextAtPosition', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'SBSCopyDisplayIdentifierForProcessID', 'AXFocusedApplication', 'AXHitTestSnapshot', 'main-screen-width', 'gui-tree: SpringBoardServices, AX focused-app, AX application-at-position, and AX element-at-position fallbacks all failed', 'gui-screenshot/render-server:', 'gui-screenshot/uiwindow-iosurface:', 'Keep explicit capability refresh lightweight'):
+          for marker in ('CLOUDCODE_GUI_MAX_TREE_NODES', 'CLOUDCODE_GUI_MAX_TREE_BYTES', 'CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES', 'CLOUDCODE_GUI_PARENT_INDEX 0u', 'CLOUDCODE_GUI_PARENT_IDENTITY 0u', 'CLOUDCODE_GUI_FINGER_INDEX 2u', 'CLOUDCODE_GUI_FINGER_IDENTITY 2u', 'CLOUDCODE_GUI_SENDER_ID 0x8000000817319371ULL', 'CLOUDCODE_HID_DIGITIZER_ATTRIBUTE', '90.0, range && touching', 'IOHIDEventSystemClientCreate', 'IOHIDEventSystemClientDispatchEvent', 'IOHIDEventSystemConnectionDispatchEvent', 'BKSHIDEventSetDigitizerInfo', '_eventRoutingClientConnectionManager', 'clientForBundleID:', 'clientForTaskPort:', 'contextIdAtPosition:', 'taskPortOfContextId:', 'profile=modern-trollstore route=system-client', 'profile=modern-trollstore route=backboard-bundle', 'profile=modern-trollstore route=backboard-context', 'result=dispatched-unverified', 'return CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route);', 'CloudCodeScreenshotLooksInformative', 'rejected low-information frame', '_UICreateScreenUIImage', 'createScreenIOSurface', 'UICreateCGImageFromIOSurface', 'CARenderServerRenderDisplay', 'IOSurfaceCreate', 'IOSurfaceLock', 'IOSurfaceUnlock', 'IOSurfaceGetBaseAddress', 'IOSurfaceGetBytesPerRow', 'CloudCodeResolveAcrossFrameworks', 'ApplicationServices.framework/Frameworks/HIServices.framework/HIServices', 'RTLD_GLOBAL', 'AXUIElementCopyAttributeValue', 'AXUIElementSetAttributeValue', 'AXUIElementCreateSystemWide', '_AXUIElementCreateAppElementWithPid', 'AXUIElementCopyElementAtPosition', 'AXUIElementCopyApplicationAtPosition', 'AXUIElementCopyApplicationAndContextAtPosition', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'SBSCopyDisplayIdentifierForProcessID', 'AXFocusedApplication', 'AXHitTestSnapshot', 'main-screen-width', 'gui-tree: SpringBoardServices, AX focused-app, AX application-at-position, and AX element-at-position fallbacks all failed', 'gui-screenshot/render-server:', 'gui-screenshot/uiwindow-iosurface:', 'Keep explicit capability refresh lightweight'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: GUI helper lost bounded/runtime marker: {marker}')
-          for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'run(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', 'guiProbe()', 'run(["gui-probe-json"], privilege: .root, timeout: 6)', 'run(["gui-tree-json"], privilege: .root, timeout: 5)', 'run(["gui-screenshot-base64"], privilege: .root, timeout: 6)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
+          hid_ready = gui_text.split('static BOOL CloudCodeHIDReady', 1)[1].split('static void CloudCodeReleaseHIDRoute', 1)[0]
+          if hid_ready.index('runtime.createClient') > hid_ready.index('CloudCodeResolveBackBoardRouteAtPoint'):
+              raise SystemExit('FAIL: modern TrollStore GUI routing must prefer the global IOHID system client before BackBoard fallback')
+          if '0x8000000817319375ULL' in gui_text or 'CLOUDCODE_GUI_FALLBACK_SENDER_ID' in gui_text:
+              raise SystemExit('FAIL: build53 legacy IOHID sender/profile leaked into build54 GUI helper')
+          for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'run(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'run(["gui-probe-json"], privilege: .root, timeout: 6)', 'run(["gui-tree-json"], privilege: .root, timeout: 5)', 'run(["gui-screenshot-base64"], privilege: .root, timeout: 6)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
               if marker not in adapters:
                   raise SystemExit(f'FAIL: GUI adapter lost bounded helper marker: {marker}')
           gui_executor = adapters.split('public struct GUIFallbackExecutor', 1)[1]
@@ -414,9 +422,9 @@ jobs:
                   raise SystemExit(f'FAIL: chat bottom-navigation behavior missing: {marker}')
 
           app_entry = Path('Sources/CloudCodeApp/CloudCodeIOSApp.swift').read_text(encoding='utf-8')
-          for marker in ('app.main.enter', 'firstScene.visibleWindow'):
+          for marker in ('app.main.enter', 'firstScene.visibleWindow', 'case .inactive:', 'model.prepareForBackgroundTransition()'):
               if marker not in app_entry:
-                  raise SystemExit(f'FAIL: startup breadcrumb marker missing: {marker}')
+                  raise SystemExit(f'FAIL: app lifecycle/startup marker missing: {marker}')
           if 'Task.sleep(nanoseconds: 450_000_000)' not in app_entry:
               raise SystemExit('FAIL: privileged startup must preserve a real first-frame visibility window before constructing CloudCodeViewModel')
           for marker in ('viewModel.init.begin', 'viewModel.init.end', 'bootstrap.safe.begin', 'bootstrap.safe.end', 'bootstrap.recovery.begin', 'bootstrap.recovery.ready'):
@@ -462,7 +470,7 @@ jobs:
           for marker in ('inheritedAutoResumeIntentAtLaunch', 'autoResumeArmedInCurrentProcess', 'runtime.autoresume.coldlaunch.suppressed'):
               if marker not in app:
                   raise SystemExit(f'FAIL: post-send cold-launch crash-loop guard missing: {marker}')
-          for marker in ('lifecycleInterruptedSessionIDs', 'settleLifecycleInterruptedRunsBeforeResume()', 'await agentCore.waitUntilSessionIdle(sessionID)', 'foreground.lifecycle-settle', 'backgroundAssertionWorkerPID', 'EmbeddedRootHelper.startBackgroundAssertion', 'backgroundAssertionIsAlive', 'background.assertion.continue', 'endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: false)'):
+          for marker in ('lifecycleInterruptedSessionIDs', 'settleLifecycleInterruptedRunsBeforeResume()', 'await agentCore.waitUntilSessionIdle(sessionID)', 'foreground.lifecycle-settle', 'backgroundAssertionWorkerPID', 'prepareForBackgroundTransition()', 'background.assertion.prearm', 'EmbeddedRootHelper.startBackgroundAssertion', 'backgroundAssertionIsAlive', 'background.assertion.continue', 'endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: false)'):
               if marker not in app:
                   raise SystemExit(f'FAIL: same-process background resume synchronization missing: {marker}')
           background_interrupt = app.split('private func interruptActiveRunForBackground(reason:', 1)[1].split('private func settleLifecycleInterruptedRunsBeforeResume()', 1)[0]

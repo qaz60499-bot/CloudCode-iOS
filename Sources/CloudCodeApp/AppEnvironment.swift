@@ -818,6 +818,20 @@ public final class CloudCodeViewModel: ObservableObject {
         syncVisibleSessionState(sessionID)
     }
 
+    public func prepareForBackgroundTransition() {
+        guard isRunning else { return }
+        beginBackgroundExecutionIfNeeded()
+        Task {
+            try? await diagnosticLogStore.log(
+                level: .info,
+                subsystem: "app",
+                action: "background.assertion.prearm",
+                result: backgroundAssertionWorkerPID == nil ? "fallback" : "armed",
+                metadata: ["runningSessions": String(runningSessionIDs.count)]
+            )
+        }
+    }
+
     public func suspendForBackground() {
         guard isRunning else { return }
         Task {
@@ -861,6 +875,20 @@ public final class CloudCodeViewModel: ObservableObject {
             }
         }
         #endif
+
+        if let workerPID = backgroundAssertionWorkerPID,
+           !EmbeddedRootHelper.backgroundAssertionIsAlive(workerPID: workerPID) {
+            backgroundAssertionWorkerPID = nil
+            Task {
+                try? await diagnosticLogStore.log(
+                    level: .warning,
+                    subsystem: "app",
+                    action: "background.assertion",
+                    result: "stale-worker",
+                    metadata: ["workerPID": String(workerPID)]
+                )
+            }
+        }
 
         if backgroundAssertionWorkerPID == nil {
             let targetPID = ProcessInfo.processInfo.processIdentifier
