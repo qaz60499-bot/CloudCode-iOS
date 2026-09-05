@@ -71,15 +71,26 @@ static NSString *CloudCodeCapturedText(NSData *captured, NSString *suffix)
     return [NSString stringWithFormat:@"%@\n%@", text, suffix];
 }
 
+static NSString *CloudCodeCombinedOutput(NSString *standardOutput, NSString *standardError)
+{
+    NSString *stdoutText = standardOutput ?: @"";
+    NSString *stderrText = standardError ?: @"";
+    if (stdoutText.length == 0) { return stderrText; }
+    if (stderrText.length == 0) { return stdoutText; }
+    return [NSString stringWithFormat:@"%@\n%@", stdoutText, stderrText];
+}
+
 static NSInteger CloudCodeSpawnHelperInternal(
     NSString *path,
     NSArray<NSString *> *arguments,
     BOOL asRoot,
     NSTimeInterval timeout,
-    NSString * _Nullable * _Nullable diagnostic
+    NSString * _Nullable * _Nullable standardOutput,
+    NSString * _Nullable * _Nullable standardError
 )
 {
-    if (diagnostic) { *diagnostic = nil; }
+    if (standardOutput) { *standardOutput = nil; }
+    if (standardError) { *standardError = nil; }
     if (path.length == 0) { return -1001; }
     if (timeout <= 0) { timeout = CLOUDCODE_HELPER_DEFAULT_TIMEOUT; }
 
@@ -128,23 +139,37 @@ static NSInteger CloudCodeSpawnHelperInternal(
         return -1200 - actionsInit;
     }
 
-    int diagnosticPipe[2] = {-1, -1};
-    BOOL captureOutput = diagnostic != NULL;
+    int stdoutPipe[2] = {-1, -1};
+    int stderrPipe[2] = {-1, -1};
+    BOOL captureStdout = standardOutput != NULL;
+    BOOL captureStderr = standardError != NULL;
+    BOOL captureOutput = captureStdout || captureStderr;
     NSInteger earlyFailure = 0;
-    if (captureOutput) {
-        if (pipe(diagnosticPipe) != 0) {
-            earlyFailure = -6000 - errno;
-        } else {
-            int actionError = posix_spawn_file_actions_adddup2(&actions, diagnosticPipe[1], STDOUT_FILENO);
-            if (actionError == 0) { actionError = posix_spawn_file_actions_adddup2(&actions, diagnosticPipe[1], STDERR_FILENO); }
-            if (actionError == 0) { actionError = posix_spawn_file_actions_addclose(&actions, diagnosticPipe[0]); }
-            if (actionError == 0) { actionError = posix_spawn_file_actions_addclose(&actions, diagnosticPipe[1]); }
-            if (actionError != 0) { earlyFailure = -6100 - actionError; }
+
+    if (captureStdout && pipe(stdoutPipe) != 0) {
+        earlyFailure = -6000 - errno;
+    }
+    if (earlyFailure == 0 && captureStderr && pipe(stderrPipe) != 0) {
+        earlyFailure = -6000 - errno;
+    }
+    if (earlyFailure == 0 && captureOutput) {
+        int actionError = 0;
+        if (captureStdout) {
+            actionError = posix_spawn_file_actions_adddup2(&actions, stdoutPipe[1], STDOUT_FILENO);
+            if (actionError == 0) { actionError = posix_spawn_file_actions_addclose(&actions, stdoutPipe[0]); }
+            if (actionError == 0) { actionError = posix_spawn_file_actions_addclose(&actions, stdoutPipe[1]); }
         }
+        if (actionError == 0 && captureStderr) {
+            actionError = posix_spawn_file_actions_adddup2(&actions, stderrPipe[1], STDERR_FILENO);
+            if (actionError == 0) { actionError = posix_spawn_file_actions_addclose(&actions, stderrPipe[0]); }
+            if (actionError == 0) { actionError = posix_spawn_file_actions_addclose(&actions, stderrPipe[1]); }
+        }
+        if (actionError != 0) { earlyFailure = -6100 - actionError; }
     }
 
     NSInteger result = 0;
-    NSMutableData *captured = captureOutput ? [NSMutableData data] : nil;
+    NSMutableData *capturedStdout = captureStdout ? [NSMutableData data] : nil;
+    NSMutableData *capturedStderr = captureStderr ? [NSMutableData data] : nil;
     NSString *diagnosticSuffix = @"";
 
     if (earlyFailure != 0) {
@@ -157,18 +182,25 @@ static NSInteger CloudCodeSpawnHelperInternal(
         if (spawnError != 0) {
             result = -3000 - spawnError;
         } else {
-            if (captureOutput) {
-                close(diagnosticPipe[1]);
-                diagnosticPipe[1] = -1;
-                int flags = fcntl(diagnosticPipe[0], F_GETFL, 0);
-                if (flags >= 0) { (void)fcntl(diagnosticPipe[0], F_SETFL, flags | O_NONBLOCK); }
+            if (captureStdout) {
+                close(stdoutPipe[1]);
+                stdoutPipe[1] = -1;
+                int flags = fcntl(stdoutPipe[0], F_GETFL, 0);
+                if (flags >= 0) { (void)fcntl(stdoutPipe[0], F_SETFL, flags | O_NONBLOCK); }
+            }
+            if (captureStderr) {
+                close(stderrPipe[1]);
+                stderrPipe[1] = -1;
+                int flags = fcntl(stderrPipe[0], F_GETFL, 0);
+                if (flags >= 0) { (void)fcntl(stderrPipe[0], F_SETFL, flags | O_NONBLOCK); }
             }
 
             const double start = CloudCodeMonotonicSeconds();
             int status = 0;
             BOOL finished = NO;
             while (!finished) {
-                if (captureOutput) { CloudCodeDrainPipe(diagnosticPipe[0], captured); }
+                if (captureStdout) { CloudCodeDrainPipe(stdoutPipe[0], capturedStdout); }
+                if (captureStderr) { CloudCodeDrainPipe(stderrPipe[0], capturedStderr); }
 
                 pid_t waited = waitpid(pid, &status, WNOHANG);
                 if (waited == pid) {
@@ -195,14 +227,22 @@ static NSInteger CloudCodeSpawnHelperInternal(
                 }
 
                 if (captureOutput) {
-                    struct pollfd pollFD = {.fd = diagnosticPipe[0], .events = POLLIN | POLLHUP, .revents = 0};
-                    (void)poll(&pollFD, 1, 50);
+                    struct pollfd pollFDs[2];
+                    nfds_t countFDs = 0;
+                    if (captureStdout) {
+                        pollFDs[countFDs++] = (struct pollfd){.fd = stdoutPipe[0], .events = POLLIN | POLLHUP, .revents = 0};
+                    }
+                    if (captureStderr) {
+                        pollFDs[countFDs++] = (struct pollfd){.fd = stderrPipe[0], .events = POLLIN | POLLHUP, .revents = 0};
+                    }
+                    if (countFDs > 0) { (void)poll(pollFDs, countFDs, 50); }
                 } else {
                     usleep(50000);
                 }
             }
 
-            if (captureOutput) { CloudCodeDrainPipe(diagnosticPipe[0], captured); }
+            if (captureStdout) { CloudCodeDrainPipe(stdoutPipe[0], capturedStdout); }
+            if (captureStderr) { CloudCodeDrainPipe(stderrPipe[0], capturedStderr); }
             if (result == 0) {
                 if (WIFEXITED(status)) {
                     result = WEXITSTATUS(status);
@@ -216,13 +256,19 @@ static NSInteger CloudCodeSpawnHelperInternal(
         }
     }
 
-    if (diagnostic && captureOutput) {
-        NSString *text = CloudCodeCapturedText(captured ?: [NSData data], diagnosticSuffix);
-        if (text.length > 0) { *diagnostic = text; }
+    if (standardOutput && captureStdout) {
+        NSString *text = CloudCodeCapturedText(capturedStdout ?: [NSData data], @"");
+        if (text.length > 0) { *standardOutput = text; }
+    }
+    if (standardError && captureStderr) {
+        NSString *text = CloudCodeCapturedText(capturedStderr ?: [NSData data], diagnosticSuffix);
+        if (text.length > 0) { *standardError = text; }
     }
 
-    if (diagnosticPipe[0] >= 0) { close(diagnosticPipe[0]); }
-    if (diagnosticPipe[1] >= 0) { close(diagnosticPipe[1]); }
+    if (stdoutPipe[0] >= 0) { close(stdoutPipe[0]); }
+    if (stdoutPipe[1] >= 0) { close(stdoutPipe[1]); }
+    if (stderrPipe[0] >= 0) { close(stderrPipe[0]); }
+    if (stderrPipe[1] >= 0) { close(stderrPipe[1]); }
     posix_spawn_file_actions_destroy(&actions);
     posix_spawnattr_destroy(&attributes);
     CloudCodeFreeArgv(argv, count);
@@ -231,15 +277,34 @@ static NSInteger CloudCodeSpawnHelperInternal(
 
 NSInteger CloudCodeSpawnRootHelper(NSString *path, NSArray<NSString *> *arguments)
 {
-    return CloudCodeSpawnHelperInternal(path, arguments, YES, CLOUDCODE_HELPER_DEFAULT_TIMEOUT, NULL);
+    return CloudCodeSpawnHelperInternal(path, arguments, YES, CLOUDCODE_HELPER_DEFAULT_TIMEOUT, NULL, NULL);
 }
 
 NSInteger CloudCodeSpawnRootHelperWithOutput(NSString *path, NSArray<NSString *> *arguments, NSString * _Nullable * _Nullable diagnostic)
 {
-    return CloudCodeSpawnHelperInternal(path, arguments, YES, CLOUDCODE_HELPER_DEFAULT_TIMEOUT, diagnostic);
+    NSString *standardOutput = nil;
+    NSString *standardError = nil;
+    NSInteger result = CloudCodeSpawnHelperInternal(path, arguments, YES, CLOUDCODE_HELPER_DEFAULT_TIMEOUT, &standardOutput, &standardError);
+    if (diagnostic) {
+        NSString *combined = CloudCodeCombinedOutput(standardOutput, standardError);
+        if (combined.length > 0) { *diagnostic = combined; }
+    }
+    return result;
 }
 
 NSInteger CloudCodeSpawnHelperWithOutput(NSString *path, NSArray<NSString *> *arguments, BOOL asRoot, NSTimeInterval timeout, NSString * _Nullable * _Nullable diagnostic)
 {
-    return CloudCodeSpawnHelperInternal(path, arguments, asRoot, timeout, diagnostic);
+    NSString *standardOutput = nil;
+    NSString *standardError = nil;
+    NSInteger result = CloudCodeSpawnHelperInternal(path, arguments, asRoot, timeout, &standardOutput, &standardError);
+    if (diagnostic) {
+        NSString *combined = CloudCodeCombinedOutput(standardOutput, standardError);
+        if (combined.length > 0) { *diagnostic = combined; }
+    }
+    return result;
+}
+
+NSInteger CloudCodeSpawnHelperWithSeparatedOutput(NSString *path, NSArray<NSString *> *arguments, BOOL asRoot, NSTimeInterval timeout, NSString * _Nullable * _Nullable standardOutput, NSString * _Nullable * _Nullable standardError)
+{
+    return CloudCodeSpawnHelperInternal(path, arguments, asRoot, timeout, standardOutput, standardError);
 }

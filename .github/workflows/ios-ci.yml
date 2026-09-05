@@ -292,7 +292,9 @@ jobs:
             '<string>UninstallForLaunchServices</string>' \
             '<string>Uninstall</string>' \
             '<key>com.apple.security.iokit-user-client-class</key>' \
-            '<key>com.apple.security.exception.iokit-user-client-class</key>'; do
+            '<key>com.apple.security.exception.iokit-user-client-class</key>' \
+            '<string>IOHIDEventServiceFastPathUserClient</string>' \
+            '<string>IOHIDLibUserClient</string>'; do
             grep -F "$root_helper_storage_entitlement" Entitlements/CloudCodeRootHelper.entitlements >/dev/null
           done
           grep -F 'ldid -SEntitlements/CloudCodeRootHelper.entitlements "$ROOT_HELPER"' .github/workflows/private-trollstore-privileged-ipa.yml >/dev/null
@@ -380,11 +382,13 @@ jobs:
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: root helper command missing: {marker}')
           bridge = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
-          for marker in ('CLOUDCODE_HELPER_CAPTURE_LIMIT (1024 * 1024)', 'WIFSIGNALED(status)', 'WNOHANG', 'O_NONBLOCK', 'ETIMEDOUT', 'kill(pid, SIGKILL)', 'CloudCodeSpawnHelperInternal'):
+          for marker in ('CLOUDCODE_HELPER_CAPTURE_LIMIT (1024 * 1024)', 'WIFSIGNALED(status)', 'WNOHANG', 'O_NONBLOCK', 'ETIMEDOUT', 'kill(pid, SIGKILL)', 'CloudCodeSpawnHelperInternal', 'stdoutPipe', 'stderrPipe', 'CloudCodeSpawnHelperWithSeparatedOutput'):
               if marker not in bridge:
                   raise SystemExit(f'FAIL: root helper bridge lost timeout/isolation marker: {marker}')
-          if 'CloudCodeSpawnHelperWithOutput' not in Path('Sources/CloudCodeApp/RootHelperBridge.h').read_text(encoding='utf-8'):
-              raise SystemExit('FAIL: bounded helper bridge API is missing')
+          bridge_header = Path('Sources/CloudCodeApp/RootHelperBridge.h').read_text(encoding='utf-8')
+          for marker in ('CloudCodeSpawnHelperWithOutput', 'CloudCodeSpawnHelperWithSeparatedOutput'):
+              if marker not in bridge_header:
+                  raise SystemExit(f'FAIL: bounded helper bridge API is missing: {marker}')
           if 'run(["enumerate-json"], privilege: .isolatedUser' not in adapters or 'run(["probe-launch"], privilege: .isolatedUser' not in adapters or 'run(["launch", bundleID], privilege: .isolatedUser' not in adapters:
               raise SystemExit('FAIL: app discovery/launch must use the bounded non-root isolated helper path')
           if 'shouldRefreshIndex()' not in resolver or 'failedIndexRetryAfter' not in resolver or 'negativeBundleIDs' not in resolver:
@@ -407,7 +411,7 @@ jobs:
               raise SystemExit('FAIL: modern TrollStore GUI routing must prefer the global IOHID system client before BackBoard fallback')
           if '0x8000000817319375ULL' in gui_text or 'CLOUDCODE_GUI_FALLBACK_SENDER_ID' in gui_text:
               raise SystemExit('FAIL: build53 legacy IOHID sender/profile leaked into build54 GUI helper')
-          for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'run(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'run(["gui-probe-json"], privilege: .root, timeout: 6)', 'run(["gui-tree-json"], privilege: .root, timeout: 5)', 'run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)', '全局截图已通过独立 tmp JPEG 通道返回', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
+          for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'run(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'CloudCodeSpawnHelperWithSeparatedOutput', 'runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)', 'runSeparated(["gui-tree-json"], privilege: .root, timeout: 5)', 'result.stdout', 'result.stderr', 'run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)', '全局截图已通过独立 tmp JPEG 通道返回', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
               if marker not in adapters:
                   raise SystemExit(f'FAIL: GUI adapter lost bounded helper marker: {marker}')
           gui_executor = adapters.split('public struct GUIFallbackExecutor', 1)[1]

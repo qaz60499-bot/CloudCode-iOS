@@ -89,6 +89,8 @@
     <key>com.apple.security.iokit-user-client-class</key>
     <array>
         <string>IOSurfaceRootUserClient</string>
+        <string>IOHIDEventServiceFastPathUserClient</string>
+        <string>IOHIDLibUserClient</string>
         <string>IOAccelDevice</string>
         <string>IOAccelDevice2</string>
         <string>IOAccelSharedUserClient</string>
@@ -98,6 +100,8 @@
     <key>com.apple.security.exception.iokit-user-client-class</key>
     <array>
         <string>IOSurfaceRootUserClient</string>
+        <string>IOHIDEventServiceFastPathUserClient</string>
+        <string>IOHIDLibUserClient</string>
         <string>IOAccelDevice</string>
         <string>IOAccelDevice2</string>
         <string>IOAccelSharedUserClient</string>

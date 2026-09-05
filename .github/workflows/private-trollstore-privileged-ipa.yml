@@ -152,6 +152,15 @@ jobs:
             com.apple.backboard.client; do
             /usr/libexec/PlistBuddy -c "Print :$required_helper_entitlement" "$HELPER_ENTITLEMENTS" | grep -F 'true'
           done
+          for required_helper_iokit_class in \
+            IOHIDEventServiceFastPathUserClient \
+            IOHIDLibUserClient; do
+            for iokit_entitlement in \
+              com.apple.security.iokit-user-client-class \
+              com.apple.security.exception.iokit-user-client-class; do
+              /usr/libexec/PlistBuddy -c "Print :$iokit_entitlement" "$HELPER_ENTITLEMENTS" | grep -F "$required_helper_iokit_class"
+            done
+          done
           rm -f "$HELPER_ENTITLEMENTS"
           echo 'PASS: privileged host + isolated GUI helper entitlement sets embedded'
 

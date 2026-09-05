@@ -176,6 +176,8 @@ for iokit_key in \
   'com.apple.security.exception.iokit-user-client-class'; do
   for iokit_class in \
     'IOSurfaceRootUserClient' \
+    'IOHIDEventServiceFastPathUserClient' \
+    'IOHIDLibUserClient' \
     'IOAccelDevice' \
     'IOAccelDevice2' \
     'IOAccelSharedUserClient' \

@@ -81,6 +81,27 @@ enum EmbeddedRootHelper {
         return (code, text)
     }
 
+    private static func runSeparated(_ arguments: [String], privilege: PrivilegeMode, timeout: TimeInterval = 6) -> (code: Int, stdout: String, stderr: String) {
+        guard embeddedHelperMatchesExpectedProtocol else {
+            return (69, "", "内嵌 CloudCodeRootHelper 与当前 App 协议不匹配；拒绝执行，避免误用旧 helper。")
+        }
+        var standardOutput: NSString?
+        var standardError: NSString?
+        let code = CloudCodeSpawnHelperWithSeparatedOutput(
+            executablePath,
+            arguments,
+            privilege == .root,
+            timeout,
+            &standardOutput,
+            &standardError
+        )
+        return (
+            code,
+            (standardOutput as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+            (standardError as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        )
+    }
+
     private static func failureDetail(prefix: String, code: Int, diagnostic: String) -> String {
         let meaning: String
         switch code {
@@ -290,22 +311,26 @@ enum EmbeddedRootHelper {
         guard FileManager.default.isExecutableFile(atPath: executablePath) else {
             return (nil, "\(executableName) 不可执行；GUI backend 保持不可用。")
         }
-        let result = run(["gui-probe-json"], privilege: .root, timeout: 6)
-        guard result.code == 0, let payload = decodeGUIProbe(result.diagnostic) else {
-            return (nil, failureDetail(prefix: "隔离 GUI readiness 探测", code: result.code, diagnostic: result.diagnostic))
+        let result = runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)
+        guard result.code == 0, let payload = decodeGUIProbe(result.stdout) else {
+            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+            return (nil, failureDetail(prefix: "隔离 GUI readiness 探测", code: result.code, diagnostic: diagnostic))
         }
-        return (payload, "\(payload.backend) 已在受限 root helper 内完成只读 readiness handshake。")
+        let diagnosticSuffix = result.stderr.isEmpty ? "" : " helper diagnostics: \(result.stderr)"
+        return (payload, "\(payload.backend) 已在受限 root helper 内完成只读 readiness handshake。\(diagnosticSuffix)")
     }
 
     static func guiTree() -> (tree: String?, detail: String) {
-        let result = run(["gui-tree-json"], privilege: .root, timeout: 5)
-        guard result.code == 0, !result.diagnostic.isEmpty else {
-            return (nil, failureDetail(prefix: "GUI tree", code: result.code, diagnostic: result.diagnostic))
+        let result = runSeparated(["gui-tree-json"], privilege: .root, timeout: 5)
+        guard result.code == 0, !result.stdout.isEmpty else {
+            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+            return (nil, failureDetail(prefix: "GUI tree", code: result.code, diagnostic: diagnostic))
         }
-        guard result.diagnostic.utf8.count <= 256 * 1024 else {
+        guard result.stdout.utf8.count <= 256 * 1024 else {
             return (nil, "GUI tree 输出超过 256 KiB 限制，已 fail closed。")
         }
-        return (result.diagnostic, "AXRuntime tree 已返回。")
+        let diagnosticSuffix = result.stderr.isEmpty ? "" : " helper diagnostics: \(result.stderr)"
+        return (result.stdout, "AXRuntime tree 已返回。\(diagnosticSuffix)")
     }
 
     static func guiScreenshot() -> (data: Data?, detail: String) {
