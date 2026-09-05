@@ -36,16 +36,21 @@ static void CloudCodeFreeArgv(char **argv, NSUInteger count)
     free(argv);
 }
 
-static void CloudCodeDrainPipe(int fd, NSMutableData *captured)
+static void CloudCodeDrainPipe(int fd, NSMutableData *captured, BOOL *truncated)
 {
     if (fd < 0 || !captured) { return; }
     uint8_t buffer[2048];
     while (YES) {
         ssize_t readCount = read(fd, buffer, sizeof(buffer));
         if (readCount > 0) {
+            NSUInteger incoming = (NSUInteger)readCount;
             if (captured.length < CLOUDCODE_HELPER_CAPTURE_LIMIT) {
                 NSUInteger remaining = CLOUDCODE_HELPER_CAPTURE_LIMIT - captured.length;
-                [captured appendBytes:buffer length:MIN((NSUInteger)readCount, remaining)];
+                NSUInteger appendLength = MIN(incoming, remaining);
+                [captured appendBytes:buffer length:appendLength];
+                if (appendLength < incoming && truncated) { *truncated = YES; }
+            } else if (truncated) {
+                *truncated = YES;
             }
             continue;
         }
@@ -170,6 +175,8 @@ static NSInteger CloudCodeSpawnHelperInternal(
     NSInteger result = 0;
     NSMutableData *capturedStdout = captureStdout ? [NSMutableData data] : nil;
     NSMutableData *capturedStderr = captureStderr ? [NSMutableData data] : nil;
+    BOOL stdoutTruncated = NO;
+    BOOL stderrTruncated = NO;
     NSString *diagnosticSuffix = @"";
 
     if (earlyFailure != 0) {
@@ -199,8 +206,8 @@ static NSInteger CloudCodeSpawnHelperInternal(
             int status = 0;
             BOOL finished = NO;
             while (!finished) {
-                if (captureStdout) { CloudCodeDrainPipe(stdoutPipe[0], capturedStdout); }
-                if (captureStderr) { CloudCodeDrainPipe(stderrPipe[0], capturedStderr); }
+                if (captureStdout) { CloudCodeDrainPipe(stdoutPipe[0], capturedStdout, &stdoutTruncated); }
+                if (captureStderr) { CloudCodeDrainPipe(stderrPipe[0], capturedStderr, &stderrTruncated); }
 
                 pid_t waited = waitpid(pid, &status, WNOHANG);
                 if (waited == pid) {
@@ -241,8 +248,8 @@ static NSInteger CloudCodeSpawnHelperInternal(
                 }
             }
 
-            if (captureStdout) { CloudCodeDrainPipe(stdoutPipe[0], capturedStdout); }
-            if (captureStderr) { CloudCodeDrainPipe(stderrPipe[0], capturedStderr); }
+            if (captureStdout) { CloudCodeDrainPipe(stdoutPipe[0], capturedStdout, &stdoutTruncated); }
+            if (captureStderr) { CloudCodeDrainPipe(stderrPipe[0], capturedStderr, &stderrTruncated); }
             if (result == 0) {
                 if (WIFEXITED(status)) {
                     result = WEXITSTATUS(status);
@@ -252,6 +259,19 @@ static NSInteger CloudCodeSpawnHelperInternal(
                 } else {
                     result = -5001;
                 }
+            }
+            if (stdoutTruncated || stderrTruncated) {
+                NSMutableArray<NSString *> *streams = [NSMutableArray array];
+                if (stdoutTruncated) { [streams addObject:@"stdout"]; }
+                if (stderrTruncated) { [streams addObject:@"stderr"]; }
+                NSString *overflow = [NSString stringWithFormat:@"helper %@ capture truncated at %d bytes", [streams componentsJoinedByString:@"+"], CLOUDCODE_HELPER_CAPTURE_LIMIT];
+                diagnosticSuffix = diagnosticSuffix.length > 0
+                    ? [NSString stringWithFormat:@"%@\n%@", diagnosticSuffix, overflow]
+                    : overflow;
+                // Machine-readable helper responses must never be accepted after truncation. A
+                // distinct negative result prevents a partial JSON/text payload from masquerading
+                // as a successful exact-operation probe.
+                if (result == 0) { result = -8000 - EOVERFLOW; }
             }
         }
     }

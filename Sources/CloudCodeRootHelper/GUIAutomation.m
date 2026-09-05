@@ -1459,8 +1459,11 @@ int CloudCodeGUIScreenshotFile(NSString *path)
             fprintf(stderr, "gui-screenshot-file: no bounded JPEG available\n");
             return 63;
         }
+        // The app pre-creates this file as its own uid. Overwrite that inode in-place so a root
+        // helper does not replace it with a root-owned atomic-temp file that the sandboxed app
+        // cannot subsequently read.
         NSError *error = nil;
-        if (![data writeToFile:normalized options:NSDataWritingAtomic error:&error]) {
+        if (![data writeToFile:normalized options:0 error:&error]) {
             fprintf(stderr, "gui-screenshot-file: write failed: %s\n", error.localizedDescription.UTF8String ?: "unknown");
             return 63;
         }

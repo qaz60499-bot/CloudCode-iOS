@@ -341,15 +341,19 @@ enum EmbeddedRootHelper {
         // payload physically separate and also avoids the 1 MiB textual capture ceiling.
         let outputURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("CloudCode-GUI-\(UUID().uuidString).jpg", isDirectory: false)
+        // Pre-create the destination as the app user. The privileged helper must overwrite this
+        // inode in-place rather than atomically replacing it with a root-owned file, otherwise the
+        // sandboxed app may be unable to read the returned JPEG even though capture succeeded.
+        guard FileManager.default.createFile(atPath: outputURL.path, contents: Data()) else {
+            return (nil, "GUI screenshot 无法在 App tmp 中创建受控输出文件。")
+        }
         defer { try? FileManager.default.removeItem(at: outputURL) }
         let result = run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)
         guard result.code == 0 else {
             return (nil, failureDetail(prefix: "GUI screenshot", code: result.code, diagnostic: result.diagnostic))
         }
         guard let data = try? Data(contentsOf: outputURL, options: [.mappedIfSafe]),
-              !data.isEmpty,
-              data.count <= 700 * 1024,
-              data.starts(with: [0xFF, 0xD8, 0xFF]) else {
+              GUIAutomationPayloadPolicy.isValidScreenshotJPEG(data) else {
             return (nil, "GUI screenshot helper 返回成功，但 tmp 文件不是有效的 bounded JPEG；已按 fail-closed 处理。")
         }
         let routeDetail = result.diagnostic.isEmpty ? "" : " helper diagnostics: \(result.diagnostic)"

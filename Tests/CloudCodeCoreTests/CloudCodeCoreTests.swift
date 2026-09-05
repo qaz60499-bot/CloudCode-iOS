@@ -2252,6 +2252,21 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(saved.title, "create it")
     }
 
+    func testGUIScreenshotPayloadPolicyRejectsEmptyCorruptAndOversizedData() {
+        XCTAssertFalse(GUIAutomationPayloadPolicy.isValidScreenshotJPEG(Data()))
+        XCTAssertFalse(GUIAutomationPayloadPolicy.isValidScreenshotJPEG(Data([0xFF, 0xD8])))
+        XCTAssertFalse(GUIAutomationPayloadPolicy.isValidScreenshotJPEG(Data("not-a-jpeg".utf8)))
+
+        var bounded = Data([0xFF, 0xD8, 0xFF])
+        bounded.append(Data(repeating: 0x41, count: GUIAutomationPayloadPolicy.maxScreenshotBytes - bounded.count))
+        XCTAssertEqual(bounded.count, GUIAutomationPayloadPolicy.maxScreenshotBytes)
+        XCTAssertTrue(GUIAutomationPayloadPolicy.isValidScreenshotJPEG(bounded))
+
+        var oversized = bounded
+        oversized.append(0x42)
+        XCTAssertFalse(GUIAutomationPayloadPolicy.isValidScreenshotJPEG(oversized))
+    }
+
     func testAgentFeedsScreenshotToolAttachmentBackAsHiddenVisualObservation() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

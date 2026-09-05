@@ -40,6 +40,19 @@ jobs:
           test "$(git -C .build/checkouts/ZIPFoundation rev-parse HEAD)" = "22787ffb59de99e5dc1fbfe80b19c97a904ad48d"
           swift test --parallel
 
+      - name: Test helper output transport
+        run: |
+          set -euo pipefail
+          TEST_BINARY="$RUNNER_TEMP/root-helper-bridge-tests"
+          xcrun clang \
+            -fobjc-arc \
+            -framework Foundation \
+            -I Sources/CloudCodeApp \
+            Tests/RootHelperBridgeTests/RootHelperBridgeHarness.m \
+            Sources/CloudCodeApp/RootHelperBridge.m \
+            -o "$TEST_BINARY"
+          "$TEST_BINARY"
+
       - name: Generate Xcode project
         run: xcodegen generate
 
@@ -384,7 +397,7 @@ jobs:
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: root helper command missing: {marker}')
           bridge = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
-          for marker in ('CLOUDCODE_HELPER_CAPTURE_LIMIT (1024 * 1024)', 'WIFSIGNALED(status)', 'WNOHANG', 'O_NONBLOCK', 'ETIMEDOUT', 'kill(pid, SIGKILL)', 'CloudCodeSpawnHelperInternal', 'stdoutPipe', 'stderrPipe', 'CloudCodeSpawnHelperWithSeparatedOutput'):
+          for marker in ('CLOUDCODE_HELPER_CAPTURE_LIMIT (1024 * 1024)', 'WIFSIGNALED(status)', 'WNOHANG', 'O_NONBLOCK', 'ETIMEDOUT', 'kill(pid, SIGKILL)', 'CloudCodeSpawnHelperInternal', 'stdoutPipe', 'stderrPipe', 'CloudCodeSpawnHelperWithSeparatedOutput', 'helper %@ capture truncated', 'EOVERFLOW'):
               if marker not in bridge:
                   raise SystemExit(f'FAIL: root helper bridge lost timeout/isolation marker: {marker}')
           bridge_header = Path('Sources/CloudCodeApp/RootHelperBridge.h').read_text(encoding='utf-8')
@@ -405,7 +418,7 @@ jobs:
           gui_text = gui_helper.read_text(encoding='utf-8')
           if '#import <IOSurface/IOSurface.h>' in gui_text or '-framework IOSurface' in Path('project.yml').read_text(encoding='utf-8'):
               raise SystemExit('FAIL: GUI helper must resolve IOSurface at runtime because the iPhoneOS SDK does not expose IOSurface headers')
-          for marker in ('CLOUDCODE_GUI_MAX_TREE_NODES', 'CLOUDCODE_GUI_MAX_TREE_BYTES', 'CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES', 'CLOUDCODE_GUI_PARENT_INDEX 0u', 'CLOUDCODE_GUI_PARENT_IDENTITY 0u', 'CLOUDCODE_GUI_FINGER_INDEX 2u', 'CLOUDCODE_GUI_FINGER_IDENTITY 2u', 'CLOUDCODE_GUI_SENDER_ID 0x8000000817319371ULL', 'CLOUDCODE_HID_DIGITIZER_ATTRIBUTE', 'uint64_t machTime = mach_absolute_time()', 'kCFAllocatorDefault, machTime, 3', 'kCFAllocatorDefault, machTime,', '90.0, range && touching', 'IOHIDEventSystemClientCreate', 'IOHIDEventSystemClientDispatchEvent', 'IOHIDEventSystemConnectionDispatchEvent', 'BKSHIDEventSetDigitizerInfo', '_eventRoutingClientConnectionManager', 'clientForBundleID:', 'clientForTaskPort:', 'contextIdAtPosition:', 'taskPortOfContextId:', 'profile=modern-trollstore route=system-client', 'profile=modern-trollstore route=backboard-bundle', 'profile=modern-trollstore route=backboard-context', 'result=dispatched-unverified', 'return CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route);', 'CloudCodeScreenshotLooksInformative', 'CloudCodeGUIScreenshotFile', 'CloudCode-GUI-', 'NSDataWritingAtomic', 'rejected low-information frame', '_UICreateScreenUIImage', 'createScreenIOSurface', 'UICreateCGImageFromIOSurface', 'CARenderServerRenderDisplay', 'IOSurfaceCreate', 'IOSurfaceAcceleratorCreate', 'IOSurfaceAcceleratorTransferSurface', 'route=iosurface-accelerator transfer=success', 'IOSurfaceLock', 'IOSurfaceUnlock', 'IOSurfaceGetBaseAddress', 'IOSurfaceGetBytesPerRow', 'CloudCodeResolveAcrossFrameworks', 'ApplicationServices.framework/Frameworks/HIServices.framework/HIServices', 'RTLD_GLOBAL', 'AXUIElementCopyAttributeValue', 'AXUIElementSetAttributeValue', 'AXUIElementCreateSystemWide', '_AXUIElementCreateAppElementWithPid', 'AXUIElementCopyElementAtPosition', 'AXUIElementCopyApplicationAtPosition', 'AXUIElementCopyApplicationAndContextAtPosition', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'SBSCopyDisplayIdentifierForProcessID', 'AXFocusedApplication', 'AXHitTestSnapshot', 'main-screen-width', 'gui-tree: SpringBoardServices, AX focused-app, AX application-at-position, and AX element-at-position fallbacks all failed', 'gui-screenshot/render-server:', 'gui-screenshot/uiwindow-iosurface:', 'Keep explicit capability refresh lightweight'):
+          for marker in ('CLOUDCODE_GUI_MAX_TREE_NODES', 'CLOUDCODE_GUI_MAX_TREE_BYTES', 'CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES', 'CLOUDCODE_GUI_PARENT_INDEX 0u', 'CLOUDCODE_GUI_PARENT_IDENTITY 0u', 'CLOUDCODE_GUI_FINGER_INDEX 2u', 'CLOUDCODE_GUI_FINGER_IDENTITY 2u', 'CLOUDCODE_GUI_SENDER_ID 0x8000000817319371ULL', 'CLOUDCODE_HID_DIGITIZER_ATTRIBUTE', 'uint64_t machTime = mach_absolute_time()', 'kCFAllocatorDefault, machTime, 3', 'kCFAllocatorDefault, machTime,', '90.0, range && touching', 'IOHIDEventSystemClientCreate', 'IOHIDEventSystemClientDispatchEvent', 'IOHIDEventSystemConnectionDispatchEvent', 'BKSHIDEventSetDigitizerInfo', '_eventRoutingClientConnectionManager', 'clientForBundleID:', 'clientForTaskPort:', 'contextIdAtPosition:', 'taskPortOfContextId:', 'profile=modern-trollstore route=system-client', 'profile=modern-trollstore route=backboard-bundle', 'profile=modern-trollstore route=backboard-context', 'result=dispatched-unverified', 'return CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route);', 'CloudCodeScreenshotLooksInformative', 'CloudCodeGUIScreenshotFile', 'CloudCode-GUI-', 'writeToFile:normalized options:0', 'rejected low-information frame', '_UICreateScreenUIImage', 'createScreenIOSurface', 'UICreateCGImageFromIOSurface', 'CARenderServerRenderDisplay', 'IOSurfaceCreate', 'IOSurfaceAcceleratorCreate', 'IOSurfaceAcceleratorTransferSurface', 'route=iosurface-accelerator transfer=success', 'IOSurfaceLock', 'IOSurfaceUnlock', 'IOSurfaceGetBaseAddress', 'IOSurfaceGetBytesPerRow', 'CloudCodeResolveAcrossFrameworks', 'ApplicationServices.framework/Frameworks/HIServices.framework/HIServices', 'RTLD_GLOBAL', 'AXUIElementCopyAttributeValue', 'AXUIElementSetAttributeValue', 'AXUIElementCreateSystemWide', '_AXUIElementCreateAppElementWithPid', 'AXUIElementCopyElementAtPosition', 'AXUIElementCopyApplicationAtPosition', 'AXUIElementCopyApplicationAndContextAtPosition', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'SBSCopyDisplayIdentifierForProcessID', 'AXFocusedApplication', 'AXHitTestSnapshot', 'main-screen-width', 'gui-tree: SpringBoardServices, AX focused-app, AX application-at-position, and AX element-at-position fallbacks all failed', 'gui-screenshot/render-server:', 'gui-screenshot/uiwindow-iosurface:', 'Keep explicit capability refresh lightweight'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: GUI helper lost bounded/runtime marker: {marker}')
           hid_ready = gui_text.split('static BOOL CloudCodeHIDReady', 1)[1].split('static void CloudCodeReleaseHIDRoute', 1)[0]
@@ -436,9 +449,13 @@ jobs:
               if marker not in trollstore_gui:
                   raise SystemExit(f'FAIL: repeated AX timeout suppression missing: {marker}')
           screenshot_adapter = adapters.split('static func guiScreenshot()', 1)[1].split('static func guiTap(', 1)[0]
-          for marker in ('gui-screenshot-file', 'FileManager.default.temporaryDirectory', 'CloudCode-GUI-', 'data.starts(with: [0xFF, 0xD8, 0xFF])'):
+          for marker in ('gui-screenshot-file', 'FileManager.default.temporaryDirectory', 'CloudCode-GUI-', 'FileManager.default.createFile(atPath: outputURL.path, contents: Data())', 'GUIAutomationPayloadPolicy.isValidScreenshotJPEG(data)'):
               if marker not in screenshot_adapter:
                   raise SystemExit(f'FAIL: screenshot payload is not isolated from merged helper diagnostics: {marker}')
+          payload_policy = Path('Sources/CloudCodeCore/GUIAutomationPayloadPolicy.swift').read_text(encoding='utf-8')
+          for marker in ('maxScreenshotBytes = 700 * 1024', 'isValidScreenshotJPEG', 'data.count <= maxScreenshotBytes'):
+              if marker not in payload_policy:
+                  raise SystemExit(f'FAIL: screenshot payload policy lost bounded JPEG validation: {marker}')
           if 'gui-screenshot-base64' in screenshot_adapter or 'Data(base64Encoded:' in screenshot_adapter:
               raise SystemExit('FAIL: screenshot adapter regressed to mixed stdout/stderr base64 transport')
           approval = adapters.split('public final class ApprovalCenter', 1)[1].split('public struct IOSSystemExecutor', 1)[0]
