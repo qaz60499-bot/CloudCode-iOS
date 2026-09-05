@@ -144,6 +144,9 @@ private struct ChatView: View {
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var pendingImageData: Data?
     @State private var pendingImagePreview: UIImage?
+    @State private var isConversationAtBottom = true
+
+    private let conversationBottomID = "cloudcode-conversation-bottom"
 
     private var visibleMessages: [ChatMessage] {
         model.session.messages.filter {
@@ -193,44 +196,99 @@ private struct ChatView: View {
     }
 
     private var conversationPane: some View {
-        ScrollView {
-            LazyVStack(spacing: 12) {
-                if visibleMessages.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Cloud Code iOS")
-                            .font(.title2.bold())
-                        Text("消息会按你和 Cloud Code 分开显示。长按消息文字后可以只选择并复制其中一部分。")
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    ForEach(visibleMessages) { message in
-                        ChatBubble(message: message)
-                    }
-                }
-
-                if model.isCurrentSessionRunning && model.streamingAssistantMessageID == nil {
-                    HStack {
-                        ProgressView()
-                        Text("Cloud Code 正在处理…")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                    }
-                }
-
-                if !model.activityLines.isEmpty {
-                    Divider()
-                    ForEach(Array(model.activityLines.suffix(5).enumerated()), id: \.offset) { _, line in
-                        Text(line)
+        ScrollViewReader { proxy in
+            ZStack(alignment: .bottomTrailing) {
+                ScrollView {
+                    LazyVStack(spacing: 12) {
+                        if visibleMessages.isEmpty {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Cloud Code iOS")
+                                    .font(.title2.bold())
+                                Text("消息会按你和 Cloud Code 分开显示。长按消息文字后可以只选择并复制其中一部分。")
+                                    .foregroundStyle(.secondary)
+                            }
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
+                        } else {
+                            ForEach(visibleMessages) { message in
+                                ChatBubble(message: message)
+                            }
+                        }
+
+                        if model.isCurrentSessionRunning && model.streamingAssistantMessageID == nil {
+                            HStack {
+                                ProgressView()
+                                Text("Cloud Code 正在处理…")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                            }
+                        }
+
+                        if !model.activityLines.isEmpty {
+                            Divider()
+                            ForEach(Array(model.activityLines.suffix(5).enumerated()), id: \.offset) { _, line in
+                                Text(line)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                            }
+                        }
+
+                        Color.clear
+                            .frame(height: 1)
+                            .id(conversationBottomID)
+                            .onAppear { isConversationAtBottom = true }
+                            .onDisappear { isConversationAtBottom = false }
                     }
+                    .padding()
+                }
+                .onAppear {
+                    isConversationAtBottom = true
+                    scrollConversationToBottom(proxy, animated: false)
+                }
+                .onChange(of: model.session.id) { _ in
+                    isConversationAtBottom = true
+                    scrollConversationToBottom(proxy, animated: false)
+                }
+                .onChange(of: visibleMessages.last?.content) { _ in
+                    if isConversationAtBottom {
+                        scrollConversationToBottom(proxy, animated: true)
+                    }
+                }
+                .onChange(of: model.activityLines.last) { _ in
+                    if isConversationAtBottom {
+                        scrollConversationToBottom(proxy, animated: true)
+                    }
+                }
+
+                if !isConversationAtBottom && !visibleMessages.isEmpty {
+                    Button {
+                        scrollConversationToBottom(proxy, animated: true)
+                    } label: {
+                        Image(systemName: "arrow.down")
+                            .font(.headline.weight(.semibold))
+                            .frame(width: 38, height: 38)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .buttonBorderShape(.circle)
+                    .accessibilityLabel("回到对话底部")
+                    .padding(.trailing, 12)
+                    .padding(.bottom, 12)
                 }
             }
-            .padding()
+        }
+    }
+
+    private func scrollConversationToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.20)) {
+                    proxy.scrollTo(conversationBottomID, anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo(conversationBottomID, anchor: .bottom)
+            }
         }
     }
 

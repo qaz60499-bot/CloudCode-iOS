@@ -118,8 +118,18 @@ for key in \
   'com.apple.private.security.no-sandbox' \
   'platform-application' \
   'com.apple.private.security.storage.AppDataContainers' \
+  'com.apple.private.security.storage.AppBundles' \
+  'com.apple.private.security.container-manager' \
+  'com.apple.private.MobileContainerManager.allowed' \
+  'com.apple.private.coreservices.canmaplsdatabase' \
+  'com.apple.lsapplicationworkspace.rebuildappdatabases' \
+  'com.apple.private.security.storage-exempt.heritable' \
+  'com.apple.private.MobileInstallationHelperService.InstallDaemonOpsEnabled' \
+  'com.apple.private.MobileInstallationHelperService.allowed' \
+  'com.apple.private.uninstall.deletion' \
   'com.apple.private.persona-mgmt' \
   'com.apple.hid.system.server-access' \
+  'com.apple.hid.system.user-access-service' \
   'com.apple.private.hid.client.event-dispatch' \
   'com.apple.accessibility.api' \
   'com.apple.QuartzCore.displayable-context' \
@@ -129,6 +139,33 @@ for key in \
     echo "FAIL: root helper entitlement missing or false: $key" >&2
     exit 12
   fi
+done
+container_required="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.private.security.container-required' "$HELPER_ENTITLEMENTS" 2>/dev/null || true)"
+if [[ "$container_required" != "false" ]]; then
+  echo "FAIL: root helper entitlement missing or not false: com.apple.private.security.container-required" >&2
+  exit 12
+fi
+for uninstall_spi in 'UninstallForLaunchServices' 'Uninstall'; do
+  if ! /usr/libexec/PlistBuddy -c 'Print :com.apple.private.mobileinstall.allowedSPI' "$HELPER_ENTITLEMENTS" 2>/dev/null | grep -F "$uninstall_spi" >/dev/null; then
+    echo "FAIL: root helper MobileInstallation SPI entitlement missing: $uninstall_spi" >&2
+    exit 12
+  fi
+done
+for iokit_key in \
+  'com.apple.security.iokit-user-client-class' \
+  'com.apple.security.exception.iokit-user-client-class'; do
+  for iokit_class in \
+    'IOSurfaceRootUserClient' \
+    'IOAccelDevice' \
+    'IOAccelDevice2' \
+    'IOAccelSharedUserClient' \
+    'IOAccelSharedUserClient2' \
+    'AGXDeviceUserClient'; do
+    if ! /usr/libexec/PlistBuddy -c "Print :$iokit_key" "$HELPER_ENTITLEMENTS" 2>/dev/null | grep -F "$iokit_class" >/dev/null; then
+      echo "FAIL: root helper IOKit entitlement missing: $iokit_key -> $iokit_class" >&2
+      exit 12
+    fi
+  done
 done
 for banned in \
   'com.apple.private.cs.debugger' \

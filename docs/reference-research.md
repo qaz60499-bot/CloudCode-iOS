@@ -15,6 +15,31 @@ Adopted:
 Important limitation retained in architecture:
 
 - TrollStore can support unsandboxed applications and, with specific entitlements, root-helper spawning, but it does not provide unrestricted platformization and does not make every private/system capability automatically available.
+- `platform-application` can tighten IOKit access. GUI-only IOKit/accessibility/capture entitlements therefore belong on the crash-isolated root helper, and exact GUI operations must still prove runtime support on-device.
+- App/container cleanup must not equate a LaunchServices registration change with a completed uninstall. Bundle and known data-container state remain independent postconditions.
+- Cloud Code's root helper mirrors only the TrollStore RootHelper lifecycle entitlements needed by its typed app-management surface: container-free/root access, LaunchServices database access, MobileInstallation helper access, uninstall deletion, and the `UninstallForLaunchServices`/`Uninstall` SPI entries. It deliberately does not copy TrollStore's unrelated AMFI/shutdown capabilities.
+- TrollStore's own uninstall implementation uses `LSApplicationWorkspace` first and falls back to bounded bundle-container removal. Cloud Code retains stricter postcondition verification around that pattern so an accepted registration change is never reported as a completed uninstall while the bundle is still present.
+
+## Apple OSS: IOHIDFamily
+
+Reference: https://github.com/apple-oss-distributions/IOHIDFamily
+
+Adopted:
+
+- Apple IOHID sources distinguish server access from EventSystem user access; the GUI helper carries both relevant HID entitlements while the SwiftUI host carries neither.
+- Creating an IOHID EventSystem client is treated as a runtime capability check, not proof that a later synthetic gesture was accepted by the foreground UI.
+- Private IOKit access stays narrowly scoped to the helper and is paired with explicit user-client entitlement lists because the TrollStore `platform-application` profile can otherwise tighten those accesses.
+
+## ios-mcp accessibility/GUI implementation
+
+Reference: https://github.com/witchan/ios-mcp
+
+Adopted as compatibility guidance only:
+
+- Accessibility symbols can move between AXRuntime, Accessibility, HIServices and ApplicationServices across iOS generations. Cloud Code resolves the small AX symbol set it needs across multiple runtime candidates instead of assuming one framework owns every symbol.
+- Foreground discovery is layered rather than tied to one SpringBoardServices call: focused/frontmost AX attributes are tried first, then bounded `AXUIElementCopyApplicationAtPosition` / `AXUIElementCopyApplicationAndContextAtPosition` probes at visible screen points recover the application/PID when a detached helper cannot read the SBS frontmost identifier.
+- Screen observations should use the same logical point coordinate space as touch actions; Retina scale and Display Zoom must not silently introduce coordinate drift.
+- Continuous GUI work remains observation -> one bounded action -> observation/verification. The jailbreak/SpringBoard execution model of ios-mcp is not transplanted into Cloud Code's detached TrollStore root helper.
 
 ## Santander
 

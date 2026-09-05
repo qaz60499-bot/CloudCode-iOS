@@ -15,10 +15,35 @@
     </array>
     <key>com.apple.private.security.no-sandbox</key>
     <true/>
+    <key>com.apple.private.security.container-required</key>
+    <false/>
     <key>platform-application</key>
     <true/>
     <key>com.apple.private.security.storage.AppDataContainers</key>
     <true/>
+    <key>com.apple.private.security.storage.AppBundles</key>
+    <true/>
+    <key>com.apple.private.security.container-manager</key>
+    <true/>
+    <key>com.apple.private.MobileContainerManager.allowed</key>
+    <true/>
+    <key>com.apple.private.coreservices.canmaplsdatabase</key>
+    <true/>
+    <key>com.apple.lsapplicationworkspace.rebuildappdatabases</key>
+    <true/>
+    <key>com.apple.private.security.storage-exempt.heritable</key>
+    <true/>
+    <key>com.apple.private.MobileInstallationHelperService.InstallDaemonOpsEnabled</key>
+    <true/>
+    <key>com.apple.private.MobileInstallationHelperService.allowed</key>
+    <true/>
+    <key>com.apple.private.uninstall.deletion</key>
+    <true/>
+    <key>com.apple.private.mobileinstall.allowedSPI</key>
+    <array>
+        <string>UninstallForLaunchServices</string>
+        <string>Uninstall</string>
+    </array>
     <key>com.apple.private.persona-mgmt</key>
     <true/>
 
@@ -28,6 +53,8 @@
          perform bounded runtime validation and fail closed on unsupported iOS builds. -->
     <key>com.apple.hid.system.server-access</key>
     <true/>
+    <key>com.apple.hid.system.user-access-service</key>
+    <true/>
     <key>com.apple.private.hid.client.event-dispatch</key>
     <true/>
     <key>com.apple.accessibility.api</key>
@@ -36,5 +63,23 @@
     <true/>
     <key>com.apple.QuartzCore.global-capture</key>
     <true/>
+    <key>com.apple.security.iokit-user-client-class</key>
+    <array>
+        <string>IOSurfaceRootUserClient</string>
+        <string>IOAccelDevice</string>
+        <string>IOAccelDevice2</string>
+        <string>IOAccelSharedUserClient</string>
+        <string>IOAccelSharedUserClient2</string>
+        <string>AGXDeviceUserClient</string>
+    </array>
+    <key>com.apple.security.exception.iokit-user-client-class</key>
+    <array>
+        <string>IOSurfaceRootUserClient</string>
+        <string>IOAccelDevice</string>
+        <string>IOAccelDevice2</string>
+        <string>IOAccelSharedUserClient</string>
+        <string>IOAccelSharedUserClient2</string>
+        <string>AGXDeviceUserClient</string>
+    </array>
 </dict>
 </plist>

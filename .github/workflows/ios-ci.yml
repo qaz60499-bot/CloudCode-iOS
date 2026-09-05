@@ -252,6 +252,7 @@ jobs:
           done
           for gui_only_entitlement in \
             '<key>com.apple.hid.system.server-access</key>' \
+            '<key>com.apple.hid.system.user-access-service</key>' \
             '<key>com.apple.private.hid.client.event-dispatch</key>' \
             '<key>com.apple.accessibility.api</key>' \
             '<key>com.apple.QuartzCore.displayable-context</key>' \
@@ -261,6 +262,24 @@ jobs:
               exit 1
             fi
             grep -F "$gui_only_entitlement" Entitlements/CloudCodeRootHelper.entitlements >/dev/null
+          done
+          for root_helper_storage_entitlement in \
+            '<key>com.apple.private.security.container-required</key>' \
+            '<key>com.apple.private.security.storage.AppBundles</key>' \
+            '<key>com.apple.private.security.container-manager</key>' \
+            '<key>com.apple.private.MobileContainerManager.allowed</key>' \
+            '<key>com.apple.private.coreservices.canmaplsdatabase</key>' \
+            '<key>com.apple.lsapplicationworkspace.rebuildappdatabases</key>' \
+            '<key>com.apple.private.security.storage-exempt.heritable</key>' \
+            '<key>com.apple.private.MobileInstallationHelperService.InstallDaemonOpsEnabled</key>' \
+            '<key>com.apple.private.MobileInstallationHelperService.allowed</key>' \
+            '<key>com.apple.private.uninstall.deletion</key>' \
+            '<key>com.apple.private.mobileinstall.allowedSPI</key>' \
+            '<string>UninstallForLaunchServices</string>' \
+            '<string>Uninstall</string>' \
+            '<key>com.apple.security.iokit-user-client-class</key>' \
+            '<key>com.apple.security.exception.iokit-user-client-class</key>'; do
+            grep -F "$root_helper_storage_entitlement" Entitlements/CloudCodeRootHelper.entitlements >/dev/null
           done
           grep -F 'ldid -SEntitlements/CloudCodeRootHelper.entitlements "$ROOT_HELPER"' .github/workflows/private-trollstore-privileged-ipa.yml >/dev/null
           grep -F 'CODE_SIGN_ENTITLEMENTS: Entitlements/CloudCode.entitlements' project.yml >/dev/null
@@ -330,12 +349,14 @@ jobs:
           uninstall = resolver.split('public func uninstallApplication(bundleID:', 1)[1].split('private enum UninstallReconciliation', 1)[0]
           if 'EmbeddedRootHelper.uninstall(bundleID: bundleID' not in uninstall or 'EmbeddedRootHelper.installationState(bundleID: bundleID)' not in uninstall:
               raise SystemExit('FAIL: app uninstall and registration verification must execute through the isolated root helper')
+          if 'EmbeddedRootHelper.cleanupUnregistered(bundleID: bundleID' not in uninstall or 'unregisteredBundleIDs.contains(bundleID)' not in uninstall:
+              raise SystemExit('FAIL: half-uninstalled filesystem orphans lost their explicit reconciliation path')
 
           helper = Path('Sources/CloudCodeRootHelper/main.m')
           if not helper.exists():
               raise SystemExit('FAIL: CloudCodeRootHelper source is missing')
           helper_text = helper.read_text(encoding='utf-8')
-          for marker in ('enumerate-json', 'probe-filesystem-json', 'probe-launch', 'probe-uninstall', 'is-installed', 'launch', 'uninstall', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-type-base64'):
+          for marker in ('enumerate-json', 'probe-filesystem-json', 'probe-launch', 'probe-uninstall', 'is-installed', 'launch', 'uninstall', 'cleanup-unregistered', 'MCMMetadataIdentifier', 'BundleFilesystemOrphans', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-type-base64'):
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: root helper command missing: {marker}')
           bridge = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
@@ -358,7 +379,7 @@ jobs:
           gui_text = gui_helper.read_text(encoding='utf-8')
           if '#import <IOSurface/IOSurface.h>' in gui_text or '-framework IOSurface' in Path('project.yml').read_text(encoding='utf-8'):
               raise SystemExit('FAIL: GUI helper must resolve IOSurface at runtime because the iPhoneOS SDK does not expose IOSurface headers')
-          for marker in ('CLOUDCODE_GUI_MAX_TREE_NODES', 'CLOUDCODE_GUI_MAX_TREE_BYTES', 'CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES', 'IOHIDEventSystemClientCreate', '_UICreateScreenUIImage', 'createScreenIOSurface', 'UICreateCGImageFromIOSurface', 'CARenderServerRenderDisplay', 'IOSurfaceCreate', 'IOSurfaceLock', 'IOSurfaceUnlock', 'IOSurfaceGetBaseAddress', 'IOSurfaceGetBytesPerRow', 'AXUIElementCopyAttributeValue', 'AXUIElementCreateSystemWide', '_AXUIElementCreateAppElementWithPid', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'gui-tree: AXRuntime could not create or locate an element', 'gui-screenshot: render-server IOSurface', 'Keep explicit capability refresh lightweight'):
+          for marker in ('CLOUDCODE_GUI_MAX_TREE_NODES', 'CLOUDCODE_GUI_MAX_TREE_BYTES', 'CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES', 'IOHIDEventSystemClientCreate', '_UICreateScreenUIImage', 'createScreenIOSurface', 'UICreateCGImageFromIOSurface', 'CARenderServerRenderDisplay', 'IOSurfaceCreate', 'IOSurfaceLock', 'IOSurfaceUnlock', 'IOSurfaceGetBaseAddress', 'IOSurfaceGetBytesPerRow', 'CloudCodeResolveAcrossFrameworks', 'ApplicationServices.framework/Frameworks/HIServices.framework/HIServices', 'RTLD_GLOBAL', 'AXUIElementCopyAttributeValue', 'AXUIElementSetAttributeValue', 'AXUIElementCreateSystemWide', '_AXUIElementCreateAppElementWithPid', 'AXUIElementCopyApplicationAtPosition', 'AXUIElementCopyApplicationAndContextAtPosition', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'SBSCopyDisplayIdentifierForProcessID', 'AXFocusedApplication', 'main-screen-width', 'gui-tree: SpringBoardServices, AX focused-app, and AX application-at-position fallbacks all failed', 'gui-screenshot/render-server:', 'gui-screenshot/uiwindow-iosurface:', 'Keep explicit capability refresh lightweight'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: GUI helper lost bounded/runtime marker: {marker}')
           for marker in ('guiProbe()', 'run(["gui-probe-json"], privilege: .root, timeout: 6)', 'run(["gui-tree-json"], privilege: .root, timeout: 5)', 'run(["gui-screenshot-base64"], privilege: .root, timeout: 6)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
@@ -378,6 +399,11 @@ jobs:
           for marker in ('withTaskCancellationHandler', 'continuationID', 'cancelPendingApproval(requestID:', 'finishPendingApproval(returning:'):
               if marker not in approval:
                   raise SystemExit(f'FAIL: approval cancellation-safety marker missing: {marker}')
+
+          content_view = Path('Sources/CloudCodeApp/ContentView.swift').read_text(encoding='utf-8')
+          for marker in ('ScrollViewReader', 'conversationBottomID', 'scrollConversationToBottom', 'arrow.down', '回到对话底部'):
+              if marker not in content_view:
+                  raise SystemExit(f'FAIL: chat bottom-navigation behavior missing: {marker}')
 
           app_entry = Path('Sources/CloudCodeApp/CloudCodeIOSApp.swift').read_text(encoding='utf-8')
           for marker in ('app.main.enter', 'firstScene.visibleWindow'):

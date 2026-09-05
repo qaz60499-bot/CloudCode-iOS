@@ -122,6 +122,40 @@ static NSArray *InstalledApplicationProxies(id workspace, NSString **backend)
 
 static BOOL ApplicationIsInstalled(id workspace, NSString *bundleID, BOOL *known);
 
+static NSString *InstalledBundlePath(id workspace, NSString *bundleID)
+{
+    if (!workspace || bundleID.length == 0) { return nil; }
+    NSArray *proxies = InstalledApplicationProxies(workspace, NULL);
+    for (id proxy in proxies) {
+        NSString *candidate = SafeValue(proxy, @"applicationIdentifier");
+        if (![candidate isKindOfClass:NSString.class] || candidate.length == 0) {
+            candidate = SafeValue(proxy, @"bundleIdentifier");
+        }
+        if (![candidate isEqualToString:bundleID]) { continue; }
+        NSURL *bundleURL = SafeValue(proxy, @"bundleURL");
+        if (![bundleURL isKindOfClass:NSURL.class]) { return nil; }
+        NSString *path = bundleURL.path.stringByStandardizingPath;
+        return IsSafeBundlePath(path) ? path : nil;
+    }
+    return nil;
+}
+
+static NSDictionary<NSString *, NSString *> *DataContainerPathsByBundleID(void)
+{
+    NSString *root = @"/var/mobile/Containers/Data/Application";
+    NSArray<NSString *> *entries = [NSFileManager.defaultManager contentsOfDirectoryAtPath:root error:nil] ?: @[];
+    NSMutableDictionary<NSString *, NSString *> *result = [NSMutableDictionary dictionary];
+    for (NSString *entry in entries) {
+        NSString *path = [root stringByAppendingPathComponent:entry];
+        if (!IsSafeDataPath(path)) { continue; }
+        NSString *metadataPath = [path stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+        NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
+        NSString *bundleID = [metadata[@"MCMMetadataIdentifier"] isKindOfClass:NSString.class] ? metadata[@"MCMMetadataIdentifier"] : nil;
+        if (bundleID.length > 0 && result[bundleID] == nil) { result[bundleID] = path; }
+    }
+    return result.copy;
+}
+
 static int PrintInstalledApplicationsJSON(void)
 {
     id workspace = Workspace();
@@ -131,6 +165,7 @@ static int PrintInstalledApplicationsJSON(void)
     if (proxies.count == 0) { return 40; }
 
     NSMutableDictionary<NSString *, NSDictionary *> *byBundleID = [NSMutableDictionary dictionary];
+    NSDictionary<NSString *, NSString *> *dataPathsByBundleID = DataContainerPathsByBundleID();
     for (id proxy in proxies) {
         NSString *bundleID = SafeValue(proxy, @"applicationIdentifier");
         if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0) {
@@ -146,15 +181,52 @@ static int PrintInstalledApplicationsJSON(void)
         NSURL *dataURL = SafeValue(proxy, @"dataContainerURL");
         NSString *bundlePath = [bundleURL isKindOfClass:NSURL.class] ? bundleURL.path : @"";
         NSString *dataPath = [dataURL isKindOfClass:NSURL.class] ? dataURL.path : @"";
+        if (dataPath.length == 0) { dataPath = dataPathsByBundleID[bundleID] ?: @""; }
         byBundleID[bundleID] = @{
             @"bundleID": bundleID,
             @"name": name,
             @"version": version,
             @"bundlePath": bundlePath ?: @"",
-            @"dataContainerPath": dataPath ?: @""
+            @"dataContainerPath": dataPath ?: @"",
+            @"registered": @YES
         };
     }
+
+    // LaunchServices can lose registration before a failed uninstall has actually removed the
+    // bundle container. Merge only physically present, one-level user .app bundles that LS did
+    // not report so a later explicit apps.uninstall can reconcile that orphan instead of losing
+    // its path forever. This is read-only discovery and never deletes or registers anything.
+    NSUInteger orphanCount = 0;
+    NSString *bundleRoot = @"/var/containers/Bundle/Application";
+    NSArray<NSString *> *containers = [NSFileManager.defaultManager contentsOfDirectoryAtPath:bundleRoot error:nil] ?: @[];
+    for (NSString *containerName in containers) {
+        NSString *containerPath = [bundleRoot stringByAppendingPathComponent:containerName];
+        if (!IsSafeBundleContainerPath(containerPath)) { continue; }
+        NSArray<NSString *> *entries = [NSFileManager.defaultManager contentsOfDirectoryAtPath:containerPath error:nil] ?: @[];
+        for (NSString *entry in entries) {
+            if (![entry.pathExtension.lowercaseString isEqualToString:@"app"]) { continue; }
+            NSString *bundlePath = [containerPath stringByAppendingPathComponent:entry];
+            if (!IsSafeBundlePath(bundlePath)) { continue; }
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"Info.plist"]];
+            NSString *bundleID = [info[@"CFBundleIdentifier"] isKindOfClass:NSString.class] ? info[@"CFBundleIdentifier"] : nil;
+            if (bundleID.length == 0 || byBundleID[bundleID] != nil) { continue; }
+            NSString *name = [info[@"CFBundleDisplayName"] isKindOfClass:NSString.class] ? info[@"CFBundleDisplayName"] : nil;
+            if (name.length == 0 && [info[@"CFBundleName"] isKindOfClass:NSString.class]) { name = info[@"CFBundleName"]; }
+            if (name.length == 0) { name = bundleID; }
+            NSString *version = [info[@"CFBundleShortVersionString"] isKindOfClass:NSString.class] ? info[@"CFBundleShortVersionString"] : @"";
+            byBundleID[bundleID] = @{
+                @"bundleID": bundleID,
+                @"name": name,
+                @"version": version ?: @"",
+                @"bundlePath": bundlePath,
+                @"dataContainerPath": dataPathsByBundleID[bundleID] ?: @"",
+                @"registered": @NO
+            };
+            orphanCount++;
+        }
+    }
     if (byBundleID.count == 0) { return 40; }
+    if (orphanCount > 0) { backend = [backend stringByAppendingString:@"+BundleFilesystemOrphans"]; }
     NSArray *apps = [[byBundleID allValues] sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *lhs, NSDictionary *rhs) {
         return [lhs[@"name"] localizedCaseInsensitiveCompare:rhs[@"name"]];
     }];
@@ -251,7 +323,28 @@ static int ProbeUninstallCapability(NSString *bundleID)
     void *handle = dlopen("/System/Library/PrivateFrameworks/MobileInstallation.framework/MobileInstallation", RTLD_LAZY | RTLD_LOCAL);
     BOOL hasMobileInstallation = handle && dlsym(handle, "MobileInstallationUninstall") != NULL;
     if (handle) { dlclose(handle); }
-    return (hasLaunchServices || hasMobileInstallation) ? 0 : 45;
+    if (!hasLaunchServices && !hasMobileInstallation) { return 45; }
+
+    // LaunchServices can report that an app is unregistered before its bundle container is gone.
+    // Our exact uninstall path therefore needs a verified filesystem fallback when
+    // MobileInstallation is unavailable. Probe that prerequisite read-only instead of claiming
+    // availability from selector presence alone.
+    if (!hasMobileInstallation) {
+        NSString *bundlePath = InstalledBundlePath(workspace, bundleID);
+        if (bundlePath.length == 0) { return 48; }
+        NSString *bundleContainer = bundlePath.stringByDeletingLastPathComponent;
+        NSString *bundleRoot = bundleContainer.stringByDeletingLastPathComponent;
+        BOOL safeRoot = [bundleRoot isEqualToString:@"/var/containers/Bundle/Application"]
+            || [bundleRoot isEqualToString:@"/private/var/containers/Bundle/Application"];
+        if (!IsSafeBundleContainerPath(bundleContainer)
+            || !safeRoot
+            || ![NSFileManager.defaultManager isReadableFileAtPath:bundleContainer]
+            || ![NSFileManager.defaultManager isWritableFileAtPath:bundleContainer]
+            || ![NSFileManager.defaultManager isWritableFileAtPath:bundleRoot]) {
+            return 48;
+        }
+    }
+    return 0;
 }
 
 static BOOL ApplicationIsInstalled(id workspace, NSString *bundleID, BOOL *known)
@@ -473,6 +566,37 @@ static int VerifyRemoved(id workspace, NSString *bundleID, NSString *bundlePath,
     return 31;
 }
 
+static int CleanupUnregisteredApplication(NSString *bundleID, NSString *bundlePath, NSString *dataPath)
+{
+    if ([bundleID isEqualToString:@"com.cloudcode.ios"]) { return 12; }
+    if (!IsSafeBundlePath(bundlePath)) { return 20; }
+    if (dataPath.length > 0 && !IsSafeDataPath(dataPath)) { return 21; }
+    NSString *bundleContainer = NormalizePath(bundlePath).stringByDeletingLastPathComponent;
+    if (!IsSafeBundleContainerPath(bundleContainer)) { return 22; }
+
+    id workspace = Workspace();
+    if (!workspace) { return 23; }
+    BOOL known = NO;
+    BOOL installed = ApplicationIsInstalled(workspace, bundleID, &known);
+    if (!known) { return 43; }
+    if (installed) {
+        fprintf(stderr, "cleanup-unregistered refused: target is still registered as installed\n");
+        return 49;
+    }
+
+    NSString *effectiveDataPath = dataPath;
+    if (effectiveDataPath.length == 0) {
+        effectiveDataPath = DataContainerPathsByBundleID()[bundleID];
+    }
+    if (effectiveDataPath.length > 0 && !IsSafeDataPath(effectiveDataPath)) { return 21; }
+
+    NSArray<NSString *> *pluginPaths = PluginDataPaths(bundleID);
+    if (!RemovePath(bundleContainer, YES)) { return 34; }
+    for (NSString *pluginPath in pluginPaths) { RemovePath(pluginPath, NO); }
+    if (effectiveDataPath.length > 0 && !RemovePath(effectiveDataPath, YES)) { return 35; }
+    return VerifyRemoved(workspace, bundleID, bundlePath, effectiveDataPath);
+}
+
 static int Uninstall(NSString *bundleID, NSString *bundlePath, NSString *dataPath)
 {
     if ([bundleID isEqualToString:@"com.cloudcode.ios"]) { return 12; }
@@ -593,6 +717,15 @@ int main(int argc, const char *argv[])
             if (argc < 3) { return 10; }
             NSString *encoded = [NSString stringWithUTF8String:argv[2]];
             return CloudCodeGUITypeBase64(encoded);
+        }
+        if ([command isEqualToString:@"cleanup-unregistered"]) {
+            if (getuid() != 0 || geteuid() != 0) { return 11; }
+            if (argc < 5) { return 10; }
+            NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
+            NSString *bundlePath = [NSString stringWithUTF8String:argv[3]];
+            NSString *dataPathArgument = [NSString stringWithUTF8String:argv[4]];
+            NSString *dataPath = [dataPathArgument isEqualToString:@"-"] ? @"" : dataPathArgument;
+            return CleanupUnregisteredApplication(bundleID, bundlePath, dataPath);
         }
         if ([command isEqualToString:@"uninstall"]) {
             if (getuid() != 0 || geteuid() != 0) { return 11; }

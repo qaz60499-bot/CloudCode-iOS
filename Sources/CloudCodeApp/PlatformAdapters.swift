@@ -19,6 +19,7 @@ enum EmbeddedRootHelper {
         var version: String
         var bundlePath: String
         var dataContainerPath: String
+        var registered: Bool
     }
 
     struct EnumerationPayload: Decodable {
@@ -89,6 +90,8 @@ enum EmbeddedRootHelper {
         case 45: meaning = "LaunchServices/MobileInstallation 卸载后端均不可用"
         case 46: meaning = "LaunchServices 拒绝启动目标 App"
         case 47: meaning = "目标 App 已确认不在安装状态"
+        case 48: meaning = "卸载后端存在，但 Bundle 容器读写兜底能力未验证"
+        case 49: meaning = "残留清理被拒绝：目标仍处于已注册安装状态"
         case 61: meaning = "GUI readiness JSON 无法生成"
         case 62: meaning = "AXRuntime 前台 UI tree 当前不可用"
         case 63: meaning = "全局截图后端当前不可用或输出超限"
@@ -136,7 +139,7 @@ enum EmbeddedRootHelper {
     static func uninstallCapability(bundleID: String) -> RootHelperCapabilitySnapshot {
         let result = run(["probe-uninstall", bundleID], privilege: .root, timeout: 6)
         if result.code == 0 {
-            return RootHelperCapabilitySnapshot(available: true, detail: "卸载 selector/symbol 与权威安装状态查询已在 helper 子进程内验证。")
+            return RootHelperCapabilitySnapshot(available: true, detail: "卸载后端、权威安装状态查询及必要的 Bundle 容器兜底访问已在 helper 子进程内验证。")
         }
         return RootHelperCapabilitySnapshot(available: false, detail: failureDetail(prefix: "helper 卸载能力探测", code: result.code, diagnostic: result.diagnostic))
     }
@@ -219,6 +222,16 @@ enum EmbeddedRootHelper {
             return (true, detail)
         }
         return (false, failureDetail(prefix: "Embedded root helper 卸载", code: result.code, diagnostic: result.diagnostic))
+    }
+
+    static func cleanupUnregistered(bundleID: String, bundlePath: String, dataPath: String?) -> (accepted: Bool, detail: String) {
+        let capability = probe()
+        guard capability.available else { return (false, capability.detail) }
+        let result = run(["cleanup-unregistered", bundleID, bundlePath, dataPath ?? "-"], privilege: .root, timeout: 15)
+        if result.code == 0 {
+            return (true, result.diagnostic.isEmpty ? "Embedded root helper 已清理未注册的残留 App Bundle。" : "Embedded root helper 已清理未注册残留：\(result.diagnostic)")
+        }
+        return (false, failureDetail(prefix: "Embedded root helper 残留清理", code: result.code, diagnostic: result.diagnostic))
     }
 
     static func terminateCapability() -> RootHelperCapabilitySnapshot {
@@ -326,6 +339,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     private var appIndexNeedsRefresh = true
     private var failedIndexRetryAfter: Date?
     private var negativeBundleIDs: Set<String> = []
+    private var unregisteredBundleIDs: Set<String> = []
     private var enumerationProven = false
     private var enumerationDetail = "尚未检测已安装 App 枚举能力。"
     private var uninstallDetail = "尚未检测 App 卸载后端。"
@@ -346,6 +360,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         appIndexNeedsRefresh = true
         failedIndexRetryAfter = nil
         negativeBundleIDs.removeAll()
+        unregisteredBundleIDs.removeAll()
         return cachedApps
     }
 
@@ -503,17 +518,20 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             return false
         }
         if let pendingBundleID = pendingUninstallBundleID {
-            let stillInstalled = cachedApps.contains { $0.ownerBundleID == pendingBundleID }
-            pendingUninstallBundleID = nil
-            if stillInstalled {
-                uninstallDetail = "上一次卸载请求 \(pendingBundleID) 已通过隔离枚举核对：目标仍处于已安装状态；旧 Tool Call 不会重放，新的卸载仍需重新确认。"
+            if unregisteredBundleIDs.contains(pendingBundleID), bundlePaths[pendingBundleID] != nil {
+                uninstallDetail = "上一次卸载请求 \(pendingBundleID) 已由 LaunchServices 注销，但 Bundle 仍在磁盘；路径已保留为待清理残留。旧 Tool Call 不会重放，新的卸载仍需重新确认。"
+            } else if cachedApps.contains(where: { $0.ownerBundleID == pendingBundleID }) {
+                pendingUninstallBundleID = nil
+                uninstallDetail = "上一次卸载请求 \(pendingBundleID) 已通过隔离枚举核对：目标仍处于已注册安装状态；旧 Tool Call 不会重放，新的卸载仍需重新确认。"
             } else {
+                pendingUninstallBundleID = nil
                 bundlePaths.removeValue(forKey: pendingBundleID)
                 containerPaths.removeValue(forKey: pendingBundleID)
             }
         }
         guard let target = cachedApps.first(where: {
             guard let bundleID = $0.ownerBundleID, bundleID != Bundle.main.bundleIdentifier else { return false }
+            guard !unregisteredBundleIDs.contains(bundleID) else { return false }
             return Self.isUserApplicationBundlePath($0.resolvedPath)
         }), let targetBundleID = target.ownerBundleID else {
             uninstallDetail = "没有可用于无损验证的普通用户 App。"
@@ -545,6 +563,36 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             return .rejected("目标不是当前可验证的普通用户 App，或已经不存在。")
         }
         let dataPath = containerPaths[bundleID]
+
+        // A previous system uninstall can remove the LaunchServices registration before the
+        // physical bundle/data containers are gone. The helper enumerator marks those filesystem
+        // orphans explicitly; a new approved uninstall request may reconcile only that known path,
+        // and the root helper refuses this cleanup if the bundle becomes registered again.
+        if unregisteredBundleIDs.contains(bundleID) {
+            let cleanup = EmbeddedRootHelper.cleanupUnregistered(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath)
+            try? await diagnosticLogger?.log(
+                level: cleanup.accepted ? .info : .warning,
+                subsystem: "root-helper",
+                action: "cleanup-unregistered",
+                result: cleanup.accepted ? "accepted" : "rejected",
+                diagnostic: cleanup.detail,
+                metadata: ["bundleID": bundleID, "bundlePath": bundlePath]
+            )
+            let reconciliation = reconcileUninstallState(bundleID: bundleID, bundlePath: bundlePath, dataPath: dataPath)
+            switch reconciliation {
+            case .removed:
+                return .removed
+            case .removedWithResidualData(let detail):
+                return .removedWithResidualData(detail)
+            case .stillInstalled:
+                return .rejected("残留清理前后发现目标重新处于已安装状态；已停止清理。\(cleanup.detail)")
+            case .inconsistent(let detail):
+                pendingUninstallBundleID = bundleID
+                uninstallDetail = "未注册残留清理后状态仍不一致：\(detail)。helper：\(cleanup.detail)"
+                return .verificationTimedOut(uninstallDetail)
+            }
+        }
+
         guard await canUninstallInstalledApps() else {
             return .rejected(uninstallDetail)
         }
@@ -682,6 +730,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         uninstallDetail = "正在根据本次 helper 隔离探测重新判断卸载后端。"
         bundlePaths = [:]
         containerPaths = [:]
+        unregisteredBundleIDs.removeAll()
 
         let isolated = EmbeddedRootHelper.enumerateInstalledApps()
         guard let payload = isolated.payload, !payload.apps.isEmpty else {
@@ -694,9 +743,11 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         var appsByBundleID: [String: ResourceNode] = [:]
         var bundles: [String: String] = [:]
         var containers: [String: String] = [:]
+        var unregistered: Set<String> = []
         for app in payload.apps where !app.bundleID.isEmpty {
             if !app.bundlePath.isEmpty { bundles[app.bundleID] = app.bundlePath }
             if !app.dataContainerPath.isEmpty { containers[app.bundleID] = app.dataContainerPath }
+            if !app.registered { unregistered.insert(app.bundleID) }
             appsByBundleID[app.bundleID] = ResourceNode(
                 id: ResourceID("app://\(app.bundleID)"),
                 kind: .app,
@@ -704,7 +755,11 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
                 logicalLocation: "app://\(app.bundleID)",
                 resolvedPath: app.bundlePath.isEmpty ? nil : app.bundlePath,
                 ownerBundleID: app.bundleID,
-                metadata: ["version": app.version, "containerKnown": app.dataContainerPath.isEmpty ? "false" : "true"]
+                metadata: [
+                    "version": app.version,
+                    "containerKnown": app.dataContainerPath.isEmpty ? "false" : "true",
+                    "registration": app.registered ? "registered" : "filesystem-orphan"
+                ]
             )
         }
 
@@ -724,6 +779,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         cachedApps = parsedApps
         bundlePaths = bundles
         containerPaths = containers
+        unregisteredBundleIDs = unregistered
     }
 
     private static func isUserApplicationBundlePath(_ path: String?) -> Bool {
