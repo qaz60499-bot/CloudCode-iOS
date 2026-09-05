@@ -21,6 +21,10 @@
 #define CLOUDCODE_GUI_PARENT_IDENTITY 1u
 #define CLOUDCODE_GUI_FINGER_INDEX 3u
 #define CLOUDCODE_GUI_FINGER_IDENTITY 2u
+#define CLOUDCODE_HID_DIGITIZER_RANGE (1u << 0)
+#define CLOUDCODE_HID_DIGITIZER_TOUCH (1u << 1)
+#define CLOUDCODE_HID_DIGITIZER_POSITION (1u << 2)
+#define CLOUDCODE_HID_DIGITIZER_IDENTITY (1u << 4)
 
 typedef const struct __CloudCodeIOHIDEvent *CloudCodeIOHIDEventRef;
 typedef const struct __CloudCodeIOHIDEventSystemClient *CloudCodeIOHIDEventSystemClientRef;
@@ -246,12 +250,12 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
     // Range|Touch|Identity|Position for contact end. A zero mask or a permanently touching parent
     // can both produce structurally valid events that SpringBoard silently ignores.
     uint32_t parentMask = 0;
-    if (touching && (phaseMask & (1u << 2)) != 0) {
-        parentMask = (1u << 2);
+    if (touching && (phaseMask & CLOUDCODE_HID_DIGITIZER_POSITION) != 0) {
+        parentMask = CLOUDCODE_HID_DIGITIZER_POSITION;
     } else if (touching) {
-        parentMask = (1u << 0) | (1u << 1) | (1u << 5);
+        parentMask = CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH | CLOUDCODE_HID_DIGITIZER_IDENTITY;
     } else {
-        parentMask = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 5);
+        parentMask = CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH | CLOUDCODE_HID_DIGITIZER_POSITION | CLOUDCODE_HID_DIGITIZER_IDENTITY;
     }
     CloudCodeIOHIDEventRef parent = runtime.createDigitizer(
         kCFAllocatorDefault, mach_absolute_time(), 3,
@@ -299,8 +303,8 @@ static BOOL CloudCodePerformTap(double x, double y)
     CGSize size = CloudCodeScreenSize();
     double nx = size.width > 1 ? x / size.width : 0;
     double ny = size.height > 1 ? y / size.height : 0;
-    BOOL ok = CloudCodeDispatchTouch(runtime, client, x, y, (1u << 0) | (1u << 1), YES, YES);
-    if (ok) { usleep(50000); ok = CloudCodeDispatchTouch(runtime, client, x, y, (1u << 0) | (1u << 1), NO, NO); }
+    BOOL ok = CloudCodeDispatchTouch(runtime, client, x, y, CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH, YES, YES);
+    if (ok) { usleep(50000); ok = CloudCodeDispatchTouch(runtime, client, x, y, CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH, NO, NO); }
     if (ok) {
         // The helper is intentionally short-lived. Keep the HID client alive briefly after the
         // final lift packet so the last Mach delivery cannot be torn down with the process.
@@ -322,17 +326,17 @@ static BOOL CloudCodePerformSwipe(double fromX, double fromY, double toX, double
     if (!CloudCodeHIDReady(runtime, &client)) { return NO; }
     const int steps = 20;
     useconds_t delay = (useconds_t)((durationSeconds * 1000000.0) / steps);
-    BOOL ok = CloudCodeDispatchTouch(runtime, client, fromX, fromY, (1u << 0) | (1u << 1), YES, YES);
+    BOOL ok = CloudCodeDispatchTouch(runtime, client, fromX, fromY, CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH, YES, YES);
     for (int index = 1; ok && index <= steps; index++) {
         usleep(delay);
         double t = (double)index / (double)steps;
         double x = fromX + (toX - fromX) * t;
         double y = fromY + (toY - fromY) * t;
-        ok = CloudCodeDispatchTouch(runtime, client, x, y, (1u << 2), YES, YES);
+        ok = CloudCodeDispatchTouch(runtime, client, x, y, CLOUDCODE_HID_DIGITIZER_POSITION, YES, YES);
     }
     if (ok) {
         usleep(10000);
-        ok = CloudCodeDispatchTouch(runtime, client, toX, toY, (1u << 0) | (1u << 1), NO, NO);
+        ok = CloudCodeDispatchTouch(runtime, client, toX, toY, CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH, NO, NO);
     }
     if (ok) {
         usleep(100000);
