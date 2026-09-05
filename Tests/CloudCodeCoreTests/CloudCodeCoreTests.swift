@@ -2155,6 +2155,44 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(saved.title, "create it")
     }
 
+    func testAgentFeedsScreenshotToolAttachmentBackAsHiddenVisualObservation() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let provider = ScreenshotRoundProvider()
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "gui.screenshot", summary: "shot", risk: .readOnly, preferredRoute: .guiFallback)
+        ])
+        let attachment = ChatAttachment(
+            filename: "gui-screenshot.jpg",
+            path: "/tmp/gui-screenshot.jpg",
+            mimeType: "image/jpeg",
+            byteSize: 2048
+        )
+        let agent = AgentCore(
+            provider: provider,
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(
+                registry: registry,
+                executors: [AttachmentExecutor(route: .guiFallback, names: ["gui.screenshot"], attachment: attachment)]
+            ),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true)),
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 3
+        )
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "vision-test", apiKeyReference: "test-key")
+        let stream = await agent.send(text: "inspect the screen", session: AgentSession(permissionMode: .full), providerConfiguration: config)
+        for try await _ in stream {}
+
+        let snapshots = await provider.snapshots()
+        XCTAssertEqual(snapshots.count, 2)
+        let observation = snapshots[1].messages.first(where: { $0.providerMetadata["internal_observation"] == "gui.screenshot" })
+        XCTAssertEqual(observation?.role, .user)
+        XCTAssertEqual(observation?.attachments, [attachment])
+        XCTAssertTrue(observation?.content.contains("untrusted observation") == true)
+    }
+
     func testAgentUsesExplicitlyValidatedSessionCapabilitySnapshotForToolRouting() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -4382,6 +4420,55 @@ private actor SequencedGUIProvider: ProviderStreaming {
             continuation.yield(.finished)
             continuation.finish()
         }
+    }
+}
+
+private actor ScreenshotRoundProvider: ProviderStreaming {
+    struct Snapshot: Sendable {
+        var messages: [ChatMessage]
+    }
+
+    private var recorded: [Snapshot] = []
+
+    func snapshots() -> [Snapshot] { recorded }
+
+    nonisolated func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                await record(messages: messages)
+                if messages.contains(where: { $0.role == .tool }) {
+                    continuation.yield(.token("done"))
+                    continuation.yield(.finished)
+                } else {
+                    continuation.yield(.toolCall(id: "shot-1", name: "gui_screenshot", argumentsJSON: "{}"))
+                    continuation.yield(.finished)
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    private func record(messages: [ChatMessage]) {
+        recorded.append(Snapshot(messages: messages))
+    }
+}
+
+private struct AttachmentExecutor: ToolExecuting, Sendable {
+    let route: AppExecutionRoute
+    let names: Set<String>
+    let attachment: ChatAttachment
+
+    func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
+        names.contains(tool.name)
+    }
+
+    func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
+        ToolResult(toolCallID: call.id, success: true, summary: "Screenshot captured", attachments: [attachment])
     }
 }
 
