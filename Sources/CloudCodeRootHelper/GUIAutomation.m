@@ -71,6 +71,7 @@ typedef UIImage *(*CloudCodeCreateScreenImageFn)(void);
 typedef CFTypeRef CloudCodeIOSurfaceRef;
 typedef CFTypeRef CloudCodeIOSurfaceAcceleratorRef;
 typedef CloudCodeIOSurfaceRef (*CloudCodeIOSurfaceCreateFn)(CFDictionaryRef);
+typedef size_t (*CloudCodeIOSurfaceAlignPropertyFn)(CFStringRef, size_t);
 typedef int32_t (*CloudCodeIOSurfaceAcceleratorCreateFn)(CFAllocatorRef, CFTypeRef, CloudCodeIOSurfaceAcceleratorRef *);
 typedef int32_t (*CloudCodeIOSurfaceAcceleratorTransferFn)(CloudCodeIOSurfaceAcceleratorRef, CloudCodeIOSurfaceRef, CloudCodeIOSurfaceRef, void *, void *, void *, void *);
 typedef int32_t (*CloudCodeIOSurfaceLockFn)(CloudCodeIOSurfaceRef, uint32_t, uint32_t *);
@@ -541,6 +542,7 @@ static UIImage *CloudCodeScreenshotImageFromRenderServer(void)
     ]);
     CloudCodeRenderServerRenderDisplayFn render = (CloudCodeRenderServerRenderDisplayFn)CloudCodeResolve(quartzCore, "CARenderServerRenderDisplay");
     CloudCodeIOSurfaceCreateFn createSurface = (CloudCodeIOSurfaceCreateFn)CloudCodeResolve(ioSurface, "IOSurfaceCreate");
+    CloudCodeIOSurfaceAlignPropertyFn alignProperty = (CloudCodeIOSurfaceAlignPropertyFn)CloudCodeResolve(ioSurface, "IOSurfaceAlignProperty");
     CloudCodeIOSurfaceLockFn lockSurface = (CloudCodeIOSurfaceLockFn)CloudCodeResolve(ioSurface, "IOSurfaceLock");
     CloudCodeIOSurfaceUnlockFn unlockSurface = (CloudCodeIOSurfaceUnlockFn)CloudCodeResolve(ioSurface, "IOSurfaceUnlock");
     CloudCodeIOSurfaceGetBaseAddressFn getBaseAddress = (CloudCodeIOSurfaceGetBaseAddressFn)CloudCodeResolve(ioSurface, "IOSurfaceGetBaseAddress");
@@ -548,17 +550,20 @@ static UIImage *CloudCodeScreenshotImageFromRenderServer(void)
     CloudCodeIOSurfaceAcceleratorCreateFn createAccelerator = (CloudCodeIOSurfaceAcceleratorCreateFn)CloudCodeResolve(ioSurfaceAccelerator, "IOSurfaceAcceleratorCreate");
     CloudCodeIOSurfaceAcceleratorTransferFn transferSurface = (CloudCodeIOSurfaceAcceleratorTransferFn)CloudCodeResolve(ioSurfaceAccelerator, "IOSurfaceAcceleratorTransferSurface");
     CGSize pixels = CloudCodeScreenPixelSize();
-    if (!render || !createSurface || !lockSurface || !unlockSurface || !getBaseAddress || !getBytesPerRow || pixels.width <= 1 || pixels.height <= 1) {
-        fprintf(stderr, "gui-screenshot/render-server: prerequisites unavailable render=%d create=%d lock=%d unlock=%d base=%d row=%d pixels=%.0fx%.0f\n", !!render, !!createSurface, !!lockSurface, !!unlockSurface, !!getBaseAddress, !!getBytesPerRow, pixels.width, pixels.height);
+    if (!render || !createSurface || !alignProperty || !lockSurface || !unlockSurface || !getBaseAddress || !getBytesPerRow || pixels.width <= 1 || pixels.height <= 1) {
+        fprintf(stderr, "gui-screenshot/render-server: prerequisites unavailable render=%d create=%d align=%d lock=%d unlock=%d base=%d row=%d pixels=%.0fx%.0f\n", !!render, !!createSurface, !!alignProperty, !!lockSurface, !!unlockSurface, !!getBaseAddress, !!getBytesPerRow, pixels.width, pixels.height);
         return nil;
     }
 
     size_t width = (size_t)llround(pixels.width);
     size_t height = (size_t)llround(pixels.height);
-    if (width == 0 || height == 0 || width > 8192 || height > 8192) { return nil; }
-    size_t bytesPerRow = width * 4;
-    size_t allocationSize = bytesPerRow * height;
-    if (allocationSize == 0 || allocationSize > 256 * 1024 * 1024) { return nil; }
+    if (width == 0 || height == 0 || width > 8192 || height > 8192 || width > SIZE_MAX / 4) { return nil; }
+    size_t rawBytesPerRow = width * 4;
+    size_t bytesPerRow = alignProperty(CFSTR("IOSurfaceBytesPerRow"), rawBytesPerRow);
+    if (bytesPerRow < rawBytesPerRow || bytesPerRow == 0 || height > SIZE_MAX / bytesPerRow) { return nil; }
+    size_t rawAllocationSize = bytesPerRow * height;
+    size_t allocationSize = alignProperty(CFSTR("IOSurfaceAllocSize"), rawAllocationSize);
+    if (allocationSize < rawAllocationSize || allocationSize == 0 || allocationSize > 256 * 1024 * 1024) { return nil; }
 
     NSDictionary *properties = @{
         @"IOSurfaceWidth": @(width),
