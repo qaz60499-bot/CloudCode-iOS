@@ -9,7 +9,7 @@
 #import "GUIAutomation.h"
 
 #define CLOUDCODE_PROC_PATH_MAX 4096
-#define CLOUDCODE_ROOT_HELPER_PROTOCOL_MARKER "cloudcode-root-helper-protocol=42"
+#define CLOUDCODE_ROOT_HELPER_PROTOCOL_MARKER "cloudcode-root-helper-protocol=1"
 typedef int (*CloudCodeProcListAllPidsFn)(void *, int);
 typedef int (*CloudCodeProcPidPathFn)(int, void *, uint32_t);
 
