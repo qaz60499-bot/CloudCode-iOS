@@ -1672,7 +1672,7 @@ private func localizedCapabilityDetail(_ id: String, detail: String) -> String {
     case "automation.gui.tree": return "只有隔离 helper 实际从前台 App 返回 bounded AXRuntime tree 后才标记可用。"
     case "automation.gui.screenshot": return "只有隔离 helper 实际捕获并编码全局截图后才标记可用。"
     case "automation.gui.touch": return "只有当前 TrollStore 签名下 IOHID client 与 digitizer runtime 握手成功后才标记可用。"
-    case "automation.gui.text_input": return "只有 IOHID Unicode 文本事件 runtime 握手成功后才标记可用；输入正文不会进入诊断/审批日志。"
+    case "automation.gui.text_input": return "文本输入只在具体 gui.type 时验证当前焦点：优先尝试 focused AX 文本字段写入并读回校验，不可用时回退 IOHID Unicode；输入正文不会进入诊断/审批日志。"
     case "automation.gui.gestures": return "滑动和滚动依赖同一 bounded IOHID digitizer backend，并限制坐标、时长和 helper 超时。"
     case "automation.gui.verify": return "验证必须基于一次新的 AX tree 观察；如果 tree 不可用则验证能力也不可用。"
     case "automation.gui":

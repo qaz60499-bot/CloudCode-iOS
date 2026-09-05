@@ -1518,6 +1518,71 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
         if (!utf8 || utf8.length == 0 || utf8.length > CLOUDCODE_GUI_MAX_TEXT_UTF8_BYTES) { return 67; }
         NSString *text = [[NSString alloc] initWithData:utf8 encoding:NSUTF8StringEncoding];
         if (!text || text.length == 0) { return 67; }
+
+        // Prefer the focused accessibility text element when the foreground app exposes one.
+        // This is substantially more reliable than sending a Unicode HID packet into an unknown
+        // responder. Never overwrite a non-empty field through AX: in that case preserve normal
+        // caret/append semantics and fall back to HID below.
+        CloudCodeAXRuntime ax = CloudCodeResolveAX();
+        id focusedHolder = nil;
+        CloudCodeAXUIElementRef focusedElement = NULL;
+        NSString *focusedBackend = nil;
+        NSString *focusedRole = nil;
+        NSString *beforeText = nil;
+        if (ax.copyAttribute && ax.setAttribute) {
+            pid_t focusedPID = 0;
+            CloudCodeAXUIElementRef focusedRoot = CloudCodeAXFocusedApplicationRoot(ax, &focusedPID, &focusedBackend);
+            if (focusedRoot) {
+                for (NSString *attribute in @[@"AXFocusedUIElement", @"AXFocusedElement"]) {
+                    id candidate = CloudCodeAXCopy(ax, focusedRoot, (__bridge CFStringRef)attribute);
+                    if (candidate) {
+                        focusedHolder = candidate;
+                        focusedElement = (CloudCodeAXUIElementRef)(__bridge CFTypeRef)focusedHolder;
+                        break;
+                    }
+                }
+                CFRelease(focusedRoot);
+            }
+            if (focusedElement) {
+                id rawRole = CloudCodeAXCopy(ax, focusedElement, ax.attributeElementType ?: CFSTR("AXRole"));
+                focusedRole = CloudCodeBoundedString(rawRole);
+                BOOL isTextRole = focusedRole && (
+                    [focusedRole rangeOfString:@"TextField" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [focusedRole rangeOfString:@"TextArea" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [focusedRole rangeOfString:@"TextView" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [focusedRole rangeOfString:@"SearchField" options:NSCaseInsensitiveSearch].location != NSNotFound
+                );
+                if (isTextRole) {
+                    id rawBefore = CloudCodeAXCopy(ax, focusedElement, ax.attributeValue ?: CFSTR("AXValue"));
+                    if ([rawBefore isKindOfClass:NSString.class]) { beforeText = [rawBefore copy]; }
+                    if (!beforeText || beforeText.length == 0) {
+                        CloudCodeAXError setCode = -1;
+                        @try {
+                            setCode = ax.setAttribute(focusedElement, ax.attributeValue ?: CFSTR("AXValue"), (__bridge CFTypeRef)text);
+                        } @catch (__unused NSException *exception) {
+                            setCode = -1;
+                        }
+                        if (setCode == 0) {
+                            usleep(80000);
+                            id rawAfter = CloudCodeAXCopy(ax, focusedElement, ax.attributeValue ?: CFSTR("AXValue"));
+                            if ([rawAfter isKindOfClass:NSString.class] && [(NSString *)rawAfter isEqualToString:text]) {
+                                fprintf(stderr, "gui-type: route=ax-focused-value result=verified chars=%lu backend=%s role=%s\n",
+                                        (unsigned long)text.length,
+                                        focusedBackend.UTF8String ?: "AXRuntime.focused",
+                                        focusedRole.UTF8String ?: "unknown");
+                                return 0;
+                            }
+                            fprintf(stderr, "gui-type: route=ax-focused-value result=write-unverified chars=%lu backend=%s role=%s\n",
+                                    (unsigned long)text.length,
+                                    focusedBackend.UTF8String ?: "AXRuntime.focused",
+                                    focusedRole.UTF8String ?: "unknown");
+                            return 70;
+                        }
+                    }
+                }
+            }
+        }
+
         NSData *unicode = [text dataUsingEncoding:NSUTF16LittleEndianStringEncoding];
         if (!unicode || unicode.length == 0 || unicode.length > UINT32_MAX) { return 67; }
         CloudCodeHIDRuntime runtime = CloudCodeResolveHID();
@@ -1543,6 +1608,27 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
         }
         CFRelease(event);
         CloudCodeReleaseHIDRoute(&route);
+
+        // Keep the helper alive briefly so UIKit can consume the event. If AX can read the same
+        // focused field, use that as a bounded postcondition and fail instead of reporting a false
+        // success when the text field did not change at all.
+        usleep(120000);
+        if (focusedElement && beforeText) {
+            id rawAfter = CloudCodeAXCopy(ax, focusedElement, ax.attributeValue ?: CFSTR("AXValue"));
+            if ([rawAfter isKindOfClass:NSString.class]) {
+                NSString *afterText = (NSString *)rawAfter;
+                if ([afterText isEqualToString:beforeText]) {
+                    fprintf(stderr, "gui-type: route=hid-unicode result=no-observed-change chars=%lu\n", (unsigned long)text.length);
+                    return 70;
+                }
+                fprintf(stderr, "gui-type: route=hid-unicode result=ax-observed-change chars=%lu beforeChars=%lu afterChars=%lu\n",
+                        (unsigned long)text.length,
+                        (unsigned long)beforeText.length,
+                        (unsigned long)afterText.length);
+                return 0;
+            }
+        }
+        fprintf(stderr, "gui-type: route=hid-unicode result=dispatched-unverified chars=%lu\n", (unsigned long)text.length);
         return 0;
     }
 }

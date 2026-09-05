@@ -490,6 +490,25 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(target.contains("内容已隐藏"))
     }
 
+    func testGUISwipeSequenceApprovalTargetShowsOnlyBoundedCount() {
+        let call = ToolCall(
+            name: "gui.swipeSequence",
+            arguments: ["fromX": "195", "fromY": "620", "toX": "195", "toY": "220", "duration": "0.3", "count": "3"],
+            sessionID: UUID()
+        )
+        let target = GUIApprovalTargetSanitizer.target(for: call)
+        XCTAssertTrue(target.contains("bounded swipe sequence"))
+        XCTAssertTrue(target.contains("×3"))
+    }
+
+    func testDefaultToolRegistryIncludesBoundedSwipeSequence() async {
+        let registry = ToolRegistry()
+        let descriptor = await registry.descriptor(named: "gui.swipeSequence")
+        XCTAssertEqual(descriptor?.risk, .safeWrite)
+        XCTAssertEqual(descriptor?.preferredRoute, .guiFallback)
+        XCTAssertEqual(descriptor?.requiredCapabilities, [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
+    }
+
     func testGUIVisibleTextVerifierReportsSuccessAndFailureFromFreshObservation() {
         let tree = #"{"tree":{"label":"Done","identifier":"finish-button"}}"#
         let success = GUIVisibleTextVerifier.verify(tree: tree, assertion: "contains:Done")
@@ -1594,12 +1613,15 @@ final class CloudCodeCoreTests: XCTestCase {
         let tapValue = await registry.descriptor(named: "gui.tap")
         let treeValue = await registry.descriptor(named: "gui.tree")
         let typeValue = await registry.descriptor(named: "gui.type")
+        let sequenceValue = await registry.descriptor(named: "gui.swipeSequence")
         let tap = try XCTUnwrap(tapValue)
         let tree = try XCTUnwrap(treeValue)
         let type = try XCTUnwrap(typeValue)
+        let sequence = try XCTUnwrap(sequenceValue)
         XCTAssertEqual(tap.requiredCapabilities, [GUIAutomationFeature.touch.capabilityID])
         XCTAssertEqual(tree.requiredCapabilities, [GUIAutomationFeature.tree.capabilityID])
         XCTAssertEqual(type.requiredCapabilities, [GUIAutomationFeature.textInput.capabilityID])
+        XCTAssertEqual(sequence.requiredCapabilities, [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
     }
 
     func testPartialGUICapabilityFailsClosedForUnprovenFeature() async throws {
@@ -2370,7 +2392,7 @@ final class CloudCodeCoreTests: XCTestCase {
             $0.role == .system
                 && $0.providerMetadata["context_layer"] == "computer_use_fallback"
                 && $0.content.contains("AX/gui.tree failed")
-                && $0.content.contains("next action should be one bounded gui.swipe")
+                && $0.content.contains("prefer one bounded gui.swipeSequence")
         })
         XCTAssertTrue(snapshots[2].messages.contains {
             $0.providerMetadata["internal_observation"] == "gui.screenshot" && $0.attachments == [attachment]
@@ -3196,6 +3218,9 @@ final class CloudCodeCoreTests: XCTestCase {
             "fromX": "200", "fromY": "700", "toX": "200", "toY": "200", "duration": "0.3"
         ])
         XCTAssertEqual(guiScope, "gui:foreground")
+        XCTAssertEqual(AgentCore.semanticToolScope(name: "gui.swipeSequence", arguments: [
+            "fromX": "200", "fromY": "700", "toX": "200", "toY": "200", "duration": "0.3", "count": "3"
+        ]), "gui:foreground")
         XCTAssertTrue(AgentCore.readOnlyToolVerifiesLastStateChange(name: "gui.screenshot", arguments: [:], scope: guiScope))
         XCTAssertTrue(AgentCore.readOnlyToolVerifiesLastStateChange(name: "gui.tree", arguments: [:], scope: guiScope))
         XCTAssertTrue(AgentCore.readOnlyToolVerifiesLastStateChange(name: "gui.verify", arguments: ["assertion": "visible"], scope: guiScope))
@@ -3204,6 +3229,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(AgentCore.allowsImmediateSemanticRepeat(name: "apps.launch"))
         XCTAssertTrue(AgentCore.allowsImmediateSemanticRepeat(name: "gui.openApp"))
         XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "gui.swipe"))
+        XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "gui.swipeSequence"))
         XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "gui.tap"))
         XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "files.create"))
     }
@@ -3776,6 +3802,46 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(compressed.contains { $0.role == .assistant && $0.providerMetadata["tool_call_id"] == "call-final" })
         XCTAssertTrue(compressed.contains { $0.role == .tool && $0.providerMetadata["tool_call_id"] == "call-final" })
         XCTAssertLessThan(compressed.count, messages.count)
+    }
+
+    func testHarnessExecutionHintRecognizesExplicitBoundedRepeatedSwipe() {
+        let messages = [
+            ChatMessage(role: .system, content: "safety"),
+            ChatMessage(role: .user, content: "打开抖音向上刷三下，然后点赞")
+        ]
+        let providerMessages = HarnessContextManager.providerMessages(from: messages)
+        let hint = providerMessages.first(where: { $0.providerMetadata["context_layer"] == "harness_execution" })
+        XCTAssertEqual(hint?.providerMetadata["execution_mode"], "bounded_repeated_swipe")
+        XCTAssertEqual(hint?.providerMetadata["repeat_count"], "3")
+        XCTAssertTrue(hint?.content.contains("gui.swipeSequence") == true)
+    }
+
+    func testHarnessExecutionHintSupportsArabicCountAndIgnoresInternalScreenshotObservation() {
+        let messages = [
+            ChatMessage(role: .user, content: "swipe up 5 times"),
+            ChatMessage(role: .user, content: "Device screenshot", providerMetadata: ["internal_observation": "gui.screenshot"])
+        ]
+        let hint = HarnessContextManager.executionHint(from: messages)
+        XCTAssertEqual(hint?.providerMetadata["repeat_count"], "5")
+    }
+
+    func testHarnessExecutionHintDoesNotInventUnboundedSwipeCount() {
+        XCTAssertNil(HarnessContextManager.boundedRepeatedSwipeCount(in: "打开抖音一直刷视频，直到我叫停"))
+        XCTAssertNil(HarnessContextManager.boundedRepeatedSwipeCount(in: "打开热门页面看看"))
+        XCTAssertNil(HarnessContextManager.boundedRepeatedSwipeCount(in: "刷 20 次"), "fast sequence is intentionally bounded to at most 12 gestures")
+    }
+
+    func testHarnessExecutionHintTracksTransientVideoReturnBeforeTyping() {
+        let messages = [ChatMessage(role: .user, content: "打开抖音群聊里的视频看一下，然后回来评价并发送")]
+        let hints = HarnessContextManager.executionHints(from: messages)
+        let navigation = hints.first(where: { $0.providerMetadata["execution_mode"] == "transient_navigation_return" })
+        XCTAssertNotNil(navigation)
+        XCTAssertTrue(navigation?.content.contains("navigate back") == true)
+        XCTAssertTrue(navigation?.content.contains("before locating a text field or typing") == true)
+    }
+
+    func testHarnessDoesNotForceTransientReturnForVideoOnlyViewingTask() {
+        XCTAssertFalse(HarnessContextManager.transientNavigationNeedsReturn(in: "打开群聊里的视频看一下"))
     }
 
     func testHarnessContextCompressionDropsAssistantToolCallWhenLargeResultDoesNotFit() {

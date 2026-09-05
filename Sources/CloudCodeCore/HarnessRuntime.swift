@@ -82,6 +82,7 @@ public enum HarnessContextManager {
         })
 
         var result = systemMessages
+        result.append(contentsOf: executionHints(from: messages))
         let omitted = conversational.count - selectedIndexes.count
         if omitted > 0 {
             result.append(ChatMessage(
@@ -94,6 +95,77 @@ public enum HarnessContextManager {
             result.append(messages[index])
         }
         return result
+    }
+
+    static func executionHints(from messages: [ChatMessage]) -> [ChatMessage] {
+        guard let request = messages.reversed().first(where: {
+            $0.role == .user && $0.providerMetadata["internal_observation"] == nil
+        })?.content else { return [] }
+        var hints: [ChatMessage] = []
+        if let count = boundedRepeatedSwipeCount(in: request) {
+            hints.append(ChatMessage(
+                role: .system,
+                content: "Harness execution hint: the latest user request contains an explicit finite repeated swipe/feed-browse count of \(count). After a fresh foreground observation, prefer one gui.swipeSequence with count=\(count) when the repeated motion is mechanically identical and no intermediate semantic decision is required. This hint is advisory only: if the screen changes into a state that requires interpretation, use individual observe/action steps instead. Never turn this hint into an unbounded loop.",
+                providerMetadata: [
+                    "context_layer": "harness_execution",
+                    "execution_mode": "bounded_repeated_swipe",
+                    "repeat_count": String(count)
+                ]
+            ))
+        }
+        if transientNavigationNeedsReturn(in: request) {
+            hints.append(ChatMessage(
+                role: .system,
+                content: "Harness execution hint: this request appears to open a transient content/detail surface in order to inspect it and then continue a later communication/evaluation step. Treat the origin screen as a return obligation. After observing the transient content, explicitly navigate back to the originating context and verify that return with a fresh GUI observation before locating a text field or typing. Do not type while still on the temporary video/detail surface unless the user explicitly asked to comment there.",
+                providerMetadata: [
+                    "context_layer": "harness_execution",
+                    "execution_mode": "transient_navigation_return"
+                ]
+            ))
+        }
+        return hints
+    }
+
+    static func executionHint(from messages: [ChatMessage]) -> ChatMessage? {
+        executionHints(from: messages).first
+    }
+
+    static func transientNavigationNeedsReturn(in request: String) -> Bool {
+        let normalized = request.lowercased()
+        let openMarkers = ["打开", "点开", "进入", "查看", "看", "open", "watch", "view"]
+        let transientMarkers = ["视频", "详情", "帖子", "图片", "照片", "链接", "video", "detail", "post", "photo", "image", "link"]
+        let continuationMarkers = ["评价", "回复", "告诉", "总结", "输入", "发送", "说说", "comment", "reply", "evaluate", "summarize", "type", "send"]
+        return openMarkers.contains(where: normalized.contains)
+            && transientMarkers.contains(where: normalized.contains)
+            && continuationMarkers.contains(where: normalized.contains)
+    }
+
+    static func boundedRepeatedSwipeCount(in request: String) -> Int? {
+        let normalized = request.lowercased()
+        let actionMarkers = ["swipe", "滑", "刷"]
+        guard actionMarkers.contains(where: normalized.contains) else { return nil }
+        let finiteMarkers = ["次", "下", "个视频", "條視頻", "条视频", "videos", "times"]
+        guard finiteMarkers.contains(where: normalized.contains) else { return nil }
+
+        let digitPattern = #"(?<!\d)([2-9]|1[0-2])\s*(?:次|下|个视频|條視頻|条视频|videos?|times?)"#
+        if let regex = try? NSRegularExpression(pattern: digitPattern, options: [.caseInsensitive]),
+           let match = regex.firstMatch(in: request, range: NSRange(request.startIndex..., in: request)),
+           let range = Range(match.range(at: 1), in: request),
+           let count = Int(request[range]) {
+            return count
+        }
+
+        let chineseCounts: [(String, Int)] = [
+            ("十二", 12), ("十一", 11), ("十", 10),
+            ("九", 9), ("八", 8), ("七", 7), ("六", 6),
+            ("五", 5), ("四", 4), ("三", 3), ("二", 2), ("两", 2), ("兩", 2)
+        ]
+        for (token, count) in chineseCounts {
+            for suffix in ["次", "下", "个视频", "條視頻", "条视频"] where normalized.contains(token + suffix) {
+                return count
+            }
+        }
+        return nil
     }
 
     private static func estimatedCharacters(_ message: ChatMessage) -> Int {

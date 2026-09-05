@@ -134,6 +134,7 @@ enum EmbeddedRootHelper {
         case 67: meaning = "文本输入参数无效或超出限制"
         case 68: meaning = "IOHID Unicode 文本输入后端不可用"
         case 69: meaning = "内嵌 root helper 协议/构建指纹不匹配"
+        case 70: meaning = "文本输入事件已派发，但可读的聚焦输入框内容没有变化"
         case 73: meaning = "后台 assertion 目标进程不存在或无效"
         case 74: meaning = "后台 assertion worker 创建失败"
         case 75: meaning = "AssertionServices 拒绝或未建立后台保活 assertion"
@@ -388,7 +389,7 @@ enum EmbeddedRootHelper {
         let encoded = utf8.base64EncodedString()
         let result = run(["gui-type-base64", encoded], privilege: .root, timeout: 6)
         return result.code == 0
-            ? (true, "IOHID Unicode 文本输入已提交；输入内容未写入 helper 诊断输出。")
+            ? (true, result.diagnostic.isEmpty ? "文本输入已通过受控 AX/HID 路径提交；输入内容未写入 helper 诊断输出。" : "文本输入已提交；输入内容未写入日志。\(result.diagnostic)")
             : (false, failureDetail(prefix: "GUI type", code: result.code, diagnostic: result.diagnostic))
     }
 
@@ -1225,6 +1226,13 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         for tool: ToolDescriptor,
         capabilities: CapabilityProfile
     ) async -> Bool {
+        if tool.name == "gui.swipeSequence" {
+            let expected = Set([GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
+            let deferred = Set(capabilityIDs)
+            guard !deferred.isEmpty, deferred.isSubset(of: expected),
+                  capabilityIDs.allSatisfy({ capabilities.status($0) == .deviceValidationRequired }) else { return false }
+            return true
+        }
         guard let feature = Self.feature(for: tool.name),
               capabilityIDs == [feature.capabilityID],
               capabilities.status(feature.capabilityID) == .deviceValidationRequired else { return false }
@@ -1234,6 +1242,12 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
     }
 
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
+        if tool.name == "gui.swipeSequence" {
+            return [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID].allSatisfy {
+                let status = capabilities.status($0)
+                return status == .available || status == .deviceValidationRequired
+            }
+        }
         guard let feature = Self.feature(for: tool.name) else { return false }
         let status = capabilities.status(feature.capabilityID)
         return status == .available || status == .deviceValidationRequired
@@ -1263,13 +1277,20 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                   abs(dx) >= 0.5 || abs(dy) >= 0.5 else {
                 throw ToolRouterError.noExecutionRoute("scroll delta missing, invalid, zero, or outside bounded range")
             }
-        case "gui.swipe":
+        case "gui.swipe", "gui.swipeSequence":
             let keys = ["fromX", "fromY", "toX", "toY"]
             let coordinates = keys.compactMap { Double(call.arguments[$0] ?? "") }
             let duration = Double(call.arguments["duration"] ?? "0.3")
             guard coordinates.count == keys.count, coordinates.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 10_000 }),
                   let duration, duration.isFinite, duration >= 0.05, duration <= 5.0 else {
                 throw ToolRouterError.noExecutionRoute("swipe coordinates/duration missing, invalid, or outside bounded range")
+            }
+            if call.name == "gui.swipeSequence" {
+                guard let rawCount = Double(call.arguments["count"] ?? ""), rawCount.isFinite,
+                      rawCount.rounded(.towardZero) == rawCount,
+                      rawCount >= 2, rawCount <= 12 else {
+                    throw ToolRouterError.noExecutionRoute("swipe sequence count must be an integer from 2 through 12")
+                }
             }
         case "gui.verify":
             guard let assertion = call.arguments["assertion"], !assertion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -1326,12 +1347,87 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.swipe":
             try await backend.swipe(fromX: Double(call.arguments["fromX"] ?? "0") ?? 0, fromY: Double(call.arguments["fromY"] ?? "0") ?? 0, toX: Double(call.arguments["toX"] ?? "0") ?? 0, toY: Double(call.arguments["toY"] ?? "0") ?? 0, duration: Double(call.arguments["duration"] ?? "0.3") ?? 0.3)
             return ToolResult(toolCallID: call.id, success: true, summary: "Swipe dispatched; foreground effect unverified", payload: ["effectVerification": "required"])
+        case "gui.swipeSequence":
+            return try await executeSwipeSequence(call)
         case "gui.verify":
             let result = try await backend.verify(call.arguments["assertion"] ?? "")
             return ToolResult(toolCallID: call.id, success: result.passed, summary: "GUI verification", verification: result)
         default:
             throw ToolRouterError.noExecutionRoute(call.name)
         }
+    }
+
+    private func executeSwipeSequence(_ call: ToolCall) async throws -> ToolResult {
+        let fromX = Double(call.arguments["fromX"] ?? "0") ?? 0
+        let fromY = Double(call.arguments["fromY"] ?? "0") ?? 0
+        let toX = Double(call.arguments["toX"] ?? "0") ?? 0
+        let toY = Double(call.arguments["toY"] ?? "0") ?? 0
+        let duration = Double(call.arguments["duration"] ?? "0.3") ?? 0.3
+        let count = Int(Double(call.arguments["count"] ?? "0") ?? 0)
+        let settleSeconds = max(0.35, min(0.9, duration + 0.2))
+        let settleNanoseconds = UInt64(settleSeconds * 1_000_000_000)
+
+        // Capture once before the first gesture, then carry each post-gesture frame forward as the
+        // next baseline. This keeps an N-swipe sequence to N+1 screenshots instead of 2N while still
+        // stopping if a static foreground produces a byte-identical frame after a dispatched swipe.
+        var latestScreenshot = try await backend.screenshot()
+        let baselineSHA256 = GUIAutomationPayloadPolicy.sha256Hex(latestScreenshot)
+        var previousSHA256 = baselineSHA256
+        var dispatchedCount = 0
+        var changedObservationCount = 0
+        var stoppedAtGesture: Int?
+
+        for gestureIndex in 1...count {
+            try Task.checkCancellation()
+            try await backend.swipe(
+                fromX: fromX,
+                fromY: fromY,
+                toX: toX,
+                toY: toY,
+                duration: duration
+            )
+            dispatchedCount += 1
+            try await Task.sleep(nanoseconds: settleNanoseconds)
+            try Task.checkCancellation()
+
+            let observed = try await backend.screenshot()
+            let observedSHA256 = GUIAutomationPayloadPolicy.sha256Hex(observed)
+            latestScreenshot = observed
+            if observedSHA256 == previousSHA256 {
+                stoppedAtGesture = gestureIndex
+                previousSHA256 = observedSHA256
+                break
+            }
+            changedObservationCount += 1
+            previousSHA256 = observedSHA256
+        }
+
+        let attachment = try persistScreenshotAttachment(latestScreenshot, sessionID: call.sessionID)
+        let sequenceCompleted = dispatchedCount == count && stoppedAtGesture == nil
+        var payload: [String: String] = [
+            "requestedCount": String(count),
+            "dispatchedCount": String(dispatchedCount),
+            "changedObservationCount": String(changedObservationCount),
+            "sequenceCompleted": sequenceCompleted ? "true" : "false",
+            "baselineSHA256": baselineSHA256,
+            "sha256": previousSHA256,
+            "settleMs": String(Int((settleSeconds * 1000).rounded())),
+            "effectVerification": "semantic_required",
+            "localObservation": sequenceCompleted ? "changed_after_each_gesture" : "byte_identical_after_gesture"
+        ]
+        if let stoppedAtGesture {
+            payload["stoppedAtGesture"] = String(stoppedAtGesture)
+        }
+        let summary = sequenceCompleted
+            ? "Bounded swipe sequence dispatched \(dispatchedCount)/\(count); each local post-gesture frame changed. Final screenshot attached; semantic foreground outcome remains unverified."
+            : "Bounded swipe sequence stopped after \(dispatchedCount)/\(count) gestures because the next local screenshot was byte-identical. Final screenshot attached for re-planning."
+        return ToolResult(
+            toolCallID: call.id,
+            success: true,
+            summary: summary,
+            payload: payload,
+            attachments: attachment.map { [$0] }
+        )
     }
 
     private func persistScreenshotAttachment(_ data: Data, sessionID: UUID) throws -> ChatAttachment? {
@@ -1359,7 +1455,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.screenshot": return .screenshot
         case "gui.tap": return .touch
         case "gui.type": return .textInput
-        case "gui.scroll", "gui.swipe": return .gestures
+        case "gui.scroll", "gui.swipe", "gui.swipeSequence": return .gestures
         case "gui.verify": return .verify
         default: return nil
         }

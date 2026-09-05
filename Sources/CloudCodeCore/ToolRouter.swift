@@ -129,6 +129,9 @@ public enum GUIApprovalTargetSanitizer {
         case "gui.tap": return "当前前台 App · tap"
         case "gui.scroll": return "当前前台 App · scroll"
         case "gui.swipe": return "当前前台 App · swipe"
+        case "gui.swipeSequence":
+            let count = call.arguments["count"] ?? "?"
+            return "当前前台 App · bounded swipe sequence ×\(count)"
         case "gui.verify": return "当前 GUI 会话 · verify"
         default: return "当前 GUI 会话"
         }
@@ -176,6 +179,7 @@ public actor ToolRegistry {
         ToolDescriptor(name: "gui.type", summary: "Type text through the configured backend.", risk: .sensitiveWrite, requiredCapabilities: [GUIAutomationFeature.textInput.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.scroll", summary: "Scroll through the configured backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.swipe", summary: "Swipe through the configured backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.swipeSequence", summary: "Execute an explicitly requested finite sequence of identical swipes locally. The bounded executor captures lightweight screenshots between gestures, stops early on byte-identical observations, and returns the final screenshot so the model does not need a full round-trip between every repeated swipe.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.verify", summary: "Verify GUI postconditions through the configured backend.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.verify.capabilityID], preferredRoute: .guiFallback)
     ]
 }

@@ -56,15 +56,15 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             statuses[.tree] = .deviceValidationRequired
             statuses[.screenshot] = .deviceValidationRequired
             statuses[.touch] = .deviceValidationRequired
-            statuses[.textInput] = payload.textInput ? .available : .deviceValidationRequired
+            statuses[.textInput] = .deviceValidationRequired
             statuses[.gestures] = .deviceValidationRequired
             statuses[.verify] = .deviceValidationRequired
             details[.tree] = "AXRuntime tree probing is deferred to the exact gui.tree/gui.verify request to keep device refresh crash-isolated."
             details[.screenshot] = "Global screenshot probing is deferred to the exact gui.screenshot request to keep device refresh crash-isolated."
             details[.touch] = "IOHID touch dispatch and coordinate-space validation are deferred to the exact gui.tap request."
             details[.textInput] = payload.textInput
-                ? "IOHID Unicode input symbols opened successfully in the lightweight helper; the exact input event is still bounded and runtime-validated."
-                : "IOHID Unicode text input remains deferred until an exact gui.type request proves the runtime."
+                ? "IOHID Unicode symbols are present, but symbol presence alone is not proof that the current focused field accepts text. Exact gui.type execution now prefers focused AX value injection with read-back verification, then falls back to HID Unicode with bounded postcondition checks when AX can observe the field."
+                : "Text input remains deferred until an exact gui.type request proves a focused AX or HID Unicode route at runtime."
             details[.gestures] = "IOHID gesture dispatch and coordinate-space validation are deferred to the exact gui.scroll/gui.swipe request."
             details[.verify] = "Verification is deferred with AX tree observation and runs only for an exact gui.verify request."
         }
@@ -133,6 +133,14 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     public func type(_ text: String) async throws {
         guard !text.isEmpty else { throw ToolRouterError.noExecutionRoute("text must not be empty") }
         let outcome = EmbeddedRootHelper.guiType(text)
+        try? await diagnosticLogger?.log(
+            level: outcome.success ? .info : .error,
+            subsystem: "gui",
+            action: "type.helper",
+            result: outcome.success ? "submitted" : "failed",
+            diagnostic: outcome.detail,
+            metadata: ["characters": String(text.count), "utf8Bytes": String(text.utf8.count)]
+        )
         guard outcome.success else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
     }
 
