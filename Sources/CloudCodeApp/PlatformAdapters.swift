@@ -1273,16 +1273,16 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             )
         case "gui.tap":
             try await backend.tap(x: Double(call.arguments["x"] ?? "0") ?? 0, y: Double(call.arguments["y"] ?? "0") ?? 0)
-            return ToolResult(toolCallID: call.id, success: true, summary: "Tap executed")
+            return ToolResult(toolCallID: call.id, success: true, summary: "Tap dispatched; foreground effect unverified", payload: ["effectVerification": "required"])
         case "gui.type":
             try await backend.type(call.arguments["text"] ?? "")
-            return ToolResult(toolCallID: call.id, success: true, summary: "Text input executed")
+            return ToolResult(toolCallID: call.id, success: true, summary: "Text input dispatched; foreground effect unverified", payload: ["effectVerification": "required"])
         case "gui.scroll":
             try await backend.scroll(deltaX: Double(call.arguments["dx"] ?? "0") ?? 0, deltaY: Double(call.arguments["dy"] ?? "0") ?? 0)
-            return ToolResult(toolCallID: call.id, success: true, summary: "Scroll executed")
+            return ToolResult(toolCallID: call.id, success: true, summary: "Scroll dispatched; foreground effect unverified", payload: ["effectVerification": "required"])
         case "gui.swipe":
             try await backend.swipe(fromX: Double(call.arguments["fromX"] ?? "0") ?? 0, fromY: Double(call.arguments["fromY"] ?? "0") ?? 0, toX: Double(call.arguments["toX"] ?? "0") ?? 0, toY: Double(call.arguments["toY"] ?? "0") ?? 0, duration: Double(call.arguments["duration"] ?? "0.3") ?? 0.3)
-            return ToolResult(toolCallID: call.id, success: true, summary: "Swipe executed")
+            return ToolResult(toolCallID: call.id, success: true, summary: "Swipe dispatched; foreground effect unverified", payload: ["effectVerification": "required"])
         case "gui.verify":
             let result = try await backend.verify(call.arguments["assertion"] ?? "")
             return ToolResult(toolCallID: call.id, success: result.passed, summary: "GUI verification", verification: result)

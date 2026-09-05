@@ -106,7 +106,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             level: outcome.success ? .info : .error,
             subsystem: "gui",
             action: "tap.helper",
-            result: outcome.success ? "submitted" : "failed",
+            result: outcome.success ? "dispatched-unverified" : "failed",
             diagnostic: outcome.detail,
             metadata: ["x": String(x), "y": String(y)]
         )
@@ -129,7 +129,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             level: outcome.success ? .info : .error,
             subsystem: "gui",
             action: "scroll.helper",
-            result: outcome.success ? "submitted" : "failed",
+            result: outcome.success ? "dispatched-unverified" : "failed",
             diagnostic: outcome.detail,
             metadata: ["dx": String(deltaX), "dy": String(deltaY)]
         )
@@ -147,7 +147,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             level: outcome.success ? .info : .error,
             subsystem: "gui",
             action: "swipe.helper",
-            result: outcome.success ? "submitted" : "failed",
+            result: outcome.success ? "dispatched-unverified" : "failed",
             diagnostic: outcome.detail,
             metadata: [
                 "fromX": String(fromX), "fromY": String(fromY),

@@ -411,6 +411,12 @@ jobs:
               raise SystemExit('FAIL: GUI route no longer admits only available or exact deferred granular capabilities')
           if 'capabilityIDs == [feature.capabilityID]' not in gui_routing:
               raise SystemExit('FAIL: GUI deferred routing must be limited to the exact requested granular capability')
+          for marker in ('foreground effect unverified', 'effectVerification'):
+              if marker not in gui_executor:
+                  raise SystemExit(f'FAIL: GUI action result can be mistaken for verified foreground success: {marker}')
+          trollstore_gui = Path('Sources/CloudCodeApp/TrollStoreGUIBackend.swift').read_text(encoding='utf-8')
+          if trollstore_gui.count('dispatched-unverified') < 3:
+              raise SystemExit('FAIL: TrollStore GUI backend diagnostics reverted to claiming submitted actions as verified success')
           approval = adapters.split('public final class ApprovalCenter', 1)[1].split('public struct IOSSystemExecutor', 1)[0]
           for marker in ('withTaskCancellationHandler', 'continuationID', 'cancelPendingApproval(requestID:', 'finishPendingApproval(returning:'):
               if marker not in approval:
