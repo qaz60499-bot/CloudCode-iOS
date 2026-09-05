@@ -39,6 +39,7 @@ typedef CloudCodeAXUIElementRef (*CloudCodeAXCreateSystemWideFn)(void);
 typedef CloudCodeAXError (*CloudCodeAXGetPidFn)(CloudCodeAXUIElementRef, pid_t *);
 typedef CloudCodeAXError (*CloudCodeAXCopyAttributeFn)(CloudCodeAXUIElementRef, CFStringRef, CFTypeRef *);
 typedef CloudCodeAXError (*CloudCodeAXSetAttributeFn)(CloudCodeAXUIElementRef, CFStringRef, CFTypeRef);
+typedef CloudCodeAXError (*CloudCodeAXCopyElementAtPositionFn)(CloudCodeAXUIElementRef, float, float, CloudCodeAXUIElementRef *);
 typedef CloudCodeAXError (*CloudCodeAXCopyApplicationAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, float, float);
 typedef CloudCodeAXError (*CloudCodeAXCopyApplicationAndContextAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, uint32_t *, float, float);
 typedef CloudCodeAXError (*CloudCodeAXSetTimeoutFn)(CloudCodeAXUIElementRef, float);
@@ -85,6 +86,7 @@ typedef struct {
     CloudCodeAXGetPidFn getPid;
     CloudCodeAXCopyAttributeFn copyAttribute;
     CloudCodeAXSetAttributeFn setAttribute;
+    CloudCodeAXCopyElementAtPositionFn copyElementAtPosition;
     CloudCodeAXCopyApplicationAtPositionFn copyApplicationAtPosition;
     CloudCodeAXCopyApplicationAndContextAtPositionFn copyApplicationAndContextAtPosition;
     CloudCodeAXSetTimeoutFn setTimeout;
@@ -633,6 +635,7 @@ static CloudCodeAXRuntime CloudCodeResolveAX(void)
     }
     runtime.copyAttribute = (CloudCodeAXCopyAttributeFn)CloudCodeResolveAcrossFrameworks(paths, "AXUIElementCopyAttributeValue");
     runtime.setAttribute = (CloudCodeAXSetAttributeFn)CloudCodeResolveAcrossFrameworks(paths, "AXUIElementSetAttributeValue");
+    runtime.copyElementAtPosition = (CloudCodeAXCopyElementAtPositionFn)CloudCodeResolveAcrossFrameworks(paths, "AXUIElementCopyElementAtPosition");
     runtime.copyApplicationAtPosition = (CloudCodeAXCopyApplicationAtPositionFn)CloudCodeResolveAcrossFrameworks(paths, "AXUIElementCopyApplicationAtPosition");
     runtime.copyApplicationAndContextAtPosition = (CloudCodeAXCopyApplicationAndContextAtPositionFn)CloudCodeResolveAcrossFrameworks(paths, "AXUIElementCopyApplicationAndContextAtPosition");
     runtime.setTimeout = (CloudCodeAXSetTimeoutFn)CloudCodeResolveAcrossFrameworks(paths, "AXUIElementSetMessagingTimeout");
@@ -915,6 +918,79 @@ static CloudCodeAXUIElementRef CloudCodeAXApplicationAtScreenPointRoot(CloudCode
     return NULL;
 }
 
+static NSDictionary *CloudCodeAXHitTestTree(CloudCodeAXRuntime runtime, NSUInteger *nodeCount, pid_t *pidOut, NSString **backend)
+{
+    if (!runtime.createSystemWide || !runtime.copyElementAtPosition || !runtime.getPid || !nodeCount) { return nil; }
+    CGSize size = CloudCodeScreenSize();
+    if (size.width <= 1 || size.height <= 1) { return nil; }
+
+    CloudCodeAXUIElementRef systemWide = NULL;
+    @try { systemWide = runtime.createSystemWide(); } @catch (__unused NSException *exception) { systemWide = NULL; }
+    if (!systemWide) { return nil; }
+    if (runtime.setTimeout) { @try { runtime.setTimeout(systemWide, 1.5f); } @catch (__unused NSException *exception) {} }
+
+    // Sample a bounded grid rather than one center point. Video/social UIs commonly place primary
+    // actions along the right edge, while the center is often an unlabeled media surface. Apple's
+    // system-wide AX hit-test respects z-order, so these points can still recover useful foreground
+    // elements when detached helpers cannot obtain a full application root.
+    const CGPoint points[] = {
+        {size.width * 0.50, size.height * 0.50},
+        {size.width * 0.88, size.height * 0.30},
+        {size.width * 0.88, size.height * 0.43},
+        {size.width * 0.88, size.height * 0.56},
+        {size.width * 0.88, size.height * 0.69},
+        {size.width * 0.88, size.height * 0.82},
+        {size.width * 0.50, size.height * 0.22},
+        {size.width * 0.50, size.height * 0.78},
+        {size.width * 0.12, size.height * 0.50}
+    };
+    NSMutableArray *hits = [NSMutableArray array];
+    pid_t foregroundPID = 0;
+    for (NSUInteger index = 0; index < sizeof(points) / sizeof(points[0]); index++) {
+        if (*nodeCount >= CLOUDCODE_GUI_MAX_TREE_NODES) { break; }
+        CloudCodeAXUIElementRef candidate = NULL;
+        CloudCodeAXError code = -1;
+        @try {
+            code = runtime.copyElementAtPosition(systemWide, (float)points[index].x, (float)points[index].y, &candidate);
+        } @catch (__unused NSException *exception) {
+            code = -1;
+            candidate = NULL;
+        }
+        if (code != 0 || !candidate) { if (candidate) CFRelease(candidate); continue; }
+
+        pid_t candidatePID = 0;
+        CloudCodeAXError pidCode = -1;
+        @try { pidCode = runtime.getPid(candidate, &candidatePID); } @catch (__unused NSException *exception) { pidCode = -1; }
+        if (pidCode != 0 || candidatePID <= 0 || candidatePID == getpid()) {
+            CFRelease(candidate);
+            continue;
+        }
+        if (foregroundPID == 0) { foregroundPID = candidatePID; }
+        if (candidatePID != foregroundPID) {
+            CFRelease(candidate);
+            continue;
+        }
+        if (runtime.addAssociatedPid) {
+            runtime.addAssociatedPid(getpid(), candidatePID, 0);
+            runtime.addAssociatedPid(getpid(), candidatePID, 1);
+            runtime.addAssociatedPid(candidatePID, getpid(), 0);
+            runtime.addAssociatedPid(candidatePID, getpid(), 1);
+        }
+
+        NSDictionary *node = CloudCodeAXNode(runtime, candidate, 0, nodeCount);
+        CFRelease(candidate);
+        if (!node) { continue; }
+        NSMutableDictionary *annotated = [node mutableCopy];
+        annotated[@"hitPoint"] = @{@"x": @(points[index].x), @"y": @(points[index].y)};
+        [hits addObject:annotated];
+    }
+    CFRelease(systemWide);
+    if (hits.count == 0 || foregroundPID <= 0) { return nil; }
+    if (pidOut) { *pidOut = foregroundPID; }
+    if (backend) { *backend = @"AXRuntime.systemWide.elementAtPosition"; }
+    return @{@"role": @"AXHitTestSnapshot", @"children": hits};
+}
+
 static NSData *CloudCodeFrontmostTreeData(void)
 {
     CloudCodeAXRuntime runtime = CloudCodeResolveAX();
@@ -967,8 +1043,7 @@ static NSData *CloudCodeFrontmostTreeData(void)
 
     // Some detached helpers cannot read AXFocusedApplication even though AXRuntime can still
     // hit-test the visible display. Resolve the application element at a few bounded screen points
-    // as a final read-only fallback; this mirrors the compatibility path used by current iOS AX
-    // tooling without depending on SpringBoard injection.
+    // as another read-only fallback without depending on SpringBoard injection.
     if (!root) {
         pid_t positionPID = 0;
         root = CloudCodeAXApplicationAtScreenPointRoot(runtime, &positionPID, &backend);
@@ -985,15 +1060,29 @@ static NSData *CloudCodeFrontmostTreeData(void)
         }
     }
 
-    if (!root || pid <= 0) {
-        if (root) { CFRelease(root); }
-        fprintf(stderr, "gui-tree: SpringBoardServices, AX focused-app, and AX application-at-position fallbacks all failed to produce a readable foreground root\n");
+    // Public AXUIElementCopyElementAtPosition is a separate system-wide hit-test primitive. It can
+    // still return topmost foreground elements when the application-level AX constructors above are
+    // unavailable to a detached TrollStore root helper. Keep the result explicitly labeled as a
+    // sampled snapshot so the agent never mistakes it for a complete hierarchy.
+    NSUInteger nodeCount = 0;
+    NSDictionary *rootNode = nil;
+    if (!root) {
+        rootNode = CloudCodeAXHitTestTree(runtime, &nodeCount, &pid, &backend);
+        if (rootNode && pid > 0) {
+            NSString *hitBundleID = CloudCodeBundleIDForPID(pid);
+            if (hitBundleID.length > 0) { bundleID = hitBundleID; }
+        }
+    }
+
+    if (!root && (!rootNode || pid <= 0)) {
+        fprintf(stderr, "gui-tree: SpringBoardServices, AX focused-app, AX application-at-position, and AX element-at-position fallbacks all failed to produce readable foreground UI\n");
         return nil;
     }
 
-    NSUInteger nodeCount = 0;
-    NSDictionary *rootNode = CloudCodeAXNode(runtime, root, 0, &nodeCount);
-    CFRelease(root);
+    if (root) {
+        rootNode = CloudCodeAXNode(runtime, root, 0, &nodeCount);
+        CFRelease(root);
+    }
     if (!rootNode || nodeCount == 0) {
         fprintf(stderr, "gui-tree: AX root existed but no readable UI nodes were returned\n");
         return nil;

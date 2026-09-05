@@ -20,15 +20,20 @@ Important limitation retained in architecture:
 - Cloud Code's root helper mirrors only the TrollStore RootHelper lifecycle entitlements needed by its typed app-management surface: container-free/root access, LaunchServices database access, MobileInstallation helper access, uninstall deletion, and the `UninstallForLaunchServices`/`Uninstall` SPI entries. It deliberately does not copy TrollStore's unrelated AMFI/shutdown capabilities.
 - TrollStore's own uninstall implementation uses `LSApplicationWorkspace` first and falls back to bounded bundle-container removal. Cloud Code retains stricter postcondition verification around that pattern so an accepted registration change is never reported as a completed uninstall while the bundle is still present.
 
-## Apple OSS: IOHIDFamily
+## Apple OSS / Accessibility APIs
 
-Reference: https://github.com/apple-oss-distributions/IOHIDFamily
+References:
+
+- https://github.com/apple-oss-distributions/IOHIDFamily
+- https://developer.apple.com/documentation/applicationservices/1462077-axuielementcopyelementatposition
+- https://developer.apple.com/documentation/applicationservices/1462095-axuielementcreatesystemwide
 
 Adopted:
 
 - Apple IOHID sources distinguish server access from EventSystem user access; the GUI helper carries both relevant HID entitlements while the SwiftUI host carries neither.
 - Creating an IOHID EventSystem client is treated as a runtime capability check, not proof that a later synthetic gesture was accepted by the foreground UI.
 - Private IOKit access stays narrowly scoped to the helper and is paired with explicit user-client entitlement lists because the TrollStore `platform-application` profile can otherwise tighten those accesses.
+- `AXUIElementCreateSystemWide` and `AXUIElementCopyElementAtPosition` provide a separate z-order-aware read-only hit-test path. Cloud Code uses a bounded multi-point snapshot only after full application-root discovery fails, and labels it as a sampled snapshot rather than pretending it is a complete accessibility hierarchy.
 
 ## ios-mcp accessibility/GUI implementation
 
