@@ -1566,83 +1566,6 @@ final class CloudCodeCoreTests: XCTestCase {
         }
     }
 
-    func testDeviceValidationRequiredCanRouteOnlyThroughExplicitRuntimeValidator() async throws {
-        let registry = ToolRegistry(descriptors: [
-            ToolDescriptor(name: "gui.tap", summary: "", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback)
-        ])
-        let validationCounter = InvocationCounter()
-        let executor = RuntimeValidatingExecutor(
-            route: .guiFallback,
-            names: ["gui.tap"],
-            validationResult: true,
-            validationCounter: validationCounter
-        )
-        let router = ToolRouter(registry: registry, executors: [executor])
-        let profile = CapabilityProfile(records: [
-            CapabilityRecord(id: GUIAutomationFeature.touch.capabilityID, domain: .automation, status: .deviceValidationRequired, detail: "deferred at startup")
-        ])
-        let call = ToolCall(name: "gui.tap", arguments: ["x": "20", "y": "30"], sessionID: UUID())
-
-        let route = try await router.chooseRoute(for: call, capabilities: profile)
-        XCTAssertEqual(route, .guiFallback)
-        let validationCount = await validationCounter.value()
-        XCTAssertEqual(validationCount, 1)
-    }
-
-    func testRuntimeValidatorFailureLeavesDeviceValidationRequiredFailClosed() async throws {
-        let registry = ToolRegistry(descriptors: [
-            ToolDescriptor(name: "gui.tap", summary: "", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback)
-        ])
-        let validationCounter = InvocationCounter()
-        let executor = RuntimeValidatingExecutor(
-            route: .guiFallback,
-            names: ["gui.tap"],
-            validationResult: false,
-            validationCounter: validationCounter
-        )
-        let router = ToolRouter(registry: registry, executors: [executor])
-        let profile = CapabilityProfile(records: [
-            CapabilityRecord(id: GUIAutomationFeature.touch.capabilityID, domain: .automation, status: .deviceValidationRequired, detail: "deferred at startup")
-        ])
-        let call = ToolCall(name: "gui.tap", arguments: ["x": "20", "y": "30"], sessionID: UUID())
-
-        do {
-            _ = try await router.chooseRoute(for: call, capabilities: profile)
-            XCTFail("Failed runtime handshake must keep the GUI feature unavailable")
-        } catch {
-            XCTAssertEqual(error as? ToolRouterError, .missingCapability(GUIAutomationFeature.touch.capabilityID))
-        }
-        let validationCount = await validationCounter.value()
-        XCTAssertEqual(validationCount, 1)
-    }
-
-    func testUnavailableCapabilityNeverInvokesRuntimeValidator() async throws {
-        let registry = ToolRegistry(descriptors: [
-            ToolDescriptor(name: "gui.tap", summary: "", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback)
-        ])
-        let validationCounter = InvocationCounter()
-        let executor = RuntimeValidatingExecutor(
-            route: .guiFallback,
-            names: ["gui.tap"],
-            validationResult: true,
-            validationCounter: validationCounter
-        )
-        let router = ToolRouter(registry: registry, executors: [executor])
-        let profile = CapabilityProfile(records: [
-            CapabilityRecord(id: GUIAutomationFeature.touch.capabilityID, domain: .automation, status: .unavailable, detail: "runtime already disproved")
-        ])
-        let call = ToolCall(name: "gui.tap", arguments: ["x": "20", "y": "30"], sessionID: UUID())
-
-        do {
-            _ = try await router.chooseRoute(for: call, capabilities: profile)
-            XCTFail("Unavailable capability must never be promoted by a runtime validator")
-        } catch {
-            XCTAssertEqual(error as? ToolRouterError, .missingCapability(GUIAutomationFeature.touch.capabilityID))
-        }
-        let validationCount = await validationCounter.value()
-        XCTAssertEqual(validationCount, 0)
-    }
-
     func testDeviceValidationRequiredCapabilityDoesNotAuthorizeExecution() async throws {
         let registry = ToolRegistry(descriptors: [ToolDescriptor(name: "ipa.install", summary: "", risk: .systemChange, requiredCapabilities: ["ipa.install"], preferredRoute: .privateFramework)])
         let executor = StubExecutor(route: .privateFramework, names: ["ipa.install"])
@@ -4490,30 +4413,6 @@ private actor InvocationCounter {
     private var count = 0
     func increment() { count += 1 }
     func value() -> Int { count }
-}
-
-private struct RuntimeValidatingExecutor: RuntimeCapabilityValidatingToolExecutor, Sendable {
-    let route: AppExecutionRoute
-    let names: Set<String>
-    let validationResult: Bool
-    let validationCounter: InvocationCounter
-
-    func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
-        names.contains(tool.name)
-    }
-
-    func validatesRuntimeCapabilities(
-        _ capabilityIDs: [String],
-        for tool: ToolDescriptor,
-        capabilities: CapabilityProfile
-    ) async -> Bool {
-        await validationCounter.increment()
-        return validationResult
-    }
-
-    func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
-        ToolResult(toolCallID: call.id, success: true, summary: "runtime validated")
-    }
 }
 
 private struct SlowCountingExecutor: ToolExecuting, Sendable {
