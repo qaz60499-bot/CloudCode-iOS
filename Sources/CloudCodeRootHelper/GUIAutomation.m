@@ -251,7 +251,7 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
     }
     CloudCodeIOHIDEventRef parent = runtime.createDigitizer(
         kCFAllocatorDefault, mach_absolute_time(), 3, 99, 1, parentMask, 0,
-        nx, ny, 0, 0, 0, range, touching, 0
+        nx, ny, 0, 0, 0, 0, range, touching, 0
     );
     if (!parent) { return NULL; }
     CloudCodeIOHIDEventRef child = runtime.createFinger(
