@@ -27,6 +27,6 @@ This is the implementation/default matrix. Runtime `CapabilityProbe` is authorit
 
 ## Authorization and validation rule
 
-Only status `available` satisfies a tool's declared required capability. `device_validation_required`, `unknown`, and `unavailable` block those tools.
+Status `available` directly satisfies a tool's declared capability. `unknown` and `unavailable` always block execution. A `device_validation_required` capability may proceed only through an executor that explicitly supports exact-operation self-validation for that same capability; route selection itself remains side-effect free and the concrete helper operation must fail closed.
 
-`apps.list`, `apps.inspect`, `container.resolve`, and `apps.launch` intentionally do not declare a static required capability: they are bounded self-validating adapters. On explicit use they run only the minimum isolated helper check needed for that operation, with a hard timeout, and fail closed if the helper cannot prove the backend or target. This exception does not apply to root-required state changes such as terminate or uninstall.
+`apps.list`, `apps.inspect`, `container.resolve`, and `apps.launch` are bounded self-validating adapters. `apps.terminate`, `apps.uninstall`, and granular `gui.*` operations may also self-validate only when the user explicitly requested that exact operation. Destructive/root actions still pass normal policy and confirmation checks before the state-changing helper call executes.

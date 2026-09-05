@@ -55,18 +55,18 @@ No decryption/install/uninstall result is considered PASS from the GitHub Runner
 
 ## GUI fallback
 
-Build 36 has two distinct GUI backend classes and they must never be conflated:
+Build 37 has two distinct GUI backend classes and they must never be conflated:
 
 1. The preferred self-contained TrollStore path runs private GUI work only in the bounded embedded root helper. Runtime readiness is reported independently for `automation.gui.open_app`, `.tree`, `.screenshot`, `.touch`, `.text_input`, `.gestures`, and `.verify`.
 2. XCTest/WDA may be added as a replaceable external adapter. A missing WDA service must not affect Cloud Code startup/chat and must never be treated as proof that the TrollStore-native backend is ready.
 
 The TrollStore-native device test sequence is:
 
-1. Explicitly perform the bounded GUI readiness handshake from device validation before GUI tools are authorized; cold launch and ordinary Agent sends must not run or lazily promote this root/persona readiness probe.
-2. Open a harmless deterministic test app.
-3. Require a real frontmost-app AX tree before promoting `automation.gui.tree`.
-4. Require a real global screenshot before promoting `automation.gui.screenshot`.
-5. Require the entitled IOHID runtime/client handshake before promoting touch/gesture/text-input features.
+1. Explicit device refresh performs only a lightweight bounded helper handshake; it must not touch global screenshot, AX tree, coordinate-space, or synthetic-touch paths that can destabilize a private runtime.
+2. Open a harmless deterministic test app. An exact `gui.openApp` request may self-validate its LaunchServices backend when the cached status is `device_validation_required`.
+3. Require a real frontmost-app AX tree from the exact bounded `gui.tree` helper call before treating that observation as successful.
+4. Require a real global screenshot from the exact bounded `gui.screenshot` helper call before treating that observation as successful.
+5. Touch, gesture, and text-input requests self-validate their exact IOHID/coordinate runtime in the action helper; helper failure never upgrades the capability.
 6. Tap a deterministic element, then observe the UI again.
 7. Enter harmless text and verify the plaintext never appears in approval, diagnostic, or audit logs.
 8. Scroll/swipe, observe again, and verify a postcondition from a fresh tree.

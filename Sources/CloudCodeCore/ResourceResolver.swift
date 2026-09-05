@@ -41,6 +41,22 @@ public protocol RootHelperCapabilityProviding: Sendable {
     func rootHelperCapability() async -> RootHelperCapabilitySnapshot
 }
 
+public struct PrivilegedFilesystemCapabilitySnapshot: Sendable, Equatable {
+    public var sharedUserFilesAvailable: Bool
+    public var unrestrictedAvailable: Bool
+    public var detail: String
+
+    public init(sharedUserFilesAvailable: Bool, unrestrictedAvailable: Bool, detail: String) {
+        self.sharedUserFilesAvailable = sharedUserFilesAvailable
+        self.unrestrictedAvailable = unrestrictedAvailable
+        self.detail = detail
+    }
+}
+
+public protocol PrivilegedFilesystemCapabilityProviding: Sendable {
+    func privilegedFilesystemCapability() async -> PrivilegedFilesystemCapabilitySnapshot
+}
+
 public struct AppLifecycleCapabilitySnapshot: Sendable, Equatable {
     public var available: Bool
     public var detail: String

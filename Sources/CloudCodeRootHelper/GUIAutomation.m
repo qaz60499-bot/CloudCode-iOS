@@ -48,6 +48,7 @@ typedef Boolean (*CloudCodeAXValueGetValueFn)(CFTypeRef, int, void *);
 
 typedef UIImage *(*CloudCodeCreateScreenImageFn)(void);
 typedef CFStringRef (*CloudCodeCopyFrontmostBundleIDFn)(void);
+typedef CFTypeRef (*CloudCodeMGCopyAnswerFn)(CFStringRef);
 
 typedef struct {
     void *handle;
@@ -132,6 +133,37 @@ static CGSize CloudCodeScreenSize(void)
         CGRect bounds = UIScreen.mainScreen.bounds;
         if (bounds.size.width > 1 && bounds.size.height > 1) { return bounds.size; }
     } @catch (__unused NSException *exception) {
+    }
+
+    // A standalone TrollStore/root helper can have no UIApplication scene, in which case
+    // UIScreen may not expose a usable logical coordinate space. Fall back to MobileGestalt's
+    // physical dimensions divided by display scale. This remains read-only and dynamically
+    // resolved so unsupported runtimes simply fail closed.
+    void *handle = CloudCodeOpenFramework(@[
+        @"/usr/lib/libMobileGestalt.dylib",
+        @"/System/Library/PrivateFrameworks/MobileGestalt.framework/MobileGestalt",
+        @"/rootfs/usr/lib/libMobileGestalt.dylib"
+    ]);
+    CloudCodeMGCopyAnswerFn copyAnswer = (CloudCodeMGCopyAnswerFn)CloudCodeResolve(handle, "MGCopyAnswer");
+    if (!copyAnswer) { return CGSizeZero; }
+    CFTypeRef widthValue = copyAnswer(CFSTR("main-screen-width"));
+    CFTypeRef heightValue = copyAnswer(CFSTR("main-screen-height"));
+    CFTypeRef scaleValue = copyAnswer(CFSTR("main-screen-scale"));
+    double width = 0, height = 0, scale = 0;
+    if (widthValue && CFGetTypeID(widthValue) == CFNumberGetTypeID()) {
+        CFNumberGetValue((CFNumberRef)widthValue, kCFNumberDoubleType, &width);
+    }
+    if (heightValue && CFGetTypeID(heightValue) == CFNumberGetTypeID()) {
+        CFNumberGetValue((CFNumberRef)heightValue, kCFNumberDoubleType, &height);
+    }
+    if (scaleValue && CFGetTypeID(scaleValue) == CFNumberGetTypeID()) {
+        CFNumberGetValue((CFNumberRef)scaleValue, kCFNumberDoubleType, &scale);
+    }
+    if (widthValue) { CFRelease(widthValue); }
+    if (heightValue) { CFRelease(heightValue); }
+    if (scaleValue) { CFRelease(scaleValue); }
+    if (width > 1 && height > 1 && scale >= 1 && isfinite(width) && isfinite(height) && isfinite(scale)) {
+        return CGSizeMake(width / scale, height / scale);
     }
     return CGSizeZero;
 }
@@ -446,27 +478,24 @@ static void CloudCodePrintData(NSData *data)
 int CloudCodeGUIProbeJSON(void)
 {
     @autoreleasepool {
+        // Keep explicit capability refresh lightweight. Do not touch UIScreen, global screenshots,
+        // AXRuntime, or dispatch synthetic touch events here; each exact GUI operation validates
+        // those private runtimes in its own bounded helper invocation when the user requests it.
         CloudCodeHIDRuntime hid = CloudCodeResolveHID();
         CloudCodeIOHIDEventSystemClientRef client = NULL;
         BOOL hidReady = CloudCodeHIDReady(hid, &client);
         if (client) { CFRelease(client); }
-        CGSize screenSize = CloudCodeScreenSize();
-        BOOL coordinateSpaceReady = isfinite(screenSize.width) && isfinite(screenSize.height)
-            && screenSize.width > 1 && screenSize.height > 1;
-        BOOL touch = hidReady && coordinateSpaceReady;
         BOOL text = hidReady && hid.createUnicode != NULL;
-        NSData *screenshot = CloudCodeScreenshotJPEG();
-        NSData *tree = CloudCodeFrontmostTreeData();
         NSDictionary *payload = @{
-            @"backend": @"trollstore-root-helper",
-            @"touch": @(touch),
-            @"gestures": @(touch),
+            @"backend": @"trollstore-root-helper-lightweight",
+            @"touch": @NO,
+            @"gestures": @NO,
             @"textInput": @(text),
-            @"screenshot": @(screenshot.length > 0),
-            @"tree": @(tree.length > 0),
-            @"verify": @(tree.length > 0),
-            @"screenWidth": @(screenSize.width),
-            @"screenHeight": @(screenSize.height)
+            @"screenshot": @NO,
+            @"tree": @NO,
+            @"verify": @NO,
+            @"screenWidth": @0,
+            @"screenHeight": @0
         };
         NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
         if (!data) { return 61; }

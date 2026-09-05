@@ -38,6 +38,12 @@ enum EmbeddedRootHelper {
         var screenHeight: Double
     }
 
+    struct FilesystemProbePayload: Decodable {
+        var sharedUserFiles: Bool
+        var unrestricted: Bool
+        var detail: String
+    }
+
     static let executableName = "CloudCodeRootHelper"
 
     static var executablePath: String {
@@ -170,6 +176,40 @@ enum EmbeddedRootHelper {
         return RootHelperCapabilitySnapshot(available: false, detail: failureDetail(prefix: "\(executableName) root 探测", code: result.code, diagnostic: result.diagnostic))
     }
 
+    static func filesystemCapability() -> PrivilegedFilesystemCapabilitySnapshot {
+        let result = run(["probe-filesystem-json"], privilege: .root, timeout: 5)
+        guard result.code == 0 else {
+            return PrivilegedFilesystemCapabilitySnapshot(
+                sharedUserFilesAvailable: false,
+                unrestrictedAvailable: false,
+                detail: failureDetail(prefix: "helper 高权限文件系统探测", code: result.code, diagnostic: result.diagnostic)
+            )
+        }
+        let decoder = JSONDecoder()
+        var payload: FilesystemProbePayload?
+        if let data = result.diagnostic.data(using: .utf8) {
+            payload = try? decoder.decode(FilesystemProbePayload.self, from: data)
+        }
+        if payload == nil, let start = result.diagnostic.firstIndex(of: "{"), let end = result.diagnostic.lastIndex(of: "}") {
+            let json = String(result.diagnostic[start...end])
+            if let data = json.data(using: .utf8) {
+                payload = try? decoder.decode(FilesystemProbePayload.self, from: data)
+            }
+        }
+        guard let payload else {
+            return PrivilegedFilesystemCapabilitySnapshot(
+                sharedUserFilesAvailable: false,
+                unrestrictedAvailable: false,
+                detail: "helper 高权限文件系统探测输出无法解析；已按 fail-closed 处理。"
+            )
+        }
+        return PrivilegedFilesystemCapabilitySnapshot(
+            sharedUserFilesAvailable: payload.sharedUserFiles,
+            unrestrictedAvailable: payload.unrestricted,
+            detail: payload.detail
+        )
+    }
+
     static func uninstall(bundleID: String, bundlePath: String, dataPath: String?) -> (accepted: Bool, detail: String) {
         let capability = probe()
         guard capability.available else { return (false, capability.detail) }
@@ -279,7 +319,7 @@ enum EmbeddedRootHelper {
     }
 }
 
-public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, RootHelperCapabilityProviding, AppLifecycleCapabilityProviding {
+public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, RootHelperCapabilityProviding, PrivilegedFilesystemCapabilityProviding, AppLifecycleCapabilityProviding {
     private var cachedApps: [ResourceNode] = []
     private var bundlePaths: [String: String] = [:]
     private var containerPaths: [String: String] = [:]
@@ -348,6 +388,22 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             action: "probe",
             result: snapshot.available ? "available" : "unavailable",
             diagnostic: snapshot.detail
+        )
+        return snapshot
+    }
+
+    public func privilegedFilesystemCapability() async -> PrivilegedFilesystemCapabilitySnapshot {
+        let snapshot = EmbeddedRootHelper.filesystemCapability()
+        try? await diagnosticLogger?.log(
+            level: snapshot.unrestrictedAvailable ? .info : .warning,
+            subsystem: "root-helper",
+            action: "filesystem-capability",
+            result: snapshot.unrestrictedAvailable ? "available" : "partial_or_unavailable",
+            diagnostic: snapshot.detail,
+            metadata: [
+                "sharedUserFiles": String(snapshot.sharedUserFilesAvailable),
+                "unrestricted": String(snapshot.unrestrictedAvailable)
+            ]
         )
         return snapshot
     }
@@ -740,7 +796,7 @@ public struct IOSSystemExecutor: ToolExecuting, Sendable {
     }
 }
 
-public struct IOSPrivateAppExecutor: ToolExecuting, Sendable {
+public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecutor, Sendable {
     public let route: AppExecutionRoute = .privateFramework
     private let appResolver: IOSAppResolver
     private let policy: PolicyEngine
@@ -754,14 +810,32 @@ public struct IOSPrivateAppExecutor: ToolExecuting, Sendable {
         self.audit = audit
     }
 
+    public func allowsDeferredCapabilityAttempt(
+        _ capabilityIDs: [String],
+        for tool: ToolDescriptor,
+        capabilities: CapabilityProfile
+    ) async -> Bool {
+        guard capabilityIDs.count == 1, let capabilityID = capabilityIDs.first,
+              capabilities.status(capabilityID) == .deviceValidationRequired else { return false }
+        switch tool.name {
+        case "apps.terminate": return capabilityID == "apps.terminate"
+        case "apps.uninstall": return capabilityID == "apps.uninstall"
+        default: return false
+        }
+    }
+
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
         switch tool.name {
         case "apps.launch":
             if capabilities.isAvailable("apps.launch") { return true }
             guard capabilities.status("apps.launch") != .unavailable else { return false }
             return await appResolver.appLaunchCapability().available
-        case "apps.terminate": return capabilities.isAvailable("apps.terminate")
-        case "apps.uninstall": return capabilities.isAvailable("apps.uninstall")
+        case "apps.terminate":
+            let status = capabilities.status("apps.terminate")
+            return status == .available || status == .deviceValidationRequired
+        case "apps.uninstall":
+            let status = capabilities.status("apps.uninstall")
+            return status == .available || status == .deviceValidationRequired
         default: return false
         }
     }
@@ -950,7 +1024,7 @@ public struct URLSchemeExecutor: ToolExecuting, Sendable {
     }
 }
 
-public struct GUIFallbackExecutor: ToolExecuting, Sendable {
+public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor, Sendable {
     public let route: AppExecutionRoute = .guiFallback
     private let backend: GUIAutomationBackend
     private let policy: PolicyEngine
@@ -962,9 +1036,23 @@ public struct GUIFallbackExecutor: ToolExecuting, Sendable {
         self.approval = approval
     }
 
+    public func allowsDeferredCapabilityAttempt(
+        _ capabilityIDs: [String],
+        for tool: ToolDescriptor,
+        capabilities: CapabilityProfile
+    ) async -> Bool {
+        guard let feature = Self.feature(for: tool.name),
+              capabilityIDs == [feature.capabilityID],
+              capabilities.status(feature.capabilityID) == .deviceValidationRequired else { return false }
+        // Route selection stays side-effect free. The exact requested GUI operation below runs
+        // in the bounded helper and is itself the runtime proof; helper failures remain fail-closed.
+        return true
+    }
+
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
         guard let feature = Self.feature(for: tool.name) else { return false }
-        return capabilities.status(feature.capabilityID) == .available
+        let status = capabilities.status(feature.capabilityID)
+        return status == .available || status == .deviceValidationRequired
     }
 
     public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {

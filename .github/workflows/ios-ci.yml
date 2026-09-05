@@ -315,7 +315,7 @@ jobs:
           if not helper.exists():
               raise SystemExit('FAIL: CloudCodeRootHelper source is missing')
           helper_text = helper.read_text(encoding='utf-8')
-          for marker in ('enumerate-json', 'probe-launch', 'probe-uninstall', 'is-installed', 'launch', 'uninstall', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-type-base64'):
+          for marker in ('enumerate-json', 'probe-filesystem-json', 'probe-launch', 'probe-uninstall', 'is-installed', 'launch', 'uninstall', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-type-base64'):
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: root helper command missing: {marker}')
           bridge = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
@@ -332,7 +332,7 @@ jobs:
           if not gui_helper.exists():
               raise SystemExit('FAIL: TrollStore GUI helper source is missing')
           gui_text = gui_helper.read_text(encoding='utf-8')
-          for marker in ('CLOUDCODE_GUI_MAX_TREE_NODES', 'CLOUDCODE_GUI_MAX_TREE_BYTES', 'CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES', 'IOHIDEventSystemClientCreate', '_UICreateScreenUIImage', 'AXUIElementCopyAttributeValue', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'coordinateSpaceReady'):
+          for marker in ('CLOUDCODE_GUI_MAX_TREE_NODES', 'CLOUDCODE_GUI_MAX_TREE_BYTES', 'CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES', 'IOHIDEventSystemClientCreate', '_UICreateScreenUIImage', 'AXUIElementCopyAttributeValue', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'Keep explicit capability refresh lightweight'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: GUI helper lost bounded/runtime marker: {marker}')
           for marker in ('guiProbe()', 'run(["gui-probe-json"], privilege: .root, timeout: 6)', 'run(["gui-tree-json"], privilege: .root, timeout: 5)', 'run(["gui-screenshot-base64"], privilege: .root, timeout: 6)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
@@ -340,12 +340,14 @@ jobs:
                   raise SystemExit(f'FAIL: GUI adapter lost bounded helper marker: {marker}')
           gui_executor = adapters.split('public struct GUIFallbackExecutor', 1)[1]
           gui_routing = gui_executor.split('public func execute(', 1)[0]
-          if 'DeferredCapabilitySelfValidatingToolExecutor' in gui_executor or 'allowsDeferredCapabilityAttempt' in gui_routing:
-              raise SystemExit('FAIL: GUI route must not promote device_validation_required during ordinary Agent send')
+          if 'DeferredCapabilitySelfValidatingToolExecutor' not in gui_executor or 'allowsDeferredCapabilityAttempt' not in gui_routing:
+              raise SystemExit('FAIL: GUI route lost exact-operation self-validation for device_validation_required capabilities')
           if 'backend.guiCapabilitySnapshot()' in gui_routing or 'EmbeddedRootHelper.guiProbe()' in gui_routing:
-              raise SystemExit('FAIL: GUI route selection must not run root/persona readiness probing during ordinary Agent send')
-          if 'capabilities.status(feature.capabilityID) == .available' not in gui_routing:
-              raise SystemExit('FAIL: GUI route must require an explicitly validated available granular capability')
+              raise SystemExit('FAIL: GUI route selection must remain side-effect free and never run a readiness probe')
+          if 'status == .available || status == .deviceValidationRequired' not in gui_routing:
+              raise SystemExit('FAIL: GUI route no longer admits only available or exact deferred granular capabilities')
+          if 'capabilityIDs == [feature.capabilityID]' not in gui_routing:
+              raise SystemExit('FAIL: GUI deferred routing must be limited to the exact requested granular capability')
           approval = adapters.split('public final class ApprovalCenter', 1)[1].split('public struct IOSSystemExecutor', 1)[0]
           for marker in ('withTaskCancellationHandler', 'continuationID', 'cancelPendingApproval(requestID:', 'finishPendingApproval(returning:'):
               if marker not in approval:

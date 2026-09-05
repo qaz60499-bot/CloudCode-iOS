@@ -1566,20 +1566,28 @@ final class CloudCodeCoreTests: XCTestCase {
         }
     }
 
-    func testDeviceValidationRequiredGUICapabilityNeverAuthorizesSendTimeExecution() async throws {
+    func testDeviceValidationRequiredGUICapabilityRoutesOnlyThroughExactSelfValidation() async throws {
         let registry = ToolRegistry()
-        let router = ToolRouter(registry: registry, executors: [StubExecutor(route: .guiFallback, names: ["gui.tap"])])
+        let router = ToolRouter(registry: registry, executors: [DeferredExactExecutor(route: .guiFallback, names: ["gui.tap"], capabilityIDs: [GUIAutomationFeature.touch.capabilityID])])
         let profile = CapabilityProfile(records: [
-            CapabilityRecord(id: GUIAutomationFeature.touch.capabilityID, domain: .automation, status: .deviceValidationRequired, detail: "explicit device validation pending")
+            CapabilityRecord(id: GUIAutomationFeature.touch.capabilityID, domain: .automation, status: .deviceValidationRequired, detail: "exact operation validation pending")
         ])
         let call = ToolCall(name: "gui.tap", arguments: ["x": "100", "y": "200"], sessionID: UUID())
 
-        do {
-            _ = try await router.chooseRoute(for: call, capabilities: profile)
-            XCTFail("GUI execution must require a previously validated available capability")
-        } catch {
-            XCTAssertEqual(error as? ToolRouterError, .missingCapability(GUIAutomationFeature.touch.capabilityID))
-        }
+        let route = try await router.chooseRoute(for: call, capabilities: profile)
+        XCTAssertEqual(route, .guiFallback)
+    }
+
+    func testDeviceValidationRequiredUninstallCanUseExactSelfValidationButGenericInstallCannot() async throws {
+        let registry = ToolRegistry()
+        let router = ToolRouter(registry: registry, executors: [DeferredExactExecutor(route: .privateFramework, names: ["apps.uninstall"], capabilityIDs: ["apps.uninstall"])])
+        let profile = CapabilityProfile(records: [
+            CapabilityRecord(id: "apps.uninstall", domain: .apps, status: .deviceValidationRequired, detail: "privileged backend validation pending")
+        ])
+        let call = ToolCall(name: "apps.uninstall", arguments: ["bundleId": "com.example.target"], sessionID: UUID())
+
+        let route = try await router.chooseRoute(for: call, capabilities: profile)
+        XCTAssertEqual(route, .privateFramework)
     }
 
     func testDeviceValidationRequiredCapabilityDoesNotAuthorizeExecution() async throws {
@@ -4482,5 +4490,29 @@ private struct StubExecutor: ToolExecuting, Sendable {
 
     func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
         ToolResult(toolCallID: call.id, success: true, summary: route.rawValue)
+    }
+}
+
+private struct DeferredExactExecutor: DeferredCapabilitySelfValidatingToolExecutor, Sendable {
+    let route: AppExecutionRoute
+    let names: Set<String>
+    let capabilityIDs: Set<String>
+
+    func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
+        names.contains(tool.name)
+    }
+
+    func allowsDeferredCapabilityAttempt(
+        _ capabilityIDs: [String],
+        for tool: ToolDescriptor,
+        capabilities: CapabilityProfile
+    ) async -> Bool {
+        names.contains(tool.name)
+            && Set(capabilityIDs) == self.capabilityIDs
+            && capabilityIDs.allSatisfy { capabilities.status($0) == .deviceValidationRequired }
+    }
+
+    func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
+        ToolResult(toolCallID: call.id, success: true, summary: "deferred exact validation")
     }
 }

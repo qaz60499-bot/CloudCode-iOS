@@ -167,6 +167,51 @@ static int PrintInstalledApplicationsJSON(void)
     return 0;
 }
 
+static int ProbePrivilegedFilesystemJSON(void)
+{
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    NSString *sharedPath = @"/var/mobile/Media";
+    NSString *preferencesPath = @"/var/mobile/Library/Preferences";
+    BOOL sharedUserFiles = [fileManager isReadableFileAtPath:sharedPath];
+    BOOL unrestricted = NO;
+    NSString *detail = @"root helper could not prove unrestricted read/write access";
+
+    if ([fileManager isReadableFileAtPath:preferencesPath] && [fileManager isWritableFileAtPath:preferencesPath]) {
+        NSString *name = [@".cloudcode-capability-" stringByAppendingString:[NSUUID UUID].UUIDString];
+        NSString *canary = [preferencesPath stringByAppendingPathComponent:name];
+        NSData *expected = [@"CCPR" dataUsingEncoding:NSUTF8StringEncoding];
+        NSError *writeError = nil;
+        BOOL wrote = [expected writeToFile:canary options:NSDataWritingAtomic error:&writeError];
+        if (wrote) {
+            NSData *actual = [NSData dataWithContentsOfFile:canary options:0 error:nil];
+            unrestricted = [actual isEqualToData:expected];
+        }
+        NSError *removeError = nil;
+        if ([fileManager fileExistsAtPath:canary]) {
+            [fileManager removeItemAtPath:canary error:&removeError];
+        }
+        if (unrestricted) {
+            detail = @"root helper verified bounded read/write/delete access outside the app container";
+        } else if (writeError) {
+            detail = [@"root helper write probe failed: " stringByAppendingString:writeError.localizedDescription ?: @"unknown error"];
+        } else if (removeError) {
+            detail = [@"root helper cleanup probe failed: " stringByAppendingString:removeError.localizedDescription ?: @"unknown error"];
+        }
+    }
+
+    NSDictionary *payload = @{
+        @"sharedUserFiles": @(sharedUserFiles),
+        @"unrestricted": @(unrestricted),
+        @"detail": detail
+    };
+    NSError *error = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
+    if (!data || error) { return 41; }
+    fwrite(data.bytes, 1, data.length, stdout);
+    fputc('\n', stdout);
+    return 0;
+}
+
 static int ProbeLaunchCapability(void)
 {
     id workspace = Workspace();
@@ -497,6 +542,10 @@ int main(int argc, const char *argv[])
         if ([command isEqualToString:@"probe-terminate"]) {
             if (getuid() != 0 || geteuid() != 0) { return 11; }
             return HasProcessInspectionBackend() ? 0 : 33;
+        }
+        if ([command isEqualToString:@"probe-filesystem-json"]) {
+            if (getuid() != 0 || geteuid() != 0) { return 11; }
+            return ProbePrivilegedFilesystemJSON();
         }
         if ([command isEqualToString:@"enumerate-json"]) {
             return PrintInstalledApplicationsJSON();

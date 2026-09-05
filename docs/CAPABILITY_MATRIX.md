@@ -30,6 +30,6 @@ The matrix is intentionally conservative. `DEVICE_VALIDATION_REQUIRED` means the
 
 1. Automatic startup uses only `probeStartupSafe()` and never invokes root/persona or private LaunchServices code.
 2. `apps.list`, `apps.inspect`, `container.resolve`, and `apps.launch` are bounded self-validating operations. They may perform an isolated child-process validation when the user explicitly requests the operation, and they fail closed if the helper crashes, times out, or cannot prove the target.
-3. `apps.terminate`, `apps.uninstall`, root helper use, and other root-required mutations remain capability-gated. Ordinary model execution never promotes `device_validation_required` to `available` for these operations.
+3. `apps.terminate`, `apps.uninstall`, and granular `gui.*` tools may consume `device_validation_required` only through an executor that explicitly supports exact-operation self-validation. Route selection never probes privilege; the concrete helper validates the requested primitive and fails closed. State-changing app operations still require the normal policy/confirmation path.
 4. Helper subprocess output is bounded and helper execution has a hard timeout; a stuck or signaled helper must degrade that primitive instead of hanging the SwiftUI host.
-5. Capability and permission remain separate. A capability being technically available does not authorize a state-changing action that policy or confirmation rules reject.
+5. Capability and permission remain separate. A capability being technically available or exactly self-validatable does not authorize a state-changing action that policy or confirmation rules reject.

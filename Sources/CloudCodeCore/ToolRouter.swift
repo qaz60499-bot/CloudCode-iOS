@@ -6,6 +6,18 @@ public protocol ToolExecuting: Sendable {
     func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult
 }
 
+/// Allows an exact requested operation to validate a capability lazily when the startup snapshot
+/// deliberately left that capability as `device_validation_required`. Route selection must stay
+/// side-effect free: the concrete execute() call performs the bounded validation and fails closed.
+/// `unknown` and `unavailable` are never eligible.
+public protocol DeferredCapabilitySelfValidatingToolExecutor: ToolExecuting {
+    func allowsDeferredCapabilityAttempt(
+        _ capabilityIDs: [String],
+        for tool: ToolDescriptor,
+        capabilities: CapabilityProfile
+    ) async -> Bool
+}
+
 public struct ToolExecutionContext: Sendable {
     public var permissionMode: PermissionMode
     public var capabilityProfile: CapabilityProfile
@@ -189,16 +201,33 @@ public actor ToolRouter {
 
     public func chooseRoute(for call: ToolCall, capabilities: CapabilityProfile) async throws -> AppExecutionRoute {
         guard let descriptor = await registry.descriptor(named: call.name) else { throw ToolRouterError.unknownTool(call.name) }
+        var deferredCapabilities: [String] = []
         for required in descriptor.requiredCapabilities {
-            guard capabilities.status(required) == .available else {
+            switch capabilities.status(required) {
+            case .available:
+                continue
+            case .deviceValidationRequired:
+                deferredCapabilities.append(required)
+            case .unknown, .unavailable:
                 throw ToolRouterError.missingCapability(required)
             }
         }
 
         for route in routeOrder(preferred: descriptor.preferredRoute) {
             for executor in executors where executor.route == route {
+                if !deferredCapabilities.isEmpty {
+                    guard let selfValidating = executor as? any DeferredCapabilitySelfValidatingToolExecutor,
+                          await selfValidating.allowsDeferredCapabilityAttempt(
+                            deferredCapabilities,
+                            for: descriptor,
+                            capabilities: capabilities
+                          ) else { continue }
+                }
                 if await executor.supports(descriptor, capabilities: capabilities) { return route }
             }
+        }
+        if let missing = deferredCapabilities.first {
+            throw ToolRouterError.missingCapability(missing)
         }
         throw ToolRouterError.noExecutionRoute(call.name)
     }

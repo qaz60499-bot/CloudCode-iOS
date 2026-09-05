@@ -96,7 +96,7 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         let deferredGUIStatus: CapabilityStatus = guiCapabilityProvider == nil ? .unavailable : .deviceValidationRequired
         let deferredGUIDetail = guiCapabilityProvider == nil
             ? "No GUI automation backend is connected in this build."
-            : "GUI private-runtime probing is deferred during automatic startup and ordinary message send. Run explicit device validation before use."
+            : "GUI private-runtime probing is deferred during automatic startup. Exact requested GUI operations may self-validate in the isolated helper; unknown/unavailable capabilities remain blocked."
         for feature in GUIAutomationFeature.allCases {
             records.append(record(feature.capabilityID, .automation, deferredGUIStatus, deferredGUIDetail))
         }
@@ -225,14 +225,29 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         records.append(record("filesystem.own_container", .filesystem, canReadAndWrite(homeDirectory) ? .available : .unavailable,
                               "Read/write probe against the app's home directory."))
 
-        let sharedCandidate = URL(fileURLWithPath: "/var/mobile/Media", isDirectory: true)
-        records.append(record("filesystem.shared_user_files", .filesystem, fileManager.isReadableFile(atPath: sharedCandidate.path) ? .available : .unavailable,
-                              "Best-effort read probe for the user media area; exact access depends on entitlement and device."))
+        try? await diagnosticLogger?.log(level: .info, subsystem: "capability", action: "probe.privileged.stage", result: "filesystem-helper")
+        if let provider = appResolver as? any PrivilegedFilesystemCapabilityProviding {
+            let filesystem = await provider.privilegedFilesystemCapability()
+            records.append(record(
+                "filesystem.shared_user_files",
+                .filesystem,
+                filesystem.sharedUserFilesAvailable ? .available : .unavailable,
+                "Isolated helper read probe for the user media area: \(filesystem.detail)"
+            ))
+            records.append(record(
+                "filesystem.unrestricted",
+                .filesystem,
+                filesystem.unrestrictedAvailable ? .available : .deviceValidationRequired,
+                "Bounded read/write/delete canary executed only in the isolated helper: \(filesystem.detail)"
+            ))
+        } else {
+            records.append(record("filesystem.shared_user_files", .filesystem, .deviceValidationRequired,
+                                  "No isolated privileged filesystem capability provider is connected."))
+            records.append(record("filesystem.unrestricted", .filesystem, .deviceValidationRequired,
+                                  "Direct privileged writes are intentionally not attempted by the host process."))
+        }
 
-        let mobileRoot = URL(fileURLWithPath: "/var/mobile", isDirectory: true)
-        records.append(record("filesystem.unrestricted", .filesystem, unrestrictedFilesystemProbe(root: mobileRoot) ? .available : .unavailable,
-                              "Conservative direct read/write probe outside the app container. This does not imply root identity."))
-
+        try? await diagnosticLogger?.log(level: .info, subsystem: "capability", action: "probe.privileged.stage", result: "app-resolution")
         let apps = await appResolver.installedApps()
         let ownBundle = Bundle.main.bundleIdentifier ?? ""
         let enumerationProven: Bool
@@ -282,6 +297,7 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
                               "Detected dynamically. Core tools do not require ios_system."))
         records.append(record("execution.posix_spawn_symbol", .execution, Self.hasDynamicSymbol("posix_spawn") ? .available : .unavailable,
                               "Only reports symbol presence; it does not prove sandbox escape or helper privilege."))
+        try? await diagnosticLogger?.log(level: .info, subsystem: "capability", action: "probe.privileged.stage", result: "root-helper")
         if let provider = appResolver as? any RootHelperCapabilityProviding {
             let helper = await provider.rootHelperCapability()
             let helperStatus: CapabilityStatus = helper.available ? .available : .deviceValidationRequired
@@ -298,6 +314,7 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         records.append(record("execution.jit_wasm", .execution, .unavailable,
                               "No WASM/JIT execution backend is connected in the current app build."))
 
+        try? await diagnosticLogger?.log(level: .info, subsystem: "capability", action: "probe.privileged.stage", result: "lifecycle")
         if let lifecycle = appResolver as? any AppLifecycleCapabilityProviding {
             let launch = await lifecycle.appLaunchCapability()
             let terminate = await lifecycle.appTerminateCapability()
@@ -311,6 +328,7 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
             records.append(record("apps.terminate", .apps, .unavailable,
                                   "No app-termination capability provider is connected in the current build."))
         }
+        try? await diagnosticLogger?.log(level: .info, subsystem: "capability", action: "probe.privileged.stage", result: "uninstall")
         if let provider = appResolver as? any AppUninstallCapabilityProviding {
             let uninstallReady = await provider.canUninstallInstalledApps()
             let uninstallDetail = await provider.installedAppUninstallDetail()
@@ -335,6 +353,7 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
                               "Contacts access is authorization-gated and not automatically requested by the core."))
         records.append(record("data.calendar", .data, .deviceValidationRequired,
                               "Calendar access is authorization-gated and not automatically requested by the core."))
+        try? await diagnosticLogger?.log(level: .info, subsystem: "capability", action: "probe.privileged.stage", result: "keychain")
         let keychainProbe = Self.probeOwnKeychain()
         records.append(record("data.keychain_scope", .data, keychainProbe.status, keychainProbe.detail))
 
@@ -342,6 +361,7 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
                               "The current URL-scheme executor is a disabled placeholder and cannot execute app actions."))
         records.append(record("automation.xctest_wda", .automation, .unavailable,
                               "No XCTest/WDA runtime backend is connected in this build."))
+        try? await diagnosticLogger?.log(level: .info, subsystem: "capability", action: "probe.privileged.stage", result: "gui-lightweight")
         if let guiCapabilityProvider {
             let gui = await guiCapabilityProvider.guiCapabilitySnapshot()
             for feature in GUIAutomationFeature.allCases {
@@ -397,24 +417,6 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
     private func canReadAndWrite(_ directory: URL) -> Bool {
         guard fileManager.isReadableFile(atPath: directory.path), fileManager.isWritableFile(atPath: directory.path) else { return false }
         return true
-    }
-
-    private func unrestrictedFilesystemProbe(root: URL) -> Bool {
-        guard fileManager.isReadableFile(atPath: root.path) else { return false }
-        let sensitiveProbe = root.appendingPathComponent("Library/Preferences", isDirectory: true)
-        guard fileManager.isReadableFile(atPath: sensitiveProbe.path), fileManager.isWritableFile(atPath: sensitiveProbe.path) else { return false }
-
-        let canary = sensitiveProbe.appendingPathComponent(".cloudcode-capability-\(UUID().uuidString)")
-        let bytes = Data([0x43, 0x43, 0x50, 0x52])
-        do {
-            try bytes.write(to: canary, options: [.atomic, .withoutOverwriting])
-            defer { try? fileManager.removeItem(at: canary) }
-            let actual = try Data(contentsOf: canary)
-            return actual == bytes
-        } catch {
-            try? fileManager.removeItem(at: canary)
-            return false
-        }
     }
 
     private static func probeOwnKeychain() -> (status: CapabilityStatus, detail: String) {
