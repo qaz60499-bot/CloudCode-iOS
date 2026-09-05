@@ -6,6 +6,7 @@ NS_ASSUME_NONNULL_BEGIN
 int CloudCodeGUIProbeJSON(void);
 int CloudCodeGUITreeJSON(void);
 int CloudCodeGUIScreenshotBase64(void);
+int CloudCodeGUIScreenshotFile(NSString *path);
 int CloudCodeGUITap(double x, double y);
 int CloudCodeGUISwipe(double fromX, double fromY, double toX, double toY, double durationSeconds);
 int CloudCodeGUIScroll(double deltaX, double deltaY);

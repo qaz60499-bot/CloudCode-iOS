@@ -62,11 +62,29 @@
     <true/>
     <key>com.apple.private.hid.client.event-dispatch</key>
     <true/>
+    <key>com.apple.private.hid.client.event-filter</key>
+    <true/>
+    <key>com.apple.private.hid.client.event-monitor</key>
+    <true/>
+    <key>com.apple.private.hid.client.service-protected</key>
+    <true/>
+    <key>com.apple.private.hid.manager.client</key>
+    <true/>
     <key>com.apple.accessibility.api</key>
     <true/>
     <key>com.apple.QuartzCore.displayable-context</key>
     <true/>
     <key>com.apple.QuartzCore.global-capture</key>
+    <true/>
+    <key>com.apple.QuartzCore.secure-capture</key>
+    <true/>
+    <key>com.apple.QuartzCore.secure-mode</key>
+    <true/>
+    <key>com.apple.QuartzCore.system-layers</key>
+    <true/>
+    <key>com.apple.private.IOSurface.protected-access</key>
+    <true/>
+    <key>com.apple.backboard.client</key>
     <true/>
     <key>com.apple.security.iokit-user-client-class</key>
     <array>

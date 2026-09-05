@@ -868,6 +868,11 @@ int main(int argc, const char *argv[])
         if ([command isEqualToString:@"gui-screenshot-base64"]) {
             return CloudCodeGUIScreenshotBase64();
         }
+        if ([command isEqualToString:@"gui-screenshot-file"]) {
+            if (argc < 3) { return 10; }
+            NSString *outputPath = [NSString stringWithUTF8String:argv[2]];
+            return CloudCodeGUIScreenshotFile(outputPath);
+        }
         if ([command isEqualToString:@"gui-tap"]) {
             if (argc < 4) { return 10; }
             return CloudCodeGUITap(strtod(argv[2], NULL), strtod(argv[3], NULL));

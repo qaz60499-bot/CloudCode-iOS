@@ -368,8 +368,12 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
         eventMask = CLOUDCODE_HID_DIGITIZER_TOUCH | CLOUDCODE_HID_DIGITIZER_IDENTITY;
     }
 
+    // Keep the collection and child on the exact same HID timestamp. Current TrollVNC and
+    // WebKit's iOS test injector both construct a complete contact frame from one mach time;
+    // using two timestamps can make the child look like it belongs to a different frame.
+    uint64_t machTime = mach_absolute_time();
     CloudCodeIOHIDEventRef parent = runtime.createDigitizer(
-        kCFAllocatorDefault, mach_absolute_time(), 3,
+        kCFAllocatorDefault, machTime, 3,
         CLOUDCODE_GUI_PARENT_INDEX, CLOUDCODE_GUI_PARENT_IDENTITY, eventMask, 0,
         0, 0, 0, 0, 0,
         NO, touching, 0
@@ -377,7 +381,7 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
     if (!parent) { return NULL; }
 
     CloudCodeIOHIDEventRef child = runtime.createFinger(
-        kCFAllocatorDefault, mach_absolute_time(),
+        kCFAllocatorDefault, machTime,
         CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY, eventMask,
         nx, ny, 0, 0, 90.0, range && touching, touching, 0
     );
@@ -385,8 +389,9 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
         CFRelease(parent);
         return NULL;
     }
-    runtime.setFloat(child, 0xB0014, 5.0);
-    runtime.setFloat(child, 0xB0015, 5.0);
+    double contactRadius = touching ? 5.0 : 0.0;
+    runtime.setFloat(child, 0xB0014, contactRadius);
+    runtime.setFloat(child, 0xB0015, contactRadius);
     runtime.append(parent, child, 0);
     CFRelease(child);
 
@@ -1376,6 +1381,37 @@ int CloudCodeGUIScreenshotBase64(void)
             return 63;
         }
         CloudCodePrintData(output);
+        return 0;
+    }
+}
+
+int CloudCodeGUIScreenshotFile(NSString *path)
+{
+    @autoreleasepool {
+        NSString *normalized = [path isKindOfClass:NSString.class] ? path.stringByStandardizingPath : nil;
+        NSString *parent = normalized.stringByDeletingLastPathComponent;
+        NSString *filename = normalized.lastPathComponent;
+        BOOL appContainer = [normalized hasPrefix:@"/var/mobile/Containers/Data/Application/"]
+            || [normalized hasPrefix:@"/private/var/mobile/Containers/Data/Application/"];
+        BOOL boundedTempTarget = appContainer
+            && [parent.lastPathComponent isEqualToString:@"tmp"]
+            && [filename hasPrefix:@"CloudCode-GUI-"]
+            && [[filename.pathExtension lowercaseString] isEqualToString:@"jpg"];
+        if (!boundedTempTarget) {
+            fprintf(stderr, "gui-screenshot-file: rejected output path outside the app tmp boundary\n");
+            return 63;
+        }
+
+        NSData *data = CloudCodeScreenshotJPEG();
+        if (!data || data.length == 0 || data.length > CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES) {
+            fprintf(stderr, "gui-screenshot-file: no bounded JPEG available\n");
+            return 63;
+        }
+        NSError *error = nil;
+        if (![data writeToFile:normalized options:NSDataWritingAtomic error:&error]) {
+            fprintf(stderr, "gui-screenshot-file: write failed: %s\n", error.localizedDescription.UTF8String ?: "unknown");
+            return 63;
+        }
         return 0;
     }
 }

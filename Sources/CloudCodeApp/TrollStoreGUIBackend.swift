@@ -7,7 +7,9 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     public nonisolated let identifier = "trollstore-root-helper"
     private var cachedSnapshot: GUIAutomationCapabilitySnapshot?
     private var cachedSnapshotAt: Date?
+    private var treeRetryAfter: Date?
     private let snapshotTTL: TimeInterval = 2
+    private let treeFailureCooldown: TimeInterval = 30
     private let diagnosticLogger: DiagnosticLogStore?
 
     public init(diagnosticLogger: DiagnosticLogStore? = nil) {
@@ -80,20 +82,35 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     public func openApp(bundleID: String) async throws {
         let outcome = EmbeddedRootHelper.launch(bundleID: bundleID)
         guard outcome.success else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
+        // A foreground-app change invalidates the previous AX timeout state. Permit one fresh tree
+        // attempt for the newly launched target before falling back to screenshots again.
+        treeRetryAfter = nil
     }
 
     public func tree() async throws -> String {
+        if let treeRetryAfter, treeRetryAfter > Date() {
+            let seconds = max(1, Int(treeRetryAfter.timeIntervalSinceNow.rounded(.up)))
+            throw ToolRouterError.noExecutionRoute("AX tree recently timed out for the current device; retry is suppressed for \(seconds)s so screenshot-driven computer use can continue.")
+        }
         let outcome = EmbeddedRootHelper.guiTree()
-        guard let tree = outcome.tree else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
+        guard let tree = outcome.tree else {
+            treeRetryAfter = Date().addingTimeInterval(treeFailureCooldown)
+            throw ToolRouterError.noExecutionRoute(outcome.detail)
+        }
         guard tree.utf8.count <= 256 * 1024 else {
+            treeRetryAfter = Date().addingTimeInterval(treeFailureCooldown)
             throw ToolRouterError.noExecutionRoute("GUI tree exceeded the 256 KiB app-layer output limit")
         }
+        treeRetryAfter = nil
         return tree
     }
 
     public func screenshot() async throws -> Data {
         let outcome = EmbeddedRootHelper.guiScreenshot()
         guard let data = outcome.data else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
+        // A working global screenshot is authoritative visual evidence for the current foreground
+        // state. Keep any recent AX timeout cooldown in place; visually rich apps such as video
+        // feeds do not become better automation targets by immediately retrying the same AX path.
         return data
     }
 

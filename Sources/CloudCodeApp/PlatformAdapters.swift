@@ -309,15 +309,26 @@ enum EmbeddedRootHelper {
     }
 
     static func guiScreenshot() -> (data: Data?, detail: String) {
-        let result = run(["gui-screenshot-base64"], privilege: .root, timeout: 6)
-        guard result.code == 0,
-              let encoded = result.diagnostic.data(using: .utf8),
-              let data = Data(base64Encoded: encoded, options: [.ignoreUnknownCharacters]),
-              !data.isEmpty,
-              data.count <= 700 * 1024 else {
-            return (nil, failureDetail(prefix: "GUI screenshot", code: result.code, diagnostic: result.code == 0 ? "截图输出无法解码或超过 700 KiB" : result.diagnostic))
+        // Screenshot bytes must not share the helper diagnostic pipe. The bridge intentionally
+        // merges stdout/stderr for ordinary text commands, and a successful fallback screenshot
+        // can therefore be preceded by stderr from an earlier failed capture backend. Passing
+        // JPEG bytes through a bounded file in this app's own tmp directory keeps diagnostics and
+        // payload physically separate and also avoids the 1 MiB textual capture ceiling.
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CloudCode-GUI-\(UUID().uuidString).jpg", isDirectory: false)
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+        let result = run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)
+        guard result.code == 0 else {
+            return (nil, failureDetail(prefix: "GUI screenshot", code: result.code, diagnostic: result.diagnostic))
         }
-        return (data, "全局截图已由隔离 helper 返回。")
+        guard let data = try? Data(contentsOf: outputURL, options: [.mappedIfSafe]),
+              !data.isEmpty,
+              data.count <= 700 * 1024,
+              data.starts(with: [0xFF, 0xD8, 0xFF]) else {
+            return (nil, "GUI screenshot helper 返回成功，但 tmp 文件不是有效的 bounded JPEG；已按 fail-closed 处理。")
+        }
+        let routeDetail = result.diagnostic.isEmpty ? "" : " helper diagnostics: \(result.diagnostic)"
+        return (data, "全局截图已通过独立 tmp JPEG 通道返回。\(routeDetail)")
     }
 
     static func guiTap(x: Double, y: Double) -> (success: Bool, detail: String) {

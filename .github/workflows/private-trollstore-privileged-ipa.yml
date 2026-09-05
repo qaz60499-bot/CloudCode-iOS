@@ -138,9 +138,18 @@ jobs:
             com.apple.multitasking.unlimitedassertions \
             com.apple.hid.system.server-access \
             com.apple.private.hid.client.event-dispatch \
+            com.apple.private.hid.client.event-filter \
+            com.apple.private.hid.client.event-monitor \
+            com.apple.private.hid.client.service-protected \
+            com.apple.private.hid.manager.client \
             com.apple.accessibility.api \
             com.apple.QuartzCore.displayable-context \
-            com.apple.QuartzCore.global-capture; do
+            com.apple.QuartzCore.global-capture \
+            com.apple.QuartzCore.secure-capture \
+            com.apple.QuartzCore.secure-mode \
+            com.apple.QuartzCore.system-layers \
+            com.apple.private.IOSurface.protected-access \
+            com.apple.backboard.client; do
             /usr/libexec/PlistBuddy -c "Print :$required_helper_entitlement" "$HELPER_ENTITLEMENTS" | grep -F 'true'
           done
           rm -f "$HELPER_ENTITLEMENTS"
