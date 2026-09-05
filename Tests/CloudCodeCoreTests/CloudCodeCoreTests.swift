@@ -2333,7 +2333,8 @@ final class CloudCodeCoreTests: XCTestCase {
         )
         for try await _ in stream {}
 
-        XCTAssertEqual(await swipeCounter.value(), 1)
+        let swipeCount = await swipeCounter.value()
+        XCTAssertEqual(swipeCount, 1)
         let snapshots = await provider.snapshots()
         XCTAssertGreaterThanOrEqual(snapshots.count, 3)
         XCTAssertTrue(snapshots[2].messages.contains {
