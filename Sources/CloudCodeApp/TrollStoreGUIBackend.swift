@@ -8,8 +8,11 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     private var cachedSnapshot: GUIAutomationCapabilitySnapshot?
     private var cachedSnapshotAt: Date?
     private let snapshotTTL: TimeInterval = 2
+    private let diagnosticLogger: DiagnosticLogStore?
 
-    public init() {}
+    public init(diagnosticLogger: DiagnosticLogStore? = nil) {
+        self.diagnosticLogger = diagnosticLogger
+    }
 
     public func isAvailable() async -> Bool {
         // Never initiate a root/persona readiness probe from a generic availability check.
@@ -99,6 +102,14 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             throw ToolRouterError.noExecutionRoute("tap coordinates must be finite and non-negative")
         }
         let outcome = EmbeddedRootHelper.guiTap(x: x, y: y)
+        try? await diagnosticLogger?.log(
+            level: outcome.success ? .info : .error,
+            subsystem: "gui",
+            action: "tap.helper",
+            result: outcome.success ? "submitted" : "failed",
+            diagnostic: outcome.detail,
+            metadata: ["x": String(x), "y": String(y)]
+        )
         guard outcome.success else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
     }
 
@@ -114,6 +125,14 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             throw ToolRouterError.noExecutionRoute("scroll delta is invalid or outside the bounded range")
         }
         let outcome = EmbeddedRootHelper.guiScroll(deltaX: deltaX, deltaY: deltaY)
+        try? await diagnosticLogger?.log(
+            level: outcome.success ? .info : .error,
+            subsystem: "gui",
+            action: "scroll.helper",
+            result: outcome.success ? "submitted" : "failed",
+            diagnostic: outcome.detail,
+            metadata: ["dx": String(deltaX), "dy": String(deltaY)]
+        )
         guard outcome.success else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
     }
 
@@ -124,6 +143,18 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             throw ToolRouterError.noExecutionRoute("swipe coordinates/duration are invalid or outside the bounded range")
         }
         let outcome = EmbeddedRootHelper.guiSwipe(fromX: fromX, fromY: fromY, toX: toX, toY: toY, duration: duration)
+        try? await diagnosticLogger?.log(
+            level: outcome.success ? .info : .error,
+            subsystem: "gui",
+            action: "swipe.helper",
+            result: outcome.success ? "submitted" : "failed",
+            diagnostic: outcome.detail,
+            metadata: [
+                "fromX": String(fromX), "fromY": String(fromY),
+                "toX": String(toX), "toY": String(toY),
+                "duration": String(duration)
+            ]
+        )
         guard outcome.success else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
     }
 

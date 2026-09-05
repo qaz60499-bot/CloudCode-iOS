@@ -16,7 +16,11 @@
 #define CLOUDCODE_GUI_MAX_TREE_BYTES (256 * 1024)
 #define CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES (700 * 1024)
 #define CLOUDCODE_GUI_MAX_TEXT_UTF8_BYTES (16 * 1024)
-#define CLOUDCODE_GUI_SENDER_ID 0x8000000817319372ULL
+#define CLOUDCODE_GUI_SENDER_ID 0x8000000817319375ULL
+#define CLOUDCODE_GUI_PARENT_INDEX (1u << 22)
+#define CLOUDCODE_GUI_PARENT_IDENTITY 1u
+#define CLOUDCODE_GUI_FINGER_INDEX 3u
+#define CLOUDCODE_GUI_FINGER_IDENTITY 2u
 
 typedef const struct __CloudCodeIOHIDEvent *CloudCodeIOHIDEventRef;
 typedef const struct __CloudCodeIOHIDEventSystemClient *CloudCodeIOHIDEventSystemClientRef;
@@ -250,12 +254,15 @@ static CloudCodeIOHIDEventRef CloudCodeCreateTouchParent(CloudCodeHIDRuntime run
         parentMask = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 5);
     }
     CloudCodeIOHIDEventRef parent = runtime.createDigitizer(
-        kCFAllocatorDefault, mach_absolute_time(), 3, 99, 1, parentMask, 0,
-        nx, ny, 0, 0, 0, range, touching, 0
+        kCFAllocatorDefault, mach_absolute_time(), 3,
+        CLOUDCODE_GUI_PARENT_INDEX, CLOUDCODE_GUI_PARENT_IDENTITY, parentMask, 0,
+        nx, ny, 0, 0, 0,
+        NO, NO, 0
     );
     if (!parent) { return NULL; }
     CloudCodeIOHIDEventRef child = runtime.createFinger(
-        kCFAllocatorDefault, mach_absolute_time(), 1, 3, phaseMask,
+        kCFAllocatorDefault, mach_absolute_time(),
+        CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY, phaseMask,
         nx, ny, 0, 0, 0, range, touching, 0
     );
     if (!child) {
@@ -289,9 +296,19 @@ static BOOL CloudCodePerformTap(double x, double y)
     CloudCodeHIDRuntime runtime = CloudCodeResolveHID();
     CloudCodeIOHIDEventSystemClientRef client = NULL;
     if (!CloudCodeHIDReady(runtime, &client)) { return NO; }
+    CGSize size = CloudCodeScreenSize();
+    double nx = size.width > 1 ? x / size.width : 0;
+    double ny = size.height > 1 ? y / size.height : 0;
     BOOL ok = CloudCodeDispatchTouch(runtime, client, x, y, (1u << 0) | (1u << 1), YES, YES);
-    if (ok) { usleep(50000); ok = CloudCodeDispatchTouch(runtime, client, x, y, (1u << 2), YES, YES); }
     if (ok) { usleep(50000); ok = CloudCodeDispatchTouch(runtime, client, x, y, (1u << 0) | (1u << 1), NO, NO); }
+    if (ok) {
+        // The helper is intentionally short-lived. Keep the HID client alive briefly after the
+        // final lift packet so the last Mach delivery cannot be torn down with the process.
+        usleep(100000);
+        fprintf(stderr, "gui-hid: tap submitted screen=%.0fx%.0f point=(%.2f,%.2f) normalized=(%.5f,%.5f) parentIndex=%u fingerIndex=%u fingerIdentity=%u\n",
+                size.width, size.height, x, y, nx, ny,
+                CLOUDCODE_GUI_PARENT_INDEX, CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY);
+    }
     CFRelease(client);
     return ok;
 }
@@ -316,6 +333,14 @@ static BOOL CloudCodePerformSwipe(double fromX, double fromY, double toX, double
     if (ok) {
         usleep(10000);
         ok = CloudCodeDispatchTouch(runtime, client, toX, toY, (1u << 0) | (1u << 1), NO, NO);
+    }
+    if (ok) {
+        usleep(100000);
+        fprintf(stderr, "gui-hid: swipe submitted screen=%.0fx%.0f from=(%.2f,%.2f) to=(%.2f,%.2f) normalizedFrom=(%.5f,%.5f) normalizedTo=(%.5f,%.5f) duration=%.3f steps=%d parentIndex=%u fingerIndex=%u fingerIdentity=%u\n",
+                size.width, size.height, fromX, fromY, toX, toY,
+                fromX / size.width, fromY / size.height, toX / size.width, toY / size.height,
+                durationSeconds, steps,
+                CLOUDCODE_GUI_PARENT_INDEX, CLOUDCODE_GUI_FINGER_INDEX, CLOUDCODE_GUI_FINGER_IDENTITY);
     }
     CFRelease(client);
     return ok;

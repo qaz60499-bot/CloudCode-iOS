@@ -121,7 +121,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let approval = ApprovalCenter()
         let diagnosticLogStore = DiagnosticLogStore(directory: support.appendingPathComponent("Diagnostics/Runtime", isDirectory: true))
         let resolver = IOSAppResolver(diagnosticLogger: diagnosticLogStore)
-        let guiBackend = TrollStoreGUIBackend()
+        let guiBackend = TrollStoreGUIBackend(diagnosticLogger: diagnosticLogStore)
         let probe = CapabilityProbe(appResolver: resolver, diagnosticLogger: diagnosticLogStore, guiCapabilityProvider: guiBackend)
         let resourceResolver = ResourceResolver(appResolver: resolver)
         let fileService = FileService()

@@ -318,21 +318,21 @@ enum EmbeddedRootHelper {
     static func guiTap(x: Double, y: Double) -> (success: Bool, detail: String) {
         let result = run(["gui-tap", String(x), String(y)], privilege: .root, timeout: 3)
         return result.code == 0
-            ? (true, "IOHID tap 已提交。")
+            ? (true, result.diagnostic.isEmpty ? "IOHID tap 已提交。" : "IOHID tap 已提交：\(result.diagnostic)")
             : (false, failureDetail(prefix: "GUI tap", code: result.code, diagnostic: result.diagnostic))
     }
 
     static func guiSwipe(fromX: Double, fromY: Double, toX: Double, toY: Double, duration: Double) -> (success: Bool, detail: String) {
         let result = run(["gui-swipe", String(fromX), String(fromY), String(toX), String(toY), String(duration)], privilege: .root, timeout: min(max(duration + 2.0, 3.0), 7.0))
         return result.code == 0
-            ? (true, "IOHID swipe 已提交。")
+            ? (true, result.diagnostic.isEmpty ? "IOHID swipe 已提交。" : "IOHID swipe 已提交：\(result.diagnostic)")
             : (false, failureDetail(prefix: "GUI swipe", code: result.code, diagnostic: result.diagnostic))
     }
 
     static func guiScroll(deltaX: Double, deltaY: Double) -> (success: Bool, detail: String) {
         let result = run(["gui-scroll", String(deltaX), String(deltaY)], privilege: .root, timeout: 4)
         return result.code == 0
-            ? (true, "IOHID scroll gesture 已提交。")
+            ? (true, result.diagnostic.isEmpty ? "IOHID scroll gesture 已提交。" : "IOHID scroll gesture 已提交：\(result.diagnostic)")
             : (false, failureDetail(prefix: "GUI scroll", code: result.code, diagnostic: result.diagnostic))
     }
 
