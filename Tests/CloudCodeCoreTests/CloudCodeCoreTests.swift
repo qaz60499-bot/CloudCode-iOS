@@ -1566,6 +1566,35 @@ final class CloudCodeCoreTests: XCTestCase {
         }
     }
 
+    func testDeferredGUICapabilityRoutesOnlyThroughSelfValidatingExecutor() async throws {
+        let registry = ToolRegistry()
+        let router = ToolRouter(registry: registry, executors: [DeferredGUIExecutor(names: ["gui.tap"])])
+        let profile = CapabilityProfile(records: [
+            CapabilityRecord(id: GUIAutomationFeature.touch.capabilityID, domain: .automation, status: .deviceValidationRequired, detail: "startup-safe deferred")
+        ])
+        let call = ToolCall(name: "gui.tap", arguments: ["x": "100", "y": "200"], sessionID: UUID())
+
+        let route = try await router.chooseRoute(for: call, capabilities: profile)
+        XCTAssertEqual(route, AppExecutionRoute.guiFallback)
+        XCTAssertEqual(profile.status(GUIAutomationFeature.touch.capabilityID), .deviceValidationRequired)
+    }
+
+    func testUnavailableGUICapabilityNeverUsesSelfValidatingException() async throws {
+        let registry = ToolRegistry()
+        let router = ToolRouter(registry: registry, executors: [DeferredGUIExecutor(names: ["gui.tap"])])
+        let profile = CapabilityProfile(records: [
+            CapabilityRecord(id: GUIAutomationFeature.touch.capabilityID, domain: .automation, status: .unavailable, detail: "runtime disproved")
+        ])
+        let call = ToolCall(name: "gui.tap", arguments: ["x": "100", "y": "200"], sessionID: UUID())
+
+        do {
+            _ = try await router.chooseRoute(for: call, capabilities: profile)
+            XCTFail("Unavailable GUI capability must remain fail closed")
+        } catch {
+            XCTAssertEqual(error as? ToolRouterError, .missingCapability(GUIAutomationFeature.touch.capabilityID))
+        }
+    }
+
     func testDeviceValidationRequiredCapabilityDoesNotAuthorizeExecution() async throws {
         let registry = ToolRegistry(descriptors: [ToolDescriptor(name: "ipa.install", summary: "", risk: .systemChange, requiredCapabilities: ["ipa.install"], preferredRoute: .privateFramework)])
         let executor = StubExecutor(route: .privateFramework, names: ["ipa.install"])
@@ -4413,6 +4442,28 @@ private actor InvocationCounter {
     private var count = 0
     func increment() { count += 1 }
     func value() -> Int { count }
+}
+
+private struct DeferredGUIExecutor: DeferredCapabilitySelfValidatingToolExecutor, Sendable {
+    let route: AppExecutionRoute = .guiFallback
+    let names: Set<String>
+
+    func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
+        names.contains(tool.name)
+    }
+
+    func allowsDeferredCapabilityAttempt(
+        _ capabilityIDs: [String],
+        for tool: ToolDescriptor,
+        capabilities: CapabilityProfile
+    ) async -> Bool {
+        guard names.contains(tool.name), capabilityIDs.count == 1, let capabilityID = capabilityIDs.first else { return false }
+        return capabilityID.hasPrefix("automation.gui.") && capabilities.status(capabilityID) == .deviceValidationRequired
+    }
+
+    func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
+        ToolResult(toolCallID: call.id, success: true, summary: "bounded self-validating attempt")
+    }
 }
 
 private struct SlowCountingExecutor: ToolExecuting, Sendable {
