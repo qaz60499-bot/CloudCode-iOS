@@ -338,6 +338,14 @@ jobs:
           for marker in ('guiProbe()', 'run(["gui-probe-json"], privilege: .root, timeout: 6)', 'run(["gui-tree-json"], privilege: .root, timeout: 5)', 'run(["gui-screenshot-base64"], privilege: .root, timeout: 6)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
               if marker not in adapters:
                   raise SystemExit(f'FAIL: GUI adapter lost bounded helper marker: {marker}')
+          gui_executor = adapters.split('public struct GUIFallbackExecutor', 1)[1]
+          gui_routing = gui_executor.split('public func execute(', 1)[0]
+          if 'DeferredCapabilitySelfValidatingToolExecutor' not in gui_executor:
+              raise SystemExit('FAIL: GUI executor lost bounded self-validating deferred-capability route')
+          if 'backend.guiCapabilitySnapshot()' in gui_routing or 'EmbeddedRootHelper.guiProbe()' in gui_routing:
+              raise SystemExit('FAIL: GUI route selection must not run root/persona readiness probing during ordinary Agent send')
+          if '.deviceValidationRequired' not in gui_routing:
+              raise SystemExit('FAIL: GUI deferred capability route no longer supports one-line self-validating operations')
           approval = adapters.split('public final class ApprovalCenter', 1)[1].split('public struct IOSSystemExecutor', 1)[0]
           for marker in ('withTaskCancellationHandler', 'continuationID', 'cancelPendingApproval(requestID:', 'finishPendingApproval(returning:'):
               if marker not in approval:

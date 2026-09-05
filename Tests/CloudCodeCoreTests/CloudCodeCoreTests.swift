@@ -1560,7 +1560,7 @@ final class CloudCodeCoreTests: XCTestCase {
         let treeCall = ToolCall(name: "gui.tree", arguments: [:], sessionID: UUID())
         do {
             _ = try await router.chooseRoute(for: treeCall, capabilities: profile)
-            XCTFail("Unproven GUI tree capability must fail closed")
+            XCTFail("A normal executor must not consume an unproven GUI capability")
         } catch {
             XCTAssertEqual(error as? ToolRouterError, .missingCapability(GUIAutomationFeature.tree.capabilityID))
         }
