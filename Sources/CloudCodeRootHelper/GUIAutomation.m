@@ -24,7 +24,7 @@
 #define CLOUDCODE_HID_DIGITIZER_RANGE (1u << 0)
 #define CLOUDCODE_HID_DIGITIZER_TOUCH (1u << 1)
 #define CLOUDCODE_HID_DIGITIZER_POSITION (1u << 2)
-#define CLOUDCODE_HID_DIGITIZER_IDENTITY (1u << 4)
+#define CLOUDCODE_HID_DIGITIZER_IDENTITY (1u << 5)
 
 typedef const struct __CloudCodeIOHIDEvent *CloudCodeIOHIDEventRef;
 typedef const struct __CloudCodeIOHIDEventSystemClient *CloudCodeIOHIDEventSystemClientRef;
