@@ -1012,6 +1012,60 @@ final class ProviderProtocolClientTests: XCTestCase {
         ))
     }
 
+    func testGatewayRecoveryCompactsGeneric503ButNotExplicitQuotaOrCredentialFailures() {
+        XCTAssertTrue(ProviderCompatibilityClassifier.shouldRetryWithCompactContext(
+            statusCode: 503,
+            body: Data("{\"error\":\"upstream overloaded\"}".utf8)
+        ))
+        XCTAssertTrue(ProviderCompatibilityClassifier.shouldRetryWithCompactContext(
+            statusCode: 413,
+            body: Data("{\"error\":\"request too large\"}".utf8)
+        ))
+        XCTAssertFalse(ProviderCompatibilityClassifier.shouldRetryWithCompactContext(
+            statusCode: 503,
+            body: Data("{\"error\":\"insufficient_user_quota\"}".utf8)
+        ))
+        XCTAssertFalse(ProviderCompatibilityClassifier.shouldRetryWithCompactContext(
+            statusCode: 503,
+            body: Data("{\"error\":\"invalid api key\"}".utf8)
+        ))
+    }
+
+    func testAnthropicGeneric503RetriesOnceWithCompactedContextBeforeNormalRetryBudget() async throws {
+        ProviderGatewayRecoveryURLProtocol.reset()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProviderGatewayRecoveryURLProtocol.self]
+        let client = AnthropicProviderClient(
+            session: URLSession(configuration: configuration),
+            retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0)
+        )
+        let provider = ProviderConfiguration(
+            name: "gateway-recovery",
+            baseURL: URL(string: "https://proxy.example/v1")!,
+            model: "claude-test",
+            apiKeyReference: "key",
+            protocolName: ProviderProtocol.anthropic.rawValue,
+            authModeName: ProviderAuthMode.bearer.rawValue
+        )
+        var messages: [ChatMessage] = [ChatMessage(role: .system, content: "safety")]
+        for index in 0..<80 {
+            messages.append(ChatMessage(role: .user, content: "old-\(index)-" + String(repeating: "x", count: 2_000)))
+            messages.append(ChatMessage(role: .assistant, content: "answer-\(index)-" + String(repeating: "y", count: 2_000)))
+        }
+        messages.append(ChatMessage(role: .user, content: "latest-user-must-survive"))
+
+        var events: [ProviderEvent] = []
+        for try await event in client.stream(configuration: provider, apiKey: "secret", messages: messages, tools: []) {
+            events.append(event)
+        }
+        XCTAssertEqual(events.last, .finished)
+        let bodies = ProviderGatewayRecoveryURLProtocol.requestBodies()
+        XCTAssertEqual(bodies.count, 2)
+        XCTAssertGreaterThan(bodies[0].count, bodies[1].count)
+        let compactText = String(data: bodies[1], encoding: .utf8) ?? ""
+        XCTAssertTrue(compactText.contains("latest-user-must-survive"))
+    }
+
     func testHTTP403QuotaIsCapacityNotCredentialFailure() {
         let body = Data("{\"error\":\"insufficient_user_quota\"}".utf8)
         XCTAssertEqual(ProviderHTTPClassifier.error(for: 403, body: body), .capacityExhausted(403))
@@ -1760,6 +1814,67 @@ private final class ProviderPricingDiscoveryURLProtocol: URLProtocol, @unchecked
         }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class ProviderGatewayRecoveryURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    private static var bodies: [Data] = []
+
+    static func reset() {
+        lock.lock()
+        bodies = []
+        lock.unlock()
+    }
+
+    static func requestBodies() -> [Data] {
+        lock.lock()
+        defer { lock.unlock() }
+        return bodies
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        var requestBody = request.httpBody
+        if requestBody == nil, let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var data = Data()
+            let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+            defer { buffer.deallocate() }
+            while true {
+                let count = stream.read(buffer, maxLength: 4096)
+                if count <= 0 { break }
+                data.append(buffer, count: count)
+            }
+            requestBody = data
+        }
+        let body = requestBody ?? Data()
+        Self.lock.lock()
+        let index = Self.bodies.count
+        Self.bodies.append(body)
+        Self.lock.unlock()
+
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let status = index == 0 ? 503 : 200
+        let responseBody = index == 0
+            ? Data("{\"error\":\"upstream overloaded\"}".utf8)
+            : Data("data: {\"type\":\"message_stop\"}\n\n".utf8)
+        let headers = ["Content-Type": index == 0 ? "application/json" : "text/event-stream"]
+        guard let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: responseBody)
         client?.urlProtocolDidFinishLoading(self)
     }
 

@@ -7,10 +7,12 @@ public struct HarnessContextPolicy: Sendable, Equatable {
     public var maxCharacters: Int
     public var maxMessages: Int
 
-    public init(maxCharacters: Int = 120_000, maxMessages: Int = 96) {
+    public init(maxCharacters: Int = 80_000, maxMessages: Int = 72) {
         self.maxCharacters = max(8_000, maxCharacters)
         self.maxMessages = max(12, maxMessages)
     }
+
+    public static let gatewayRecovery = HarnessContextPolicy(maxCharacters: 48_000, maxMessages: 48)
 }
 
 public enum HarnessContextManager {
@@ -51,7 +53,9 @@ public enum HarnessContextManager {
 
         // Ensure at least the most recent user message survives even when the newest
         // messages are assistant/tool records and the context budget is exhausted.
-        if let latestUser = messages.indices.reversed().first(where: { messages[$0].role == .user }) {
+        if let latestUser = messages.indices.reversed().first(where: {
+            messages[$0].role == .user && messages[$0].providerMetadata["internal_observation"] == nil
+        }) {
             selectedIndexes.insert(latestUser)
         }
 
@@ -171,7 +175,15 @@ public enum HarnessContextManager {
     private static func estimatedCharacters(_ message: ChatMessage) -> Int {
         var cost = message.content.count + 32
         cost += message.providerMetadata.reduce(0) { $0 + $1.key.count + $1.value.count }
-        cost += message.attachments.reduce(0) { $0 + $1.filename.count + $1.path.count + $1.mimeType.count + 64 }
+        cost += message.attachments.reduce(0) { partial, attachment in
+            let metadataCost = attachment.filename.count + attachment.path.count + attachment.mimeType.count + 64
+            // Provider payloads inline image attachments as Base64. Counting only the local path made
+            // a long GUI session look tiny while repeatedly resending multiple historical screenshots.
+            // 4/3 approximates Base64 expansion; the small fixed JSON overhead is intentionally rounded up.
+            let boundedBytes = max(0, attachment.byteSize)
+            let base64Cost = Int(min(Int64(Int.max / 2), ((boundedBytes + 2) / 3) * 4))
+            return partial + metadataCost + base64Cost + 256
+        }
         return cost
     }
 }

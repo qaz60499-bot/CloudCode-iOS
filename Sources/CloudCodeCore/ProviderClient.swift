@@ -486,14 +486,16 @@ private extension ProviderRequestBuilding {
             let task = Task {
                 var attempt = 1
                 var requestConfiguration = configuration
+                var requestMessages = messages
                 var didDropReasoningEffortForCompatibility = false
+                var didCompactContextForGatewayRecovery = false
                 while attempt <= retryPolicy.maxAttempts {
                     var responseStarted = false
                     var successfulStreamEstablished = false
                     var transport: ProviderStreamingTransport?
                     var endpoint = (configuration.baseURL.host ?? "") + configuration.baseURL.path
                     do {
-                        let request = try makeRequest(configuration: requestConfiguration, apiKey: apiKey, messages: messages, tools: tools)
+                        let request = try makeRequest(configuration: requestConfiguration, apiKey: apiKey, messages: requestMessages, tools: tools)
                         endpoint = (request.url?.host ?? configuration.baseURL.host ?? "") + (request.url?.path ?? configuration.baseURL.path)
                         try? await diagnosticLogger?.log(
                             level: .info,
@@ -511,7 +513,11 @@ private extension ProviderRequestBuilding {
                                 "host": request.url?.host ?? configuration.baseURL.host ?? "",
                                 "endpointPath": request.url?.path ?? configuration.baseURL.path,
                                 "endpoint": endpoint,
-                                "transportState": "connecting"
+                                "transportState": "connecting",
+                                "requestBodyBytes": String(request.httpBody?.count ?? 0),
+                                "messageCount": String(requestMessages.count),
+                                "toolCount": String(tools.count),
+                                "gatewayRecoveryCompacted": didCompactContextForGatewayRecovery ? "true" : "false"
                             ]
                         )
                         let attemptTransport = ProviderStreamingTransport(configuration: session.configuration, request: request)
@@ -546,6 +552,27 @@ private extension ProviderRequestBuilding {
                             } catch {
                                 // HTTP status is authoritative for classification; a truncated
                                 // error body must not turn a known 4xx/5xx into a transport replay.
+                            }
+                            if !didCompactContextForGatewayRecovery,
+                               ProviderCompatibilityClassifier.shouldRetryWithCompactContext(statusCode: http.statusCode, body: body) {
+                                didCompactContextForGatewayRecovery = true
+                                requestMessages = HarnessContextManager.providerMessages(from: messages, policy: .gatewayRecovery)
+                                try? await diagnosticLogger?.log(
+                                    level: .warning,
+                                    subsystem: "provider",
+                                    action: "request.compatibility-fallback",
+                                    result: "retry_with_compact_context",
+                                    diagnostic: "Provider gateway rejected the full request before output. Retrying once with attachment-aware bounded context while preserving the latest user request and complete tool-call pairs.",
+                                    metadata: [
+                                        "providerID": configuration.providerID ?? "",
+                                        "model": configuration.model,
+                                        "statusCode": String(http.statusCode),
+                                        "protocol": configuration.protocolName ?? "",
+                                        "originalMessageCount": String(messages.count),
+                                        "compactMessageCount": String(requestMessages.count)
+                                    ]
+                                )
+                                continue
                             }
                             if requestConfiguration.reasoningEffort?.providerValue != nil,
                                !didDropReasoningEffortForCompatibility,
@@ -1355,6 +1382,24 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
 }
 
 public enum ProviderCompatibilityClassifier {
+    public static func shouldRetryWithCompactContext(statusCode: Int, body: Data) -> Bool {
+        let text = String(data: body.prefix(262_144), encoding: .utf8)?.lowercased() ?? ""
+        if ProviderFailureEvidence.isCapacity(text) || ProviderFailureEvidence.isCredential(text) {
+            return false
+        }
+        let contextMarkers = [
+            "context length", "context_length", "context window", "too many tokens", "request too large",
+            "payload too large", "prompt is too long", "maximum context", "max context"
+        ]
+        if statusCode == 400 || statusCode == 413 || statusCode == 422 {
+            return contextMarkers.contains { text.contains($0) }
+        }
+        // Several Anthropic-compatible gateways surface request overload/context rejection as a
+        // generic 502/503/504. A single replay with a much smaller attachment-aware context is safe
+        // because no provider output has been emitted yet; normal retry rules resume afterwards.
+        return statusCode == 502 || statusCode == 503 || statusCode == 504
+    }
+
     public static func shouldRetryWithoutReasoningEffort(statusCode: Int, body: Data) -> Bool {
         guard statusCode == 400 || statusCode == 422 else { return false }
         let text = String(data: body.prefix(262_144), encoding: .utf8)?.lowercased() ?? ""

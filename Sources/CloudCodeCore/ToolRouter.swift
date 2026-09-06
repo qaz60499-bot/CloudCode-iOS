@@ -471,6 +471,21 @@ public actor ToolRouter {
         await executionPathMetrics.recent(limit: limit)
     }
 
+    /// Returns only tools that have a side-effect-free route decision for the current capability
+    /// profile. This keeps impossible/unavailable schemas out of every provider request while
+    /// retaining exact-operation deferred self-validation routes such as the TrollStore GUI tools.
+    public func providerRoutableToolNames(capabilities: CapabilityProfile) async -> Set<String> {
+        let descriptors = await registry.all()
+        var names = Set<String>()
+        for descriptor in descriptors {
+            let probeCall = ToolCall(name: descriptor.name, arguments: [:], sessionID: UUID())
+            if (try? await routeDecision(for: probeCall, capabilities: capabilities)) != nil {
+                names.insert(descriptor.name)
+            }
+        }
+        return names
+    }
+
     public func chooseRoute(for call: ToolCall, capabilities: CapabilityProfile) async throws -> AppExecutionRoute {
         try await routeDecision(for: call, capabilities: capabilities).route
     }

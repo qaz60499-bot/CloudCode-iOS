@@ -581,7 +581,21 @@ public actor AgentCore {
                     let toolNameMap = try ProviderToolNameMap(internalNames: descriptors.map(\.name))
                     session = try Self.normalizeProviderToolMetadata(in: session, using: toolNameMap)
                     try await sessionStore.save(session)
-                    let schemas = try Self.makeToolSchemas(descriptors: descriptors, toolNameMap: toolNameMap)
+                    let providerRoutableNames = await toolRouter.providerRoutableToolNames(capabilities: capabilities)
+                    let providerDescriptors = descriptors.filter { providerRoutableNames.contains($0.name) }
+                    let schemas = try Self.makeToolSchemas(descriptors: providerDescriptors, toolNameMap: toolNameMap)
+                    try? await diagnosticLogger?.log(
+                        level: .info,
+                        subsystem: "provider",
+                        action: "tool-schema",
+                        result: "bounded",
+                        sessionID: session.id,
+                        metadata: [
+                            "registered": String(descriptors.count),
+                            "routable": String(providerDescriptors.count),
+                            "omitted": String(max(0, descriptors.count - providerDescriptors.count))
+                        ]
+                    )
                     let descriptorsByName = Dictionary(descriptors.map { ($0.name, $0) }, uniquingKeysWith: { _, latest in latest })
                     var lastStateChangeSignature = checkpoint.payload["tool.lastStateChangeSignature"]
                         ?? Self.lastCompletedStateChangeSignature(in: session, descriptorsByName: descriptorsByName)

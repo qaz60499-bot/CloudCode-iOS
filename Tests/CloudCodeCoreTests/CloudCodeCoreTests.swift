@@ -3892,6 +3892,36 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertLessThan(compressed.count, messages.count)
     }
 
+    func testHarnessContextCompressionBudgetsScreenshotBytesAndPreservesLatestExternalUser() {
+        let oldScreenshot = ChatAttachment(
+            filename: "old.jpg",
+            path: "/tmp/old.jpg",
+            mimeType: "image/jpeg",
+            byteSize: 2_000_000
+        )
+        let latestScreenshot = ChatAttachment(
+            filename: "latest.jpg",
+            path: "/tmp/latest.jpg",
+            mimeType: "image/jpeg",
+            byteSize: 1_500_000
+        )
+        let messages = [
+            ChatMessage(role: .system, content: "safety"),
+            ChatMessage(role: .user, content: "open app and inspect the current screen"),
+            ChatMessage(role: .user, content: "old screenshot", providerMetadata: ["internal_observation": "gui.screenshot"], attachments: [oldScreenshot]),
+            ChatMessage(role: .assistant, content: "continue"),
+            ChatMessage(role: .user, content: "current screenshot", providerMetadata: ["internal_observation": "gui.screenshot"], attachments: [latestScreenshot])
+        ]
+
+        let compressed = HarnessContextManager.providerMessages(
+            from: messages,
+            policy: HarnessContextPolicy(maxCharacters: 80_000, maxMessages: 72)
+        )
+        XCTAssertTrue(compressed.contains { $0.role == .user && $0.content == "open app and inspect the current screen" })
+        XCTAssertTrue(compressed.contains { $0.providerMetadata["internal_observation"] == "gui.screenshot" && $0.content == "current screenshot" })
+        XCTAssertFalse(compressed.contains { $0.content == "old screenshot" })
+    }
+
     func testHarnessExecutionHintRecognizesExplicitBoundedRepeatedSwipe() {
         let messages = [
             ChatMessage(role: .system, content: "safety"),

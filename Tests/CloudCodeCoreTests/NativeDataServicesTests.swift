@@ -140,6 +140,17 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertTrue(graph.nodes.contains(where: { $0.ownerBundleID == "com.example.app" }))
     }
 
+    func testToolRouterProviderSchemaEligibilityOmitsUnavailableCapabilities() async throws {
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "test.routable", summary: "", risk: .readOnly),
+            ToolDescriptor(name: "test.blocked", summary: "", risk: .readOnly, requiredCapabilities: ["missing.capability"])
+        ])
+        let router = ToolRouter(registry: registry, executors: [RouteStubExecutor(route: .structuredTool, supported: true)])
+        let names = await router.providerRoutableToolNames(capabilities: CapabilityProfile(records: []))
+        XCTAssertTrue(names.contains("test.routable"))
+        XCTAssertFalse(names.contains("test.blocked"))
+    }
+
     func testToolRouterRecordsFallbackCandidatesReasonsAndExecutionLatency() async throws {
         let registry = ToolRegistry(descriptors: [ToolDescriptor(name: "test.route", summary: "", risk: .readOnly)])
         let structured = RouteStubExecutor(route: .structuredTool, supported: false)
