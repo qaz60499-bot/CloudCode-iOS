@@ -416,7 +416,7 @@ jobs:
           for marker in ('enumerate-json', 'probe-filesystem-json', 'probe-launch', 'probe-uninstall', 'is-installed', 'launch', 'uninstall', 'cleanup-unregistered', 'MCMMetadataIdentifier', 'BundleFilesystemOrphans', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-screenshot-file', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-navigate-back', 'gui-type-base64', 'background-assert-worker', 'background-assert-start', 'background-assert-status', 'background-assert-stop', 'BKSProcessAssertion', 'CloudCode.BackgroundAgent'):
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: root helper command missing: {marker}')
-          for marker in ('FrontBoardServices.framework', 'BackBoardServices.framework', 'FBSSystemService', 'BKSSystemService', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'geteuid() != 0', 'foreground verification passed', 'launchservices+frontboard+backboard'):
+          for marker in ('@"%@.framework/%@"', '@"FBSSystemService", @"FrontBoardServices"', '@"BKSSystemService", @"BackBoardServices"', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'geteuid() != 0', 'foreground verification passed', 'launchservices+frontboard+backboard'):
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: app launch lost bounded board-service fallback/foreground verification marker: {marker}')
           bridge = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
