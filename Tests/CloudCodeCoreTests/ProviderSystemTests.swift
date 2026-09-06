@@ -1045,16 +1045,17 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(events.last, .finished)
     }
 
-    func testAgentRouterDeepSeekUsesOpenAIChatCurrentOriginAndBearerAuth() async throws {
+    func testAgentRouterDeepSeekUsesAnthropicPreferredCurrentOriginAndBearerAuth() async throws {
         let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-agentrouter-org" }))
         let protocolName = provider.protocolFor(model: "deepseek-v4-flash", keySlotID: "slot-1")
-        XCTAssertEqual(protocolName, .openAIChat)
+        XCTAssertEqual(protocolName, .anthropic)
+        XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.anthropic, .openAIChat])
         ProviderTestURLProtocol.install(
             status: 200,
-            body: Data("data: [DONE]\n\n".utf8),
+            body: Data("data: {\"type\":\"message_stop\"}\n\n".utf8),
             headers: ["Content-Type": "text/event-stream"]
         )
-        let client = OpenAICompatibleProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let client = AnthropicProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
         let configuration = ProviderConfiguration(
             name: provider.displayName,
             baseURL: provider.baseURL,
@@ -1066,10 +1067,10 @@ final class ProviderProtocolClientTests: XCTestCase {
         )
         for try await _ in client.stream(configuration: configuration, apiKey: "test-secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
         let request = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
-        XCTAssertEqual(request.url?.absoluteString, "https://co.agentrouter.org/v1/chat/completions")
+        XCTAssertEqual(request.url?.absoluteString, "https://agentrouter.org/v1/messages")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
         XCTAssertNil(request.value(forHTTPHeaderField: "x-api-key"))
-        XCTAssertNil(request.value(forHTTPHeaderField: "anthropic-version"))
+        XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-version"), "2023-06-01")
         XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "claude-cli/1.0.120 (external, cli)")
         XCTAssertEqual(request.value(forHTTPHeaderField: "x-app"), "cli")
         XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-beta"), "claude-code-20250219")
