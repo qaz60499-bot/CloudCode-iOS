@@ -1,0 +1,213 @@
+name: AgentRouter Live Smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  agentrouter-live-smoke:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate AgentRouter mobile compatibility and model protocols
+        env:
+          CLOUDCODE_PROVIDER_BOOTSTRAP: ${{ secrets.CLOUDCODE_PROVIDER_BOOTSTRAP }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          PROVIDER_ID = "https-agentrouter-org"
+          BASE_URL = "https://co.agentrouter.org"
+          EXPECTED_FINGERPRINT = "105a3fce9a105c41472b926f6448a91be2f9726d5e074adbaaa2206f4d6dbf23"
+          CLIENT_HEADERS = {
+              "User-Agent": "claude-cli/1.0.120 (external, cli)",
+              "x-app": "cli",
+              "anthropic-beta": "claude-code-20250219",
+              "x-stainless-lang": "js",
+              "x-stainless-package-version": "0.60.0",
+              "x-stainless-runtime": "node",
+              "x-stainless-runtime-version": "v22.0.0",
+              "x-stainless-os": "Windows",
+              "x-stainless-arch": "x64",
+          }
+
+          bootstrap = json.loads(os.environ["CLOUDCODE_PROVIDER_BOOTSTRAP"])
+          provider = next((p for p in bootstrap.get("providers", []) if p.get("providerID") == PROVIDER_ID), None)
+          if not provider or not provider.get("keys"):
+              raise SystemExit("FAIL: private bootstrap is missing AgentRouter")
+          secret = provider["keys"][0].get("secret", "")
+          if not secret:
+              raise SystemExit("FAIL: AgentRouter key is empty")
+
+          fingerprint_matches = hashlib.sha256(secret.encode("utf-8")).hexdigest() == EXPECTED_FINGERPRINT
+          print(f"AGENTROUTER_SECRET_MATCHES_CATALOG={str(fingerprint_matches).lower()}")
+          if not fingerprint_matches:
+              raise SystemExit("FAIL: AgentRouter private key does not match the catalog fingerprint")
+
+          def request(path, payload=None, anthropic=False):
+              headers = {
+                  "Accept": "application/json",
+                  "Authorization": f"Bearer {secret}",
+                  **CLIENT_HEADERS,
+              }
+              data = None
+              if payload is not None:
+                  headers["Content-Type"] = "application/json"
+                  data = json.dumps(payload).encode("utf-8")
+              if anthropic:
+                  headers["anthropic-version"] = "2023-06-01"
+              req = urllib.request.Request(
+                  BASE_URL + path,
+                  data=data,
+                  headers=headers,
+                  method="POST" if payload is not None else "GET",
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      return response.status, response.read(262144), response.headers.get("Content-Type", "")
+              except urllib.error.HTTPError as exc:
+                  return exc.code, exc.read(262144), exc.headers.get("Content-Type", "")
+
+          def body_text(body):
+              return body.decode("utf-8", "replace").lower()
+
+          def client_blocked(status, body):
+              if status not in (401, 403):
+                  return False
+              text = body_text(body)
+              markers = (
+                  "unauthorized_client_error",
+                  "unauthorized client detected",
+                  "unauthorized_client",
+                  "client not allowed",
+                  "forbidden client",
+                  "not a recognized client",
+              )
+              return any(marker in text for marker in markers)
+
+          def capacity_blocked(status, body):
+              if status not in (402, 403, 429):
+                  return False
+              text = body_text(body)
+              markers = (
+                  "预扣费额度失败",
+                  "insufficient balance",
+                  "insufficient credit",
+                  "precharge",
+                  "credit exhausted",
+                  "balance exhausted",
+                  "account capacity",
+                  "capacity exhausted",
+                  "quota exhausted",
+              )
+              return any(marker in text for marker in markers)
+
+          def model_unavailable(body):
+              text = body_text(body)
+              markers = (
+                  "model_not_found",
+                  "model not found",
+                  "no available channel",
+                  "no channel",
+                  "模型不存在",
+                  "无可用渠道",
+                  "渠道不可用",
+              )
+              return any(marker in text for marker in markers)
+
+          models_status, models_body, models_content_type = request("/v1/models")
+          if client_blocked(models_status, models_body) or models_status == 401:
+              raise SystemExit(f"FAIL: AgentRouter /v1/models still has client/auth 401 regression (status={models_status})")
+          if not 200 <= models_status < 300:
+              raise SystemExit(f"FAIL: AgentRouter /v1/models did not return 2xx (status={models_status})")
+
+          discovered = []
+          try:
+              parsed = json.loads(models_body.decode("utf-8", "replace"))
+              raw = (parsed.get("data") or parsed.get("models") or []) if isinstance(parsed, dict) else parsed
+              if isinstance(raw, list):
+                  for item in raw:
+                      if isinstance(item, str):
+                          candidate = item.strip()
+                      elif isinstance(item, dict):
+                          candidate = str(item.get("id") or item.get("model") or item.get("name") or "").strip()
+                      else:
+                          candidate = ""
+                      if candidate and candidate not in discovered:
+                          discovered.append(candidate)
+          except Exception:
+              pass
+          print(
+              "AGENTROUTER_MODELS "
+              f"status={models_status} content_type={models_content_type.split(';')[0]} "
+              f"model_count={len(discovered)}"
+          )
+
+          matrix = [
+              ("deepseek-v4-flash", "openai_chat", "/v1/chat/completions"),
+              ("glm-5.3", "openai_chat", "/v1/chat/completions"),
+              ("gpt-5.6-sol", "openai_chat", "/v1/chat/completions"),
+              ("claude-opus-5", "anthropic", "/v1/messages"),
+              ("claude-opus-4-8", "anthropic", "/v1/messages"),
+          ]
+
+          hard_failures = []
+          for model, protocol, path in matrix:
+              if protocol == "anthropic":
+                  payload = {
+                      "model": model,
+                      "max_tokens": 1,
+                      "stream": False,
+                      "messages": [{"role": "user", "content": "Reply OK"}],
+                  }
+                  status, body, content_type = request(path, payload=payload, anthropic=True)
+              else:
+                  payload = {
+                      "model": model,
+                      "max_tokens": 1,
+                      "stream": False,
+                      "messages": [{"role": "user", "content": "Reply OK"}],
+                  }
+                  status, body, content_type = request(path, payload=payload)
+
+              blocked = client_blocked(status, body)
+              capacity = capacity_blocked(status, body)
+              unavailable = model_unavailable(body)
+              listed = model in discovered
+              if 200 <= status < 300:
+                  classification = "ok"
+              elif capacity:
+                  classification = "capacity"
+              elif unavailable:
+                  classification = "model_unavailable"
+              elif 500 <= status < 600:
+                  classification = "upstream_5xx"
+              elif status in (401, 403) or blocked:
+                  classification = "auth_or_client_rejected"
+                  hard_failures.append(f"{model}:{status}")
+              else:
+                  classification = "protocol_or_route_error"
+                  hard_failures.append(f"{model}:{status}")
+
+              print(
+                  "AGENTROUTER_MODEL_MATRIX "
+                  f"model={model} protocol={protocol} endpoint={path} status={status} "
+                  f"content_type={content_type.split(';')[0]} body_bytes={len(body)} "
+                  f"listed={str(listed).lower()} classification={classification}"
+              )
+
+          if hard_failures:
+              raise SystemExit("FAIL: AgentRouter model matrix has client/auth/protocol regressions: " + ",".join(hard_failures))
+
+          print("AGENTROUTER_LIVE_SMOKE_OK")
+          PY
