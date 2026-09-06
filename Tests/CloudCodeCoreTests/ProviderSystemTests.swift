@@ -677,7 +677,7 @@ final class ProviderRouterTests: XCTestCase {
         XCTAssertTrue(outputs.allSatisfy { $0 == "good" })
     }
 
-    func testSuccessfulFallbackPreferenceDoesNotLeakAcrossConfigurations() async throws {
+    func testSuccessfulFallbackPreferenceIsReusedAcrossEquivalentConfigurations() async throws {
         let vault = MemoryKeyVault(keys: ["fallback": "good"])
         let recorder = RecordingKeyOutcomeProvider()
         let router = ProviderClientRouter(
@@ -699,6 +699,29 @@ final class ProviderRouterTests: XCTestCase {
         let seen = await recorder.keysSeen()
         XCTAssertEqual(firstOutput, "good")
         XCTAssertEqual(secondOutput, "good")
+        XCTAssertEqual(seen, ["bad-auth", "good", "good"])
+    }
+
+    func testSuccessfulFallbackPreferenceRemainsIsolatedByModel() async throws {
+        let vault = MemoryKeyVault(keys: ["fallback": "good"])
+        let recorder = RecordingKeyOutcomeProvider()
+        let router = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: recorder,
+            openAIChat: recorder,
+            responses: recorder
+        )
+        var first = config(protocolName: .anthropic)
+        first.fallbackAPIKeyReferences = ["fallback"]
+        first.allowSameProviderKeyFailover = true
+        var second = config(protocolName: .anthropic)
+        second.model = "different-model"
+        second.fallbackAPIKeyReferences = ["fallback"]
+        second.allowSameProviderKeyFailover = true
+
+        _ = try await collectText(router.stream(configuration: first, apiKey: "bad-auth", messages: [], tools: []))
+        _ = try await collectText(router.stream(configuration: second, apiKey: "bad-auth", messages: [], tools: []))
+        let seen = await recorder.keysSeen()
         XCTAssertEqual(seen, ["bad-auth", "good", "bad-auth", "good"])
     }
 
