@@ -493,6 +493,7 @@ private extension ProviderRequestBuilding {
                 var attempt = 1
                 var requestConfiguration = configuration
                 var requestMessages = messages
+                var requestTools = tools
                 var didDropReasoningEffortForCompatibility = false
                 var didCompactContextForGatewayRecovery = false
                 while attempt <= retryPolicy.maxAttempts {
@@ -501,7 +502,7 @@ private extension ProviderRequestBuilding {
                     var transport: ProviderStreamingTransport?
                     var endpoint = (configuration.baseURL.host ?? "") + configuration.baseURL.path
                     do {
-                        let request = try makeRequest(configuration: requestConfiguration, apiKey: apiKey, messages: requestMessages, tools: tools)
+                        let request = try makeRequest(configuration: requestConfiguration, apiKey: apiKey, messages: requestMessages, tools: requestTools)
                         endpoint = (request.url?.host ?? configuration.baseURL.host ?? "") + (request.url?.path ?? configuration.baseURL.path)
                         try? await diagnosticLogger?.log(
                             level: .info,
@@ -522,7 +523,7 @@ private extension ProviderRequestBuilding {
                                 "transportState": "connecting",
                                 "requestBodyBytes": String(request.httpBody?.count ?? 0),
                                 "messageCount": String(requestMessages.count),
-                                "toolCount": String(tools.count),
+                                "toolCount": String(requestTools.count),
                                 "gatewayRecoveryCompacted": didCompactContextForGatewayRecovery ? "true" : "false"
                             ]
                         )
@@ -559,23 +560,37 @@ private extension ProviderRequestBuilding {
                                 // HTTP status is authoritative for classification; a truncated
                                 // error body must not turn a known 4xx/5xx into a transport replay.
                             }
-                            if !didCompactContextForGatewayRecovery,
-                               ProviderCompatibilityClassifier.shouldRetryWithCompactContext(statusCode: http.statusCode, body: body) {
+                            let genericContextRecovery = ProviderCompatibilityClassifier.shouldRetryWithCompactContext(statusCode: http.statusCode, body: body)
+                            let agentRouterEnvelopeRecovery = ProviderCompatibilityClassifier.shouldRetryAgentRouterCompatibilityEnvelope(
+                                providerID: configuration.providerID,
+                                statusCode: http.statusCode,
+                                body: body,
+                                messageCount: requestMessages.count,
+                                toolCount: requestTools.count
+                            )
+                            if !didCompactContextForGatewayRecovery, genericContextRecovery || agentRouterEnvelopeRecovery {
                                 didCompactContextForGatewayRecovery = true
                                 requestMessages = HarnessContextManager.providerMessages(from: messages, policy: .gatewayRecovery)
+                                if agentRouterEnvelopeRecovery {
+                                    requestTools = ProviderCompatibilityClassifier.recoveryToolSchemas(from: tools, messages: messages)
+                                }
                                 try? await diagnosticLogger?.log(
                                     level: .warning,
                                     subsystem: "provider",
                                     action: "request.compatibility-fallback",
-                                    result: "retry_with_compact_context",
-                                    diagnostic: "Provider gateway rejected the full request before output. Retrying once with attachment-aware bounded context while preserving the latest user request and complete tool-call pairs.",
+                                    result: agentRouterEnvelopeRecovery ? "retry_with_compact_context_and_tools" : "retry_with_compact_context",
+                                    diagnostic: agentRouterEnvelopeRecovery
+                                        ? "AgentRouter rejected a large multi-round tool envelope before output. Retrying once with complete recent tool-call pairs and task-family-scoped tool schemas."
+                                        : "Provider gateway rejected the full request before output. Retrying once with attachment-aware bounded context while preserving the latest user request and complete tool-call pairs.",
                                     metadata: [
                                         "providerID": configuration.providerID ?? "",
                                         "model": configuration.model,
                                         "statusCode": String(http.statusCode),
                                         "protocol": configuration.protocolName ?? "",
                                         "originalMessageCount": String(messages.count),
-                                        "compactMessageCount": String(requestMessages.count)
+                                        "compactMessageCount": String(requestMessages.count),
+                                        "originalToolCount": String(tools.count),
+                                        "compactToolCount": String(requestTools.count)
                                     ]
                                 )
                                 continue
@@ -599,6 +614,21 @@ private extension ProviderRequestBuilding {
                                     ]
                                 )
                                 continue
+                            }
+                            if let upstreamDetail = ProviderCompatibilityClassifier.safeUpstreamErrorDetail(body: body) {
+                                try? await diagnosticLogger?.log(
+                                    level: .warning,
+                                    subsystem: "provider",
+                                    action: "request.http-error-detail",
+                                    result: "captured",
+                                    diagnostic: upstreamDetail,
+                                    metadata: [
+                                        "providerID": configuration.providerID ?? "",
+                                        "model": configuration.model,
+                                        "statusCode": String(http.statusCode),
+                                        "protocol": configuration.protocolName ?? ""
+                                    ]
+                                )
                             }
                             throw ProviderHTTPClassifier.error(for: http.statusCode, body: body) ?? ProviderError.invalidResponse(http.statusCode)
                         }
@@ -1496,6 +1526,70 @@ public enum ProviderCompatibilityClassifier {
         // generic 502/503/504. A single replay with a much smaller attachment-aware context is safe
         // because no provider output has been emitted yet; normal retry rules resume afterwards.
         return statusCode == 502 || statusCode == 503 || statusCode == 504
+    }
+
+    public static func shouldRetryAgentRouterCompatibilityEnvelope(
+        providerID: String?,
+        statusCode: Int,
+        body: Data,
+        messageCount: Int,
+        toolCount: Int
+    ) -> Bool {
+        guard providerID == ProviderCatalog.agentRouterID, statusCode == 400 || statusCode == 422 else { return false }
+        let text = String(data: body.prefix(262_144), encoding: .utf8)?.lowercased() ?? ""
+        if ProviderFailureEvidence.isCapacity(text) || ProviderFailureEvidence.isCredential(text) || ProviderFailureEvidence.isModelUnavailable(text) {
+            return false
+        }
+        // AgentRouter can accept the same model/protocol for small requests yet reject a later
+        // multi-round tool envelope with a generic 400. One bounded retry is safe before output:
+        // compact complete tool-call pairs and scope the advertised tool list to the active task
+        // family instead of resending the full device toolbox.
+        return messageCount >= 48 || toolCount >= 40 || text.contains("content-blocked") || text.contains("content blocked")
+    }
+
+    public static func recoveryToolSchemas(from tools: [ProviderToolSchema], messages: [ChatMessage]) -> [ProviderToolSchema] {
+        guard let recentTool = messages.reversed().compactMap({ $0.providerMetadata["tool_name"] }).first else { return tools }
+        let families: [String]
+        if recentTool.hasPrefix("apps.") || recentTool.hasPrefix("gui.") || recentTool.hasPrefix("interaction.") {
+            families = ["apps.", "gui.", "interaction.", "capability."]
+        } else if recentTool.hasPrefix("files.") || recentTool.hasPrefix("container.") || recentTool.hasPrefix("data.")
+                    || recentTool.hasPrefix("json.") || recentTool.hasPrefix("plist.") || recentTool.hasPrefix("sqlite.") || recentTool.hasPrefix("storage.") {
+            families = ["files.", "container.", "data.", "json.", "plist.", "sqlite.", "storage.", "capability."]
+        } else if recentTool.hasPrefix("ipa.") {
+            families = ["ipa.", "files.", "capability."]
+        } else {
+            return tools
+        }
+
+        let filtered = tools.filter { schema in
+            guard let internalName = try? ProviderToolNameMap.decode(schema.name) else { return false }
+            return families.contains { internalName.hasPrefix($0) }
+        }
+        return filtered.count >= 4 ? filtered : tools
+    }
+
+    public static func safeUpstreamErrorDetail(body: Data) -> String? {
+        let raw = String(data: body.prefix(262_144), encoding: .utf8) ?? ""
+        for line in raw.split(whereSeparator: { $0.isNewline }) {
+            var candidate = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+            if candidate.hasPrefix("data:") {
+                candidate = String(candidate.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            guard !candidate.isEmpty, candidate != "[DONE]", let data = candidate.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) else { continue }
+            let detail: String?
+            if let dictionary = object as? [String: Any] {
+                detail = providerErrorDetail(from: dictionary["error"] ?? dictionary["message"] ?? dictionary["detail"])
+                    ?? providerErrorDetail(from: dictionary)
+            } else {
+                detail = providerErrorDetail(from: object)
+            }
+            if let detail {
+                let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return String(trimmed.prefix(512)) }
+            }
+        }
+        return nil
     }
 
     public static func shouldRetryWithoutReasoningEffort(statusCode: Int, body: Data) -> Bool {

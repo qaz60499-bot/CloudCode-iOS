@@ -1333,6 +1333,58 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(finalUserBlocks.map { $0["type"] as? String }, ["tool_result", "text"])
     }
 
+    func testAgentRouterLargeToolEnvelopeGetsOneBoundedCompatibilityRecovery() throws {
+        XCTAssertTrue(ProviderCompatibilityClassifier.shouldRetryAgentRouterCompatibilityEnvelope(
+            providerID: ProviderCatalog.agentRouterID,
+            statusCode: 400,
+            body: Data("{\"error\":{\"message\":\"bad request\"}}".utf8),
+            messageCount: 67,
+            toolCount: 64
+        ))
+        XCTAssertFalse(ProviderCompatibilityClassifier.shouldRetryAgentRouterCompatibilityEnvelope(
+            providerID: "other-provider",
+            statusCode: 400,
+            body: Data("{\"error\":{\"message\":\"bad request\"}}".utf8),
+            messageCount: 67,
+            toolCount: 64
+        ))
+        XCTAssertFalse(ProviderCompatibilityClassifier.shouldRetryAgentRouterCompatibilityEnvelope(
+            providerID: ProviderCatalog.agentRouterID,
+            statusCode: 401,
+            body: Data("{\"error\":{\"message\":\"invalid api key\"}}".utf8),
+            messageCount: 67,
+            toolCount: 64
+        ))
+
+        let names = ["apps.launch", "apps.list", "gui.screenshot", "gui.swipeSequence", "interaction.confirmTransition", "files.read", "sqlite.query"]
+        let schemas = try names.map { internalName in
+            ProviderToolSchema(name: try ProviderToolNameMap.encode(internalName), description: internalName)
+        }
+        let messages = [
+            ChatMessage(role: .assistant, content: "", providerMetadata: ["tool_call_id": "call-1", "tool_name": "apps.launch", "tool_arguments": "{\"bundleId\":\"com.example.app\"}"]),
+            ChatMessage(role: .tool, content: "accepted but foreground unverified", providerMetadata: ["tool_call_id": "call-1", "tool_name": "apps.launch"])
+        ]
+        let recovered = ProviderCompatibilityClassifier.recoveryToolSchemas(from: schemas, messages: messages)
+        let recoveredInternal = try recovered.map { try ProviderToolNameMap.decode($0.name) }
+        XCTAssertTrue(recoveredInternal.contains("apps.launch"))
+        XCTAssertTrue(recoveredInternal.contains("gui.screenshot"))
+        XCTAssertTrue(recoveredInternal.contains("gui.swipeSequence"))
+        XCTAssertTrue(recoveredInternal.contains("interaction.confirmTransition"))
+        XCTAssertFalse(recoveredInternal.contains("files.read"))
+        XCTAssertFalse(recoveredInternal.contains("sqlite.query"))
+    }
+
+    func testProviderSafeUpstreamErrorDetailExtractsJSONAndSSEMessages() {
+        XCTAssertEqual(
+            ProviderCompatibilityClassifier.safeUpstreamErrorDetail(body: Data("{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"tool result history rejected\"}}".utf8)),
+            "tool result history rejected"
+        )
+        XCTAssertEqual(
+            ProviderCompatibilityClassifier.safeUpstreamErrorDetail(body: Data("data: {\"error\":{\"message\":\"content-blocked\"}}\n\n".utf8)),
+            "content-blocked"
+        )
+    }
+
     func testReasoningEffortCompatibilityFallbackRequiresExplicitUnsupportedFieldEvidence() {
         XCTAssertTrue(ProviderCompatibilityClassifier.shouldRetryWithoutReasoningEffort(
             statusCode: 400,

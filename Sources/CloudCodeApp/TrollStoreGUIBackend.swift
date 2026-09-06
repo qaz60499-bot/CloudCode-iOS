@@ -81,7 +81,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
 
     public func openApp(bundleID: String) async throws {
         let outcome = EmbeddedRootHelper.launch(bundleID: bundleID)
-        guard outcome.success else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
+        guard outcome.accepted else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
         // A foreground-app change invalidates the previous AX timeout state. Permit one fresh tree
         // attempt for the newly launched target before falling back to screenshots again.
         treeRetryAfter = nil

@@ -45,6 +45,12 @@ enum EmbeddedRootHelper {
         var detail: String
     }
 
+    struct LaunchOutcome: Sendable, Equatable {
+        var accepted: Bool
+        var foregroundVerified: Bool
+        var detail: String
+    }
+
     static let executableName = "CloudCodeRootHelper"
     static let expectedProtocolMarker = "cloudcode-root-helper-protocol=1"
 
@@ -196,29 +202,42 @@ enum EmbeddedRootHelper {
         }
     }
 
-    static func launch(bundleID: String) -> (success: Bool, detail: String) {
+    static func launch(bundleID: String) -> LaunchOutcome {
+        func acceptedButUnverified(_ result: (code: Int, diagnostic: String)) -> Bool {
+            result.code == 46
+                && result.diagnostic.contains("accepted=1")
+                && result.diagnostic.contains("foreground=unverified")
+        }
+
         let isolated = run(["launch", bundleID], privilege: .isolatedUser, timeout: 5)
         if isolated.code == 0 {
             let route = isolated.diagnostic.isEmpty ? "" : " \(isolated.diagnostic)"
-            return (true, "隔离 helper 已验证目标安装状态并完成 App 启动路径。\(route)")
+            return LaunchOutcome(accepted: true, foregroundVerified: true, detail: "隔离 helper 已验证目标安装状态并完成 App 启动路径。\(route)")
         }
 
-        // Some third-party apps reject LSApplicationWorkspace activation from the isolated mobile
-        // persona even though the exact same helper is privileged and device-validated. Retry only
-        // the same bounded launch operation under the signed root helper; never broaden this into a
-        // generic shell or arbitrary private-API executor.
+        // Some third-party apps accept the LaunchServices request but the helper cannot read back
+        // a reliable foreground bundle identifier. That is not the same as a rejected launch: keep
+        // the write as dispatched/unverified so the Agent can immediately obtain a fresh screenshot
+        // instead of turning a visibly opened App into a terminal tool failure.
         if isolated.code == 46 {
             let privileged = run(["launch", bundleID], privilege: .root, timeout: 6)
             if privileged.code == 0 {
                 let route = privileged.diagnostic.isEmpty ? "" : " \(privileged.diagnostic)"
-                return (true, "隔离 LaunchServices 路径被拒绝后，root helper 通过系统启动路由完成目标 App 前台切换。\(route)")
+                return LaunchOutcome(accepted: true, foregroundVerified: true, detail: "隔离 LaunchServices 路径未验证前台后，root helper 通过系统启动路由完成目标 App 前台切换。\(route)")
             }
             let isolatedDetail = failureDetail(prefix: "隔离 helper 启动 App", code: isolated.code, diagnostic: isolated.diagnostic)
             let privilegedDetail = failureDetail(prefix: "root helper 启动 App", code: privileged.code, diagnostic: privileged.diagnostic)
-            return (false, "\(isolatedDetail)；root fallback 同样失败：\(privilegedDetail)")
+            if acceptedButUnverified(isolated) || acceptedButUnverified(privileged) {
+                return LaunchOutcome(
+                    accepted: true,
+                    foregroundVerified: false,
+                    detail: "系统已接受目标 App 启动请求，但 helper 无法可靠读取前台 Bundle ID；启动保持为已派发/待截图验证。\(isolatedDetail)；root fallback：\(privilegedDetail)"
+                )
+            }
+            return LaunchOutcome(accepted: false, foregroundVerified: false, detail: "\(isolatedDetail)；root fallback 同样失败：\(privilegedDetail)")
         }
 
-        return (false, failureDetail(prefix: "隔离 helper 启动 App", code: isolated.code, diagnostic: isolated.diagnostic))
+        return LaunchOutcome(accepted: false, foregroundVerified: false, detail: failureDetail(prefix: "隔离 helper 启动 App", code: isolated.code, diagnostic: isolated.diagnostic))
     }
 
     static func probe() -> RootHelperCapabilitySnapshot {
@@ -609,22 +628,23 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         )
     }
 
-    public func launchApplication(bundleID: String) async -> (success: Bool, detail: String) {
+    public func launchApplication(bundleID: String) async -> (accepted: Bool, foregroundVerified: Bool, detail: String) {
         guard !bundleID.isEmpty, bundleID != Bundle.main.bundleIdentifier else {
-            return (false, "目标 Bundle ID 无效，或目标是 Cloud Code 自身。")
+            return (false, false, "目标 Bundle ID 无效，或目标是 Cloud Code 自身。")
         }
         let capability = await appLaunchCapability()
         guard capability.available else {
-            return (false, "启动能力不可用：\(capability.detail)")
+            return (false, false, "启动能力不可用：\(capability.detail)")
         }
-        let outcome = EmbeddedRootHelper.launch(bundleID: bundleID)
-        var metadata = ["bundleID": bundleID]
+        let helperOutcome = EmbeddedRootHelper.launch(bundleID: bundleID)
+        let outcome = (accepted: helperOutcome.accepted, foregroundVerified: helperOutcome.foregroundVerified, detail: helperOutcome.detail)
+        var metadata = ["bundleID": bundleID, "foregroundVerified": outcome.foregroundVerified ? "true" : "false"]
         if let path = bundlePaths[bundleID] { metadata["bundlePath"] = path }
         try? await diagnosticLogger?.log(
-            level: outcome.success ? .info : .error,
+            level: outcome.accepted ? .info : .error,
             subsystem: "root-helper",
             action: "launch",
-            result: outcome.success ? "accepted" : "rejected",
+            result: outcome.accepted ? (outcome.foregroundVerified ? "verified" : "accepted_unverified") : "rejected",
             diagnostic: outcome.detail,
             metadata: metadata
         )
@@ -1089,16 +1109,28 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
                 action: call.name,
                 target: bundleID,
                 risk: descriptor.risk,
-                result: outcome.success ? "launch_accepted" : "launch_rejected",
-                detail: ["diagnostic": outcome.detail]
+                result: outcome.accepted ? (outcome.foregroundVerified ? "launch_verified" : "launch_accepted_unverified") : "launch_rejected",
+                detail: ["diagnostic": outcome.detail, "foregroundVerified": outcome.foregroundVerified ? "true" : "false"]
             ))
             let version = await appResolver.cachedVersion(for: bundleID) ?? ""
             return ToolResult(
                 toolCallID: call.id,
-                success: outcome.success,
-                summary: outcome.success ? "已请求启动 \(bundleID)" : "启动失败：\(outcome.detail)",
-                payload: ["bundleId": bundleID, "detail": outcome.detail, "version": version],
-                verification: VerificationResult(passed: outcome.success, checks: ["目标 App 已由有界系统启动路由确认进入前台"], failures: outcome.success ? [] : [outcome.detail])
+                success: outcome.accepted,
+                summary: outcome.accepted
+                    ? (outcome.foregroundVerified ? "已启动 \(bundleID) 并验证前台" : "已派发启动 \(bundleID)；前台状态待下一次截图确认")
+                    : "启动失败：\(outcome.detail)",
+                payload: [
+                    "bundleId": bundleID,
+                    "detail": outcome.detail,
+                    "version": version,
+                    "foregroundVerified": outcome.foregroundVerified ? "true" : "false",
+                    "effectVerification": outcome.foregroundVerified ? "verified" : "screenshot_required"
+                ],
+                verification: VerificationResult(
+                    passed: outcome.foregroundVerified,
+                    checks: outcome.foregroundVerified ? ["目标 App 已由有界系统启动路由确认进入前台"] : ["系统已接受目标 App 启动请求"],
+                    failures: outcome.accepted && !outcome.foregroundVerified ? ["前台 Bundle ID 无法可靠读取；需要立即截图确认当前界面"] : (outcome.accepted ? [] : [outcome.detail])
+                )
             )
         }
 
