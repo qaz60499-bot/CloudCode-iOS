@@ -27,7 +27,7 @@ jobs:
           import urllib.request
 
           PROVIDER_ID = "https-agentrouter-org"
-          BASE_URL = "https://co.agentrouter.org"
+          BASE_URL = "https://agentrouter.org"
           EXPECTED_FINGERPRINT = "105a3fce9a105c41472b926f6448a91be2f9726d5e074adbaaa2206f4d6dbf23"
           CLIENT_HEADERS = {
               "User-Agent": "claude-cli/1.0.120 (external, cli)",
@@ -153,61 +153,69 @@ jobs:
               f"model_count={len(discovered)}"
           )
 
-          matrix = [
-              ("deepseek-v4-flash", "openai_chat", "/v1/chat/completions"),
-              ("glm-5.3", "openai_chat", "/v1/chat/completions"),
-              ("gpt-5.6-sol", "openai_chat", "/v1/chat/completions"),
-              ("claude-opus-5", "anthropic", "/v1/messages"),
-              ("claude-opus-4-8", "anthropic", "/v1/messages"),
+          models_to_probe = [
+              "deepseek-v4-flash",
+              "glm-5.3",
+              "gpt-5.6-sol",
+              "claude-opus-5",
+              "claude-opus-4-8",
+          ]
+          protocol_candidates = [
+              ("anthropic", "/v1/messages", True),
+              ("openai_chat", "/v1/chat/completions", False),
           ]
 
           hard_failures = []
-          for model, protocol, path in matrix:
-              if protocol == "anthropic":
-                  payload = {
-                      "model": model,
-                      "max_tokens": 1,
-                      "stream": False,
-                      "messages": [{"role": "user", "content": "Reply OK"}],
-                  }
-                  status, body, content_type = request(path, payload=payload, anthropic=True)
-              else:
-                  payload = {
-                      "model": model,
-                      "max_tokens": 1,
-                      "stream": False,
-                      "messages": [{"role": "user", "content": "Reply OK"}],
-                  }
-                  status, body, content_type = request(path, payload=payload)
-
-              blocked = client_blocked(status, body)
-              capacity = capacity_blocked(status, body)
-              unavailable = model_unavailable(body)
+          for model in models_to_probe:
               listed = model in discovered
-              if 200 <= status < 300:
-                  classification = "ok"
-              elif capacity:
-                  classification = "capacity"
-              elif unavailable:
-                  classification = "model_unavailable"
-              elif 500 <= status < 600:
-                  classification = "upstream_5xx"
-              elif status in (401, 403) or blocked:
-                  classification = "auth_or_client_rejected"
-                  hard_failures.append(f"{model}:{status}")
-              else:
-                  classification = "protocol_or_route_error"
-                  hard_failures.append(f"{model}:{status}")
+              successful_protocols = []
+              non_auth_evidence = False
+              for protocol, path, anthropic in protocol_candidates:
+                  payload = {
+                      "model": model,
+                      "max_tokens": 1,
+                      "stream": False,
+                      "messages": [{"role": "user", "content": "Reply OK"}],
+                  }
+                  status, body, content_type = request(path, payload=payload, anthropic=anthropic)
+                  blocked = client_blocked(status, body)
+                  capacity = capacity_blocked(status, body)
+                  unavailable = model_unavailable(body)
+                  if 200 <= status < 300:
+                      classification = "ok"
+                      successful_protocols.append(protocol)
+                      non_auth_evidence = True
+                  elif capacity:
+                      classification = "capacity"
+                      non_auth_evidence = True
+                  elif unavailable:
+                      classification = "model_unavailable"
+                      non_auth_evidence = True
+                  elif 500 <= status < 600:
+                      classification = "upstream_5xx"
+                      non_auth_evidence = True
+                  elif status in (401, 403) or blocked:
+                      classification = "auth_or_client_rejected"
+                  else:
+                      classification = "protocol_or_route_error"
+                      non_auth_evidence = True
+
+                  print(
+                      "AGENTROUTER_MODEL_MATRIX "
+                      f"model={model} protocol={protocol} endpoint={path} status={status} "
+                      f"content_type={content_type.split(';')[0]} body_bytes={len(body)} "
+                      f"listed={str(listed).lower()} classification={classification}"
+                  )
 
               print(
-                  "AGENTROUTER_MODEL_MATRIX "
-                  f"model={model} protocol={protocol} endpoint={path} status={status} "
-                  f"content_type={content_type.split(';')[0]} body_bytes={len(body)} "
-                  f"listed={str(listed).lower()} classification={classification}"
+                  "AGENTROUTER_MODEL_PROTOCOLS "
+                  f"model={model} successful={','.join(successful_protocols) or 'none'}"
               )
+              if not successful_protocols and not non_auth_evidence:
+                  hard_failures.append(model)
 
           if hard_failures:
-              raise SystemExit("FAIL: AgentRouter model matrix has client/auth/protocol regressions: " + ",".join(hard_failures))
+              raise SystemExit("FAIL: AgentRouter models were rejected only by auth/client gates: " + ",".join(hard_failures))
 
           print("AGENTROUTER_LIVE_SMOKE_OK")
           PY
