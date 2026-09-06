@@ -111,6 +111,8 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(provider.protocolFor(model: "kimi-k2.6", keySlotID: "slot-1"), .openAIChat)
         XCTAssertEqual(provider.protocolFor(model: "glm-5.1", keySlotID: "slot-1"), .openAIChat)
         XCTAssertEqual(provider.protocolFor(model: "glm-5.2", keySlotID: "slot-1"), .openAIChat)
+        XCTAssertEqual(provider.protocolFor(model: "glm-5.3", keySlotID: "slot-1"), .openAIChat)
+        XCTAssertTrue(provider.selectableModels(for: "slot-1").contains("glm-5.3"))
         XCTAssertEqual(provider.protocolFor(model: "step3p5-code-alpha", keySlotID: "slot-1"), .openAIChat)
         XCTAssertFalse(provider.protocols.contains(.openAIResponses))
     }
@@ -659,6 +661,31 @@ final class ProviderDiscoveryTests: XCTestCase {
         super.tearDown()
     }
 
+    func testAgentRouterModelDiscoveryUsesCompatibleClientIdentity() async throws {
+        ProviderTestURLProtocol.install(
+            status: 200,
+            body: Data("{\"data\":[{\"id\":\"glm-5.3\"}]}".utf8),
+            headers: ["Content-Type": "application/json"]
+        )
+        defer { ProviderTestURLProtocol.reset() }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProviderTestURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let models = try await ProviderDiscoveryClient(session: session).discoverModels(
+            baseURL: URL(string: "https://co.agentrouter.org")!,
+            apiKey: "test-secret",
+            authMode: .bearer
+        )
+        XCTAssertEqual(models, ["glm-5.3"])
+        let request = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
+        XCTAssertEqual(request.url?.absoluteString, "https://co.agentrouter.org/v1/models")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "claude-cli/1.0.120 (external, cli)")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "x-app"), "cli")
+    }
+
     func testDiscoveryFindsInferenceAuthModeInsteadOfTrustingModelsEndpointAlone() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ProviderDiscoveryURLProtocol.self]
@@ -1039,6 +1066,10 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
         XCTAssertNil(request.value(forHTTPHeaderField: "x-api-key"))
         XCTAssertNil(request.value(forHTTPHeaderField: "anthropic-version"))
+        XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "claude-cli/1.0.120 (external, cli)")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "x-app"), "cli")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-beta"), "claude-code-20250219")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "x-stainless-runtime"), "node")
     }
 
     func testProviderEndpointReplacesFullProtocolEndpointWithoutDuplicatingV1() async throws {
@@ -1053,6 +1084,7 @@ final class ProviderProtocolClientTests: XCTestCase {
         )
         for try await _ in chat.stream(configuration: chatConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
         XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://example.com/v1/chat/completions")
+        XCTAssertNil(ProviderTestURLProtocol.lastRequest()?.value(forHTTPHeaderField: "x-app"))
 
         ProviderTestURLProtocol.install(status: 200, body: Data("data: {\"type\":\"message_stop\"}\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
         let anthropic = AnthropicProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))

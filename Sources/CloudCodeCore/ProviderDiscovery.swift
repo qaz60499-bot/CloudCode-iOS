@@ -214,6 +214,7 @@ public struct ProviderDiscoveryClient: Sendable {
         let url = try ProviderEndpoint.endpoint(baseURL: baseURL, path: "models")
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        ProviderCompatibilityHeaders.apply(to: &request)
         applyAuth(apiKey, mode: authMode, request: &request)
         request.timeoutInterval = 30
         let (data, response) = try await session.data(for: request)
@@ -240,6 +241,7 @@ public struct ProviderDiscoveryClient: Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        ProviderCompatibilityHeaders.apply(to: &request)
         if let apiKey, !apiKey.isEmpty {
             applyAuth(apiKey, mode: authMode, request: &request)
         }
@@ -273,6 +275,7 @@ public struct ProviderDiscoveryClient: Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        ProviderCompatibilityHeaders.apply(to: &request)
         applyAuth(apiKey, mode: authMode, request: &request)
         request.timeoutInterval = 30
         let (data, response) = try await session.data(for: request)
@@ -382,6 +385,7 @@ public struct ProviderDiscoveryClient: Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        ProviderCompatibilityHeaders.apply(to: &request)
         if protocolName == .anthropic { request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version") }
         applyAuth(apiKey, mode: authMode, request: &request)
         request.httpBody = try JSONSerialization.data(withJSONObject: body)

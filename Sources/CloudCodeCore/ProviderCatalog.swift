@@ -700,7 +700,7 @@ public enum ProviderCatalog {
                 authMode: .bearer,
                 models: [
                     "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-5",
-                    "gpt-5.5", "gpt-5.6-sol", "kimi-k2.6", "glm-5.1", "glm-5.2",
+                    "gpt-5.5", "gpt-5.6-sol", "kimi-k2.6", "glm-5.1", "glm-5.2", "glm-5.3",
                     "deepseek-v4-flash", "step3p5-code-alpha"
                 ],
                 keySlots: [ProviderKeySlot(
@@ -709,7 +709,7 @@ public enum ProviderCatalog {
                     fingerprint: "105a3fce9a105c41472b926f6448a91be2f9726d5e074adbaaa2206f4d6dbf23",
                     models: [
                         "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-5",
-                        "gpt-5.5", "gpt-5.6-sol", "kimi-k2.6", "glm-5.1", "glm-5.2",
+                        "gpt-5.5", "gpt-5.6-sol", "kimi-k2.6", "glm-5.1", "glm-5.2", "glm-5.3",
                         "deepseek-v4-flash", "step3p5-code-alpha"
                     ],
                     protocols: [.anthropic, .openAIChat],
@@ -723,6 +723,7 @@ public enum ProviderCatalog {
                         "kimi-k2.6": [.openAIChat],
                         "glm-5.1": [.openAIChat],
                         "glm-5.2": [.openAIChat],
+                        "glm-5.3": [.openAIChat],
                         "deepseek-v4-flash": [.openAIChat],
                         "step3p5-code-alpha": [.openAIChat]
                     ]

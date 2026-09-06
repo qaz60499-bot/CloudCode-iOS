@@ -1693,6 +1693,26 @@ enum ProviderEndpoint {
     }
 }
 
+enum ProviderCompatibilityHeaders {
+    private static let agentRouterHosts = Set(["agentrouter.org", "co.agentrouter.org"])
+
+    static func apply(to request: inout URLRequest) {
+        guard let host = request.url?.host?.lowercased(), agentRouterHosts.contains(host) else { return }
+        // AgentRouter validates a coding-Agent client identity before it reaches API-key
+        // authentication. Keep this provider-specific and aligned with the desktop runtime;
+        // ordinary OpenAI/Anthropic-compatible gateways must not receive these headers.
+        request.setValue("claude-cli/1.0.120 (external, cli)", forHTTPHeaderField: "User-Agent")
+        request.setValue("cli", forHTTPHeaderField: "x-app")
+        request.setValue("claude-code-20250219", forHTTPHeaderField: "anthropic-beta")
+        request.setValue("js", forHTTPHeaderField: "x-stainless-lang")
+        request.setValue("0.60.0", forHTTPHeaderField: "x-stainless-package-version")
+        request.setValue("node", forHTTPHeaderField: "x-stainless-runtime")
+        request.setValue("v22.0.0", forHTTPHeaderField: "x-stainless-runtime-version")
+        request.setValue("Windows", forHTTPHeaderField: "x-stainless-os")
+        request.setValue("x64", forHTTPHeaderField: "x-stainless-arch")
+    }
+}
+
 private enum ProviderRequestFactory {
     static func authMode(_ configuration: ProviderConfiguration) -> ProviderAuthMode {
         ProviderAuthMode(rawValue: configuration.authModeName ?? "") ?? .bearer
@@ -1703,6 +1723,7 @@ private enum ProviderRequestFactory {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("text/event-stream, application/json", forHTTPHeaderField: "Accept")
+        ProviderCompatibilityHeaders.apply(to: &request)
         switch authMode {
         case .bearer:
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
