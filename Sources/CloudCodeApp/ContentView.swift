@@ -1158,6 +1158,14 @@ private struct SettingsView: View {
                     }
                     .disabled(model.availableKeySlots.isEmpty || model.isProviderKeyMutationInFlight)
 
+                    if model.selectedProviderID == ProviderCatalog.agentRouterID {
+                        Button("刷新模型目录（实时）") {
+                            keyInputFocused = false
+                            Task { _ = await model.refreshSelectedProviderModelCatalog() }
+                        }
+                        .disabled(model.availableKeySlots.isEmpty || model.isProviderKeyMutationInFlight)
+                    }
+
                     if let message = model.providerKeyCheckMessage, !message.isEmpty {
                         Text(message)
                             .font(.footnote)
@@ -1269,7 +1277,10 @@ private struct SettingsView: View {
             .navigationTitle("设置")
             .onAppear {
                 model.recordStartupBreadcrumb("settings.appear")
-                Task { await model.reloadInteractionLearning() }
+                Task {
+                    await model.reloadInteractionLearning()
+                    _ = await model.refreshSelectedProviderModelCatalog(showStatus: false)
+                }
             }
             .onDisappear {
                 model.recordStartupBreadcrumb("settings.disappear")

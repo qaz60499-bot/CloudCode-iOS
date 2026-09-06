@@ -539,6 +539,10 @@ public final class CloudCodeViewModel: ObservableObject {
             profiles: providerProfiles
         )
         applySelection(state)
+        Task { [weak self] in
+            guard let self else { return }
+            _ = await self.refreshSelectedProviderModelCatalog(showStatus: false)
+        }
     }
 
     public func selectKey(_ keySlotID: String) {
@@ -548,6 +552,73 @@ public final class CloudCodeViewModel: ObservableObject {
             profiles: providerProfiles
         )
         applySelection(state)
+        Task { [weak self] in
+            guard let self else { return }
+            _ = await self.refreshSelectedProviderModelCatalog(showStatus: false)
+        }
+    }
+
+    @discardableResult
+    public func refreshSelectedProviderModelCatalog(showStatus: Bool = true) async -> Bool {
+        guard let provider = selectedProvider,
+              !selectedKeySlotID.isEmpty else {
+            if showStatus { providerKeyCheckMessage = "请先选择厂商和 Key。" }
+            return false
+        }
+        // AgentRouter mirrors NativeCloud's picker semantics: the selected Key's authenticated
+        // /v1/models response is the live source of truth. Other built-in providers keep their
+        // existing full discovery path because some expose partial/non-authoritative catalogs.
+        guard provider.id == ProviderCatalog.agentRouterID else { return false }
+        let keySlotID = selectedKeySlotID
+        let reference = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: keySlotID)
+        do {
+            let apiKey = try await keyVault.key(for: reference)
+            guard !apiKey.isEmpty else { throw ProviderError.missingAPIKey }
+            let models = try await ProviderDiscoveryClient().discoverModels(
+                baseURL: provider.baseURL,
+                apiKey: apiKey,
+                authMode: provider.authMode
+            )
+            guard !models.isEmpty else { throw ProviderError.malformedEvent }
+            guard let providerIndex = providerProfiles.firstIndex(where: { $0.id == provider.id }) else { return false }
+            providerProfiles[providerIndex].applyLiveModelCatalog(models, keySlotID: keySlotID, authoritative: true)
+            let reconciled = ProviderSelectionResolver.reconcile(
+                ProviderSelectionState(providerID: selectedProviderID, keySlotID: selectedKeySlotID, model: selectedModel),
+                profiles: providerProfiles
+            )
+            applySelection(reconciled)
+            if showStatus {
+                providerKeyCheckMessage = "已从厂商实时读取当前 Key 的模型目录：\(models.count) 个模型。"
+            }
+            try? await diagnosticLogStore.log(
+                level: .info,
+                subsystem: "provider-discovery",
+                action: "catalog-refresh",
+                result: "live-authoritative-applied",
+                metadata: [
+                    "providerID": provider.id,
+                    "keySlotID": keySlotID,
+                    "modelCount": String(models.count),
+                    "source": "authenticated-v1-models"
+                ]
+            )
+            return true
+        } catch {
+            // Desktop NativeCloud keeps the last successful catalog when the live refresh itself
+            // fails. Do the same here: never replace a usable picker with an empty/error result.
+            if showStatus {
+                providerKeyCheckMessage = "实时模型目录读取失败，已保留上一次成功目录：\(error)"
+            }
+            try? await diagnosticLogStore.log(
+                level: .warning,
+                subsystem: "provider-discovery",
+                action: "catalog-refresh",
+                result: "failed-last-known-good-preserved",
+                error: error,
+                metadata: ["providerID": provider.id, "keySlotID": keySlotID]
+            )
+            return false
+        }
     }
 
     public func selectModel(_ model: String) {

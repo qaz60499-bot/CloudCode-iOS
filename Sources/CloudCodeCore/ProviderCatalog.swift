@@ -58,7 +58,7 @@ public enum ProviderEndpointHealthClassifier {
                 return true
             case .missingAPIKey, .invalidEndpoint, .capacityExhausted, .modelUnavailable, .clientRejected,
                  .attachmentUnavailable, .attachmentTooLarge,
-                 .unsupportedAttachmentType, .transport:
+                 .unsupportedAttachmentType, .protocolIncompatible, .transport:
                 return false
             }
         }
@@ -201,23 +201,26 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
         if let keySlotID,
            let slot = keySlots.first(where: { $0.id == keySlotID }) {
             if let verified = slot.modelProtocols[model], !verified.isEmpty {
-                // Exact Key+model wire evidence is authoritative. Do not broaden an explicitly
-                // verified Anthropic-only model back to provider-wide OpenAI protocols.
-                if verified.contains(preferredProtocol) { append([preferredProtocol]) }
+                // Key+model evidence owns the ordering. A Provider-wide preferred protocol must
+                // never reorder a model-specific result; doing so made a dynamically verified
+                // OpenAI model start on Anthropic merely because the Provider default was Anthropic.
                 append(verified)
+                if id == ProviderCatalog.agentRouterID {
+                    // AgentRouter can expose heterogeneous compatibility layers behind one Key.
+                    // Keep the verified path first, but retain other provider-supported wire
+                    // families as zero-output fallbacks so a transient gateway adapter regression
+                    // does not strand the selected model.
+                    append(slot.protocols)
+                }
                 return ordered
             }
-            if id == "https-agentrouter-org" {
-                // AgentRouter publishes two distinct wire families on the same origin:
-                // Claude models use Anthropic Messages; GPT/Kimi/GLM/Step/etc. use
-                // OpenAI-compatible Chat Completions. A newly discovered/custom model must
-                // therefore choose its family before falling back to provider-wide protocols.
-                let lowered = model.lowercased()
-                if lowered.hasPrefix("claude-"), slot.protocols.contains(.anthropic) {
-                    append([.anthropic])
-                } else if !lowered.isEmpty, slot.protocols.contains(.openAIChat) {
-                    append([.openAIChat])
-                }
+            if id == ProviderCatalog.agentRouterID {
+                // Mirror NativeCloud: the live /models catalog decides what is selectable, while
+                // exact wire support is learned lazily for the selected Key+model. Start with the
+                // compatibility path AgentRouter currently validates for Cloud Code, then retain
+                // OpenAI Chat as a bounded zero-output fallback. No model-name allowlist is needed.
+                if slot.protocols.contains(.anthropic) { append([.anthropic]) }
+                if slot.protocols.contains(.openAIChat) { append([.openAIChat]) }
             }
             if slot.protocols.contains(preferredProtocol) { append([preferredProtocol]) }
             append(slot.protocols)
@@ -248,26 +251,42 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
         }
     }
 
+    public mutating func applyLiveModelCatalog(_ liveModels: [String], keySlotID: String, authoritative: Bool) {
+        let discoveredModels = Self.unique(liveModels)
+        guard !discoveredModels.isEmpty,
+              let targetSlotIndex = keySlots.firstIndex(where: { $0.id == keySlotID }) else { return }
+        if authoritative {
+            // Match NativeCloud's selected-Key catalog semantics: a successful authenticated
+            // /models response is the current source of truth. New models appear immediately and
+            // models removed upstream disappear from this Key's picker. Static/catalog data is
+            // retained only by the caller when a later live refresh itself fails.
+            keySlots[targetSlotIndex].models = discoveredModels
+            keySlots[targetSlotIndex].modelProtocols = keySlots[targetSlotIndex].modelProtocols.filter {
+                discoveredModels.contains($0.key)
+            }
+            models = Self.unique(keySlots.flatMap(\.models))
+        } else {
+            // Some built-in compatible gateways expose partial/resource-pool-specific catalogs;
+            // preserve the historical enrich-without-shrinking behavior for those providers.
+            models = Self.unique(models + discoveredModels)
+            keySlots[targetSlotIndex].models = Self.unique(keySlots[targetSlotIndex].models + discoveredModels)
+        }
+    }
+
     public mutating func applyDiscovery(_ discovery: ProviderDiscoveryResult, keySlotID: String) {
         let discoveredModels = Self.unique(discovery.models)
-        // Provider catalogs are configuration truth, while discovery is only runtime evidence.
-        // Empty/unverified discovery results are common on compatible gateways and must never
-        // erase a previously valid provider/key/model configuration. Only a live-validated,
-        // non-empty catalog may replace the local snapshot.
+        // Empty/unverified discovery results must never erase last-known-good configuration.
         guard discovery.readiness == .ready, !discoveredModels.isEmpty else { return }
         guard let targetSlotIndex = keySlots.firstIndex(where: { $0.id == keySlotID }) else { return }
 
         authMode = discovery.authMode
-        // Runtime discovery enriches configuration truth; it never shrinks the selectable catalog.
-        // Compatible gateways frequently expose only a partial/resource-pool-specific /models view,
-        // so replacing the static catalog here made models disappear from the picker between checks.
-        models = Self.unique(models + discoveredModels)
+        let authoritativeCatalog = id == ProviderCatalog.agentRouterID || source == .custom
+        applyLiveModelCatalog(discoveredModels, keySlotID: keySlotID, authoritative: authoritativeCatalog)
         readiness = discovery.readiness
         if !discovery.protocols.isEmpty {
             protocols = Self.uniqueProtocols(protocols + discovery.protocols)
         }
 
-        keySlots[targetSlotIndex].models = Self.unique(keySlots[targetSlotIndex].models + discoveredModels)
         keySlots[targetSlotIndex].status = Self.keyStatus(for: discovery.readiness)
         if !discovery.protocols.isEmpty {
             keySlots[targetSlotIndex].protocols = Self.uniqueProtocols(keySlots[targetSlotIndex].protocols + discovery.protocols)
@@ -508,6 +527,7 @@ public struct ProviderBootstrapPayload: Codable, Equatable, Sendable {
 
 public enum ProviderCatalog {
     public static let tabitokenID = "tabitoken"
+    public static let agentRouterID = "https-agentrouter-org"
 
     public static func keyReference(providerID: String, keySlotID: String) -> String {
         "provider.\(providerID).key.\(keySlotID)"

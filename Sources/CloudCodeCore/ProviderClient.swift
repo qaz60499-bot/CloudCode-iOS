@@ -260,6 +260,7 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
     case attachmentUnavailable(String)
     case attachmentTooLarge(Int64)
     case unsupportedAttachmentType(String)
+    case protocolIncompatible(String)
     case transport(String)
 
     public var description: String {
@@ -284,6 +285,7 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
         case .attachmentUnavailable(let filename): return "图片附件无法读取：\(filename)"
         case .attachmentTooLarge(let bytes): return "图片附件过大（\(bytes) 字节）；单张图片限制为 4 MB"
         case .unsupportedAttachmentType(let mimeType): return "暂不支持的图片类型：\(mimeType)"
+        case .protocolIncompatible(let detail): return "当前模型的兼容协议返回错误：\(detail)"
         case .transport(let value): return value
         }
     }
@@ -737,6 +739,25 @@ private func providerText(from content: Any?) -> String? {
     return text.isEmpty ? nil : text
 }
 
+private func providerErrorDetail(from value: Any?) -> String? {
+    if let text = value as? String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+    if let object = value as? [String: Any] {
+        for key in ["message", "detail", "error_description", "reason", "error"] {
+            if let detail = providerErrorDetail(from: object[key]) { return detail }
+        }
+        if let type = object["type"] as? String, !type.isEmpty { return type }
+        return nil
+    }
+    if let values = value as? [Any] {
+        let details = values.compactMap { providerErrorDetail(from: $0) }
+        return details.isEmpty ? nil : details.joined(separator: "; ")
+    }
+    return nil
+}
+
 public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, ProviderRequestBuilding {
     fileprivate let session: URLSession
     fileprivate let retryPolicy: RetryPolicy
@@ -942,8 +963,9 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
                 }
 
                 if let errorObject = object["error"] {
-                    let detail = providerText(from: errorObject) ?? "Anthropic 兼容流返回错误对象"
-                    throw ProviderError.transport(detail)
+                    if outputStarted { throw ProviderError.streamInterrupted }
+                    let detail = providerErrorDetail(from: errorObject) ?? "上游未提供可解析的错误详情"
+                    throw ProviderError.protocolIncompatible(detail)
                 }
 
                 guard let type = object["type"] as? String else { continue }
@@ -1533,7 +1555,7 @@ public enum ProviderProtocolFallbackClassifier {
     public static func shouldFallback(_ error: Error) -> Bool {
         guard let providerError = error as? ProviderError else { return false }
         switch providerError {
-        case .modelUnavailable, .malformedEvent:
+        case .modelUnavailable, .malformedEvent, .protocolIncompatible:
             return true
         case .clientRejected:
             return false
@@ -1566,7 +1588,8 @@ public enum ProviderKeyRotationClassifier {
                 // Before any output, another Key owned by the same Provider is a safe bounded route.
                 return true
             case .missingAPIKey, .invalidEndpoint, .rateLimited, .malformedEvent, .streamInterrupted,
-                 .attachmentUnavailable, .attachmentTooLarge, .unsupportedAttachmentType, .transport:
+                 .attachmentUnavailable, .attachmentTooLarge, .unsupportedAttachmentType,
+                 .protocolIncompatible, .transport:
                 return false
             }
         }
@@ -1582,7 +1605,8 @@ public enum ProviderRetryClassifier {
                 return true
             case .invalidResponse(let code):
                 return (500...599).contains(code)
-            case .capacityExhausted, .modelUnavailable, .clientRejected, .transport, .streamInterrupted:
+            case .capacityExhausted, .modelUnavailable, .clientRejected, .protocolIncompatible,
+                 .transport, .streamInterrupted:
                 return false
             case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .malformedEvent,
                  .attachmentUnavailable, .attachmentTooLarge, .unsupportedAttachmentType:
@@ -1842,28 +1866,60 @@ private func openAIMessageObject(_ message: ChatMessage) throws -> [String: Any]
 }
 
 private func anthropicMessages(_ messages: [ChatMessage]) throws -> [[String: Any]] {
-    try messages.map { message in
+    var result: [[String: Any]] = []
+
+    func append(role: String, blocks: [[String: Any]]) {
+        guard !blocks.isEmpty else { return }
+        if let lastIndex = result.indices.last,
+           result[lastIndex]["role"] as? String == role,
+           var existing = result[lastIndex]["content"] as? [[String: Any]] {
+            existing.append(contentsOf: blocks)
+            result[lastIndex]["content"] = existing
+            return
+        }
+        result.append(["role": role, "content": blocks])
+    }
+
+    for message in messages {
         if message.role == .tool, let callID = message.providerMetadata["tool_call_id"] {
-            return ["role": "user", "content": [["type": "tool_result", "tool_use_id": callID, "content": message.content]]]
+            append(role: "user", blocks: [[
+                "type": "tool_result",
+                "tool_use_id": callID,
+                "content": message.content
+            ]])
+            continue
         }
         if message.role == .assistant,
            let callID = message.providerMetadata["tool_call_id"],
            let name = providerVisibleToolName(message) {
             let arguments = message.providerMetadata["tool_arguments"] ?? "{}"
-            let input: Any
-            if let data = arguments.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) {
-                input = object
+            let input: [String: Any]
+            if let data = arguments.data(using: .utf8),
+               let object = try? JSONSerialization.jsonObject(with: data),
+               let dictionary = object as? [String: Any] {
+                input = dictionary
             } else {
+                // Anthropic tool_use.input must be an object. Persisted history can contain a
+                // provider-produced scalar/array argument payload after a rejected tool call; never
+                // replay that invalid shape into the next /messages request.
                 input = [:]
             }
-            return ["role": "assistant", "content": [["type": "tool_use", "id": callID, "name": name, "input": input]]]
+            append(role: "assistant", blocks: [[
+                "type": "tool_use",
+                "id": callID,
+                "name": name,
+                "input": input
+            ]])
+            continue
         }
         let role = message.role == .assistant ? "assistant" : "user"
         if let attachment = try providerImageAttachment(message) {
-            return ["role": role, "content": anthropicImageContent(message, attachment: attachment)]
+            append(role: role, blocks: anthropicImageContent(message, attachment: attachment))
+        } else if !message.content.isEmpty {
+            append(role: role, blocks: [["type": "text", "text": message.content]])
         }
-        return ["role": role, "content": message.content]
     }
+    return result
 }
 
 private func responsesInput(_ messages: [ChatMessage]) throws -> [[String: Any]] {

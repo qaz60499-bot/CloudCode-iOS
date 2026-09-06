@@ -120,11 +120,30 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertFalse(provider.protocols.contains(.openAIResponses))
     }
 
-    func testAgentRouterUnknownDiscoveredModelChoosesProtocolByModelFamily() throws {
-        var provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-agentrouter-org" }))
+    func testAgentRouterUnknownDiscoveredModelKeepsBoundedAdaptiveProtocols() throws {
+        var provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.agentRouterID }))
         provider.keySlots[0].models.append(contentsOf: ["claude-future-model", "future-general-model"])
-        XCTAssertEqual(provider.protocolCandidates(for: "claude-future-model", keySlotID: "slot-1").first, .anthropic)
-        XCTAssertEqual(provider.protocolCandidates(for: "future-general-model", keySlotID: "slot-1").first, .openAIChat)
+        XCTAssertEqual(provider.protocolCandidates(for: "claude-future-model", keySlotID: "slot-1"), [.anthropic, .openAIChat])
+        XCTAssertEqual(provider.protocolCandidates(for: "future-general-model", keySlotID: "slot-1"), [.anthropic, .openAIChat])
+    }
+
+    func testAgentRouterLiveCatalogReplacesStaticPickerForSelectedKey() throws {
+        var provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.agentRouterID }))
+        XCTAssertGreaterThan(provider.selectableModels(for: "slot-1").count, 5)
+        let liveModels = ["claude-opus-4-8", "claude-opus-5", "deepseek-v4-flash", "glm-5.3", "gpt-5.6-sol"]
+        let discovery = ProviderDiscoveryResult(
+            models: liveModels,
+            protocols: [.anthropic, .openAIChat],
+            authMode: .bearer,
+            readiness: .ready
+        )
+
+        provider.applyDiscovery(discovery, keySlotID: "slot-1")
+
+        XCTAssertEqual(provider.selectableModels(for: "slot-1"), liveModels)
+        XCTAssertEqual(provider.models, liveModels)
+        XCTAssertFalse(provider.selectableModels(for: "slot-1").contains("gpt-5.5"))
+        XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.anthropic, .openAIChat])
     }
 
     func testPerKeyModelScopeOverridesProviderCatalog() throws {
@@ -434,6 +453,20 @@ final class ProviderRouterTests: XCTestCase {
         let router = ProviderClientRouter(
             keyVault: vault,
             anthropic: AlwaysFailureProvider(error: .modelUnavailable(503)),
+            openAIChat: FixedProvider(token: "chat-fallback"),
+            responses: FixedProvider(token: "responses")
+        )
+        var configuration = config(protocolName: .anthropic)
+        configuration.fallbackProtocolNames = [ProviderProtocol.openAIChat.rawValue]
+        let text = try await collectText(router.stream(configuration: configuration, apiKey: "primary", messages: [], tools: []))
+        XCTAssertEqual(text, "chat-fallback")
+    }
+
+    func testProtocolCompatibilityErrorFallsBackBeforeAnyOutput() async throws {
+        let vault = MemoryKeyVault()
+        let router = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: AlwaysFailureProvider(error: .protocolIncompatible("unsupported compatibility envelope")),
             openAIChat: FixedProvider(token: "chat-fallback"),
             responses: FixedProvider(token: "responses")
         )
@@ -927,6 +960,30 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "text/event-stream, application/json")
     }
 
+    func testAnthropicErrorEnvelopePreservesUpstreamDetailForProtocolFallback() async throws {
+        let body = Data("""
+        data: {"error":{"type":"invalid_request_error","message":"tool schema is not supported on this compatibility route"}}
+
+        """.utf8)
+        ProviderTestURLProtocol.install(status: 200, body: body, headers: ["Content-Type": "text/event-stream"])
+        let client = AnthropicProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let configuration = ProviderConfiguration(
+            name: "AgentRouter",
+            baseURL: URL(string: "https://agentrouter.org")!,
+            model: "deepseek-v4-flash",
+            apiKeyReference: "key",
+            providerID: ProviderCatalog.agentRouterID,
+            protocolName: ProviderProtocol.anthropic.rawValue,
+            authModeName: ProviderAuthMode.bearer.rawValue
+        )
+        do {
+            for try await _ in client.stream(configuration: configuration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
+            XCTFail("Expected compatibility error")
+        } catch {
+            XCTAssertEqual(error as? ProviderError, .protocolIncompatible("tool schema is not supported on this compatibility route"))
+        }
+    }
+
     func testAnthropicAcceptsNonSSEFullJSONResponseFromCompatibleProxy() async throws {
         let body = Data("""
         {"id":"msg-proxy","type":"message","role":"assistant","content":[{"type":"text","text":"proxy-ok"}],"stop_reason":"end_turn"}
@@ -1240,6 +1297,40 @@ final class ProviderProtocolClientTests: XCTestCase {
         let responsesBody = try XCTUnwrap(JSONSerialization.jsonObject(with: responsesData) as? [String: Any])
         let input = try XCTUnwrap(responsesBody["input"] as? [[String: Any]])
         XCTAssertEqual(input[1]["name"] as? String, "files_read")
+    }
+
+    func testAnthropicHistoryCoalescesRolesAndSanitizesNonObjectToolArguments() async throws {
+        let messages = [
+            ChatMessage(role: .user, content: "run"),
+            ChatMessage(role: .assistant, content: "planning"),
+            ChatMessage(role: .assistant, content: "", providerMetadata: [
+                "tool_call_id": "call-1",
+                "tool_name": "files.read",
+                "tool_arguments": "[1,2,3]"
+            ]),
+            ChatMessage(role: .tool, content: "ok", providerMetadata: [
+                "tool_call_id": "call-1",
+                "tool_name": "files.read"
+            ]),
+            ChatMessage(role: .user, content: "continue")
+        ]
+        ProviderTestURLProtocol.install(status: 200, body: Data("data: {\"type\":\"message_stop\"}\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let client = AnthropicProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let configuration = ProviderConfiguration(name: "a", baseURL: URL(string: "https://example.com/v1")!, model: "m", apiKeyReference: "k", protocolName: ProviderProtocol.anthropic.rawValue)
+        for try await _ in client.stream(configuration: configuration, apiKey: "secret", messages: messages, tools: []) {}
+
+        let data = try XCTUnwrap(ProviderTestURLProtocol.lastRequestBody())
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let encoded = try XCTUnwrap(body["messages"] as? [[String: Any]])
+        XCTAssertEqual(encoded.count, 3)
+        XCTAssertEqual(encoded.map { $0["role"] as? String }, ["user", "assistant", "user"])
+        let assistantBlocks = try XCTUnwrap(encoded[1]["content"] as? [[String: Any]])
+        XCTAssertEqual(assistantBlocks.count, 2)
+        XCTAssertEqual(assistantBlocks[0]["type"] as? String, "text")
+        XCTAssertEqual(assistantBlocks[1]["type"] as? String, "tool_use")
+        XCTAssertEqual((assistantBlocks[1]["input"] as? [String: Any])?.count, 0)
+        let finalUserBlocks = try XCTUnwrap(encoded[2]["content"] as? [[String: Any]])
+        XCTAssertEqual(finalUserBlocks.map { $0["type"] as? String }, ["tool_result", "text"])
     }
 
     func testReasoningEffortCompatibilityFallbackRequiresExplicitUnsupportedFieldEvidence() {
