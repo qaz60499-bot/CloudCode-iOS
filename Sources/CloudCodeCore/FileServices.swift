@@ -338,7 +338,7 @@ public struct FileService: @unchecked Sendable {
         )
     }
 
-    private func entry(for url: URL) -> FileEntry?
+    private func entry(for url: URL) -> FileEntry? {
         guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileAllocatedSizeKey, .totalFileAllocatedSizeKey, .contentModificationDateKey]) else { return nil }
         let isDirectory = values.isDirectory == true
         let size = isDirectory ? (try? fileManager.allocatedSizeOfItem(at: url)) ?? 0 : Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
