@@ -93,6 +93,9 @@ jobs:
                   break
           else:
               print(f"::warning::AgentRouter private-bootstrap key was rejected for all supported auth modes: {agent_statuses}. This indicates stale/rotated credentials rather than an endpoint-shape failure; continuing other provider compatibility probes.")
+          agentrouter_auth_failed = bool(agent_statuses) and all(status in (401, 403) for status in agent_statuses.values())
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"agentrouter_auth_failed={'true' if agentrouter_auth_failed else 'false'}\n")
 
           just_key = provider_key("https-api-justwoker-icu")
           just_payload = {
@@ -121,12 +124,20 @@ jobs:
                   just_capacity_blocked = True
                   break
           if just_response is None:
+              just_auth_failed = bool(just_statuses) and all(status in (401, 403) for status in just_statuses.values())
+              just_upstream_unavailable = bool(just_statuses) and all(500 <= status < 600 for status in just_statuses.values())
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write(f"justwoker_capacity_blocked={'true' if just_capacity_blocked else 'false'}\n")
+                  output.write(f"justwoker_auth_failed={'true' if just_auth_failed else 'false'}\n")
+                  output.write(f"justwoker_upstream_unavailable={'true' if just_upstream_unavailable else 'false'}\n")
               if just_capacity_blocked:
-                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-                      output.write("justwoker_capacity_blocked=true\n")
                   print("::warning::Justwoker is explicitly blocked by provider credit/capacity; live shape/tool probes are skipped and deterministic Provider regressions will run.")
+              elif just_upstream_unavailable:
+                  print(f"::warning::Justwoker currently returns only upstream 5xx responses for the minimal probe: {just_statuses}. Other providers and deterministic Provider regressions will still run.")
+              elif just_auth_failed:
+                  print(f"::warning::Justwoker private-bootstrap key is rejected for all supported auth modes: {just_statuses}. Other providers and deterministic Provider regressions will still run.")
               else:
-                  raise SystemExit(f"FAIL: Justwoker Anthropic endpoint rejected all supported auth modes: {just_statuses}")
+                  raise SystemExit(f"FAIL: Justwoker Anthropic endpoint rejected all supported auth modes with an unclassified result: {just_statuses}")
           else:
               mode, status, body, content_type = just_response
               text = body.decode("utf-8", "replace")
@@ -148,6 +159,8 @@ jobs:
                   raise SystemExit("FAIL: Justwoker returned HTTP 2xx but not the expected Anthropic SSE message_delta/message_stop shape")
               with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
                   output.write("justwoker_capacity_blocked=false\n")
+                  output.write("justwoker_auth_failed=false\n")
+                  output.write("justwoker_upstream_unavailable=false\n")
                   output.write(f"justwoker_auth_mode={mode}\n")
           PY
 
@@ -606,7 +619,7 @@ jobs:
           test "$(git -C .build/checkouts/ZIPFoundation rev-parse HEAD)" = "22787ffb59de99e5dc1fbfe80b19c97a904ad48d"
 
       - name: Run real Cloud Code Agent two-round tool smoke against Justwoker
-        if: steps.compatibility_probe.outputs.justwoker_capacity_blocked != 'true'
+        if: steps.compatibility_probe.outputs.justwoker_capacity_blocked != 'true' && steps.compatibility_probe.outputs.justwoker_auth_failed != 'true' && steps.compatibility_probe.outputs.justwoker_upstream_unavailable != 'true'
         env:
           CLOUDCODE_JUSTWOKER_LIVE_SMOKE: "1"
           CLOUDCODE_PROVIDER_BOOTSTRAP: ${{ secrets.CLOUDCODE_PROVIDER_BOOTSTRAP }}
@@ -625,8 +638,14 @@ jobs:
           set -euo pipefail
           swift test --filter testTabitokenAgentUsesFullCloudCodeToolSchemaExecutesToolAndContinuesAfterResult
 
-      - name: Run deterministic Provider regressions when account credit blocks live generation
-        if: steps.live_probe.outputs.billing_blocked == 'true' || steps.compatibility_probe.outputs.justwoker_capacity_blocked == 'true'
+      - name: Run deterministic Provider regressions when a live provider is externally blocked
+        if: steps.live_probe.outputs.billing_blocked == 'true' || steps.compatibility_probe.outputs.justwoker_capacity_blocked == 'true' || steps.compatibility_probe.outputs.justwoker_auth_failed == 'true' || steps.compatibility_probe.outputs.justwoker_upstream_unavailable == 'true'
         run: |
           set -euo pipefail
           swift test --filter Provider
+
+      - name: Reject stale private-bootstrap credentials after independent probes complete
+        if: always() && (steps.compatibility_probe.outputs.agentrouter_auth_failed == 'true' || steps.compatibility_probe.outputs.justwoker_auth_failed == 'true')
+        run: |
+          echo 'FAIL: at least one credential embedded by CLOUDCODE_PROVIDER_BOOTSTRAP is explicitly rejected by its provider. Refresh the private bootstrap before delivery.' >&2
+          exit 1
