@@ -1816,9 +1816,9 @@ public final class CloudCodeViewModel: ObservableObject {
                 let count = try await importProviderBootstrapNow(
                     from: url,
                     removeSource: false,
-                    manualOverridePolicy: .replaceManual
+                    manualOverridePolicy: .preserveManual
                 )
-                activityLines.append("已一键导入预配置 Key：\(count) 个 Key 已写入 iOS Keychain。")
+                activityLines.append("已导入预配置 Key：\(count) 个 Key 已写入 iOS Keychain；手机上已手动更新的 Key 保持不变。")
             } catch {
                 lastError = "预配置 Key 导入失败：\(Self.userFacingProviderBootstrapError(error))"
             }

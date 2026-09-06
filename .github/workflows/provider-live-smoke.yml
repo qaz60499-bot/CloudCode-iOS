@@ -436,6 +436,7 @@ jobs:
           anthropic_candidates = []
           selected_key_index = None
           catalog_attempts = []
+          saw_model_unavailable = False
           diagnostic_inference_candidates = [
               "claude-opus-5",
               "claude-opus-5-thinking",
@@ -520,6 +521,7 @@ jobs:
                       print(f"::warning::Tabitoken key {key_index} inference auth returned HTTP {probe_status}; trying the next configured key.")
                       break
                   if is_model_not_found(probe_status, probe_body):
+                      saw_model_unavailable = True
                       print(f"TABITOKEN_MODEL_NOT_FOUND key={key_index} status={probe_status}")
                       continue
                   if probe_status not in (400, 404, 422):
@@ -531,6 +533,12 @@ jobs:
                   continue
 
           if not selected_model or base_anthropic is None or selected_key_index is None:
+              if saw_model_unavailable:
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                      output.write("model_unavailable=true\n")
+                      output.write("billing_blocked=false\n")
+                  print(f"::warning::Tabitoken credentials reached the provider, but no configured Anthropic model currently has an available channel; catalog_attempts={catalog_attempts}")
+                  raise SystemExit(0)
               raise SystemExit(f"FAIL: no configured Tabitoken key exposed or live-validated a working Anthropic model; catalog_attempts={catalog_attempts}")
           print(f"TABITOKEN_LIVE_ANTHROPIC_MODEL_VALIDATED=true key={selected_key_index}")
 
@@ -614,6 +622,7 @@ jobs:
               output.write(f"model={selected_model}\n")
               output.write(f"key_index={selected_key_index}\n")
               output.write("billing_blocked=false\n")
+              output.write("model_unavailable=false\n")
           PY
 
       - name: Resolve pinned Swift package
@@ -632,7 +641,7 @@ jobs:
           swift test --filter testJustwokerAgentUsesFullCloudCodeToolSchemaExecutesToolAndContinuesAfterResult
 
       - name: Run real Cloud Code Agent tool round against Tabitoken
-        if: steps.live_probe.outputs.billing_blocked != 'true'
+        if: steps.live_probe.outputs.billing_blocked != 'true' && steps.live_probe.outputs.model_unavailable != 'true'
         env:
           CLOUDCODE_LIVE_SMOKE: "1"
           CLOUDCODE_PROVIDER_BOOTSTRAP: ${{ secrets.CLOUDCODE_PROVIDER_BOOTSTRAP }}
@@ -643,7 +652,7 @@ jobs:
           swift test --filter testTabitokenAgentUsesFullCloudCodeToolSchemaExecutesToolAndContinuesAfterResult
 
       - name: Run deterministic Provider regressions when a live provider is externally blocked
-        if: steps.live_probe.outputs.billing_blocked == 'true' || steps.compatibility_probe.outputs.justwoker_capacity_blocked == 'true' || steps.compatibility_probe.outputs.justwoker_auth_failed == 'true' || steps.compatibility_probe.outputs.justwoker_upstream_unavailable == 'true'
+        if: steps.live_probe.outputs.billing_blocked == 'true' || steps.live_probe.outputs.model_unavailable == 'true' || steps.compatibility_probe.outputs.justwoker_capacity_blocked == 'true' || steps.compatibility_probe.outputs.justwoker_auth_failed == 'true' || steps.compatibility_probe.outputs.justwoker_upstream_unavailable == 'true'
         run: |
           set -euo pipefail
           swift test --filter Provider

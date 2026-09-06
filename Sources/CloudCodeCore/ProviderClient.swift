@@ -252,6 +252,7 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
     case authenticationFailed(Int)
     case capacityExhausted(Int)
     case rateLimited
+    case modelUnavailable(Int)
     case invalidResponse(Int)
     case malformedEvent
     case streamInterrupted
@@ -267,6 +268,7 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
         case .authenticationFailed(let code): return "厂商返回认证拒绝（HTTP \(code)）。请核对当前协议、接口地址、鉴权方式和 Key；不能仅凭该状态判定 Key 本身无效。"
         case .capacityExhausted(let code): return "当前厂商 Key 的额度 / 容量不足（HTTP \(code)）；可选择同一厂商内的其他 Key"
         case .rateLimited: return "厂商触发限流，请稍后重试"
+        case .modelUnavailable(let code): return "当前模型在该厂商没有可用推理通道（HTTP \(code)）；Key 未被判定失效，请切换模型或厂商后重试。"
         case .invalidResponse(let code):
             if (500...599).contains(code) {
                 return "上游厂商服务暂时不可用（HTTP \(code)）；这不是设备权限或卸载链路错误"
@@ -1384,7 +1386,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
 public enum ProviderCompatibilityClassifier {
     public static func shouldRetryWithCompactContext(statusCode: Int, body: Data) -> Bool {
         let text = String(data: body.prefix(262_144), encoding: .utf8)?.lowercased() ?? ""
-        if ProviderFailureEvidence.isCapacity(text) || ProviderFailureEvidence.isCredential(text) {
+        if ProviderFailureEvidence.isCapacity(text) || ProviderFailureEvidence.isCredential(text) || ProviderFailureEvidence.isModelUnavailable(text) {
             return false
         }
         let contextMarkers = [
@@ -1434,6 +1436,9 @@ public enum ProviderHTTPClassifier {
         if ProviderFailureEvidence.isCapacity(text) {
             return .capacityExhausted(statusCode)
         }
+        if ProviderFailureEvidence.isModelUnavailable(text) {
+            return .modelUnavailable(statusCode)
+        }
         if statusCode == 401 {
             return .authenticationFailed(statusCode)
         }
@@ -1456,6 +1461,8 @@ public enum ProviderKeyRotationClassifier {
                 return true
             case .invalidResponse(let code):
                 return (500...599).contains(code)
+            case .modelUnavailable:
+                return false
             case .missingAPIKey, .invalidEndpoint, .rateLimited, .malformedEvent, .streamInterrupted,
                  .attachmentUnavailable, .attachmentTooLarge, .unsupportedAttachmentType, .transport:
                 return false
@@ -1473,7 +1480,7 @@ public enum ProviderRetryClassifier {
                 return true
             case .invalidResponse(let code):
                 return (500...599).contains(code)
-            case .capacityExhausted, .transport, .streamInterrupted:
+            case .capacityExhausted, .modelUnavailable, .transport, .streamInterrupted:
                 return false
             case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .malformedEvent,
                  .attachmentUnavailable, .attachmentTooLarge, .unsupportedAttachmentType:
@@ -1525,6 +1532,15 @@ private enum ProviderFailureEvidence {
             "insufficient_user_quota", "insufficient quota", "quota exhausted", "insufficient balance",
             "balance insufficient", "pre-charge failed", "预扣费额度失败", "用户剩余额度", "余额不足",
             "余额已用尽", "额度不足", "额度已用尽"
+        ]
+        return markers.contains { text.contains($0) }
+    }
+
+    static func isModelUnavailable(_ text: String) -> Bool {
+        let markers = [
+            "model_not_found", "model not found", "no available channel for model",
+            "no available channel", "no available distributor", "模型无可用渠道", "模型不存在",
+            "无可用渠道（distributor）", "无可用渠道(distributor)"
         ]
         return markers.contains { text.contains($0) }
     }

@@ -56,7 +56,7 @@ public enum ProviderEndpointHealthClassifier {
                 return (500...599).contains(code)
             case .streamInterrupted, .malformedEvent, .authenticationFailed:
                 return true
-            case .missingAPIKey, .invalidEndpoint, .capacityExhausted,
+            case .missingAPIKey, .invalidEndpoint, .capacityExhausted, .modelUnavailable,
                  .attachmentUnavailable, .attachmentTooLarge,
                  .unsupportedAttachmentType, .transport:
                 return false

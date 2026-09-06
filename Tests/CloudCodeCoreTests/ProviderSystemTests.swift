@@ -1066,6 +1066,16 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertTrue(compactText.contains("latest-user-must-survive"))
     }
 
+    func testHTTP503ModelNotFoundIsModelScopedAndDoesNotDegradeProviderOrRetry() {
+        let body = Data("{\"error\":{\"code\":\"model_not_found\",\"message\":\"No available channel for model claude-opus-5 under group default\"}}".utf8)
+        let error = ProviderHTTPClassifier.error(for: 503, body: body)
+        XCTAssertEqual(error, .modelUnavailable(503))
+        XCTAssertFalse(ProviderCompatibilityClassifier.shouldRetryWithCompactContext(statusCode: 503, body: body))
+        XCTAssertFalse(ProviderRetryClassifier.isRetryableBeforeOutput(try! XCTUnwrap(error)))
+        XCTAssertFalse(ProviderKeyRotationClassifier.shouldRotate(try! XCTUnwrap(error)))
+        XCTAssertFalse(ProviderEndpointHealthClassifier.shouldMarkDegraded(try! XCTUnwrap(error)))
+    }
+
     func testHTTP403QuotaIsCapacityNotCredentialFailure() {
         let body = Data("{\"error\":\"insufficient_user_quota\"}".utf8)
         XCTAssertEqual(ProviderHTTPClassifier.error(for: 403, body: body), .capacityExhausted(403))
