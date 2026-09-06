@@ -56,7 +56,7 @@ public enum ProviderEndpointHealthClassifier {
                 return (500...599).contains(code)
             case .streamInterrupted, .malformedEvent, .authenticationFailed:
                 return true
-            case .missingAPIKey, .invalidEndpoint, .capacityExhausted, .modelUnavailable,
+            case .missingAPIKey, .invalidEndpoint, .capacityExhausted, .modelUnavailable, .clientRejected,
                  .attachmentUnavailable, .attachmentTooLarge,
                  .unsupportedAttachmentType, .transport:
                 return false
@@ -609,7 +609,8 @@ public enum ProviderCatalog {
                 models: gorouterModels,
                 keySlots: gorouterSlots,
                 source: .desktopSnapshot,
-                customModelAllowed: true
+                customModelAllowed: true,
+                autoRotateKeys: true
             ),
             ProviderProfile(
                 id: "https-api-denxio-top",
@@ -648,7 +649,8 @@ public enum ProviderCatalog {
                     ProviderKeySlot(id: "slot-2", label: "Key 2", fingerprint: "1290d3f87fe1b12bdc3155496d93f6a9ffbc28dd5d622b7c628938e209b0b602", models: shareLLMModels, protocols: [.anthropic, .openAIResponses])
                 ],
                 source: .desktopSnapshot,
-                customModelAllowed: true
+                customModelAllowed: true,
+                autoRotateKeys: true
             ),
             ProviderProfile(
                 id: "https-agentrouter-org",
@@ -684,7 +686,8 @@ public enum ProviderCatalog {
                 models: sirModels,
                 keySlots: sirSlots,
                 source: .desktopSnapshot,
-                customModelAllowed: true
+                customModelAllowed: true,
+                autoRotateKeys: true
             ),
             ProviderProfile(
                 id: "https-vyceai-com",

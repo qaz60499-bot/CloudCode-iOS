@@ -34,6 +34,7 @@ public struct ProviderDiscoveryClient: Sendable {
     ) async throws -> ProviderDiscoveryResult {
         var lastError: Error = ProviderError.missingAPIKey
         var sawAuthoritativeEmptyCatalog = false
+        var sawReachableUnparseableCatalog = false
         var authModes = [ProviderAuthMode.bearer, .xAPIKey, .both]
         if let preferredAuthMode {
             authModes.removeAll { $0.rawValue == preferredAuthMode.rawValue }
@@ -59,6 +60,12 @@ public struct ProviderDiscoveryClient: Sendable {
                 }
             } catch {
                 lastError = error
+                if let providerError = error as? ProviderError, providerError == .malformedEvent {
+                    // A reachable /models endpoint with an unfamiliar wrapper is not evidence that
+                    // the Key/provider is unavailable. Known bounded inference candidates may still
+                    // prove the real wire path, especially for compatible community gateways.
+                    sawReachableUnparseableCatalog = true
+                }
                 if allowPricingCatalogFallback,
                    let providerError = error as? ProviderError,
                    providerError == .rateLimited {
@@ -113,7 +120,7 @@ public struct ProviderDiscoveryClient: Sendable {
         }
 
         if discoveredCatalog == nil,
-           sawAuthoritativeEmptyCatalog,
+           (sawAuthoritativeEmptyCatalog || sawReachableUnparseableCatalog),
            !fallbackInferenceCandidates.isEmpty {
             // A successful empty /models response is authoritative for catalog visibility,
             // but some compatible gateways still allow inference for explicitly configured
@@ -158,18 +165,27 @@ public struct ProviderDiscoveryClient: Sendable {
                     readiness: .unavailable
                 )
             }
+            if sawReachableUnparseableCatalog {
+                return ProviderDiscoveryResult(
+                    models: [],
+                    protocols: [],
+                    authMode: preferredAuthMode ?? .both,
+                    readiness: .needsValidation
+                )
+            }
             throw lastError
         }
         let models = discoveredCatalog.models
+        let protocolsToProbe = Self.uniqueProtocols(inferenceProtocols)
 
         // Model catalogs from compatible gateways can mix chat, image, embedding,
         // and legacy entries. Do not assume the first row is inference-compatible.
-        // Probe a bounded prefix under each inference auth mode, keeping the provider's
-        // existing auth mode first when supplied by the caller.
+        // Probe a bounded prefix under each inference auth mode and only the protocols
+        // this profile actually advertises, keeping validation bounded and fast.
         for inferenceAuthMode in authModes {
             for model in models.prefix(12) {
                 var supported: [ProviderProtocol] = []
-                for protocolName in ProviderProtocol.allCases {
+                for protocolName in protocolsToProbe {
                     if try await probe(protocolName, baseURL: baseURL, apiKey: apiKey, authMode: inferenceAuthMode, model: model) {
                         supported.append(protocolName)
                     }

@@ -250,6 +250,7 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
     case missingAPIKey
     case invalidEndpoint
     case authenticationFailed(Int)
+    case clientRejected(Int)
     case capacityExhausted(Int)
     case rateLimited
     case modelUnavailable(Int)
@@ -266,6 +267,7 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
         case .missingAPIKey: return "厂商 API Key 缺失"
         case .invalidEndpoint: return "厂商接口地址无效"
         case .authenticationFailed(let code): return "厂商返回认证拒绝（HTTP \(code)）。请核对当前协议、接口地址、鉴权方式和 Key；不能仅凭该状态判定 Key 本身无效。"
+        case .clientRejected(let code): return "厂商网关拒绝当前客户端类型（HTTP \(code)），请求尚未证明 Key 无效；这属于客户端/网关兼容限制，不会把 Key 标记为失效。"
         case .capacityExhausted(let code): return "当前厂商 Key 的额度 / 容量不足（HTTP \(code)）；可选择同一厂商内的其他 Key"
         case .rateLimited: return "厂商触发限流，请稍后重试"
         case .modelUnavailable(let code): return "当前模型在该厂商没有可用推理通道（HTTP \(code)）；Key 未被判定失效，请切换模型或厂商后重试。"
@@ -1439,6 +1441,9 @@ public enum ProviderHTTPClassifier {
         if ProviderFailureEvidence.isModelUnavailable(text) {
             return .modelUnavailable(statusCode)
         }
+        if ProviderFailureEvidence.isClientRejected(text) {
+            return .clientRejected(statusCode)
+        }
         if statusCode == 401 {
             return .authenticationFailed(statusCode)
         }
@@ -1459,6 +1464,8 @@ public enum ProviderKeyRotationClassifier {
             switch providerError {
             case .authenticationFailed, .capacityExhausted:
                 return true
+            case .clientRejected:
+                return false
             case .invalidResponse(let code):
                 return (500...599).contains(code)
             case .modelUnavailable:
@@ -1480,7 +1487,7 @@ public enum ProviderRetryClassifier {
                 return true
             case .invalidResponse(let code):
                 return (500...599).contains(code)
-            case .capacityExhausted, .modelUnavailable, .transport, .streamInterrupted:
+            case .capacityExhausted, .modelUnavailable, .clientRejected, .transport, .streamInterrupted:
                 return false
             case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .malformedEvent,
                  .attachmentUnavailable, .attachmentTooLarge, .unsupportedAttachmentType:
@@ -1523,6 +1530,14 @@ private enum ProviderFailureEvidence {
             "invalid key", "key invalid", "invalid api key", "api key invalid", "key expired",
             "expired key", "api key expired", "authentication failed", "unauthorized api key",
             "无效密钥", "密钥失效", "密钥过期"
+        ]
+        return markers.contains { text.contains($0) }
+    }
+
+    static func isClientRejected(_ text: String) -> Bool {
+        let markers = [
+            "unauthorized_client_error", "unauthorized client detected", "unauthorized_client",
+            "client not allowed", "forbidden client", "not a recognized client"
         ]
         return markers.contains { text.contains($0) }
     }

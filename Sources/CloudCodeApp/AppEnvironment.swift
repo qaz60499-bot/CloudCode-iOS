@@ -481,6 +481,7 @@ public final class CloudCodeViewModel: ObservableObject {
             profiles: providerProfiles
         )
         applySelection(state)
+        refreshProviderSelectionInBackground(state)
     }
 
     public func selectKey(_ keySlotID: String) {
@@ -489,6 +490,25 @@ public final class CloudCodeViewModel: ObservableObject {
             profiles: providerProfiles
         )
         applySelection(state)
+        refreshProviderSelectionInBackground(state)
+    }
+
+    private func refreshProviderSelectionInBackground(_ state: ProviderSelectionState) {
+        guard !state.providerID.isEmpty, !state.keySlotID.isEmpty else { return }
+        let reference = ProviderCatalog.keyReference(providerID: state.providerID, keySlotID: state.keySlotID)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let value = try await keyVault.key(for: reference)
+                guard !value.isEmpty else { return }
+                installedKeyReferences.insert(reference)
+                _ = await refreshLiveProviderMetadataIfNeeded(providerID: state.providerID, keySlotID: state.keySlotID, apiKey: value)
+            } catch {
+                // Selection must remain instant and side-effect free when the Key is absent or
+                // currently protected. Explicit "check current Key" remains the user-facing path
+                // for reporting Keychain errors.
+            }
+        }
     }
 
     public func selectModel(_ model: String) {
@@ -1827,22 +1847,26 @@ public final class CloudCodeViewModel: ObservableObject {
 
     @discardableResult
     private func refreshLiveProviderMetadataIfNeeded(providerID: String, keySlotID: String, apiKey: String) async -> Bool {
-        guard providerID == ProviderCatalog.tabitokenID,
-              let providerIndex = providerProfiles.firstIndex(where: { $0.id == providerID }),
+        guard let providerIndex = providerProfiles.firstIndex(where: { $0.id == providerID }),
               !keySlotID.isEmpty,
               !apiKey.isEmpty else { return false }
-        let baseURL = providerProfiles[providerIndex].baseURL
-        let preferredAuthMode = providerProfiles[providerIndex].authMode
-        let inferenceProtocols = providerProfiles[providerIndex].protocols
-        let fallbackInferenceCandidates = ProviderCatalog.desktopSnapshot
-            .first(where: { $0.id == providerID })?
-            .models(for: keySlotID) ?? []
+        let profile = providerProfiles[providerIndex]
+        let baseURL = profile.baseURL
+        let preferredAuthMode = profile.authMode
+        let inferenceProtocols = profile.protocols
+        var fallbackInferenceCandidates = profile.models(for: keySlotID)
+        if let snapshot = ProviderCatalog.desktopSnapshot.first(where: { $0.id == providerID }) {
+            for model in snapshot.models(for: keySlotID) where !fallbackInferenceCandidates.contains(model) {
+                fallbackInferenceCandidates.append(model)
+            }
+        }
+        let allowPricingCatalogFallback = providerID == ProviderCatalog.tabitokenID
         do {
             let discovery = try await ProviderDiscoveryClient().discover(
                 baseURL: baseURL,
                 apiKey: apiKey,
                 preferredAuthMode: preferredAuthMode,
-                allowPricingCatalogFallback: true,
+                allowPricingCatalogFallback: allowPricingCatalogFallback,
                 fallbackInferenceCandidates: fallbackInferenceCandidates,
                 inferenceProtocols: inferenceProtocols
             )
@@ -1853,29 +1877,37 @@ public final class CloudCodeViewModel: ObservableObject {
             )
             applySelection(reconciled)
             let emptyCatalog = discovery.models.isEmpty && discovery.readiness == .unavailable
-            activityLines.append(
-                emptyCatalog
-                    ? "Tabitoken 当前 Key 返回空目录且已验证不到可用推理模型；仅将该 Key 标记为暂不可用，其他 Key 保持可继续验证。"
-                    : "Tabitoken 已按当前 Key 实时验证可用模型：\(discovery.models.count) 个。"
-            )
+            let unresolvedCatalog = discovery.models.isEmpty && discovery.readiness == .needsValidation
+            if emptyCatalog {
+                activityLines.append("\(profile.displayName) 当前 Key 的目录为空且没有验证到可用推理模型；仅标记这个 Key 暂不可用，其他 Key/厂商不受影响。")
+            } else if unresolvedCatalog {
+                activityLines.append("\(profile.displayName) 的模型目录格式当前无法权威解析；已保留现有模型/Key，不会误判厂商不可用。")
+            } else {
+                activityLines.append("\(profile.displayName) 已按当前 Key 实时验证可用模型：\(discovery.models.count) 个。")
+            }
             try? await diagnosticLogStore.log(
-                level: emptyCatalog ? .warning : .info,
+                level: (emptyCatalog || unresolvedCatalog) ? .warning : .info,
                 subsystem: "provider-discovery",
                 action: "refresh",
-                result: emptyCatalog ? "empty-catalog-key-scoped" : "updated",
-                metadata: ["providerID": providerID, "keySlotID": keySlotID, "modelCount": String(discovery.models.count)]
+                result: emptyCatalog ? "empty-catalog-key-scoped" : (unresolvedCatalog ? "catalog-unresolved-key-preserved" : "updated"),
+                metadata: [
+                    "providerID": providerID,
+                    "keySlotID": keySlotID,
+                    "modelCount": String(discovery.models.count),
+                    "readiness": discovery.readiness.rawValue
+                ]
             )
-            return !discovery.models.isEmpty
+            return !discovery.models.isEmpty && discovery.readiness == .ready
         } catch {
             try? await diagnosticLogStore.log(
                 level: .warning,
                 subsystem: "provider-discovery",
                 action: "refresh",
-                result: "failed",
+                result: "failed-key-preserved",
                 error: error,
                 metadata: ["providerID": providerID, "keySlotID": keySlotID]
             )
-            activityLines.append("Tabitoken 当前模型目录刷新失败；Key 已保留，可稍后重新检查当前 Key。")
+            activityLines.append("\(profile.displayName) 实时模型/协议验证失败；已保留现有 Key 与模型配置，不会把该失败扩散到其他厂商。")
             return false
         }
     }

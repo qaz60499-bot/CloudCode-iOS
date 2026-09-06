@@ -71,6 +71,13 @@ jobs:
                   status in (402, 403) and any(marker in text for marker in capacity_markers)
               )
 
+          def client_blocked(status, body):
+              if status not in (401, 403):
+                  return False
+              text = body.decode("utf-8", "replace").lower()
+              markers = ("unauthorized_client_error", "unauthorized client detected", "unauthorized_client", "client not allowed", "forbidden client", "not a recognized client")
+              return any(marker in text for marker in markers)
+
           agent_key = provider_key("https-agentrouter-org")
           agent_payload = {
               "model": "deepseek-v4-flash",
@@ -79,6 +86,8 @@ jobs:
               "messages": [{"role": "user", "content": "Reply OK"}],
           }
           agent_statuses = {}
+          agentrouter_client_blocked = False
+          agentrouter_compatible = False
           for mode in ("both", "bearer", "x-api-key"):
               status, body, content_type = request(
                   "https://co.agentrouter.org/v1/chat/completions",
@@ -89,13 +98,20 @@ jobs:
               agent_statuses[mode] = status
               print(f"AGENTROUTER_CHAT auth={mode} status={status} content_type={content_type.split(';')[0]} body_bytes={len(body)}")
               if 200 <= status < 300 or capacity_blocked(status, body):
+                  agentrouter_compatible = True
                   print(f"AGENTROUTER_COMPATIBLE_AUTH={mode}")
                   break
-          else:
-              print(f"::warning::AgentRouter private-bootstrap key was rejected for all supported auth modes: {agent_statuses}. This indicates stale/rotated credentials rather than an endpoint-shape failure; continuing other provider compatibility probes.")
-          agentrouter_auth_failed = bool(agent_statuses) and all(status in (401, 403) for status in agent_statuses.values())
+              if client_blocked(status, body):
+                  agentrouter_client_blocked = True
+          if not agentrouter_compatible:
+              if agentrouter_client_blocked:
+                  print(f"::warning::AgentRouter gateway rejected this generic client before credential validation: {agent_statuses}. The Key is not classified as stale.")
+              else:
+                  print(f"::warning::AgentRouter private-bootstrap credential was rejected for all supported auth modes: {agent_statuses}; continuing independent provider probes.")
+          agentrouter_auth_failed = bool(agent_statuses) and not agentrouter_client_blocked and all(status in (401, 403) for status in agent_statuses.values())
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"agentrouter_auth_failed={'true' if agentrouter_auth_failed else 'false'}\n")
+              output.write(f"agentrouter_client_blocked={'true' if agentrouter_client_blocked else 'false'}\n")
 
           just_key = provider_key("https-api-justwoker-icu")
           just_payload = {

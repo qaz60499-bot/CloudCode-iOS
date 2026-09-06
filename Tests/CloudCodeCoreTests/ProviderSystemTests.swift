@@ -82,6 +82,14 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-5-thinking", keySlotID: "slot-1"), .anthropic)
     }
 
+    func testMultiKeyDesktopProvidersEnableSameProviderFailover() throws {
+        for id in ["ccs-7bdd07431575", "https-sharellm-cn", "https-sirthisway-icu"] {
+            let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == id }))
+            XCTAssertGreaterThan(provider.keySlots.count, 1, id)
+            XCTAssertTrue(provider.autoRotateKeys, id)
+        }
+    }
+
     func testAgentRouterUsesCurrentOriginAndExplicitPerModelProtocols() throws {
         let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-agentrouter-org" }))
         XCTAssertEqual(provider.baseURL.absoluteString, "https://co.agentrouter.org")
@@ -591,6 +599,26 @@ final class ProviderDiscoveryTests: XCTestCase {
         XCTAssertEqual(result.readiness, .ready)
     }
 
+    func testDiscoveryLiveValidatesConfiguredCandidateWhenReachableCatalogWrapperIsUnparseable() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProviderUnparseableCatalogLiveInferenceURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let result = try await ProviderDiscoveryClient(session: session).discover(
+            baseURL: URL(string: "https://community.example")!,
+            apiKey: "test-secret",
+            preferredAuthMode: .bearer,
+            fallbackInferenceCandidates: ["claude-opus-live"],
+            inferenceProtocols: [.anthropic]
+        )
+
+        XCTAssertEqual(result.models, ["claude-opus-live"])
+        XCTAssertEqual(result.protocols, [.anthropic])
+        XCTAssertEqual(result.authMode, .bearer)
+        XCTAssertEqual(result.readiness, .ready)
+    }
+
     func testDiscoveryFallsBackToRatioConfigWhenModelsAndPricingAreEmpty() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ProviderRatioDiscoveryURLProtocol.self]
@@ -1071,6 +1099,15 @@ final class ProviderProtocolClientTests: XCTestCase {
         let error = ProviderHTTPClassifier.error(for: 503, body: body)
         XCTAssertEqual(error, .modelUnavailable(503))
         XCTAssertFalse(ProviderCompatibilityClassifier.shouldRetryWithCompactContext(statusCode: 503, body: body))
+        XCTAssertFalse(ProviderRetryClassifier.isRetryableBeforeOutput(try! XCTUnwrap(error)))
+        XCTAssertFalse(ProviderKeyRotationClassifier.shouldRotate(try! XCTUnwrap(error)))
+        XCTAssertFalse(ProviderEndpointHealthClassifier.shouldMarkDegraded(try! XCTUnwrap(error)))
+    }
+
+    func testUnauthorizedClientErrorDoesNotInvalidateKeyOrProviderHealth() {
+        let body = Data("{\"error\":{\"type\":\"unauthorized_client_error\",\"message\":\"unauthorized client detected\"}}".utf8)
+        let error = ProviderHTTPClassifier.error(for: 401, body: body)
+        XCTAssertEqual(error, .clientRejected(401))
         XCTAssertFalse(ProviderRetryClassifier.isRetryableBeforeOutput(try! XCTUnwrap(error)))
         XCTAssertFalse(ProviderKeyRotationClassifier.shouldRotate(try! XCTUnwrap(error)))
         XCTAssertFalse(ProviderEndpointHealthClassifier.shouldMarkDegraded(try! XCTUnwrap(error)))
@@ -1738,6 +1775,40 @@ private final class ProviderEmptyCatalogLiveInferenceURLProtocol: URLProtocol, @
                 status = 503
                 body = Data(#"{"error":{"type":"model_not_found","message":"model unavailable"}}"#.utf8)
             }
+        } else {
+            status = 404
+            body = Data(#"{"error":"unsupported"}"#.utf8)
+        }
+        guard let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"]) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class ProviderUnparseableCatalogLiveInferenceURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let status: Int
+        let body: Data
+        if url.path.hasSuffix("/v1/models") {
+            status = 200
+            body = Data(#"{"success":true,"result":{"rows":[]}}"#.utf8)
+        } else if url.path.hasSuffix("/v1/messages"),
+                  request.value(forHTTPHeaderField: "Authorization") == "Bearer test-secret" {
+            status = 200
+            body = Data(#"{"content":[{"type":"text","text":"OK"}]}"#.utf8)
         } else {
             status = 404
             body = Data(#"{"error":"unsupported"}"#.utf8)
