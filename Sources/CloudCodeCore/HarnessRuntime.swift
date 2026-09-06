@@ -21,8 +21,9 @@ public enum HarnessContextManager {
         policy: HarnessContextPolicy = HarnessContextPolicy()
     ) -> [ChatMessage] {
         guard !messages.isEmpty else { return [] }
-        let systemMessages = messages.filter { $0.role == .system }
-        let conversational = messages.enumerated().filter { $0.element.role != .system }
+        let normalizedMessages = pruningHistoricalObservationAttachments(in: messages)
+        let systemMessages = normalizedMessages.filter { $0.role == .system }
+        let conversational = normalizedMessages.enumerated().filter { $0.element.role != .system }
         let systemCost = systemMessages.reduce(0) { $0 + estimatedCharacters($1) }
         var remainingBudget = max(1_000, policy.maxCharacters - systemCost)
         var selectedIndexes = Set<Int>()
@@ -53,8 +54,8 @@ public enum HarnessContextManager {
 
         // Ensure at least the most recent user message survives even when the newest
         // messages are assistant/tool records and the context budget is exhausted.
-        if let latestUser = messages.indices.reversed().first(where: {
-            messages[$0].role == .user && messages[$0].providerMetadata["internal_observation"] == nil
+        if let latestUser = normalizedMessages.indices.reversed().first(where: {
+            normalizedMessages[$0].role == .user && normalizedMessages[$0].providerMetadata["internal_observation"] == nil
         }) {
             selectedIndexes.insert(latestUser)
         }
@@ -64,20 +65,20 @@ public enum HarnessContextManager {
         // opposite can still happen: a small assistant tool-call record may fit while the large
         // tool result immediately after it does not. Remove either side unless both survived.
         let selectedToolResultIDs = Set(selectedIndexes.compactMap { index -> String? in
-            let message = messages[index]
+            let message = normalizedMessages[index]
             guard message.role == .tool else { return nil }
             let id = message.providerMetadata["tool_call_id"]
             return (id?.isEmpty == false) ? id : nil
         })
         let selectedAssistantToolIDs = Set(selectedIndexes.compactMap { index -> String? in
-            let message = messages[index]
+            let message = normalizedMessages[index]
             guard message.role == .assistant else { return nil }
             let id = message.providerMetadata["tool_call_id"]
             return (id?.isEmpty == false) ? id : nil
         })
         let completeToolCallIDs = selectedToolResultIDs.intersection(selectedAssistantToolIDs)
         selectedIndexes = Set(selectedIndexes.filter { index in
-            let message = messages[index]
+            let message = normalizedMessages[index]
             guard let id = message.providerMetadata["tool_call_id"], !id.isEmpty else { return true }
             if message.role == .assistant || message.role == .tool {
                 return completeToolCallIDs.contains(id)
@@ -86,7 +87,7 @@ public enum HarnessContextManager {
         })
 
         var result = systemMessages
-        result.append(contentsOf: executionHints(from: messages))
+        result.append(contentsOf: executionHints(from: normalizedMessages))
         let omitted = conversational.count - selectedIndexes.count
         if omitted > 0 {
             result.append(ChatMessage(
@@ -95,8 +96,8 @@ public enum HarnessContextManager {
                 providerMetadata: ["context_layer": "harness_compression"]
             ))
         }
-        for index in messages.indices where selectedIndexes.contains(index) && messages[index].role != .system {
-            result.append(messages[index])
+        for index in normalizedMessages.indices where selectedIndexes.contains(index) && normalizedMessages[index].role != .system {
+            result.append(normalizedMessages[index])
         }
         return result
     }
@@ -107,12 +108,15 @@ public enum HarnessContextManager {
         })?.content else { return [] }
         var hints: [ChatMessage] = []
         if let count = boundedRepeatedSwipeCount(in: request) {
+            let needsFeedReview = feedSamplingNeedsIntermediateReview(in: request)
             hints.append(ChatMessage(
                 role: .system,
-                content: "Harness execution hint: the latest user request contains an explicit finite repeated swipe/feed-browse count of \(count). After a fresh foreground observation, prefer one gui.swipeSequence with count=\(count) when the repeated motion is mechanically identical and no intermediate semantic decision is required. This hint is advisory only: if the screen changes into a state that requires interpretation, use individual observe/action steps instead. Never turn this hint into an unbounded loop.",
+                content: needsFeedReview
+                    ? "Harness execution hint: the latest user request asks to inspect/compare \(count) consecutive feed items. After the target feed is foreground, prefer one gui.feedSample with direction=forward and count=\(count). It captures all current samples locally and returns them together for one semantic review; do not spend one provider round-trip per item and do not translate forward into user-facing up/down swipe wording."
+                    : "Harness execution hint: the latest user request contains an explicit finite repeated swipe/feed-browse count of \(count). After a fresh foreground observation, prefer one gui.swipeSequence with count=\(count) when the repeated motion is mechanically identical and no intermediate semantic decision is required. This hint is advisory only: if the screen changes into a state that requires interpretation, use a bounded local semantic macro or individual observe/action steps instead. Never turn this hint into an unbounded loop.",
                 providerMetadata: [
                     "context_layer": "harness_execution",
-                    "execution_mode": "bounded_repeated_swipe",
+                    "execution_mode": needsFeedReview ? "bounded_feed_sample" : "bounded_repeated_swipe",
                     "repeat_count": String(count)
                 ]
             ))
@@ -144,6 +148,15 @@ public enum HarnessContextManager {
             && continuationMarkers.contains(where: normalized.contains)
     }
 
+    static func feedSamplingNeedsIntermediateReview(in request: String) -> Bool {
+        let normalized = request.lowercased()
+        let markers = [
+            "比较", "哪个", "哪一个", "最高", "最多", "最低", "点赞量", "点赞数", "评论量", "评论数", "好看", "分析", "看看", "看一下",
+            "compare", "highest", "most", "likes", "comments", "analyze", "inspect"
+        ]
+        return markers.contains(where: normalized.contains)
+    }
+
     static func boundedRepeatedSwipeCount(in request: String) -> Int? {
         let normalized = request.lowercased()
         let actionMarkers = ["swipe", "滑", "刷"]
@@ -170,6 +183,60 @@ public enum HarnessContextManager {
             }
         }
         return nil
+    }
+
+    static func scopedProviderToolNames(for request: String, availableNames: Set<String>) -> Set<String> {
+        let normalized = request.lowercased()
+        var prefixes = Set<String>()
+
+        let guiMarkers = [
+            "刷视频", "刷几个", "滑", "滚动", "点赞", "点开", "点击", "界面", "屏幕", "截图", "聊天", "发送消息", "输入",
+            "swipe", "scroll", "tap", "screenshot", "gui"
+        ]
+        let likelyNamedAppOpen = normalized.contains("打开") && [
+            "微信", "抖音", "小红书", "浏览器", "设置", "相册", "照片", "视频", "app", "应用", "软件"
+        ].contains(where: normalized.contains)
+        if likelyNamedAppOpen || guiMarkers.contains(where: normalized.contains) {
+            prefixes.formUnion(["apps.", "gui.", "interaction.", "capability."])
+        }
+
+        let dataMarkers = [
+            "读取文件", "删除文件", "复制文件", "移动文件", "搜索文件", "文件路径", "文件夹", "目录", "json", "plist", "sqlite", "数据库", "container"
+        ]
+        if dataMarkers.contains(where: normalized.contains) {
+            prefixes.formUnion(["files.", "container.", "data.", "json.", "plist.", "sqlite.", "storage.", "trash.", "capability."])
+        }
+        if normalized.contains("ipa") || normalized.contains("安装包") {
+            prefixes.formUnion(["ipa.", "files.", "capability."])
+        }
+        if normalized.contains("shell") || normalized.contains("命令行") || normalized.contains("cli") {
+            prefixes.formUnion(["advanced.", "capability."])
+        }
+
+        guard !prefixes.isEmpty else { return availableNames }
+        let scoped = Set(availableNames.filter { name in prefixes.contains(where: name.hasPrefix) })
+        return scoped.isEmpty ? availableNames : scoped
+    }
+
+    private static func pruningHistoricalObservationAttachments(in messages: [ChatMessage]) -> [ChatMessage] {
+        let latestObservationIndex = messages.indices.reversed().first(where: {
+            messages[$0].role == .user
+                && messages[$0].providerMetadata["internal_observation"] != nil
+                && !messages[$0].attachments.isEmpty
+        })
+        guard let latestObservationIndex else { return messages }
+
+        return messages.enumerated().map { index, message in
+            guard index != latestObservationIndex,
+                  message.role == .user,
+                  message.providerMetadata["internal_observation"] != nil,
+                  !message.attachments.isEmpty else { return message }
+            var compacted = message
+            compacted.attachments = []
+            compacted.content = "Historical device screenshot omitted from this provider request; use the newest attached observation for current GUI state."
+            compacted.providerMetadata["historical_observation_image"] = "omitted"
+            return compacted
+        }
     }
 
     private static func estimatedCharacters(_ message: ChatMessage) -> Int {

@@ -1191,6 +1191,76 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://example.com/v1/responses")
     }
 
+    func testResponsesFailureEventPreservesUpstreamDetailAsProtocolIncompatibility() async throws {
+        let body = Data("""
+        data: {"type":"response.failed","response":{"status":"failed","error":{"code":"unsupported_stream","message":"responses streaming is not available for this model"}}}
+
+        """.utf8)
+        ProviderTestURLProtocol.install(status: 200, body: body, headers: ["Content-Type": "text/event-stream"])
+        let client = OpenAIResponsesProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let configuration = ProviderConfiguration(
+            name: "Responses",
+            baseURL: URL(string: "https://example.com/v1")!,
+            model: "model-x",
+            apiKeyReference: "key",
+            protocolName: ProviderProtocol.openAIResponses.rawValue
+        )
+        do {
+            for try await _ in client.stream(configuration: configuration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
+            XCTFail("expected provider error")
+        } catch {
+            XCTAssertEqual(error as? ProviderError, .protocolIncompatible("responses streaming is not available for this model"))
+        }
+    }
+
+    func testMultipleCurrentObservationImagesAreEncodedForAllProviderProtocols() async throws {
+        let support = (FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).appendingPathComponent("Library/Application Support", isDirectory: true))
+            .appendingPathComponent("CloudCode/Attachments/provider-multi-image-tests", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let firstURL = support.appendingPathComponent("first-\(UUID().uuidString).jpg")
+        let secondURL = support.appendingPathComponent("second-\(UUID().uuidString).jpg")
+        let first = Data([0xFF, 0xD8, 0x01, 0xFF, 0xD9])
+        let second = Data([0xFF, 0xD8, 0x02, 0xFF, 0xD9])
+        try first.write(to: firstURL, options: .atomic)
+        try second.write(to: secondURL, options: .atomic)
+        defer {
+            try? FileManager.default.removeItem(at: firstURL)
+            try? FileManager.default.removeItem(at: secondURL)
+        }
+        let message = ChatMessage(role: .user, content: "compare", attachments: [
+            ChatAttachment(filename: "first.jpg", path: firstURL.path, mimeType: "image/jpeg", byteSize: Int64(first.count)),
+            ChatAttachment(filename: "second.jpg", path: secondURL.path, mimeType: "image/jpeg", byteSize: Int64(second.count))
+        ])
+
+        ProviderTestURLProtocol.install(status: 200, body: Data("data: [DONE]\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let chat = OpenAICompatibleProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let chatConfig = ProviderConfiguration(name: "chat", baseURL: URL(string: "https://example.com/v1")!, model: "vision", apiKeyReference: "key", protocolName: ProviderProtocol.openAIChat.rawValue)
+        for try await _ in chat.stream(configuration: chatConfig, apiKey: "secret", messages: [message], tools: []) {}
+        let chatBody = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(ProviderTestURLProtocol.lastRequestBody())) as? [String: Any])
+        let chatMessages = try XCTUnwrap(chatBody["messages"] as? [[String: Any]])
+        let chatContent = try XCTUnwrap(chatMessages.first?["content"] as? [[String: Any]])
+        XCTAssertEqual(chatContent.filter { $0["type"] as? String == "image_url" }.count, 2)
+
+        ProviderTestURLProtocol.install(status: 200, body: Data("data: {\"type\":\"message_stop\"}\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let anthropic = AnthropicProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let anthropicConfig = ProviderConfiguration(name: "anthropic", baseURL: URL(string: "https://example.com/v1")!, model: "vision", apiKeyReference: "key", protocolName: ProviderProtocol.anthropic.rawValue)
+        for try await _ in anthropic.stream(configuration: anthropicConfig, apiKey: "secret", messages: [message], tools: []) {}
+        let anthropicBody = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(ProviderTestURLProtocol.lastRequestBody())) as? [String: Any])
+        let anthropicMessages = try XCTUnwrap(anthropicBody["messages"] as? [[String: Any]])
+        let anthropicContent = try XCTUnwrap(anthropicMessages.first?["content"] as? [[String: Any]])
+        XCTAssertEqual(anthropicContent.filter { $0["type"] as? String == "image" }.count, 2)
+
+        ProviderTestURLProtocol.install(status: 200, body: Data("data: {\"type\":\"response.completed\"}\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let responses = OpenAIResponsesProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let responsesConfig = ProviderConfiguration(name: "responses", baseURL: URL(string: "https://example.com/v1")!, model: "vision", apiKeyReference: "key", protocolName: ProviderProtocol.openAIResponses.rawValue)
+        for try await _ in responses.stream(configuration: responsesConfig, apiKey: "secret", messages: [message], tools: []) {}
+        let responsesBody = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(ProviderTestURLProtocol.lastRequestBody())) as? [String: Any])
+        let input = try XCTUnwrap(responsesBody["input"] as? [[String: Any]])
+        let responsesContent = try XCTUnwrap(input.first?["content"] as? [[String: Any]])
+        XCTAssertEqual(responsesContent.filter { $0["type"] as? String == "input_image" }.count, 2)
+    }
+
     func testImageAttachmentIsEncodedForChatAnthropicAndResponses() async throws {
         let support = (FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).appendingPathComponent("Library/Application Support", isDirectory: true))

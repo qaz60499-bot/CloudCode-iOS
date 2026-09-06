@@ -1200,7 +1200,12 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
                 }
                 terminal = true
             case "response.failed", "error":
-                throw ProviderError.transport("Responses 流返回错误事件")
+                let detail = providerErrorDetail(from: object["response"] ?? object["error"] ?? object)
+                    ?? "上游未提供可解析的 Responses 错误详情"
+                if outputStarted {
+                    throw ProviderError.streamInterrupted
+                }
+                throw ProviderError.protocolIncompatible(detail)
             default:
                 break
             }
@@ -1872,70 +1877,83 @@ private struct ProviderImageAttachment {
     var dataURL: String { "data:\(mimeType);base64,\(base64)" }
 }
 
-private func providerImageAttachment(_ message: ChatMessage) throws -> ProviderImageAttachment? {
-    guard message.role == .user, let attachment = message.attachments.first else { return nil }
-    guard attachment.byteSize > 0, attachment.byteSize <= Int64(ChatMessageAttachmentPolicy.maxImageBytes) else {
-        throw ProviderError.attachmentTooLarge(attachment.byteSize)
+private func providerImageAttachments(_ message: ChatMessage) throws -> [ProviderImageAttachment] {
+    guard message.role == .user, !message.attachments.isEmpty else { return [] }
+    guard message.attachments.count <= 8 else {
+        throw ProviderError.transport("单条消息最多向厂商发送 8 张当前观察图片")
     }
-    let mimeType = attachment.mimeType.lowercased()
-    guard ["image/jpeg", "image/png", "image/webp", "image/gif"].contains(mimeType) else {
-        throw ProviderError.unsupportedAttachmentType(attachment.mimeType)
-    }
-    let candidate = URL(fileURLWithPath: attachment.path).standardizedFileURL
     let supportRoot = (FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
         ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).appendingPathComponent("Library/Application Support", isDirectory: true))
         .appendingPathComponent("CloudCode", isDirectory: true)
         .appendingPathComponent("Attachments", isDirectory: true)
         .standardizedFileURL
-    guard candidate.path.hasPrefix(supportRoot.path + "/") else {
-        throw ProviderError.attachmentUnavailable(attachment.filename)
+    var totalBytes: Int64 = 0
+    return try message.attachments.map { attachment in
+        guard attachment.byteSize > 0, attachment.byteSize <= Int64(ChatMessageAttachmentPolicy.maxImageBytes) else {
+            throw ProviderError.attachmentTooLarge(attachment.byteSize)
+        }
+        totalBytes += attachment.byteSize
+        guard totalBytes <= Int64(ChatMessageAttachmentPolicy.maxImageBytes * 8) else {
+            throw ProviderError.attachmentTooLarge(totalBytes)
+        }
+        let mimeType = attachment.mimeType.lowercased()
+        guard ["image/jpeg", "image/png", "image/webp", "image/gif"].contains(mimeType) else {
+            throw ProviderError.unsupportedAttachmentType(attachment.mimeType)
+        }
+        let candidate = URL(fileURLWithPath: attachment.path).standardizedFileURL
+        guard candidate.path.hasPrefix(supportRoot.path + "/") else {
+            throw ProviderError.attachmentUnavailable(attachment.filename)
+        }
+        guard let data = try? Data(contentsOf: candidate, options: [.mappedIfSafe]),
+              !data.isEmpty,
+              data.count <= ChatMessageAttachmentPolicy.maxImageBytes else {
+            throw ProviderError.attachmentUnavailable(attachment.filename)
+        }
+        return ProviderImageAttachment(base64: data.base64EncodedString(), mimeType: mimeType)
     }
-    guard let data = try? Data(contentsOf: candidate, options: [.mappedIfSafe]),
-          !data.isEmpty,
-          data.count <= ChatMessageAttachmentPolicy.maxImageBytes else {
-        throw ProviderError.attachmentUnavailable(attachment.filename)
-    }
-    return ProviderImageAttachment(base64: data.base64EncodedString(), mimeType: mimeType)
 }
 
-private func openAIImageContent(_ message: ChatMessage, attachment: ProviderImageAttachment) -> [[String: Any]] {
+private func openAIImageContent(_ message: ChatMessage, attachments: [ProviderImageAttachment]) -> [[String: Any]] {
     var content: [[String: Any]] = []
     if !message.content.isEmpty {
         content.append(["type": "text", "text": message.content])
     }
-    content.append(["type": "image_url", "image_url": ["url": attachment.dataURL]])
+    content.append(contentsOf: attachments.map { ["type": "image_url", "image_url": ["url": $0.dataURL]] })
     return content
 }
 
-private func anthropicImageContent(_ message: ChatMessage, attachment: ProviderImageAttachment) -> [[String: Any]] {
+private func anthropicImageContent(_ message: ChatMessage, attachments: [ProviderImageAttachment]) -> [[String: Any]] {
     var content: [[String: Any]] = []
     if !message.content.isEmpty {
         content.append(["type": "text", "text": message.content])
     }
-    content.append([
-        "type": "image",
-        "source": [
-            "type": "base64",
-            "media_type": attachment.mimeType,
-            "data": attachment.base64
+    content.append(contentsOf: attachments.map { attachment in
+        [
+            "type": "image",
+            "source": [
+                "type": "base64",
+                "media_type": attachment.mimeType,
+                "data": attachment.base64
+            ]
         ]
-    ])
+    })
     return content
 }
 
-private func responsesImageContent(_ message: ChatMessage, attachment: ProviderImageAttachment) -> [[String: Any]] {
+private func responsesImageContent(_ message: ChatMessage, attachments: [ProviderImageAttachment]) -> [[String: Any]] {
     var content: [[String: Any]] = []
     if !message.content.isEmpty {
         content.append(["type": "input_text", "text": message.content])
     }
-    content.append(["type": "input_image", "image_url": attachment.dataURL])
+    content.append(contentsOf: attachments.map { ["type": "input_image", "image_url": $0.dataURL] })
     return content
 }
 
 private func openAIMessageObject(_ message: ChatMessage) throws -> [String: Any] {
     var object: [String: Any] = ["role": message.role.rawValue]
-    if let attachment = try providerImageAttachment(message) {
-        object["content"] = openAIImageContent(message, attachment: attachment)
+    let attachments = try providerImageAttachments(message)
+    if !attachments.isEmpty {
+        object["content"] = openAIImageContent(message, attachments: attachments)
     } else {
         object["content"] = message.content
     }
@@ -2007,8 +2025,9 @@ private func anthropicMessages(_ messages: [ChatMessage]) throws -> [[String: An
             continue
         }
         let role = message.role == .assistant ? "assistant" : "user"
-        if let attachment = try providerImageAttachment(message) {
-            append(role: role, blocks: anthropicImageContent(message, attachment: attachment))
+        let attachments = try providerImageAttachments(message)
+        if !attachments.isEmpty {
+            append(role: role, blocks: anthropicImageContent(message, attachments: attachments))
         } else if !message.content.isEmpty {
             append(role: role, blocks: [["type": "text", "text": message.content]])
         }
@@ -2031,8 +2050,9 @@ private func responsesInput(_ messages: [ChatMessage]) throws -> [[String: Any]]
                 "arguments": message.providerMetadata["tool_arguments"] ?? "{}"
             ]
         }
-        if let attachment = try providerImageAttachment(message) {
-            return ["role": message.role.rawValue, "content": responsesImageContent(message, attachment: attachment)]
+        let attachments = try providerImageAttachments(message)
+        if !attachments.isEmpty {
+            return ["role": message.role.rawValue, "content": responsesImageContent(message, attachments: attachments)]
         }
         return ["role": message.role.rawValue, "content": message.content]
     }

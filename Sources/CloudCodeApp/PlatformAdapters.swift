@@ -1449,6 +1449,15 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                   abs(dx) >= 0.5 || abs(dy) >= 0.5 else {
                 throw ToolRouterError.noExecutionRoute("scroll delta missing, invalid, zero, or outside bounded range")
             }
+        case "gui.feedSample":
+            guard let direction = call.arguments["direction"], direction == "forward" || direction == "backward" else {
+                throw ToolRouterError.noExecutionRoute("feedSample direction must be forward or backward")
+            }
+            guard let rawCount = Double(call.arguments["count"] ?? ""), rawCount.isFinite,
+                  rawCount.rounded(.towardZero) == rawCount,
+                  rawCount >= 2, rawCount <= 8 else {
+                throw ToolRouterError.noExecutionRoute("feedSample count must be an integer from 2 through 8")
+            }
         case "gui.swipe", "gui.swipeSequence", "gui.swipeObserve":
             let keys = ["fromX", "fromY", "toX", "toY"]
             let coordinates = keys.compactMap { Double(call.arguments[$0] ?? "") }
@@ -1612,6 +1621,8 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             return ToolResult(toolCallID: call.id, success: true, summary: "Swipe dispatched; foreground effect unverified", payload: ["effectVerification": "required"])
         case "gui.swipeSequence":
             return try await executeSwipeSequence(call)
+        case "gui.feedSample":
+            return try await executeFeedSample(call)
         case "gui.tapObserve", "gui.typeObserve", "gui.scrollObserve", "gui.swipeObserve":
             return try await executeActionObserve(call)
         case "gui.navigateBack":
@@ -1712,6 +1723,74 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             summary: summary,
             payload: payload,
             attachments: attachment.map { [$0] }
+        )
+    }
+
+    private func executeFeedSample(_ call: ToolCall) async throws -> ToolResult {
+        let count = Int(Double(call.arguments["count"] ?? "0") ?? 0)
+        let direction = call.arguments["direction"] ?? "forward"
+        // Keep physical finger direction private to the executor. The provider only reasons in
+        // semantic feed order (forward/backward), avoiding the common Chinese "往下刷" vs
+        // "手指向上滑" ambiguity. Positive scroll delta means advancing the scroll/feed content;
+        // the helper owns the inverse physical finger trajectory needed to produce that motion.
+        let deltaY = direction == "forward" ? 600.0 : -600.0
+        let settleNanoseconds: UInt64 = 650_000_000
+
+        var attachments: [ChatAttachment] = []
+        var hashes: [String] = []
+        var sampledCount = 0
+        var stoppedAtSample: Int?
+
+        func captureSample() async throws -> String {
+            let data = try await backend.screenshot()
+            let hash = GUIAutomationPayloadPolicy.sha256Hex(data)
+            if let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID) {
+                attachments.append(attachment)
+            }
+            hashes.append(hash)
+            sampledCount += 1
+            return hash
+        }
+
+        let baselineHash = try await captureSample()
+        var previousHash = baselineHash
+        if count >= 2 {
+            for sampleIndex in 2...count {
+                try Task.checkCancellation()
+                try await backend.scroll(deltaX: 0, deltaY: deltaY)
+                try await Task.sleep(nanoseconds: settleNanoseconds)
+                try Task.checkCancellation()
+                let currentHash = try await captureSample()
+                if currentHash == previousHash {
+                    stoppedAtSample = sampleIndex
+                    break
+                }
+                previousHash = currentHash
+            }
+        }
+
+        let completed = sampledCount == count && stoppedAtSample == nil
+        var payload: [String: String] = [
+            "requestedCount": String(count),
+            "sampledCount": String(sampledCount),
+            "direction": direction,
+            "sequenceCompleted": completed ? "true" : "false",
+            "frameSHA256": hashes.joined(separator: ","),
+            "baselineSHA256": baselineHash,
+            "sha256": hashes.last ?? baselineHash,
+            "settleMs": "650",
+            "effectVerification": "semantic_review_required",
+            "localObservation": "feed_samples_attached"
+        ]
+        if let stoppedAtSample { payload["stoppedAtSample"] = String(stoppedAtSample) }
+        return ToolResult(
+            toolCallID: call.id,
+            success: true,
+            summary: completed
+                ? "Locally sampled \(sampledCount) consecutive feed items in one bounded execution; all sample screenshots are attached for one semantic review."
+                : "Local feed sampling stopped at sample \(sampledCount) because the next frame was byte-identical; collected screenshots are attached for re-planning.",
+            payload: payload,
+            attachments: attachments
         )
     }
 
@@ -2085,7 +2164,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.tap": return [.touch]
         case "gui.type": return [.textInput]
         case "gui.scroll", "gui.swipe": return [.gestures]
-        case "gui.swipeSequence", "gui.navigateBack", "gui.scrollObserve", "gui.swipeObserve": return [.gestures, .screenshot]
+        case "gui.swipeSequence", "gui.feedSample", "gui.navigateBack", "gui.scrollObserve", "gui.swipeObserve": return [.gestures, .screenshot]
         case "gui.tapObserve": return [.touch, .screenshot]
         case "gui.typeObserve": return [.textInput, .screenshot]
         case "gui.verify": return [.verify]

@@ -337,6 +337,10 @@ public enum GUIApprovalTargetSanitizer {
         case "gui.swipeSequence":
             let count = call.arguments["count"] ?? "?"
             return "当前前台 App · bounded swipe sequence ×\(count)"
+        case "gui.feedSample":
+            let count = call.arguments["count"] ?? "?"
+            let direction = call.arguments["direction"] ?? "next"
+            return "当前前台 App · local feed sample \(direction) ×\(count)"
         case "gui.navigateBack": return "当前前台 App · navigate back/dismiss (\(call.arguments["strategy"] ?? "?"))"
         case "gui.verify": return "当前 GUI 会话 · verify"
         default: return "当前 GUI 会话"
@@ -415,6 +419,7 @@ public actor ToolRegistry {
         ToolDescriptor(name: "gui.scroll", summary: "Scroll through the configured backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.swipe", summary: "Swipe through the configured backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.swipeSequence", summary: "Execute an explicitly requested finite sequence of identical swipes locally. The bounded executor captures lightweight screenshots between gestures, stops early on byte-identical observations, and returns the final screenshot so the model does not need a full round-trip between every repeated swipe.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.feedSample", summary: "Sample 2–8 consecutive feed items locally in one bounded tool call. direction=forward means advance to later feed items and direction=backward means return toward earlier items; the model never chooses raw swipe coordinates. The executor captures the current item plus each locally advanced item and returns all current sample screenshots together, avoiding one provider round-trip per feed item.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.navigateBack", summary: "Navigate back from a temporary iOS detail/media surface using one explicit bounded strategy: edge for a left-edge navigation-pop gesture, or dismissDown for a fullscreen/modal downward dismiss. The tool returns a fresh final screenshot; that screenshot, not motion/hash alone, must be inspected semantically before continuing.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.tapObserve", summary: "Execute one bounded tap and immediately capture a fresh screenshot locally. This is a one-write micro-plan; the returned image must be interpreted before any dependent write.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.typeObserve", summary: "Execute one bounded text-input action and immediately capture a fresh screenshot locally. This is a one-write micro-plan; do not send or perform another dependent write before interpreting the returned image.", risk: .sensitiveWrite, requiredCapabilities: [GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),

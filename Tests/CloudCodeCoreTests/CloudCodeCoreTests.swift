@@ -523,6 +523,21 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(descriptor?.requiredCapabilities, [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
     }
 
+    func testDefaultToolRegistryIncludesSemanticFeedSample() async {
+        let registry = ToolRegistry()
+        let descriptor = await registry.descriptor(named: "gui.feedSample")
+        XCTAssertEqual(descriptor?.risk, .safeWrite)
+        XCTAssertEqual(descriptor?.preferredRoute, .guiFallback)
+        XCTAssertEqual(descriptor?.requiredCapabilities, [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
+        let target = GUIApprovalTargetSanitizer.target(for: ToolCall(
+            name: "gui.feedSample",
+            arguments: ["direction": "forward", "count": "5"],
+            sessionID: UUID()
+        ))
+        XCTAssertTrue(target.contains("feed sample forward"))
+        XCTAssertTrue(target.contains("×5"))
+    }
+
     func testDefaultToolRegistryIncludesNavigateBackWithGestureAndScreenshotCapabilities() async {
         let registry = ToolRegistry()
         let descriptor = await registry.descriptor(named: "gui.navigateBack")
@@ -3317,6 +3332,7 @@ final class CloudCodeCoreTests: XCTestCase {
             "fromX": "200", "fromY": "700", "toX": "200", "toY": "200", "duration": "0.3"
         ])
         XCTAssertEqual(guiScope, "gui:foreground")
+        XCTAssertEqual(AgentCore.semanticToolScope(name: "gui.feedSample", arguments: ["direction": "forward", "count": "5"]), "gui:foreground")
         XCTAssertEqual(AgentCore.semanticToolScope(name: "gui.swipeSequence", arguments: [
             "fromX": "200", "fromY": "700", "toX": "200", "toY": "200", "duration": "0.3", "count": "3"
         ]), "gui:foreground")
@@ -3946,6 +3962,53 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(hint?.providerMetadata["execution_mode"], "bounded_repeated_swipe")
         XCTAssertEqual(hint?.providerMetadata["repeat_count"], "3")
         XCTAssertTrue(hint?.content.contains("gui.swipeSequence") == true)
+    }
+
+    func testHarnessExecutionHintUsesLocalFeedSampleForFiniteComparisonTask() {
+        let messages = [
+            ChatMessage(role: .user, content: "打开抖音刷五个视频看哪个点赞量最高")
+        ]
+        let hint = HarnessContextManager.executionHint(from: messages)
+        XCTAssertEqual(hint?.providerMetadata["execution_mode"], "bounded_feed_sample")
+        XCTAssertEqual(hint?.providerMetadata["repeat_count"], "5")
+        XCTAssertTrue(hint?.content.contains("gui.feedSample") == true)
+        XCTAssertTrue(hint?.content.contains("direction=forward") == true)
+    }
+
+    func testHarnessScopesProviderToolsToCurrentTaskDomain() {
+        let available: Set<String> = [
+            "apps.launch", "apps.list", "gui.screenshot", "gui.feedSample", "interaction.confirmTransition", "capability.probe",
+            "files.read", "sqlite.query", "ipa.inspect", "advanced.shell"
+        ]
+        let gui = HarnessContextManager.scopedProviderToolNames(for: "打开抖音刷五个视频看点赞量", availableNames: available)
+        XCTAssertTrue(gui.contains("apps.launch"))
+        XCTAssertTrue(gui.contains("gui.feedSample"))
+        XCTAssertTrue(gui.contains("interaction.confirmTransition"))
+        XCTAssertTrue(gui.contains("capability.probe"))
+        XCTAssertFalse(gui.contains("files.read"))
+        XCTAssertFalse(gui.contains("sqlite.query"))
+        XCTAssertFalse(gui.contains("ipa.inspect"))
+        XCTAssertFalse(gui.contains("advanced.shell"))
+
+        let unknown = HarnessContextManager.scopedProviderToolNames(for: "帮我处理一下", availableNames: available)
+        XCTAssertEqual(unknown, available)
+    }
+
+    func testHarnessPrunesOlderObservationImagesButKeepsNewestMultiImageObservation() {
+        let old = ChatAttachment(filename: "old.jpg", path: "/tmp/old.jpg", mimeType: "image/jpeg", byteSize: 10)
+        let currentA = ChatAttachment(filename: "a.jpg", path: "/tmp/a.jpg", mimeType: "image/jpeg", byteSize: 10)
+        let currentB = ChatAttachment(filename: "b.jpg", path: "/tmp/b.jpg", mimeType: "image/jpeg", byteSize: 10)
+        let messages = [
+            ChatMessage(role: .user, content: "打开抖音刷三个视频比较点赞量"),
+            ChatMessage(role: .user, content: "old", providerMetadata: ["internal_observation": "gui.screenshot"], attachments: [old]),
+            ChatMessage(role: .assistant, content: "continue"),
+            ChatMessage(role: .user, content: "samples", providerMetadata: ["internal_observation": "gui.feedSample.samples"], attachments: [currentA, currentB])
+        ]
+        let providerMessages = HarnessContextManager.providerMessages(from: messages)
+        let observations = providerMessages.filter { $0.providerMetadata["internal_observation"] != nil }
+        XCTAssertEqual(observations.filter { !$0.attachments.isEmpty }.count, 1)
+        XCTAssertEqual(observations.first(where: { !$0.attachments.isEmpty })?.attachments.count, 2)
+        XCTAssertTrue(observations.contains { $0.providerMetadata["historical_observation_image"] == "omitted" && $0.attachments.isEmpty })
     }
 
     func testHarnessExecutionHintSupportsArabicCountAndIgnoresInternalScreenshotObservation() {
