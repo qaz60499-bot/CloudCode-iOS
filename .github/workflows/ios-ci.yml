@@ -253,6 +253,12 @@ jobs:
           grep -F 'ToolDescriptor(name: "gui.typeObserve"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
           grep -F 'ToolDescriptor(name: "gui.scrollObserve"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
           grep -F 'ToolDescriptor(name: "gui.swipeObserve"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
+          grep -F 'ToolDescriptor(name: "gui.openAppObserve"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
+          grep -F 'ToolDescriptor(name: "gui.findElement"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
+          grep -F 'ToolDescriptor(name: "gui.waitForElement"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
+          grep -F 'ToolDescriptor(name: "gui.tapElementObserve"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
+          grep -F 'ToolDescriptor(name: "gui.typeElementObserve"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
+          grep -F 'ToolDescriptor(name: "gui.runStructuredPlan"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
           grep -F 'ToolDescriptor(name: "interaction.confirmTransition"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
           grep -F 'version: 2, observations: observations, navigation: navigation' Sources/CloudCodeCore/Interaction/IOSInteractionFramework.swift >/dev/null
           if grep -R --line-number 'NSAllowsArbitraryLoads' Sources project.yml Entitlements; then
@@ -291,7 +297,9 @@ jobs:
             '<key>com.apple.QuartzCore.secure-mode</key>' \
             '<key>com.apple.QuartzCore.system-layers</key>' \
             '<key>com.apple.private.IOSurface.protected-access</key>' \
-            '<key>com.apple.backboard.client</key>'; do
+            '<key>com.apple.backboard.client</key>' \
+            '<key>com.apple.frontboard.launchapplications</key>' \
+            '<key>com.apple.backboardd.launchapplications</key>'; do
             if grep -F "$gui_only_entitlement" Entitlements/TrollStore.entitlements >/dev/null; then
               echo "FAIL: GUI-only entitlement leaked onto SwiftUI host: $gui_only_entitlement" >&2
               exit 1
@@ -310,6 +318,8 @@ jobs:
             '<key>com.apple.private.MobileInstallationHelperService.allowed</key>' \
             '<key>com.apple.private.uninstall.deletion</key>' \
             '<key>com.apple.private.mobileinstall.allowedSPI</key>' \
+            '<key>com.apple.frontboard.launchapplications</key>' \
+            '<key>com.apple.backboardd.launchapplications</key>' \
             '<string>UninstallForLaunchServices</string>' \
             '<string>Uninstall</string>' \
             '<key>com.apple.security.iokit-user-client-class</key>' \
@@ -406,6 +416,9 @@ jobs:
           for marker in ('enumerate-json', 'probe-filesystem-json', 'probe-launch', 'probe-uninstall', 'is-installed', 'launch', 'uninstall', 'cleanup-unregistered', 'MCMMetadataIdentifier', 'BundleFilesystemOrphans', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-screenshot-file', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-navigate-back', 'gui-type-base64', 'background-assert-worker', 'background-assert-start', 'background-assert-status', 'background-assert-stop', 'BKSProcessAssertion', 'CloudCode.BackgroundAgent'):
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: root helper command missing: {marker}')
+          for marker in ('FrontBoardServices.framework', 'BackBoardServices.framework', 'FBSSystemService', 'BKSSystemService', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'geteuid() != 0', 'foreground verification passed', 'launchservices+frontboard+backboard'):
+              if marker not in helper_text:
+                  raise SystemExit(f'FAIL: app launch lost bounded board-service fallback/foreground verification marker: {marker}')
           bridge = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
           for marker in ('CLOUDCODE_HELPER_CAPTURE_LIMIT (1024 * 1024)', 'WIFSIGNALED(status)', 'WNOHANG', 'O_NONBLOCK', 'ETIMEDOUT', 'kill(pid, SIGKILL)', 'CloudCodeSpawnHelperInternal', 'stdoutPipe', 'stderrPipe', 'CloudCodeSpawnHelperWithSeparatedOutput', 'helper %@ capture truncated', 'EOVERFLOW'):
               if marker not in bridge:
@@ -416,6 +429,10 @@ jobs:
                   raise SystemExit(f'FAIL: bounded helper bridge API is missing: {marker}')
           if 'run(["enumerate-json"], privilege: .isolatedUser' not in adapters or 'run(["probe-launch"], privilege: .isolatedUser' not in adapters or 'run(["launch", bundleID], privilege: .isolatedUser' not in adapters:
               raise SystemExit('FAIL: app discovery/launch must use the bounded non-root isolated helper path')
+          if 'if isolated.code == 46' not in adapters or 'run(["launch", bundleID], privilege: .root' not in adapters:
+              raise SystemExit('FAIL: exact app-launch rejection lost its bounded privileged board-service fallback')
+          if 'cachedLaunchCapability' not in resolver or 'if let cachedLaunchCapability, cachedLaunchCapability.available' not in resolver:
+              raise SystemExit('FAIL: app launch capability lost process-local success caching and may re-probe on every route check')
           if 'shouldRefreshIndex()' not in resolver or 'failedIndexRetryAfter' not in resolver or 'negativeBundleIDs' not in resolver:
               raise SystemExit('FAIL: installed-app discovery lost cached-index/bounded-refresh guards')
           if 'timeIntervalSince(lastRefresh)' in resolver:
@@ -436,7 +453,7 @@ jobs:
               raise SystemExit('FAIL: modern TrollStore GUI routing must prefer the global IOHID system client before BackBoard fallback')
           if '0x8000000817319375ULL' in gui_text or 'CLOUDCODE_GUI_FALLBACK_SENDER_ID' in gui_text:
               raise SystemExit('FAIL: build53 legacy IOHID sender/profile leaked into build54 GUI helper')
-          for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'run(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'CloudCodeSpawnHelperWithSeparatedOutput', 'runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)', 'runSeparated(["gui-tree-json"], privilege: .root, timeout: 5)', 'result.stdout', 'result.stderr', 'run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)', '全局截图已通过独立 tmp JPEG 通道返回', 'run(["gui-navigate-back", strategy], privilege: .root, timeout: 4)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
+          for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'run(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'CloudCodeSpawnHelperWithSeparatedOutput', 'runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)', 'runSeparated(["gui-tree-json"], privilege: .root, timeout: 3)', 'result.stdout', 'result.stderr', 'run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)', '全局截图已通过独立 tmp JPEG 通道返回', 'run(["gui-navigate-back", strategy], privilege: .root, timeout: 4)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
               if marker not in adapters:
                   raise SystemExit(f'FAIL: GUI adapter lost bounded helper marker: {marker}')
           gui_executor = adapters.split('public struct GUIFallbackExecutor', 1)[1]
@@ -456,6 +473,16 @@ jobs:
           for marker in ('gui.swipeSequence', 'executeSwipeSequence', 'requestedCount', 'sequenceCompleted', 'baselineSHA256', 'byte_identical_after_gesture', 'Task.sleep(nanoseconds: settleNanoseconds)'):
               if marker not in gui_executor:
                   raise SystemExit(f'FAIL: bounded local swipe-sequence fast path missing safety marker: {marker}')
+          for marker in ('GUIElementLookupCache', 'GUIElementResolver.find', 'treeSHA256', 'tree_signature_hit', 'structured element query is ambiguous', 'protected/system-confirmation element cannot be automated', 'gui.openAppObserve', 'gui.findElement', 'gui.waitForElement', 'gui.tapElementObserve', 'gui.typeElementObserve'):
+              if marker not in adapters and marker not in Path('Sources/CloudCodeCore/ToolRouter.swift').read_text(encoding='utf-8'):
+                  raise SystemExit(f'FAIL: structured UI-tree fast path/cache lost safety marker: {marker}')
+          for marker in ('gui.runStructuredPlan', 'executeStructuredPlan', '1...8 steps', 'every state-changing structured step requires expectQuery', 'structured plan stopped at protected', 'structured plan stopped before a commit/irreversible element', 'replanRequired', 'local_structured_validators_passed_final_semantic_review_required'):
+              if marker not in gui_executor:
+                  raise SystemExit(f'FAIL: bounded local structured plan lost validation/replan marker: {marker}')
+          if 'let result = runSeparated(["gui-tree-json"], privilege: .root, timeout: 3)' not in adapters:
+              raise SystemExit('FAIL: structured UI-tree outer deadline regressed above the bounded fast-fail path')
+          if '#define CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS 0.65f' not in gui_text:
+              raise SystemExit('FAIL: AX per-request timeout budget missing; inaccessible apps could stall the structured-first router')
           trollstore_gui = Path('Sources/CloudCodeApp/TrollStoreGUIBackend.swift').read_text(encoding='utf-8')
           if trollstore_gui.count('dispatched-unverified') < 3:
               raise SystemExit('FAIL: TrollStore GUI backend diagnostics reverted to claiming submitted actions as verified success')
@@ -480,13 +507,13 @@ jobs:
           for marker in ('harness_execution', 'bounded_repeated_swipe', 'gui.swipeSequence', 'boundedRepeatedSwipeCount', 'Never turn this hint into an unbounded loop', 'transient_navigation_return', 'return obligation', 'gui.navigateBack', 'strategy=dismissDown', 'Never treat ordinary video-frame changes as proof that navigation succeeded', 'before locating a text field or typing'):
               if marker not in harness_runtime:
                   raise SystemExit(f'FAIL: Harness lost bounded GUI execution/navigation compilation marker: {marker}')
-          for marker in ('IOSInteractionFramework', 'IOSInteractionExperienceStore', 'return obligation', 'tabs as peer roots', 'performance hint only', 'Never learn or persist passwords', 'permanent screen coordinates', 'HID constants', 'retentionInterval: TimeInterval = 30 * 24 * 60 * 60', 'attempts >= 3'):
+          for marker in ('IOSInteractionFramework', 'IOSInteractionExperienceStore', 'return obligation', 'tabs as peer roots', 'performance hint only', 'Never learn or persist passwords', 'permanent screen coordinates', 'HID constants', 'retentionInterval: TimeInterval = 30 * 24 * 60 * 60', 'attempts >= 3', 'native/system lifecycle', 'structured accessibility/UI-tree elements', 'remote Vision reasoning', 'gui.runStructuredPlan', 'local accessibility expectation'):
               if marker not in interaction_framework:
                   raise SystemExit(f'FAIL: embedded iOS Interaction Framework lost core semantics/learning boundary: {marker}')
           for marker in ('tool.lastGUIScreenshotSHA256', 'tool.guiBeforeStateChangeSHA256', 'tool.lastGUIEffectBeforeSHA256', 'tool.lastGUIEffectAfterSHA256', 'tool.lastGUIEffectScreenChanged', 'guiScreenshotChanged', 'byte-identical to the pre-action screenshot'):
               if marker not in agent_core:
                   raise SystemExit(f'FAIL: GUI before/after screenshot effect gate missing: {marker}')
-          for marker in ('gui.swipeSequence', 'prefer gui.swipeSequence', 'strictly bounded', 'Do not use gui.swipeSequence', 'same provider tool plan', 'Never batch two state-changing GUI actions', 'Before gui.type', 'explicitly return to that origin', 'gui.navigateBack with strategy=edge', 'Never infer success from video-frame pixel changes alone'):
+          for marker in ('gui.swipeSequence', 'prefer gui.swipeSequence', 'strictly bounded', 'Do not use gui.swipeSequence', 'same provider tool plan', 'Never batch two state-changing GUI actions', 'Before gui.type', 'explicitly return to that origin', 'gui.navigateBack with strategy=edge', 'Never infer success from video-frame pixel changes alone', 'Prefer deterministic local execution over remote visual reasoning', 'gui.findElement/gui.waitForElement', 'gui.tapElementObserve/gui.typeElementObserve', 'gui.runStructuredPlan', 'protected confirmation stops the plan immediately'):
               if marker not in agent_core:
                   raise SystemExit(f'FAIL: Agent lost bounded GUI fast-path/batching/input/navigation policy: {marker}')
           if 'gui-screenshot-base64' in screenshot_adapter or 'Data(base64Encoded:' in screenshot_adapter:

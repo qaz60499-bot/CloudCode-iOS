@@ -88,6 +88,10 @@
     <true/>
     <key>com.apple.backboard.client</key>
     <true/>
+    <key>com.apple.frontboard.launchapplications</key>
+    <true/>
+    <key>com.apple.backboardd.launchapplications</key>
+    <true/>
     <key>com.apple.security.iokit-user-client-class</key>
     <array>
         <string>IOSurfaceRootUserClient</string>

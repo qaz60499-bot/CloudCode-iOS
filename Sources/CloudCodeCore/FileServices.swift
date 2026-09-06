@@ -136,15 +136,63 @@ public struct FileEntry: Codable, Equatable, Identifiable, Sendable {
 public struct FileSearchQuery: Sendable {
     public var nameContains: String?
     public var extensions: Set<String>
+    public var modifiedAfter: Date?
+    public var modifiedBefore: Date?
     public var maxDepth: Int
     public var maxResults: Int
 
-    public init(nameContains: String? = nil, extensions: Set<String> = [], maxDepth: Int = 4, maxResults: Int = 500) {
+    public init(
+        nameContains: String? = nil,
+        extensions: Set<String> = [],
+        modifiedAfter: Date? = nil,
+        modifiedBefore: Date? = nil,
+        maxDepth: Int = 4,
+        maxResults: Int = 500
+    ) {
         self.nameContains = nameContains
         self.extensions = extensions
+        self.modifiedAfter = modifiedAfter
+        self.modifiedBefore = modifiedBefore
         self.maxDepth = maxDepth
         self.maxResults = maxResults
     }
+}
+
+public struct FileMetadataSnapshot: Codable, Equatable, Sendable {
+    public var path: String
+    public var name: String
+    public var isDirectory: Bool
+    public var isRegularFile: Bool
+    public var size: Int64
+    public var creationDate: Date?
+    public var modificationDate: Date?
+    public var contentType: String?
+    public var fileProtection: String?
+    public var isReadable: Bool
+    public var isWritable: Bool
+
+    public init(path: String, name: String, isDirectory: Bool, isRegularFile: Bool, size: Int64, creationDate: Date?, modificationDate: Date?, contentType: String?, fileProtection: String?, isReadable: Bool, isWritable: Bool) {
+        self.path = path
+        self.name = name
+        self.isDirectory = isDirectory
+        self.isRegularFile = isRegularFile
+        self.size = size
+        self.creationDate = creationDate
+        self.modificationDate = modificationDate
+        self.contentType = contentType
+        self.fileProtection = fileProtection
+        self.isReadable = isReadable
+        self.isWritable = isWritable
+    }
+}
+
+public struct FileTextDiffSummary: Codable, Equatable, Sendable {
+    public var leftPath: String
+    public var rightPath: String
+    public var identical: Bool
+    public var addedLineCount: Int
+    public var removedLineCount: Int
+    public var firstDifferences: [String]
 }
 
 public struct FileService: @unchecked Sendable {
@@ -195,6 +243,12 @@ public struct FileService: @unchecked Sendable {
                 let ext = url.pathExtension.lowercased()
                 if !query.extensions.contains(ext) { continue }
             }
+            if let modifiedAfter = query.modifiedAfter {
+                guard let modificationDate = item.modificationDate, modificationDate >= modifiedAfter else { continue }
+            }
+            if let modifiedBefore = query.modifiedBefore {
+                guard let modificationDate = item.modificationDate, modificationDate <= modifiedBefore else { continue }
+            }
             results.append(item)
             if results.count >= query.maxResults { break }
         }
@@ -218,7 +272,73 @@ public struct FileService: @unchecked Sendable {
         return value
     }
 
-    private func entry(for url: URL) -> FileEntry? {
+    public func stat(_ url: URL, allowedRoot: URL? = nil) throws -> FileMetadataSnapshot {
+        let safe = try pathGuard.validate(target: url, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
+        let values = try safe.resourceValues(forKeys: [
+            .isDirectoryKey, .isRegularFileKey, .fileSizeKey, .totalFileAllocatedSizeKey,
+            .creationDateKey, .contentModificationDateKey, .typeIdentifierKey
+        ])
+        let attributes = try? fileManager.attributesOfItem(atPath: safe.path)
+        let protection = attributes?[.protectionKey].map { String(describing: $0) }
+        let logicalSize = Int64(values.fileSize ?? 0)
+        let allocatedSize = Int64(values.totalFileAllocatedSize ?? 0)
+        return FileMetadataSnapshot(
+            path: safe.path,
+            name: safe.lastPathComponent,
+            isDirectory: values.isDirectory == true,
+            isRegularFile: values.isRegularFile == true,
+            size: max(logicalSize, allocatedSize),
+            creationDate: values.creationDate,
+            modificationDate: values.contentModificationDate,
+            contentType: values.typeIdentifier,
+            fileProtection: protection,
+            isReadable: fileManager.isReadableFile(atPath: safe.path),
+            isWritable: fileManager.isWritableFile(atPath: safe.path)
+        )
+    }
+
+    public func sha256(_ url: URL, allowedRoot: URL? = nil, maxBytes: Int = 64 * 1024 * 1024) throws -> String {
+        let safe = try pathGuard.validate(target: url, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
+        let identity = try secureFileMutation.identity(of: safe, allowedRoot: allowedRoot)
+        let data = try secureFileMutation.readFile(at: safe, allowedRoot: allowedRoot, expectedIdentity: identity, maxBytes: maxBytes)
+        #if canImport(CryptoKit)
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        #else
+        throw CocoaError(.featureUnsupported)
+        #endif
+    }
+
+    public func diffText(_ left: URL, _ right: URL, allowedRoot: URL? = nil, maxBytesPerFile: Int = 1_000_000) throws -> FileTextDiffSummary {
+        let leftText = try readText(left, allowedRoot: allowedRoot, maxBytes: maxBytesPerFile)
+        let rightText = try readText(right, allowedRoot: allowedRoot, maxBytes: maxBytesPerFile)
+        let leftLines = leftText.components(separatedBy: .newlines)
+        let rightLines = rightText.components(separatedBy: .newlines)
+        let difference = rightLines.difference(from: leftLines)
+        var added = 0
+        var removed = 0
+        var firstDifferences: [String] = []
+        firstDifferences.reserveCapacity(32)
+        for change in difference {
+            switch change {
+            case .insert(let offset, let element, _):
+                added += 1
+                if firstDifferences.count < 32 { firstDifferences.append("+\(offset + 1): \(String(element.prefix(240)))") }
+            case .remove(let offset, let element, _):
+                removed += 1
+                if firstDifferences.count < 32 { firstDifferences.append("-\(offset + 1): \(String(element.prefix(240)))") }
+            }
+        }
+        return FileTextDiffSummary(
+            leftPath: left.standardizedFileURL.path,
+            rightPath: right.standardizedFileURL.path,
+            identical: difference.isEmpty,
+            addedLineCount: added,
+            removedLineCount: removed,
+            firstDifferences: firstDifferences
+        )
+    }
+
+    private func entry(for url: URL) -> FileEntry?
         guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileAllocatedSizeKey, .totalFileAllocatedSizeKey, .contentModificationDateKey]) else { return nil }
         let isDirectory = values.isDirectory == true
         let size = isDirectory ? (try? fileManager.allocatedSizeOfItem(at: url)) ?? 0 : Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)

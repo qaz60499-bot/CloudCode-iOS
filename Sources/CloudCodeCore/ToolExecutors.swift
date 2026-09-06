@@ -24,6 +24,10 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
     private let audit: AuditLogStore
     private let approval: ApprovalRequesting
     private let secureFileMutation: SecureFileMutation
+    private let plistService: NativePropertyListService
+    private let jsonService: NativeJSONService
+    private let sqliteService: NativeSQLiteService
+    private let resourceIndex: ProgressiveResourceIndex?
 
     public init(
         capabilityProbe: CapabilityProbing,
@@ -36,7 +40,11 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
         policy: PolicyEngine,
         audit: AuditLogStore,
         approval: ApprovalRequesting,
-        secureFileMutation: SecureFileMutation = SecureFileMutation()
+        secureFileMutation: SecureFileMutation = SecureFileMutation(),
+        plistService: NativePropertyListService = NativePropertyListService(),
+        jsonService: NativeJSONService = NativeJSONService(),
+        sqliteService: NativeSQLiteService = NativeSQLiteService(),
+        resourceIndex: ProgressiveResourceIndex? = nil
     ) {
         self.capabilityProbe = capabilityProbe
         self.appResolver = appResolver
@@ -49,13 +57,20 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
         self.audit = audit
         self.approval = approval
         self.secureFileMutation = secureFileMutation
+        self.plistService = plistService
+        self.jsonService = jsonService
+        self.sqliteService = sqliteService
+        self.resourceIndex = resourceIndex
     }
 
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
         let supported: Set<String> = [
-            "capability.probe", "apps.list", "apps.inspect", "container.resolve",
-            "files.list", "files.search", "files.read", "storage.analyze", "files.create",
-            "files.modify", "files.delete", "trash.restore", "trash.purge",
+            "capability.probe", "apps.list", "apps.inspect", "container.resolve", "container.list", "container.search",
+            "files.list", "files.search", "files.read", "files.stat", "files.metadata", "files.hash", "files.diff", "files.copy", "files.move",
+            "plist.read", "plist.query", "plist.metadata",
+            "json.read", "json.query", "json.filter", "json.aggregate",
+            "sqlite.discover", "sqlite.tables", "sqlite.schema", "sqlite.query", "sqlite.filter", "sqlite.aggregate", "sqlite.sample",
+            "data.localQuery", "storage.analyze", "files.create", "files.modify", "files.delete", "trash.restore", "trash.purge",
             "ipa.locate", "ipa.inspect", "ipa.extract", "ipa.repack"
         ]
         return supported.contains(tool.name)
@@ -133,24 +148,51 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
 
         case "container.resolve":
             guard let bundleID = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
-            let node = try await resourceResolver.resolve(ResourceID("container://\(bundleID)"))
+            let node = try await resourceResolver.resolve(containerResourceID(bundleID: bundleID, relativePath: nil))
+            try? await resourceIndex?.add(node)
             let payload = ["logical": node.logicalLocation, "path": node.resolvedPath ?? ""]
             return try untrustedResult(call.id, summary: "容器解析完成", key: "container", value: payload, source: "container.resolve")
+
+        case "container.list":
+            guard let bundleID = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
+            let rootNode = try await resourceResolver.resolve(containerResourceID(bundleID: bundleID, relativePath: nil))
+            let node = try await resourceResolver.resolve(containerResourceID(bundleID: bundleID, relativePath: call.arguments["relativePath"]))
+            guard let rootPath = rootNode.resolvedPath, let resolvedPath = node.resolvedPath else { throw ToolRouterError.noExecutionRoute("container path unavailable") }
+            let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true)
+            let targetURL = URL(fileURLWithPath: resolvedPath, isDirectory: true)
+            _ = try PathGuard().validate(target: targetURL, allowedRoot: context.allowedRoot, rejectSymlink: true)
+            let entries = try fileService.list(directory: targetURL, allowedRoot: rootURL)
+            try? await resourceIndex?.add(rootNode)
+            try? await resourceIndex?.add(node)
+            try? await index(entries: entries, ownerBundleID: bundleID)
+            return try untrustedResult(call.id, summary: "容器目录列出 \(entries.count) 项", key: "entries", value: entries, source: "container.list")
+
+        case "container.search":
+            guard let bundleID = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
+            let rootNode = try await resourceResolver.resolve(containerResourceID(bundleID: bundleID, relativePath: nil))
+            let node = try await resourceResolver.resolve(containerResourceID(bundleID: bundleID, relativePath: call.arguments["relativePath"]))
+            guard let rootPath = rootNode.resolvedPath, let resolvedPath = node.resolvedPath else { throw ToolRouterError.noExecutionRoute("container path unavailable") }
+            let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true)
+            let targetURL = URL(fileURLWithPath: resolvedPath, isDirectory: true)
+            _ = try PathGuard().validate(target: targetURL, allowedRoot: context.allowedRoot, rejectSymlink: true)
+            let query = makeFileSearchQuery(call, defaultMaxDepth: 6, defaultMaxResults: 200)
+            let entries = try fileService.search(root: targetURL, query: query, allowedRoot: rootURL)
+            try? await resourceIndex?.add(rootNode)
+            try? await resourceIndex?.add(node)
+            try? await index(entries: entries, ownerBundleID: bundleID)
+            return try untrustedResult(call.id, summary: "容器搜索找到 \(entries.count) 项", key: "entries", value: entries, source: "container.search")
 
         case "files.list":
             let url = try requiredURL(call, key: "path")
             let entries = try fileService.list(directory: url, allowedRoot: context.allowedRoot)
+            try? await index(entries: entries, ownerBundleID: nil)
             return try untrustedResult(call.id, summary: "列出 \(entries.count) 个项目", key: "entries", value: entries, source: "files.list")
 
         case "files.search":
             let root = try requiredURL(call, key: "path")
-            let query = FileSearchQuery(
-                nameContains: call.arguments["query"],
-                extensions: call.arguments["extension"].map { [$0.lowercased()] } ?? [],
-                maxDepth: Int(call.arguments["maxDepth"] ?? "6") ?? 6,
-                maxResults: Int(call.arguments["maxResults"] ?? "500") ?? 500
-            )
+            let query = makeFileSearchQuery(call, defaultMaxDepth: 6, defaultMaxResults: 500)
             let entries = try fileService.search(root: root, query: query, allowedRoot: context.allowedRoot)
+            try? await index(entries: entries, ownerBundleID: nil)
             return try untrustedResult(call.id, summary: "找到 \(entries.count) 个项目", key: "entries", value: entries, source: "files.search")
 
         case "files.read":
@@ -158,6 +200,166 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             let text = try fileService.readText(url, allowedRoot: context.allowedRoot)
             let envelope = ToolOutputEnvelope(trust: .untrustedData, source: url.path, content: text)
             return ToolResult(toolCallID: call.id, success: true, summary: "已读取 \(url.lastPathComponent)", payload: ["content": envelope.promptSafeRepresentation])
+
+        case "files.stat", "files.metadata":
+            let url = try requiredURL(call, key: "path")
+            let metadata = try fileService.stat(url, allowedRoot: context.allowedRoot)
+            return try untrustedResult(call.id, summary: "已读取当前文件元数据", key: "metadata", value: metadata, source: call.name)
+
+        case "files.hash":
+            let url = try requiredURL(call, key: "path")
+            let maxBytes = min(max(Int(call.arguments["maxBytes"] ?? "67108864") ?? 67_108_864, 1), 67_108_864)
+            let hash = try fileService.sha256(url, allowedRoot: context.allowedRoot, maxBytes: maxBytes)
+            return ToolResult(toolCallID: call.id, success: true, summary: "SHA-256 计算完成", payload: ["path": url.standardizedFileURL.path, "sha256": hash])
+
+        case "files.diff":
+            let left = try requiredURL(call, key: "leftPath")
+            let right = try requiredURL(call, key: "rightPath")
+            let diff = try fileService.diffText(left, right, allowedRoot: context.allowedRoot, maxBytesPerFile: min(max(Int(call.arguments["maxBytesPerFile"] ?? "1000000") ?? 1_000_000, 1), 2_000_000))
+            return try untrustedResult(call.id, summary: diff.identical ? "文本内容一致" : "文本差异已计算", key: "diff", value: diff, source: "files.diff")
+
+        case "files.copy", "files.move":
+            let source = try requiredURL(call, key: "source")
+            let destination = try requiredURL(call, key: "destination")
+            if call.name == "files.move", PathGuard.isSystemManagedApplicationContainerTarget(source.standardizedFileURL.resolvingSymlinksInPath()) {
+                throw PathSafetyError.systemManagedApplicationContainer
+            }
+            let guardedSource = try PathGuard().validate(target: source, allowedRoot: context.allowedRoot, rejectSymlink: true)
+            let guardedDestination = try PathGuard().validate(target: destination, allowedRoot: context.allowedRoot, rejectSymlink: true)
+            let sourceIdentity = try secureFileMutation.identity(of: guardedSource, allowedRoot: context.allowedRoot)
+            let destinationParentIdentity = try? secureFileMutation.parentIdentity(of: guardedDestination, allowedRoot: context.allowedRoot)
+            let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: guardedDestination.path)
+            if decision == .deny { throw TransactionError.confirmationDenied }
+            if decision == .requireConfirmation {
+                let title = call.name == "files.copy" ? "复制文件" : "移动文件"
+                let preview = ApprovalPreview(
+                    title: title,
+                    target: guardedDestination.path,
+                    originalSummary: guardedSource.path,
+                    reason: call.arguments["reason"] ?? "Agent 请求\(title)",
+                    plan: ["重新验证源路径身份", "重新验证目标父目录身份", title, "验证最终状态", "写入审计日志"],
+                    risk: descriptor.risk
+                )
+                guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
+            }
+            let finalSource = try PathGuard().validate(target: source, allowedRoot: context.allowedRoot, rejectSymlink: true)
+            let finalDestination = try PathGuard().validate(target: destination, allowedRoot: context.allowedRoot, rejectSymlink: true)
+            guard finalSource.path == guardedSource.path, finalDestination.path == guardedDestination.path else {
+                throw PathSafetyError.targetChangedAfterApproval
+            }
+            if call.name == "files.copy" {
+                try secureFileMutation.copyFile(
+                    from: finalSource,
+                    sourceAllowedRoot: context.allowedRoot,
+                    to: finalDestination,
+                    destinationAllowedRoot: context.allowedRoot,
+                    createDestinationIntermediates: true,
+                    expectedSourceIdentity: sourceIdentity,
+                    expectedDestinationParentIdentity: destinationParentIdentity
+                )
+            } else {
+                try secureFileMutation.moveItem(
+                    from: finalSource,
+                    sourceAllowedRoot: context.allowedRoot,
+                    to: finalDestination,
+                    destinationAllowedRoot: context.allowedRoot,
+                    createDestinationIntermediates: true,
+                    expectedSourceIdentity: sourceIdentity,
+                    expectedDestinationParentIdentity: destinationParentIdentity
+                )
+            }
+            let sourceExists = FileManager.default.fileExists(atPath: finalSource.path)
+            let destinationExists = FileManager.default.fileExists(atPath: finalDestination.path)
+            let passed = destinationExists && (call.name == "files.copy" ? sourceExists : !sourceExists)
+            let verification = VerificationResult(
+                passed: passed,
+                checks: call.name == "files.copy"
+                    ? ["descriptor-pinned source/destination", "copied bytes re-read through file descriptors", "source and destination exist"]
+                    : ["descriptor-pinned source/destination", "exclusive rename identity verified", "source removed and destination exists"],
+                failures: passed ? [] : ["最终文件状态不符合预期"]
+            )
+            try await audit.append(AuditEvent(sessionID: call.sessionID, toolCallID: call.id, action: call.name, target: finalDestination.path, risk: descriptor.risk, result: passed ? "completed" : "verification_failed", detail: ["source": finalSource.path]))
+            if passed, let metadata = try? fileService.stat(finalDestination, allowedRoot: context.allowedRoot) {
+                try? await index(metadata: metadata, ownerBundleID: nil)
+            }
+            return ToolResult(toolCallID: call.id, success: passed, summary: passed ? "\(call.name == "files.copy" ? "复制" : "移动")完成" : "最终状态验证失败", payload: ["source": finalSource.path, "destination": finalDestination.path], verification: verification)
+
+        case "plist.read":
+            let path = try requiredURL(call, key: "path")
+            return try untrustedAnyResult(call.id, summary: "plist 已读取", key: "value", value: plistService.read(path: path, allowedRoot: context.allowedRoot), source: "plist.read")
+
+        case "plist.query":
+            let path = try requiredURL(call, key: "path")
+            let keyPath = call.arguments["keyPath"] ?? "$"
+            return try untrustedAnyResult(call.id, summary: "plist 查询完成", key: "value", value: plistService.query(path: path, keyPath: keyPath, allowedRoot: context.allowedRoot), source: "plist.query")
+
+        case "plist.metadata":
+            let path = try requiredURL(call, key: "path")
+            let metadata = try plistService.metadata(path: path, allowedRoot: context.allowedRoot)
+            return try untrustedResult(call.id, summary: "plist 元数据读取完成", key: "metadata", value: metadata, source: "plist.metadata")
+
+        case "json.read":
+            let path = try requiredURL(call, key: "path")
+            return try untrustedAnyResult(call.id, summary: "JSON 已读取", key: "value", value: jsonService.read(path: path, allowedRoot: context.allowedRoot), source: "json.read")
+
+        case "json.query":
+            let path = try requiredURL(call, key: "path")
+            return try untrustedAnyResult(call.id, summary: "JSON 查询完成", key: "value", value: jsonService.query(path: path, keyPath: call.arguments["keyPath"] ?? "$", allowedRoot: context.allowedRoot), source: "json.query")
+
+        case "json.filter":
+            let path = try requiredURL(call, key: "path")
+            guard let field = call.arguments["field"], let equals = call.arguments["equals"] else { throw ToolRouterError.noExecutionRoute("field/equals missing") }
+            let value = try jsonService.filter(path: path, keyPath: call.arguments["keyPath"] ?? "$", field: field, equals: equals, limit: Int(call.arguments["limit"] ?? "100") ?? 100, allowedRoot: context.allowedRoot)
+            return try untrustedAnyResult(call.id, summary: "JSON 过滤完成", key: "value", value: value, source: "json.filter")
+
+        case "json.aggregate":
+            let path = try requiredURL(call, key: "path")
+            guard let operation = call.arguments["operation"] else { throw ToolRouterError.noExecutionRoute("operation missing") }
+            let value = try jsonService.aggregate(path: path, keyPath: call.arguments["keyPath"] ?? "$", field: call.arguments["field"], operation: operation, allowedRoot: context.allowedRoot)
+            return try untrustedResult(call.id, summary: "JSON 聚合完成", key: "aggregate", value: value, source: "json.aggregate")
+
+        case "sqlite.discover":
+            let root = try requiredURL(call, key: "path")
+            var query = makeFileSearchQuery(call, defaultMaxDepth: 8, defaultMaxResults: 200)
+            query.extensions = ["sqlite", "sqlite3", "db"]
+            let entries = try fileService.search(root: root, query: query, allowedRoot: context.allowedRoot).filter { !$0.isDirectory }
+            try? await index(entries: entries, ownerBundleID: nil)
+            return try untrustedResult(call.id, summary: "发现 \(entries.count) 个 SQLite 候选", key: "entries", value: entries, source: "sqlite.discover")
+
+        case "sqlite.tables":
+            let path = try requiredURL(call, key: "path")
+            return try untrustedResult(call.id, summary: "SQLite 表/视图读取完成", key: "result", value: sqliteService.tables(path: path, allowedRoot: context.allowedRoot), source: "sqlite.tables")
+
+        case "sqlite.schema":
+            let path = try requiredURL(call, key: "path")
+            return try untrustedResult(call.id, summary: "SQLite schema 读取完成", key: "result", value: sqliteService.schema(path: path, table: call.arguments["table"], allowedRoot: context.allowedRoot), source: "sqlite.schema")
+
+        case "sqlite.query":
+            let path = try requiredURL(call, key: "path")
+            guard let sql = call.arguments["sql"] else { throw ToolRouterError.noExecutionRoute("sql missing") }
+            let result = try sqliteService.query(path: path, sql: sql, parametersJSON: call.arguments["params"], rowLimit: Int(call.arguments["rowLimit"] ?? "200") ?? 200, timeoutMS: Int(call.arguments["timeoutMs"] ?? "2000") ?? 2_000, allowedRoot: context.allowedRoot)
+            return try untrustedResult(call.id, summary: "SQLite 只读查询完成", key: "result", value: result, source: "sqlite.query")
+
+        case "sqlite.filter":
+            let path = try requiredURL(call, key: "path")
+            guard let table = call.arguments["table"], let field = call.arguments["field"], let equals = call.arguments["equals"] else { throw ToolRouterError.noExecutionRoute("table/field/equals missing") }
+            let result = try sqliteService.filter(path: path, table: table, field: field, equals: equals, limit: Int(call.arguments["limit"] ?? "100") ?? 100, allowedRoot: context.allowedRoot)
+            return try untrustedResult(call.id, summary: "SQLite 过滤完成", key: "result", value: result, source: "sqlite.filter")
+
+        case "sqlite.aggregate":
+            let path = try requiredURL(call, key: "path")
+            guard let table = call.arguments["table"], let operation = call.arguments["operation"] else { throw ToolRouterError.noExecutionRoute("table/operation missing") }
+            let result = try sqliteService.aggregate(path: path, table: table, field: call.arguments["field"], operation: operation, allowedRoot: context.allowedRoot)
+            return try untrustedResult(call.id, summary: "SQLite 聚合完成", key: "result", value: result, source: "sqlite.aggregate")
+
+        case "sqlite.sample":
+            let path = try requiredURL(call, key: "path")
+            guard let table = call.arguments["table"] else { throw ToolRouterError.noExecutionRoute("table missing") }
+            let result = try sqliteService.sample(path: path, table: table, limit: Int(call.arguments["limit"] ?? "20") ?? 20, allowedRoot: context.allowedRoot)
+            return try untrustedResult(call.id, summary: "SQLite sample 完成", key: "result", value: result, source: "sqlite.sample")
+
+        case "data.localQuery":
+            return try await executeBoundedDataMacro(call, context: context)
 
         case "storage.analyze":
             let root = try requiredURL(call, key: "path")
@@ -412,6 +614,224 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
     private func requiredURL(_ call: ToolCall, key: String) throws -> URL {
         guard let raw = call.arguments[key], !raw.isEmpty else { throw ToolRouterError.noExecutionRoute("\(key) missing") }
         return URL(fileURLWithPath: raw)
+    }
+
+    private func makeFileSearchQuery(_ call: ToolCall, defaultMaxDepth: Int, defaultMaxResults: Int) -> FileSearchQuery {
+        let extensions = Set((call.arguments["extension"] ?? "")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty })
+        return FileSearchQuery(
+            nameContains: call.arguments["query"],
+            extensions: extensions,
+            modifiedAfter: call.arguments["modifiedAfter"].flatMap(parseISO8601),
+            modifiedBefore: call.arguments["modifiedBefore"].flatMap(parseISO8601),
+            maxDepth: min(max(Int(call.arguments["maxDepth"] ?? String(defaultMaxDepth)) ?? defaultMaxDepth, 0), 16),
+            maxResults: min(max(Int(call.arguments["maxResults"] ?? String(defaultMaxResults)) ?? defaultMaxResults, 1), 2_000)
+        )
+    }
+
+    private func parseISO8601(_ value: String) -> Date? {
+        ISO8601DateFormatter().date(from: value)
+    }
+
+    private func containerResourceID(bundleID: String, relativePath: String?) -> ResourceID {
+        var components = URLComponents()
+        components.scheme = "container"
+        components.host = bundleID
+        if let relativePath {
+            let trimmed = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            if !trimmed.isEmpty { components.path = "/" + trimmed }
+        }
+        return ResourceID(components.string ?? "container://\(bundleID)")
+    }
+
+    private func index(entries: [FileEntry], ownerBundleID: String?) async throws {
+        guard let resourceIndex, !entries.isEmpty else { return }
+        let nodes = entries.map { entry -> ResourceNode in
+            let id = ResourceID(URL(fileURLWithPath: entry.path).absoluteString)
+            var metadata: [String: String] = [:]
+            if let date = entry.modificationDate { metadata["modifiedAt"] = ISO8601DateFormatter().string(from: date) }
+            return ResourceNode(
+                id: id,
+                kind: entry.isDirectory ? .directory : .file,
+                displayName: entry.name,
+                logicalLocation: id.rawValue,
+                resolvedPath: entry.path,
+                ownerBundleID: ownerBundleID,
+                byteSize: entry.size,
+                metadata: metadata
+            )
+        }
+        try await resourceIndex.add(nodes)
+    }
+
+    private func index(metadata: FileMetadataSnapshot, ownerBundleID: String?) async throws {
+        guard let resourceIndex else { return }
+        let id = ResourceID(URL(fileURLWithPath: metadata.path).absoluteString)
+        let node = ResourceNode(
+            id: id,
+            kind: metadata.isDirectory ? .directory : .file,
+            displayName: metadata.name,
+            logicalLocation: id.rawValue,
+            resolvedPath: metadata.path,
+            ownerBundleID: ownerBundleID,
+            byteSize: metadata.size,
+            metadata: ["contentType": metadata.contentType ?? ""]
+        )
+        try await resourceIndex.add(node)
+    }
+
+    private func executeBoundedDataMacro(_ call: ToolCall, context: ToolExecutionContext) async throws -> ToolResult {
+        var stages: [String] = []
+        var ownerBundleID: String?
+        var executionAllowedRoot = context.allowedRoot
+        let target: URL
+        if let bundleID = call.arguments["bundleId"], !bundleID.isEmpty {
+            ownerBundleID = bundleID
+            let rootNode = try await resourceResolver.resolve(containerResourceID(bundleID: bundleID, relativePath: nil))
+            let node = try await resourceResolver.resolve(containerResourceID(bundleID: bundleID, relativePath: call.arguments["relativePath"]))
+            guard let rootPath = rootNode.resolvedPath, let resolvedPath = node.resolvedPath else { throw ToolRouterError.noExecutionRoute("container path unavailable") }
+            let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true)
+            target = URL(fileURLWithPath: resolvedPath)
+            _ = try PathGuard().validate(target: target, allowedRoot: context.allowedRoot, rejectSymlink: true)
+            executionAllowedRoot = rootURL
+            try? await resourceIndex?.add(rootNode)
+            try? await resourceIndex?.add(node)
+            stages.append("resolve:container")
+        } else {
+            target = try requiredURL(call, key: "path")
+            stages.append("resolve:path")
+        }
+
+        var selected = target
+        var metadata = try fileService.stat(selected, allowedRoot: executionAllowedRoot)
+        if metadata.isDirectory {
+            let requestedFormat = (call.arguments["format"] ?? "auto").lowercased()
+            let extensions: Set<String>
+            switch requestedFormat {
+            case "plist": extensions = ["plist"]
+            case "json": extensions = ["json"]
+            case "sqlite": extensions = ["sqlite", "sqlite3", "db"]
+            default: extensions = ["plist", "json", "sqlite", "sqlite3", "db"]
+            }
+            let query = FileSearchQuery(
+                nameContains: call.arguments["query"],
+                extensions: extensions,
+                maxDepth: min(max(Int(call.arguments["maxDepth"] ?? "6") ?? 6, 0), 8),
+                maxResults: 32
+            )
+            let candidates = try fileService.search(root: selected, query: query, allowedRoot: executionAllowedRoot).filter { !$0.isDirectory }
+            try? await index(entries: candidates, ownerBundleID: ownerBundleID)
+            guard candidates.count == 1, let candidate = candidates.first else {
+                throw ToolRouterError.noExecutionRoute("bounded data macro requires one unique data file candidate; matched \(candidates.count)")
+            }
+            selected = URL(fileURLWithPath: candidate.path)
+            metadata = try fileService.stat(selected, allowedRoot: executionAllowedRoot)
+            stages.append("search:unique")
+        }
+        try? await index(metadata: metadata, ownerBundleID: ownerBundleID)
+        stages.append("inspect:metadata")
+
+        let requestedFormat = (call.arguments["format"] ?? "auto").lowercased()
+        let detectedFormat: String
+        if requestedFormat != "auto" {
+            detectedFormat = requestedFormat
+        } else {
+            switch selected.pathExtension.lowercased() {
+            case "plist": detectedFormat = "plist"
+            case "json": detectedFormat = "json"
+            case "sqlite", "sqlite3", "db": detectedFormat = "sqlite"
+            default: throw ToolRouterError.noExecutionRoute("unable to infer local data format")
+            }
+        }
+
+        let result: Any
+        switch detectedFormat {
+        case "plist":
+            if (call.arguments["mode"] ?? "") == "metadata" {
+                result = try plistService.metadata(path: selected, allowedRoot: executionAllowedRoot)
+                stages.append("query:plist.metadata")
+            } else if let keyPath = call.arguments["keyPath"] {
+                result = try plistService.query(path: selected, keyPath: keyPath, allowedRoot: executionAllowedRoot)
+                stages.append("query:plist")
+            } else {
+                result = try plistService.read(path: selected, allowedRoot: executionAllowedRoot)
+                stages.append("query:plist.read")
+            }
+        case "json":
+            if let operation = call.arguments["operation"] {
+                result = try jsonService.aggregate(path: selected, keyPath: call.arguments["keyPath"] ?? "$", field: call.arguments["field"], operation: operation, allowedRoot: executionAllowedRoot)
+                stages.append("aggregate:json")
+            } else if let field = call.arguments["field"], let equals = call.arguments["equals"] {
+                result = try jsonService.filter(path: selected, keyPath: call.arguments["keyPath"] ?? "$", field: field, equals: equals, limit: Int(call.arguments["limit"] ?? "100") ?? 100, allowedRoot: executionAllowedRoot)
+                stages.append("filter:json")
+            } else if let keyPath = call.arguments["keyPath"] {
+                result = try jsonService.query(path: selected, keyPath: keyPath, allowedRoot: executionAllowedRoot)
+                stages.append("query:json")
+            } else {
+                result = try jsonService.read(path: selected, allowedRoot: executionAllowedRoot)
+                stages.append("query:json.read")
+            }
+        case "sqlite":
+            let sqliteResult: NativeSQLiteQueryResult
+            if let sql = call.arguments["sql"] {
+                sqliteResult = try sqliteService.query(path: selected, sql: sql, parametersJSON: call.arguments["params"], rowLimit: Int(call.arguments["rowLimit"] ?? "200") ?? 200, timeoutMS: Int(call.arguments["timeoutMs"] ?? "2000") ?? 2_000, allowedRoot: executionAllowedRoot)
+                stages.append("query:sqlite")
+            } else if let operation = call.arguments["operation"], let table = call.arguments["table"] {
+                sqliteResult = try sqliteService.aggregate(path: selected, table: table, field: call.arguments["field"], operation: operation, allowedRoot: executionAllowedRoot)
+                stages.append("aggregate:sqlite")
+            } else if let table = call.arguments["table"], let field = call.arguments["field"], let equals = call.arguments["equals"] {
+                sqliteResult = try sqliteService.filter(path: selected, table: table, field: field, equals: equals, limit: Int(call.arguments["limit"] ?? "100") ?? 100, allowedRoot: executionAllowedRoot)
+                stages.append("filter:sqlite")
+            } else if let table = call.arguments["table"] {
+                sqliteResult = try sqliteService.sample(path: selected, table: table, limit: Int(call.arguments["limit"] ?? "20") ?? 20, allowedRoot: executionAllowedRoot)
+                stages.append("sample:sqlite")
+            } else {
+                sqliteResult = try sqliteService.tables(path: selected, allowedRoot: executionAllowedRoot)
+                stages.append("inspect:sqlite.tables")
+            }
+            result = try encodableJSONObject(sqliteResult)
+        default:
+            throw ToolRouterError.noExecutionRoute("unsupported local data format \(detectedFormat)")
+        }
+
+        let payload: [String: Any] = [
+            "path": selected.path,
+            "format": detectedFormat,
+            "stages": stages,
+            "metadata": [
+                "size": metadata.size,
+                "contentType": metadata.contentType ?? "",
+                "modifiedAt": metadata.modificationDate.map { ISO8601DateFormatter().string(from: $0) } ?? ""
+            ],
+            "result": NativeStructuredValue.jsonCompatible(result)
+        ]
+        return try untrustedAnyResult(call.id, summary: "本地 bounded data macro 完成：\(stages.joined(separator: "→"))", key: "macro", value: payload, source: "data.localQuery")
+    }
+
+    private func encodableJSONObject<T: Encodable>(_ value: T) throws -> Any {
+        let data = try JSONEncoder.pretty.encode(value)
+        return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+    }
+
+    private func untrustedAnyResult(_ id: UUID, summary: String, key: String, value: Any, source: String) throws -> ToolResult {
+        let object = NativeStructuredValue.jsonCompatible(value)
+        let encoded = try JSONSerialization.data(withJSONObject: object, options: [.fragmentsAllowed, .sortedKeys])
+        let content: String
+        if encoded.count <= 512 * 1024 {
+            content = String(data: encoded, encoding: .utf8) ?? "null"
+        } else {
+            let preview = String(decoding: encoded.prefix(256 * 1024), as: UTF8.self)
+            let bounded = try JSONSerialization.data(withJSONObject: [
+                "truncated": true,
+                "byteCount": encoded.count,
+                "preview": preview
+            ], options: [.sortedKeys])
+            content = String(data: bounded, encoding: .utf8) ?? "{\"truncated\":true}"
+        }
+        let envelope = ToolOutputEnvelope(trust: .untrustedData, source: source, content: content)
+        return ToolResult(toolCallID: id, success: true, summary: summary, payload: [key: envelope.promptSafeRepresentation])
     }
 
     private func untrustedResult<T: Encodable>(_ id: UUID, summary: String, key: String, value: T, source: String, verification: VerificationResult? = nil) throws -> ToolResult {

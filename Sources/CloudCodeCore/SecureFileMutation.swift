@@ -362,7 +362,7 @@ public struct SecureFileMutation: Sendable {
         try requireDestinationAbsent(parentFD: destinationParent.fd, leaf: destinationParent.leaf)
 
         let destinationFD = destinationParent.leaf.withCString {
-            openat(destinationParent.fd, $0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
+            openat(destinationParent.fd, $0, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
         }
         guard destinationFD >= 0 else {
             let code = errno
@@ -380,6 +380,7 @@ public struct SecureFileMutation: Sendable {
 
         try copyAll(from: sourceFD, to: destinationFD)
         guard fsync(destinationFD) == 0 else { throw SecureFileMutationError.posix(errno) }
+        try verifyFileDescriptorsEqual(sourceFD, destinationFD)
         try assertPinnedDirectoryStillMatches(sourceParent.fd, path: sourceParent.path)
         try assertPinnedDirectoryStillMatches(destinationParent.fd, path: destinationParent.path)
         try assertLeafStillMatches(parentFD: sourceParent.fd, leaf: sourceParent.leaf, expected: sourceStat)
@@ -750,6 +751,31 @@ public struct SecureFileMutation: Sendable {
                 }
                 if writeCount == 0 { throw SecureFileMutationError.verificationFailed }
                 offset += writeCount
+            }
+        }
+    }
+
+    private func verifyFileDescriptorsEqual(_ lhsFD: Int32, _ rhsFD: Int32) throws {
+        guard lseek(lhsFD, 0, SEEK_SET) >= 0, lseek(rhsFD, 0, SEEK_SET) >= 0 else {
+            throw SecureFileMutationError.posix(errno)
+        }
+        var lhs = [UInt8](repeating: 0, count: 256 * 1024)
+        var rhs = [UInt8](repeating: 0, count: 256 * 1024)
+        while true {
+            let lhsCount = lhs.withUnsafeMutableBytes { read(lhsFD, $0.baseAddress, $0.count) }
+            if lhsCount < 0 {
+                if errno == EINTR { continue }
+                throw SecureFileMutationError.posix(errno)
+            }
+            let rhsCount = rhs.withUnsafeMutableBytes { read(rhsFD, $0.baseAddress, $0.count) }
+            if rhsCount < 0 {
+                if errno == EINTR { continue }
+                throw SecureFileMutationError.posix(errno)
+            }
+            guard lhsCount == rhsCount else { throw SecureFileMutationError.verificationFailed }
+            if lhsCount == 0 { break }
+            guard lhs.prefix(lhsCount).elementsEqual(rhs.prefix(rhsCount)) else {
+                throw SecureFileMutationError.verificationFailed
             }
         }
     }

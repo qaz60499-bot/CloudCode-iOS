@@ -1659,6 +1659,50 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.typeObserve", arguments: ["text": "secret text"], sessionID: UUID())), "当前前台 App · 输入 11 个字符（内容已隐藏）")
     }
 
+    func testStructuredGUIElementToolsPreferTreeAndBoundedLocalExecutionCapabilities() async throws {
+        let registry = ToolRegistry()
+        let find = try XCTUnwrap(await registry.descriptor(named: "gui.findElement"))
+        let wait = try XCTUnwrap(await registry.descriptor(named: "gui.waitForElement"))
+        let tap = try XCTUnwrap(await registry.descriptor(named: "gui.tapElementObserve"))
+        let type = try XCTUnwrap(await registry.descriptor(named: "gui.typeElementObserve"))
+        let plan = try XCTUnwrap(await registry.descriptor(named: "gui.runStructuredPlan"))
+        let openObserve = try XCTUnwrap(await registry.descriptor(named: "gui.openAppObserve"))
+
+        XCTAssertEqual(find.requiredCapabilities, [GUIAutomationFeature.tree.capabilityID])
+        XCTAssertEqual(wait.requiredCapabilities, [GUIAutomationFeature.tree.capabilityID])
+        XCTAssertEqual(tap.requiredCapabilities, [GUIAutomationFeature.tree.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
+        XCTAssertEqual(type.requiredCapabilities, [GUIAutomationFeature.tree.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
+        XCTAssertEqual(plan.requiredCapabilities, [GUIAutomationFeature.openApp.capabilityID, GUIAutomationFeature.tree.capabilityID, GUIAutomationFeature.screenshot.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.gestures.capabilityID])
+        XCTAssertEqual(openObserve.requiredCapabilities, [GUIAutomationFeature.openApp.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
+        XCTAssertEqual(type.risk, .sensitiveWrite)
+        XCTAssertEqual(plan.risk, .sensitiveWrite)
+        XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.typeElementObserve", arguments: ["query": "搜索", "text": "private text"], sessionID: UUID())), "当前前台 App · structured element input 12 个字符（内容已隐藏）")
+    }
+
+    func testGUIElementResolverFindsExactIdentifierAndChineseContainsWithoutVision() throws {
+        let tree = #"{"backend":"AXRuntime","tree":{"role":"Application","frame":{"x":0,"y":0,"width":390,"height":844},"children":[{"role":"Button","identifier":"search.button","label":"搜索","frame":{"x":320,"y":40,"width":44,"height":44}},{"role":"StaticText","label":"发现更多精彩内容","frame":{"x":20,"y":120,"width":200,"height":30}}]}}"#
+
+        let exact = GUIElementResolver.find(in: tree, query: "search.button", role: "Button", mode: .exact)
+        XCTAssertEqual(exact.count, 1)
+        let exactMatch = try XCTUnwrap(exact.first)
+        XCTAssertEqual(exactMatch.label, "搜索")
+        XCTAssertEqual(exactMatch.frame.centerX, 342, accuracy: 0.001)
+        XCTAssertEqual(exactMatch.frame.centerY, 62, accuracy: 0.001)
+
+        let chinese = GUIElementResolver.find(in: tree, query: "更多精彩", mode: .contains)
+        XCTAssertEqual(chinese.count, 1)
+        XCTAssertEqual(chinese.first?.role, "StaticText")
+    }
+
+    func testGUIElementResolverFailsClosedOnAmbiguityAndIgnoresUnusableFrames() {
+        let ambiguous = #"{"tree":{"role":"Application","frame":{"x":0,"y":0,"width":390,"height":844},"children":[{"role":"Button","label":"赞","frame":{"x":300,"y":300,"width":40,"height":40}},{"role":"Button","label":"赞","frame":{"x":300,"y":400,"width":40,"height":40}},{"role":"Button","label":"无框按钮"}]}}"#
+        XCTAssertNil(GUIElementResolver.uniqueMatch(in: ambiguous, query: "赞", role: "Button", mode: .exact))
+        XCTAssertTrue(GUIElementResolver.find(in: ambiguous, query: "无框按钮", mode: .exact).isEmpty)
+
+        let roleFiltered = GUIElementResolver.find(in: ambiguous, query: "赞", role: "StaticText", mode: .exact)
+        XCTAssertTrue(roleFiltered.isEmpty)
+    }
+
     func testPartialGUICapabilityFailsClosedForUnprovenFeature() async throws {
         let registry = ToolRegistry()
         let executor = StubExecutor(route: .guiFallback, names: ["gui.tap", "gui.tree"])

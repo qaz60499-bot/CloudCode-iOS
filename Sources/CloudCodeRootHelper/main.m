@@ -85,6 +85,121 @@ static id Workspace(void)
     return sendObject(cls, selector);
 }
 
+typedef CFStringRef (*CloudCodeCopyFrontmostApplicationDisplayIdentifierFn)(void);
+
+static void *SpringBoardServicesHandle(void)
+{
+    static void *handle = NULL;
+    if (handle) { return handle; }
+    for (NSString *path in @[
+        @"/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
+        @"/rootfs/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices"
+    ]) {
+        handle = dlopen(path.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL);
+        if (handle) { break; }
+    }
+    return handle;
+}
+
+static NSString *FrontmostApplicationBundleID(void)
+{
+    void *handle = SpringBoardServicesHandle();
+    if (!handle) { return nil; }
+    CloudCodeCopyFrontmostApplicationDisplayIdentifierFn copyFrontmost =
+        (CloudCodeCopyFrontmostApplicationDisplayIdentifierFn)dlsym(handle, "SBSCopyFrontmostApplicationDisplayIdentifier");
+    if (!copyFrontmost) { return nil; }
+    CFStringRef raw = copyFrontmost();
+    if (!raw) { return nil; }
+    return CFBridgingRelease(raw);
+}
+
+static BOOL WaitForFrontmostApplication(NSString *bundleID, useconds_t timeoutMicroseconds)
+{
+    if (bundleID.length == 0) { return NO; }
+    const useconds_t interval = 50000;
+    useconds_t elapsed = 0;
+    do {
+        NSString *frontmost = FrontmostApplicationBundleID();
+        if ([frontmost isEqualToString:bundleID]) { return YES; }
+        if (elapsed >= timeoutMicroseconds) { break; }
+        usleep(interval);
+        elapsed += interval;
+    } while (YES);
+    return NO;
+}
+
+static void LoadBoardFramework(NSString *frameworkName)
+{
+    if (frameworkName.length == 0) { return; }
+    NSString *binary = [NSString stringWithFormat:@"%@.framework/%@", frameworkName, frameworkName];
+    for (NSString *root in @[@"/System/Library/PrivateFrameworks", @"/rootfs/System/Library/PrivateFrameworks"]) {
+        NSString *path = [root stringByAppendingPathComponent:binary];
+        void *handle = dlopen(path.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL);
+        if (handle) { return; }
+    }
+}
+
+static BOOL LaunchViaBoardSystemService(NSString *bundleID, NSString *className, NSString *frameworkName, NSString **diagnostic)
+{
+    LoadBoardFramework(frameworkName);
+    Class cls = NSClassFromString(className);
+    if (!cls) {
+        if (diagnostic) { *diagnostic = [NSString stringWithFormat:@"%@ unavailable", className]; }
+        return NO;
+    }
+
+    id service = nil;
+    SEL sharedSelector = NSSelectorFromString(@"sharedService");
+    if ([cls respondsToSelector:sharedSelector]) {
+        id (*sendObject)(id, SEL) = (void *)objc_msgSend;
+        service = sendObject(cls, sharedSelector);
+    }
+    if (!service) { service = [[cls alloc] init]; }
+    if (!service) {
+        if (diagnostic) { *diagnostic = [NSString stringWithFormat:@"%@ service unavailable", className]; }
+        return NO;
+    }
+
+    __block NSError *reportedError = nil;
+    void (^completion)(NSError *) = ^(NSError *error) {
+        reportedError = error;
+    };
+    @try {
+        SEL simpleSelector = NSSelectorFromString(@"openApplication:options:withResult:");
+        if ([service respondsToSelector:simpleSelector]) {
+            void (*sendOpen)(id, SEL, id, id, void (^)(NSError *)) = (void *)objc_msgSend;
+            sendOpen(service, simpleSelector, bundleID, @{}, completion);
+        } else {
+            SEL createPortSelector = NSSelectorFromString(@"createClientPort");
+            SEL clientSelector = NSSelectorFromString(@"openApplication:options:clientPort:withResult:");
+            if (![service respondsToSelector:createPortSelector] || ![service respondsToSelector:clientSelector]) {
+                if (diagnostic) { *diagnostic = [NSString stringWithFormat:@"%@ openApplication selector unavailable", className]; }
+                return NO;
+            }
+            unsigned int (*sendPort)(id, SEL) = (void *)objc_msgSend;
+            unsigned int port = sendPort(service, createPortSelector);
+            void (*sendOpenWithPort)(id, SEL, id, id, unsigned int, void (^)(NSError *)) = (void *)objc_msgSend;
+            sendOpenWithPort(service, clientSelector, bundleID, @{}, port, completion);
+        }
+    } @catch (NSException *exception) {
+        if (diagnostic) {
+            *diagnostic = [NSString stringWithFormat:@"%@ launch raised %@", className, exception.name ?: @"exception"];
+        }
+        return NO;
+    }
+
+    if (WaitForFrontmostApplication(bundleID, 1500000)) {
+        if (diagnostic) { *diagnostic = [NSString stringWithFormat:@"%@ foreground verification passed", className]; }
+        return YES;
+    }
+    if (diagnostic) {
+        *diagnostic = reportedError
+            ? [NSString stringWithFormat:@"%@ launch rejected: %@", className, reportedError.localizedDescription ?: @"error"]
+            : [NSString stringWithFormat:@"%@ did not establish target foreground", className];
+    }
+    return NO;
+}
+
 static id SafeValue(id object, NSString *key)
 {
     if (!object || key.length == 0 || ![object respondsToSelector:NSSelectorFromString(key)]) { return nil; }
@@ -306,14 +421,59 @@ static int LaunchApplication(NSString *bundleID)
     BOOL installed = ApplicationIsInstalled(workspace, bundleID, &known);
     if (!known) { return 43; }
     if (!installed) { return 47; }
-    SEL selector = NSSelectorFromString(@"openApplicationWithBundleID:");
-    if (![workspace respondsToSelector:selector]) { return 42; }
-    BOOL (*sendBool)(id, SEL, id) = (void *)objc_msgSend;
-    @try {
-        return sendBool(workspace, selector, bundleID) ? 0 : 46;
-    } @catch (__unused NSException *exception) {
-        return 46;
+
+    if ([[FrontmostApplicationBundleID() lowercaseString] isEqualToString:bundleID.lowercaseString]) {
+        fprintf(stderr, "launch: target already foreground route=springboard-frontmost\n");
+        return 0;
     }
+
+    SEL selector = NSSelectorFromString(@"openApplicationWithBundleID:");
+    BOOL launchServicesAccepted = NO;
+    if ([workspace respondsToSelector:selector]) {
+        BOOL (*sendBool)(id, SEL, id) = (void *)objc_msgSend;
+        @try {
+            launchServicesAccepted = sendBool(workspace, selector, bundleID);
+        } @catch (__unused NSException *exception) {
+            launchServicesAccepted = NO;
+        }
+        if (launchServicesAccepted) {
+            BOOL foregroundVerified = WaitForFrontmostApplication(bundleID, 750000);
+            fprintf(stderr, "launch: route=launchservices accepted=1 foreground=%s\n", foregroundVerified ? "verified" : "unverified");
+            if (foregroundVerified) { return 0; }
+        }
+        if (WaitForFrontmostApplication(bundleID, 150000)) {
+            fprintf(stderr, "launch: route=launchservices accepted=0 but target is foreground\n");
+            return 0;
+        }
+    }
+
+    // The ordinary mobile-persona helper remains the least-privilege fast path. Only the signed
+    // root helper is allowed to fall back to the same board-service activation path Apple's own
+    // debugserver uses for device launches. The concrete launch is still bounded to one Bundle ID,
+    // and success requires the requested App to become the actual frontmost application.
+    if (geteuid() != 0) {
+        fprintf(stderr, "launch: isolated LaunchServices path did not establish target foreground; privileged board fallback required\n");
+        return [workspace respondsToSelector:selector] ? 46 : 42;
+    }
+
+    NSString *frontBoardDiagnostic = nil;
+    if (LaunchViaBoardSystemService(bundleID, @"FBSSystemService", @"FrontBoardServices", &frontBoardDiagnostic)) {
+        fprintf(stderr, "launch: route=frontboard %s\n", frontBoardDiagnostic.UTF8String ?: "verified");
+        return 0;
+    }
+
+    NSString *backBoardDiagnostic = nil;
+    if (LaunchViaBoardSystemService(bundleID, @"BKSSystemService", @"BackBoardServices", &backBoardDiagnostic)) {
+        fprintf(stderr, "launch: route=backboard %s\n", backBoardDiagnostic.UTF8String ?: "verified");
+        return 0;
+    }
+
+    fprintf(stderr,
+            "launch: route=launchservices+frontboard+backboard rejected lsSelector=%s fbs=%s bks=%s\n",
+            [workspace respondsToSelector:selector] ? "available" : "unavailable",
+            frontBoardDiagnostic.UTF8String ?: "unavailable",
+            backBoardDiagnostic.UTF8String ?: "unavailable");
+    return [workspace respondsToSelector:selector] ? 46 : 42;
 }
 
 static int ProbeUninstallCapability(NSString *bundleID)

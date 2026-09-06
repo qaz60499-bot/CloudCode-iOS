@@ -98,7 +98,9 @@ for helper_only in \
   'com.apple.QuartzCore.secure-mode' \
   'com.apple.QuartzCore.system-layers' \
   'com.apple.private.IOSurface.protected-access' \
-  'com.apple.backboard.client'; do
+  'com.apple.backboard.client' \
+  'com.apple.frontboard.launchapplications' \
+  'com.apple.backboardd.launchapplications'; do
   if /usr/libexec/PlistBuddy -c "Print :$helper_only" "$ENTITLEMENTS" >/dev/null 2>&1; then
     echo "FAIL: GUI-only entitlement leaked onto SwiftUI host: $helper_only" >&2
     exit 11
@@ -158,7 +160,9 @@ for key in \
   'com.apple.QuartzCore.secure-mode' \
   'com.apple.QuartzCore.system-layers' \
   'com.apple.private.IOSurface.protected-access' \
-  'com.apple.backboard.client'; do
+  'com.apple.backboard.client' \
+  'com.apple.frontboard.launchapplications' \
+  'com.apple.backboardd.launchapplications'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$HELPER_ENTITLEMENTS" 2>/dev/null || true)"
   if [[ "$value" != "true" ]]; then
     echo "FAIL: root helper entitlement missing or false: $key" >&2
@@ -174,7 +178,9 @@ for key in \
   'com.apple.private.hid.client.service-protected' \
   'com.apple.private.hid.manager.client' \
   'com.apple.QuartzCore.global-capture' \
-  'com.apple.private.IOSurface.protected-access'; do
+  'com.apple.private.IOSurface.protected-access' \
+  'com.apple.frontboard.launchapplications' \
+  'com.apple.backboardd.launchapplications'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$HELPER_CODESIGN_ENTITLEMENTS" 2>/dev/null || true)"
   if [[ "$value" != "true" ]]; then
     echo "FAIL: final root helper code signature entitlement missing or false: $key" >&2

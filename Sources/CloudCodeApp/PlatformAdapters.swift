@@ -121,7 +121,7 @@ enum EmbeddedRootHelper {
         case 43: meaning = "权威安装状态查询 selector 不可用"
         case 44: meaning = "用于卸载能力验证的目标 App 已不在安装状态"
         case 45: meaning = "LaunchServices/MobileInstallation 卸载后端均不可用"
-        case 46: meaning = "LaunchServices 拒绝启动目标 App"
+        case 46: meaning = "系统 App 启动路由未能将目标 App 置于前台"
         case 47: meaning = "目标 App 已确认不在安装状态"
         case 48: meaning = "卸载后端存在，但 Bundle 容器读写兜底能力未验证"
         case 49: meaning = "残留清理被拒绝：目标仍处于已注册安装状态"
@@ -197,11 +197,28 @@ enum EmbeddedRootHelper {
     }
 
     static func launch(bundleID: String) -> (success: Bool, detail: String) {
-        let result = run(["launch", bundleID], privilege: .isolatedUser, timeout: 5)
-        if result.code == 0 {
-            return (true, "隔离 helper 已验证目标安装状态并提交 App 启动请求。")
+        let isolated = run(["launch", bundleID], privilege: .isolatedUser, timeout: 5)
+        if isolated.code == 0 {
+            let route = isolated.diagnostic.isEmpty ? "" : " \(isolated.diagnostic)"
+            return (true, "隔离 helper 已验证目标安装状态并完成 App 启动路径。\(route)")
         }
-        return (false, failureDetail(prefix: "隔离 helper 启动 App", code: result.code, diagnostic: result.diagnostic))
+
+        // Some third-party apps reject LSApplicationWorkspace activation from the isolated mobile
+        // persona even though the exact same helper is privileged and device-validated. Retry only
+        // the same bounded launch operation under the signed root helper; never broaden this into a
+        // generic shell or arbitrary private-API executor.
+        if isolated.code == 46 {
+            let privileged = run(["launch", bundleID], privilege: .root, timeout: 6)
+            if privileged.code == 0 {
+                let route = privileged.diagnostic.isEmpty ? "" : " \(privileged.diagnostic)"
+                return (true, "隔离 LaunchServices 路径被拒绝后，root helper 通过系统启动路由完成目标 App 前台切换。\(route)")
+            }
+            let isolatedDetail = failureDetail(prefix: "隔离 helper 启动 App", code: isolated.code, diagnostic: isolated.diagnostic)
+            let privilegedDetail = failureDetail(prefix: "root helper 启动 App", code: privileged.code, diagnostic: privileged.diagnostic)
+            return (false, "\(isolatedDetail)；root fallback 同样失败：\(privilegedDetail)")
+        }
+
+        return (false, failureDetail(prefix: "隔离 helper 启动 App", code: isolated.code, diagnostic: isolated.diagnostic))
     }
 
     static func probe() -> RootHelperCapabilitySnapshot {
@@ -322,7 +339,11 @@ enum EmbeddedRootHelper {
     }
 
     static func guiTree() -> (tree: String?, detail: String) {
-        let result = runSeparated(["gui-tree-json"], privilege: .root, timeout: 5)
+        // Structured UI is the preferred fast path, but an inaccessible/custom-rendered foreground
+        // must fail quickly so the router can fall back to screenshot/Vision rather than burning a
+        // provider-scale latency budget inside AX. The helper also applies sub-second AX request
+        // timeouts per candidate root; this outer deadline bounds the whole fallback chain.
+        let result = runSeparated(["gui-tree-json"], privilege: .root, timeout: 3)
         guard result.code == 0, !result.stdout.isEmpty else {
             let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
             return (nil, failureDetail(prefix: "GUI tree", code: result.code, diagnostic: diagnostic))
@@ -447,6 +468,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     private var enumerationDetail = "尚未检测已安装 App 枚举能力。"
     private var uninstallDetail = "尚未检测 App 卸载后端。"
     private var pendingUninstallBundleID: String?
+    private var cachedLaunchCapability: AppLifecycleCapabilitySnapshot?
     private let diagnosticLogger: DiagnosticLogStore?
 
     public init(diagnosticLogger: DiagnosticLogStore? = nil) {
@@ -457,6 +479,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         enumerationProven = false
         enumerationDetail = "自动启动阶段仅加载 Cloud Code 自身；跨 App 私有 API 探测已延后。"
         uninstallDetail = "卸载能力尚未进行显式设备验证。"
+        cachedLaunchCapability = nil
         bundlePaths = [:]
         containerPaths = [:]
         cachedApps = fallbackOwnApp()
@@ -547,7 +570,12 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     }
 
     public func appLaunchCapability() async -> AppLifecycleCapabilitySnapshot {
+        if let cachedLaunchCapability, cachedLaunchCapability.available {
+            return cachedLaunchCapability
+        }
         let snapshot = EmbeddedRootHelper.launchCapability()
+        let lifecycle = AppLifecycleCapabilitySnapshot(available: snapshot.available, detail: snapshot.detail)
+        if lifecycle.available { cachedLaunchCapability = lifecycle }
         try? await diagnosticLogger?.log(
             level: snapshot.available ? .info : .warning,
             subsystem: "root-helper",
@@ -555,7 +583,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
             result: snapshot.available ? "available" : "unavailable",
             diagnostic: snapshot.detail
         )
-        return AppLifecycleCapabilitySnapshot(available: snapshot.available, detail: snapshot.detail)
+        return lifecycle
     }
 
     public func appTerminateCapability() async -> AppLifecycleCapabilitySnapshot {
@@ -1045,7 +1073,7 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
                     title: "启动 App",
                     target: bundleID,
                     reason: "启动目标 App 会改变设备前台状态。",
-                    plan: ["确认目标 Bundle ID", "调用已验证的 LaunchServices 启动接口", "记录启动结果"],
+                    plan: ["确认目标 Bundle ID", "调用有界系统启动路由", "验证目标 Bundle ID 已成为前台 App"],
                     risk: descriptor.risk
                 )
                 guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
@@ -1066,7 +1094,7 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
                 success: outcome.success,
                 summary: outcome.success ? "已请求启动 \(bundleID)" : "启动失败：\(outcome.detail)",
                 payload: ["bundleId": bundleID, "detail": outcome.detail, "version": version],
-                verification: VerificationResult(passed: outcome.success, checks: ["LaunchServices 接受目标 App 启动请求"], failures: outcome.success ? [] : [outcome.detail])
+                verification: VerificationResult(passed: outcome.success, checks: ["目标 App 已由有界系统启动路由确认进入前台"], failures: outcome.success ? [] : [outcome.detail])
             )
         }
 
@@ -1217,12 +1245,69 @@ public struct URLSchemeExecutor: ToolExecuting, Sendable {
     }
 }
 
+private struct LocalGUIPlan: Decodable {
+    var steps: [LocalGUIPlanStep]
+}
+
+private struct LocalGUIPlanStep: Decodable {
+    var action: String
+    var bundleId: String?
+    var query: String?
+    var role: String?
+    var match: String?
+    var text: String?
+    var fromX: Double?
+    var fromY: Double?
+    var toX: Double?
+    var toY: Double?
+    var duration: Double?
+    var strategy: String?
+    var expectQuery: String?
+    var expectRole: String?
+    var expectMatch: String?
+    var expect: String?
+    var timeoutMs: Int?
+}
+
+private actor GUIElementLookupCache {
+    private struct Entry: Sendable {
+        var match: GUIElementMatch
+        var lastUsedAt: Date
+    }
+
+    private var entries: [String: Entry] = [:]
+    private let maximumEntries = 128
+    private let retention: TimeInterval = 10 * 60
+
+    func get(_ key: String, now: Date = Date()) -> GUIElementMatch? {
+        prune(now: now)
+        guard var entry = entries[key] else { return nil }
+        entry.lastUsedAt = now
+        entries[key] = entry
+        return entry.match
+    }
+
+    func put(_ match: GUIElementMatch, key: String, now: Date = Date()) {
+        prune(now: now)
+        entries[key] = Entry(match: match, lastUsedAt: now)
+        if entries.count > maximumEntries {
+            let keep = Set(entries.sorted { $0.value.lastUsedAt > $1.value.lastUsedAt }.prefix(maximumEntries).map(\.key))
+            entries = entries.filter { keep.contains($0.key) }
+        }
+    }
+
+    private func prune(now: Date) {
+        entries = entries.filter { now.timeIntervalSince($0.value.lastUsedAt) <= retention }
+    }
+}
+
 public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor, Sendable {
     public let route: AppExecutionRoute = .guiFallback
     private let backend: GUIAutomationBackend
     private let policy: PolicyEngine
     private let approval: ApprovalRequesting
     private let attachmentRoot: URL?
+    private let elementCache: GUIElementLookupCache
 
     public init(
         backend: GUIAutomationBackend,
@@ -1234,6 +1319,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         self.policy = policy
         self.approval = approval
         self.attachmentRoot = attachmentRoot
+        self.elementCache = GUIElementLookupCache()
     }
 
     public func allowsDeferredCapabilityAttempt(
@@ -1261,12 +1347,35 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
 
     public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
         switch call.name {
-        case "gui.openApp":
+        case "gui.openApp", "gui.openAppObserve":
             guard let bundle = call.arguments["bundleId"], Self.isValidBundleIdentifier(bundle) else {
                 throw ToolRouterError.noExecutionRoute("bundleId missing or invalid")
             }
         case "gui.tree", "gui.screenshot":
             break
+        case "gui.findElement", "gui.waitForElement", "gui.tapElementObserve", "gui.typeElementObserve":
+            guard let query = call.arguments["query"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !query.isEmpty, query.utf8.count <= 512 else {
+                throw ToolRouterError.noExecutionRoute("element query missing, empty, or exceeds 512 bytes")
+            }
+            if let role = call.arguments["role"], role.utf8.count > 128 {
+                throw ToolRouterError.noExecutionRoute("element role exceeds 128 bytes")
+            }
+            if let match = call.arguments["match"], GUIElementMatchMode(rawValue: match) == nil {
+                throw ToolRouterError.noExecutionRoute("element match must be exact or contains")
+            }
+            if call.name == "gui.waitForElement" {
+                let timeoutMS = Int(call.arguments["timeoutMs"] ?? "3000") ?? 0
+                guard timeoutMS >= 100, timeoutMS <= 8_000 else {
+                    throw ToolRouterError.noExecutionRoute("waitForElement timeoutMs must be 100...8000")
+                }
+            }
+            if call.name == "gui.typeElementObserve" {
+                guard let text = call.arguments["text"], !text.isEmpty,
+                      (text.data(using: .utf8)?.count ?? Int.max) <= 16 * 1024 else {
+                    throw ToolRouterError.noExecutionRoute("text missing, empty, or exceeds 16 KiB")
+                }
+            }
         case "gui.navigateBack":
             guard let strategy = call.arguments["strategy"], strategy == "edge" || strategy == "dismissDown" else {
                 throw ToolRouterError.noExecutionRoute("navigateBack strategy must be edge or dismissDown")
@@ -1302,6 +1411,10 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                     throw ToolRouterError.noExecutionRoute("swipe sequence count must be an integer from 2 through 12")
                 }
             }
+        case "gui.runStructuredPlan":
+            guard let plan = call.arguments["plan"], !plan.isEmpty, plan.utf8.count <= 16 * 1024 else {
+                throw ToolRouterError.noExecutionRoute("structured plan missing, empty, or exceeds 16 KiB")
+            }
         case "gui.verify":
             guard let assertion = call.arguments["assertion"], !assertion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   assertion.utf8.count <= 1_024 else {
@@ -1328,10 +1441,97 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.openApp":
             guard let bundle = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
             try await backend.openApp(bundleID: bundle)
-            return ToolResult(toolCallID: call.id, success: true, summary: "Opened app")
+            return ToolResult(toolCallID: call.id, success: true, summary: "Opened app after target-foreground verification")
+        case "gui.openAppObserve":
+            guard let bundle = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
+            try await backend.openApp(bundleID: bundle)
+            try await Task.sleep(nanoseconds: 200_000_000)
+            try Task.checkCancellation()
+            let data = try await backend.screenshot()
+            let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
+            return ToolResult(
+                toolCallID: call.id,
+                success: true,
+                summary: "Target app became foreground and one fresh screenshot was captured locally for semantic planning.",
+                payload: [
+                    "bundleId": bundle,
+                    "byteCount": String(data.count),
+                    "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
+                    "effectVerification": "target_foreground_verified_screenshot_semantic_required",
+                    "localObservation": "final_screenshot_attached"
+                ],
+                attachments: attachment.map { [$0] }
+            )
         case "gui.tree":
             let tree = try await backend.tree()
             return ToolResult(toolCallID: call.id, success: true, summary: "GUI tree read", payload: ["tree": ToolOutputEnvelope(trust: .untrustedData, source: "gui.tree", content: tree).promptSafeRepresentation])
+        case "gui.findElement":
+            let resolved = try await resolveElement(call)
+            return ToolResult(
+                toolCallID: call.id,
+                success: true,
+                summary: "Unique accessibility element resolved locally",
+                payload: elementPayload(resolved.match, treeHash: resolved.treeHash, cacheHit: resolved.cacheHit)
+            )
+        case "gui.waitForElement":
+            let timeoutMS = Int(call.arguments["timeoutMs"] ?? "3000") ?? 3000
+            let resolved = try await waitForElement(call, timeoutMS: timeoutMS)
+            return ToolResult(
+                toolCallID: call.id,
+                success: true,
+                summary: "Unique accessibility element became available within bounded local wait",
+                payload: elementPayload(resolved.match, treeHash: resolved.treeHash, cacheHit: resolved.cacheHit)
+            )
+        case "gui.tapElementObserve":
+            let resolved = try await resolveElement(call)
+            guard !Self.isProtectedElement(resolved.match) else {
+                throw ToolRouterError.noExecutionRoute("protected/system-confirmation element cannot be automated")
+            }
+            try await backend.tap(x: resolved.match.frame.centerX, y: resolved.match.frame.centerY)
+            try await Task.sleep(nanoseconds: 250_000_000)
+            try Task.checkCancellation()
+            let data = try await backend.screenshot()
+            let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
+            var payload = elementPayload(resolved.match, treeHash: resolved.treeHash, cacheHit: resolved.cacheHit)
+            payload["sha256"] = GUIAutomationPayloadPolicy.sha256Hex(data)
+            payload["effectVerification"] = "semantic_required"
+            payload["localObservation"] = "final_screenshot_attached"
+            payload["structuredPath"] = "accessibility_tree_element"
+            return ToolResult(
+                toolCallID: call.id,
+                success: true,
+                summary: "Unique accessibility element tapped locally; final screenshot attached for semantic verification.",
+                payload: payload,
+                attachments: attachment.map { [$0] }
+            )
+        case "gui.typeElementObserve":
+            let resolved = try await resolveElement(call)
+            guard !Self.isProtectedElement(resolved.match) else {
+                throw ToolRouterError.noExecutionRoute("protected/secure input element cannot be automated")
+            }
+            try await backend.tap(x: resolved.match.frame.centerX, y: resolved.match.frame.centerY)
+            try await Task.sleep(nanoseconds: 120_000_000)
+            try Task.checkCancellation()
+            try await backend.type(call.arguments["text"] ?? "")
+            try await Task.sleep(nanoseconds: 250_000_000)
+            try Task.checkCancellation()
+            let data = try await backend.screenshot()
+            let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
+            var payload = elementPayload(resolved.match, treeHash: resolved.treeHash, cacheHit: resolved.cacheHit)
+            payload["sha256"] = GUIAutomationPayloadPolicy.sha256Hex(data)
+            payload["effectVerification"] = "semantic_required"
+            payload["localObservation"] = "final_screenshot_attached"
+            payload["structuredPath"] = "accessibility_tree_element_input"
+            payload["characters"] = String(call.arguments["text"]?.count ?? 0)
+            return ToolResult(
+                toolCallID: call.id,
+                success: true,
+                summary: "Unique non-protected accessibility element focused and text submitted locally; final screenshot attached for semantic verification.",
+                payload: payload,
+                attachments: attachment.map { [$0] }
+            )
+        case "gui.runStructuredPlan":
+            return try await executeStructuredPlan(call)
         case "gui.screenshot":
             let data = try await backend.screenshot()
             let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
@@ -1511,6 +1711,297 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         )
     }
 
+    private func executeStructuredPlan(_ call: ToolCall) async throws -> ToolResult {
+        guard let rawPlan = call.arguments["plan"], let data = rawPlan.data(using: .utf8),
+              let plan = try? JSONDecoder().decode(LocalGUIPlan.self, from: data) else {
+            throw ToolRouterError.noExecutionRoute("structured plan JSON is malformed")
+        }
+        try Self.validateStructuredPlan(plan)
+        let startedAt = Date()
+        var completedSteps = 0
+        var elementCacheHits = 0
+        var stateChanges = 0
+
+        do {
+            for (index, step) in plan.steps.enumerated() {
+                try Task.checkCancellation()
+                let isFinal = index == plan.steps.count - 1
+                let timeoutMS = min(max(step.timeoutMs ?? 2_500, 100), 5_000)
+                switch step.action {
+                case "openApp":
+                    guard let bundleID = step.bundleId else { throw ToolRouterError.noExecutionRoute("openApp step missing bundleId") }
+                    try await backend.openApp(bundleID: bundleID)
+                    stateChanges += 1
+                case "waitForElement":
+                    let elementCall = Self.elementLookupCall(from: step, sessionID: call.sessionID, toolName: "gui.waitForElement")
+                    let resolved = try await waitForElement(elementCall, timeoutMS: timeoutMS)
+                    if resolved.cacheHit { elementCacheHits += 1 }
+                case "tapElement":
+                    let elementCall = Self.elementLookupCall(from: step, sessionID: call.sessionID, toolName: "gui.findElement")
+                    let resolved = try await resolveElement(elementCall)
+                    if resolved.cacheHit { elementCacheHits += 1 }
+                    guard !Self.isProtectedElement(resolved.match) else {
+                        throw ToolRouterError.noExecutionRoute("structured plan stopped at protected/system-confirmation element")
+                    }
+                    guard !Self.isCommitElement(resolved.match) else {
+                        throw ToolRouterError.noExecutionRoute("structured plan stopped before a commit/irreversible element; execute that action as a separately verified tool step")
+                    }
+                    try await backend.tap(x: resolved.match.frame.centerX, y: resolved.match.frame.centerY)
+                    stateChanges += 1
+                    if !isFinal || step.expectQuery != nil {
+                        try await validateExpectation(step, timeoutMS: timeoutMS)
+                    }
+                case "typeElement":
+                    let elementCall = Self.elementLookupCall(from: step, sessionID: call.sessionID, toolName: "gui.findElement")
+                    let resolved = try await resolveElement(elementCall)
+                    if resolved.cacheHit { elementCacheHits += 1 }
+                    guard !Self.isProtectedElement(resolved.match) else {
+                        throw ToolRouterError.noExecutionRoute("structured plan stopped at protected/secure input element")
+                    }
+                    try await backend.tap(x: resolved.match.frame.centerX, y: resolved.match.frame.centerY)
+                    try await Task.sleep(nanoseconds: 120_000_000)
+                    try Task.checkCancellation()
+                    try await backend.type(step.text ?? "")
+                    stateChanges += 1
+                    if !isFinal || step.expectQuery != nil {
+                        try await validateExpectation(step, timeoutMS: timeoutMS)
+                    }
+                case "swipe":
+                    try await backend.swipe(
+                        fromX: step.fromX ?? 0,
+                        fromY: step.fromY ?? 0,
+                        toX: step.toX ?? 0,
+                        toY: step.toY ?? 0,
+                        duration: step.duration ?? 0.3
+                    )
+                    stateChanges += 1
+                    if !isFinal || step.expectQuery != nil {
+                        try await validateExpectation(step, timeoutMS: timeoutMS)
+                    }
+                case "navigateBack":
+                    try await backend.navigateBack(strategy: step.strategy ?? "")
+                    stateChanges += 1
+                    if !isFinal || step.expectQuery != nil {
+                        try await validateExpectation(step, timeoutMS: timeoutMS)
+                    }
+                default:
+                    throw ToolRouterError.noExecutionRoute("unsupported structured plan action: \(step.action)")
+                }
+                completedSteps += 1
+            }
+        } catch {
+            let elapsedMS = max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))
+            let screenshot = try? await backend.screenshot()
+            let attachment = try screenshot.flatMap { try persistScreenshotAttachment($0, sessionID: call.sessionID) }
+            var payload: [String: String] = [
+                "completedSteps": String(completedSteps),
+                "requestedSteps": String(plan.steps.count),
+                "stateChanges": String(stateChanges),
+                "elementCacheHits": String(elementCacheHits),
+                "localExecutionMS": String(elapsedMS),
+                "replanRequired": "true",
+                "failure": String(describing: error)
+            ]
+            if let screenshot { payload["sha256"] = GUIAutomationPayloadPolicy.sha256Hex(screenshot) }
+            return ToolResult(
+                toolCallID: call.id,
+                success: false,
+                summary: "Structured local plan stopped safely after \(completedSteps)/\(plan.steps.count) steps; fresh screenshot attached when available for re-planning.",
+                payload: payload,
+                attachments: attachment.map { [$0] }
+            )
+        }
+
+        let screenshot = try await backend.screenshot()
+        let attachment = try persistScreenshotAttachment(screenshot, sessionID: call.sessionID)
+        let elapsedMS = max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))
+        return ToolResult(
+            toolCallID: call.id,
+            success: true,
+            summary: "Structured local plan completed \(completedSteps) steps with local validation; one final screenshot is attached for semantic completion review.",
+            payload: [
+                "completedSteps": String(completedSteps),
+                "requestedSteps": String(plan.steps.count),
+                "stateChanges": String(stateChanges),
+                "elementCacheHits": String(elementCacheHits),
+                "localExecutionMS": String(elapsedMS),
+                "sha256": GUIAutomationPayloadPolicy.sha256Hex(screenshot),
+                "effectVerification": "local_structured_validators_passed_final_semantic_review_required",
+                "localObservation": "final_screenshot_attached",
+                "structuredPath": "local_plan"
+            ],
+            attachments: attachment.map { [$0] }
+        )
+    }
+
+    private func validateExpectation(_ step: LocalGUIPlanStep, timeoutMS: Int) async throws {
+        guard let query = step.expectQuery?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty else {
+            throw ToolRouterError.noExecutionRoute("non-final state-changing structured plan step is missing expectQuery")
+        }
+        let expectation = step.expect ?? "present"
+        guard expectation == "present" || expectation == "absent" else {
+            throw ToolRouterError.noExecutionRoute("structured plan expect must be present or absent")
+        }
+        let deadline = Date().addingTimeInterval(Double(timeoutMS) / 1_000.0)
+        let mode = GUIElementMatchMode(rawValue: step.expectMatch ?? "exact") ?? .exact
+        repeat {
+            try Task.checkCancellation()
+            let tree = try await backend.tree()
+            let matches = GUIElementResolver.find(in: tree, query: query, role: step.expectRole, mode: mode, maximumMatches: 3)
+            if expectation == "present", matches.count == 1 { return }
+            if expectation == "absent", matches.isEmpty { return }
+            if expectation == "present", matches.count > 1 {
+                throw ToolRouterError.noExecutionRoute("structured plan expectation is ambiguous; refine expectQuery/expectRole")
+            }
+            if Date() >= deadline { break }
+            try await Task.sleep(nanoseconds: 180_000_000)
+        } while Date() < deadline
+        throw ToolRouterError.noExecutionRoute("structured plan local expectation did not become true before timeout")
+    }
+
+    private static func validateStructuredPlan(_ plan: LocalGUIPlan) throws {
+        guard !plan.steps.isEmpty, plan.steps.count <= 8 else {
+            throw ToolRouterError.noExecutionRoute("structured plan must contain 1...8 steps")
+        }
+        let supported = Set(["openApp", "waitForElement", "tapElement", "typeElement", "swipe", "navigateBack"])
+        for (index, step) in plan.steps.enumerated() {
+            guard supported.contains(step.action) else {
+                throw ToolRouterError.noExecutionRoute("unsupported structured plan action: \(step.action)")
+            }
+            let timeoutMS = step.timeoutMs ?? 2_500
+            guard timeoutMS >= 100, timeoutMS <= 5_000 else {
+                throw ToolRouterError.noExecutionRoute("structured plan timeoutMs must be 100...5000")
+            }
+            if step.action == "openApp" {
+                guard let bundleID = step.bundleId, isValidBundleIdentifier(bundleID) else {
+                    throw ToolRouterError.noExecutionRoute("structured openApp bundleId missing or invalid")
+                }
+            }
+            if ["waitForElement", "tapElement", "typeElement"].contains(step.action) {
+                guard let query = step.query?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty, query.utf8.count <= 512 else {
+                    throw ToolRouterError.noExecutionRoute("structured element step query missing or invalid")
+                }
+                if let match = step.match, GUIElementMatchMode(rawValue: match) == nil {
+                    throw ToolRouterError.noExecutionRoute("structured element match must be exact or contains")
+                }
+            }
+            if step.action == "typeElement" {
+                guard let text = step.text, !text.isEmpty, text.utf8.count <= 16 * 1024 else {
+                    throw ToolRouterError.noExecutionRoute("structured typeElement text missing or too large")
+                }
+            }
+            if step.action == "swipe" {
+                let values = [step.fromX, step.fromY, step.toX, step.toY].compactMap { $0 }
+                let duration = step.duration ?? 0.3
+                guard values.count == 4, values.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 10_000 }),
+                      duration.isFinite, duration >= 0.05, duration <= 5 else {
+                    throw ToolRouterError.noExecutionRoute("structured swipe coordinates/duration invalid")
+                }
+            }
+            if step.action == "navigateBack" {
+                guard step.strategy == "edge" || step.strategy == "dismissDown" else {
+                    throw ToolRouterError.noExecutionRoute("structured navigateBack strategy invalid")
+                }
+            }
+            if ["tapElement", "typeElement", "swipe", "navigateBack"].contains(step.action) {
+                guard let expectQuery = step.expectQuery?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !expectQuery.isEmpty, expectQuery.utf8.count <= 512 else {
+                    throw ToolRouterError.noExecutionRoute("every state-changing structured step requires expectQuery")
+                }
+                if let expect = step.expect, expect != "present" && expect != "absent" {
+                    throw ToolRouterError.noExecutionRoute("structured expect must be present or absent")
+                }
+                if let match = step.expectMatch, GUIElementMatchMode(rawValue: match) == nil {
+                    throw ToolRouterError.noExecutionRoute("structured expectMatch must be exact or contains")
+                }
+            }
+        }
+    }
+
+    private static func elementLookupCall(from step: LocalGUIPlanStep, sessionID: UUID, toolName: String) -> ToolCall {
+        var arguments: [String: String] = ["query": step.query ?? ""]
+        if let role = step.role { arguments["role"] = role }
+        if let match = step.match { arguments["match"] = match }
+        if let timeoutMS = step.timeoutMs { arguments["timeoutMs"] = String(timeoutMS) }
+        return ToolCall(name: toolName, arguments: arguments, sessionID: sessionID)
+    }
+
+    private func resolveElement(_ call: ToolCall) async throws -> (match: GUIElementMatch, treeHash: String, cacheHit: Bool) {
+        let tree = try await backend.tree()
+        let treeHash = GUIAutomationPayloadPolicy.sha256Hex(Data(tree.utf8))
+        let query = call.arguments["query"] ?? ""
+        let role = call.arguments["role"]
+        let mode = GUIElementMatchMode(rawValue: call.arguments["match"] ?? "exact") ?? .exact
+        let cacheKey = [treeHash, mode.rawValue, role ?? "", query].joined(separator: "|")
+        if let cached = await elementCache.get(cacheKey) {
+            return (cached, treeHash, true)
+        }
+        let matches = GUIElementResolver.find(in: tree, query: query, role: role, mode: mode, maximumMatches: 3)
+        guard matches.count == 1 else {
+            if matches.isEmpty {
+                throw ToolRouterError.noExecutionRoute("structured element query returned no usable visible match")
+            }
+            throw ToolRouterError.noExecutionRoute("structured element query is ambiguous (\(matches.count)+ matches); refine query/role instead of guessing coordinates")
+        }
+        let match = matches[0]
+        await elementCache.put(match, key: cacheKey)
+        return (match, treeHash, false)
+    }
+
+    private func waitForElement(_ call: ToolCall, timeoutMS: Int) async throws -> (match: GUIElementMatch, treeHash: String, cacheHit: Bool) {
+        let deadline = Date().addingTimeInterval(Double(timeoutMS) / 1_000.0)
+        var lastError: Error?
+        repeat {
+            do {
+                return try await resolveElement(call)
+            } catch {
+                lastError = error
+            }
+            try Task.checkCancellation()
+            if Date() >= deadline { break }
+            try await Task.sleep(nanoseconds: 180_000_000)
+        } while Date() < deadline
+        throw lastError ?? ToolRouterError.noExecutionRoute("structured element did not appear before timeout")
+    }
+
+    private func elementPayload(_ match: GUIElementMatch, treeHash: String, cacheHit: Bool) -> [String: String] {
+        var payload: [String: String] = [
+            "path": match.path,
+            "treeSHA256": treeHash,
+            "cache": cacheHit ? "tree_signature_hit" : "tree_signature_miss",
+            "x": String(match.frame.x),
+            "y": String(match.frame.y),
+            "width": String(match.frame.width),
+            "height": String(match.frame.height),
+            "centerX": String(match.frame.centerX),
+            "centerY": String(match.frame.centerY)
+        ]
+        if let role = match.role { payload["role"] = role }
+        if let identifier = match.identifier { payload["identifier"] = identifier }
+        if let label = match.label { payload["label"] = String(label.prefix(256)) }
+        if let title = match.title { payload["title"] = String(title.prefix(256)) }
+        if let placeholder = match.placeholder { payload["placeholder"] = String(placeholder.prefix(256)) }
+        return payload
+    }
+
+    private static func isProtectedElement(_ match: GUIElementMatch) -> Bool {
+        let haystack = match.searchableText.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        let protectedMarkers = [
+            "face id", "touch id", "apple pay", "passcode", "password confirmation", "security code",
+            "允许", "不允许", "系统权限", "密码确认", "支付确认", "面容 id", "触控 id"
+        ]
+        return protectedMarkers.contains(where: { haystack.contains($0) })
+    }
+
+    private static func isCommitElement(_ match: GUIElementMatch) -> Bool {
+        let haystack = match.searchableText.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        let commitMarkers = [
+            "send", "submit", "publish", "post", "delete", "remove", "purchase", "buy", "pay", "checkout", "confirm order",
+            "发送", "提交", "发布", "删除", "移除", "购买", "支付", "结算", "确认订单", "卸载"
+        ]
+        return commitMarkers.contains(where: { haystack.contains($0) })
+    }
+
     private func persistScreenshotAttachment(_ data: Data, sessionID: UUID) throws -> ChatAttachment? {
         guard let attachmentRoot else { return nil }
         guard !data.isEmpty, data.count <= ChatMessageAttachmentPolicy.maxImageBytes else {
@@ -1532,7 +2023,11 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
     private static func features(for toolName: String) -> [GUIAutomationFeature]? {
         switch toolName {
         case "gui.openApp": return [.openApp]
-        case "gui.tree": return [.tree]
+        case "gui.openAppObserve": return [.openApp, .screenshot]
+        case "gui.tree", "gui.findElement", "gui.waitForElement": return [.tree]
+        case "gui.tapElementObserve": return [.tree, .touch, .screenshot]
+        case "gui.typeElementObserve": return [.tree, .touch, .textInput, .screenshot]
+        case "gui.runStructuredPlan": return [.openApp, .tree, .screenshot, .touch, .textInput, .gestures]
         case "gui.screenshot": return [.screenshot]
         case "gui.tap": return [.touch]
         case "gui.type": return [.textInput]

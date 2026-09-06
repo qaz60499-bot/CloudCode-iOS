@@ -109,6 +109,7 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
                               "No IPA installation executor is connected in the current build."))
         records.append(record("network.urlsession", .network, .available,
                               "Foundation URLSession is available; no network request is required by this startup probe."))
+        records.append(contentsOf: publicNativeCapabilityRecords())
 
         records.append(contentsOf: HomeOSCapabilityLayer.records(from: records))
         let profile = CapabilityProfile(records: records)
@@ -386,6 +387,7 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
 
         records.append(record("network.urlsession", .network, .available,
                               "Foundation URLSession is linked and available to typed network/provider adapters; this proves API availability, not current internet reachability."))
+        records.append(contentsOf: publicNativeCapabilityRecords())
 
         records.append(contentsOf: HomeOSCapabilityLayer.records(from: records))
 
@@ -412,6 +414,17 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
 
     private func record(_ id: String, _ domain: CapabilityDomain, _ status: CapabilityStatus, _ detail: String) -> CapabilityRecord {
         CapabilityRecord(id: id, domain: domain, status: status, detail: detail)
+    }
+
+    private func publicNativeCapabilityRecords() -> [CapabilityRecord] {
+        [
+            record("native.files", .filesystem, .available, "Public Foundation/POSIX structured file metadata, bounded hashing/diff, and descriptor-pinned copy/move are compiled into Cloud Code; each execution still revalidates the real path and allowed root."),
+            record("native.plist", .data, .available, "PropertyListSerialization read/query/metadata is available in-process with bounded input and path revalidation."),
+            record("native.json", .data, .available, "JSONSerialization read/query/filter/aggregate is available in-process with bounded input and output."),
+            record("native.sqlite", .data, .available, "libsqlite3 read-only discovery/query/filter/aggregate/sample support is linked in-process with authorizer, row, SQL-length, cell-size and timeout bounds."),
+            record("native.container", .filesystem, .available, "Structured container list/search is available after a fresh ResourceResolver lookup; cross-app container visibility remains governed by apps.resolve_data_container and the runtime resolver."),
+            record("native.data_macro", .data, .available, "Bounded local resolve→search→inspect→query/aggregate macro is available without a provider round-trip between its local stages; ambiguous file discovery fails closed.")
+        ]
     }
 
     private func canReadAndWrite(_ directory: URL) -> Bool {

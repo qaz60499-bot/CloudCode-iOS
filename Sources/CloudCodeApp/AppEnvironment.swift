@@ -130,6 +130,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let probe = CapabilityProbe(appResolver: resolver, diagnosticLogger: diagnosticLogStore, guiCapabilityProvider: guiBackend)
         let resourceResolver = ResourceResolver(appResolver: resolver)
         let fileService = FileService()
+        let resourceIndex = ProgressiveResourceIndex(fileURL: support.appendingPathComponent("Index/resource-graph.json"))
         let policy = PolicyEngine()
         let audit = AuditLogStore(fileURL: support.appendingPathComponent("Audit/audit.jsonl"))
         let trash = TrashService(root: support.appendingPathComponent("Trash", isDirectory: true))
@@ -150,7 +151,8 @@ public final class CloudCodeViewModel: ObservableObject {
             transactionEngine: transactionEngine,
             policy: policy,
             audit: audit,
-            approval: approval
+            approval: approval,
+            resourceIndex: resourceIndex
         )
         let registry = ToolRegistry()
         let cli = IOSSystemExecutor(policy: policy, approval: approval)
@@ -253,7 +255,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.hermesStore = hermesStore
         self.interactionExperienceStore = interactionExperienceStore
         self.agentCore = agent
-        self.resourceIndex = ProgressiveResourceIndex(fileURL: support.appendingPathComponent("Index/resource-graph.json"))
+        self.resourceIndex = resourceIndex
         self.appKnowledge = AppKnowledgeRegistry(fileURL: support.appendingPathComponent("Index/app-knowledge.json"))
         self.customProviderFileURL = customProviderFileURL
         startupBreadcrumbStore.append(runID: resolvedStartupRunID, stage: "viewModel.init.end")

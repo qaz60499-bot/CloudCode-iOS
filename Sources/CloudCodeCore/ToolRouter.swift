@@ -117,12 +117,181 @@ public enum GUIVisibleTextVerifier {
     }
 }
 
+public struct GUIElementFrame: Codable, Equatable, Sendable {
+    public var x: Double
+    public var y: Double
+    public var width: Double
+    public var height: Double
+
+    public init(x: Double, y: Double, width: Double, height: Double) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+
+    public var centerX: Double { x + width / 2 }
+    public var centerY: Double { y + height / 2 }
+    public var isUsable: Bool {
+        [x, y, width, height].allSatisfy(\.isFinite) && width > 0 && height > 0 && x >= 0 && y >= 0
+    }
+}
+
+public struct GUIElementMatch: Codable, Equatable, Sendable {
+    public var path: String
+    public var role: String?
+    public var label: String?
+    public var value: String?
+    public var title: String?
+    public var identifier: String?
+    public var placeholder: String?
+    public var frame: GUIElementFrame
+
+    public init(path: String, role: String?, label: String?, value: String?, title: String?, identifier: String?, placeholder: String?, frame: GUIElementFrame) {
+        self.path = path
+        self.role = role
+        self.label = label
+        self.value = value
+        self.title = title
+        self.identifier = identifier
+        self.placeholder = placeholder
+        self.frame = frame
+    }
+
+    public var searchableText: String {
+        [identifier, label, title, placeholder, value].compactMap { $0 }.joined(separator: "\n")
+    }
+}
+
+public enum GUIElementMatchMode: String, Sendable {
+    case exact
+    case contains
+}
+
+/// Parses the existing bounded AX JSON tree into stable element candidates. This stays in Core so
+/// both the on-device TrollStore backend and an optional XCTest/WDA bridge can share identical
+/// query/ambiguity/stale-element rules without creating a second automation architecture.
+public enum GUIElementResolver {
+    public static func find(
+        in tree: String,
+        query: String,
+        role: String? = nil,
+        mode: GUIElementMatchMode = .exact,
+        maximumMatches: Int = 8
+    ) -> [GUIElementMatch] {
+        let needle = normalized(query)
+        guard !needle.isEmpty, needle.utf8.count <= 512,
+              let data = tree.data(using: .utf8), data.count <= 512 * 1024,
+              let root = try? JSONSerialization.jsonObject(with: data) else { return [] }
+        let normalizedRole = role.map(normalized).flatMap { $0.isEmpty ? nil : $0 }
+        var matches: [GUIElementMatch] = []
+        walk(root, path: "0", needle: needle, role: normalizedRole, mode: mode, maximumMatches: max(1, min(maximumMatches, 32)), matches: &matches)
+        return matches
+    }
+
+    public static func uniqueMatch(
+        in tree: String,
+        query: String,
+        role: String? = nil,
+        mode: GUIElementMatchMode = .exact
+    ) -> GUIElementMatch? {
+        let matches = find(in: tree, query: query, role: role, mode: mode, maximumMatches: 2)
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    private static func walk(
+        _ raw: Any,
+        path: String,
+        needle: String,
+        role: String?,
+        mode: GUIElementMatchMode,
+        maximumMatches: Int,
+        matches: inout [GUIElementMatch]
+    ) {
+        guard matches.count < maximumMatches else { return }
+        if let node = raw as? [String: Any] {
+            if let candidate = candidate(node, path: path), elementMatches(candidate, needle: needle, role: role, mode: mode) {
+                matches.append(candidate)
+                if matches.count >= maximumMatches { return }
+            }
+            if let children = node["children"] as? [Any] {
+                for (index, child) in children.enumerated() {
+                    walk(child, path: "\(path).\(index)", needle: needle, role: role, mode: mode, maximumMatches: maximumMatches, matches: &matches)
+                    if matches.count >= maximumMatches { return }
+                }
+            }
+        } else if let array = raw as? [Any] {
+            for (index, child) in array.enumerated() {
+                walk(child, path: "\(path).\(index)", needle: needle, role: role, mode: mode, maximumMatches: maximumMatches, matches: &matches)
+                if matches.count >= maximumMatches { return }
+            }
+        }
+    }
+
+    private static func candidate(_ node: [String: Any], path: String) -> GUIElementMatch? {
+        guard let rawFrame = node["frame"] as? [String: Any],
+              let x = number(rawFrame["x"]), let y = number(rawFrame["y"]),
+              let width = number(rawFrame["width"]), let height = number(rawFrame["height"]) else { return nil }
+        let frame = GUIElementFrame(x: x, y: y, width: width, height: height)
+        guard frame.isUsable else { return nil }
+        return GUIElementMatch(
+            path: path,
+            role: string(node["role"]),
+            label: string(node["label"]),
+            value: string(node["value"]),
+            title: string(node["title"]),
+            identifier: string(node["identifier"]),
+            placeholder: string(node["placeholder"]),
+            frame: frame
+        )
+    }
+
+    private static func elementMatches(_ candidate: GUIElementMatch, needle: String, role: String?, mode: GUIElementMatchMode) -> Bool {
+        if let role, normalized(candidate.role ?? "") != role { return false }
+        let fields = [candidate.identifier, candidate.label, candidate.title, candidate.placeholder, candidate.value]
+            .compactMap { $0 }
+            .map(normalized)
+            .filter { !$0.isEmpty }
+        switch mode {
+        case .exact: return fields.contains(needle)
+        case .contains: return fields.contains(where: { $0.contains(needle) })
+        }
+    }
+
+    private static func normalized(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    private static func string(_ raw: Any?) -> String? {
+        guard let value = raw as? String else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.utf8.count <= 2_048 else { return nil }
+        return trimmed
+    }
+
+    private static func number(_ raw: Any?) -> Double? {
+        if let value = raw as? NSNumber { return value.doubleValue }
+        if let value = raw as? Double { return value }
+        if let value = raw as? Int { return Double(value) }
+        return nil
+    }
+}
+
 public enum GUIApprovalTargetSanitizer {
     /// Builds approval text without ever embedding gui.type input contents.
     public static func target(for call: ToolCall) -> String {
         switch call.name {
-        case "gui.openApp":
+        case "gui.openApp", "gui.openAppObserve":
             return call.arguments["bundleId"] ?? "当前前台 App"
+        case "gui.findElement", "gui.waitForElement":
+            return "当前前台 App · element query"
+        case "gui.tapElementObserve":
+            return "当前前台 App · structured element tap"
+        case "gui.typeElementObserve":
+            let count = call.arguments["text"]?.count ?? 0
+            return "当前前台 App · structured element input \(count) 个字符（内容已隐藏）"
+        case "gui.runStructuredPlan":
+            return "当前前台 App · bounded structured local plan"
         case "gui.type", "gui.typeObserve":
             let count = call.arguments["text"]?.count ?? 0
             return "当前前台 App · 输入 \(count) 个字符（内容已隐藏）"
@@ -158,6 +327,29 @@ public actor ToolRegistry {
         ToolDescriptor(name: "files.list", summary: "List a directory through structured filesystem access.", risk: .readOnly),
         ToolDescriptor(name: "files.search", summary: "Search a bounded directory progressively.", risk: .readOnly),
         ToolDescriptor(name: "files.read", summary: "Read a bounded text file.", risk: .readOnly),
+        ToolDescriptor(name: "files.stat", summary: "Read current filesystem stat-style metadata after revalidating the real path.", risk: .readOnly, requiredCapabilities: ["native.files"]),
+        ToolDescriptor(name: "files.metadata", summary: "Read bounded current file metadata through public native filesystem APIs.", risk: .readOnly, requiredCapabilities: ["native.files"]),
+        ToolDescriptor(name: "files.hash", summary: "Compute a bounded SHA-256 over a revalidated regular file.", risk: .readOnly, requiredCapabilities: ["native.files"]),
+        ToolDescriptor(name: "files.diff", summary: "Compute a bounded local text diff between two revalidated files.", risk: .readOnly, requiredCapabilities: ["native.files"]),
+        ToolDescriptor(name: "files.copy", summary: "Copy one ordinary file with descriptor-pinned source/destination validation and byte verification.", risk: .safeWrite, requiredCapabilities: ["native.files"]),
+        ToolDescriptor(name: "files.move", summary: "Move one item with descriptor-pinned source/destination validation and post-rename identity verification.", risk: .sensitiveWrite, requiredCapabilities: ["native.files"]),
+        ToolDescriptor(name: "plist.read", summary: "Read a bounded plist through PropertyListSerialization.", risk: .readOnly, requiredCapabilities: ["native.plist"]),
+        ToolDescriptor(name: "plist.query", summary: "Query a bounded plist key path locally.", risk: .readOnly, requiredCapabilities: ["native.plist"]),
+        ToolDescriptor(name: "plist.metadata", summary: "Inspect bounded plist format/type/key metadata locally.", risk: .readOnly, requiredCapabilities: ["native.plist"]),
+        ToolDescriptor(name: "json.read", summary: "Read a bounded JSON value locally.", risk: .readOnly, requiredCapabilities: ["native.json"]),
+        ToolDescriptor(name: "json.query", summary: "Query a bounded JSON key path locally.", risk: .readOnly, requiredCapabilities: ["native.json"]),
+        ToolDescriptor(name: "json.filter", summary: "Filter a bounded JSON array locally by one scalar field equality.", risk: .readOnly, requiredCapabilities: ["native.json"]),
+        ToolDescriptor(name: "json.aggregate", summary: "Aggregate count/sum/min/max/avg over a bounded JSON array locally.", risk: .readOnly, requiredCapabilities: ["native.json"]),
+        ToolDescriptor(name: "sqlite.discover", summary: "Discover likely SQLite files under a bounded revalidated root without opening unrelated paths.", risk: .readOnly, requiredCapabilities: ["native.sqlite"]),
+        ToolDescriptor(name: "sqlite.tables", summary: "List SQLite tables/views through a read-only native connection.", risk: .readOnly, requiredCapabilities: ["native.sqlite"]),
+        ToolDescriptor(name: "sqlite.schema", summary: "Inspect bounded SQLite schema metadata through a read-only native connection.", risk: .readOnly, requiredCapabilities: ["native.sqlite"]),
+        ToolDescriptor(name: "sqlite.query", summary: "Run one bounded read-only SELECT/WITH/EXPLAIN QUERY PLAN statement locally.", risk: .readOnly, requiredCapabilities: ["native.sqlite"]),
+        ToolDescriptor(name: "sqlite.filter", summary: "Filter one SQLite table locally using validated identifiers and a bound scalar parameter.", risk: .readOnly, requiredCapabilities: ["native.sqlite"]),
+        ToolDescriptor(name: "sqlite.aggregate", summary: "Run one bounded count/sum/min/max/avg SQLite aggregate locally.", risk: .readOnly, requiredCapabilities: ["native.sqlite"]),
+        ToolDescriptor(name: "sqlite.sample", summary: "Sample a bounded number of rows from one validated SQLite table.", risk: .readOnly, requiredCapabilities: ["native.sqlite"]),
+        ToolDescriptor(name: "container.list", summary: "Resolve the current app data container and list a bounded subdirectory; cached UUID paths are never trusted for execution.", risk: .readOnly, requiredCapabilities: ["native.container"]),
+        ToolDescriptor(name: "container.search", summary: "Resolve the current app data container and search it progressively; execution always revalidates the current path.", risk: .readOnly, requiredCapabilities: ["native.container"]),
+        ToolDescriptor(name: "data.localQuery", summary: "Bounded local resolve→search→inspect→query/aggregate macro for plist/JSON/SQLite data, reducing provider round-trips while keeping every real path revalidated.", risk: .readOnly, requiredCapabilities: ["native.data_macro"]),
         ToolDescriptor(name: "storage.analyze", summary: "Analyze file sizes in a resolved directory/container.", risk: .readOnly),
         ToolDescriptor(name: "files.create", summary: "Create a new ordinary file.", risk: .safeWrite),
         ToolDescriptor(name: "files.modify", summary: "Transactionally modify an existing file with diff, backup and verification.", risk: .sensitiveWrite),
@@ -174,7 +366,13 @@ public actor ToolRegistry {
         ToolDescriptor(name: "apps.terminate", summary: "Terminate an app/process.", risk: .systemChange, requiredCapabilities: ["apps.terminate"], preferredRoute: .privateFramework),
         ToolDescriptor(name: "advanced.shell", summary: "Execute an advanced shell command. High risk and never the default tool path.", risk: .systemChange, requiredCapabilities: ["execution.ios_system"], preferredRoute: .cli),
         ToolDescriptor(name: "gui.openApp", summary: "Open an app using the GUI automation fallback backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.openApp.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.openAppObserve", summary: "Open exactly one target app, verify the target became foreground in the bounded helper, then immediately capture one fresh screenshot locally. The screenshot is for semantic planning only and never substitutes for the target-foreground launch verification.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.openApp.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.tree", summary: "Read the GUI accessibility tree from the configured automation backend.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.findElement", summary: "Resolve a unique visible accessibility element locally by identifier/label/title/placeholder/value, with optional role and exact-or-contains matching. Returns only bounded structural metadata and coordinates; no screenshot or Vision call is needed.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.waitForElement", summary: "Poll the local accessibility tree for a unique element for a bounded time without calling the remote model between polls. Use for known delayed pages; ambiguity and timeouts fail closed.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.tapElementObserve", summary: "Find one unique accessibility element locally, tap its current frame center, then immediately capture a fresh screenshot. This avoids Vision coordinate lookup while preserving post-action semantic re-planning.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.typeElementObserve", summary: "Find one unique non-protected accessibility element locally, focus it, enter bounded text, then immediately capture a fresh screenshot. Secure/system-confirmation targets are rejected and ambiguity fails closed.", risk: .sensitiveWrite, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.runStructuredPlan", summary: "Execute a bounded local multi-step plan using only foreground-verified app launch, accessibility element queries, element taps/text, bounded swipes/back gestures, and local validators. Every non-final state-changing step must declare an accessibility-tree expectation before another write may run. Any ambiguity, stale tree, failed expectation, protected confirmation target, or unsupported action stops the plan and returns control for re-planning. Vision remains fallback only.", risk: .sensitiveWrite, requiredCapabilities: [GUIAutomationFeature.openApp.capabilityID, GUIAutomationFeature.tree.capabilityID, GUIAutomationFeature.screenshot.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.gestures.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.screenshot", summary: "Capture a screenshot through the GUI automation backend.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.tap", summary: "Tap a GUI coordinate/element through the configured backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.type", summary: "Type text through the configured backend.", risk: .sensitiveWrite, requiredCapabilities: [GUIAutomationFeature.textInput.capabilityID], preferredRoute: .guiFallback),
@@ -191,27 +389,92 @@ public actor ToolRegistry {
     ]
 }
 
+public struct ExecutionPathMetric: Codable, Equatable, Sendable {
+    public var tool: String
+    public var routeCandidates: [AppExecutionRoute]
+    public var selectedRoute: AppExecutionRoute?
+    public var fallbackReason: String
+    public var fallbackDepth: Int
+    public var routeSelectionLatencyMS: Int
+    public var executionLatencyMS: Int
+    public var totalLatencyMS: Int
+    public var outcome: String
+    public var recordedAt: Date
+
+    public init(tool: String, routeCandidates: [AppExecutionRoute], selectedRoute: AppExecutionRoute?, fallbackReason: String, fallbackDepth: Int, routeSelectionLatencyMS: Int, executionLatencyMS: Int, totalLatencyMS: Int, outcome: String, recordedAt: Date = Date()) {
+        self.tool = tool
+        self.routeCandidates = routeCandidates
+        self.selectedRoute = selectedRoute
+        self.fallbackReason = fallbackReason
+        self.fallbackDepth = fallbackDepth
+        self.routeSelectionLatencyMS = routeSelectionLatencyMS
+        self.executionLatencyMS = executionLatencyMS
+        self.totalLatencyMS = totalLatencyMS
+        self.outcome = outcome
+        self.recordedAt = recordedAt
+    }
+}
+
+public actor ExecutionPathMetrics {
+    private var values: [ExecutionPathMetric] = []
+    private let maximumCount: Int
+
+    public init(maximumCount: Int = 512) {
+        self.maximumCount = max(32, min(maximumCount, 4_096))
+    }
+
+    public func record(_ metric: ExecutionPathMetric) {
+        values.append(metric)
+        if values.count > maximumCount { values.removeFirst(values.count - maximumCount) }
+    }
+
+    public func recent(limit: Int = 100) -> [ExecutionPathMetric] {
+        Array(values.suffix(min(max(limit, 1), maximumCount)))
+    }
+}
+
 public actor ToolRouter {
+    private struct RouteDecision: Sendable {
+        var route: AppExecutionRoute
+        var candidates: [AppExecutionRoute]
+        var fallbackReason: String
+        var fallbackDepth: Int
+        var latencyMS: Int
+    }
+
     private let registry: ToolRegistry
     private let executors: [ToolExecuting]
     private let executionLedger: ToolExecutionLedger?
     private let diagnosticLogger: DiagnosticLogStore?
+    private let executionPathMetrics: ExecutionPathMetrics
     private var inFlight: [UUID: (call: ToolCall, task: Task<ToolResult, Error>)] = [:]
 
     public init(
         registry: ToolRegistry,
         executors: [ToolExecuting],
         executionLedger: ToolExecutionLedger? = nil,
-        diagnosticLogger: DiagnosticLogStore? = nil
+        diagnosticLogger: DiagnosticLogStore? = nil,
+        executionPathMetrics: ExecutionPathMetrics = ExecutionPathMetrics()
     ) {
         self.registry = registry
         self.executors = executors
         self.executionLedger = executionLedger
         self.diagnosticLogger = diagnosticLogger
+        self.executionPathMetrics = executionPathMetrics
+    }
+
+    public func recentExecutionPathMetrics(limit: Int = 100) async -> [ExecutionPathMetric] {
+        await executionPathMetrics.recent(limit: limit)
     }
 
     public func chooseRoute(for call: ToolCall, capabilities: CapabilityProfile) async throws -> AppExecutionRoute {
+        try await routeDecision(for: call, capabilities: capabilities).route
+    }
+
+    private func routeDecision(for call: ToolCall, capabilities: CapabilityProfile) async throws -> RouteDecision {
+        let startedAt = Date()
         guard let descriptor = await registry.descriptor(named: call.name) else { throw ToolRouterError.unknownTool(call.name) }
+        let candidates = routeOrder(preferred: descriptor.preferredRoute)
         var deferredCapabilities: [String] = []
         for required in descriptor.requiredCapabilities {
             switch capabilities.status(required) {
@@ -224,18 +487,33 @@ public actor ToolRouter {
             }
         }
 
-        for route in routeOrder(preferred: descriptor.preferredRoute) {
-            for executor in executors where executor.route == route {
+        var skipped: [String] = []
+        for (index, route) in candidates.enumerated() {
+            let routeExecutors = executors.filter { $0.route == route }
+            guard !routeExecutors.isEmpty else {
+                skipped.append("\(route.rawValue):no_executor")
+                continue
+            }
+            var routeDeferredBlocked = false
+            for executor in routeExecutors {
                 if !deferredCapabilities.isEmpty {
                     guard let selfValidating = executor as? any DeferredCapabilitySelfValidatingToolExecutor,
                           await selfValidating.allowsDeferredCapabilityAttempt(
                             deferredCapabilities,
                             for: descriptor,
                             capabilities: capabilities
-                          ) else { continue }
+                          ) else {
+                        routeDeferredBlocked = true
+                        continue
+                    }
                 }
-                if await executor.supports(descriptor, capabilities: capabilities) { return route }
+                if await executor.supports(descriptor, capabilities: capabilities) {
+                    let latencyMS = max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))
+                    let reason = skipped.isEmpty ? "first_candidate_supported" : skipped.joined(separator: ";")
+                    return RouteDecision(route: route, candidates: candidates, fallbackReason: reason, fallbackDepth: index, latencyMS: latencyMS)
+                }
             }
+            skipped.append(routeDeferredBlocked ? "\(route.rawValue):deferred_validation_rejected_or_unsupported" : "\(route.rawValue):unsupported")
         }
         if let missing = deferredCapabilities.first {
             throw ToolRouterError.missingCapability(missing)
@@ -255,6 +533,7 @@ public actor ToolRouter {
     }
 
     public func execute(_ call: ToolCall, context: ToolExecutionContext) async throws -> ToolResult {
+        let executionStartedAt = Date()
         try? await diagnosticLogger?.log(
             level: .info,
             subsystem: "tool",
@@ -269,13 +548,42 @@ public actor ToolRouter {
             try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "unknown_tool", sessionID: call.sessionID, toolCallID: call.id, error: error)
             throw error
         }
-        let route: AppExecutionRoute
+        let decision: RouteDecision
         do {
-            route = try await chooseRoute(for: call, capabilities: context.capabilityProfile)
+            decision = try await routeDecision(for: call, capabilities: context.capabilityProfile)
+            try? await diagnosticLogger?.log(
+                level: .info,
+                subsystem: "tool-route",
+                action: call.name,
+                result: "selected",
+                sessionID: call.sessionID,
+                toolCallID: call.id,
+                metadata: [
+                    "route": decision.route.rawValue,
+                    "routeCandidates": decision.candidates.map(\.rawValue).joined(separator: ","),
+                    "fallbackReason": decision.fallbackReason,
+                    "fallbackDepth": String(decision.fallbackDepth),
+                    "routeSelectionLatencyMS": String(decision.latencyMS)
+                ]
+            )
         } catch {
-            try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "route_failed", sessionID: call.sessionID, toolCallID: call.id, error: error)
+            let candidates = routeOrder(preferred: descriptor.preferredRoute)
+            let totalMS = max(0, Int(Date().timeIntervalSince(executionStartedAt) * 1_000))
+            await executionPathMetrics.record(ExecutionPathMetric(
+                tool: call.name,
+                routeCandidates: candidates,
+                selectedRoute: nil,
+                fallbackReason: "route_failed:\(String(describing: error))",
+                fallbackDepth: candidates.count,
+                routeSelectionLatencyMS: totalMS,
+                executionLatencyMS: 0,
+                totalLatencyMS: totalMS,
+                outcome: "route_failed"
+            ))
+            try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "route_failed", sessionID: call.sessionID, toolCallID: call.id, error: error, metadata: ["routeCandidates": candidates.map(\.rawValue).joined(separator: ","), "routeSelectionLatencyMS": String(totalMS)])
             throw error
         }
+        let route = decision.route
 
         var selectedExecutor: ToolExecuting?
         for executor in executors where executor.route == route {
@@ -287,25 +595,32 @@ public actor ToolRouter {
         guard let executor = selectedExecutor else { throw ToolRouterError.noExecutionRoute(call.name) }
 
         if descriptor.risk == .readOnly {
+            let executorStartedAt = Date()
             do {
                 let result = try await DiagnosticContext.$sessionID.withValue(call.sessionID) {
                     try await DiagnosticContext.$toolCallID.withValue(call.id) {
                         try await executor.execute(call, descriptor: descriptor, context: context)
                     }
                 }
-                try? await diagnosticLogger?.log(level: result.success ? .info : .warning, subsystem: "tool", action: call.name, result: result.success ? "completed" : "failed", sessionID: call.sessionID, toolCallID: call.id, diagnostic: result.summary, metadata: ["route": route.rawValue, "verification": result.verification.map { $0.passed ? "passed" : "failed" } ?? "none"])
+                await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, outcome: result.success ? "completed" : "failed")
+                try? await diagnosticLogger?.log(level: result.success ? .info : .warning, subsystem: "tool", action: call.name, result: result.success ? "completed" : "failed", sessionID: call.sessionID, toolCallID: call.id, diagnostic: result.summary, metadata: executionMetadata(decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: result.verification))
                 return result
             } catch {
-                try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "failed", sessionID: call.sessionID, toolCallID: call.id, error: error, metadata: ["route": route.rawValue])
+                await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, outcome: "failed")
+                try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "failed", sessionID: call.sessionID, toolCallID: call.id, error: error, metadata: executionMetadata(decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: nil))
                 throw error
             }
         }
 
         if let existing = inFlight[call.id] {
             guard existing.call == call else { throw ToolExecutionLedgerError.idempotencyConflict(call.id) }
-            return try await existing.task.value
+            let reusedAt = Date()
+            let result = try await existing.task.value
+            await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: reusedAt, outcome: "inflight_reused")
+            return result
         }
 
+        let executorStartedAt = Date()
         let task = Task<ToolResult, Error> {
             if let executionLedger,
                let cached = try await executionLedger.prepare(call) {
@@ -326,6 +641,7 @@ public actor ToolRouter {
         defer { inFlight.removeValue(forKey: call.id) }
         do {
             let result = try await task.value
+            await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, outcome: result.success ? "completed" : "failed")
             try? await diagnosticLogger?.log(
                 level: result.success ? .info : .warning,
                 subsystem: "tool",
@@ -334,13 +650,56 @@ public actor ToolRouter {
                 sessionID: call.sessionID,
                 toolCallID: call.id,
                 diagnostic: result.summary,
-                metadata: ["route": route.rawValue, "verification": result.verification.map { $0.passed ? "passed" : "failed" } ?? "none"]
+                metadata: executionMetadata(decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: result.verification)
             )
             return result
         } catch {
-            try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "failed", sessionID: call.sessionID, toolCallID: call.id, error: error, metadata: ["route": route.rawValue])
+            await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, outcome: "failed")
+            try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "failed", sessionID: call.sessionID, toolCallID: call.id, error: error, metadata: executionMetadata(decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: nil))
             throw error
         }
+    }
+
+    private func recordExecutionPath(
+        call: ToolCall,
+        decision: RouteDecision,
+        executionStartedAt: Date,
+        executorStartedAt: Date,
+        outcome: String
+    ) async {
+        let now = Date()
+        let executionMS = max(0, Int(now.timeIntervalSince(executorStartedAt) * 1_000))
+        let totalMS = max(0, Int(now.timeIntervalSince(executionStartedAt) * 1_000))
+        await executionPathMetrics.record(ExecutionPathMetric(
+            tool: call.name,
+            routeCandidates: decision.candidates,
+            selectedRoute: decision.route,
+            fallbackReason: decision.fallbackReason,
+            fallbackDepth: decision.fallbackDepth,
+            routeSelectionLatencyMS: decision.latencyMS,
+            executionLatencyMS: executionMS,
+            totalLatencyMS: totalMS,
+            outcome: outcome
+        ))
+    }
+
+    private func executionMetadata(
+        decision: RouteDecision,
+        executionStartedAt: Date,
+        executorStartedAt: Date,
+        verification: VerificationResult?
+    ) -> [String: String] {
+        let now = Date()
+        return [
+            "route": decision.route.rawValue,
+            "routeCandidates": decision.candidates.map(\.rawValue).joined(separator: ","),
+            "fallbackReason": decision.fallbackReason,
+            "fallbackDepth": String(decision.fallbackDepth),
+            "routeSelectionLatencyMS": String(decision.latencyMS),
+            "executionLatencyMS": String(max(0, Int(now.timeIntervalSince(executorStartedAt) * 1_000))),
+            "totalLatencyMS": String(max(0, Int(now.timeIntervalSince(executionStartedAt) * 1_000))),
+            "verification": verification.map { $0.passed ? "passed" : "failed" } ?? "none"
+        ]
     }
 
     private func routeOrder(preferred: AppExecutionRoute) -> [AppExecutionRoute] {

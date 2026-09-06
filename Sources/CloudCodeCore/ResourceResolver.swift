@@ -107,9 +107,14 @@ public actor ResourceResolver {
                 throw ResourceResolverError.containerUnavailable(bundleID)
             }
             let suffix = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            let root = URL(fileURLWithPath: basePath, isDirectory: true)
-            let target = suffix.isEmpty ? root : root.appendingPathComponent(suffix)
-            let resolved = target.standardizedFileURL.path
+            let root = URL(fileURLWithPath: basePath, isDirectory: true).standardizedFileURL
+            let target = (suffix.isEmpty ? root : root.appendingPathComponent(suffix)).standardizedFileURL
+            let rootPath = root.path
+            let resolved = target.path
+            let rootPrefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+            guard resolved == rootPath || resolved.hasPrefix(rootPrefix) else {
+                throw ResourceResolverError.invalidResourceID
+            }
             return ResourceNode(
                 id: id,
                 kind: fileManager.directoryExists(at: target) ? .directory : .container,

@@ -158,7 +158,9 @@ jobs:
             com.apple.QuartzCore.secure-mode \
             com.apple.QuartzCore.system-layers \
             com.apple.private.IOSurface.protected-access \
-            com.apple.backboard.client; do
+            com.apple.backboard.client \
+            com.apple.frontboard.launchapplications \
+            com.apple.backboardd.launchapplications; do
             /usr/libexec/PlistBuddy -c "Print :$required_helper_entitlement" "$HELPER_ENTITLEMENTS" | grep -F 'true'
           done
           for required_helper_codesign_entitlement in \
@@ -168,7 +170,9 @@ jobs:
             com.apple.private.hid.client.service-protected \
             com.apple.private.hid.manager.client \
             com.apple.QuartzCore.global-capture \
-            com.apple.private.IOSurface.protected-access; do
+            com.apple.private.IOSurface.protected-access \
+            com.apple.frontboard.launchapplications \
+            com.apple.backboardd.launchapplications; do
             /usr/libexec/PlistBuddy -c "Print :$required_helper_codesign_entitlement" "$HELPER_CODESIGN_ENTITLEMENTS" | grep -F 'true'
           done
           for required_helper_iokit_class in \

@@ -15,6 +15,7 @@
 
 #define CLOUDCODE_GUI_MAX_TREE_NODES 400
 #define CLOUDCODE_GUI_MAX_TREE_BYTES (256 * 1024)
+#define CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS 0.65f
 #define CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES (700 * 1024)
 #define CLOUDCODE_GUI_MAX_TEXT_UTF8_BYTES (16 * 1024)
 #define CLOUDCODE_GUI_SENDER_ID 0x8000000817319371ULL
@@ -1049,7 +1050,7 @@ static void CloudCodePrepareAXApplication(CloudCodeAXRuntime runtime, CloudCodeA
 {
     if (!root) { return; }
     if (runtime.setTimeout) {
-        @try { runtime.setTimeout(root, 1.5f); } @catch (__unused NSException *exception) {}
+        @try { runtime.setTimeout(root, CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {}
     }
     if (runtime.setAttribute) {
         @try { runtime.setAttribute(root, CFSTR("AXManualAccessibility"), kCFBooleanTrue); } @catch (__unused NSException *exception) {}
@@ -1079,7 +1080,7 @@ static CloudCodeAXUIElementRef CloudCodeAXRootForPid(CloudCodeAXRuntime runtime,
         CloudCodeAXUIElementRef systemWide = NULL;
         @try { systemWide = runtime.createSystemWide(); } @catch (__unused NSException *exception) { systemWide = NULL; }
         if (systemWide) {
-            if (runtime.setTimeout) { @try { runtime.setTimeout(systemWide, 1.5f); } @catch (__unused NSException *exception) {} }
+            if (runtime.setTimeout) { @try { runtime.setTimeout(systemWide, CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {} }
             NSUInteger visited = 0;
             root = CloudCodeAXFindElementForPid(runtime, systemWide, pid, 0, &visited);
             CFRelease(systemWide);
@@ -1099,7 +1100,7 @@ static CloudCodeAXUIElementRef CloudCodeAXFocusedApplicationRoot(CloudCodeAXRunt
     CloudCodeAXUIElementRef systemWide = NULL;
     @try { systemWide = runtime.createSystemWide(); } @catch (__unused NSException *exception) { systemWide = NULL; }
     if (!systemWide) { return NULL; }
-    if (runtime.setTimeout) { @try { runtime.setTimeout(systemWide, 1.5f); } @catch (__unused NSException *exception) {} }
+    if (runtime.setTimeout) { @try { runtime.setTimeout(systemWide, CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {} }
 
     CloudCodeAXUIElementRef focusedRoot = NULL;
     for (NSString *attribute in @[@"AXFocusedApplication", @"AXFrontmostApplication"]) {
@@ -1125,7 +1126,7 @@ static CloudCodeAXUIElementRef CloudCodeAXFocusedApplicationRoot(CloudCodeAXRunt
 static CloudCodeAXUIElementRef CloudCodeAXApplicationAtPointFromSeed(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef seed, CGSize size, pid_t *pidOut, NSString **backend, NSString *backendPrefix)
 {
     if (!seed || !runtime.getPid || (!runtime.copyApplicationAtPosition && !runtime.copyApplicationAndContextAtPosition)) { return NULL; }
-    if (runtime.setTimeout) { @try { runtime.setTimeout(seed, 1.5f); } @catch (__unused NSException *exception) {} }
+    if (runtime.setTimeout) { @try { runtime.setTimeout(seed, CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {} }
     const CGPoint points[] = {
         {size.width * 0.5, size.height * 0.5},
         {size.width * 0.5, size.height * 0.25},
@@ -1206,7 +1207,7 @@ static NSDictionary *CloudCodeAXHitTestTree(CloudCodeAXRuntime runtime, NSUInteg
     CloudCodeAXUIElementRef systemWide = NULL;
     @try { systemWide = runtime.createSystemWide(); } @catch (__unused NSException *exception) { systemWide = NULL; }
     if (!systemWide) { return nil; }
-    if (runtime.setTimeout) { @try { runtime.setTimeout(systemWide, 1.5f); } @catch (__unused NSException *exception) {} }
+    if (runtime.setTimeout) { @try { runtime.setTimeout(systemWide, CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {} }
 
     // Sample a bounded grid rather than one center point. Video/social UIs commonly place primary
     // actions along the right edge, while the center is often an unlabeled media surface. Apple's
