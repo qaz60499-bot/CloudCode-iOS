@@ -142,8 +142,8 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertEqual(fallbackResult.payload["searchPath"], "bounded_scan_then_index")
         XCTAssertTrue(fallbackResult.summary.contains("有界目录扫描"))
         let graph = await resourceIndex.snapshot()
-        XCTAssertFalse(graph.nodes.contains(where: { $0.resolvedPath == indexedURL.path }))
-        XCTAssertTrue(graph.nodes.contains(where: { $0.resolvedPath == fallbackURL.path }))
+        XCTAssertFalse(graph.nodes.contains(where: { $0.displayName == indexedURL.lastPathComponent }))
+        XCTAssertTrue(graph.nodes.contains(where: { $0.displayName == fallbackURL.lastPathComponent }))
     }
 
     func testProgressiveResourceIndexRanksExactAndPrefixNamesBeforePathOnlyMatches() async throws {
