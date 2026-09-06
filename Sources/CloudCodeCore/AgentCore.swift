@@ -584,15 +584,29 @@ public actor AgentCore {
                     session = try Self.normalizeProviderToolMetadata(in: session, using: toolNameMap)
                     try await sessionStore.save(session)
                     let providerRoutableNames = await toolRouter.providerRoutableToolNames(capabilities: capabilities)
-                    let latestRequest = session.messages.reversed().first(where: {
-                        $0.role == .user && $0.providerMetadata["internal_observation"] == nil
-                    })?.content ?? ""
-                    let scopedProviderNames = HarnessContextManager.scopedProviderToolNames(
-                        for: latestRequest,
-                        availableNames: providerRoutableNames
-                    )
-                    let providerDescriptors = descriptors.filter { scopedProviderNames.contains($0.name) }
-                    let schemas = try Self.makeToolSchemas(descriptors: providerDescriptors, toolNameMap: toolNameMap)
+                    // `text` is the authoritative request for this run, including checkpoint resume.
+                    // A resumed session may have a newer historical user message than the checkpoint
+                    // request, which previously disabled GUI/domain scoping and execution hints.
+                    // Once steering arrives in this process, that newer user instruction becomes the
+                    // active request and recompiles the provider-visible tool domain immediately.
+                    var activeRequest = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    func scopedProviderState(for request: String) throws -> ([ToolDescriptor], [ProviderToolSchema]) {
+                        let names = HarnessContextManager.scopedProviderToolNames(
+                            for: request,
+                            availableNames: providerRoutableNames
+                        )
+                        let scopedDescriptors = descriptors.filter { names.contains($0.name) }
+                        return (scopedDescriptors, try Self.makeToolSchemas(descriptors: scopedDescriptors, toolNameMap: toolNameMap))
+                    }
+                    var (providerDescriptors, schemas) = try scopedProviderState(for: activeRequest)
+                    func rescopeAfterSteering() throws {
+                        if let latest = session.messages.reversed().first(where: {
+                            $0.role == .user && $0.providerMetadata["internal_observation"] == nil
+                        })?.content.trimmingCharacters(in: .whitespacesAndNewlines), !latest.isEmpty {
+                            activeRequest = latest
+                        }
+                        (providerDescriptors, schemas) = try scopedProviderState(for: activeRequest)
+                    }
                     try? await diagnosticLogger?.log(
                         level: .info,
                         subsystem: "provider",
@@ -645,6 +659,7 @@ public actor AgentCore {
 
                         let steeringAtRoundStart = try await applyPendingSteering(to: &session)
                         if steeringAtRoundStart > 0 {
+                            try rescopeAfterSteering()
                             continuation.yield(.status("已收到 \(steeringAtRoundStart) 条追加指令，正在按最新要求重新规划…"))
                         } else {
                             continuation.yield(.status(round == 0 ? "正在使用工具优先路由规划…" : "正在根据工具结果继续…"))
@@ -666,7 +681,11 @@ public actor AgentCore {
                                 ]
                             ))
                         }
-                        let providerMessages = HarnessContextManager.providerMessages(from: providerContextMessages)
+                        let providerMessages = HarnessContextManager.providerMessages(
+                            from: providerContextMessages,
+                            policy: HarnessContextManager.providerPolicy(for: activeRequest),
+                            currentRequest: activeRequest
+                        )
                         runtimeBreadcrumb?("runtime.agent.provider.begin")
                         try? await diagnosticLogger?.log(
                             level: .debug,
@@ -727,6 +746,7 @@ public actor AgentCore {
                                 session.updatedAt = Date()
                             }
                             let count = try await applyPendingSteering(to: &session)
+                            if count > 0 { try rescopeAfterSteering() }
                             continuation.yield(.status("已收到 \(count) 条追加指令，已中止尚未执行的旧规划并按最新要求继续。"))
                             previousToolPlanSignature = nil
                             repeatedToolPlanCount = 0
@@ -741,6 +761,7 @@ public actor AgentCore {
                             await Task.yield()
                             let steeringBeforeCompletion = try await applyPendingSteering(to: &session)
                             if steeringBeforeCompletion > 0 {
+                                try rescopeAfterSteering()
                                 continuation.yield(.status("已收到 \(steeringBeforeCompletion) 条追加指令，继续当前会话而不结束任务…"))
                                 continue
                             }
@@ -779,6 +800,7 @@ public actor AgentCore {
                         }
                         let steeringBeforeTools = try await applyPendingSteering(to: &session)
                         if steeringBeforeTools > 0 {
+                            try rescopeAfterSteering()
                             continuation.yield(.status("已收到 \(steeringBeforeTools) 条追加指令；尚未执行本轮工具调用，已按新要求重新规划。"))
                             continue
                         }
@@ -1107,6 +1129,7 @@ public actor AgentCore {
 
                             let steeringAfterTool = try await applyPendingSteering(to: &session)
                             if steeringAfterTool > 0 {
+                                try rescopeAfterSteering()
                                 continuation.yield(.status("已完成当前不可安全打断的工具步骤，并收到 \(steeringAfterTool) 条追加指令；正在按新要求继续。"))
                                 shouldReplanForSteering = true
                                 break

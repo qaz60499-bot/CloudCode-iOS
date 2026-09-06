@@ -1233,7 +1233,7 @@ public actor ProviderRequestKeyState {
         var touchedAt: Date
     }
 
-    private var entries: [UUID: Entry] = [:]
+    private var entries: [String: Entry] = [:]
     private let ttl: TimeInterval
 
     public init(ttl: TimeInterval = 60 * 60) {
@@ -1241,25 +1241,37 @@ public actor ProviderRequestKeyState {
     }
 
     public func preferredReference(configurationID: UUID, allowedReferences: [String], fallback: String) -> String {
+        preferredReference(routingKey: "configuration:\(configurationID.uuidString)", allowedReferences: allowedReferences, fallback: fallback)
+    }
+
+    public func preferredReference(routingKey: String, allowedReferences: [String], fallback: String) -> String {
         prune()
-        guard let entry = entries[configurationID], allowedReferences.contains(entry.reference) else { return fallback }
-        entries[configurationID]?.touchedAt = Date()
+        guard let entry = entries[routingKey], allowedReferences.contains(entry.reference) else { return fallback }
+        entries[routingKey]?.touchedAt = Date()
         return entry.reference
     }
 
     public func preferredProtocol(configurationID: UUID, reference: String, allowedProtocols: [String], fallback: String) -> String {
+        preferredProtocol(routingKey: "configuration:\(configurationID.uuidString)", reference: reference, allowedProtocols: allowedProtocols, fallback: fallback)
+    }
+
+    public func preferredProtocol(routingKey: String, reference: String, allowedProtocols: [String], fallback: String) -> String {
         prune()
-        guard let entry = entries[configurationID],
+        guard let entry = entries[routingKey],
               entry.reference == reference,
               let protocolName = entry.protocolName,
               allowedProtocols.contains(protocolName) else { return fallback }
-        entries[configurationID]?.touchedAt = Date()
+        entries[routingKey]?.touchedAt = Date()
         return protocolName
     }
 
     public func markSuccessful(configurationID: UUID, reference: String, protocolName: String? = nil) {
+        markSuccessful(routingKey: "configuration:\(configurationID.uuidString)", reference: reference, protocolName: protocolName)
+    }
+
+    public func markSuccessful(routingKey: String, reference: String, protocolName: String? = nil) {
         prune()
-        entries[configurationID] = Entry(reference: reference, protocolName: protocolName, touchedAt: Date())
+        entries[routingKey] = Entry(reference: reference, protocolName: protocolName, touchedAt: Date())
     }
 
     private func prune(now: Date = Date()) {
@@ -1316,8 +1328,12 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
             let task = Task {
                 let fallbackReferences = (configuration.fallbackAPIKeyReferences ?? []).filter { $0 != configuration.apiKeyReference }
                 let allowedReferences = [configuration.apiKeyReference] + fallbackReferences
+                let routingStateKey = [
+                    configuration.providerID ?? configuration.baseURL.absoluteString,
+                    configuration.model.lowercased()
+                ].joined(separator: "|")
                 let preferredReference = await requestKeyState.preferredReference(
-                    configurationID: configuration.id,
+                    routingKey: routingStateKey,
                     allowedReferences: allowedReferences,
                     fallback: configuration.apiKeyReference
                 )
@@ -1358,7 +1374,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                     if keyProtocolCandidates.isEmpty { keyProtocolCandidates = defaultProtocolCandidates }
                     let protocolNames = keyProtocolCandidates.map(\.rawValue)
                     let preferredProtocolName = await requestKeyState.preferredProtocol(
-                        configurationID: configuration.id,
+                        routingKey: routingStateKey,
                         reference: keyCandidate.0,
                         allowedProtocols: protocolNames,
                         fallback: keyProtocolCandidates[0].rawValue
@@ -1410,7 +1426,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                                 continuation.yield(event)
                             }
                             await requestKeyState.markSuccessful(
-                                configurationID: configuration.id,
+                                routingKey: routingStateKey,
                                 reference: keyCandidate.0,
                                 protocolName: protocolCandidate.rawValue
                             )

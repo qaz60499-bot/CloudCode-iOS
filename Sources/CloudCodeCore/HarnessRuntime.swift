@@ -18,7 +18,8 @@ public struct HarnessContextPolicy: Sendable, Equatable {
 public enum HarnessContextManager {
     public static func providerMessages(
         from messages: [ChatMessage],
-        policy: HarnessContextPolicy = HarnessContextPolicy()
+        policy: HarnessContextPolicy = HarnessContextPolicy(),
+        currentRequest: String? = nil
     ) -> [ChatMessage] {
         guard !messages.isEmpty else { return [] }
         let normalizedMessages = pruningHistoricalObservationAttachments(in: messages)
@@ -87,7 +88,7 @@ public enum HarnessContextManager {
         })
 
         var result = systemMessages
-        result.append(contentsOf: executionHints(from: normalizedMessages))
+        result.append(contentsOf: executionHints(from: normalizedMessages, currentRequest: currentRequest))
         let omitted = conversational.count - selectedIndexes.count
         if omitted > 0 {
             result.append(ChatMessage(
@@ -102,8 +103,9 @@ public enum HarnessContextManager {
         return result
     }
 
-    static func executionHints(from messages: [ChatMessage]) -> [ChatMessage] {
-        guard let request = messages.reversed().first(where: {
+    static func executionHints(from messages: [ChatMessage], currentRequest: String? = nil) -> [ChatMessage] {
+        let explicitRequest = currentRequest?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard let request = !explicitRequest.isEmpty ? explicitRequest : messages.reversed().first(where: {
             $0.role == .user && $0.providerMetadata["internal_observation"] == nil
         })?.content else { return [] }
         var hints: [ChatMessage] = []
@@ -134,8 +136,23 @@ public enum HarnessContextManager {
         return hints
     }
 
-    static func executionHint(from messages: [ChatMessage]) -> ChatMessage? {
-        executionHints(from: messages).first
+    static func executionHint(from messages: [ChatMessage], currentRequest: String? = nil) -> ChatMessage? {
+        executionHints(from: messages, currentRequest: currentRequest).first
+    }
+
+    static func providerPolicy(for request: String) -> HarnessContextPolicy {
+        let normalized = request.lowercased()
+        let guiMarkers = [
+            "打开", "刷视频", "刷几个", "滑", "滚动", "点赞", "点开", "点击", "界面", "屏幕", "截图", "聊天", "发送", "输入",
+            "swipe", "scroll", "tap", "screenshot", "gui", "send", "chat"
+        ]
+        if guiMarkers.contains(where: normalized.contains) {
+            // GUI execution is dominated by current foreground evidence. Retaining dozens of old
+            // screenshot/tool turns makes gateway payloads slower and can trigger compatibility
+            // failures without improving the next local action. Full history stays persisted locally.
+            return HarnessContextPolicy(maxCharacters: 48_000, maxMessages: 40)
+        }
+        return HarnessContextPolicy()
     }
 
     static func transientNavigationNeedsReturn(in request: String) -> Bool {
@@ -190,7 +207,7 @@ public enum HarnessContextManager {
         var prefixes = Set<String>()
 
         let guiMarkers = [
-            "刷视频", "刷几个", "滑", "滚动", "点赞", "点开", "点击", "界面", "屏幕", "截图", "聊天", "发送消息", "输入",
+            "刷视频", "刷几个", "滑", "滚动", "点赞", "点开", "点击", "界面", "屏幕", "截图", "聊天", "发送消息", "发送", "没发送", "未发送", "回复", "输入",
             "swipe", "scroll", "tap", "screenshot", "gui"
         ]
         let likelyNamedAppOpen = normalized.contains("打开") && [

@@ -206,21 +206,25 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
                 // OpenAI model start on Anthropic merely because the Provider default was Anthropic.
                 append(verified)
                 if id == ProviderCatalog.agentRouterID {
-                    // AgentRouter can expose heterogeneous compatibility layers behind one Key.
-                    // Keep the verified path first, but retain other provider-supported wire
-                    // families as zero-output fallbacks so a transient gateway adapter regression
-                    // does not strand the selected model.
-                    append(slot.protocols)
+                    // AgentRouter documents distinct wire families per model family. Mixing the
+                    // alternate wire format for the same model adds long failed streams and can
+                    // surface gateway-specific 400s, so exact model evidence is terminal here.
+                    return ordered
                 }
                 return ordered
             }
             if id == ProviderCatalog.agentRouterID {
-                // Mirror NativeCloud: the live /models catalog decides what is selectable, while
-                // exact wire support is learned lazily for the selected Key+model. Start with the
-                // compatibility path AgentRouter currently validates for Cloud Code, then retain
-                // OpenAI Chat as a bounded zero-output fallback. No model-name allowlist is needed.
-                if slot.protocols.contains(.anthropic) { append([.anthropic]) }
-                if slot.protocols.contains(.openAIChat) { append([.openAIChat]) }
+                // AgentRouter's current public integration contract separates Claude-family models
+                // onto Anthropic Messages and general/OpenAI-compatible models onto Chat Completions.
+                // Keep this model-family rule adaptive for newly discovered models instead of forcing
+                // every unknown model through Anthropic first and paying a long failed stream.
+                let normalizedModel = model.lowercased()
+                if normalizedModel.hasPrefix("claude-") || normalizedModel.contains("/claude-") {
+                    if slot.protocols.contains(.anthropic) { append([.anthropic]) }
+                } else if slot.protocols.contains(.openAIChat) {
+                    append([.openAIChat])
+                }
+                return ordered.isEmpty ? slot.protocols : ordered
             }
             if slot.protocols.contains(preferredProtocol) { append([preferredProtocol]) }
             append(slot.protocols)
@@ -434,9 +438,9 @@ public enum ProviderCheckpointConfigurationResolver {
     private static func checkpointEndpointMatches(_ storedURL: String, profile: ProviderProfile) -> Bool {
         if storedURL == profile.baseURL.absoluteString { return true }
         // AgentRouter has used both public origins over time. Keep checkpoint migration
-        // provider-scoped so build 71 sessions stored against co.agentrouter.org can resume
-        // on the desktop-verified canonical agentrouter.org origin without allowing any
-        // arbitrary endpoint substitution.
+        // provider-scoped so older sessions stored against agentrouter.org can resume on the
+        // current documented co.agentrouter.org API origin without allowing arbitrary endpoint
+        // substitution.
         guard profile.id == "https-agentrouter-org" else { return false }
         let allowedOrigins = Set(["https://agentrouter.org", "https://co.agentrouter.org"])
         return allowedOrigins.contains(storedURL) && allowedOrigins.contains(profile.baseURL.absoluteString)
@@ -715,7 +719,7 @@ public enum ProviderCatalog {
             ProviderProfile(
                 id: "https-agentrouter-org",
                 displayName: "agentrouter.org",
-                baseURL: URL(string: "https://agentrouter.org")!,
+                baseURL: URL(string: "https://co.agentrouter.org")!,
                 protocols: [.anthropic, .openAIChat],
                 preferredProtocol: .anthropic,
                 authMode: .bearer,
@@ -740,12 +744,12 @@ public enum ProviderCatalog {
                         "claude-opus-4-6": [.anthropic],
                         "claude-opus-5": [.anthropic],
                         "gpt-5.5": [.openAIChat],
-                        "gpt-5.6-sol": [.anthropic, .openAIChat],
+                        "gpt-5.6-sol": [.openAIChat],
                         "kimi-k2.6": [.openAIChat],
                         "glm-5.1": [.openAIChat],
                         "glm-5.2": [.openAIChat],
-                        "glm-5.3": [.anthropic, .openAIChat],
-                        "deepseek-v4-flash": [.anthropic, .openAIChat],
+                        "glm-5.3": [.openAIChat],
+                        "deepseek-v4-flash": [.openAIChat],
                         "step3p5-code-alpha": [.openAIChat]
                     ]
                 )],
@@ -773,7 +777,7 @@ public enum ProviderCatalog {
                 preferredProtocol: .openAIResponses,
                 authMode: .bearer,
                 models: ["claude-sonnet-4-6", "gpt-5.6-luna", "gpt-5.6-new", "gpt-5.6-luna-testing", "deepseek-v4-flash", "deepseek-v4-flash-lr", "nemotron-ultra-550b", "nemotron-vision", "grok-imagine-2", "grok-imagine"],
-                keySlots: [ProviderKeySlot(id: "slot-1", label: "Key 1", fingerprint: "f79abeb673144d33c472a21cf54b39cb1bd0c34be0b56a1f645ac84c9a2d2078", models: ["claude-sonnet-4-6", "gpt-5.6-luna", "gpt-5.6-new", "gpt-5.6-luna-testing", "deepseek-v4-flash", "deepseek-v4-flash-lr", "nemotron-ultra-550b", "nemotron-vision", "grok-imagine-2", "grok-imagine"], protocols: [.anthropic, .openAIResponses, .openAIChat], modelProtocols: ["claude-sonnet-4-6": [.openAIResponses]])],
+                keySlots: [ProviderKeySlot(id: "slot-1", label: "Key 1", fingerprint: "f79abeb673144d33c472a21cf54b39cb1bd0c34be0b56a1f645ac84c9a2d2078", models: ["claude-sonnet-4-6", "gpt-5.6-luna", "gpt-5.6-new", "gpt-5.6-luna-testing", "deepseek-v4-flash", "deepseek-v4-flash-lr", "nemotron-ultra-550b", "nemotron-vision", "grok-imagine-2", "grok-imagine"], protocols: [.anthropic, .openAIResponses, .openAIChat], modelProtocols: ["claude-sonnet-4-6": [.openAIResponses], "gpt-5.6-luna": [.openAIChat, .openAIResponses, .anthropic]])],
                 source: .desktopSnapshot,
                 customModelAllowed: true
             ),

@@ -3975,6 +3975,23 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(hint?.content.contains("direction=forward") == true)
     }
 
+    func testHarnessCurrentRequestOverrideWinsOverStaleSessionUserOnResume() {
+        let messages = [
+            ChatMessage(role: .user, content: "帮我处理一下"),
+            ChatMessage(role: .assistant, content: "older answer")
+        ]
+        let current = "现在打开抖音极速版刷五个视频，看哪个点赞量最高"
+        let providerMessages = HarnessContextManager.providerMessages(
+            from: messages,
+            policy: HarnessContextManager.providerPolicy(for: current),
+            currentRequest: current
+        )
+        let hint = providerMessages.first(where: { $0.providerMetadata["context_layer"] == "harness_execution" })
+        XCTAssertEqual(hint?.providerMetadata["execution_mode"], "bounded_feed_sample")
+        XCTAssertEqual(hint?.providerMetadata["repeat_count"], "5")
+        XCTAssertEqual(HarnessContextManager.providerPolicy(for: current).maxMessages, 40)
+    }
+
     func testHarnessScopesProviderToolsToCurrentTaskDomain() {
         let available: Set<String> = [
             "apps.launch", "apps.list", "gui.screenshot", "gui.feedSample", "interaction.confirmTransition", "capability.probe",
@@ -3989,6 +4006,12 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(gui.contains("sqlite.query"))
         XCTAssertFalse(gui.contains("ipa.inspect"))
         XCTAssertFalse(gui.contains("advanced.shell"))
+
+        let sendCorrection = HarnessContextManager.scopedProviderToolNames(for: "但是你并没有发送啊", availableNames: available)
+        XCTAssertTrue(sendCorrection.contains("gui.screenshot"))
+        XCTAssertTrue(sendCorrection.contains("apps.launch"))
+        XCTAssertFalse(sendCorrection.contains("sqlite.query"))
+        XCTAssertFalse(sendCorrection.contains("advanced.shell"))
 
         let unknown = HarnessContextManager.scopedProviderToolNames(for: "帮我处理一下", availableNames: available)
         XCTAssertEqual(unknown, available)

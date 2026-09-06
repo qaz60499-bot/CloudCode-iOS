@@ -27,7 +27,7 @@ jobs:
           import urllib.request
 
           PROVIDER_ID = "https-agentrouter-org"
-          BASE_URL = "https://agentrouter.org"
+          BASE_URL = "https://co.agentrouter.org"
           EXPECTED_FINGERPRINT = "105a3fce9a105c41472b926f6448a91be2f9726d5e074adbaaa2206f4d6dbf23"
           CLIENT_HEADERS = {
               "User-Agent": "claude-cli/1.0.120 (external, cli)",
@@ -160,25 +160,21 @@ jobs:
               f"api_response={str(models_api_response).lower()} model_count={len(discovered)}"
           )
 
-          models_to_probe = [
-              "deepseek-v4-flash",
-              "glm-5.3",
-              "gpt-5.6-sol",
-              "claude-opus-5",
-              "claude-opus-4-8",
-          ]
-          protocol_candidates = [
-              ("anthropic", "/v1/messages", True),
-              ("openai_chat", "/v1/chat/completions", False),
-          ]
+          models_to_probe = {
+              "deepseek-v4-flash": ("openai_chat", "/v1/chat/completions", False),
+              "glm-5.3": ("openai_chat", "/v1/chat/completions", False),
+              "gpt-5.6-sol": ("openai_chat", "/v1/chat/completions", False),
+              "claude-opus-5": ("anthropic", "/v1/messages", True),
+              "claude-opus-4-8": ("anthropic", "/v1/messages", True),
+          }
 
           hard_failures = []
           fully_verified_models = []
-          for model in models_to_probe:
+          for model, expected_protocol in models_to_probe.items():
               listed = model in discovered
               successful_protocols = []
               non_auth_evidence = False
-              for protocol, path, anthropic in protocol_candidates:
+              for protocol, path, anthropic in [expected_protocol]:
                   payload = {
                       "model": model,
                       "max_tokens": 1,

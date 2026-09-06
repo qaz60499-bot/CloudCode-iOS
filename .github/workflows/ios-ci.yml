@@ -622,6 +622,17 @@ jobs:
           agent_router = catalog.split('id: "https-agentrouter-org"', 1)[1].split('source: .desktopSnapshot', 1)[0]
           if 'authMode: .bearer' not in agent_router:
               raise SystemExit('FAIL: AgentRouter catalog auth mode drifted without live evidence')
+          for marker in ('baseURL: URL(string: "https://co.agentrouter.org")!', '"gpt-5.6-sol": [.openAIChat]', '"glm-5.3": [.openAIChat]', '"deepseek-v4-flash": [.openAIChat]'):
+              if marker not in agent_router:
+                  raise SystemExit(f'FAIL: AgentRouter documented endpoint/model protocol mapping regressed: {marker}')
+          harness = Path('Sources/CloudCodeCore/HarnessRuntime.swift').read_text(encoding='utf-8')
+          agent_core = Path('Sources/CloudCodeCore/AgentCore.swift').read_text(encoding='utf-8')
+          for marker in ('currentRequest: String? = nil', 'providerPolicy(for request: String)', 'maxCharacters: 48_000, maxMessages: 40'):
+              if marker not in harness:
+                  raise SystemExit(f'FAIL: current-request GUI harness compression marker missing: {marker}')
+          for marker in ('var activeRequest = text.trimmingCharacters', 'func rescopeAfterSteering()', 'policy: HarnessContextManager.providerPolicy(for: activeRequest)'):
+              if marker not in agent_core:
+                  raise SystemExit(f'FAIL: checkpoint/steering must recompile provider tools/context from the active request: {marker}')
           for marker in ('ProviderKeyProvisioner.apply(', 'manualProviderKeyOverrides', 'provider.key.save.begin', 'installedKeyReferences'):
               if marker not in app:
                   raise SystemExit(f'FAIL: hardened Provider Key replacement marker missing: {marker}')

@@ -97,34 +97,59 @@ final class ProviderCatalogTests: XCTestCase {
         }
     }
 
-    func testAgentRouterUsesDesktopCanonicalOriginAndExplicitPerModelProtocols() throws {
+    func testAgentRouterUsesCurrentDocumentedOriginAndExplicitPerModelProtocols() throws {
         let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-agentrouter-org" }))
-        XCTAssertEqual(provider.baseURL.absoluteString, "https://agentrouter.org")
+        XCTAssertEqual(provider.baseURL.absoluteString, "https://co.agentrouter.org")
         XCTAssertEqual(provider.authMode, .bearer)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-4-8", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-5", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-4-7", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-4-6", keySlotID: "slot-1"), .anthropic)
-        XCTAssertEqual(provider.protocolFor(model: "deepseek-v4-flash", keySlotID: "slot-1"), .anthropic)
-        XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.anthropic, .openAIChat])
-        XCTAssertEqual(provider.protocolFor(model: "gpt-5.6-sol", keySlotID: "slot-1"), .anthropic)
-        XCTAssertEqual(provider.protocolCandidates(for: "gpt-5.6-sol", keySlotID: "slot-1"), [.anthropic, .openAIChat])
+        XCTAssertEqual(provider.protocolFor(model: "deepseek-v4-flash", keySlotID: "slot-1"), .openAIChat)
+        XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.openAIChat])
+        XCTAssertEqual(provider.protocolFor(model: "gpt-5.6-sol", keySlotID: "slot-1"), .openAIChat)
+        XCTAssertEqual(provider.protocolCandidates(for: "gpt-5.6-sol", keySlotID: "slot-1"), [.openAIChat])
         XCTAssertEqual(provider.protocolFor(model: "gpt-5.5", keySlotID: "slot-1"), .openAIChat)
         XCTAssertEqual(provider.protocolFor(model: "kimi-k2.6", keySlotID: "slot-1"), .openAIChat)
         XCTAssertEqual(provider.protocolFor(model: "glm-5.1", keySlotID: "slot-1"), .openAIChat)
         XCTAssertEqual(provider.protocolFor(model: "glm-5.2", keySlotID: "slot-1"), .openAIChat)
-        XCTAssertEqual(provider.protocolFor(model: "glm-5.3", keySlotID: "slot-1"), .anthropic)
-        XCTAssertEqual(provider.protocolCandidates(for: "glm-5.3", keySlotID: "slot-1"), [.anthropic, .openAIChat])
+        XCTAssertEqual(provider.protocolFor(model: "glm-5.3", keySlotID: "slot-1"), .openAIChat)
+        XCTAssertEqual(provider.protocolCandidates(for: "glm-5.3", keySlotID: "slot-1"), [.openAIChat])
         XCTAssertTrue(provider.selectableModels(for: "slot-1").contains("glm-5.3"))
         XCTAssertEqual(provider.protocolFor(model: "step3p5-code-alpha", keySlotID: "slot-1"), .openAIChat)
         XCTAssertFalse(provider.protocols.contains(.openAIResponses))
     }
 
-    func testAgentRouterUnknownDiscoveredModelKeepsBoundedAdaptiveProtocols() throws {
+    func testAgentRouterUnknownDiscoveredModelUsesModelFamilyProtocol() throws {
         var provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.agentRouterID }))
         provider.keySlots[0].models.append(contentsOf: ["claude-future-model", "future-general-model"])
-        XCTAssertEqual(provider.protocolCandidates(for: "claude-future-model", keySlotID: "slot-1"), [.anthropic, .openAIChat])
-        XCTAssertEqual(provider.protocolCandidates(for: "future-general-model", keySlotID: "slot-1"), [.anthropic, .openAIChat])
+        XCTAssertEqual(provider.protocolCandidates(for: "claude-future-model", keySlotID: "slot-1"), [.anthropic])
+        XCTAssertEqual(provider.protocolCandidates(for: "future-general-model", keySlotID: "slot-1"), [.openAIChat])
+    }
+
+    func testVyceLunaPrefersDeviceVerifiedChatCompletionsWithBoundedFallbacks() throws {
+        let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-vyceai-com" }))
+        XCTAssertEqual(
+            provider.protocolCandidates(for: "gpt-5.6-luna", keySlotID: "slot-1"),
+            [.openAIChat, .openAIResponses, .anthropic]
+        )
+    }
+
+    func testProviderRequestKeyStatePersistsLearnedProtocolAcrossEquivalentConfigurations() async {
+        let state = ProviderRequestKeyState(ttl: 3600)
+        let routingKey = "https-vyceai-com|gpt-5.6-luna"
+        await state.markSuccessful(
+            routingKey: routingKey,
+            reference: "provider.https-vyceai-com.key.slot-1",
+            protocolName: ProviderProtocol.openAIChat.rawValue
+        )
+        let preferred = await state.preferredProtocol(
+            routingKey: routingKey,
+            reference: "provider.https-vyceai-com.key.slot-1",
+            allowedProtocols: [ProviderProtocol.openAIResponses.rawValue, ProviderProtocol.anthropic.rawValue, ProviderProtocol.openAIChat.rawValue],
+            fallback: ProviderProtocol.openAIResponses.rawValue
+        )
+        XCTAssertEqual(preferred, ProviderProtocol.openAIChat.rawValue)
     }
 
     func testAgentRouterLiveCatalogReplacesStaticPickerForSelectedKey() throws {
@@ -143,7 +168,7 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(provider.selectableModels(for: "slot-1"), liveModels)
         XCTAssertEqual(provider.models, liveModels)
         XCTAssertFalse(provider.selectableModels(for: "slot-1").contains("gpt-5.5"))
-        XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.anthropic, .openAIChat])
+        XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.openAIChat])
     }
 
     func testPerKeyModelScopeOverridesProviderCatalog() throws {
@@ -259,14 +284,14 @@ final class ProviderCatalogTests: XCTestCase {
         let agentRouterReference = ProviderCatalog.keyReference(providerID: agentRouter.id, keySlotID: "slot-1")
         let migratedAgentRouter = try ProviderCheckpointConfigurationResolver.resolve(payload: [
             "provider.id": agentRouter.id,
-            "provider.baseURL": "https://co.agentrouter.org",
+            "provider.baseURL": "https://agentrouter.org",
             "provider.model": "deepseek-v4-flash",
             "provider.keyReference": agentRouterReference,
             "provider.sameProviderFailover": "false"
         ], profiles: profiles)
-        XCTAssertEqual(migratedAgentRouter.baseURL.absoluteString, "https://agentrouter.org")
-        XCTAssertEqual(migratedAgentRouter.protocolName, ProviderProtocol.anthropic.rawValue)
-        XCTAssertEqual(migratedAgentRouter.fallbackProtocolNames, [ProviderProtocol.openAIChat.rawValue])
+        XCTAssertEqual(migratedAgentRouter.baseURL.absoluteString, "https://co.agentrouter.org")
+        XCTAssertEqual(migratedAgentRouter.protocolName, ProviderProtocol.openAIChat.rawValue)
+        XCTAssertEqual(migratedAgentRouter.fallbackProtocolNames, [])
 
         let otherProvider = try XCTUnwrap(profiles.first(where: { $0.id != provider.id }))
         var crossProvider = payload
@@ -711,13 +736,13 @@ final class ProviderDiscoveryTests: XCTestCase {
         defer { session.invalidateAndCancel() }
 
         let models = try await ProviderDiscoveryClient(session: session).discoverModels(
-            baseURL: URL(string: "https://agentrouter.org")!,
+            baseURL: URL(string: "https://co.agentrouter.org")!,
             apiKey: "test-secret",
             authMode: .bearer
         )
         XCTAssertEqual(models, ["glm-5.3"])
         let request = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
-        XCTAssertEqual(request.url?.absoluteString, "https://agentrouter.org/v1/models")
+        XCTAssertEqual(request.url?.absoluteString, "https://co.agentrouter.org/v1/models")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
         XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "claude-cli/1.0.120 (external, cli)")
         XCTAssertEqual(request.value(forHTTPHeaderField: "x-app"), "cli")
@@ -969,7 +994,7 @@ final class ProviderProtocolClientTests: XCTestCase {
         let client = AnthropicProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
         let configuration = ProviderConfiguration(
             name: "AgentRouter",
-            baseURL: URL(string: "https://agentrouter.org")!,
+            baseURL: URL(string: "https://co.agentrouter.org")!,
             model: "deepseek-v4-flash",
             apiKeyReference: "key",
             providerID: ProviderCatalog.agentRouterID,
@@ -1102,17 +1127,17 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(events.last, .finished)
     }
 
-    func testAgentRouterDeepSeekUsesAnthropicPreferredCurrentOriginAndBearerAuth() async throws {
+    func testAgentRouterDeepSeekUsesOpenAICompatibleCurrentOriginAndBearerAuth() async throws {
         let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-agentrouter-org" }))
         let protocolName = provider.protocolFor(model: "deepseek-v4-flash", keySlotID: "slot-1")
-        XCTAssertEqual(protocolName, .anthropic)
-        XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.anthropic, .openAIChat])
+        XCTAssertEqual(protocolName, .openAIChat)
+        XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.openAIChat])
         ProviderTestURLProtocol.install(
             status: 200,
-            body: Data("data: {\"type\":\"message_stop\"}\n\n".utf8),
+            body: Data("data: [DONE]\n\n".utf8),
             headers: ["Content-Type": "text/event-stream"]
         )
-        let client = AnthropicProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let client = OpenAICompatibleProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
         let configuration = ProviderConfiguration(
             name: provider.displayName,
             baseURL: provider.baseURL,
@@ -1124,10 +1149,9 @@ final class ProviderProtocolClientTests: XCTestCase {
         )
         for try await _ in client.stream(configuration: configuration, apiKey: "test-secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
         let request = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
-        XCTAssertEqual(request.url?.absoluteString, "https://agentrouter.org/v1/messages")
+        XCTAssertEqual(request.url?.absoluteString, "https://co.agentrouter.org/v1/chat/completions")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
         XCTAssertNil(request.value(forHTTPHeaderField: "x-api-key"))
-        XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-version"), "2023-06-01")
         XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "claude-cli/1.0.120 (external, cli)")
         XCTAssertEqual(request.value(forHTTPHeaderField: "x-app"), "cli")
         XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-beta"), "claude-code-20250219")
