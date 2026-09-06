@@ -20,7 +20,7 @@ public struct ResourceIndexStatistics: Sendable, Equatable {
 final class ResourceIndexSQLiteStore {
     private let url: URL
     private var database: OpaquePointer?
-    let fts5Available: Bool
+    private(set) var fts5Available = false
     var rebuiltCorruptSidecar = false
 
     init(url: URL) throws {
