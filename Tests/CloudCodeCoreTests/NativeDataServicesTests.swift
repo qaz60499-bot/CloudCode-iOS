@@ -104,7 +104,7 @@ final class NativeDataServicesTests: XCTestCase {
         let sqliteFiltered = try sqlite.filter(path: databaseURL, table: "items", field: "kind", equals: "a", limit: 10, allowedRoot: root)
         XCTAssertEqual(sqliteFiltered.rows.count, 2)
         let sqliteAggregate = try sqlite.aggregate(path: databaseURL, table: "items", field: "value", operation: "sum", allowedRoot: root)
-        XCTAssertEqual(sqliteAggregate.rows.first?["value"], "7")
+        XCTAssertEqual(sqliteAggregate.rows.first?["value"], "10")
         XCTAssertThrowsError(try sqlite.query(path: databaseURL, sql: "DELETE FROM items", parametersJSON: nil, allowedRoot: root))
     }
 

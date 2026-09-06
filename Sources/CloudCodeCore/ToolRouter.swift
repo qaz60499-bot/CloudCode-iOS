@@ -214,6 +214,10 @@ public enum GUIElementResolver {
                 matches.append(candidate)
                 if matches.count >= maximumMatches { return }
             }
+            if let wrappedTree = node["tree"] {
+                walk(wrappedTree, path: "\(path).tree", needle: needle, role: role, mode: mode, maximumMatches: maximumMatches, matches: &matches)
+                if matches.count >= maximumMatches { return }
+            }
             if let children = node["children"] as? [Any] {
                 for (index, child) in children.enumerated() {
                     walk(child, path: "\(path).\(index)", needle: needle, role: role, mode: mode, maximumMatches: maximumMatches, matches: &matches)
