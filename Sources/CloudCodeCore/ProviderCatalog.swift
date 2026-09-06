@@ -414,12 +414,13 @@ public enum ProviderCheckpointConfigurationResolver {
 
     private static func checkpointEndpointMatches(_ storedURL: String, profile: ProviderProfile) -> Bool {
         if storedURL == profile.baseURL.absoluteString { return true }
-        // AgentRouter moved its documented API origin from agentrouter.org to
-        // co.agentrouter.org. Old checkpoints may resume only through this explicit,
-        // provider-scoped migration; arbitrary endpoint changes remain rejected.
-        return profile.id == "https-agentrouter-org"
-            && storedURL == "https://agentrouter.org"
-            && profile.baseURL.absoluteString == "https://co.agentrouter.org"
+        // AgentRouter has used both public origins over time. Keep checkpoint migration
+        // provider-scoped so build 71 sessions stored against co.agentrouter.org can resume
+        // on the desktop-verified canonical agentrouter.org origin without allowing any
+        // arbitrary endpoint substitution.
+        guard profile.id == "https-agentrouter-org" else { return false }
+        let allowedOrigins = Set(["https://agentrouter.org", "https://co.agentrouter.org"])
+        return allowedOrigins.contains(storedURL) && allowedOrigins.contains(profile.baseURL.absoluteString)
     }
 }
 
@@ -694,7 +695,7 @@ public enum ProviderCatalog {
             ProviderProfile(
                 id: "https-agentrouter-org",
                 displayName: "agentrouter.org",
-                baseURL: URL(string: "https://co.agentrouter.org")!,
+                baseURL: URL(string: "https://agentrouter.org")!,
                 protocols: [.anthropic, .openAIChat],
                 preferredProtocol: .anthropic,
                 authMode: .bearer,
@@ -719,12 +720,12 @@ public enum ProviderCatalog {
                         "claude-opus-4-6": [.anthropic],
                         "claude-opus-5": [.anthropic],
                         "gpt-5.5": [.openAIChat],
-                        "gpt-5.6-sol": [.openAIChat],
+                        "gpt-5.6-sol": [.anthropic, .openAIChat],
                         "kimi-k2.6": [.openAIChat],
                         "glm-5.1": [.openAIChat],
                         "glm-5.2": [.openAIChat],
-                        "glm-5.3": [.openAIChat],
-                        "deepseek-v4-flash": [.openAIChat],
+                        "glm-5.3": [.anthropic, .openAIChat],
+                        "deepseek-v4-flash": [.anthropic, .openAIChat],
                         "step3p5-code-alpha": [.openAIChat]
                     ]
                 )],

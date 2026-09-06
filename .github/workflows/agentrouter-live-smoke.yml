@@ -81,6 +81,11 @@ jobs:
           def body_text(body):
               return body.decode("utf-8", "replace").lower()
 
+          def is_api_response(body, content_type):
+              media_type = content_type.split(";")[0].strip().lower()
+              stripped = body.lstrip()
+              return "json" in media_type or stripped.startswith(b"{") or stripped.startswith(b"[")
+
           def client_blocked(status, body):
               if status not in (401, 403):
                   return False
@@ -131,26 +136,28 @@ jobs:
           if not 200 <= models_status < 300:
               raise SystemExit(f"FAIL: AgentRouter /v1/models did not return 2xx (status={models_status})")
 
+          models_api_response = is_api_response(models_body, models_content_type)
           discovered = []
-          try:
-              parsed = json.loads(models_body.decode("utf-8", "replace"))
-              raw = (parsed.get("data") or parsed.get("models") or []) if isinstance(parsed, dict) else parsed
-              if isinstance(raw, list):
-                  for item in raw:
-                      if isinstance(item, str):
-                          candidate = item.strip()
-                      elif isinstance(item, dict):
-                          candidate = str(item.get("id") or item.get("model") or item.get("name") or "").strip()
-                      else:
-                          candidate = ""
-                      if candidate and candidate not in discovered:
-                          discovered.append(candidate)
-          except Exception:
-              pass
+          if models_api_response:
+              try:
+                  parsed = json.loads(models_body.decode("utf-8", "replace"))
+                  raw = (parsed.get("data") or parsed.get("models") or []) if isinstance(parsed, dict) else parsed
+                  if isinstance(raw, list):
+                      for item in raw:
+                          if isinstance(item, str):
+                              candidate = item.strip()
+                          elif isinstance(item, dict):
+                              candidate = str(item.get("id") or item.get("model") or item.get("name") or "").strip()
+                          else:
+                              candidate = ""
+                          if candidate and candidate not in discovered:
+                              discovered.append(candidate)
+              except Exception:
+                  pass
           print(
               "AGENTROUTER_MODELS "
               f"status={models_status} content_type={models_content_type.split(';')[0]} "
-              f"model_count={len(discovered)}"
+              f"api_response={str(models_api_response).lower()} model_count={len(discovered)}"
           )
 
           models_to_probe = [
@@ -166,6 +173,7 @@ jobs:
           ]
 
           hard_failures = []
+          fully_verified_models = []
           for model in models_to_probe:
               listed = model in discovered
               successful_protocols = []
@@ -181,9 +189,13 @@ jobs:
                   blocked = client_blocked(status, body)
                   capacity = capacity_blocked(status, body)
                   unavailable = model_unavailable(body)
-                  if 200 <= status < 300:
+                  api_response = is_api_response(body, content_type)
+                  if 200 <= status < 300 and api_response:
                       classification = "ok"
                       successful_protocols.append(protocol)
+                      non_auth_evidence = True
+                  elif 200 <= status < 300:
+                      classification = "non_api_html"
                       non_auth_evidence = True
                   elif capacity:
                       classification = "capacity"
@@ -211,11 +223,20 @@ jobs:
                   "AGENTROUTER_MODEL_PROTOCOLS "
                   f"model={model} successful={','.join(successful_protocols) or 'none'}"
               )
-              if not successful_protocols and not non_auth_evidence:
+              if successful_protocols:
+                  fully_verified_models.append(model)
+              elif not non_auth_evidence:
                   hard_failures.append(model)
 
           if hard_failures:
               raise SystemExit("FAIL: AgentRouter models were rejected only by auth/client gates: " + ",".join(hard_failures))
 
-          print("AGENTROUTER_LIVE_SMOKE_OK")
+          if models_api_response and len(fully_verified_models) == len(models_to_probe):
+              print("AGENTROUTER_LIVE_SMOKE_OK")
+          else:
+              print(
+                  "AGENTROUTER_HOSTED_RUNNER_API_UNVERIFIED "
+                  f"models_api_response={str(models_api_response).lower()} "
+                  f"verified_models={len(fully_verified_models)}/{len(models_to_probe)}"
+              )
           PY
