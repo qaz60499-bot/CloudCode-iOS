@@ -125,7 +125,11 @@ jobs:
                   break
           if just_response is None:
               just_auth_failed = bool(just_statuses) and all(status in (401, 403) for status in just_statuses.values())
-              just_upstream_unavailable = bool(just_statuses) and all(500 <= status < 600 for status in just_statuses.values())
+              # Compatible gateways can return an empty 403 from a WAF/header path while the
+              # single-header paths reach the upstream and return 5xx. Treat any observed 5xx as
+              # external gateway/upstream degradation unless every attempted auth mode was an
+              # explicit auth rejection; this keeps independent provider probes running.
+              just_upstream_unavailable = not just_auth_failed and any(500 <= status < 600 for status in just_statuses.values())
               with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
                   output.write(f"justwoker_capacity_blocked={'true' if just_capacity_blocked else 'false'}\n")
                   output.write(f"justwoker_auth_failed={'true' if just_auth_failed else 'false'}\n")
