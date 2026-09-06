@@ -333,7 +333,8 @@ public actor ProgressiveResourceIndex {
         guard !nodes.isEmpty else { return }
         loadIfNeeded()
         if let store {
-            for node in nodes where Self.isContainerRoot(node), let bundleID = node.ownerBundleID, let rootPath = node.resolvedPath {
+            for node in nodes where Self.isContainerRoot(node) {
+                guard let bundleID = node.ownerBundleID, let rootPath = node.resolvedPath else { continue }
                 try store.invalidateOwnerPathsOutside(bundleID: bundleID, rootPath: rootPath)
                 graph.nodes.removeAll { candidate in
                     guard candidate.ownerBundleID == bundleID, let candidatePath = candidate.resolvedPath else { return false }
