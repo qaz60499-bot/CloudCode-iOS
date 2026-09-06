@@ -167,6 +167,14 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
         self.autoRotateKeys = autoRotateKeys
     }
 
+    public func selectableModels(for keySlotID: String?) -> [String] {
+        guard let keySlotID,
+              let slot = keySlots.first(where: { $0.id == keySlotID }) else {
+            return models
+        }
+        return slot.models.isEmpty ? models : Self.unique(slot.models)
+    }
+
     public func models(for keySlotID: String?) -> [String] {
         guard let keySlotID,
               let slot = keySlots.first(where: { $0.id == keySlotID }) else {
@@ -175,7 +183,7 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
         if slot.status == .unavailable || slot.status == .authFailed {
             return []
         }
-        return slot.models.isEmpty ? models : Self.unique(slot.models)
+        return selectableModels(for: keySlotID)
     }
 
     public func protocolFor(model: String, keySlotID: String?) -> ProviderProtocol {
@@ -198,6 +206,18 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
                 if verified.contains(preferredProtocol) { append([preferredProtocol]) }
                 append(verified)
                 return ordered
+            }
+            if id == "https-agentrouter-org" {
+                // AgentRouter publishes two distinct wire families on the same origin:
+                // Claude models use Anthropic Messages; GPT/Kimi/GLM/Step/etc. use
+                // OpenAI-compatible Chat Completions. A newly discovered/custom model must
+                // therefore choose its family before falling back to provider-wide protocols.
+                let lowered = model.lowercased()
+                if lowered.hasPrefix("claude-"), slot.protocols.contains(.anthropic) {
+                    append([.anthropic])
+                } else if !lowered.isEmpty, slot.protocols.contains(.openAIChat) {
+                    append([.openAIChat])
+                }
             }
             if slot.protocols.contains(preferredProtocol) { append([preferredProtocol]) }
             append(slot.protocols)
@@ -238,25 +258,19 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
         guard let targetSlotIndex = keySlots.firstIndex(where: { $0.id == keySlotID }) else { return }
 
         authMode = discovery.authMode
-        let previousProviderModels = models
-        models = discoveredModels
+        // Runtime discovery enriches configuration truth; it never shrinks the selectable catalog.
+        // Compatible gateways frequently expose only a partial/resource-pool-specific /models view,
+        // so replacing the static catalog here made models disappear from the picker between checks.
+        models = Self.unique(models + discoveredModels)
         readiness = discovery.readiness
         if !discovery.protocols.isEmpty {
-            protocols = discovery.protocols
-            if !protocols.contains(preferredProtocol), let first = protocols.first {
-                preferredProtocol = first
-            }
+            protocols = Self.uniqueProtocols(protocols + discovery.protocols)
         }
 
-        for slotIndex in keySlots.indices {
-            let sharesProviderCatalog = keySlots[slotIndex].models == previousProviderModels
-            guard keySlots[slotIndex].id == keySlotID || sharesProviderCatalog else { continue }
-            keySlots[slotIndex].models = discoveredModels
-            keySlots[slotIndex].status = Self.keyStatus(for: discovery.readiness)
-            if !discovery.protocols.isEmpty {
-                keySlots[slotIndex].protocols = discovery.protocols
-            }
-            keySlots[slotIndex].modelProtocols = keySlots[slotIndex].modelProtocols.filter { discoveredModels.contains($0.key) }
+        keySlots[targetSlotIndex].models = Self.unique(keySlots[targetSlotIndex].models + discoveredModels)
+        keySlots[targetSlotIndex].status = Self.keyStatus(for: discovery.readiness)
+        if !discovery.protocols.isEmpty {
+            keySlots[targetSlotIndex].protocols = Self.uniqueProtocols(keySlots[targetSlotIndex].protocols + discovery.protocols)
         }
     }
 
@@ -278,6 +292,11 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
     private static func unique(_ values: [String]) -> [String] {
         var seen = Set<String>()
         return values.filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
+
+    private static func uniqueProtocols(_ values: [ProviderProtocol]) -> [ProviderProtocol] {
+        var seen = Set<String>()
+        return values.filter { seen.insert($0.rawValue).inserted }
     }
 }
 
@@ -301,12 +320,12 @@ public enum ProviderSelectionResolver {
         }
         let requestedSlot = profile.keySlots.first(where: { $0.id == state.keySlotID }) ?? profile.keySlots.first
         let selectedSlot: ProviderKeySlot?
-        if let requestedSlot, !profile.models(for: requestedSlot.id).isEmpty || profile.customModelAllowed {
+        if let requestedSlot, !profile.selectableModels(for: requestedSlot.id).isEmpty || profile.customModelAllowed {
             selectedSlot = requestedSlot
         } else {
-            selectedSlot = profile.keySlots.first(where: { !profile.models(for: $0.id).isEmpty }) ?? requestedSlot
+            selectedSlot = profile.keySlots.first(where: { !profile.selectableModels(for: $0.id).isEmpty }) ?? requestedSlot
         }
-        let models = profile.models(for: selectedSlot?.id)
+        let models = profile.selectableModels(for: selectedSlot?.id)
         let selectedModel = models.contains(state.model) ? state.model : (models.first ?? (profile.customModelAllowed ? state.model : ""))
         return ProviderSelectionState(
             providerID: profile.id,
@@ -355,7 +374,7 @@ public enum ProviderCheckpointConfigurationResolver {
             throw ProviderCheckpointConfigurationError.invalidKeyReference
         }
         let model = payload["provider.model"] ?? ""
-        let allowedModels = profile.models(for: slot.id)
+        let allowedModels = profile.selectableModels(for: slot.id)
         guard !model.isEmpty, allowedModels.contains(model) || profile.customModelAllowed else {
             throw ProviderCheckpointConfigurationError.invalidModel(model)
         }
@@ -680,7 +699,7 @@ public enum ProviderCatalog {
                 preferredProtocol: .anthropic,
                 authMode: .bearer,
                 models: [
-                    "claude-opus-4-8", "claude-opus-4-7", "claude-opus-5",
+                    "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-5",
                     "gpt-5.5", "gpt-5.6-sol", "kimi-k2.6", "glm-5.1", "glm-5.2",
                     "deepseek-v4-flash", "step3p5-code-alpha"
                 ],
@@ -689,7 +708,7 @@ public enum ProviderCatalog {
                     label: "Key 1",
                     fingerprint: "105a3fce9a105c41472b926f6448a91be2f9726d5e074adbaaa2206f4d6dbf23",
                     models: [
-                        "claude-opus-4-8", "claude-opus-4-7", "claude-opus-5",
+                        "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-5",
                         "gpt-5.5", "gpt-5.6-sol", "kimi-k2.6", "glm-5.1", "glm-5.2",
                         "deepseek-v4-flash", "step3p5-code-alpha"
                     ],
@@ -697,6 +716,7 @@ public enum ProviderCatalog {
                     modelProtocols: [
                         "claude-opus-4-8": [.anthropic],
                         "claude-opus-4-7": [.anthropic],
+                        "claude-opus-4-6": [.anthropic],
                         "claude-opus-5": [.anthropic],
                         "gpt-5.5": [.openAIChat],
                         "gpt-5.6-sol": [.openAIChat],

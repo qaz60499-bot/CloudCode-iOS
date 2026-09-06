@@ -432,7 +432,7 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public var availableModels: [String] {
-        selectedProvider?.models(for: selectedKeySlotID) ?? []
+        selectedProvider?.selectableModels(for: selectedKeySlotID) ?? []
     }
 
     public var selectedProtocol: ProviderProtocol? {
@@ -552,7 +552,7 @@ public final class CloudCodeViewModel: ObservableObject {
 
     public func selectModel(_ model: String) {
         guard let provider = selectedProvider else { return }
-        let allowed = provider.models(for: selectedKeySlotID)
+        let allowed = provider.selectableModels(for: selectedKeySlotID)
         guard allowed.contains(model) || provider.customModelAllowed else { return }
         selectedModel = model
         persistProviderSelection()

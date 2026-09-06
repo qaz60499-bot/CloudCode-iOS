@@ -104,6 +104,7 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-4-8", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-5", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-4-7", keySlotID: "slot-1"), .anthropic)
+        XCTAssertEqual(provider.protocolFor(model: "claude-opus-4-6", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.protocolFor(model: "deepseek-v4-flash", keySlotID: "slot-1"), .openAIChat)
         XCTAssertEqual(provider.protocolFor(model: "gpt-5.6-sol", keySlotID: "slot-1"), .openAIChat)
         XCTAssertEqual(provider.protocolFor(model: "gpt-5.5", keySlotID: "slot-1"), .openAIChat)
@@ -112,6 +113,13 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(provider.protocolFor(model: "glm-5.2", keySlotID: "slot-1"), .openAIChat)
         XCTAssertEqual(provider.protocolFor(model: "step3p5-code-alpha", keySlotID: "slot-1"), .openAIChat)
         XCTAssertFalse(provider.protocols.contains(.openAIResponses))
+    }
+
+    func testAgentRouterUnknownDiscoveredModelChoosesProtocolByModelFamily() throws {
+        var provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-agentrouter-org" }))
+        provider.keySlots[0].models.append(contentsOf: ["claude-future-model", "future-general-model"])
+        XCTAssertEqual(provider.protocolCandidates(for: "claude-future-model", keySlotID: "slot-1").first, .anthropic)
+        XCTAssertEqual(provider.protocolCandidates(for: "future-general-model", keySlotID: "slot-1").first, .openAIChat)
     }
 
     func testPerKeyModelScopeOverridesProviderCatalog() throws {
@@ -794,8 +802,11 @@ final class ProviderDiscoveryTests: XCTestCase {
         XCTAssertEqual(result.readiness, .ready)
     }
 
-    func testProviderProfileAppliesLiveDiscoveryAndDropsStaleModelMetadata() throws {
+    func testProviderProfileLiveDiscoveryEnrichesWithoutShrinkingSelectableCatalog() throws {
         var profile = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.tabitokenID }))
+        let originalProviderModels = profile.models
+        let originalSlot1Models = profile.selectableModels(for: "slot-1")
+        let originalSlot2Models = profile.selectableModels(for: "slot-2")
         let discovery = ProviderDiscoveryResult(
             models: ["live-model-a", "live-model-b", "live-model-a"],
             protocols: [.anthropic],
@@ -805,13 +816,15 @@ final class ProviderDiscoveryTests: XCTestCase {
 
         profile.applyDiscovery(discovery, keySlotID: "slot-1")
 
-        XCTAssertEqual(profile.models, ["live-model-a", "live-model-b"])
-        XCTAssertEqual(profile.models(for: "slot-1"), ["live-model-a", "live-model-b"])
-        XCTAssertEqual(profile.models(for: "slot-2"), ["live-model-a", "live-model-b"])
-        XCTAssertEqual(profile.protocols, [.anthropic])
+        XCTAssertTrue(originalProviderModels.allSatisfy { profile.models.contains($0) })
+        XCTAssertTrue(profile.models.contains("live-model-a"))
+        XCTAssertTrue(profile.models.contains("live-model-b"))
+        XCTAssertTrue(originalSlot1Models.allSatisfy { profile.selectableModels(for: "slot-1").contains($0) })
+        XCTAssertTrue(profile.selectableModels(for: "slot-1").contains("live-model-a"))
+        XCTAssertEqual(profile.selectableModels(for: "slot-2"), originalSlot2Models)
+        XCTAssertTrue(profile.protocols.contains(.anthropic))
         XCTAssertEqual(profile.authMode, .both)
         XCTAssertEqual(profile.readiness, .ready)
-        XCTAssertTrue(profile.keySlots.first(where: { $0.id == "slot-1" })?.modelProtocols.isEmpty == true)
 
         let reconciled = ProviderSelectionResolver.reconcile(
             ProviderSelectionState(providerID: profile.id, keySlotID: "slot-3", model: "claude-opus-5"),
@@ -819,7 +832,22 @@ final class ProviderDiscoveryTests: XCTestCase {
         )
         XCTAssertEqual(reconciled.providerID, profile.id)
         XCTAssertEqual(reconciled.keySlotID, "slot-3")
-        XCTAssertEqual(reconciled.model, "live-model-a")
+        XCTAssertEqual(reconciled.model, "claude-opus-5")
+    }
+
+    func testAuthFailedKeyDoesNotEraseSelectableModels() throws {
+        var profile = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-agentrouter-org" }))
+        let originalModels = profile.selectableModels(for: "slot-1")
+        XCTAssertFalse(originalModels.isEmpty)
+        profile.keySlots[0].status = .authFailed
+
+        XCTAssertTrue(profile.models(for: "slot-1").isEmpty)
+        XCTAssertEqual(profile.selectableModels(for: "slot-1"), originalModels)
+        let reconciled = ProviderSelectionResolver.reconcile(
+            ProviderSelectionState(providerID: profile.id, keySlotID: "slot-1", model: "glm-5.2"),
+            profiles: [profile]
+        )
+        XCTAssertEqual(reconciled.model, "glm-5.2")
     }
 }
 
