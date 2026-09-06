@@ -108,6 +108,58 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertThrowsError(try sqlite.query(path: databaseURL, sql: "DELETE FROM items", parametersJSON: nil, allowedRoot: root))
     }
 
+    func testPersistentResourceIndexServesSearchBeforeFilesystemScanAndRevalidatesStalePaths() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let indexedURL = root.appendingPathComponent("indexed-target.txt")
+        let fallbackURL = root.appendingPathComponent("fallback-target.txt")
+        try Data("indexed".utf8).write(to: indexedURL)
+        try Data("fallback".utf8).write(to: fallbackURL)
+
+        let resourceIndex = ProgressiveResourceIndex(fileURL: root.appendingPathComponent("index/resource-graph.json"))
+        let indexedNode = ResourceNode(
+            id: ResourceID(indexedURL.absoluteString),
+            kind: .file,
+            displayName: indexedURL.lastPathComponent,
+            logicalLocation: indexedURL.absoluteString,
+            resolvedPath: indexedURL.path,
+            byteSize: 7
+        )
+        try await resourceIndex.add(indexedNode)
+
+        let resolver = StaticAppResolver(containerPaths: [:])
+        let executor = try makeStructuredExecutor(root: root, resolver: resolver, resourceIndex: resourceIndex)
+        let descriptor = ToolDescriptor(name: "files.search", summary: "", risk: .readOnly)
+        let context = ToolExecutionContext(permissionMode: .safe, capabilityProfile: publicNativeProfile(), allowedRoot: root)
+        let call = ToolCall(name: "files.search", arguments: ["path": root.path, "query": "target"], sessionID: UUID())
+
+        let indexedResult = try await executor.execute(call, descriptor: descriptor, context: context)
+        XCTAssertEqual(indexedResult.payload["searchPath"], "persistent_index_revalidated")
+        XCTAssertTrue(indexedResult.summary.contains("持久资源索引"))
+
+        try FileManager.default.removeItem(at: indexedURL)
+        let fallbackResult = try await executor.execute(call, descriptor: descriptor, context: context)
+        XCTAssertEqual(fallbackResult.payload["searchPath"], "bounded_scan_then_index")
+        XCTAssertTrue(fallbackResult.summary.contains("有界目录扫描"))
+        let graph = await resourceIndex.snapshot()
+        XCTAssertFalse(graph.nodes.contains(where: { $0.resolvedPath == indexedURL.path }))
+        XCTAssertTrue(graph.nodes.contains(where: { $0.resolvedPath == fallbackURL.path }))
+    }
+
+    func testProgressiveResourceIndexRanksExactAndPrefixNamesBeforePathOnlyMatches() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let index = ProgressiveResourceIndex(fileURL: root.appendingPathComponent("index/resource-graph.json"))
+        let nodes = [
+            ResourceNode(id: ResourceID("file:///tmp/target-folder/notes"), kind: .file, displayName: "notes", logicalLocation: "file:///tmp/target-folder/notes", resolvedPath: "/tmp/target-folder/notes"),
+            ResourceNode(id: ResourceID("file:///tmp/target"), kind: .file, displayName: "target", logicalLocation: "file:///tmp/target", resolvedPath: "/tmp/target"),
+            ResourceNode(id: ResourceID("file:///tmp/target-backup"), kind: .file, displayName: "target-backup", logicalLocation: "file:///tmp/target-backup", resolvedPath: "/tmp/target-backup")
+        ]
+        try await index.add(nodes)
+        let matches = await index.search(nameContains: "target", pathPrefix: "/tmp", maxResults: 10)
+        XCTAssertEqual(matches.map(\.displayName), ["target", "target-backup", "notes"])
+    }
+
     func testStructuredDataMacroResolvesSearchesIndexesAndQueriesLocally() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

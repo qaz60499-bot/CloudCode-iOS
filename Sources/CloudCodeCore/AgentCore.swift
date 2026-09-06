@@ -290,6 +290,7 @@ public actor ProgressiveResourceIndex {
     private var graph = ResourceGraph()
     private let fileURL: URL
     private var didLoad = false
+    private var deepIndexInFlight: Set<ResourceID> = []
     private static let maxSerializedBytes: Int64 = 16 * 1024 * 1024
 
     public init(fileURL: URL) {
@@ -327,6 +328,86 @@ public actor ProgressiveResourceIndex {
         }
         graph.indexedAt = Date()
         try persist()
+    }
+
+    public func search(
+        nameContains: String,
+        extensions: Set<String> = [],
+        ownerBundleID: String? = nil,
+        pathPrefix: String? = nil,
+        kinds: Set<ResourceKind> = [.file, .directory],
+        maxResults: Int = 100
+    ) -> [ResourceNode] {
+        loadIfNeeded()
+        let needle = Self.normalizedSearchText(nameContains)
+        guard !needle.isEmpty else { return [] }
+        let boundedLimit = min(max(maxResults, 1), 2_000)
+        let normalizedPrefix = pathPrefix.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        let candidates = graph.nodes.compactMap { node -> (ResourceNode, Int)? in
+            guard kinds.contains(node.kind), let path = node.resolvedPath else { return nil }
+            if let ownerBundleID, node.ownerBundleID != ownerBundleID { return nil }
+            let standardizedPath = URL(fileURLWithPath: path).standardizedFileURL.path
+            if let normalizedPrefix, !Self.path(standardizedPath, isWithin: normalizedPrefix) { return nil }
+            if !extensions.isEmpty, node.kind != .directory {
+                let ext = URL(fileURLWithPath: standardizedPath).pathExtension.lowercased()
+                if !extensions.contains(ext) { return nil }
+            }
+            let normalizedName = Self.normalizedSearchText(node.displayName)
+            let normalizedPath = Self.normalizedSearchText(standardizedPath)
+            let score: Int
+            if normalizedName == needle {
+                score = 0
+            } else if normalizedName.hasPrefix(needle) {
+                score = 1
+            } else if normalizedName.contains(needle) {
+                score = 2
+            } else if normalizedPath.contains(needle) {
+                score = 3
+            } else {
+                return nil
+            }
+            return (node, score)
+        }
+        return candidates.sorted { lhs, rhs in
+            if lhs.1 != rhs.1 { return lhs.1 < rhs.1 }
+            return lhs.0.displayName.localizedCaseInsensitiveCompare(rhs.0.displayName) == .orderedAscending
+        }.prefix(boundedLimit).map(\.0)
+    }
+
+    public func remove(_ ids: Set<ResourceID>) throws {
+        guard !ids.isEmpty else { return }
+        loadIfNeeded()
+        let previousCount = graph.nodes.count
+        graph.nodes.removeAll { ids.contains($0.id) }
+        graph.deepIndexedResourceIDs.subtract(ids)
+        deepIndexInFlight.subtract(ids)
+        guard graph.nodes.count != previousCount else { return }
+        graph.indexedAt = Date()
+        try persist()
+    }
+
+    public func beginDeepIndex(_ rootID: ResourceID) -> Bool {
+        loadIfNeeded()
+        guard !graph.deepIndexedResourceIDs.contains(rootID), !deepIndexInFlight.contains(rootID) else { return false }
+        deepIndexInFlight.insert(rootID)
+        return true
+    }
+
+    public func finishDeepIndex(_ rootID: ResourceID, complete: Bool) throws {
+        loadIfNeeded()
+        deepIndexInFlight.remove(rootID)
+        guard complete else { return }
+        graph.deepIndexedResourceIDs.insert(rootID)
+        graph.indexedAt = Date()
+        try persist()
+    }
+
+    private static func normalizedSearchText(_ value: String) -> String {
+        value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    private static func path(_ candidate: String, isWithin root: String) -> Bool {
+        candidate == root || candidate.hasPrefix(root.hasSuffix("/") ? root : root + "/")
     }
 
     private func loadIfNeeded() {

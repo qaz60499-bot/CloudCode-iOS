@@ -165,6 +165,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             try? await resourceIndex?.add(rootNode)
             try? await resourceIndex?.add(node)
             try? await index(entries: entries, ownerBundleID: bundleID)
+            scheduleContainerIndexWarmup(rootNode: rootNode, rootURL: rootURL, ownerBundleID: bundleID)
             return try untrustedResult(call.id, summary: "容器目录列出 \(entries.count) 项", key: "entries", value: entries, source: "container.list")
 
         case "container.search":
@@ -176,11 +177,20 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             let targetURL = URL(fileURLWithPath: resolvedPath, isDirectory: true)
             _ = try PathGuard().validate(target: targetURL, allowedRoot: context.allowedRoot, rejectSymlink: true)
             let query = makeFileSearchQuery(call, defaultMaxDepth: 6, defaultMaxResults: 200)
-            let entries = try fileService.search(root: targetURL, query: query, allowedRoot: rootURL)
             try? await resourceIndex?.add(rootNode)
             try? await resourceIndex?.add(node)
+            if let indexed = await revalidatedIndexedSearch(root: targetURL, query: query, ownerBundleID: bundleID, allowedRoot: rootURL), !indexed.isEmpty {
+                scheduleContainerIndexWarmup(rootNode: rootNode, rootURL: rootURL, ownerBundleID: bundleID)
+                var result = try untrustedResult(call.id, summary: "持久资源索引命中并重新验证 \(indexed.count) 项", key: "entries", value: indexed, source: "container.search.index")
+                result.payload["searchPath"] = "persistent_index_revalidated"
+                return result
+            }
+            let entries = try fileService.search(root: targetURL, query: query, allowedRoot: rootURL)
             try? await index(entries: entries, ownerBundleID: bundleID)
-            return try untrustedResult(call.id, summary: "容器搜索找到 \(entries.count) 项", key: "entries", value: entries, source: "container.search")
+            scheduleContainerIndexWarmup(rootNode: rootNode, rootURL: rootURL, ownerBundleID: bundleID)
+            var result = try untrustedResult(call.id, summary: "容器有界扫描找到 \(entries.count) 项并增量更新索引", key: "entries", value: entries, source: "container.search.scan")
+            result.payload["searchPath"] = "bounded_scan_then_index"
+            return result
 
         case "files.list":
             let url = try requiredURL(call, key: "path")
@@ -191,9 +201,17 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
         case "files.search":
             let root = try requiredURL(call, key: "path")
             let query = makeFileSearchQuery(call, defaultMaxDepth: 6, defaultMaxResults: 500)
+            _ = try fileService.stat(root, allowedRoot: context.allowedRoot)
+            if let indexed = await revalidatedIndexedSearch(root: root, query: query, ownerBundleID: nil, allowedRoot: context.allowedRoot), !indexed.isEmpty {
+                var result = try untrustedResult(call.id, summary: "持久资源索引命中并重新验证 \(indexed.count) 项", key: "entries", value: indexed, source: "files.search.index")
+                result.payload["searchPath"] = "persistent_index_revalidated"
+                return result
+            }
             let entries = try fileService.search(root: root, query: query, allowedRoot: context.allowedRoot)
             try? await index(entries: entries, ownerBundleID: nil)
-            return try untrustedResult(call.id, summary: "找到 \(entries.count) 个项目", key: "entries", value: entries, source: "files.search")
+            var result = try untrustedResult(call.id, summary: "有界目录扫描找到 \(entries.count) 项并增量更新索引", key: "entries", value: entries, source: "files.search.scan")
+            result.payload["searchPath"] = "bounded_scan_then_index"
+            return result
 
         case "files.read":
             let url = try requiredURL(call, key: "path")
@@ -644,6 +662,91 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             if !trimmed.isEmpty { components.path = "/" + trimmed }
         }
         return ResourceID(components.string ?? "container://\(bundleID)")
+    }
+
+    private func revalidatedIndexedSearch(
+        root: URL,
+        query: FileSearchQuery,
+        ownerBundleID: String?,
+        allowedRoot: URL?
+    ) async -> [FileEntry]? {
+        guard let resourceIndex,
+              let rawNeedle = query.nameContains?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawNeedle.isEmpty else { return nil }
+        let rootPath = root.standardizedFileURL.path
+        let indexed = await resourceIndex.search(
+            nameContains: rawNeedle,
+            extensions: query.extensions,
+            ownerBundleID: ownerBundleID,
+            pathPrefix: rootPath,
+            maxResults: query.maxResults
+        )
+        guard !indexed.isEmpty else { return [] }
+
+        let baseDepth = root.standardizedFileURL.pathComponents.count
+        var valid: [FileEntry] = []
+        var staleIDs: Set<ResourceID> = []
+        for node in indexed {
+            guard valid.count < query.maxResults, let rawPath = node.resolvedPath else { continue }
+            let candidate = URL(fileURLWithPath: rawPath).standardizedFileURL
+            let depth = candidate.pathComponents.count - baseDepth
+            guard depth >= 0, depth <= query.maxDepth else { continue }
+            do {
+                let metadata = try fileService.stat(candidate, allowedRoot: allowedRoot)
+                if let modifiedAfter = query.modifiedAfter {
+                    guard let modified = metadata.modificationDate, modified >= modifiedAfter else { continue }
+                }
+                if let modifiedBefore = query.modifiedBefore {
+                    guard let modified = metadata.modificationDate, modified <= modifiedBefore else { continue }
+                }
+                valid.append(FileEntry(
+                    path: metadata.path,
+                    name: metadata.name,
+                    isDirectory: metadata.isDirectory,
+                    size: metadata.size,
+                    modificationDate: metadata.modificationDate
+                ))
+            } catch {
+                staleIDs.insert(node.id)
+            }
+        }
+        if !staleIDs.isEmpty { try? await resourceIndex.remove(staleIDs) }
+        return valid
+    }
+
+    private func scheduleContainerIndexWarmup(rootNode: ResourceNode, rootURL: URL, ownerBundleID: String) {
+        guard let resourceIndex else { return }
+        let fileService = self.fileService
+        Task(priority: .utility) {
+            guard await resourceIndex.beginDeepIndex(rootNode.id) else { return }
+            do {
+                let limit = 8_000
+                let entries = try fileService.search(
+                    root: rootURL,
+                    query: FileSearchQuery(maxDepth: 8, maxResults: limit),
+                    allowedRoot: rootURL
+                )
+                let nodes = entries.map { entry -> ResourceNode in
+                    let id = ResourceID(URL(fileURLWithPath: entry.path).absoluteString)
+                    var metadata: [String: String] = [:]
+                    if let date = entry.modificationDate { metadata["modifiedAt"] = ISO8601DateFormatter().string(from: date) }
+                    return ResourceNode(
+                        id: id,
+                        kind: entry.isDirectory ? .directory : .file,
+                        displayName: entry.name,
+                        logicalLocation: id.rawValue,
+                        resolvedPath: entry.path,
+                        ownerBundleID: ownerBundleID,
+                        byteSize: entry.size,
+                        metadata: metadata
+                    )
+                }
+                if !nodes.isEmpty { try await resourceIndex.add(nodes) }
+                try await resourceIndex.finishDeepIndex(rootNode.id, complete: entries.count < limit)
+            } catch {
+                try? await resourceIndex.finishDeepIndex(rootNode.id, complete: false)
+            }
+        }
     }
 
     private func index(entries: [FileEntry], ownerBundleID: String?) async throws {

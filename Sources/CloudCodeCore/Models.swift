@@ -56,7 +56,7 @@ public struct CapabilityProfile: Codable, Equatable, Sendable {
     }
 }
 
-public enum ResourceKind: String, Codable, Sendable {
+public enum ResourceKind: String, Codable, Hashable, Sendable {
     case app
     case container
     case file
