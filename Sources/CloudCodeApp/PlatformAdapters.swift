@@ -504,6 +504,10 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
         cachedApps.first(where: { $0.ownerBundleID == bundleID })?.metadata["version"]
     }
 
+    public func cachedDisplayName(for bundleID: String) -> String? {
+        cachedApps.first(where: { $0.ownerBundleID == bundleID })?.displayName
+    }
+
     public func bundlePath(for bundleID: String) async -> String? {
         if bundleID == Bundle.main.bundleIdentifier { return bundlePaths[bundleID] ?? Bundle.main.bundleURL.path }
         if shouldRefreshIndex() { refresh() }
@@ -1136,6 +1140,23 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
         guard call.name == "apps.uninstall" else { throw ToolRouterError.noExecutionRoute(call.name) }
         guard bundleID != Bundle.main.bundleIdentifier else {
             throw ToolRouterError.noExecutionRoute("Cloud Code cannot uninstall itself through the active session")
+        }
+        let displayName = await appResolver.cachedDisplayName(for: bundleID)
+        guard ExplicitUserIntentGate.allowsAppUninstall(
+            request: context.currentUserRequest,
+            bundleID: bundleID,
+            displayName: displayName
+        ) else {
+            try? await audit.append(AuditEvent(
+                sessionID: call.sessionID,
+                toolCallID: call.id,
+                action: call.name,
+                target: bundleID,
+                risk: descriptor.risk,
+                result: "request_rejected_missing_explicit_user_intent",
+                detail: ["displayName": displayName ?? ""]
+            ))
+            throw ToolRouterError.noExecutionRoute("apps.uninstall requires explicit current-user uninstall intent naming the target app or Bundle ID")
         }
 
         let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: bundleID, explicitlyPermanent: true)

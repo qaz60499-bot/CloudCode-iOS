@@ -44,7 +44,10 @@ public struct PolicyEngine: Sendable {
         explicitlyPermanent: Bool = false
     ) -> PolicyDecision {
         if explicitlyPermanent || tool.risk == .permanentDestructive {
-            return mode == .full ? .allow : .requireConfirmation
+            // Permanent destruction is never auto-approved, even in full mode.
+            // Full mode can suppress ordinary write confirmations, but it must not let
+            // a model-originated uninstall/purge bypass an explicit user confirmation.
+            return .requireConfirmation
         }
 
         let sensitive = targetPath.map { classifier.isSensitive(path: $0, operation: tool.name) } ?? false

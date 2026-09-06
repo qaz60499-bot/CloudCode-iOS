@@ -1172,6 +1172,7 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
 public actor ProviderRequestKeyState {
     private struct Entry: Sendable {
         var reference: String
+        var protocolName: String?
         var touchedAt: Date
     }
 
@@ -1189,9 +1190,19 @@ public actor ProviderRequestKeyState {
         return entry.reference
     }
 
-    public func markSuccessful(configurationID: UUID, reference: String) {
+    public func preferredProtocol(configurationID: UUID, reference: String, allowedProtocols: [String], fallback: String) -> String {
         prune()
-        entries[configurationID] = Entry(reference: reference, touchedAt: Date())
+        guard let entry = entries[configurationID],
+              entry.reference == reference,
+              let protocolName = entry.protocolName,
+              allowedProtocols.contains(protocolName) else { return fallback }
+        entries[configurationID]?.touchedAt = Date()
+        return protocolName
+    }
+
+    public func markSuccessful(configurationID: UUID, reference: String, protocolName: String? = nil) {
+        prune()
+        entries[configurationID] = Entry(reference: reference, protocolName: protocolName, touchedAt: Date())
     }
 
     private func prune(now: Date = Date()) {
@@ -1246,7 +1257,6 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
     public func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
-                let client = clientFor(configuration)
                 let fallbackReferences = (configuration.fallbackAPIKeyReferences ?? []).filter { $0 != configuration.apiKeyReference }
                 let allowedReferences = [configuration.apiKeyReference] + fallbackReferences
                 let preferredReference = await requestKeyState.preferredReference(
@@ -1264,110 +1274,172 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                     orderedReferences = [configuration.apiKeyReference]
                 }
 
-                var candidates: [(String, String)] = []
+                var keyCandidates: [(String, String)] = []
                 for reference in orderedReferences {
                     if reference == configuration.apiKeyReference {
-                        candidates.append((reference, apiKey))
+                        keyCandidates.append((reference, apiKey))
                     } else if let key = try? await keyVault.key(for: reference) {
-                        candidates.append((reference, key))
+                        keyCandidates.append((reference, key))
                     }
                 }
 
+                var defaultProtocolCandidates: [ProviderProtocol] = []
+                let rawProtocolNames = [configuration.protocolName ?? ""] + (configuration.fallbackProtocolNames ?? [])
+                for raw in rawProtocolNames {
+                    guard let value = ProviderProtocol(rawValue: raw), !defaultProtocolCandidates.contains(value) else { continue }
+                    defaultProtocolCandidates.append(value)
+                }
+                if defaultProtocolCandidates.isEmpty { defaultProtocolCandidates = [.openAIChat] }
+
                 var lastError: Error = ProviderError.missingAPIKey
-                for (index, candidate) in candidates.enumerated() {
-                    var emittedOutput = false
-                    var emittedToken = false
-                    var emittedToolCall = false
-                    try? await diagnosticLogger?.log(
-                        level: .info,
-                        subsystem: "provider",
-                        action: "key-slot.attempt",
-                        result: "started",
-                        metadata: [
-                            "providerID": configuration.providerID ?? "",
-                            "protocol": configuration.protocolName ?? "",
-                            "keyReference": candidate.0,
-                            "candidateIndex": String(index),
-                            "fallbackKey": index == 0 ? "false" : "true"
-                        ]
+                keyLoop: for (keyIndex, keyCandidate) in keyCandidates.enumerated() {
+                    var keyProtocolCandidates: [ProviderProtocol] = []
+                    for raw in configuration.protocolNamesByKeyReference?[keyCandidate.0] ?? [] {
+                        guard let value = ProviderProtocol(rawValue: raw), !keyProtocolCandidates.contains(value) else { continue }
+                        keyProtocolCandidates.append(value)
+                    }
+                    if keyProtocolCandidates.isEmpty { keyProtocolCandidates = defaultProtocolCandidates }
+                    let protocolNames = keyProtocolCandidates.map(\.rawValue)
+                    let preferredProtocolName = await requestKeyState.preferredProtocol(
+                        configurationID: configuration.id,
+                        reference: keyCandidate.0,
+                        allowedProtocols: protocolNames,
+                        fallback: keyProtocolCandidates[0].rawValue
                     )
-                    do {
-                        let stream = client.stream(configuration: configuration, apiKey: candidate.1, messages: messages, tools: tools)
-                        for try await event in stream {
-                            try Task.checkCancellation()
-                            switch event {
-                            case .token:
-                                emittedOutput = true
-                                emittedToken = true
-                            case .toolCall:
-                                emittedOutput = true
-                                emittedToolCall = true
-                            case .finished:
-                                break
-                            }
-                            continuation.yield(event)
+                    let orderedProtocols: [ProviderProtocol]
+                    if let preferredProtocolIndex = keyProtocolCandidates.firstIndex(where: { $0.rawValue == preferredProtocolName }) {
+                        orderedProtocols = (0..<keyProtocolCandidates.count).map { offset in
+                            keyProtocolCandidates[(preferredProtocolIndex + offset) % keyProtocolCandidates.count]
                         }
-                        await requestKeyState.markSuccessful(configurationID: configuration.id, reference: candidate.0)
+                    } else {
+                        orderedProtocols = keyProtocolCandidates
+                    }
+                    for (protocolIndex, protocolCandidate) in orderedProtocols.enumerated() {
+                        var attemptConfiguration = configuration
+                        attemptConfiguration.protocolName = protocolCandidate.rawValue
+                        let client = clientFor(attemptConfiguration)
+                        var emittedOutput = false
+                        var emittedToken = false
+                        var emittedToolCall = false
                         try? await diagnosticLogger?.log(
                             level: .info,
                             subsystem: "provider",
-                            action: "key-slot.attempt",
-                            result: "completed",
+                            action: "route-candidate.attempt",
+                            result: "started",
                             metadata: [
                                 "providerID": configuration.providerID ?? "",
-                                "protocol": configuration.protocolName ?? "",
-                                "keyReference": candidate.0,
-                                "fallbackKey": index == 0 ? "false" : "true",
-                                "emittedToken": String(emittedToken),
-                                "emittedToolCall": String(emittedToolCall)
+                                "protocol": protocolCandidate.rawValue,
+                                "keyReference": keyCandidate.0,
+                                "keyCandidateIndex": String(keyIndex),
+                                "protocolCandidateIndex": String(protocolIndex),
+                                "fallbackKey": keyIndex == 0 ? "false" : "true",
+                                "fallbackProtocol": protocolIndex == 0 ? "false" : "true"
                             ]
                         )
-                        continuation.finish()
-                        return
-                    } catch is CancellationError {
-                        continuation.finish(throwing: CancellationError())
-                        return
-                    } catch {
-                        lastError = error
-                        let hasAnother = index + 1 < candidates.count
-                        let mayRotate = !emittedOutput && hasAnother && configuration.allowSameProviderKeyFailover == true && ProviderKeyRotationClassifier.shouldRotate(error)
-                        try? await diagnosticLogger?.log(
-                            level: .error,
-                            subsystem: "provider",
-                            action: "key-slot.failure",
-                            result: "failed",
-                            error: error,
-                            metadata: [
-                                "providerID": configuration.providerID ?? "",
-                                "protocol": configuration.protocolName ?? "",
-                                "keyReference": candidate.0,
-                                "candidateIndex": String(index),
-                                "fallbackKey": index == 0 ? "false" : "true",
-                                "emittedToken": String(emittedToken),
-                                "emittedToolCall": String(emittedToolCall),
-                                "rotationAllowed": String(mayRotate)
-                            ]
-                        )
-                        if mayRotate {
+                        do {
+                            let stream = client.stream(configuration: attemptConfiguration, apiKey: keyCandidate.1, messages: messages, tools: tools)
+                            for try await event in stream {
+                                try Task.checkCancellation()
+                                switch event {
+                                case .token:
+                                    emittedOutput = true
+                                    emittedToken = true
+                                case .toolCall:
+                                    emittedOutput = true
+                                    emittedToolCall = true
+                                case .finished:
+                                    break
+                                }
+                                continuation.yield(event)
+                            }
+                            await requestKeyState.markSuccessful(
+                                configurationID: configuration.id,
+                                reference: keyCandidate.0,
+                                protocolName: protocolCandidate.rawValue
+                            )
                             try? await diagnosticLogger?.log(
-                                level: .warning,
+                                level: .info,
                                 subsystem: "provider",
-                                action: "key-slot.rotate",
-                                result: "rotating",
-                                error: error,
+                                action: "route-candidate.attempt",
+                                result: "completed",
                                 metadata: [
                                     "providerID": configuration.providerID ?? "",
-                                    "protocol": configuration.protocolName ?? "",
-                                    "fromKeyReference": candidate.0,
-                                    "nextCandidateIndex": String(index + 1),
+                                    "protocol": protocolCandidate.rawValue,
+                                    "keyReference": keyCandidate.0,
+                                    "fallbackKey": keyIndex == 0 ? "false" : "true",
+                                    "fallbackProtocol": protocolIndex == 0 ? "false" : "true",
                                     "emittedToken": String(emittedToken),
                                     "emittedToolCall": String(emittedToolCall)
                                 ]
                             )
-                            continue
+                            continuation.finish()
+                            return
+                        } catch is CancellationError {
+                            continuation.finish(throwing: CancellationError())
+                            return
+                        } catch {
+                            lastError = error
+                            let hasAnotherProtocol = protocolIndex + 1 < orderedProtocols.count
+                            let hasAnotherKey = keyIndex + 1 < keyCandidates.count
+                            let mayFallbackProtocol = !emittedOutput && hasAnotherProtocol && ProviderProtocolFallbackClassifier.shouldFallback(error)
+                            let mayRotateKey = !emittedOutput && hasAnotherKey && configuration.allowSameProviderKeyFailover == true && ProviderKeyRotationClassifier.shouldRotate(error)
+                            try? await diagnosticLogger?.log(
+                                level: .error,
+                                subsystem: "provider",
+                                action: "route-candidate.failure",
+                                result: "failed",
+                                error: error,
+                                metadata: [
+                                    "providerID": configuration.providerID ?? "",
+                                    "protocol": protocolCandidate.rawValue,
+                                    "keyReference": keyCandidate.0,
+                                    "keyCandidateIndex": String(keyIndex),
+                                    "protocolCandidateIndex": String(protocolIndex),
+                                    "fallbackKey": keyIndex == 0 ? "false" : "true",
+                                    "fallbackProtocol": protocolIndex == 0 ? "false" : "true",
+                                    "emittedToken": String(emittedToken),
+                                    "emittedToolCall": String(emittedToolCall),
+                                    "protocolFallbackAllowed": String(mayFallbackProtocol),
+                                    "keyRotationAllowed": String(mayRotateKey)
+                                ]
+                            )
+                            if mayFallbackProtocol {
+                                try? await diagnosticLogger?.log(
+                                    level: .warning,
+                                    subsystem: "provider",
+                                    action: "protocol.rotate",
+                                    result: "rotating",
+                                    error: error,
+                                    metadata: [
+                                        "providerID": configuration.providerID ?? "",
+                                        "keyReference": keyCandidate.0,
+                                        "fromProtocol": protocolCandidate.rawValue,
+                                        "nextProtocol": orderedProtocols[protocolIndex + 1].rawValue
+                                    ]
+                                )
+                                continue
+                            }
+                            if mayRotateKey {
+                                try? await diagnosticLogger?.log(
+                                    level: .warning,
+                                    subsystem: "provider",
+                                    action: "key-slot.rotate",
+                                    result: "rotating",
+                                    error: error,
+                                    metadata: [
+                                        "providerID": configuration.providerID ?? "",
+                                        "protocol": protocolCandidate.rawValue,
+                                        "fromKeyReference": keyCandidate.0,
+                                        "nextCandidateIndex": String(keyIndex + 1),
+                                        "emittedToken": String(emittedToken),
+                                        "emittedToolCall": String(emittedToolCall)
+                                    ]
+                                )
+                                continue keyLoop
+                            }
+                            continuation.finish(throwing: error)
+                            return
                         }
-                        continuation.finish(throwing: error)
-                        return
                     }
                 }
                 continuation.finish(throwing: lastError)
@@ -1454,6 +1526,27 @@ public enum ProviderHTTPClassifier {
     }
 }
 
+public enum ProviderProtocolFallbackClassifier {
+    /// Protocol failover is only allowed before any provider output. It is reserved for
+    /// errors that can plausibly be route/protocol specific; credential/quota/rate-limit
+    /// failures stay on the current protocol decision and move only through the Key pool.
+    public static func shouldFallback(_ error: Error) -> Bool {
+        guard let providerError = error as? ProviderError else { return false }
+        switch providerError {
+        case .modelUnavailable, .malformedEvent:
+            return true
+        case .clientRejected:
+            return false
+        case .invalidResponse(let code):
+            return code == 404 || code == 405 || (500...599).contains(code)
+        case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .capacityExhausted,
+             .rateLimited, .streamInterrupted, .attachmentUnavailable, .attachmentTooLarge,
+             .unsupportedAttachmentType, .transport:
+            return false
+        }
+    }
+}
+
 public enum ProviderKeyRotationClassifier {
     /// Key failover is only consulted before any token/tool output was emitted.
     /// It covers credential/capacity failures and transient upstream failures after the
@@ -1469,7 +1562,9 @@ public enum ProviderKeyRotationClassifier {
             case .invalidResponse(let code):
                 return (500...599).contains(code)
             case .modelUnavailable:
-                return false
+                // Channel availability is frequently Key/account scoped on compatible gateways.
+                // Before any output, another Key owned by the same Provider is a safe bounded route.
+                return true
             case .missingAPIKey, .invalidEndpoint, .rateLimited, .malformedEvent, .streamInterrupted,
                  .attachmentUnavailable, .attachmentTooLarge, .unsupportedAttachmentType, .transport:
                 return false

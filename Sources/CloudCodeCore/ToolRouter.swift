@@ -22,11 +22,43 @@ public struct ToolExecutionContext: Sendable {
     public var permissionMode: PermissionMode
     public var capabilityProfile: CapabilityProfile
     public var allowedRoot: URL?
+    public var currentUserRequest: String?
 
-    public init(permissionMode: PermissionMode, capabilityProfile: CapabilityProfile, allowedRoot: URL? = nil) {
+    public init(
+        permissionMode: PermissionMode,
+        capabilityProfile: CapabilityProfile,
+        allowedRoot: URL? = nil,
+        currentUserRequest: String? = nil
+    ) {
         self.permissionMode = permissionMode
         self.capabilityProfile = capabilityProfile
         self.allowedRoot = allowedRoot
+        self.currentUserRequest = currentUserRequest
+    }
+}
+
+public enum ExplicitUserIntentGate {
+    public static func allowsAppUninstall(request: String?, bundleID: String, displayName: String?) -> Bool {
+        guard let request else { return false }
+        let normalized = normalize(request)
+        guard !normalized.isEmpty else { return false }
+        let uninstallMarkers = ["卸载", "移除", "删掉", "删除app", "删除应用", "uninstall", "removeapp", "deleteapp"]
+        guard uninstallMarkers.contains(where: { normalized.contains(normalize($0)) }) else { return false }
+
+        let normalizedBundleID = normalize(bundleID)
+        if !normalizedBundleID.isEmpty, normalized.contains(normalizedBundleID) { return true }
+        if let displayName {
+            let normalizedName = normalize(displayName)
+            if normalizedName.count >= 2, normalized.contains(normalizedName) { return true }
+        }
+        return false
+    }
+
+    private static func normalize(_ value: String) -> String {
+        value.lowercased().unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) || $0.value > 0x7F }
+            .map(String.init)
+            .joined()
     }
 }
 

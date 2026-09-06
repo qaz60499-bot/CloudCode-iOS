@@ -472,6 +472,20 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(engine.decision(mode: .balanced, tool: ToolDescriptor(name: "trash.purge", summary: "", risk: .permanentDestructive), explicitlyPermanent: true), .requireConfirmation)
     }
 
+    func testFullModeStillRequiresConfirmationForPermanentDestruction() {
+        let engine = PolicyEngine()
+        let uninstall = ToolDescriptor(name: "apps.uninstall", summary: "", risk: .permanentDestructive)
+        XCTAssertEqual(engine.decision(mode: .full, tool: uninstall, targetPath: "com.tencent.xin", explicitlyPermanent: true), .requireConfirmation)
+    }
+
+    func testAppUninstallIntentGateRequiresExplicitCurrentRequestAndTargetMatch() {
+        XCTAssertTrue(ExplicitUserIntentGate.allowsAppUninstall(request: "卸载微信", bundleID: "com.tencent.xin", displayName: "微信"))
+        XCTAssertTrue(ExplicitUserIntentGate.allowsAppUninstall(request: "uninstall com.tencent.xin", bundleID: "com.tencent.xin", displayName: "WeChat"))
+        XCTAssertFalse(ExplicitUserIntentGate.allowsAppUninstall(request: "重试", bundleID: "com.tencent.xin", displayName: "微信"))
+        XCTAssertFalse(ExplicitUserIntentGate.allowsAppUninstall(request: "删除无用缓存", bundleID: "com.tencent.xin", displayName: "微信"))
+        XCTAssertFalse(ExplicitUserIntentGate.allowsAppUninstall(request: "卸载另一个应用", bundleID: "com.tencent.xin", displayName: "微信"))
+    }
+
     func testGUITypeSensitiveWriteRequiresConfirmationOutsideFullMode() {
         let engine = PolicyEngine()
         let tool = ToolDescriptor(name: "gui.type", summary: "", risk: .sensitiveWrite)

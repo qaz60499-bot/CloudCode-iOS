@@ -83,6 +83,38 @@ jobs:
           import hashlib
           agent_fingerprint_matches_catalog = hashlib.sha256(agent_key.encode("utf-8")).hexdigest() == expected_agent_fingerprint
           print(f"AGENTROUTER_SECRET_MATCHES_CATALOG={str(agent_fingerprint_matches_catalog).lower()}")
+
+          models_status, models_body, models_content_type = request(
+              "https://co.agentrouter.org/v1/models",
+              agent_key,
+              "bearer",
+          )
+          agent_model_ids = []
+          if 200 <= models_status < 300:
+              try:
+                  parsed_models = json.loads(models_body.decode("utf-8", "replace"))
+                  if isinstance(parsed_models, dict):
+                      raw_models = parsed_models.get("data") or parsed_models.get("models") or []
+                  else:
+                      raw_models = parsed_models
+                  if isinstance(raw_models, list):
+                      for item in raw_models:
+                          if isinstance(item, str):
+                              candidate = item.strip()
+                          elif isinstance(item, dict):
+                              candidate = str(item.get("id") or item.get("model") or item.get("name") or "").strip()
+                          else:
+                              candidate = ""
+                          if candidate and candidate not in agent_model_ids:
+                              agent_model_ids.append(candidate)
+              except Exception:
+                  pass
+          print(
+              "AGENTROUTER_MODELS "
+              f"status={models_status} content_type={models_content_type.split(';')[0]} "
+              f"model_count={len(agent_model_ids)} sample={','.join(agent_model_ids[:12])}"
+          )
+
           agent_payload = {
               "model": "deepseek-v4-flash",
               "max_tokens": 1,
@@ -117,6 +149,8 @@ jobs:
               output.write(f"agentrouter_auth_failed={'true' if agentrouter_auth_failed else 'false'}\n")
               output.write(f"agentrouter_client_blocked={'true' if agentrouter_client_blocked else 'false'}\n")
               output.write(f"agentrouter_secret_matches_catalog={'true' if agent_fingerprint_matches_catalog else 'false'}\n")
+              output.write(f"agentrouter_models_status={models_status}\n")
+              output.write(f"agentrouter_model_count={len(agent_model_ids)}\n")
 
           just_key = provider_key("https-api-justwoker-icu")
           just_payload = {
@@ -187,6 +221,55 @@ jobs:
                   output.write("justwoker_auth_failed=false\n")
                   output.write("justwoker_upstream_unavailable=false\n")
                   output.write(f"justwoker_auth_mode={mode}\n")
+
+          # Keep a tiny model matrix in the same secure runner so delivery diagnostics can
+          # distinguish "this model has no channel" from "the whole Provider is unreachable".
+          for model in ("claude-opus-5", "claude-opus-5-thinking"):
+              payload = {
+                  "model": model,
+                  "max_tokens": 1,
+                  "stream": False,
+                  "messages": [{"role": "user", "content": "OK"}],
+              }
+              status, body, content_type = request(
+                  "https://api.justwoker.icu/v1/messages",
+                  just_key,
+                  "bearer",
+                  payload,
+                  anthropic=True,
+              )
+              text = body.decode("utf-8", "replace").lower()
+              model_unavailable = any(marker in text for marker in ("model_not_found", "model not found", "no available channel", "模型不存在", "无可用渠道"))
+              print(
+                  "JUSTWOKER_MODEL_MATRIX "
+                  f"model={model} auth=bearer status={status} content_type={content_type.split(';')[0]} "
+                  f"body_bytes={len(body)} model_unavailable={str(model_unavailable).lower()}"
+              )
+
+          sir_key = provider_key("https-sirthisway-icu")
+          sir_payload = {
+              "model": "claude-opus-5",
+              "max_tokens": 4,
+              "stream": True,
+              "messages": [{"role": "user", "content": "Reply OK"}],
+          }
+          sir_status, sir_body, sir_content_type = request(
+              "https://sirthisway.icu/v1/messages",
+              sir_key,
+              "bearer",
+              sir_payload,
+              anthropic=True,
+          )
+          sir_live_available = 200 <= sir_status < 300
+          print(
+              "SIRTHISWAY_LIVE_PROBE "
+              f"status={sir_status} content_type={sir_content_type.split(';')[0]} "
+              f"body_bytes={len(sir_body)} available={str(sir_live_available).lower()}"
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"sirthisway_live_available={'true' if sir_live_available else 'false'}\n")
+          if not sir_live_available:
+              print("::warning::sirthisway.icu did not pass the tiny live inference probe; deterministic Provider regressions remain authoritative for client behavior.")
           PY
 
       - name: Probe Tabitoken request compatibility without exposing secrets
@@ -660,6 +743,15 @@ jobs:
         run: |
           set -euo pipefail
           swift test --filter testJustwokerAgentUsesFullCloudCodeToolSchemaExecutesToolAndContinuesAfterResult
+
+      - name: Run real Cloud Code Agent tool round against sirthisway
+        if: steps.compatibility_probe.outputs.sirthisway_live_available == 'true'
+        env:
+          CLOUDCODE_SIRTHISWAY_LIVE_SMOKE: "1"
+          CLOUDCODE_PROVIDER_BOOTSTRAP: ${{ secrets.CLOUDCODE_PROVIDER_BOOTSTRAP }}
+        run: |
+          set -euo pipefail
+          swift test --filter testSirthiswayAgentUsesFullCloudCodeToolSchemaExecutesToolAndContinuesAfterResult
 
       - name: Run real Cloud Code Agent tool round against Tabitoken
         if: steps.live_probe.outputs.billing_blocked != 'true' && steps.live_probe.outputs.model_unavailable != 'true'

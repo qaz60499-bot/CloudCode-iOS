@@ -447,6 +447,8 @@ public struct ProviderConfiguration: Codable, Equatable, Identifiable, Sendable 
     public var protocolName: String?
     public var authModeName: String?
     public var fallbackAPIKeyReferences: [String]?
+    public var fallbackProtocolNames: [String]?
+    public var protocolNamesByKeyReference: [String: [String]]?
     public var allowSameProviderKeyFailover: Bool?
     public var reasoningEffort: ModelReasoningEffort?
 
@@ -460,6 +462,8 @@ public struct ProviderConfiguration: Codable, Equatable, Identifiable, Sendable 
         protocolName: String? = nil,
         authModeName: String? = nil,
         fallbackAPIKeyReferences: [String]? = nil,
+        fallbackProtocolNames: [String]? = nil,
+        protocolNamesByKeyReference: [String: [String]]? = nil,
         allowSameProviderKeyFailover: Bool? = nil,
         reasoningEffort: ModelReasoningEffort? = nil
     ) {
@@ -472,6 +476,8 @@ public struct ProviderConfiguration: Codable, Equatable, Identifiable, Sendable 
         self.protocolName = protocolName
         self.authModeName = authModeName
         self.fallbackAPIKeyReferences = fallbackAPIKeyReferences
+        self.fallbackProtocolNames = fallbackProtocolNames
+        self.protocolNamesByKeyReference = protocolNamesByKeyReference
         self.allowSameProviderKeyFailover = allowSameProviderKeyFailover
         self.reasoningEffort = reasoningEffort
     }

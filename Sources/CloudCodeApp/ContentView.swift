@@ -1152,13 +1152,25 @@ private struct SettingsView: View {
                     }
                     .disabled(selectedKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isProviderKeyMutationInFlight)
 
-                    Button("检查当前 Key") {
+                    Button("检查当前 Key（含上游验证）") {
                         keyInputFocused = false
                         Task { _ = await model.verifySelectedKeyPresence() }
                     }
                     .disabled(model.availableKeySlots.isEmpty || model.isProviderKeyMutationInFlight)
 
+                    if let message = model.providerKeyCheckMessage, !message.isEmpty {
+                        Text(message)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+
                     if model.bundledPrivateBootstrapAvailable {
+                        Button("恢复当前 Key 为安装包预配置值") {
+                            keyInputFocused = false
+                            Task { _ = await model.restoreSelectedKeyFromBundledBootstrap() }
+                        }
+                        .disabled(model.availableKeySlots.isEmpty || model.isProviderKeyMutationInFlight)
+
                         Button("一键导入预配置 Key") {
                             keyInputFocused = false
                             model.importBundledProviderBootstrap()
@@ -1662,7 +1674,7 @@ private func localizedKeyStatus(_ value: String) -> String {
     case "verified": return "已验证"
     case "unknown": return "未知"
     case "unavailable": return "不可用"
-    case "auth_failed": return "认证失败"
+    case "auth_failed": return "上游 401 / 需复核"
     case "capacity": return "额度 / 容量不足"
     case "needs_validation": return "待验证"
     default: return value

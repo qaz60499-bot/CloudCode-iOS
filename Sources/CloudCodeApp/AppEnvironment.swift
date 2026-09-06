@@ -5,6 +5,25 @@ import CloudCodeCore
 import UIKit
 #endif
 
+private enum ProviderLiveVerificationState {
+    case verified
+    case inconclusive
+    case authenticationRejected
+    case clientRejected
+    case capacityBlocked
+    case failed
+}
+
+private struct ProviderLiveMetadataRefreshResult {
+    var catalogApplied: Bool
+    var state: ProviderLiveVerificationState
+    var readiness: ProviderReadiness
+    var modelCount: Int
+    var diagnostic: String
+
+    var usable: Bool { state == .verified }
+}
+
 @MainActor
 public final class CloudCodeViewModel: ObservableObject {
     @Published public var session: AgentSession
@@ -27,6 +46,7 @@ public final class CloudCodeViewModel: ObservableObject {
     @Published public private(set) var diagnosticLogs: [DiagnosticLogRecord] = []
     @Published public private(set) var diagnosticLogBytes: Int64 = 0
     @Published public private(set) var providerEndpointHealth: [String: ProviderEndpointHealth] = [:]
+    @Published public private(set) var providerKeyCheckMessage: String? = nil
     @Published public private(set) var providerFailureSessionIDs: Set<UUID> = []
     @Published public private(set) var retryableProviderFailureSessionIDs: Set<UUID> = []
     @Published public private(set) var hermesRecords: [HermesMemoryRecord] = []
@@ -454,28 +474,66 @@ public final class CloudCodeViewModel: ObservableObject {
     @discardableResult
     public func verifySelectedKeyPresence() async -> Bool {
         guard let provider = selectedProvider, !selectedKeySlotID.isEmpty else {
-            lastError = "请先选择厂商和 Key。"
+            providerKeyCheckMessage = "请先选择厂商和 Key。"
+            lastError = providerKeyCheckMessage
             return false
         }
-        let reference = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: selectedKeySlotID)
+        let keySlotID = selectedKeySlotID
+        let reference = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: keySlotID)
         recordStartupBreadcrumb("provider.key.explicit-check.begin")
         do {
             let value = try await keyVault.key(for: reference)
             guard !value.isEmpty else { throw ProviderError.missingAPIKey }
             installedKeyReferences.insert(reference)
-            await refreshLiveProviderMetadataIfNeeded(providerID: provider.id, keySlotID: selectedKeySlotID, apiKey: value)
-            lastError = nil
-            recordStartupBreadcrumb("provider.key.explicit-check.end")
-            return true
+            let refresh = await refreshLiveProviderMetadataIfNeeded(providerID: provider.id, keySlotID: keySlotID, apiKey: value)
+            if let providerIndex = providerProfiles.firstIndex(where: { $0.id == provider.id }),
+               let slotIndex = providerProfiles[providerIndex].keySlots.firstIndex(where: { $0.id == keySlotID }) {
+                switch refresh.state {
+                case .verified:
+                    providerProfiles[providerIndex].keySlots[slotIndex].status = .verified
+                case .authenticationRejected:
+                    providerProfiles[providerIndex].keySlots[slotIndex].status = .authFailed
+                case .capacityBlocked:
+                    providerProfiles[providerIndex].keySlots[slotIndex].status = .capacity
+                case .clientRejected, .inconclusive, .failed:
+                    providerProfiles[providerIndex].keySlots[slotIndex].status = .needsValidation
+                }
+            }
+            switch refresh.state {
+            case .verified:
+                providerKeyCheckMessage = "Keychain 中已找到当前 Key；上游认证与最小推理验证通过，当前发现 \(refresh.modelCount) 个可用模型。"
+                lastError = nil
+                recordStartupBreadcrumb("provider.key.explicit-check.verified")
+                return true
+            case .capacityBlocked:
+                providerKeyCheckMessage = "Keychain 中已找到当前 Key；上游已识别该凭据，但当前额度 / 容量不足。"
+                lastError = providerKeyCheckMessage
+            case .authenticationRejected:
+                providerKeyCheckMessage = "Keychain 中已找到当前 Key，但 AgentRouter / 上游返回认证拒绝。这个结果说明当前请求未通过认证；仍需区分 Key 已失效、账号资源池限制或网关策略。"
+                lastError = providerKeyCheckMessage
+            case .clientRejected:
+                providerKeyCheckMessage = "Keychain 中已找到当前 Key，但网关拒绝当前客户端类型；不能据此判定 Key 无效。"
+                lastError = providerKeyCheckMessage
+            case .inconclusive:
+                providerKeyCheckMessage = "Keychain 中已找到当前 Key；上游可达，但模型 / 协议验证未完成。原模型目录已保留。"
+                lastError = providerKeyCheckMessage
+            case .failed:
+                providerKeyCheckMessage = "Keychain 中已找到当前 Key，但实时验证失败：\(refresh.diagnostic)"
+                lastError = providerKeyCheckMessage
+            }
+            recordStartupBreadcrumb("provider.key.explicit-check.network-unverified")
+            return false
         } catch {
             installedKeyReferences.remove(reference)
             recordStartupBreadcrumb("provider.key.explicit-check.failed")
-            lastError = "当前 Key 检查失败：\(Self.userFacingProviderBootstrapError(error))"
+            providerKeyCheckMessage = "当前 Key 不在 Keychain 或无法读取：\(Self.userFacingProviderBootstrapError(error))"
+            lastError = providerKeyCheckMessage
             return false
         }
     }
 
     public func selectProvider(_ providerID: String) {
+        providerKeyCheckMessage = nil
         let state = ProviderSelectionResolver.reconcile(
             ProviderSelectionState(providerID: providerID, keySlotID: "", model: ""),
             profiles: providerProfiles
@@ -484,6 +542,7 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func selectKey(_ keySlotID: String) {
+        providerKeyCheckMessage = nil
         let state = ProviderSelectionResolver.reconcile(
             ProviderSelectionState(providerID: selectedProviderID, keySlotID: keySlotID, model: selectedModel),
             profiles: providerProfiles
@@ -1826,10 +1885,79 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     @discardableResult
-    private func refreshLiveProviderMetadataIfNeeded(providerID: String, keySlotID: String, apiKey: String) async -> Bool {
+    public func restoreSelectedKeyFromBundledBootstrap() async -> Bool {
+        guard let provider = selectedProvider, !selectedKeySlotID.isEmpty else {
+            providerKeyCheckMessage = "请先选择要恢复的厂商和 Key。"
+            lastError = providerKeyCheckMessage
+            return false
+        }
+        guard let url = Bundle.main.url(forResource: "CloudCode-Provider-Bootstrap", withExtension: "json") else {
+            providerKeyCheckMessage = "当前安装包不包含预配置 Key。"
+            lastError = providerKeyCheckMessage
+            return false
+        }
+        let reference = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: selectedKeySlotID)
+        guard !isProviderKeyReferenceInUse(reference) else {
+            providerKeyCheckMessage = "当前仍有任务正在使用这个 Key；请先停止任务再恢复预配置值。"
+            lastError = providerKeyCheckMessage
+            return false
+        }
+        guard beginExclusiveOperation(Self.providerKeyMutationOperationKey) else {
+            providerKeyCheckMessage = "另一个厂商 Key 操作正在进行中。"
+            lastError = providerKeyCheckMessage
+            return false
+        }
+        defer { endExclusiveOperation(Self.providerKeyMutationOperationKey) }
+
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            let byteSize = (attributes[.size] as? NSNumber)?.intValue ?? 0
+            guard byteSize > 0, byteSize <= 1_048_576 else { throw CocoaError(.fileReadCorruptFile) }
+            var data = try Data(contentsOf: url, options: [.mappedIfSafe])
+            defer { data.resetBytes(in: 0..<data.count) }
+            let payload = try ProviderBootstrapPayload.decodeBootstrap(from: data)
+            guard payload.schemaVersion == 1,
+                  let providerKeys = payload.providers.first(where: { $0.providerID == provider.id }),
+                  let key = providerKeys.keys.first(where: { $0.slotID == selectedKeySlotID }),
+                  !key.secret.isEmpty else {
+                throw ProviderError.missingAPIKey
+            }
+            let fingerprint = ProviderFingerprint.sha256(key.secret)
+            if let declared = key.fingerprint, !declared.isEmpty, declared != fingerprint {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            _ = try await ProviderKeyProvisioner.apply(
+                [ProviderKeyMutation(reference: reference, secret: key.secret)],
+                vault: keyVault
+            )
+            installedKeyReferences.insert(reference)
+            updateManualProviderKeyOverrides { $0.remove(reference) }
+            if let providerIndex = providerProfiles.firstIndex(where: { $0.id == provider.id }),
+               let slotIndex = providerProfiles[providerIndex].keySlots.firstIndex(where: { $0.id == selectedKeySlotID }) {
+                providerProfiles[providerIndex].keySlots[slotIndex].fingerprint = fingerprint
+                providerProfiles[providerIndex].keySlots[slotIndex].status = .needsValidation
+            }
+            let refresh = await refreshLiveProviderMetadataIfNeeded(providerID: provider.id, keySlotID: selectedKeySlotID, apiKey: key.secret)
+            providerKeyCheckMessage = refresh.usable
+                ? "已把当前 Key 恢复为安装包预配置值，并通过上游验证。"
+                : "已把当前 Key 恢复为安装包预配置值；本地写入/回读已通过，但上游仍未验证成功：\(refresh.diagnostic)"
+            lastError = refresh.usable ? nil : providerKeyCheckMessage
+            activityLines.append("\(provider.displayName) / \(selectedKeySlotID) 已明确恢复为安装包预配置 Key；该槽位不再受手动覆盖保护。")
+            return refresh.usable
+        } catch {
+            providerKeyCheckMessage = "恢复当前预配置 Key 失败：\(Self.userFacingProviderBootstrapError(error))"
+            lastError = providerKeyCheckMessage
+            return false
+        }
+    }
+
+    @discardableResult
+    private func refreshLiveProviderMetadataIfNeeded(providerID: String, keySlotID: String, apiKey: String) async -> ProviderLiveMetadataRefreshResult {
         guard let providerIndex = providerProfiles.firstIndex(where: { $0.id == providerID }),
               !keySlotID.isEmpty,
-              !apiKey.isEmpty else { return false }
+              !apiKey.isEmpty else {
+            return ProviderLiveMetadataRefreshResult(catalogApplied: false, state: .failed, readiness: .needsValidation, modelCount: 0, diagnostic: "厂商、Key 槽位或 Key 内容缺失。")
+        }
         let profile = providerProfiles[providerIndex]
         let baseURL = profile.baseURL
         let preferredAuthMode = profile.authMode
@@ -1878,8 +2006,36 @@ public final class CloudCodeViewModel: ObservableObject {
                     "preservedModelCount": String(profile.models(for: keySlotID).count)
                 ]
             )
-            return shouldApplyDiscovery
+            return ProviderLiveMetadataRefreshResult(
+                catalogApplied: shouldApplyDiscovery,
+                state: shouldApplyDiscovery ? .verified : .inconclusive,
+                readiness: discovery.readiness,
+                modelCount: discovery.models.count,
+                diagnostic: shouldApplyDiscovery ? "上游认证和最小推理验证均已通过。" : "上游可达，但当前模型/协议尚未完成可用性验证。"
+            )
         } catch {
+            let state: ProviderLiveVerificationState
+            let readiness: ProviderReadiness
+            if let providerError = error as? ProviderError {
+                switch providerError {
+                case .authenticationFailed:
+                    state = .authenticationRejected
+                    readiness = .authFailed
+                case .clientRejected:
+                    state = .clientRejected
+                    readiness = .needsValidation
+                case .capacityExhausted:
+                    state = .capacityBlocked
+                    readiness = .capacity
+                default:
+                    state = .failed
+                    readiness = .needsValidation
+                }
+            } else {
+                state = .failed
+                readiness = .needsValidation
+            }
+            let diagnostic = String(describing: error)
             try? await diagnosticLogStore.log(
                 level: .warning,
                 subsystem: "provider-discovery",
@@ -1889,7 +2045,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 metadata: ["providerID": providerID, "keySlotID": keySlotID]
             )
             activityLines.append("\(profile.displayName) 实时模型/协议验证失败；已保留现有 Key 与模型配置，不会把该失败扩散到其他厂商。")
-            return false
+            return ProviderLiveMetadataRefreshResult(catalogApplied: false, state: state, readiness: readiness, modelCount: 0, diagnostic: diagnostic)
         }
     }
 
@@ -1905,9 +2061,15 @@ public final class CloudCodeViewModel: ObservableObject {
         guard let provider = selectedProvider,
               let slot = provider.keySlots.first(where: { $0.id == selectedKeySlotID }),
               !selectedModel.isEmpty else { return nil }
-        let protocolName = provider.protocolFor(model: selectedModel, keySlotID: slot.id)
-        let references = provider.orderedKeyReferences(selectedKeySlotID: slot.id)
+        let protocolCandidates = provider.protocolCandidates(for: selectedModel, keySlotID: slot.id)
+        let protocolName = protocolCandidates.first ?? provider.preferredProtocol
+        let references = provider.orderedKeyReferences(selectedKeySlotID: slot.id, model: selectedModel)
         guard let primary = references.first else { return nil }
+        let protocolNamesByKeyReference = Dictionary(uniqueKeysWithValues: provider.keySlots.map { candidateSlot in
+            let reference = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: candidateSlot.id)
+            let names = provider.protocolCandidates(for: selectedModel, keySlotID: candidateSlot.id).map(\.rawValue)
+            return (reference, names)
+        })
         return ProviderConfiguration(
             name: provider.displayName,
             baseURL: provider.baseURL,
@@ -1917,6 +2079,8 @@ public final class CloudCodeViewModel: ObservableObject {
             protocolName: protocolName.rawValue,
             authModeName: provider.authMode.rawValue,
             fallbackAPIKeyReferences: provider.autoRotateKeys ? Array(references.dropFirst()) : [],
+            fallbackProtocolNames: Array(protocolCandidates.dropFirst()).map(\.rawValue),
+            protocolNamesByKeyReference: protocolNamesByKeyReference,
             allowSameProviderKeyFailover: provider.autoRotateKeys,
             reasoningEffort: selectedReasoningEffort
         )
@@ -2039,7 +2203,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 keySlotID: tabitoken.keySlotID,
                 apiKey: tabitoken.secret
             )
-            if usable {
+            if usable.usable {
                 let preferred = ProviderSelectionResolver.reconcile(
                     ProviderSelectionState(providerID: tabitoken.providerID, keySlotID: tabitoken.keySlotID, model: selectedModel),
                     profiles: providerProfiles

@@ -75,11 +75,18 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertTrue(provider.autoRotateKeys)
     }
 
-    func testJustwokerUsesDualAuthForRotatedKeyCompatibility() throws {
+    func testJustwokerMatchesCurrentDesktopBearerAuthAndExactModelProtocolEvidence() throws {
         let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-api-justwoker-icu" }))
-        XCTAssertEqual(provider.authMode, .both)
+        XCTAssertEqual(provider.authMode, .bearer)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-5", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-5-thinking", keySlotID: "slot-1"), .anthropic)
+        XCTAssertEqual(provider.protocolCandidates(for: "claude-opus-5", keySlotID: "slot-1"), [.anthropic])
+    }
+
+    func testGorouterWithoutExactModelProtocolEvidenceKeepsBoundedProtocolCandidates() throws {
+        let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "ccs-7bdd07431575" }))
+        XCTAssertEqual(provider.protocolCandidates(for: "claude-opus-5", keySlotID: "slot-1"), [.anthropic, .openAIChat])
+        XCTAssertEqual(provider.protocolCandidates(for: "claude-opus-5", keySlotID: "slot-2"), [.anthropic, .openAIChat])
     }
 
     func testMultiKeyDesktopProvidersEnableSameProviderFailover() throws {
@@ -96,8 +103,14 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(provider.authMode, .bearer)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-4-8", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-5", keySlotID: "slot-1"), .anthropic)
+        XCTAssertEqual(provider.protocolFor(model: "claude-opus-4-7", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.protocolFor(model: "deepseek-v4-flash", keySlotID: "slot-1"), .openAIChat)
         XCTAssertEqual(provider.protocolFor(model: "gpt-5.6-sol", keySlotID: "slot-1"), .openAIChat)
+        XCTAssertEqual(provider.protocolFor(model: "gpt-5.5", keySlotID: "slot-1"), .openAIChat)
+        XCTAssertEqual(provider.protocolFor(model: "kimi-k2.6", keySlotID: "slot-1"), .openAIChat)
+        XCTAssertEqual(provider.protocolFor(model: "glm-5.1", keySlotID: "slot-1"), .openAIChat)
+        XCTAssertEqual(provider.protocolFor(model: "glm-5.2", keySlotID: "slot-1"), .openAIChat)
+        XCTAssertEqual(provider.protocolFor(model: "step3p5-code-alpha", keySlotID: "slot-1"), .openAIChat)
         XCTAssertFalse(provider.protocols.contains(.openAIResponses))
     }
 
@@ -138,6 +151,12 @@ final class ProviderCatalogTests: XCTestCase {
         )
         XCTAssertEqual(state.keySlotID, "slot-1")
         XCTAssertEqual(state.model, provider.models(for: "slot-1").first)
+    }
+
+    func testModelScopedKeyRotationSkipsKeysThatDoNotAdvertiseTheSelectedModel() throws {
+        let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-sharellm-cn" }))
+        let references = provider.orderedKeyReferences(selectedKeySlotID: "slot-2", model: "claude-opus-5")
+        XCTAssertEqual(references, [ProviderCatalog.keyReference(providerID: provider.id, keySlotID: "slot-2")])
     }
 
     func testSelectedKeyIsAlwaysThePrimaryReferenceBeforeSameProviderRotation() throws {
@@ -225,6 +244,39 @@ final class ProviderCatalogTests: XCTestCase {
                 return XCTFail("Expected cross-provider fallback rejection, got \(error)")
             }
         }
+    }
+
+    func testCheckpointConfigurationCarriesBoundedProtocolFallbacks() throws {
+        let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "ccs-7bdd07431575" }))
+        let primary = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: "slot-1")
+        let resolved = try ProviderCheckpointConfigurationResolver.resolve(payload: [
+            "provider.id": provider.id,
+            "provider.baseURL": provider.baseURL.absoluteString,
+            "provider.model": "claude-opus-5",
+            "provider.keyReference": primary,
+            "provider.sameProviderFailover": "false"
+        ], profiles: ProviderCatalog.desktopSnapshot)
+        XCTAssertEqual(resolved.protocolName, ProviderProtocol.anthropic.rawValue)
+        XCTAssertEqual(resolved.fallbackProtocolNames, [ProviderProtocol.openAIChat.rawValue])
+        XCTAssertEqual(resolved.protocolNamesByKeyReference?[primary], [ProviderProtocol.anthropic.rawValue, ProviderProtocol.openAIChat.rawValue])
+    }
+
+    func testProviderConfigurationDecodesLegacyPayloadWithoutFallbackProtocols() throws {
+        let id = UUID()
+        let data = try JSONSerialization.data(withJSONObject: [
+            "id": id.uuidString,
+            "name": "Legacy",
+            "baseURL": "https://example.com",
+            "model": "model",
+            "apiKeyReference": "primary",
+            "providerID": "legacy",
+            "protocolName": ProviderProtocol.anthropic.rawValue,
+            "authModeName": ProviderAuthMode.bearer.rawValue
+        ])
+        let decoded = try JSONDecoder().decode(ProviderConfiguration.self, from: data)
+        XCTAssertEqual(decoded.id, id)
+        XCTAssertNil(decoded.fallbackProtocolNames)
+        XCTAssertNil(decoded.protocolNamesByKeyReference)
     }
 
     func testBootstrapDecoderAcceptsFractionalISO8601GeneratedAt() throws {
@@ -346,6 +398,104 @@ final class ProviderRouterTests: XCTestCase {
         configuration.allowSameProviderKeyFailover = true
         let text = try await collectText(router.stream(configuration: configuration, apiKey: "no-quota", messages: [], tools: []))
         XCTAssertEqual(text, "good")
+    }
+
+    func testSameProviderModelUnavailableRotatesToNextKey() async throws {
+        let vault = MemoryKeyVault(keys: ["fallback": "good"])
+        let router = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: KeyOutcomeProvider(),
+            openAIChat: KeyOutcomeProvider(),
+            responses: KeyOutcomeProvider()
+        )
+        var configuration = config(protocolName: .anthropic)
+        configuration.fallbackAPIKeyReferences = ["fallback"]
+        configuration.allowSameProviderKeyFailover = true
+        let text = try await collectText(router.stream(configuration: configuration, apiKey: "model-missing", messages: [], tools: []))
+        XCTAssertEqual(text, "good")
+    }
+
+    func testModelUnavailableFallsBackToAlternateProtocolBeforeLeavingProviderRoute() async throws {
+        let vault = MemoryKeyVault()
+        let router = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: AlwaysFailureProvider(error: .modelUnavailable(503)),
+            openAIChat: FixedProvider(token: "chat-fallback"),
+            responses: FixedProvider(token: "responses")
+        )
+        var configuration = config(protocolName: .anthropic)
+        configuration.fallbackProtocolNames = [ProviderProtocol.openAIChat.rawValue]
+        let text = try await collectText(router.stream(configuration: configuration, apiKey: "primary", messages: [], tools: []))
+        XCTAssertEqual(text, "chat-fallback")
+    }
+
+    func testKeyScopedProtocolMapChangesProtocolWhenRotatingKeys() async throws {
+        let vault = MemoryKeyVault(keys: ["fallback": "fallback-key"])
+        let recorder = RecordingKeyProtocolOutcomeProvider()
+        let router = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: recorder,
+            openAIChat: recorder,
+            responses: recorder
+        )
+        var configuration = config(protocolName: .anthropic)
+        configuration.fallbackAPIKeyReferences = ["fallback"]
+        configuration.fallbackProtocolNames = [ProviderProtocol.openAIChat.rawValue]
+        configuration.protocolNamesByKeyReference = [
+            "primary": [ProviderProtocol.anthropic.rawValue],
+            "fallback": [ProviderProtocol.openAIChat.rawValue]
+        ]
+        configuration.allowSameProviderKeyFailover = true
+
+        let text = try await collectText(router.stream(configuration: configuration, apiKey: "primary-key", messages: [], tools: []))
+        let seen = await recorder.routesSeen()
+        XCTAssertEqual(text, "fallback-route-good")
+        XCTAssertEqual(seen, [
+            "primary-key|\(ProviderProtocol.anthropic.rawValue)",
+            "fallback-key|\(ProviderProtocol.openAIChat.rawValue)"
+        ])
+    }
+
+    func testSuccessfulFallbackProtocolIsPreferredOnLaterToolRound() async throws {
+        let vault = MemoryKeyVault()
+        let recorder = RecordingProtocolOutcomeProvider()
+        let router = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: recorder,
+            openAIChat: recorder,
+            responses: recorder
+        )
+        var configuration = config(protocolName: .anthropic)
+        configuration.fallbackProtocolNames = [ProviderProtocol.openAIChat.rawValue]
+
+        let first = try await collectText(router.stream(configuration: configuration, apiKey: "primary", messages: [], tools: []))
+        let second = try await collectText(router.stream(configuration: configuration, apiKey: "primary", messages: [], tools: []))
+        let seen = await recorder.protocolsSeen()
+        XCTAssertEqual(first, "chat-good")
+        XCTAssertEqual(second, "chat-good")
+        XCTAssertEqual(seen, [ProviderProtocol.anthropic.rawValue, ProviderProtocol.openAIChat.rawValue, ProviderProtocol.openAIChat.rawValue])
+    }
+
+    func testProtocolFallbackNeverReplaysAfterProviderOutput() async throws {
+        let vault = MemoryKeyVault()
+        let router = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: PartialThenFailureProvider(),
+            openAIChat: FixedProvider(token: "must-not-run"),
+            responses: FixedProvider(token: "responses")
+        )
+        var configuration = config(protocolName: .anthropic)
+        configuration.fallbackProtocolNames = [ProviderProtocol.openAIChat.rawValue]
+        var text = ""
+        do {
+            for try await event in router.stream(configuration: configuration, apiKey: "primary", messages: [], tools: []) {
+                if case .token(let token) = event { text += token }
+            }
+            XCTFail("Output followed by failure must never replay through another protocol")
+        } catch {
+            XCTAssertEqual(error as? ProviderError, .streamInterrupted)
+        }
+        XCTAssertEqual(text, "partial")
     }
 
     func test429DoesNotRotateKey() async throws {
@@ -1100,21 +1250,23 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertTrue(compactText.contains("latest-user-must-survive"))
     }
 
-    func testHTTP503ModelNotFoundIsModelScopedAndDoesNotDegradeProviderOrRetry() {
+    func testHTTP503ModelNotFoundIsModelScopedAndUsesOnlyBoundedRouteFallbacks() {
         let body = Data("{\"error\":{\"code\":\"model_not_found\",\"message\":\"No available channel for model claude-opus-5 under group default\"}}".utf8)
         let error = ProviderHTTPClassifier.error(for: 503, body: body)
         XCTAssertEqual(error, .modelUnavailable(503))
         XCTAssertFalse(ProviderCompatibilityClassifier.shouldRetryWithCompactContext(statusCode: 503, body: body))
         XCTAssertFalse(ProviderRetryClassifier.isRetryableBeforeOutput(try! XCTUnwrap(error)))
-        XCTAssertFalse(ProviderKeyRotationClassifier.shouldRotate(try! XCTUnwrap(error)))
+        XCTAssertTrue(ProviderProtocolFallbackClassifier.shouldFallback(try! XCTUnwrap(error)))
+        XCTAssertTrue(ProviderKeyRotationClassifier.shouldRotate(try! XCTUnwrap(error)))
         XCTAssertFalse(ProviderEndpointHealthClassifier.shouldMarkDegraded(try! XCTUnwrap(error)))
     }
 
-    func testUnauthorizedClientErrorDoesNotInvalidateKeyOrProviderHealth() {
+    func testUnauthorizedClientErrorDoesNotInvalidateKeyProviderHealthOrTriggerProtocolFallback() {
         let body = Data("{\"error\":{\"type\":\"unauthorized_client_error\",\"message\":\"unauthorized client detected\"}}".utf8)
         let error = ProviderHTTPClassifier.error(for: 401, body: body)
         XCTAssertEqual(error, .clientRejected(401))
         XCTAssertFalse(ProviderRetryClassifier.isRetryableBeforeOutput(try! XCTUnwrap(error)))
+        XCTAssertFalse(ProviderProtocolFallbackClassifier.shouldFallback(try! XCTUnwrap(error)))
         XCTAssertFalse(ProviderKeyRotationClassifier.shouldRotate(try! XCTUnwrap(error)))
         XCTAssertFalse(ProviderEndpointHealthClassifier.shouldMarkDegraded(try! XCTUnwrap(error)))
     }
@@ -1248,7 +1400,7 @@ final class ProviderLiveIntegrationTests: XCTestCase {
             apiKeyReference: "live-justwoker",
             providerID: "https-api-justwoker-icu",
             protocolName: ProviderProtocol.anthropic.rawValue,
-            authModeName: ProviderAuthMode.both.rawValue
+            authModeName: ProviderAuthMode.bearer.rawValue
         )
 
         var capabilityToolCallCount = 0
@@ -1277,6 +1429,83 @@ final class ProviderLiveIntegrationTests: XCTestCase {
         XCTAssertTrue(assistantText.contains("JUSTWOKER_TOOL_ROUND_OK"), "Justwoker live model did not continue after the tool result")
         let saved = try await sessions.load(session.id)
         XCTAssertTrue(saved.messages.contains { $0.role == .assistant && $0.content.contains("JUSTWOKER_TOOL_ROUND_OK") })
+        let toolCall = saved.messages.first(where: { $0.role == .assistant && $0.providerMetadata["tool_call_id"] != nil })
+        XCTAssertEqual(toolCall?.providerMetadata["tool_name"], "capability.probe")
+        XCTAssertEqual(toolCall?.providerMetadata["provider_tool_name"], "capability_probe")
+    }
+
+    func testSirthiswayAgentUsesFullCloudCodeToolSchemaExecutesToolAndContinuesAfterResult() async throws {
+        guard ProcessInfo.processInfo.environment["CLOUDCODE_SIRTHISWAY_LIVE_SMOKE"] == "1" else {
+            throw XCTSkip("sirthisway live smoke is enabled only in the dedicated GitHub Actions workflow")
+        }
+        guard let bootstrapText = ProcessInfo.processInfo.environment["CLOUDCODE_PROVIDER_BOOTSTRAP"],
+              let bootstrapData = bootstrapText.data(using: .utf8) else {
+            XCTFail("CLOUDCODE_PROVIDER_BOOTSTRAP is missing")
+            return
+        }
+        let payload = try ProviderBootstrapPayload.decodeBootstrap(from: bootstrapData)
+        let provider = try XCTUnwrap(payload.providers.first(where: { $0.providerID == "https-sirthisway-icu" }))
+        let key = try XCTUnwrap(provider.keys.first?.secret)
+        XCTAssertFalse(key.isEmpty)
+
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeSirthiswayLiveSmoke-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let vault = MemoryKeyVault(keys: ["live-sirthisway": key])
+        let registry = ToolRegistry()
+        let probe = LiveSmokeCapabilityProbe()
+        let router = ToolRouter(
+            registry: registry,
+            executors: [LiveSmokeCapabilityExecutor()],
+            executionLedger: ToolExecutionLedger(fileURL: root.appendingPathComponent("execution-ledger.json"))
+        )
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let agent = AgentCore(
+            provider: AnthropicProviderClient(retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0)),
+            keyVault: vault,
+            toolRouter: router,
+            registry: registry,
+            capabilityProbe: probe,
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 4
+        )
+        let session = AgentSession(permissionMode: .full)
+        let configuration = ProviderConfiguration(
+            name: "sirthisway.icu",
+            baseURL: URL(string: "https://sirthisway.icu")!,
+            model: "claude-opus-5",
+            apiKeyReference: "live-sirthisway",
+            providerID: "https-sirthisway-icu",
+            protocolName: ProviderProtocol.anthropic.rawValue,
+            authModeName: ProviderAuthMode.bearer.rawValue
+        )
+
+        var capabilityToolCallCount = 0
+        var sawSuccessfulToolResult = false
+        var assistantText = ""
+        let stream = await agent.send(
+            text: "You must call the capability_probe tool exactly once before answering. Do not call any other tool. After receiving its tool result, reply exactly SIRTHISWAY_TOOL_ROUND_OK.",
+            session: session,
+            providerConfiguration: configuration
+        )
+        for try await event in stream {
+            switch event {
+            case .toolStarted(let name, _):
+                if name == "capability.probe" { capabilityToolCallCount += 1 }
+            case .toolFinished(let result):
+                if result.success { sawSuccessfulToolResult = true }
+            case .token(let token):
+                assistantText += token
+            default:
+                break
+            }
+        }
+
+        XCTAssertEqual(capabilityToolCallCount, 1, "sirthisway live model must execute capability_probe exactly once")
+        XCTAssertTrue(sawSuccessfulToolResult, "sirthisway live tool result was not produced")
+        XCTAssertTrue(assistantText.contains("SIRTHISWAY_TOOL_ROUND_OK"), "sirthisway live model did not continue after the tool result")
+        let saved = try await sessions.load(session.id)
+        XCTAssertTrue(saved.messages.contains { $0.role == .assistant && $0.content.contains("SIRTHISWAY_TOOL_ROUND_OK") })
         let toolCall = saved.messages.first(where: { $0.role == .assistant && $0.providerMetadata["tool_call_id"] != nil })
         XCTAssertEqual(toolCall?.providerMetadata["tool_name"], "capability.probe")
         XCTAssertEqual(toolCall?.providerMetadata["provider_tool_name"], "capability_probe")
@@ -1600,6 +1829,15 @@ private struct FixedProvider: ProviderStreaming {
     }
 }
 
+private struct AlwaysFailureProvider: ProviderStreaming {
+    let error: ProviderError
+    func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish(throwing: error)
+        }
+    }
+}
+
 private struct KeyOutcomeProvider: ProviderStreaming {
     func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -1608,12 +1846,65 @@ private struct KeyOutcomeProvider: ProviderStreaming {
             case "no-quota": continuation.finish(throwing: ProviderError.capacityExhausted(403))
             case "rate-limit": continuation.finish(throwing: ProviderError.rateLimited)
             case "server-error": continuation.finish(throwing: ProviderError.invalidResponse(503))
+            case "model-missing": continuation.finish(throwing: ProviderError.modelUnavailable(503))
             default:
                 continuation.yield(.token("good"))
                 continuation.yield(.finished)
                 continuation.finish()
             }
         }
+    }
+}
+
+private actor RecordingKeyProtocolOutcomeProvider: ProviderStreaming {
+    private var seen: [String] = []
+
+    func routesSeen() -> [String] { seen }
+
+    nonisolated func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                let protocolName = configuration.protocolName ?? ""
+                await record("\(apiKey)|\(protocolName)")
+                if apiKey == "fallback-key" && protocolName == ProviderProtocol.openAIChat.rawValue {
+                    continuation.yield(.token("fallback-route-good"))
+                    continuation.yield(.finished)
+                    continuation.finish()
+                } else {
+                    continuation.finish(throwing: ProviderError.modelUnavailable(503))
+                }
+            }
+        }
+    }
+
+    private func record(_ route: String) {
+        seen.append(route)
+    }
+}
+
+private actor RecordingProtocolOutcomeProvider: ProviderStreaming {
+    private var seen: [String] = []
+
+    func protocolsSeen() -> [String] { seen }
+
+    nonisolated func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                let protocolName = configuration.protocolName ?? ""
+                await record(protocolName)
+                if protocolName == ProviderProtocol.anthropic.rawValue {
+                    continuation.finish(throwing: ProviderError.modelUnavailable(503))
+                } else {
+                    continuation.yield(.token("chat-good"))
+                    continuation.yield(.finished)
+                    continuation.finish()
+                }
+            }
+        }
+    }
+
+    private func record(_ protocolName: String) {
+        seen.append(protocolName)
     }
 }
 

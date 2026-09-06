@@ -476,6 +476,7 @@ public actor AgentCore {
                         "provider.authMode": providerConfiguration.authModeName ?? "",
                         "provider.keyReference": providerConfiguration.apiKeyReference,
                         "provider.fallbackKeyReferences": (providerConfiguration.fallbackAPIKeyReferences ?? []).joined(separator: ","),
+                        "provider.fallbackProtocols": (providerConfiguration.fallbackProtocolNames ?? []).joined(separator: ","),
                         "provider.sameProviderFailover": providerConfiguration.allowSameProviderKeyFailover == true ? "true" : "false",
                         "provider.reasoningEffort": providerConfiguration.reasoningEffort?.rawValue ?? ModelReasoningEffort.automatic.rawValue
                     ]
@@ -497,6 +498,7 @@ public actor AgentCore {
                 checkpoint.payload["provider.authMode"] = providerConfiguration.authModeName ?? ""
                 checkpoint.payload["provider.keyReference"] = providerConfiguration.apiKeyReference
                 checkpoint.payload["provider.fallbackKeyReferences"] = (providerConfiguration.fallbackAPIKeyReferences ?? []).joined(separator: ",")
+                checkpoint.payload["provider.fallbackProtocols"] = (providerConfiguration.fallbackProtocolNames ?? []).joined(separator: ",")
                 checkpoint.payload["provider.sameProviderFailover"] = providerConfiguration.allowSameProviderKeyFailover == true ? "true" : "false"
                 checkpoint.payload["provider.reasoningEffort"] = providerConfiguration.reasoningEffort?.rawValue ?? ModelReasoningEffort.automatic.rawValue
                 try? await diagnosticLogger?.log(
@@ -886,7 +888,12 @@ public actor AgentCore {
                                 session.updatedAt = Date()
                                 try await sessionStore.save(session)
                             } else {
-                                let context = ToolExecutionContext(permissionMode: session.permissionMode, capabilityProfile: capabilities, allowedRoot: allowedRoot)
+                                let context = ToolExecutionContext(
+                                    permissionMode: session.permissionMode,
+                                    capabilityProfile: capabilities,
+                                    allowedRoot: allowedRoot,
+                                    currentUserRequest: text
+                                )
                                 let toolExecutionStartedAt = Date()
                                 runtimeBreadcrumb?("runtime.agent.tool.\(name).begin")
                                 do {

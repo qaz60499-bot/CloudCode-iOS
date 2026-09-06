@@ -179,27 +179,52 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
     }
 
     public func protocolFor(model: String, keySlotID: String?) -> ProviderProtocol {
+        protocolCandidates(for: model, keySlotID: keySlotID).first ?? preferredProtocol
+    }
+
+    public func protocolCandidates(for model: String, keySlotID: String?) -> [ProviderProtocol] {
+        var ordered: [ProviderProtocol] = []
+        func append(_ values: [ProviderProtocol]) {
+            for value in values where !ordered.contains(value) {
+                ordered.append(value)
+            }
+        }
+
         if let keySlotID,
            let slot = keySlots.first(where: { $0.id == keySlotID }) {
             if let verified = slot.modelProtocols[model], !verified.isEmpty {
-                if verified.contains(preferredProtocol) { return preferredProtocol }
-                return verified[0]
+                // Exact Key+model wire evidence is authoritative. Do not broaden an explicitly
+                // verified Anthropic-only model back to provider-wide OpenAI protocols.
+                if verified.contains(preferredProtocol) { append([preferredProtocol]) }
+                append(verified)
+                return ordered
             }
-            if !slot.protocols.isEmpty {
-                if slot.protocols.contains(preferredProtocol) { return preferredProtocol }
-                return slot.protocols[0]
-            }
+            if slot.protocols.contains(preferredProtocol) { append([preferredProtocol]) }
+            append(slot.protocols)
         }
-        if protocols.contains(preferredProtocol) { return preferredProtocol }
-        return protocols.first ?? preferredProtocol
+        if protocols.contains(preferredProtocol) { append([preferredProtocol]) }
+        append(protocols)
+        if ordered.isEmpty { ordered.append(preferredProtocol) }
+        return ordered
     }
 
-    public func orderedKeyReferences(selectedKeySlotID: String?) -> [String] {
+    public func orderedKeyReferences(selectedKeySlotID: String?, model: String? = nil) -> [String] {
         guard !keySlots.isEmpty else { return [] }
         let selectedIndex = selectedKeySlotID.flatMap { value in keySlots.firstIndex(where: { $0.id == value }) } ?? 0
-        return (0..<keySlots.count).map { offset in
-            let slot = keySlots[(selectedIndex + offset) % keySlots.count]
-            return ProviderCatalog.keyReference(providerID: id, keySlotID: slot.id)
+        let orderedSlots = (0..<keySlots.count).map { offset in
+            keySlots[(selectedIndex + offset) % keySlots.count]
+        }
+        let requestedModel = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let modelIsCatalogued = !requestedModel.isEmpty && models.contains(requestedModel)
+        let scopedSlots = orderedSlots.filter { slot in
+            guard !requestedModel.isEmpty else { return true }
+            let slotModels = models(for: slot.id)
+            if slotModels.contains(requestedModel) { return true }
+            return customModelAllowed && !modelIsCatalogued
+        }
+        let effectiveSlots = scopedSlots.isEmpty ? orderedSlots.prefix(1).map { $0 } : scopedSlots
+        return effectiveSlots.map { slot in
+            ProviderCatalog.keyReference(providerID: id, keySlotID: slot.id)
         }
     }
 
@@ -344,9 +369,13 @@ public enum ProviderCheckpointConfigurationResolver {
         for reference in storedFallbacks where !providerReferences.contains(reference) {
             throw ProviderCheckpointConfigurationError.crossProviderFallback(reference)
         }
-        let ordered = profile.orderedKeyReferences(selectedKeySlotID: slot.id)
+        let ordered = profile.orderedKeyReferences(selectedKeySlotID: slot.id, model: model)
         let allowedFallbacks = storedFallbacks.filter { $0 != primaryReference && ordered.contains($0) }
         let allowFailover = profile.autoRotateKeys && payload["provider.sameProviderFailover"] == "true"
+        let protocolNamesByKeyReference = Dictionary(uniqueKeysWithValues: profile.keySlots.map { candidateSlot in
+            let reference = ProviderCatalog.keyReference(providerID: profile.id, keySlotID: candidateSlot.id)
+            return (reference, profile.protocolCandidates(for: model, keySlotID: candidateSlot.id).map(\.rawValue))
+        })
         let reasoningEffort = ModelReasoningEffort(rawValue: payload["provider.reasoningEffort"] ?? ModelReasoningEffort.automatic.rawValue) ?? .automatic
         return ProviderConfiguration(
             name: profile.displayName,
@@ -357,6 +386,8 @@ public enum ProviderCheckpointConfigurationResolver {
             protocolName: profile.protocolFor(model: model, keySlotID: slot.id).rawValue,
             authModeName: profile.authMode.rawValue,
             fallbackAPIKeyReferences: allowFailover ? allowedFallbacks : [],
+            fallbackProtocolNames: Array(profile.protocolCandidates(for: model, keySlotID: slot.id).dropFirst()).map(\.rawValue),
+            protocolNamesByKeyReference: protocolNamesByKeyReference,
             allowSameProviderKeyFailover: allowFailover,
             reasoningEffort: reasoningEffort
         )
@@ -619,7 +650,7 @@ public enum ProviderCatalog {
                 baseURL: URL(string: "https://api.justwoker.icu")!,
                 protocols: [.anthropic, .openAIChat],
                 preferredProtocol: .anthropic,
-                authMode: .both,
+                authMode: .bearer,
                 models: ["claude-opus-5", "claude-opus-5-thinking"],
                 keySlots: [ProviderKeySlot(id: "slot-1", label: "Key 1", fingerprint: "4b311d96d45555d663e567e0e82b8cddc46d90f02a834ea81a78ed716e690184", models: ["claude-opus-5", "claude-opus-5-thinking"], protocols: [.anthropic, .openAIChat], modelProtocols: ["claude-opus-5": [.anthropic], "claude-opus-5-thinking": [.anthropic]])],
                 source: .desktopSnapshot,
@@ -648,18 +679,32 @@ public enum ProviderCatalog {
                 protocols: [.anthropic, .openAIChat],
                 preferredProtocol: .anthropic,
                 authMode: .bearer,
-                models: ["claude-opus-4-8", "claude-opus-5", "deepseek-v4-flash", "gpt-5.6-sol"],
+                models: [
+                    "claude-opus-4-8", "claude-opus-4-7", "claude-opus-5",
+                    "gpt-5.5", "gpt-5.6-sol", "kimi-k2.6", "glm-5.1", "glm-5.2",
+                    "deepseek-v4-flash", "step3p5-code-alpha"
+                ],
                 keySlots: [ProviderKeySlot(
                     id: "slot-1",
                     label: "Key 1",
                     fingerprint: "105a3fce9a105c41472b926f6448a91be2f9726d5e074adbaaa2206f4d6dbf23",
-                    models: ["claude-opus-4-8", "claude-opus-5", "deepseek-v4-flash", "gpt-5.6-sol"],
+                    models: [
+                        "claude-opus-4-8", "claude-opus-4-7", "claude-opus-5",
+                        "gpt-5.5", "gpt-5.6-sol", "kimi-k2.6", "glm-5.1", "glm-5.2",
+                        "deepseek-v4-flash", "step3p5-code-alpha"
+                    ],
                     protocols: [.anthropic, .openAIChat],
                     modelProtocols: [
                         "claude-opus-4-8": [.anthropic],
+                        "claude-opus-4-7": [.anthropic],
                         "claude-opus-5": [.anthropic],
+                        "gpt-5.5": [.openAIChat],
+                        "gpt-5.6-sol": [.openAIChat],
+                        "kimi-k2.6": [.openAIChat],
+                        "glm-5.1": [.openAIChat],
+                        "glm-5.2": [.openAIChat],
                         "deepseek-v4-flash": [.openAIChat],
-                        "gpt-5.6-sol": [.openAIChat]
+                        "step3p5-code-alpha": [.openAIChat]
                     ]
                 )],
                 source: .desktopSnapshot,
