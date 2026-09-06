@@ -297,8 +297,13 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
                 failures: passed ? [] : ["最终文件状态不符合预期"]
             )
             try await audit.append(AuditEvent(sessionID: call.sessionID, toolCallID: call.id, action: call.name, target: finalDestination.path, risk: descriptor.risk, result: passed ? "completed" : "verification_failed", detail: ["source": finalSource.path]))
-            if passed, let metadata = try? fileService.stat(finalDestination, allowedRoot: context.allowedRoot) {
-                try? await index(metadata: metadata, ownerBundleID: nil)
+            if passed {
+                if call.name == "files.move" {
+                    try? await resourceIndex?.remove([ResourceID(finalSource.absoluteString)])
+                }
+                if let metadata = try? fileService.stat(finalDestination, allowedRoot: context.allowedRoot) {
+                    try? await index(metadata: metadata, ownerBundleID: nil)
+                }
             }
             return ToolResult(toolCallID: call.id, success: passed, summary: passed ? "\(call.name == "files.copy" ? "复制" : "移动")完成" : "最终状态验证失败", payload: ["source": finalSource.path, "destination": finalDestination.path], verification: verification)
 
@@ -417,6 +422,9 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
                 failures: []
             )
             try await audit.append(AuditEvent(sessionID: call.sessionID, toolCallID: call.id, action: call.name, target: finalTarget.path, risk: descriptor.risk, result: verification.passed ? "created" : "verification_failed"))
+            if verification.passed, let metadata = try? fileService.stat(finalTarget, allowedRoot: context.allowedRoot) {
+                try? await index(metadata: metadata, ownerBundleID: nil)
+            }
             return ToolResult(toolCallID: call.id, success: verification.passed, summary: "已创建 \(finalTarget.lastPathComponent)", payload: ["path": finalTarget.path], verification: verification)
 
         case "files.modify":
@@ -438,6 +446,9 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
                     return VerificationResult(passed: passed, checks: ["原子替换后重新读取目标"], failures: passed ? [] : ["目标内容与计划修改不一致"])
                 }
             )
+            if FileManager.default.fileExists(atPath: target.path), let metadata = try? fileService.stat(target, allowedRoot: context.allowedRoot) {
+                try? await index(metadata: metadata, ownerBundleID: nil)
+            }
             return try untrustedResult(call.id, summary: "事务状态：\(transaction.state.rawValue)", key: "transaction", value: transaction, source: "files.modify")
 
         case "files.delete":
@@ -484,6 +495,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             let passed = !FileManager.default.fileExists(atPath: target.path) && payloadVerified
             let verification = VerificationResult(passed: passed, checks: ["原位置已移除", "回收站内容指纹与删除前快照一致"], failures: passed ? [] : ["回收站最终状态或内容指纹验证失败"])
             try await audit.append(AuditEvent(sessionID: call.sessionID, toolCallID: call.id, action: call.name, target: target.path, risk: descriptor.risk, result: passed ? "trashed" : "verification_failed", detail: ["trashID": record.id.uuidString]))
+            if passed { try? await resourceIndex?.remove([ResourceID(target.absoluteString)]) }
             return try untrustedResult(call.id, summary: "已移动到 Cloud Code 回收站", key: "trashRecord", value: record, source: "files.delete", verification: verification)
 
         case "trash.restore":
@@ -513,6 +525,9 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
                 expectedDestinationParentIdentity: approvedParentIdentity
             )
             let passed = await trashService.verifyRestored(record)
+            if passed, let metadata = try? fileService.stat(originalTarget, allowedRoot: context.allowedRoot) {
+                try? await index(metadata: metadata, ownerBundleID: nil)
+            }
             return try untrustedResult(call.id, summary: "已恢复 \(record.filename)", key: "trashRecord", value: record, source: "trash.restore", verification: VerificationResult(passed: passed, checks: ["原路径存在", "恢复后的内容指纹与回收站记录一致"], failures: passed ? [] : ["恢复内容与回收站记录不一致"]))
 
         case "trash.purge":
@@ -706,6 +721,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
                     size: metadata.size,
                     modificationDate: metadata.modificationDate
                 ))
+                await resourceIndex.markValidated(node.id, path: metadata.path, byteSize: metadata.size, modificationDate: metadata.modificationDate)
             } catch {
                 staleIDs.insert(node.id)
             }
@@ -741,7 +757,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
                         metadata: metadata
                     )
                 }
-                if !nodes.isEmpty { try await resourceIndex.add(nodes) }
+                if !nodes.isEmpty { try await resourceIndex.add(nodes, source: "bounded_warmup") }
                 try await resourceIndex.finishDeepIndex(rootNode.id, complete: entries.count < limit)
             } catch {
                 try? await resourceIndex.finishDeepIndex(rootNode.id, complete: false)
@@ -772,6 +788,10 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
     private func index(metadata: FileMetadataSnapshot, ownerBundleID: String?) async throws {
         guard let resourceIndex else { return }
         let id = ResourceID(URL(fileURLWithPath: metadata.path).absoluteString)
+        var indexMetadata: [String: String] = ["contentType": metadata.contentType ?? ""]
+        if let modificationDate = metadata.modificationDate {
+            indexMetadata["modifiedAt"] = ISO8601DateFormatter().string(from: modificationDate)
+        }
         let node = ResourceNode(
             id: id,
             kind: metadata.isDirectory ? .directory : .file,
@@ -780,7 +800,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             resolvedPath: metadata.path,
             ownerBundleID: ownerBundleID,
             byteSize: metadata.size,
-            metadata: ["contentType": metadata.contentType ?? ""]
+            metadata: indexMetadata
         )
         try await resourceIndex.add(node)
     }

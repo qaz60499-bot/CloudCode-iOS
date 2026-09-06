@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
@@ -1227,17 +1228,26 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
 }
 
 public actor ProviderRequestKeyState {
-    private struct Entry: Sendable {
+    private struct Entry: Codable, Sendable {
         var reference: String
         var protocolName: String?
         var touchedAt: Date
     }
 
+    private struct PersistedState: Codable, Sendable {
+        var version: Int
+        var entries: [String: Entry]
+    }
+
     private var entries: [String: Entry] = [:]
     private let ttl: TimeInterval
+    private let fileURL: URL?
+    private var didLoad = false
+    private static let maxSerializedBytes = 1 * 1024 * 1024
 
-    public init(ttl: TimeInterval = 60 * 60) {
+    public init(ttl: TimeInterval = 7 * 24 * 60 * 60, fileURL: URL? = nil) {
         self.ttl = max(60, ttl)
+        self.fileURL = fileURL
     }
 
     public func preferredReference(configurationID: UUID, allowedReferences: [String], fallback: String) -> String {
@@ -1245,6 +1255,7 @@ public actor ProviderRequestKeyState {
     }
 
     public func preferredReference(routingKey: String, allowedReferences: [String], fallback: String) -> String {
+        loadIfNeeded()
         prune()
         guard let entry = entries[routingKey], allowedReferences.contains(entry.reference) else { return fallback }
         entries[routingKey]?.touchedAt = Date()
@@ -1256,6 +1267,7 @@ public actor ProviderRequestKeyState {
     }
 
     public func preferredProtocol(routingKey: String, reference: String, allowedProtocols: [String], fallback: String) -> String {
+        loadIfNeeded()
         prune()
         guard let entry = entries[routingKey],
               entry.reference == reference,
@@ -1270,8 +1282,37 @@ public actor ProviderRequestKeyState {
     }
 
     public func markSuccessful(routingKey: String, reference: String, protocolName: String? = nil) {
+        loadIfNeeded()
         prune()
         entries[routingKey] = Entry(reference: reference, protocolName: protocolName, touchedAt: Date())
+        persistIfConfigured()
+    }
+
+    private func loadIfNeeded() {
+        guard !didLoad else { return }
+        didLoad = true
+        guard let fileURL,
+              FileManager.default.fileExists(atPath: fileURL.path),
+              let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+              ((attributes[.size] as? NSNumber)?.intValue ?? 0) <= Self.maxSerializedBytes,
+              let data = try? Data(contentsOf: fileURL) else { return }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        if let state = try? decoder.decode(PersistedState.self, from: data), state.version == 1 {
+            entries = state.entries
+            prune()
+        }
+    }
+
+    private func persistIfConfigured() {
+        guard let fileURL else { return }
+        let state = PersistedState(version: 1, entries: entries)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(state), data.count <= Self.maxSerializedBytes else { return }
+        try? FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: fileURL, options: .atomic)
     }
 
     private func prune(now: Date = Date()) {
@@ -1328,32 +1369,36 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
             let task = Task {
                 let fallbackReferences = (configuration.fallbackAPIKeyReferences ?? []).filter { $0 != configuration.apiKeyReference }
                 let allowedReferences = [configuration.apiKeyReference] + fallbackReferences
-                let routingStateKey = [
+                var availableKeyCandidates: [(String, String)] = []
+                for reference in allowedReferences {
+                    if reference == configuration.apiKeyReference {
+                        availableKeyCandidates.append((reference, apiKey))
+                    } else if let key = try? await keyVault.key(for: reference) {
+                        availableKeyCandidates.append((reference, key))
+                    }
+                }
+                let providerModelIdentity = [
                     configuration.providerID ?? configuration.baseURL.absoluteString,
                     configuration.model.lowercased()
                 ].joined(separator: "|")
+                let poolMaterial = availableKeyCandidates.map { candidate in
+                    "\(candidate.0):\(Self.keyFingerprint(candidate.1))"
+                }.joined(separator: "|")
+                let selectionRoutingStateKey = "\(providerModelIdentity)|pool:\(Self.stableHash(poolMaterial))"
+                let availableReferences = availableKeyCandidates.map(\.0)
                 let preferredReference = await requestKeyState.preferredReference(
-                    routingKey: routingStateKey,
-                    allowedReferences: allowedReferences,
+                    routingKey: selectionRoutingStateKey,
+                    allowedReferences: availableReferences,
                     fallback: configuration.apiKeyReference
                 )
-                let orderedReferences: [String]
+                let keyCandidates: [(String, String)]
                 if configuration.allowSameProviderKeyFailover == true,
-                   let preferredIndex = allowedReferences.firstIndex(of: preferredReference) {
-                    orderedReferences = (0..<allowedReferences.count).map { offset in
-                        allowedReferences[(preferredIndex + offset) % allowedReferences.count]
+                   let preferredIndex = availableKeyCandidates.firstIndex(where: { $0.0 == preferredReference }) {
+                    keyCandidates = (0..<availableKeyCandidates.count).map { offset in
+                        availableKeyCandidates[(preferredIndex + offset) % availableKeyCandidates.count]
                     }
                 } else {
-                    orderedReferences = [configuration.apiKeyReference]
-                }
-
-                var keyCandidates: [(String, String)] = []
-                for reference in orderedReferences {
-                    if reference == configuration.apiKeyReference {
-                        keyCandidates.append((reference, apiKey))
-                    } else if let key = try? await keyVault.key(for: reference) {
-                        keyCandidates.append((reference, key))
-                    }
+                    keyCandidates = availableKeyCandidates.filter { $0.0 == configuration.apiKeyReference }
                 }
 
                 var defaultProtocolCandidates: [ProviderProtocol] = []
@@ -1373,8 +1418,9 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                     }
                     if keyProtocolCandidates.isEmpty { keyProtocolCandidates = defaultProtocolCandidates }
                     let protocolNames = keyProtocolCandidates.map(\.rawValue)
+                    let protocolRoutingStateKey = "\(providerModelIdentity)|reference:\(keyCandidate.0)|key:\(Self.keyFingerprint(keyCandidate.1))"
                     let preferredProtocolName = await requestKeyState.preferredProtocol(
-                        routingKey: routingStateKey,
+                        routingKey: protocolRoutingStateKey,
                         reference: keyCandidate.0,
                         allowedProtocols: protocolNames,
                         fallback: keyProtocolCandidates[0].rawValue
@@ -1426,7 +1472,11 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                                 continuation.yield(event)
                             }
                             await requestKeyState.markSuccessful(
-                                routingKey: routingStateKey,
+                                routingKey: selectionRoutingStateKey,
+                                reference: keyCandidate.0
+                            )
+                            await requestKeyState.markSuccessful(
+                                routingKey: protocolRoutingStateKey,
                                 reference: keyCandidate.0,
                                 protocolName: protocolCandidate.rawValue
                             )
@@ -1519,6 +1569,14 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    private static func keyFingerprint(_ key: String) -> String {
+        SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func stableHash(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     private func clientFor(_ configuration: ProviderConfiguration) -> ProviderStreaming {

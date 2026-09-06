@@ -289,14 +289,22 @@ public actor TaskCheckpointStore {
 public actor ProgressiveResourceIndex {
     private var graph = ResourceGraph()
     private let fileURL: URL
+    private let sidecarFileURL: URL
+    private var store: ResourceIndexSQLiteStore?
     private var didLoad = false
     private var deepIndexInFlight: Set<ResourceID> = []
-    private static let maxSerializedBytes: Int64 = 16 * 1024 * 1024
+    private var rebuiltCorruptSidecar = false
+    private static let maxLegacyMigrationBytes: Int64 = 16 * 1024 * 1024
+    private static let maxGraphSnapshotNodes = 1_024
+    private static let maxGraphSnapshotBytes = 4 * 1024 * 1024
 
     public init(fileURL: URL) {
-        // Resource graph is a rebuildable cache. Never read/decode it from the
-        // app's synchronous construction path.
+        // Both the compact ResourceGraph diagnostic snapshot and the SQLite machine
+        // index are rebuildable caches. Neither grants capability or authorization.
+        // Initialization stays lazy so app construction never performs SQLite or
+        // filesystem enumeration on the first-frame path.
         self.fileURL = fileURL
+        self.sidecarFileURL = fileURL.deletingLastPathComponent().appendingPathComponent("resource-index.sqlite")
     }
 
     public func snapshot() -> ResourceGraph {
@@ -304,30 +312,50 @@ public actor ProgressiveResourceIndex {
         return graph
     }
 
+    public func statistics() -> ResourceIndexStatistics {
+        loadIfNeeded()
+        guard let store, var statistics = try? store.statistics() else {
+            return ResourceIndexStatistics(resourceCount: graph.nodes.count, sidecarBytes: 0, generation: 0, fts5Available: false, rebuiltCorruptSidecar: rebuiltCorruptSidecar)
+        }
+        statistics.rebuiltCorruptSidecar = statistics.rebuiltCorruptSidecar || rebuiltCorruptSidecar
+        return statistics
+    }
+
     public func seedLightweight(apps: [ResourceNode], capabilityProfile: CapabilityProfile) throws {
-        loadIfNeeded()
-        for app in apps { graph.upsert(app) }
-        graph.indexedAt = Date()
-        try persist()
+        try add(apps, source: "lightweight_seed")
     }
 
-    public func add(_ node: ResourceNode, deep: Bool = false) throws {
-        loadIfNeeded()
-        graph.upsert(node)
-        if deep { graph.deepIndexedResourceIDs.insert(node.id) }
-        graph.indexedAt = Date()
-        try persist()
+    public func add(_ node: ResourceNode, deep: Bool = false, source: String = "incremental") throws {
+        try add([node], deep: deep, source: source)
     }
 
-    public func add(_ nodes: [ResourceNode], deep: Bool = false) throws {
+    public func add(_ nodes: [ResourceNode], deep: Bool = false, source: String = "incremental") throws {
         guard !nodes.isEmpty else { return }
         loadIfNeeded()
-        for node in nodes {
-            graph.upsert(node)
-            if deep { graph.deepIndexedResourceIDs.insert(node.id) }
+        if let store {
+            for node in nodes where Self.isContainerRoot(node), let bundleID = node.ownerBundleID, let rootPath = node.resolvedPath {
+                try store.invalidateOwnerPathsOutside(bundleID: bundleID, rootPath: rootPath)
+                graph.nodes.removeAll { candidate in
+                    guard candidate.ownerBundleID == bundleID, let candidatePath = candidate.resolvedPath else { return false }
+                    return !Self.path(URL(fileURLWithPath: candidatePath).standardizedFileURL.path, isWithin: URL(fileURLWithPath: rootPath).standardizedFileURL.path)
+                }
+            }
+            let generation = try store.nextGeneration()
+            try store.upsert(nodes: nodes, generation: generation, source: source)
+        }
+        if nodes.count >= Self.maxGraphSnapshotNodes {
+            graph.nodes = Array(nodes.suffix(Self.maxGraphSnapshotNodes))
+        } else {
+            for node in nodes { mergeIntoGraph(node) }
+        }
+        if deep {
+            for node in nodes { graph.deepIndexedResourceIDs.insert(node.id) }
         }
         graph.indexedAt = Date()
-        try persist()
+        if deep, let store {
+            for node in nodes { try store.setDeepIndexed(node.id) }
+        }
+        try persistGraphSnapshot()
     }
 
     public func search(
@@ -342,48 +370,65 @@ public actor ProgressiveResourceIndex {
         let needle = Self.normalizedSearchText(nameContains)
         guard !needle.isEmpty else { return [] }
         let boundedLimit = min(max(maxResults, 1), 2_000)
-        let normalizedPrefix = pathPrefix.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
-        let candidates = graph.nodes.compactMap { node -> (ResourceNode, Int)? in
-            guard kinds.contains(node.kind), let path = node.resolvedPath else { return nil }
-            if let ownerBundleID, node.ownerBundleID != ownerBundleID { return nil }
-            let standardizedPath = URL(fileURLWithPath: path).standardizedFileURL.path
-            if let normalizedPrefix, !Self.path(standardizedPath, isWithin: normalizedPrefix) { return nil }
-            if !extensions.isEmpty, node.kind != .directory {
-                let ext = URL(fileURLWithPath: standardizedPath).pathExtension.lowercased()
-                if !extensions.contains(ext) { return nil }
-            }
-            let normalizedName = Self.normalizedSearchText(node.displayName)
-            let normalizedPath = Self.normalizedSearchText(standardizedPath)
-            let score: Int
-            if normalizedName == needle {
-                score = 0
-            } else if normalizedName.hasPrefix(needle) {
-                score = 1
-            } else if normalizedName.contains(needle) {
-                score = 2
-            } else if normalizedPath.contains(needle) {
-                score = 3
-            } else {
-                return nil
-            }
-            return (node, score)
+        if let store,
+           let indexed = try? store.search(
+               normalizedNeedle: needle,
+               extensions: extensions,
+               ownerBundleID: ownerBundleID,
+               pathPrefix: pathPrefix,
+               kinds: kinds,
+               limit: boundedLimit
+           ) {
+            return indexed
         }
-        return candidates.sorted { lhs, rhs in
-            if lhs.1 != rhs.1 { return lhs.1 < rhs.1 }
-            return lhs.0.displayName.localizedCaseInsensitiveCompare(rhs.0.displayName) == .orderedAscending
-        }.prefix(boundedLimit).map(\.0)
+        return searchGraphFallback(
+            needle: needle,
+            extensions: extensions,
+            ownerBundleID: ownerBundleID,
+            pathPrefix: pathPrefix,
+            kinds: kinds,
+            maxResults: boundedLimit
+        )
+    }
+
+    public func markValidated(_ id: ResourceID, path: String, byteSize: Int64?, modificationDate: Date?) {
+        loadIfNeeded()
+        try? store?.markValidated(id: id, path: path, byteSize: byteSize, modificationDate: modificationDate)
     }
 
     public func remove(_ ids: Set<ResourceID>) throws {
         guard !ids.isEmpty else { return }
         loadIfNeeded()
-        let previousCount = graph.nodes.count
+        try store?.remove(ids: ids)
+        try store?.removeDeepIndexed(ids)
         graph.nodes.removeAll { ids.contains($0.id) }
         graph.deepIndexedResourceIDs.subtract(ids)
         deepIndexInFlight.subtract(ids)
-        guard graph.nodes.count != previousCount else { return }
         graph.indexedAt = Date()
-        try persist()
+        try persistGraphSnapshot()
+    }
+
+    public func invalidate(ownerBundleID: String) throws {
+        let bundleID = ownerBundleID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bundleID.isEmpty else { return }
+        loadIfNeeded()
+        try store?.removeOwner(bundleID: bundleID)
+        let removedIDs = Set(graph.nodes.filter { $0.ownerBundleID == bundleID }.map(\.id))
+        graph.nodes.removeAll { $0.ownerBundleID == bundleID }
+        graph.deepIndexedResourceIDs = graph.deepIndexedResourceIDs.filter { id in
+            guard let components = URLComponents(string: id.rawValue), components.scheme == "container" else {
+                return !removedIDs.contains(id)
+            }
+            return components.host != bundleID
+        }
+        deepIndexInFlight = deepIndexInFlight.filter { id in
+            guard let components = URLComponents(string: id.rawValue), components.scheme == "container" else {
+                return !removedIDs.contains(id)
+            }
+            return components.host != bundleID
+        }
+        graph.indexedAt = Date()
+        try persistGraphSnapshot()
     }
 
     public func beginDeepIndex(_ rootID: ResourceID) -> Bool {
@@ -398,8 +443,130 @@ public actor ProgressiveResourceIndex {
         deepIndexInFlight.remove(rootID)
         guard complete else { return }
         graph.deepIndexedResourceIDs.insert(rootID)
+        try store?.setDeepIndexed(rootID)
         graph.indexedAt = Date()
-        try persist()
+        try persistGraphSnapshot()
+    }
+
+    private func searchGraphFallback(
+        needle: String,
+        extensions: Set<String>,
+        ownerBundleID: String?,
+        pathPrefix: String?,
+        kinds: Set<ResourceKind>,
+        maxResults: Int
+    ) -> [ResourceNode] {
+        let normalizedPrefix = pathPrefix.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        let candidates = graph.nodes.compactMap { node -> (ResourceNode, Int)? in
+            guard kinds.contains(node.kind), let path = node.resolvedPath else { return nil }
+            if let ownerBundleID, node.ownerBundleID != ownerBundleID { return nil }
+            let standardizedPath = URL(fileURLWithPath: path).standardizedFileURL.path
+            if let normalizedPrefix, !Self.path(standardizedPath, isWithin: normalizedPrefix) { return nil }
+            if !extensions.isEmpty, node.kind != .directory {
+                let ext = URL(fileURLWithPath: standardizedPath).pathExtension.lowercased()
+                if !extensions.contains(ext) { return nil }
+            }
+            let normalizedName = Self.normalizedSearchText(node.displayName)
+            let normalizedPath = Self.normalizedSearchText(standardizedPath)
+            let score: Int
+            if normalizedName == needle { score = 0 }
+            else if normalizedName.hasPrefix(needle) { score = 1 }
+            else if normalizedName.contains(needle) { score = 2 }
+            else if normalizedPath.contains(needle) { score = 3 }
+            else { return nil }
+            return (node, score)
+        }
+        return candidates.sorted { lhs, rhs in
+            if lhs.1 != rhs.1 { return lhs.1 < rhs.1 }
+            return lhs.0.displayName.localizedCaseInsensitiveCompare(rhs.0.displayName) == .orderedAscending
+        }.prefix(maxResults).map(\.0)
+    }
+
+    private func loadIfNeeded() {
+        guard !didLoad else { return }
+        didLoad = true
+        let legacyGraph = loadLegacyGraph()
+        graph = legacyGraph ?? ResourceGraph()
+        guard let store = ensureStore() else {
+            trimGraphSnapshot()
+            return
+        }
+        if let statistics = try? store.statistics(), statistics.resourceCount == 0, let legacyGraph, !legacyGraph.nodes.isEmpty {
+            if let generation = try? store.nextGeneration() {
+                try? store.upsert(nodes: legacyGraph.nodes, generation: generation, source: "legacy_json_migration", validatedAt: legacyGraph.indexedAt)
+                for rootID in legacyGraph.deepIndexedResourceIDs { try? store.setDeepIndexed(rootID) }
+            }
+        }
+        if let nodes = try? store.recentNodes(limit: Self.maxGraphSnapshotNodes) {
+            graph.nodes = nodes
+        }
+        if let deepIDs = try? store.deepIndexedIDs() {
+            graph.deepIndexedResourceIDs = deepIDs
+        }
+        trimGraphSnapshot()
+        try? persistGraphSnapshot()
+    }
+
+    private func ensureStore() -> ResourceIndexSQLiteStore? {
+        if let store { return store }
+        do {
+            let value = try ResourceIndexSQLiteStore(url: sidecarFileURL)
+            store = value
+            return value
+        } catch {
+            let fileManager = FileManager.default
+            let existed = fileManager.fileExists(atPath: sidecarFileURL.path)
+            if existed {
+                try? fileManager.removeItem(at: sidecarFileURL)
+                for suffix in ["-journal", "-wal", "-shm"] {
+                    try? fileManager.removeItem(atPath: sidecarFileURL.path + suffix)
+                }
+                if let rebuilt = try? ResourceIndexSQLiteStore(url: sidecarFileURL) {
+                    rebuilt.rebuiltCorruptSidecar = true
+                    rebuiltCorruptSidecar = true
+                    store = rebuilt
+                    return rebuilt
+                }
+            }
+            return nil
+        }
+    }
+
+    private func loadLegacyGraph() -> ResourceGraph? {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+           let size = attributes[.size] as? NSNumber,
+           size.int64Value > Self.maxLegacyMigrationBytes {
+            return nil
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let data = try? Data(contentsOf: fileURL),
+              let value = try? decoder.decode(ResourceGraph.self, from: data) else { return nil }
+        return value
+    }
+
+    private func mergeIntoGraph(_ node: ResourceNode) {
+        graph.nodes.removeAll { $0.id == node.id }
+        graph.nodes.append(node)
+        trimGraphSnapshot()
+    }
+
+    private func trimGraphSnapshot() {
+        if graph.nodes.count > Self.maxGraphSnapshotNodes {
+            graph.nodes.removeFirst(graph.nodes.count - Self.maxGraphSnapshotNodes)
+        }
+    }
+
+    private func persistGraphSnapshot() throws {
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        trimGraphSnapshot()
+        var data = try JSONEncoder.pretty.encode(graph)
+        if data.count > Self.maxGraphSnapshotBytes, graph.nodes.count > 256 {
+            graph.nodes = Array(graph.nodes.suffix(256))
+            data = try JSONEncoder.pretty.encode(graph)
+        }
+        try data.write(to: fileURL, options: .atomic)
     }
 
     private static func normalizedSearchText(_ value: String) -> String {
@@ -410,29 +577,11 @@ public actor ProgressiveResourceIndex {
         candidate == root || candidate.hasPrefix(root.hasSuffix("/") ? root : root + "/")
     }
 
-    private func loadIfNeeded() {
-        guard !didLoad else { return }
-        didLoad = true
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
-        if let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
-           let size = attributes[.size] as? NSNumber,
-           size.int64Value > Self.maxSerializedBytes {
-            graph = ResourceGraph()
-            return
-        }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        if let data = try? Data(contentsOf: fileURL),
-           let value = try? decoder.decode(ResourceGraph.self, from: data) {
-            graph = value
-        } else {
-            graph = ResourceGraph()
-        }
-    }
-
-    private func persist() throws {
-        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try JSONEncoder.pretty.encode(graph).write(to: fileURL, options: .atomic)
+    private static func isContainerRoot(_ node: ResourceNode) -> Bool {
+        guard node.ownerBundleID != nil,
+              let components = URLComponents(string: node.logicalLocation),
+              components.scheme == "container" else { return false }
+        return components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).isEmpty
     }
 }
 

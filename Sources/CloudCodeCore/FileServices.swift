@@ -224,8 +224,11 @@ public struct FileService: @unchecked Sendable {
         let baseDepth = safe.pathComponents.count
         guard let enumerator = fileManager.enumerator(at: safe, includingPropertiesForKeys: [.isDirectoryKey, .fileAllocatedSizeKey, .contentModificationDateKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles]) else { return [] }
         var results: [FileEntry] = []
+        var visitedCount = 0
 
         for case let url as URL in enumerator {
+            visitedCount += 1
+            if visitedCount % 128 == 0 { try Task.checkCancellation() }
             let depth = url.pathComponents.count - baseDepth
             if depth > query.maxDepth {
                 enumerator.skipDescendants()

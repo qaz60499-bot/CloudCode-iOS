@@ -725,6 +725,119 @@ final class ProviderRouterTests: XCTestCase {
         XCTAssertEqual(seen, ["bad-auth", "good", "bad-auth", "good"])
     }
 
+    func testSuccessfulProtocolPreferencePersistsAcrossRouterRestart() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeProviderRouteState-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stateURL = root.appendingPathComponent("verified-routes.json")
+        let vault = MemoryKeyVault()
+        var configuration = config(protocolName: .anthropic)
+        configuration.fallbackProtocolNames = [ProviderProtocol.openAIChat.rawValue]
+
+        let firstRecorder = RecordingProtocolOutcomeProvider()
+        let firstRouter = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: firstRecorder,
+            openAIChat: firstRecorder,
+            responses: firstRecorder,
+            requestKeyState: ProviderRequestKeyState(fileURL: stateURL)
+        )
+        let firstText = try await collectText(firstRouter.stream(configuration: configuration, apiKey: "same-key", messages: [], tools: []))
+        let firstSeen = await firstRecorder.protocolsSeen()
+        XCTAssertEqual(firstText, "chat-good")
+        XCTAssertEqual(firstSeen, [ProviderProtocol.anthropic.rawValue, ProviderProtocol.openAIChat.rawValue])
+
+        let restartedRecorder = RecordingProtocolOutcomeProvider()
+        let restartedRouter = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: restartedRecorder,
+            openAIChat: restartedRecorder,
+            responses: restartedRecorder,
+            requestKeyState: ProviderRequestKeyState(fileURL: stateURL)
+        )
+        let restartedText = try await collectText(restartedRouter.stream(configuration: configuration, apiKey: "same-key", messages: [], tools: []))
+        let restartedSeen = await restartedRecorder.protocolsSeen()
+        XCTAssertEqual(restartedText, "chat-good")
+        XCTAssertEqual(restartedSeen, [ProviderProtocol.openAIChat.rawValue])
+    }
+
+    func testReplacingKeyContentDoesNotReuseOldExactProtocolEvidence() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeProviderKeyIsolation-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stateURL = root.appendingPathComponent("verified-routes.json")
+        let vault = MemoryKeyVault()
+        var configuration = config(protocolName: .anthropic)
+        configuration.fallbackProtocolNames = [ProviderProtocol.openAIChat.rawValue]
+
+        let initialRecorder = RecordingProtocolOutcomeProvider()
+        let initialRouter = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: initialRecorder,
+            openAIChat: initialRecorder,
+            responses: initialRecorder,
+            requestKeyState: ProviderRequestKeyState(fileURL: stateURL)
+        )
+        _ = try await collectText(initialRouter.stream(configuration: configuration, apiKey: "old-key-content", messages: [], tools: []))
+
+        let replacedRecorder = RecordingProtocolOutcomeProvider()
+        let replacedRouter = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: replacedRecorder,
+            openAIChat: replacedRecorder,
+            responses: replacedRecorder,
+            requestKeyState: ProviderRequestKeyState(fileURL: stateURL)
+        )
+        let replacedText = try await collectText(replacedRouter.stream(configuration: configuration, apiKey: "new-key-content", messages: [], tools: []))
+        let replacedSeen = await replacedRecorder.protocolsSeen()
+        XCTAssertEqual(replacedText, "chat-good")
+        XCTAssertEqual(replacedSeen, [ProviderProtocol.anthropic.rawValue, ProviderProtocol.openAIChat.rawValue])
+    }
+
+    func testSuccessfulFallbackKeyPreferencePersistsOnlyForSameKeyPool() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeProviderKeyPool-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stateURL = root.appendingPathComponent("verified-routes.json")
+        let vault = MemoryKeyVault(keys: ["fallback": "good"])
+        var configuration = config(protocolName: .anthropic)
+        configuration.fallbackAPIKeyReferences = ["fallback"]
+        configuration.allowSameProviderKeyFailover = true
+
+        let firstRecorder = RecordingKeyOutcomeProvider()
+        let firstRouter = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: firstRecorder,
+            openAIChat: firstRecorder,
+            responses: firstRecorder,
+            requestKeyState: ProviderRequestKeyState(fileURL: stateURL)
+        )
+        _ = try await collectText(firstRouter.stream(configuration: configuration, apiKey: "bad-auth", messages: [], tools: []))
+        let firstKeys = await firstRecorder.keysSeen()
+        XCTAssertEqual(firstKeys, ["bad-auth", "good"])
+
+        let restartedRecorder = RecordingKeyOutcomeProvider()
+        let restartedRouter = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: restartedRecorder,
+            openAIChat: restartedRecorder,
+            responses: restartedRecorder,
+            requestKeyState: ProviderRequestKeyState(fileURL: stateURL)
+        )
+        _ = try await collectText(restartedRouter.stream(configuration: configuration, apiKey: "bad-auth", messages: [], tools: []))
+        let restartedKeys = await restartedRecorder.keysSeen()
+        XCTAssertEqual(restartedKeys, ["good"])
+
+        let changedPoolRecorder = RecordingKeyOutcomeProvider()
+        let changedPoolRouter = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: changedPoolRecorder,
+            openAIChat: changedPoolRecorder,
+            responses: changedPoolRecorder,
+            requestKeyState: ProviderRequestKeyState(fileURL: stateURL)
+        )
+        _ = try await collectText(changedPoolRouter.stream(configuration: configuration, apiKey: "different-bad-auth", messages: [], tools: []))
+        let changedPoolKeys = await changedPoolRecorder.keysSeen()
+        XCTAssertEqual(changedPoolKeys, ["different-bad-auth"])
+    }
+
     private func config(protocolName: ProviderProtocol) -> ProviderConfiguration {
         ProviderConfiguration(
             name: "Test",

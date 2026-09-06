@@ -1046,12 +1046,20 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
     private let policy: PolicyEngine
     private let approval: ApprovalRequesting
     private let audit: AuditLogStore
+    private let resourceIndex: ProgressiveResourceIndex?
 
-    public init(appResolver: IOSAppResolver, policy: PolicyEngine, approval: ApprovalRequesting, audit: AuditLogStore) {
+    public init(
+        appResolver: IOSAppResolver,
+        policy: PolicyEngine,
+        approval: ApprovalRequesting,
+        audit: AuditLogStore,
+        resourceIndex: ProgressiveResourceIndex? = nil
+    ) {
         self.appResolver = appResolver
         self.policy = policy
         self.approval = approval
         self.audit = audit
+        self.resourceIndex = resourceIndex
     }
 
     public func allowsDeferredCapabilityAttempt(
@@ -1246,6 +1254,12 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
             auditResult = "verification_pending"
             payloadStatus = "verification_pending"
             failures = [reason]
+        }
+        switch outcome {
+        case .removed, .removedWithResidualData(_):
+            try? await resourceIndex?.invalidate(ownerBundleID: bundleID)
+        case .rejected(_), .verificationTimedOut(_):
+            break
         }
         let verification = VerificationResult(
             passed: verified,

@@ -160,6 +160,182 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertEqual(matches.map(\.displayName), ["target", "target-backup", "notes"])
     }
 
+    func testProgressiveResourceIndexPersistsAcrossRestartAndKeepsGraphSnapshotBounded() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let graphURL = root.appendingPathComponent("index/resource-graph.json")
+        let first = ProgressiveResourceIndex(fileURL: graphURL)
+        let nodes = (0..<2_000).map { offset in
+            let path = root.appendingPathComponent("persist-\(offset).txt").path
+            return ResourceNode(
+                id: ResourceID(URL(fileURLWithPath: path).absoluteString),
+                kind: .file,
+                displayName: "persist-\(offset).txt",
+                logicalLocation: URL(fileURLWithPath: path).absoluteString,
+                resolvedPath: path,
+                byteSize: Int64(offset)
+            )
+        }
+        try await first.add(nodes, source: "test_bulk")
+        let firstStats = await first.statistics()
+        let firstSnapshot = await first.snapshot()
+        XCTAssertEqual(firstStats.resourceCount, 2_000)
+        XCTAssertGreaterThan(firstStats.sidecarBytes, 0)
+        XCTAssertLessThanOrEqual(firstSnapshot.nodes.count, 1_024)
+
+        let restarted = ProgressiveResourceIndex(fileURL: graphURL)
+        let matches = await restarted.search(nameContains: "persist-1999", pathPrefix: root.path, maxResults: 10)
+        let restartedStats = await restarted.statistics()
+        XCTAssertEqual(matches.first?.displayName, "persist-1999.txt")
+        XCTAssertEqual(restartedStats.resourceCount, 2_000)
+        XCTAssertLessThanOrEqual((try Data(contentsOf: graphURL)).count, 4 * 1024 * 1024)
+    }
+
+    func testProgressiveResourceIndexRebuildsCorruptSidecar() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let indexDirectory = root.appendingPathComponent("index", isDirectory: true)
+        try FileManager.default.createDirectory(at: indexDirectory, withIntermediateDirectories: true)
+        let sidecar = indexDirectory.appendingPathComponent("resource-index.sqlite")
+        try Data("not-a-sqlite-database".utf8).write(to: sidecar)
+
+        let index = ProgressiveResourceIndex(fileURL: indexDirectory.appendingPathComponent("resource-graph.json"))
+        let stats = await index.statistics()
+        XCTAssertTrue(stats.rebuiltCorruptSidecar)
+        XCTAssertEqual(stats.resourceCount, 0)
+
+        let path = root.appendingPathComponent("rebuilt.txt").path
+        try await index.add(ResourceNode(
+            id: ResourceID(URL(fileURLWithPath: path).absoluteString),
+            kind: .file,
+            displayName: "rebuilt.txt",
+            logicalLocation: URL(fileURLWithPath: path).absoluteString,
+            resolvedPath: path
+        ))
+        let rebuiltMatches = await index.search(nameContains: "rebuilt", pathPrefix: root.path)
+        XCTAssertEqual(rebuiltMatches.count, 1)
+    }
+
+    func testProgressiveResourceIndexInvalidatesOldContainerUUIDPaths() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let index = ProgressiveResourceIndex(fileURL: root.appendingPathComponent("index/resource-graph.json"))
+        let bundleID = "com.example.relocated"
+        let oldRoot = "/var/mobile/Containers/Data/Application/OLD-UUID"
+        let newRoot = "/var/mobile/Containers/Data/Application/NEW-UUID"
+        let rootID = ResourceID("container://\(bundleID)")
+        try await index.add(ResourceNode(
+            id: rootID,
+            kind: .directory,
+            displayName: "OLD-UUID",
+            logicalLocation: rootID.rawValue,
+            resolvedPath: oldRoot,
+            ownerBundleID: bundleID
+        ), source: "container_resolve")
+        let stalePath = oldRoot + "/Documents/report.txt"
+        try await index.add(ResourceNode(
+            id: ResourceID(URL(fileURLWithPath: stalePath).absoluteString),
+            kind: .file,
+            displayName: "report.txt",
+            logicalLocation: URL(fileURLWithPath: stalePath).absoluteString,
+            resolvedPath: stalePath,
+            ownerBundleID: bundleID
+        ))
+        let matchesBeforeRelocation = await index.search(nameContains: "report", ownerBundleID: bundleID)
+        XCTAssertEqual(matchesBeforeRelocation.count, 1)
+
+        try await index.add(ResourceNode(
+            id: rootID,
+            kind: .directory,
+            displayName: "NEW-UUID",
+            logicalLocation: rootID.rawValue,
+            resolvedPath: newRoot,
+            ownerBundleID: bundleID
+        ), source: "container_resolve")
+        let matchesAfterRelocation = await index.search(nameContains: "report", ownerBundleID: bundleID)
+        XCTAssertTrue(matchesAfterRelocation.isEmpty)
+
+        let currentPath = newRoot + "/Documents/current-report.txt"
+        try await index.add(ResourceNode(
+            id: ResourceID(URL(fileURLWithPath: currentPath).absoluteString),
+            kind: .file,
+            displayName: "current-report.txt",
+            logicalLocation: URL(fileURLWithPath: currentPath).absoluteString,
+            resolvedPath: currentPath,
+            ownerBundleID: bundleID
+        ))
+        let currentMatches = await index.search(nameContains: "current-report", ownerBundleID: bundleID)
+        XCTAssertEqual(currentMatches.count, 1)
+        try await index.invalidate(ownerBundleID: bundleID)
+        let matchesAfterUninstallInvalidation = await index.search(nameContains: "current-report", ownerBundleID: bundleID)
+        XCTAssertTrue(matchesAfterUninstallInvalidation.isEmpty)
+    }
+
+    func testProgressiveResourceIndexFiftyThousandResourceLookupStaysBounded() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let graphURL = root.appendingPathComponent("index/resource-graph.json")
+        let index = ProgressiveResourceIndex(fileURL: graphURL)
+        let nodes = (0..<50_000).map { offset in
+            let name = String(format: "resource-%05d.json", offset)
+            let path = root.appendingPathComponent("bulk").appendingPathComponent(name).path
+            return ResourceNode(
+                id: ResourceID(URL(fileURLWithPath: path).absoluteString),
+                kind: .file,
+                displayName: name,
+                logicalLocation: URL(fileURLWithPath: path).absoluteString,
+                resolvedPath: path,
+                ownerBundleID: "com.example.synthetic",
+                byteSize: Int64(offset),
+                metadata: ["contentType": "public.json"]
+            )
+        }
+        try await index.add(Array(nodes.prefix(10_000)), source: "synthetic_10k")
+        let tenThousandStats = await index.statistics()
+        XCTAssertEqual(tenThousandStats.resourceCount, 10_000)
+        let tenThousandStart = Date()
+        let tenThousandExact = await index.search(nameContains: "resource-09999.json", ownerBundleID: "com.example.synthetic", pathPrefix: root.path, maxResults: 10)
+        XCTAssertEqual(tenThousandExact.first?.displayName, "resource-09999.json")
+        XCTAssertLessThan(Date().timeIntervalSince(tenThousandStart), 2.0)
+
+        try await index.add(Array(nodes.dropFirst(10_000)), source: "synthetic_50k_increment")
+        let bulkStats = await index.statistics()
+        XCTAssertEqual(bulkStats.resourceCount, 50_000)
+
+        let exactStart = Date()
+        let exact = await index.search(nameContains: "resource-49999.json", ownerBundleID: "com.example.synthetic", pathPrefix: root.path, maxResults: 10)
+        let exactElapsed = Date().timeIntervalSince(exactStart)
+        XCTAssertEqual(exact.first?.displayName, "resource-49999.json")
+        XCTAssertLessThan(exactElapsed, 2.0)
+
+        let containsStart = Date()
+        let contains = await index.search(nameContains: "999", ownerBundleID: "com.example.synthetic", pathPrefix: root.path, maxResults: 25)
+        let containsElapsed = Date().timeIntervalSince(containsStart)
+        let bulkSnapshot = await index.snapshot()
+        XCTAssertFalse(contains.isEmpty)
+        XCTAssertLessThan(containsElapsed, 2.0)
+        XCTAssertLessThanOrEqual(bulkSnapshot.nodes.count, 1_024)
+        XCTAssertLessThanOrEqual((try Data(contentsOf: graphURL)).count, 4 * 1024 * 1024)
+    }
+
+    func testFileServiceBoundedSearchRespondsToCancellation() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for offset in 0..<384 {
+            try Data().write(to: root.appendingPathComponent("cancel-\(offset).txt"))
+        }
+        let task = Task.detached {
+            try FileService().search(root: root, query: FileSearchQuery(maxDepth: 2, maxResults: 1_000), allowedRoot: root)
+        }
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("cancelled bounded filesystem search must stop cooperatively")
+        } catch is CancellationError {
+            // expected
+        }
+    }
+
     func testStructuredDataMacroResolvesSearchesIndexesAndQueriesLocally() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

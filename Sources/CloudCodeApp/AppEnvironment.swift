@@ -176,7 +176,7 @@ public final class CloudCodeViewModel: ObservableObject {
         )
         let registry = ToolRegistry()
         let cli = IOSSystemExecutor(policy: policy, approval: approval)
-        let privateApps = IOSPrivateAppExecutor(appResolver: resolver, policy: policy, approval: approval, audit: audit)
+        let privateApps = IOSPrivateAppExecutor(appResolver: resolver, policy: policy, approval: approval, audit: audit, resourceIndex: resourceIndex)
         let attachmentRoot = support.appendingPathComponent("Attachments", isDirectory: true)
         let gui = GUIFallbackExecutor(backend: guiBackend, policy: policy, approval: approval, attachmentRoot: attachmentRoot)
         let interactionExperienceStore = IOSInteractionExperienceStore(
@@ -192,11 +192,15 @@ public final class CloudCodeViewModel: ObservableObject {
         let checkpointURL = support.appendingPathComponent("Tasks/checkpoints.json")
         let checkpoints = TaskCheckpointStore(fileURL: checkpointURL)
         let hermesStore = HermesMemoryStore(root: support.appendingPathComponent("Hermes", isDirectory: true))
+        let providerRouteState = ProviderRequestKeyState(
+            fileURL: support.appendingPathComponent("Provider/verified-routes.json")
+        )
         let provider = ProviderClientRouter(
             keyVault: keyVault,
             anthropic: DeferredProviderClient { AnthropicProviderClient(diagnosticLogger: diagnosticLogStore) },
             openAIChat: DeferredProviderClient { OpenAICompatibleProviderClient(diagnosticLogger: diagnosticLogStore) },
             responses: DeferredProviderClient { OpenAIResponsesProviderClient(diagnosticLogger: diagnosticLogStore) },
+            requestKeyState: providerRouteState,
             diagnosticLogger: diagnosticLogStore
         )
         let steeringMailbox = AgentSteeringMailbox()
@@ -262,7 +266,8 @@ public final class CloudCodeViewModel: ObservableObject {
         self.diagnosticLogStore = diagnosticLogStore
         self.diagnosticBundleExporter = DiagnosticBundleExporter(logStore: diagnosticLogStore)
         self.diagnosticSourceFiles = [
-            DiagnosticBundleSource(archivePath: "index/resource-graph.json", fileURL: support.appendingPathComponent("Index/resource-graph.json"))
+            DiagnosticBundleSource(archivePath: "index/resource-graph.json", fileURL: support.appendingPathComponent("Index/resource-graph.json")),
+            DiagnosticBundleSource(archivePath: "provider/verified-routes.json", fileURL: support.appendingPathComponent("Provider/verified-routes.json"))
         ]
         self.transactionJournal = transactionJournal
         self.transactionEngine = transactionEngine
@@ -1730,6 +1735,14 @@ public final class CloudCodeViewModel: ObservableObject {
         let checkpointData = try await checkpointStore.exportSnapshotData()
         let transactionData = try await transactionJournal.exportSnapshotData()
         let startupBreadcrumbData = Data(startupBreadcrumbStore.exportText(limitRuns: 8).utf8)
+        let indexStatistics = await resourceIndex.statistics()
+        let indexStatisticsData = try JSONSerialization.data(withJSONObject: [
+            "resourceCount": indexStatistics.resourceCount,
+            "sidecarBytes": indexStatistics.sidecarBytes,
+            "generation": indexStatistics.generation,
+            "fts5Available": indexStatistics.fts5Available,
+            "rebuiltCorruptSidecar": indexStatistics.rebuiltCorruptSidecar
+        ], options: [.prettyPrinted, .sortedKeys])
         let destination = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeDiagnostics", isDirectory: true)
         let url = try await diagnosticBundleExporter.export(
             destinationDirectory: destination,
@@ -1741,7 +1754,8 @@ public final class CloudCodeViewModel: ObservableObject {
                 "tool-results/tool-results.json": toolResultsData,
                 "checkpoints/checkpoints.json": checkpointData,
                 "transactions/transactions.json": transactionData,
-                "startup/breadcrumbs.txt": startupBreadcrumbData
+                "startup/breadcrumbs.txt": startupBreadcrumbData,
+                "index/resource-index-stats.json": indexStatisticsData
             ]
         )
         try? await diagnosticLogStore.log(
