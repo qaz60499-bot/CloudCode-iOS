@@ -481,7 +481,6 @@ public final class CloudCodeViewModel: ObservableObject {
             profiles: providerProfiles
         )
         applySelection(state)
-        refreshProviderSelectionInBackground(state)
     }
 
     public func selectKey(_ keySlotID: String) {
@@ -490,25 +489,6 @@ public final class CloudCodeViewModel: ObservableObject {
             profiles: providerProfiles
         )
         applySelection(state)
-        refreshProviderSelectionInBackground(state)
-    }
-
-    private func refreshProviderSelectionInBackground(_ state: ProviderSelectionState) {
-        guard !state.providerID.isEmpty, !state.keySlotID.isEmpty else { return }
-        let reference = ProviderCatalog.keyReference(providerID: state.providerID, keySlotID: state.keySlotID)
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let value = try await keyVault.key(for: reference)
-                guard !value.isEmpty else { return }
-                installedKeyReferences.insert(reference)
-                _ = await refreshLiveProviderMetadataIfNeeded(providerID: state.providerID, keySlotID: state.keySlotID, apiKey: value)
-            } catch {
-                // Selection must remain instant and side-effect free when the Key is absent or
-                // currently protected. Explicit "check current Key" remains the user-facing path
-                // for reporting Keychain errors.
-            }
-        }
     }
 
     public func selectModel(_ model: String) {
@@ -1870,34 +1850,35 @@ public final class CloudCodeViewModel: ObservableObject {
                 fallbackInferenceCandidates: fallbackInferenceCandidates,
                 inferenceProtocols: inferenceProtocols
             )
-            providerProfiles[providerIndex].applyDiscovery(discovery, keySlotID: keySlotID)
-            let reconciled = ProviderSelectionResolver.reconcile(
-                ProviderSelectionState(providerID: selectedProviderID, keySlotID: selectedKeySlotID, model: selectedModel),
-                profiles: providerProfiles
-            )
-            applySelection(reconciled)
-            let emptyCatalog = discovery.models.isEmpty && discovery.readiness == .unavailable
-            let unresolvedCatalog = discovery.models.isEmpty && discovery.readiness == .needsValidation
-            if emptyCatalog {
-                activityLines.append("\(profile.displayName) 当前 Key 的目录为空且没有验证到可用推理模型；仅标记这个 Key 暂不可用，其他 Key/厂商不受影响。")
-            } else if unresolvedCatalog {
-                activityLines.append("\(profile.displayName) 的模型目录格式当前无法权威解析；已保留现有模型/Key，不会误判厂商不可用。")
-            } else {
+            let shouldApplyDiscovery = discovery.readiness == .ready && !discovery.models.isEmpty
+            if shouldApplyDiscovery {
+                providerProfiles[providerIndex].applyDiscovery(discovery, keySlotID: keySlotID)
+                let reconciled = ProviderSelectionResolver.reconcile(
+                    ProviderSelectionState(providerID: selectedProviderID, keySlotID: selectedKeySlotID, model: selectedModel),
+                    profiles: providerProfiles
+                )
+                applySelection(reconciled)
                 activityLines.append("\(profile.displayName) 已按当前 Key 实时验证可用模型：\(discovery.models.count) 个。")
+            } else if discovery.models.isEmpty {
+                activityLines.append("\(profile.displayName) 当前模型目录没有给出可验证模型；已保留原有厂商、Key、模型和协议配置，不会用一次网络探测覆盖本地 Catalog。")
+            } else {
+                activityLines.append("\(profile.displayName) 返回了模型目录，但推理协议尚未验证通过；已保留原有厂商配置，目录结果仅作为诊断信息。")
             }
             try? await diagnosticLogStore.log(
-                level: (emptyCatalog || unresolvedCatalog) ? .warning : .info,
+                level: shouldApplyDiscovery ? .info : .warning,
                 subsystem: "provider-discovery",
                 action: "refresh",
-                result: emptyCatalog ? "empty-catalog-key-scoped" : (unresolvedCatalog ? "catalog-unresolved-key-preserved" : "updated"),
+                result: shouldApplyDiscovery ? "verified-catalog-applied" : "non-authoritative-catalog-preserved",
                 metadata: [
                     "providerID": providerID,
                     "keySlotID": keySlotID,
                     "modelCount": String(discovery.models.count),
-                    "readiness": discovery.readiness.rawValue
+                    "readiness": discovery.readiness.rawValue,
+                    "catalogApplied": shouldApplyDiscovery ? "true" : "false",
+                    "preservedModelCount": String(profile.models(for: keySlotID).count)
                 ]
             )
-            return !discovery.models.isEmpty && discovery.readiness == .ready
+            return shouldApplyDiscovery
         } catch {
             try? await diagnosticLogStore.log(
                 level: .warning,

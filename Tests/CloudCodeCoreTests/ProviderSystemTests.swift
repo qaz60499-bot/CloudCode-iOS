@@ -557,25 +557,31 @@ final class ProviderDiscoveryTests: XCTestCase {
         XCTAssertEqual(result.readiness, .unavailable)
     }
 
-    func testProviderProfileScopesAuthoritativeEmptyCatalogToTheKeyThatReturnedIt() throws {
+    func testProviderProfilePreservesCatalogWhenDiscoveryReturnsEmptyUnavailableResult() throws {
         var profile = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.tabitokenID }))
+        let original = profile
         let staleSelection = ProviderSelectionState(providerID: profile.id, keySlotID: "slot-1", model: profile.models[0])
-        let siblingModels = profile.models(for: "slot-2")
 
         profile.applyDiscovery(
             ProviderDiscoveryResult(models: [], protocols: [], authMode: .both, readiness: .unavailable),
             keySlotID: "slot-1"
         )
 
-        XCTAssertEqual(profile.models(for: "slot-1"), [])
-        XCTAssertEqual(profile.keySlots.first(where: { $0.id == "slot-1" })?.status, .unavailable)
-        XCTAssertEqual(profile.models(for: "slot-2"), siblingModels)
-        XCTAssertFalse(profile.models.isEmpty)
-        XCTAssertEqual(profile.readiness, .partial)
+        XCTAssertEqual(profile, original)
         let reconciled = ProviderSelectionResolver.reconcile(staleSelection, profiles: [profile])
-        XCTAssertEqual(reconciled.providerID, profile.id)
-        XCTAssertEqual(reconciled.keySlotID, "slot-2")
-        XCTAssertEqual(reconciled.model, staleSelection.model)
+        XCTAssertEqual(reconciled, staleSelection)
+    }
+
+    func testProviderProfilePreservesCatalogWhenDiscoveryHasModelsButProtocolIsUnverified() throws {
+        var profile = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-api-justwoker-icu" }))
+        let original = profile
+
+        profile.applyDiscovery(
+            ProviderDiscoveryResult(models: ["unexpected-catalog-model"], protocols: [], authMode: .xAPIKey, readiness: .needsValidation),
+            keySlotID: "slot-1"
+        )
+
+        XCTAssertEqual(profile, original)
     }
 
     func testDiscoveryUsesConfiguredCandidateOnlyAfterLiveInferenceValidationWhenCatalogIsEmpty() async throws {

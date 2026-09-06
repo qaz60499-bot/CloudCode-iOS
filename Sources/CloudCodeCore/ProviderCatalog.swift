@@ -205,25 +205,14 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
 
     public mutating func applyDiscovery(_ discovery: ProviderDiscoveryResult, keySlotID: String) {
         let discoveredModels = Self.unique(discovery.models)
-        guard !discoveredModels.isEmpty || discovery.readiness == .unavailable else { return }
+        // Provider catalogs are configuration truth, while discovery is only runtime evidence.
+        // Empty/unverified discovery results are common on compatible gateways and must never
+        // erase a previously valid provider/key/model configuration. Only a live-validated,
+        // non-empty catalog may replace the local snapshot.
+        guard discovery.readiness == .ready, !discoveredModels.isEmpty else { return }
         guard let targetSlotIndex = keySlots.firstIndex(where: { $0.id == keySlotID }) else { return }
 
         authMode = discovery.authMode
-        if discoveredModels.isEmpty, discovery.readiness == .unavailable {
-            // An authenticated empty catalog is authoritative for the Key that produced it,
-            // not for sibling credentials. Do not let one empty/limited Key erase the model
-            // scope of every other configured Key before rotation has a chance to run.
-            keySlots[targetSlotIndex].models = []
-            keySlots[targetSlotIndex].status = .unavailable
-            keySlots[targetSlotIndex].modelProtocols.removeAll()
-            let aggregateModels = Self.unique(keySlots.flatMap { slot in
-                (slot.status == .unavailable || slot.status == .authFailed) ? [] : slot.models
-            })
-            models = aggregateModels
-            readiness = aggregateModels.isEmpty ? .unavailable : .partial
-            return
-        }
-
         let previousProviderModels = models
         models = discoveredModels
         readiness = discovery.readiness
