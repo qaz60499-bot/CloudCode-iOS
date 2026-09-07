@@ -219,6 +219,7 @@ public enum HarnessContextManager {
     }
 
     static func requiresPostLaunchGUIAction(in request: String) -> Bool {
+        if requiresMessageSend(in: request) { return true }
         let normalized = request.lowercased()
         let actionMarkers = [
             "刷", "滑", "滚动", "点赞", "点", "点击", "输入", "发送", "回复", "聊天", "搜索", "选择", "切换",

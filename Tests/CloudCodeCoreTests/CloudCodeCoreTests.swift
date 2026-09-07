@@ -2680,7 +2680,13 @@ final class CloudCodeCoreTests: XCTestCase {
             session: session,
             providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
         )
-        for try await _ in stream {}
+        var caughtError: Error?
+        do {
+            for try await _ in stream {}
+        } catch {
+            caughtError = error
+        }
+        XCTAssertNotNil(caughtError, "An unchanged post-action screenshot must not allow the GUI task to complete successfully.")
 
         let swipeCount = await swipeCounter.value()
         XCTAssertEqual(swipeCount, 1)
