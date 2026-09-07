@@ -16,6 +16,28 @@ enum LocalVisionTextObservation {
         var elements: [LocalPerceptionTextElement]
     }
 
+    private struct RecognitionConfiguration {
+        var level: VNRequestTextRecognitionLevel
+        var languages: [String]
+    }
+
+    // Vision language support is fixed for the running OS/Vision revision. Probe it once per
+    // process instead of paying the supported-language lookup on every screenshot.
+    private static let primaryRecognitionConfiguration: RecognitionConfiguration = {
+        let preferred = ["zh-Hans", "en-US"]
+        func supportedLanguages(_ level: VNRequestTextRecognitionLevel) -> [String] {
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = level
+            return (try? request.supportedRecognitionLanguages()) ?? []
+        }
+        let fast = supportedLanguages(.fast)
+        if fast.contains("zh-Hans") {
+            return RecognitionConfiguration(level: .fast, languages: preferred.filter { fast.contains($0) })
+        }
+        let accurate = supportedLanguages(.accurate)
+        return RecognitionConfiguration(level: .accurate, languages: preferred.filter { accurate.contains($0) })
+    }()
+
     static func payload(for jpegData: Data, maximumElements: Int = 28, regionInScreenPoints: CGRect? = nil) async -> [String: String] {
         await observe(for: jpegData, maximumElements: maximumElements, regionInScreenPoints: regionInScreenPoints).payload
     }
@@ -39,17 +61,26 @@ enum LocalVisionTextObservation {
         let pixelHeight = max(1, image.height)
         let screenWidth = CGFloat(pixelWidth)
         let screenHeight = CGFloat(pixelHeight)
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .fast
-        request.usesLanguageCorrection = false
-        request.minimumTextHeight = 0.009
-        request.recognitionLanguages = ["zh-Hans", "en-US"]
         var boundedRegion: CGRect?
         if let requestedRegion = regionInScreenPoints {
             let screenBounds = CGRect(x: 0, y: 0, width: screenWidth, height: screenHeight)
             let region = requestedRegion.standardized.intersection(screenBounds)
             if !region.isNull, region.width >= 1, region.height >= 1 {
                 boundedRegion = region
+            }
+        }
+
+        func makeRequest(level: VNRequestTextRecognitionLevel, languages: [String]?) -> VNRecognizeTextRequest {
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = level
+            request.usesLanguageCorrection = false
+            request.minimumTextHeight = 0.009
+            if let languages, !languages.isEmpty {
+                request.recognitionLanguages = languages
+            } else {
+                request.automaticallyDetectsLanguage = true
+            }
+            if let region = boundedRegion {
                 request.regionOfInterest = CGRect(
                     x: region.minX / screenWidth,
                     y: 1.0 - (region.maxY / screenHeight),
@@ -57,18 +88,45 @@ enum LocalVisionTextObservation {
                     height: region.height / screenHeight
                 )
             }
+            return request
         }
 
+        // `zh-Hans` is not guaranteed to be supported by Vision's `.fast` recognizer on every
+        // iOS/Vision revision. Asking a fast request to use an unsupported language can make the
+        // entire OCR request fail, which previously collapsed GUI planning into remote/text-only
+        // coordinate guesses. Prefer fast only when it can actually recognize Simplified Chinese;
+        // otherwise use accurate locally. Even the accurate local pass is far cheaper than a
+        // provider round-trip or a multi-second AX timeout.
+        let primary = Self.primaryRecognitionConfiguration
+        var request = makeRequest(level: primary.level, languages: primary.languages)
+        let handler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
+        var fallbackUsed = false
+        var firstFailure: NSError?
         do {
-            let handler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
             try handler.perform([request])
         } catch {
-            return Observation(payload: [
-                "localVisionOCR": "unavailable_request_failed",
-                "screenPointWidth": String(pixelWidth),
-                "screenPointHeight": String(pixelHeight),
-                "localVisionLatencyMS": String(max(0, Int(Date().timeIntervalSince(startedAt) * 1_000)))
-            ], elements: [])
+            firstFailure = error as NSError
+            // A request revision/device can still reject the chosen language/model combination.
+            // Retry once without an explicit language list before declaring local perception dead.
+            fallbackUsed = true
+            request = makeRequest(level: .fast, languages: nil)
+            do {
+                // Use a fresh handler after a failed Vision request so fallback state is isolated.
+                let fallbackHandler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
+                try fallbackHandler.perform([request])
+            } catch {
+                let finalFailure = error as NSError
+                return Observation(payload: [
+                    "localVisionOCR": "unavailable_request_failed",
+                    "screenPointWidth": String(pixelWidth),
+                    "screenPointHeight": String(pixelHeight),
+                    "localVisionLatencyMS": String(max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))),
+                    "localVisionErrorDomain": finalFailure.domain,
+                    "localVisionErrorCode": String(finalFailure.code),
+                    "localVisionPrimaryErrorDomain": firstFailure?.domain ?? "",
+                    "localVisionPrimaryErrorCode": firstFailure.map { String($0.code) } ?? ""
+                ], elements: [])
+            }
         }
 
         let observations = (request.results ?? []).sorted { lhs, rhs in
@@ -127,7 +185,9 @@ enum LocalVisionTextObservation {
             "screenPointWidth": String(pixelWidth),
             "screenPointHeight": String(pixelHeight),
             "localVisionCoordinateSpace": "screen_points_top_left",
-            "localVisionLatencyMS": String(max(0, Int(Date().timeIntervalSince(startedAt) * 1_000)))
+            "localVisionLatencyMS": String(max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))),
+            "localVisionRecognitionLevel": request.recognitionLevel == .fast ? "fast" : "accurate",
+            "localVisionFallbackUsed": fallbackUsed ? "true" : "false"
         ]
         if let boundedRegion {
             payload["localVisionRegion"] = "\(boundedRegion.minX),\(boundedRegion.minY),\(boundedRegion.width),\(boundedRegion.height)"

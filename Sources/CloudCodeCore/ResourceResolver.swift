@@ -153,26 +153,31 @@ public actor ResourceResolver {
             guard resolved == rootPath || resolved.hasPrefix(rootPrefix) else {
                 throw ResourceResolverError.invalidResourceID
             }
+            let isDirectory = fileManager.directoryExists(at: target)
             return ResourceNode(
                 id: id,
-                kind: fileManager.directoryExists(at: target) ? .directory : .container,
+                kind: isDirectory ? .directory : .container,
                 displayName: target.lastPathComponent.isEmpty ? bundleID : target.lastPathComponent,
                 logicalLocation: id.rawValue,
                 resolvedPath: resolved,
                 ownerBundleID: bundleID,
-                byteSize: try? fileManager.allocatedSizeOfItem(at: target)
+                // Resolving a logical container must stay O(1)-ish. Computing a directory's
+                // aggregate allocated size recursively enumerates the entire subtree and turns
+                // container.resolve / lazy Explorer navigation into an accidental deep scan.
+                byteSize: isDirectory ? nil : (try? fileManager.allocatedSizeOfItem(at: target))
             )
 
         case "file":
             let decoded = components.path.removingPercentEncoding ?? components.path
             let url = URL(fileURLWithPath: decoded)
+            let isDirectory = fileManager.directoryExists(at: url)
             return ResourceNode(
                 id: id,
-                kind: fileManager.directoryExists(at: url) ? .directory : .file,
+                kind: isDirectory ? .directory : .file,
                 displayName: url.lastPathComponent,
                 logicalLocation: id.rawValue,
                 resolvedPath: url.standardizedFileURL.path,
-                byteSize: try? fileManager.allocatedSizeOfItem(at: url)
+                byteSize: isDirectory ? nil : (try? fileManager.allocatedSizeOfItem(at: url))
             )
 
         case "ipa":

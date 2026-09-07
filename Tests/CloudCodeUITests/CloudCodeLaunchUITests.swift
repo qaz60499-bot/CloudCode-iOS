@@ -40,6 +40,26 @@ final class CloudCodeLaunchUITests: XCTestCase {
         XCTAssertTrue(app.navigationBars["诊断日志"].waitForExistence(timeout: 10), "诊断日志页未能打开")
     }
 
+    func testResourceExplorerStartsFromVirtualCategoriesWithoutOpeningAPath() throws {
+        let app = XCUIApplication()
+        app.launch()
+
+        let moreTab = app.tabBars.buttons["更多"]
+        XCTAssertTrue(moreTab.waitForExistence(timeout: 20), "更多 Tab 未在启动后出现")
+        moreTab.tap()
+
+        let files = app.buttons["文件"].firstMatch
+        XCTAssertTrue(files.waitForExistence(timeout: 10), "Resource Explorer 入口不可用")
+        files.tap()
+
+        XCTAssertTrue(app.navigationBars["资源"].waitForExistence(timeout: 10), "Resource Explorer 未能打开")
+        XCTAssertTrue(app.staticTexts["Resource Explorer"].waitForExistence(timeout: 5), "首屏没有虚拟资源分类")
+        XCTAssertTrue(app.staticTexts["应用"].exists)
+        XCTAssertTrue(app.staticTexts["用户文件"].exists)
+        XCTAssertTrue(app.staticTexts["系统"].exists)
+        XCTAssertFalse(app.textFields["路径"].exists, "Explorer 首屏不应恢复为路径输入并自动打开目录的旧模式")
+    }
+
     func testRepeatedRelaunchKeepsRootNavigationUsable() throws {
         let app = XCUIApplication()
 

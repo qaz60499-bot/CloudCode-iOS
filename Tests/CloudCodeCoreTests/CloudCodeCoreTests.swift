@@ -777,6 +777,24 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(LocalPerceptionRoutingPolicy.shouldAttachRemoteVision(localObservationSufficient: true, remoteVisionRequired: true))
     }
 
+    func testLocalKeyboardHeuristicRequiresMultipleLowerScreenKeyRows() {
+        let keyboardLike = [
+            LocalPerceptionTextElement(text: "Q W E R T Y U I O P", confidence: 0.94, x: 20, y: 560, width: 350, height: 34),
+            LocalPerceptionTextElement(text: "A S D F G H J K L", confidence: 0.93, x: 32, y: 610, width: 326, height: 34),
+            LocalPerceptionTextElement(text: "Z X C V B N M", confidence: 0.92, x: 58, y: 660, width: 275, height: 34),
+            LocalPerceptionTextElement(text: "space", confidence: 0.90, x: 110, y: 714, width: 170, height: 34)
+        ]
+        XCTAssertTrue(LocalKeyboardHeuristic.isLikelyVisible(elements: keyboardLike, screenHeight: 844))
+
+        let ordinaryChatLabels = [
+            LocalPerceptionTextElement(text: "文件传输助手", confidence: 0.98, x: 90, y: 72, width: 150, height: 30),
+            LocalPerceptionTextElement(text: "09:41", confidence: 0.95, x: 170, y: 110, width: 48, height: 20),
+            LocalPerceptionTextElement(text: "发送", confidence: 0.90, x: 330, y: 760, width: 44, height: 28)
+        ]
+        XCTAssertFalse(LocalKeyboardHeuristic.isLikelyVisible(elements: ordinaryChatLabels, screenHeight: 844))
+        XCTAssertFalse(LocalKeyboardHeuristic.isLikelyVisible(elements: keyboardLike, screenHeight: 120))
+    }
+
     func testExecutionPathMetricsAggregatesLocalPerceptionWithoutObservationContent() async {
         let metrics = ExecutionPathMetrics(maximumCount: 64)
         await metrics.record(ExecutionPathMetric(
@@ -1418,6 +1436,9 @@ final class CloudCodeCoreTests: XCTestCase {
 
     func testPathTraversalAndBroadRecursiveDeleteAreRejected() throws {
         let guarder = PathGuard()
+        XCTAssertThrowsError(try guarder.validate(target: URL(fileURLWithPath: "/"), rejectSymlink: false)) { error in
+            XCTAssertEqual(error as? PathSafetyError, .rootPath)
+        }
         XCTAssertThrowsError(try guarder.validate(target: URL(fileURLWithPath: "/tmp/safe/../escape"))) { error in
             XCTAssertEqual(error as? PathSafetyError, .traversal)
         }
@@ -1458,13 +1479,17 @@ final class CloudCodeCoreTests: XCTestCase {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let container = root.appendingPathComponent("UUID-ONE", isDirectory: true)
-        try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
+        let documents = container.appendingPathComponent("Documents", isDirectory: true)
+        try FileManager.default.createDirectory(at: documents, withIntermediateDirectories: true)
+        try Data(repeating: 0x41, count: 128 * 1024).write(to: documents.appendingPathComponent("large.bin"))
         let resolver = StaticAppResolver(containerPaths: ["org.telegram.Telegram": container.path])
         let resourceResolver = ResourceResolver(appResolver: resolver)
         let node = try await resourceResolver.resolve(ResourceID("container://org.telegram.Telegram/Documents"))
         XCTAssertEqual(node.logicalLocation, "container://org.telegram.Telegram/Documents")
         XCTAssertTrue(node.resolvedPath?.contains("UUID-ONE/Documents") == true)
         XCTAssertEqual(node.ownerBundleID, "org.telegram.Telegram")
+        XCTAssertEqual(node.kind, .directory)
+        XCTAssertNil(node.byteSize, "logical directory resolution must not recursively enumerate the subtree to compute size")
     }
 
     func testTrashMoveAndRestoreRoundTrip() async throws {
@@ -1995,17 +2020,23 @@ final class CloudCodeCoreTests: XCTestCase {
     func testGUILocalActionObserveToolsRequireActionAndScreenshotCapabilities() async throws {
         let registry = ToolRegistry()
         let tapObserveValue = await registry.descriptor(named: "gui.tapObserve")
+        let tapTextObserveValue = await registry.descriptor(named: "gui.tapTextObserve")
+        let focusComposerObserveValue = await registry.descriptor(named: "gui.focusComposerObserve")
         let typeObserveValue = await registry.descriptor(named: "gui.typeObserve")
         let scrollObserveValue = await registry.descriptor(named: "gui.scrollObserve")
         let swipeObserveValue = await registry.descriptor(named: "gui.swipeObserve")
         let learningValue = await registry.descriptor(named: "interaction.confirmTransition")
         let tapObserve = try XCTUnwrap(tapObserveValue)
+        let tapTextObserve = try XCTUnwrap(tapTextObserveValue)
+        let focusComposerObserve = try XCTUnwrap(focusComposerObserveValue)
         let typeObserve = try XCTUnwrap(typeObserveValue)
         let scrollObserve = try XCTUnwrap(scrollObserveValue)
         let swipeObserve = try XCTUnwrap(swipeObserveValue)
         let learning = try XCTUnwrap(learningValue)
 
         XCTAssertEqual(tapObserve.requiredCapabilities, [GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
+        XCTAssertEqual(tapTextObserve.requiredCapabilities, [GUIAutomationFeature.screenshot.capabilityID, GUIAutomationFeature.touch.capabilityID])
+        XCTAssertEqual(focusComposerObserve.requiredCapabilities, [GUIAutomationFeature.screenshot.capabilityID, GUIAutomationFeature.touch.capabilityID])
         XCTAssertEqual(typeObserve.requiredCapabilities, [GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
         XCTAssertEqual(scrollObserve.requiredCapabilities, [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
         XCTAssertEqual(swipeObserve.requiredCapabilities, [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
@@ -2013,6 +2044,8 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(learning.requiredCapabilities.isEmpty)
         XCTAssertEqual(learning.risk, .readOnly)
         XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.typeObserve", arguments: ["text": "secret text"], sessionID: UUID())), "当前前台 App · 输入 11 个字符（内容已隐藏）")
+        XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.tapTextObserve", arguments: ["query": "文件传输助手"], sessionID: UUID())), "当前前台 App · local OCR text tap")
+        XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.focusComposerObserve", arguments: [:], sessionID: UUID())), "当前前台 App · semantic chat composer focus")
     }
 
     func testStructuredGUIElementToolsPreferTreeAndBoundedLocalExecutionCapabilities() async throws {
@@ -2753,6 +2786,29 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(AgentCore.guiScreenshotChanged(currentSHA256: "after", baselineSHA256: "before") ?? false)
     }
 
+    func testMessageCommitTrackingRequiresSemanticSendTarget() {
+        XCTAssertFalse(AgentCore.isSemanticMessageCommitAction(name: "gui.tap", arguments: ["x": "320", "y": "730"]))
+        XCTAssertFalse(AgentCore.isSemanticMessageCommitAction(name: "gui.tapObserve", arguments: ["x": "320", "y": "730"]))
+        XCTAssertFalse(AgentCore.isSemanticMessageCommitAction(name: "gui.tapTextObserve", arguments: ["query": "表情"]))
+        XCTAssertTrue(AgentCore.isSemanticMessageCommitAction(name: "gui.tapTextObserve", arguments: ["query": "发送"]))
+        XCTAssertTrue(AgentCore.isSemanticMessageCommitAction(name: "gui.tapElementObserve", arguments: ["query": "Send"]))
+        XCTAssertTrue(AgentCore.isSemanticMessageCommitAction(name: "gui.runStructuredPlan", arguments: ["plan": "tap unique 发送 button then expect composer absent"]))
+    }
+
+    func testTextOnlyCoordinateGroundingRequiresTapInsideCurrentOCRBox() throws {
+        let elements = [
+            LocalPerceptionTextElement(text: "文件传输助手", confidence: 0.96, x: 24, y: 180, width: 132, height: 28),
+            LocalPerceptionTextElement(text: "123", confidence: 0.90, x: 318, y: 520, width: 34, height: 18)
+        ]
+        let data = try JSONEncoder().encode(elements)
+        let json = try XCTUnwrap(String(data: data, encoding: .utf8))
+
+        XCTAssertTrue(AgentCore.guiCoordinateIsGroundedInLocalVision(x: 90, y: 194, elementsJSON: json))
+        XCTAssertTrue(AgentCore.guiCoordinateIsGroundedInLocalVision(x: 20, y: 176, elementsJSON: json))
+        XCTAssertFalse(AgentCore.guiCoordinateIsGroundedInLocalVision(x: 345, y: 560, elementsJSON: json))
+        XCTAssertFalse(AgentCore.guiCoordinateIsGroundedInLocalVision(x: 90, y: 194, elementsJSON: nil))
+    }
+
     func testAgentFeedsScreenshotToolAttachmentBackAsHiddenVisualObservation() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2837,10 +2893,11 @@ final class CloudCodeCoreTests: XCTestCase {
         })
     }
 
-    func testGUICompletionGuardRejectsTypeOnlyFinishForMessageSend() async throws {
+    func testMessagingRawTypeIsBlockedUntilComposerFocusIsLocallyVerified() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let typeCounter = InvocationCounter()
         let registry = ToolRegistry(descriptors: [
             ToolDescriptor(name: "gui.type", summary: "type", risk: .safeWrite, preferredRoute: .guiFallback)
         ])
@@ -2849,7 +2906,7 @@ final class CloudCodeCoreTests: XCTestCase {
             keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
             toolRouter: ToolRouter(
                 registry: registry,
-                executors: [CountingExecutor(route: .guiFallback, names: ["gui.type"], counter: InvocationCounter())]
+                executors: [CountingExecutor(route: .guiFallback, names: ["gui.type"], counter: typeCounter)]
             ),
             registry: registry,
             capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
@@ -2869,14 +2926,69 @@ final class CloudCodeCoreTests: XCTestCase {
         } catch {
             caughtError = error
         }
-        XCTAssertNotNil(caughtError, "Typing text alone must not satisfy a message-send request.")
+        XCTAssertNotNil(caughtError, "Unfocused raw typing must not satisfy or escape a message-send request.")
+        let rawTypeExecutions = await typeCounter.value()
+        XCTAssertEqual(rawTypeExecutions, 0, "The raw text-input executor must not run before verified composer focus.")
 
         let saved = try await sessions.load(session.id)
         XCTAssertTrue(saved.messages.contains {
             $0.role == .system
-                && $0.providerMetadata["context_layer"] == "gui_completion_guard"
-                && $0.content.contains("文本输入后还没有确认执行提交/发送动作")
+                && $0.providerMetadata["context_layer"] == "messaging_focus_guard"
+                && $0.content.contains("gui.focusComposerObserve")
         })
+        XCTAssertTrue(saved.messages.contains {
+            $0.role == .system
+                && $0.providerMetadata["context_layer"] == "gui_completion_guard"
+                && $0.content.contains("还没有成功完成文本输入")
+        })
+    }
+
+    func testVerifiedComposerFocusAllowsRawMessageTypeExecutorToRun() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let typeCounter = InvocationCounter()
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "gui.focusComposerObserve", summary: "focus", risk: .safeWrite, preferredRoute: .guiFallback),
+            ToolDescriptor(name: "gui.type", summary: "type", risk: .safeWrite, preferredRoute: .guiFallback)
+        ])
+        let agent = AgentCore(
+            provider: FocusThenTypeProvider(),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(
+                registry: registry,
+                executors: [
+                    FixedPayloadExecutor(
+                        route: .guiFallback,
+                        names: ["gui.focusComposerObserve"],
+                        payload: ["keyboardLikely": "true"]
+                    ),
+                    CountingExecutor(route: .guiFallback, names: ["gui.type"], counter: typeCounter)
+                ]
+            ),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 5
+        )
+        let session = AgentSession(permissionMode: .full)
+        let stream = await agent.send(
+            text: "打开微信给文件传输助手发一个一",
+            session: session,
+            providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key")
+        )
+        do {
+            for try await _ in stream {}
+        } catch {
+            // The synthetic provider intentionally never performs Send; completion may fail after type.
+        }
+        let rawTypeExecutions = await typeCounter.value()
+        XCTAssertEqual(rawTypeExecutions, 1, "A locally verified composer focus must unlock exactly one requested raw type execution.")
+        let saved = try await sessions.load(session.id)
+        XCTAssertFalse(saved.messages.contains {
+            $0.providerMetadata["context_layer"] == "messaging_focus_guard"
+        }, "Verified composer focus must not trigger the unfocused raw-type guard.")
     }
 
     func testTreeFailureThenFreshScreenshotActivatesComputerUseFallbackAndSwipe() async throws {
@@ -4557,6 +4669,36 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(snapshot.first(where: { $0.backend == .accessibilityTree })?.failures, 3)
     }
 
+    func testIOSInteractionExperienceTemporarilySuppressesRepeatedSlowAXWhenScreenshotWorks() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = IOSInteractionExperienceStore(fileURL: root.appendingPathComponent("experience.json"))
+        let bundleID = "com.example.chat"
+
+        await store.recordObservation(bundleID: bundleID, backend: .screenshot, success: true, latencyMS: 220)
+        await store.recordObservation(bundleID: bundleID, backend: .screenshot, success: true, latencyMS: 180)
+        await store.recordObservation(bundleID: bundleID, backend: .accessibilityTree, success: false, latencyMS: 15_100)
+        await store.recordObservation(bundleID: bundleID, backend: .accessibilityTree, success: false, latencyMS: 15_200)
+
+        let avoidAX = await store.shouldTemporarilyAvoidObservation(bundleID: bundleID, backend: .accessibilityTree)
+        let avoidScreenshot = await store.shouldTemporarilyAvoidObservation(bundleID: bundleID, backend: .screenshot)
+        XCTAssertTrue(avoidAX)
+        XCTAssertFalse(avoidScreenshot)
+    }
+
+    func testIOSInteractionExperienceDoesNotSuppressAXWithoutWorkingAlternative() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = IOSInteractionExperienceStore(fileURL: root.appendingPathComponent("experience.json"))
+        let bundleID = "com.example.chat"
+
+        await store.recordObservation(bundleID: bundleID, backend: .accessibilityTree, success: false, latencyMS: 15_100)
+        await store.recordObservation(bundleID: bundleID, backend: .accessibilityTree, success: false, latencyMS: 15_200)
+
+        let avoidAX = await store.shouldTemporarilyAvoidObservation(bundleID: bundleID, backend: .accessibilityTree)
+        XCTAssertFalse(avoidAX)
+    }
+
     func testIOSInteractionExperiencePartitionsByAppVersionOSAndDevice() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -5328,6 +5470,11 @@ final class CloudCodeCoreTests: XCTestCase {
     }
 
     func testToolRouterPrefersStructuredToolOverGUI() async throws {
+        let defaultRegistry = ToolRegistry()
+        let defaultDescriptors = await defaultRegistry.all()
+        let defaultNames = Set(defaultDescriptors.map(\.name))
+        XCTAssertFalse(defaultNames.contains(where: { $0.hasPrefix("filza.") }), "Resource Explorer must not introduce a second Filza execution tool family")
+
         let registry = ToolRegistry(descriptors: [ToolDescriptor(name: "files.list", summary: "", risk: .readOnly)])
         let structured = StubExecutor(route: .structuredTool, names: ["files.list"])
         let gui = StubExecutor(route: .guiFallback, names: ["files.list"])
@@ -5780,6 +5927,29 @@ private struct PrematureGUICompletionProvider: ProviderStreaming, Sendable {
     }
 }
 
+private struct FocusThenTypeProvider: ProviderStreaming, Sendable {
+    func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        let completed = messages.filter { $0.role == .tool }.count
+        return AsyncThrowingStream { continuation in
+            switch completed {
+            case 0:
+                continuation.yield(.toolCall(id: "focus-composer", name: "gui_focusComposerObserve", argumentsJSON: "{}"))
+            case 1:
+                continuation.yield(.toolCall(id: "type-after-focus", name: "gui_type", argumentsJSON: "{\"text\":\"一\"}"))
+            default:
+                continuation.yield(.token("done"))
+            }
+            continuation.yield(.finished)
+            continuation.finish()
+        }
+    }
+}
+
 private struct PrematureMessageTypeOnlyProvider: ProviderStreaming, Sendable {
     func stream(
         configuration: ProviderConfiguration,
@@ -6094,6 +6264,18 @@ private struct SlowCountingExecutor: ToolExecuting, Sendable {
         await counter.increment()
         try await Task.sleep(nanoseconds: 120_000_000)
         return ToolResult(toolCallID: call.id, success: true, summary: "executed")
+    }
+}
+
+private struct FixedPayloadExecutor: ToolExecuting, Sendable {
+    let route: AppExecutionRoute
+    let names: Set<String>
+    let payload: [String: String]
+
+    func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool { names.contains(tool.name) }
+
+    func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
+        ToolResult(toolCallID: call.id, success: true, summary: "executed", payload: payload)
     }
 }
 

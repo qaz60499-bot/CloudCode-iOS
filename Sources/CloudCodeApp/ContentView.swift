@@ -132,6 +132,7 @@ private struct MoreView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(title)
     }
 }
 
@@ -759,42 +760,301 @@ private struct AppsView: View {
 
 private struct FilesView: View {
     @ObservedObject var model: CloudCodeViewModel
+    @State private var searchText = ""
+    @State private var submittedQuery = ""
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                HStack {
-                    TextField("路径", text: $model.browsePath)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.caption.monospaced())
-                    Button("打开") {
-                        do { try model.refreshFiles() } catch { model.lastError = String(describing: error) }
-                    }
+            Group {
+                if model.resourceExplorerMode == .root {
+                    rootCategories
+                } else {
+                    explorerContents
                 }
-                .padding()
-                Divider()
-                List(model.files) { item in
-                    HStack {
-                        Image(systemName: item.isDirectory ? "folder" : "doc")
-                        VStack(alignment: .leading) {
-                            Text(item.name)
-                            Text(ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                    }
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        if item.isDirectory {
-                            model.browsePath = item.path
-                            do { try model.refreshFiles() } catch { model.lastError = String(describing: error) }
+            }
+            .navigationTitle("资源")
+            .toolbar {
+                if model.resourceExplorerCanNavigateUp {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Button {
+                            clearSearch()
+                            Task { await model.navigateResourceExplorerUp() }
+                        } label: {
+                            Label("上一级", systemImage: "chevron.left")
                         }
                     }
                 }
             }
-            .navigationTitle("文件")
+            .sheet(item: $model.resourceExplorerStructuredPreview) { preview in
+                NavigationStack {
+                    List {
+                        Section("结构化资源") {
+                            LabeledContent("类型", value: preview.kind.rawValue.uppercased())
+                            Text(preview.path)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        Section("轻量预览") {
+                            ForEach(Array(preview.lines.enumerated()), id: \.offset) { _, line in
+                                Text(line)
+                                    .font(.caption.monospaced())
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+                    .navigationTitle(preview.title)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("完成") { model.resourceExplorerStructuredPreview = nil }
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    private var rootCategories: some View {
+        List {
+            Section {
+                categoryButton(
+                    title: "应用",
+                    subtitle: "现有 installed-app ResourceNode；展开 App 时才解析当前 Container",
+                    icon: "square.grid.2x2"
+                ) {
+                    clearSearch()
+                    model.openResourceExplorerApplications()
+                }
+
+                categoryButton(
+                    title: "用户文件",
+                    subtitle: "仅在打开后浅层读取 Cloud Code 可访问的用户目录",
+                    icon: "folder"
+                ) {
+                    clearSearch()
+                    Task { await model.openResourceExplorerUserFiles() }
+                }
+
+                Button {
+                    clearSearch()
+                    Task { await model.openResourceExplorerSystem() }
+                } label: {
+                    categoryLabel(
+                        title: "系统",
+                        subtitle: model.resourceExplorerCanBrowseSystem
+                            ? "按需浅层访问；不会在首屏扫描 / 或 /var"
+                            : "filesystem.unrestricted 未验证，当前锁定",
+                        icon: model.resourceExplorerCanBrowseSystem ? "externaldrive" : "lock"
+                    )
+                }
+                .disabled(!model.resourceExplorerCanBrowseSystem)
+
+                categoryLabel(
+                    title: "最近访问",
+                    subtitle: "当前索引没有可靠的用户访问历史源，本轮不伪造",
+                    icon: "clock"
+                )
+                .foregroundStyle(.secondary)
+
+                categoryLabel(
+                    title: "收藏",
+                    subtitle: "当前没有持久化收藏事实源，本轮保持未启用",
+                    icon: "star"
+                )
+                .foregroundStyle(.secondary)
+            } header: {
+                Text("Resource Explorer")
+            } footer: {
+                Text("Explorer 是现有 ResourceNode / ResourceGraph / ProgressiveResourceIndex 的人类入口；Agent 仍直接使用 files/container/plist/json/sqlite 工具。")
+            }
+        }
+    }
+
+    private var explorerContents: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(model.resourceExplorerBreadcrumbText)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+
+                HStack(spacing: 8) {
+                    TextField("在当前范围搜索", text: $searchText)
+                        .textFieldStyle(.roundedBorder)
+                        .submitLabel(.search)
+                        .onSubmit { submitSearch() }
+                    Button {
+                        submitSearch()
+                    } label: {
+                        Image(systemName: "magnifyingglass")
+                    }
+                    .disabled(searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    if !submittedQuery.isEmpty {
+                        Button {
+                            clearSearch()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                    }
+                }
+
+                if let message = model.resourceExplorerStatusMessage, !message.isEmpty {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 10)
+
+            Divider()
+
+            if model.resourceExplorerIsBusy {
+                ProgressView("正在读取当前范围…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(displayedNodes) { node in
+                    Button {
+                        clearSearch()
+                        Task { await model.openResourceExplorerNode(node) }
+                    } label: {
+                        resourceRow(node)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .overlay {
+                    if displayedNodes.isEmpty {
+                        VStack(spacing: 8) {
+                            Image(systemName: submittedQuery.isEmpty ? "folder" : "magnifyingglass")
+                                .font(.title2)
+                                .foregroundStyle(.secondary)
+                            Text(submittedQuery.isEmpty ? "此处没有可显示资源" : "没有搜索结果")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var displayedNodes: [ResourceNode] {
+        submittedQuery.isEmpty ? model.resourceExplorerNodes : model.resourceExplorerSearchResults
+    }
+
+    private func categoryButton(title: String, subtitle: String, icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            categoryLabel(title: title, subtitle: subtitle, icon: icon)
+        }
+    }
+
+    private func categoryLabel(title: String, subtitle: String, icon: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.title3)
+                .frame(width: 30)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.headline)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func resourceRow(_ node: ResourceNode) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon(for: node))
+                .frame(width: 26)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(node.displayName)
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    if node.metadata["explorerAccess"] == "locked" {
+                        Image(systemName: "lock.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let kind = structuredKindLabel(node) {
+                        Text(kind)
+                            .font(.caption2.monospaced())
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(.thinMaterial, in: Capsule())
+                    }
+                }
+                Text(node.logicalLocation)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                HStack(spacing: 8) {
+                    if let size = node.byteSize, node.kind != .directory {
+                        Text(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
+                    }
+                    if let modified = node.metadata["modifiedAt"] {
+                        Text(modified)
+                    }
+                    if let groups = node.metadata["groupCount"] {
+                        Text("\(groups) groups")
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            }
+            Spacer()
+            if node.kind == .directory || node.kind == .container || node.kind == .app {
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .contentShape(Rectangle())
+    }
+
+    private func icon(for node: ResourceNode) -> String {
+        switch node.kind {
+        case .app: return "app"
+        case .container: return "shippingbox"
+        case .directory: return "folder"
+        case .storageCategory: return node.metadata["explorerAccess"] == "metadata_only" ? "externaldrive.badge.questionmark" : "tray.full"
+        default:
+            switch URL(fileURLWithPath: node.resolvedPath ?? node.displayName).pathExtension.lowercased() {
+            case "plist": return "list.bullet.rectangle"
+            case "json": return "curlybraces"
+            case "sqlite", "sqlite3", "db": return "cylinder"
+            default: return "doc"
+            }
+        }
+    }
+
+    private func structuredKindLabel(_ node: ResourceNode) -> String? {
+        switch URL(fileURLWithPath: node.resolvedPath ?? node.displayName).pathExtension.lowercased() {
+        case "plist": return "PLIST"
+        case "json": return "JSON"
+        case "sqlite", "sqlite3", "db": return "SQLITE"
+        default: return nil
+        }
+    }
+
+    private func submitSearch() {
+        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            clearSearch()
+            return
+        }
+        submittedQuery = trimmed
+        Task { await model.searchResourceExplorer(trimmed) }
+    }
+
+    private func clearSearch() {
+        searchText = ""
+        submittedQuery = ""
+        model.clearResourceExplorerSearch()
     }
 }
 

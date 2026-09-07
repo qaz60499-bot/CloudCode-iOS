@@ -258,22 +258,33 @@ enum EmbeddedRootHelper {
         }
 
         // Some third-party apps accept the LaunchServices request but the helper cannot read back
-        // a reliable foreground bundle identifier. That is not the same as a rejected launch: keep
-        // the write as dispatched/unverified so the Agent can immediately obtain a fresh screenshot
-        // instead of turning a visibly opened App into a terminal tool failure.
+        // a reliable foreground bundle identifier. Once LaunchServices explicitly reports that the
+        // write was accepted, do not immediately issue a second root/FrontBoard launch: that is a
+        // duplicate state-changing write and costs several seconds on real devices. Return the
+        // accepted-but-unverified state and let the caller obtain one fresh screenshot as the next
+        // independent observation. Only use the privileged fallback when the isolated route did not
+        // actually report an accepted launch.
         if isolated.code == 46 {
-            let privileged = run(["launch", bundleID], privilege: .root, timeout: 6)
-            if privileged.code == 0 {
-                let route = privileged.diagnostic.isEmpty ? "" : " \(privileged.diagnostic)"
-                return LaunchOutcome(accepted: true, foregroundVerified: true, detail: "隔离 LaunchServices 路径未验证前台后，root helper 通过系统启动路由完成目标 App 前台切换。\(route)")
-            }
             let isolatedDetail = failureDetail(prefix: "隔离 helper 启动 App", code: isolated.code, diagnostic: isolated.diagnostic)
-            let privilegedDetail = failureDetail(prefix: "root helper 启动 App", code: privileged.code, diagnostic: privileged.diagnostic)
-            if acceptedButUnverified(isolated) || acceptedButUnverified(privileged) {
+            if acceptedButUnverified(isolated) {
                 return LaunchOutcome(
                     accepted: true,
                     foregroundVerified: false,
-                    detail: "系统已接受目标 App 启动请求，但 helper 无法可靠读取前台 Bundle ID；启动保持为已派发/待截图验证。\(isolatedDetail)；root fallback：\(privilegedDetail)"
+                    detail: "系统已接受目标 App 启动请求，但 helper 无法可靠读取前台 Bundle ID；已跳过重复 root 启动并等待新鲜截图验证。\(isolatedDetail)"
+                )
+            }
+
+            let privileged = run(["launch", bundleID], privilege: .root, timeout: 6)
+            if privileged.code == 0 {
+                let route = privileged.diagnostic.isEmpty ? "" : " \(privileged.diagnostic)"
+                return LaunchOutcome(accepted: true, foregroundVerified: true, detail: "隔离 LaunchServices 路径未接受启动后，root helper 通过系统启动路由完成目标 App 前台切换。\(route)")
+            }
+            let privilegedDetail = failureDetail(prefix: "root helper 启动 App", code: privileged.code, diagnostic: privileged.diagnostic)
+            if acceptedButUnverified(privileged) {
+                return LaunchOutcome(
+                    accepted: true,
+                    foregroundVerified: false,
+                    detail: "root 系统启动请求已被接受，但前台 Bundle ID 仍无法可靠读取；等待截图验证。\(privilegedDetail)"
                 )
             }
             return LaunchOutcome(accepted: false, foregroundVerified: false, detail: "\(isolatedDetail)；root fallback 同样失败：\(privilegedDetail)")
@@ -1627,12 +1638,16 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             }
         case "gui.tree", "gui.screenshot":
             break
-        case "gui.findElement", "gui.waitForElement", "gui.tapElementObserve", "gui.typeElementObserve":
+        case "gui.focusComposerObserve":
+            guard Self.requestLooksLikeMessaging(context.currentUserRequest) else {
+                throw ToolRouterError.noExecutionRoute("focusComposerObserve is available only for an explicit messaging/chat request")
+            }
+        case "gui.findElement", "gui.waitForElement", "gui.tapElementObserve", "gui.typeElementObserve", "gui.tapTextObserve":
             guard let query = call.arguments["query"]?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !query.isEmpty, query.utf8.count <= 512 else {
                 throw ToolRouterError.noExecutionRoute("element query missing, empty, or exceeds 512 bytes")
             }
-            if let role = call.arguments["role"], role.utf8.count > 128 {
+            if call.name != "gui.tapTextObserve", let role = call.arguments["role"], role.utf8.count > 128 {
                 throw ToolRouterError.noExecutionRoute("element role exceeds 128 bytes")
             }
             if let match = call.arguments["match"], GUIElementMatchMode(rawValue: match) == nil {
@@ -1755,10 +1770,16 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.openAppObserve":
             guard let bundle = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
             let reusedForeground = call.arguments["_reuseVerifiedForeground"] == "true"
-            let outcome = reusedForeground
-                ? GUIOpenAppOutcome(accepted: true, foregroundVerified: true, detail: "current verified foreground reused")
-                : try await backend.openApp(bundleID: bundle)
-            if !reusedForeground {
+            let reusedAcceptedLaunch = call.arguments["_reuseAcceptedLaunch"] == "true"
+            let outcome: GUIOpenAppOutcome
+            if reusedForeground {
+                outcome = GUIOpenAppOutcome(accepted: true, foregroundVerified: true, detail: "current verified foreground reused")
+            } else if reusedAcceptedLaunch {
+                outcome = GUIOpenAppOutcome(accepted: true, foregroundVerified: false, detail: "prior accepted launch reused for fresh observation")
+            } else {
+                outcome = try await backend.openApp(bundleID: bundle)
+            }
+            if !reusedForeground && !reusedAcceptedLaunch {
                 try await Task.sleep(nanoseconds: 200_000_000)
             }
             try Task.checkCancellation()
@@ -1832,6 +1853,99 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 toolCallID: call.id,
                 success: true,
                 summary: "Unique accessibility element tapped locally; final screenshot attached for semantic verification.",
+                payload: payload,
+                attachments: attachment.map { [$0] }
+            )
+        case "gui.tapTextObserve":
+            let baseline = try await backend.screenshot()
+            let baselineSHA256 = GUIAutomationPayloadPolicy.sha256Hex(baseline)
+            let resolved = try await resolveLocalVisionText(call, screenshot: baseline)
+            guard !Self.isProtectedLocalVisionText(resolved.text) else {
+                throw ToolRouterError.noExecutionRoute("protected/system-confirmation OCR text cannot be automated")
+            }
+            try await backend.tap(x: resolved.centerX, y: resolved.centerY)
+            try await Task.sleep(nanoseconds: 250_000_000)
+            try Task.checkCancellation()
+            let data = try await backend.screenshot()
+            let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
+            var payload: [String: String] = [
+                "matchedText": String(resolved.text.prefix(256)),
+                "matchedConfidence": String(resolved.confidence),
+                "x": String(resolved.x),
+                "y": String(resolved.y),
+                "width": String(resolved.width),
+                "height": String(resolved.height),
+                "centerX": String(resolved.centerX),
+                "centerY": String(resolved.centerY),
+                "baselineSHA256": baselineSHA256,
+                "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
+                "effectVerification": "semantic_required",
+                "localObservation": "final_screenshot_attached",
+                "perceptionClass": "local_ocr_text_action",
+                "perceptionAXAttempted": "false",
+                "perceptionAXSucceeded": "false",
+                "perceptionAnchorCacheHit": "false",
+                "perceptionFallbackReason": "fresh_local_ocr_unique_text_match"
+            ]
+            await enrichWithLocalVision(&payload, screenshot: data)
+            return ToolResult(
+                toolCallID: call.id,
+                success: true,
+                summary: "Unique visible OCR text was resolved and tapped locally; final screenshot attached for semantic verification.",
+                payload: payload,
+                attachments: attachment.map { [$0] }
+            )
+        case "gui.focusComposerObserve":
+            let baseline = try await backend.screenshot()
+            guard let image = UIImage(data: baseline), image.size.width >= 100, image.size.height >= 200 else {
+                throw ToolRouterError.noExecutionRoute("composer focus could not determine a valid current screen size")
+            }
+            let baselineSHA256 = GUIAutomationPayloadPolicy.sha256Hex(baseline)
+            // The Provider never chooses this coordinate. This semantic micro-action owns one
+            // conservative bottom-center candidate and verifies keyboard evidence before raw typing
+            // is allowed. Side icons (voice/emoji/add) stay outside the center candidate.
+            let focusX = Double(image.size.width * 0.50)
+            let focusY = Double(image.size.height * 0.92)
+            try await backend.tap(x: focusX, y: focusY)
+            try await Task.sleep(nanoseconds: 350_000_000)
+            try Task.checkCancellation()
+            let data = try await backend.screenshot()
+            let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
+            let observation = await LocalVisionTextObservation.observe(for: data, maximumElements: 48)
+            let screenHeight = Double(observation.payload["screenPointHeight"] ?? "") ?? Double(image.size.height)
+            let keyboardLikely = LocalKeyboardHeuristic.isLikelyVisible(elements: observation.elements, screenHeight: screenHeight)
+            var payload: [String: String] = [
+                "baselineSHA256": baselineSHA256,
+                "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
+                "focusStrategy": "bounded_bottom_center_composer_candidate",
+                "focusX": String(focusX),
+                "focusY": String(focusY),
+                "keyboardLikely": keyboardLikely ? "true" : "false",
+                "effectVerification": keyboardLikely ? "local_keyboard_heuristic_passed" : "semantic_required",
+                "localObservation": "final_screenshot_attached",
+                "perceptionClass": "semantic_composer_focus",
+                "perceptionAXAttempted": "false",
+                "perceptionAXSucceeded": "false",
+                "perceptionAnchorCacheHit": "false"
+            ]
+            enrichWithLocalVision(&payload, observation: observation)
+            if keyboardLikely {
+                payload["perceptionLocalSufficient"] = "true"
+                payload["perceptionRemoteVisionRequired"] = "false"
+                payload["perceptionFallbackReason"] = "local_keyboard_heuristic_verified_composer_focus"
+                payload["providerVisualRoundTripAvoided"] = "1"
+            } else {
+                payload["perceptionLocalSufficient"] = "false"
+                payload["perceptionRemoteVisionRequired"] = "true"
+                payload["perceptionFallbackReason"] = "composer_focus_keyboard_not_locally_verified"
+                payload["providerVisualRoundTripAvoided"] = "0"
+            }
+            return ToolResult(
+                toolCallID: call.id,
+                success: keyboardLikely,
+                summary: keyboardLikely
+                    ? "Chat composer focus was locally verified by keyboard-like OCR evidence."
+                    : "Composer candidate was tapped, but local keyboard evidence was insufficient; raw typing remains blocked until focus is verified.",
                 payload: payload,
                 attachments: attachment.map { [$0] }
             )
@@ -2492,6 +2606,35 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         throw lastError ?? ToolRouterError.noExecutionRoute("structured element did not appear before timeout")
     }
 
+    private func resolveLocalVisionText(_ call: ToolCall, screenshot: Data) async throws -> LocalPerceptionTextElement {
+        let query = (call.arguments["query"] ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        let mode = GUIElementMatchMode(rawValue: call.arguments["match"] ?? "exact") ?? .exact
+        let observation = await LocalVisionTextObservation.observe(for: screenshot, maximumElements: 40)
+        guard observation.payload["localVisionOCR"] == "recognized" else {
+            let status = observation.payload["localVisionOCR"] ?? "unavailable"
+            throw ToolRouterError.noExecutionRoute("local OCR text lookup unavailable: \(status)")
+        }
+        let matches = observation.elements.filter { element in
+            guard element.confidence >= 0.12, element.width > 0, element.height > 0 else { return false }
+            let candidate = element.text
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            switch mode {
+            case .exact: return candidate == query
+            case .contains: return candidate.contains(query)
+            }
+        }
+        guard matches.count == 1 else {
+            if matches.isEmpty {
+                throw ToolRouterError.noExecutionRoute("local OCR text query returned no unique visible match")
+            }
+            throw ToolRouterError.noExecutionRoute("local OCR text query is ambiguous (\(matches.count) matches); refine the query instead of guessing coordinates")
+        }
+        return matches[0]
+    }
+
     private func elementPayload(_ match: GUIElementMatch, treeHash: String, cacheHit: Bool) -> [String: String] {
         var payload: [String: String] = [
             "path": match.path,
@@ -2523,7 +2666,11 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
     }
 
     private static func isProtectedElement(_ match: GUIElementMatch) -> Bool {
-        let haystack = match.searchableText.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        isProtectedLocalVisionText(match.searchableText)
+    }
+
+    private static func isProtectedLocalVisionText(_ text: String) -> Bool {
+        let haystack = text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
         let protectedMarkers = [
             "face id", "touch id", "apple pay", "passcode", "password confirmation", "security code",
             "允许", "不允许", "系统权限", "密码确认", "支付确认", "面容 id", "触控 id"
@@ -2541,7 +2688,12 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
     }
 
     private func enrichWithLocalVision(_ payload: inout [String: String], screenshot: Data) async {
-        let local = await LocalVisionTextObservation.payload(for: screenshot)
+        let observation = await LocalVisionTextObservation.observe(for: screenshot)
+        enrichWithLocalVision(&payload, observation: observation)
+    }
+
+    private func enrichWithLocalVision(_ payload: inout [String: String], observation: LocalVisionTextObservation.Observation) {
+        let local = observation.payload
         for (key, value) in local {
             payload[key] = value
         }
@@ -2581,6 +2733,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.openAppObserve": return [.openApp, .screenshot]
         case "gui.tree", "gui.findElement", "gui.waitForElement": return [.tree]
         case "gui.tapElementObserve": return [.tree, .touch, .screenshot]
+        case "gui.tapTextObserve", "gui.focusComposerObserve": return [.screenshot, .touch]
         case "gui.typeElementObserve": return [.tree, .touch, .textInput, .screenshot]
         case "gui.runStructuredPlan": return [.openApp, .tree, .screenshot, .touch, .textInput, .gestures]
         case "gui.screenshot": return [.screenshot]
@@ -2593,6 +2746,12 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.verify": return [.verify]
         default: return nil
         }
+    }
+
+    private static func requestLooksLikeMessaging(_ value: String) -> Bool {
+        let normalized = value.lowercased()
+        let markers = ["微信", "wechat", "聊天", "消息", "文件传输助手", "发给", "发送", "回复", "message", "chat", "reply", "send"]
+        return markers.contains(where: normalized.contains)
     }
 
     private static func isValidBundleIdentifier(_ value: String) -> Bool {

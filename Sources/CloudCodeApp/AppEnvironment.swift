@@ -25,6 +25,37 @@ private struct ProviderLiveMetadataRefreshResult {
     var usable: Bool { state == .verified }
 }
 
+public enum ResourceExplorerMode: Equatable, Sendable {
+    case root
+    case applications
+    case application(bundleID: String)
+    case appBundle(bundleID: String, relativePath: String)
+    case userFiles(path: String)
+    case system(path: String)
+    case container(bundleID: String, relativePath: String)
+}
+
+public enum ResourceExplorerStructuredKind: String, Sendable {
+    case plist
+    case json
+    case sqlite
+}
+
+public struct ResourceExplorerStructuredPreview: Identifiable, Equatable, Sendable {
+    public var id: String { path }
+    public var path: String
+    public var title: String
+    public var kind: ResourceExplorerStructuredKind
+    public var lines: [String]
+
+    public init(path: String, title: String, kind: ResourceExplorerStructuredKind, lines: [String]) {
+        self.path = path
+        self.title = title
+        self.kind = kind
+        self.lines = lines
+    }
+}
+
 @MainActor
 public final class CloudCodeViewModel: ObservableObject {
     @Published public var session: AgentSession
@@ -35,6 +66,12 @@ public final class CloudCodeViewModel: ObservableObject {
     @Published public var capabilityGraph = CapabilityGraph()
     @Published public var apps: [ResourceNode] = []
     @Published public var files: [FileEntry] = []
+    @Published public private(set) var resourceExplorerMode: ResourceExplorerMode = .root
+    @Published public private(set) var resourceExplorerNodes: [ResourceNode] = []
+    @Published public private(set) var resourceExplorerSearchResults: [ResourceNode] = []
+    @Published public private(set) var resourceExplorerStatusMessage: String?
+    @Published public private(set) var resourceExplorerIsBusy = false
+    @Published public var resourceExplorerStructuredPreview: ResourceExplorerStructuredPreview?
     @Published public var trash: [TrashRecord] = []
     @Published public var auditEvents: [AuditEvent] = []
     @Published public var interruptedTasks: [TaskCheckpoint] = []
@@ -69,10 +106,14 @@ public final class CloudCodeViewModel: ObservableObject {
     public let approvalCenter: ApprovalCenter
 
     private let appResolver: IOSAppResolver
+    private let resourceResolver: ResourceResolver
     private let capabilityProbe: CapabilityProbe
     private let toolRegistry: ToolRegistry
     private let toolRouter: ToolRouter
     private let fileService: FileService
+    private let propertyListService = NativePropertyListService()
+    private let jsonService = NativeJSONService()
+    private let sqliteService = NativeSQLiteService()
     private let trashService: TrashService
     private let policyEngine: PolicyEngine
     private let auditStore: AuditLogStore
@@ -264,6 +305,7 @@ public final class CloudCodeViewModel: ObservableObject {
         )
         self.approvalCenter = approval
         self.appResolver = resolver
+        self.resourceResolver = resourceResolver
         self.capabilityProbe = probe
         self.toolRegistry = registry
         self.toolRouter = router
@@ -388,7 +430,12 @@ public final class CloudCodeViewModel: ObservableObject {
                     )
                 }
                 try await restoreSessionState()
-                try refreshFiles()
+                // Resource Explorer starts from virtual/lightweight categories. Do not enumerate
+                // even the sandbox home directory until the user explicitly opens User Files.
+                files = []
+                resourceExplorerMode = .root
+                resourceExplorerNodes = []
+                resourceExplorerSearchResults = []
                 if bundledPrivateBootstrapAvailable {
                     activityLines.append("检测到私有 Key 配置。为保证 TrollStore 真机启动稳定，启动阶段不会自动读取、写入或迁移 Provider Keychain；需要导入时请到“设置 → Key 管理”显式执行。")
                 }
@@ -1652,6 +1699,764 @@ public final class CloudCodeViewModel: ObservableObject {
         let root = URL(fileURLWithPath: browsePath, isDirectory: true)
         let allowed = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
         files = try fileService.list(directory: root, allowedRoot: allowed)
+    }
+
+    public var resourceExplorerCanBrowseSystem: Bool {
+        capabilities.isAvailable("filesystem.unrestricted")
+    }
+
+    public var resourceExplorerCanNavigateUp: Bool {
+        resourceExplorerMode != .root
+    }
+
+    public var resourceExplorerBreadcrumbText: String {
+        switch resourceExplorerMode {
+        case .root:
+            return "资源"
+        case .applications:
+            return "资源 / 应用"
+        case .application(let bundleID):
+            return "资源 / 应用 / \(bundleID)"
+        case .appBundle(let bundleID, let relativePath):
+            return relativePath.isEmpty
+                ? "资源 / 应用 / \(bundleID) / App Bundle"
+                : "资源 / 应用 / \(bundleID) / App Bundle / \(relativePath)"
+        case .userFiles(let path):
+            return "资源 / 用户文件 / \(path)"
+        case .system(let path):
+            return "资源 / 系统 / \(path)"
+        case .container(let bundleID, let relativePath):
+            return relativePath.isEmpty
+                ? "资源 / 应用 / \(bundleID) / Data Container"
+                : "资源 / 应用 / \(bundleID) / Data Container / \(relativePath)"
+        }
+    }
+
+    public func openResourceExplorerRoot() {
+        resourceExplorerMode = .root
+        resourceExplorerNodes = []
+        resourceExplorerSearchResults = []
+        resourceExplorerStatusMessage = nil
+        resourceExplorerStructuredPreview = nil
+    }
+
+    public func clearResourceExplorerSearch() {
+        resourceExplorerSearchResults = []
+    }
+
+    public func openResourceExplorerApplications() {
+        resourceExplorerMode = .applications
+        resourceExplorerNodes = apps.sorted {
+            $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+        resourceExplorerSearchResults = []
+        resourceExplorerStatusMessage = apps.isEmpty ? "当前没有可用的应用索引。" : "应用列表来自现有 lightweight installed-app ResourceNode；未扫描任何 App Container。"
+        resourceExplorerStructuredPreview = nil
+    }
+
+    public func openResourceExplorerUserFiles(path: String? = nil) async {
+        let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).standardizedFileURL
+        let requested = URL(fileURLWithPath: path ?? home.path, isDirectory: true).standardizedFileURL
+        await loadResourceExplorerDirectory(
+            directory: requested,
+            allowedRoot: home,
+            mode: .userFiles(path: requested.path),
+            ownerBundleID: nil,
+            relativeMetadataKey: nil
+        )
+    }
+
+    public func openResourceExplorerSystem(path: String = "/") async {
+        guard resourceExplorerCanBrowseSystem else {
+            resourceExplorerMode = .system(path: path)
+            resourceExplorerNodes = []
+            resourceExplorerSearchResults = []
+            resourceExplorerStatusMessage = "系统资源当前不可访问：filesystem.unrestricted 尚未被真实验证。"
+            return
+        }
+        let requested = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+        if requested.path == "/" {
+            // PathGuard intentionally rejects `/` as an operation target. Keep that protection and
+            // present a tiny virtual system root instead of weakening the filesystem safety layer or
+            // enumerating the whole device. Existence/readability checks do not traverse contents.
+            resourceExplorerMode = .system(path: "/")
+            resourceExplorerSearchResults = []
+            resourceExplorerStructuredPreview = nil
+            let fileManager = FileManager.default
+            let candidates: [(String, String)] = [
+                ("Mobile Data", "/private/var/mobile"),
+                ("App Containers", "/private/var/containers"),
+                ("System", "/System"),
+                ("Library", "/Library"),
+                ("Applications", "/Applications")
+            ]
+            resourceExplorerNodes = candidates.compactMap { displayName, rawPath in
+                var isDirectory: ObjCBool = false
+                guard fileManager.fileExists(atPath: rawPath, isDirectory: &isDirectory),
+                      isDirectory.boolValue,
+                      fileManager.isReadableFile(atPath: rawPath) else { return nil }
+                let url = URL(fileURLWithPath: rawPath, isDirectory: true).standardizedFileURL
+                return ResourceNode(
+                    id: ResourceID(url.absoluteString),
+                    kind: .directory,
+                    displayName: displayName,
+                    logicalLocation: url.absoluteString,
+                    resolvedPath: url.path,
+                    byteSize: nil,
+                    metadata: ["explorerRole": "systemVirtualRoot"]
+                )
+            }
+            resourceExplorerStatusMessage = resourceExplorerNodes.isEmpty
+                ? "unrestricted 已验证，但当前 App 进程没有发现可直接读取的预定义系统区域。"
+                : "系统首层是虚拟根：只检查少量已知区域是否存在/可读，不枚举 / 或 /var。"
+            return
+        }
+        await loadResourceExplorerDirectory(
+            directory: requested,
+            allowedRoot: nil,
+            mode: .system(path: requested.path),
+            ownerBundleID: nil,
+            relativeMetadataKey: nil
+        )
+    }
+
+    public func openResourceExplorerApplication(bundleID: String) async {
+        guard !bundleID.isEmpty else { return }
+        resourceExplorerIsBusy = true
+        resourceExplorerSearchResults = []
+        resourceExplorerStructuredPreview = nil
+        defer { resourceExplorerIsBusy = false }
+
+        do {
+            var nodes: [ResourceNode] = []
+            let canBrowsePrivilegedFiles = resourceExplorerCanBrowseSystem
+
+            var bundleNode: ResourceNode
+            var containerNode: ResourceNode
+            if canBrowsePrivilegedFiles {
+                bundleNode = try await resourceResolver.resolve(ResourceID("app://\(bundleID)"))
+                // In the Explorer this node means the App bundle directory, not "open App details".
+                bundleNode.kind = .directory
+                containerNode = try await resourceResolver.resolve(containerResourceID(bundleID: bundleID, relativePath: nil))
+                try? await resourceIndex.add(containerNode, source: "resource_explorer_container_root")
+            } else {
+                // Capability display is not capability acquisition. Keep locked entries purely logical:
+                // do not call the cross-App resolver and do not expose a cached UUID path.
+                bundleNode = ResourceNode(
+                    id: ResourceID("app://\(bundleID)"),
+                    kind: .directory,
+                    displayName: "App Bundle",
+                    logicalLocation: "app://\(bundleID)",
+                    ownerBundleID: bundleID
+                )
+                containerNode = ResourceNode(
+                    id: containerResourceID(bundleID: bundleID, relativePath: nil),
+                    kind: .container,
+                    displayName: "Data Container",
+                    logicalLocation: "container://\(bundleID)",
+                    ownerBundleID: bundleID
+                )
+            }
+            bundleNode.displayName = "App Bundle"
+            bundleNode.metadata["explorerRole"] = "appBundle"
+            bundleNode.metadata["explorerAccess"] = canBrowsePrivilegedFiles ? "available" : "locked"
+            nodes.append(bundleNode)
+
+            containerNode.displayName = "Data Container"
+            containerNode.metadata["explorerRole"] = "dataContainer"
+            containerNode.metadata["explorerAccess"] = canBrowsePrivilegedFiles ? "available" : "locked"
+            nodes.append(containerNode)
+
+            if canBrowsePrivilegedFiles,
+               let rootPath = containerNode.resolvedPath {
+                let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
+                let semanticDirectories: [(String, String)] = [
+                    ("Documents", "Documents"),
+                    ("Library", "Library"),
+                    ("Preferences", "Library/Preferences")
+                ]
+                let fileService = self.fileService
+                for (displayName, relativePath) in semanticDirectories {
+                    let candidateURL = rootURL.appendingPathComponent(relativePath).standardizedFileURL
+                    let metadata = try? await Task.detached(priority: .userInitiated) {
+                        try fileService.stat(candidateURL, allowedRoot: rootURL)
+                    }.value
+                    guard let metadata, metadata.isDirectory else { continue }
+                    let logicalID = containerResourceID(bundleID: bundleID, relativePath: relativePath)
+                    var semanticNode = ResourceNode(
+                        id: logicalID,
+                        kind: .directory,
+                        displayName: displayName,
+                        logicalLocation: logicalID.rawValue,
+                        resolvedPath: metadata.path,
+                        ownerBundleID: bundleID,
+                        byteSize: nil,
+                        metadata: [:]
+                    )
+                    semanticNode.metadata["explorerRole"] = "semanticContainerDirectory"
+                    semanticNode.metadata["containerRelativePath"] = relativePath
+                    if let date = metadata.modificationDate {
+                        semanticNode.metadata["modifiedAt"] = ISO8601DateFormatter().string(from: date)
+                    }
+                    nodes.append(semanticNode)
+                }
+            }
+
+            if let knowledge = await appKnowledge.knowledge(for: bundleID),
+               let appGroups = knowledge.introspectionMetadata?["appGroups"],
+               !appGroups.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let groupCount = appGroups.split(separator: ",").count
+                nodes.append(ResourceNode(
+                    id: ResourceID("appdata://\(bundleID)/app-groups"),
+                    kind: .storageCategory,
+                    displayName: "App Groups",
+                    logicalLocation: "appdata://\(bundleID)/app-groups",
+                    ownerBundleID: bundleID,
+                    metadata: [
+                        "explorerRole": "appGroupsMetadata",
+                        "explorerAccess": "metadata_only",
+                        "groupCount": String(groupCount)
+                    ]
+                ))
+            }
+
+            if canBrowsePrivilegedFiles {
+                let snapshot = await resourceIndex.snapshot()
+                let discovered = snapshot.nodes.filter { node in
+                    guard node.ownerBundleID == bundleID, let path = node.resolvedPath else { return false }
+                    return Self.resourceExplorerStructuredKind(for: URL(fileURLWithPath: path)) != nil
+                }.prefix(16)
+                for var node in discovered {
+                    node.metadata["explorerRole"] = "discoveredStructured"
+                    nodes.append(node)
+                }
+            }
+
+            var unique: [ResourceID: ResourceNode] = [:]
+            for node in nodes { unique[node.id] = node }
+            resourceExplorerMode = .application(bundleID: bundleID)
+            resourceExplorerNodes = unique.values.sorted(by: Self.resourceExplorerNodeSort)
+            resourceExplorerStatusMessage = canBrowsePrivilegedFiles
+                ? "App 资源已按需解析；Container UUID 来自当前 resolver，没有持久化执行旧路径。"
+                : "已显示 App 资源入口；文件系统未验证 unrestricted，Bundle/Container 内容保持锁定。"
+        } catch {
+            resourceExplorerMode = .application(bundleID: bundleID)
+            resourceExplorerNodes = []
+            resourceExplorerStatusMessage = "App 资源解析失败：\(error)"
+            lastError = resourceExplorerStatusMessage
+        }
+    }
+
+    public func openResourceExplorerNode(_ node: ResourceNode) async {
+        if node.kind == .app, let bundleID = node.ownerBundleID {
+            await openResourceExplorerApplication(bundleID: bundleID)
+            return
+        }
+        if node.kind == .storageCategory {
+            resourceExplorerStatusMessage = node.metadata["explorerAccess"] == "metadata_only"
+                ? "此项目前只有可靠 introspection 元数据，没有可安全解析的当前真实路径。"
+                : "此资源当前不可直接打开。"
+            return
+        }
+
+        if node.kind == .directory || node.kind == .container {
+            switch resourceExplorerMode {
+            case .application(let bundleID):
+                switch node.metadata["explorerRole"] {
+                case "appBundle":
+                    guard resourceExplorerCanBrowseSystem else {
+                        resourceExplorerStatusMessage = "App Bundle 内容当前锁定：filesystem.unrestricted 尚未验证。"
+                        return
+                    }
+                    await openResourceExplorerAppBundle(bundleID: bundleID, relativePath: "")
+                case "dataContainer":
+                    await openResourceExplorerContainer(bundleID: bundleID, relativePath: "")
+                case "semanticContainerDirectory":
+                    await openResourceExplorerContainer(bundleID: bundleID, relativePath: node.metadata["containerRelativePath"] ?? "")
+                default:
+                    resourceExplorerStatusMessage = "目录缺少当前可验证的语义位置。"
+                }
+            case .container(let bundleID, _):
+                guard let relativePath = node.metadata["containerRelativePath"] else {
+                    resourceExplorerStatusMessage = "Container 子目录缺少当前相对路径；已拒绝使用缓存绝对 UUID 路径。"
+                    return
+                }
+                await openResourceExplorerContainer(bundleID: bundleID, relativePath: relativePath)
+            case .appBundle(let bundleID, _):
+                guard let relativePath = node.metadata["appBundleRelativePath"] else {
+                    resourceExplorerStatusMessage = "App Bundle 子目录缺少当前相对路径；已拒绝使用缓存绝对路径。"
+                    return
+                }
+                await openResourceExplorerAppBundle(bundleID: bundleID, relativePath: relativePath)
+            case .userFiles:
+                if let path = node.resolvedPath { await openResourceExplorerUserFiles(path: path) }
+            case .system:
+                if let path = node.resolvedPath { await openResourceExplorerSystem(path: path) }
+            default:
+                break
+            }
+            return
+        }
+
+        await openResourceExplorerStructuredPreview(node)
+    }
+
+    public func openResourceExplorerContainer(bundleID: String, relativePath: String) async {
+        guard resourceExplorerCanBrowseSystem else {
+            resourceExplorerStatusMessage = "Data Container 内容当前锁定：filesystem.unrestricted 尚未被真实验证。"
+            return
+        }
+        resourceExplorerIsBusy = true
+        resourceExplorerSearchResults = []
+        resourceExplorerStructuredPreview = nil
+        defer { resourceExplorerIsBusy = false }
+        do {
+            let rootNode = try await resourceResolver.resolve(containerResourceID(bundleID: bundleID, relativePath: nil))
+            guard let rootPath = rootNode.resolvedPath else {
+                throw ResourceResolverError.containerUnavailable(bundleID)
+            }
+            try? await resourceIndex.add(rootNode, source: "resource_explorer_container_root")
+            let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
+            let relative = Self.normalizedRelativePath(relativePath)
+            let targetURL = relative.isEmpty ? rootURL : rootURL.appendingPathComponent(relative).standardizedFileURL
+            _ = try PathGuard().validate(target: targetURL, allowedRoot: rootURL, rejectSymlink: true)
+            await loadResourceExplorerDirectory(
+                directory: targetURL,
+                allowedRoot: rootURL,
+                mode: .container(bundleID: bundleID, relativePath: relative),
+                ownerBundleID: bundleID,
+                relativeMetadataKey: "containerRelativePath"
+            )
+        } catch {
+            resourceExplorerStatusMessage = "Container 打开失败：\(error)"
+            lastError = resourceExplorerStatusMessage
+        }
+    }
+
+    public func openResourceExplorerAppBundle(bundleID: String, relativePath: String) async {
+        guard resourceExplorerCanBrowseSystem else {
+            resourceExplorerStatusMessage = "App Bundle 内容当前锁定：filesystem.unrestricted 尚未被真实验证。"
+            return
+        }
+        resourceExplorerIsBusy = true
+        resourceExplorerSearchResults = []
+        resourceExplorerStructuredPreview = nil
+        defer { resourceExplorerIsBusy = false }
+        do {
+            let rootNode = try await resourceResolver.resolve(ResourceID("app://\(bundleID)"))
+            guard let rootPath = rootNode.resolvedPath else { throw ResourceResolverError.appUnavailable(bundleID) }
+            let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
+            let relative = Self.normalizedRelativePath(relativePath)
+            let targetURL = relative.isEmpty ? rootURL : rootURL.appendingPathComponent(relative).standardizedFileURL
+            await loadResourceExplorerDirectory(
+                directory: targetURL,
+                allowedRoot: rootURL,
+                mode: .appBundle(bundleID: bundleID, relativePath: relative),
+                ownerBundleID: nil,
+                relativeMetadataKey: "appBundleRelativePath"
+            )
+        } catch {
+            resourceExplorerStatusMessage = "App Bundle 打开失败：\(error)"
+            lastError = resourceExplorerStatusMessage
+        }
+    }
+
+    public func navigateResourceExplorerUp() async {
+        switch resourceExplorerMode {
+        case .root:
+            break
+        case .applications:
+            openResourceExplorerRoot()
+        case .application:
+            openResourceExplorerApplications()
+        case .container(let bundleID, let relativePath):
+            let parent = Self.parentRelativePath(relativePath)
+            if relativePath.isEmpty {
+                await openResourceExplorerApplication(bundleID: bundleID)
+            } else {
+                await openResourceExplorerContainer(bundleID: bundleID, relativePath: parent)
+            }
+        case .appBundle(let bundleID, let relativePath):
+            let parent = Self.parentRelativePath(relativePath)
+            if relativePath.isEmpty {
+                await openResourceExplorerApplication(bundleID: bundleID)
+            } else {
+                await openResourceExplorerAppBundle(bundleID: bundleID, relativePath: parent)
+            }
+        case .userFiles(let path):
+            let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).standardizedFileURL
+            let current = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+            if current.path == home.path {
+                openResourceExplorerRoot()
+            } else {
+                await openResourceExplorerUserFiles(path: current.deletingLastPathComponent().path)
+            }
+        case .system(let path):
+            let current = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+            if current.path == "/" {
+                openResourceExplorerRoot()
+            } else {
+                await openResourceExplorerSystem(path: current.deletingLastPathComponent().path)
+            }
+        }
+    }
+
+    public func searchResourceExplorer(_ query: String) async {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else {
+            resourceExplorerSearchResults = []
+            resourceExplorerStatusMessage = nil
+            return
+        }
+
+        if case .applications = resourceExplorerMode {
+            resourceExplorerSearchResults = resourceExplorerNodes.filter { node in
+                node.displayName.localizedCaseInsensitiveContains(needle)
+                    || (node.ownerBundleID?.localizedCaseInsensitiveContains(needle) == true)
+            }
+            resourceExplorerStatusMessage = "应用索引本地匹配 \(resourceExplorerSearchResults.count) 项；未访问文件系统。"
+            return
+        }
+
+        resourceExplorerIsBusy = true
+        defer { resourceExplorerIsBusy = false }
+        do {
+            switch resourceExplorerMode {
+            case .application(let bundleID):
+                guard resourceExplorerCanBrowseSystem else {
+                    resourceExplorerSearchResults = []
+                    resourceExplorerStatusMessage = "当前未验证 unrestricted 文件系统能力，不能搜索其他 App Container。"
+                    return
+                }
+                let rootNode = try await resourceResolver.resolve(containerResourceID(bundleID: bundleID, relativePath: nil))
+                guard let rootPath = rootNode.resolvedPath else { throw ResourceResolverError.containerUnavailable(bundleID) }
+                try? await resourceIndex.add(rootNode, source: "resource_explorer_container_root")
+                let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
+                try await performResourceExplorerSearch(
+                    query: needle,
+                    searchRoot: rootURL,
+                    allowedRoot: rootURL,
+                    ownerBundleID: bundleID,
+                    relativeMetadataKey: "containerRelativePath"
+                )
+            case .container(let bundleID, let relativePath):
+                let rootNode = try await resourceResolver.resolve(containerResourceID(bundleID: bundleID, relativePath: nil))
+                guard let rootPath = rootNode.resolvedPath else { throw ResourceResolverError.containerUnavailable(bundleID) }
+                try? await resourceIndex.add(rootNode, source: "resource_explorer_container_root")
+                let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
+                let relative = Self.normalizedRelativePath(relativePath)
+                let targetURL = relative.isEmpty ? rootURL : rootURL.appendingPathComponent(relative).standardizedFileURL
+                _ = try PathGuard().validate(target: targetURL, allowedRoot: rootURL, rejectSymlink: true)
+                try await performResourceExplorerSearch(
+                    query: needle,
+                    searchRoot: targetURL,
+                    allowedRoot: rootURL,
+                    ownerBundleID: bundleID,
+                    relativeMetadataKey: "containerRelativePath"
+                )
+            case .appBundle(let bundleID, let relativePath):
+                let rootNode = try await resourceResolver.resolve(ResourceID("app://\(bundleID)"))
+                guard let rootPath = rootNode.resolvedPath else { throw ResourceResolverError.appUnavailable(bundleID) }
+                let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
+                let relative = Self.normalizedRelativePath(relativePath)
+                let target = relative.isEmpty ? rootURL : rootURL.appendingPathComponent(relative).standardizedFileURL
+                try await performResourceExplorerSearch(
+                    query: needle,
+                    searchRoot: target,
+                    allowedRoot: rootURL,
+                    ownerBundleID: nil,
+                    relativeMetadataKey: "appBundleRelativePath"
+                )
+            case .userFiles(let path):
+                let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).standardizedFileURL
+                try await performResourceExplorerSearch(
+                    query: needle,
+                    searchRoot: URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL,
+                    allowedRoot: home,
+                    ownerBundleID: nil,
+                    relativeMetadataKey: nil
+                )
+            case .system(let path):
+                guard resourceExplorerCanBrowseSystem else {
+                    resourceExplorerSearchResults = []
+                    resourceExplorerStatusMessage = "系统搜索已锁定：filesystem.unrestricted 尚未验证。"
+                    return
+                }
+                try await performResourceExplorerSearch(
+                    query: needle,
+                    searchRoot: URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL,
+                    allowedRoot: nil,
+                    ownerBundleID: nil,
+                    relativeMetadataKey: nil,
+                    allowFallbackScan: path != "/"
+                )
+            case .root, .applications:
+                resourceExplorerSearchResults = []
+            }
+        } catch {
+            resourceExplorerSearchResults = []
+            resourceExplorerStatusMessage = "资源搜索失败：\(error)"
+            lastError = resourceExplorerStatusMessage
+        }
+    }
+
+    private func loadResourceExplorerDirectory(
+        directory: URL,
+        allowedRoot: URL?,
+        mode: ResourceExplorerMode,
+        ownerBundleID: String?,
+        relativeMetadataKey: String?
+    ) async {
+        resourceExplorerIsBusy = true
+        resourceExplorerSearchResults = []
+        resourceExplorerStructuredPreview = nil
+        defer { resourceExplorerIsBusy = false }
+        let fileService = self.fileService
+        do {
+            let entries = try await Task.detached(priority: .userInitiated) {
+                try fileService.list(directory: directory, allowedRoot: allowedRoot)
+            }.value
+            let nodes = Self.resourceExplorerNodes(
+                from: entries,
+                ownerBundleID: ownerBundleID,
+                logicalRoot: allowedRoot,
+                relativeMetadataKey: relativeMetadataKey
+            )
+            resourceExplorerMode = mode
+            resourceExplorerNodes = nodes
+            resourceExplorerSearchResults = []
+            browsePath = directory.standardizedFileURL.path
+            files = entries
+            resourceExplorerStatusMessage = "浅层列出 \(nodes.count) 项；未递归计算文件夹大小，也未触发深度索引。"
+            if !nodes.isEmpty { try? await resourceIndex.add(nodes, source: "resource_explorer_shallow_list") }
+        } catch {
+            resourceExplorerNodes = []
+            files = []
+            resourceExplorerStatusMessage = "目录读取失败：\(error)"
+            lastError = resourceExplorerStatusMessage
+        }
+    }
+
+    private func performResourceExplorerSearch(
+        query: String,
+        searchRoot: URL,
+        allowedRoot: URL?,
+        ownerBundleID: String?,
+        relativeMetadataKey: String?,
+        allowFallbackScan: Bool = true
+    ) async throws {
+        let indexed = await resourceIndex.search(
+            nameContains: query,
+            ownerBundleID: ownerBundleID,
+            pathPrefix: searchRoot.path,
+            maxResults: 200
+        )
+        let fileService = self.fileService
+        let validation = await Task.detached(priority: .userInitiated) { () -> (valid: [(ResourceNode, FileMetadataSnapshot)], stale: Set<ResourceID>) in
+            var valid: [(ResourceNode, FileMetadataSnapshot)] = []
+            var stale = Set<ResourceID>()
+            for node in indexed {
+                guard let rawPath = node.resolvedPath else { continue }
+                do {
+                    let metadata = try fileService.stat(URL(fileURLWithPath: rawPath), allowedRoot: allowedRoot)
+                    valid.append((node, metadata))
+                } catch {
+                    stale.insert(node.id)
+                }
+            }
+            return (valid, stale)
+        }.value
+        if !validation.stale.isEmpty { try? await resourceIndex.remove(validation.stale) }
+
+        if !validation.valid.isEmpty {
+            var revalidated: [ResourceNode] = []
+            for (candidate, metadata) in validation.valid {
+                await resourceIndex.markValidated(candidate.id, path: metadata.path, byteSize: metadata.size, modificationDate: metadata.modificationDate)
+                var node = candidate
+                node.resolvedPath = metadata.path
+                node.kind = metadata.isDirectory ? .directory : .file
+                node.byteSize = metadata.isDirectory ? nil : metadata.size
+                if let date = metadata.modificationDate { node.metadata["modifiedAt"] = ISO8601DateFormatter().string(from: date) }
+                if let relativeMetadataKey, let allowedRoot {
+                    node.metadata[relativeMetadataKey] = Self.relativePath(from: allowedRoot, to: URL(fileURLWithPath: metadata.path))
+                }
+                revalidated.append(node)
+            }
+            resourceExplorerSearchResults = revalidated.sorted(by: Self.resourceExplorerNodeSort)
+            resourceExplorerStatusMessage = "索引优先命中并重新验证 \(revalidated.count) 项；未执行文件系统扫描。"
+            return
+        }
+
+        guard allowFallbackScan else {
+            resourceExplorerSearchResults = []
+            resourceExplorerStatusMessage = "虚拟系统根的资源索引未命中；为避免全盘扫描，未对 / 执行 filesystem fallback。请先进入一个具体系统区域再搜索。"
+            return
+        }
+
+        let queryObject = FileSearchQuery(nameContains: query, maxDepth: 6, maxResults: 200, maxVisited: 12_000)
+        let entries = try await Task.detached(priority: .userInitiated) {
+            try fileService.search(root: searchRoot, query: queryObject, allowedRoot: allowedRoot)
+        }.value
+        let nodes = Self.resourceExplorerNodes(
+            from: entries,
+            ownerBundleID: ownerBundleID,
+            logicalRoot: allowedRoot,
+            relativeMetadataKey: relativeMetadataKey
+        )
+        if !nodes.isEmpty { try? await resourceIndex.add(nodes, source: "resource_explorer_bounded_search") }
+        resourceExplorerSearchResults = nodes
+        resourceExplorerStatusMessage = "索引未命中；执行一次 bounded scan（depth≤6、visited≤12000、results≤200）并增量更新同一资源索引。"
+    }
+
+    private func openResourceExplorerStructuredPreview(_ node: ResourceNode) async {
+        guard let kind = node.resolvedPath.flatMap({ Self.resourceExplorerStructuredKind(for: URL(fileURLWithPath: $0)) }) else {
+            if let path = node.resolvedPath {
+                let size = node.byteSize.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "未知大小"
+                resourceExplorerStatusMessage = "\(URL(fileURLWithPath: path).lastPathComponent) · \(size)"
+            }
+            return
+        }
+
+        do {
+            let resolved = try await resolveResourceExplorerFile(node)
+            let plistService = propertyListService
+            let jsonService = jsonService
+            let sqliteService = sqliteService
+            let lines = try await Task.detached(priority: .userInitiated) { () throws -> [String] in
+                switch kind {
+                case .plist:
+                    let metadata = try plistService.metadata(path: resolved.url, allowedRoot: resolved.allowedRoot)
+                    return metadata.keys.sorted().map { "\($0): \(metadata[$0] ?? "")" }
+                case .json:
+                    let value = try jsonService.read(path: resolved.url, allowedRoot: resolved.allowedRoot)
+                    if let dictionary = value as? [String: Any] {
+                        return ["topLevelType: dictionary", "count: \(dictionary.count)", "keys: \(dictionary.keys.sorted().prefix(32).joined(separator: ", "))"]
+                    }
+                    if let array = value as? [Any] {
+                        return ["topLevelType: array", "count: \(array.count)"]
+                    }
+                    return ["topLevelType: scalar"]
+                case .sqlite:
+                    let result = try sqliteService.tables(path: resolved.url, allowedRoot: resolved.allowedRoot)
+                    let names = result.rows.prefix(40).compactMap { row in row["name"] }.joined(separator: ", ")
+                    return ["tables/views: \(result.rows.count)", "names: \(names)", "elapsed: \(result.elapsedMS)ms"]
+                }
+            }.value
+            resourceExplorerStructuredPreview = ResourceExplorerStructuredPreview(
+                path: resolved.url.path,
+                title: resolved.url.lastPathComponent,
+                kind: kind,
+                lines: lines
+            )
+            resourceExplorerStatusMessage = "结构化预览复用了现有 Native plist/JSON/SQLite service；未创建第二套 parser。"
+        } catch {
+            resourceExplorerStatusMessage = "结构化资源读取失败：\(error)"
+            lastError = resourceExplorerStatusMessage
+        }
+    }
+
+    private func resolveResourceExplorerFile(_ node: ResourceNode) async throws -> (url: URL, allowedRoot: URL?) {
+        switch resourceExplorerMode {
+        case .container(let bundleID, _), .application(let bundleID):
+            let rootNode = try await resourceResolver.resolve(containerResourceID(bundleID: bundleID, relativePath: nil))
+            guard let rootPath = rootNode.resolvedPath, let rawPath = node.resolvedPath else { throw ResourceResolverError.containerUnavailable(bundleID) }
+            let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
+            let candidate = URL(fileURLWithPath: rawPath).standardizedFileURL
+            _ = try PathGuard().validate(target: candidate, allowedRoot: rootURL, rejectSymlink: true)
+            return (candidate, rootURL)
+        case .appBundle(let bundleID, _):
+            let rootNode = try await resourceResolver.resolve(ResourceID("app://\(bundleID)"))
+            guard let rootPath = rootNode.resolvedPath, let rawPath = node.resolvedPath else { throw ResourceResolverError.appUnavailable(bundleID) }
+            let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
+            let candidate = URL(fileURLWithPath: rawPath).standardizedFileURL
+            _ = try PathGuard().validate(target: candidate, allowedRoot: rootURL, rejectSymlink: true)
+            return (candidate, rootURL)
+        case .userFiles:
+            guard let rawPath = node.resolvedPath else { throw CocoaError(.fileNoSuchFile) }
+            let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).standardizedFileURL
+            let candidate = URL(fileURLWithPath: rawPath).standardizedFileURL
+            _ = try PathGuard().validate(target: candidate, allowedRoot: home, rejectSymlink: true)
+            return (candidate, home)
+        case .system:
+            guard resourceExplorerCanBrowseSystem, let rawPath = node.resolvedPath else { throw CocoaError(.fileNoSuchFile) }
+            let candidate = URL(fileURLWithPath: rawPath).standardizedFileURL
+            _ = try PathGuard().validate(target: candidate, allowedRoot: nil, rejectSymlink: true)
+            return (candidate, nil)
+        default:
+            throw CocoaError(.fileReadNoPermission)
+        }
+    }
+
+    private func containerResourceID(bundleID: String, relativePath: String?) -> ResourceID {
+        var components = URLComponents()
+        components.scheme = "container"
+        components.host = bundleID
+        let relative = Self.normalizedRelativePath(relativePath ?? "")
+        components.path = relative.isEmpty ? "" : "/\(relative)"
+        return ResourceID(components.string ?? "container://\(bundleID)")
+    }
+
+    private static func resourceExplorerNodes(
+        from entries: [FileEntry],
+        ownerBundleID: String?,
+        logicalRoot: URL?,
+        relativeMetadataKey: String?
+    ) -> [ResourceNode] {
+        entries.map { entry in
+            let fileURL = URL(fileURLWithPath: entry.path).standardizedFileURL
+            let id = ResourceID(fileURL.absoluteString)
+            var metadata: [String: String] = [:]
+            if let date = entry.modificationDate { metadata["modifiedAt"] = ISO8601DateFormatter().string(from: date) }
+            if !fileURL.pathExtension.isEmpty { metadata["extension"] = fileURL.pathExtension.lowercased() }
+            if let relativeMetadataKey, let logicalRoot {
+                metadata[relativeMetadataKey] = relativePath(from: logicalRoot, to: fileURL)
+            }
+            return ResourceNode(
+                id: id,
+                kind: entry.isDirectory ? .directory : .file,
+                displayName: entry.name,
+                logicalLocation: id.rawValue,
+                resolvedPath: entry.path,
+                ownerBundleID: ownerBundleID,
+                byteSize: entry.isDirectory ? nil : entry.size,
+                metadata: metadata
+            )
+        }.sorted(by: resourceExplorerNodeSort)
+    }
+
+    private static func resourceExplorerNodeSort(_ lhs: ResourceNode, _ rhs: ResourceNode) -> Bool {
+        let lhsDirectory = lhs.kind == .directory || lhs.kind == .container || lhs.kind == .storageCategory
+        let rhsDirectory = rhs.kind == .directory || rhs.kind == .container || rhs.kind == .storageCategory
+        if lhsDirectory != rhsDirectory { return lhsDirectory && !rhsDirectory }
+        return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+    }
+
+    private static func normalizedRelativePath(_ raw: String) -> String {
+        raw.split(separator: "/").filter { $0 != "." && $0 != ".." }.joined(separator: "/")
+    }
+
+    private static func parentRelativePath(_ raw: String) -> String {
+        var parts = normalizedRelativePath(raw).split(separator: "/").map(String.init)
+        if !parts.isEmpty { parts.removeLast() }
+        return parts.joined(separator: "/")
+    }
+
+    private static func relativePath(from root: URL, to target: URL) -> String {
+        let rootPath = root.standardizedFileURL.path
+        let targetPath = target.standardizedFileURL.path
+        guard targetPath != rootPath else { return "" }
+        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+        guard targetPath.hasPrefix(prefix) else { return target.lastPathComponent }
+        return String(targetPath.dropFirst(prefix.count))
+    }
+
+    private static func resourceExplorerStructuredKind(for url: URL) -> ResourceExplorerStructuredKind? {
+        switch url.pathExtension.lowercased() {
+        case "plist": return .plist
+        case "json": return .json
+        case "sqlite", "sqlite3", "db": return .sqlite
+        default: return nil
+        }
     }
 
     public func reloadInteractionLearning() async {

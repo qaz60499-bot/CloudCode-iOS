@@ -296,6 +296,7 @@ public struct FileSearchQuery: Sendable {
     public var modifiedBefore: Date?
     public var maxDepth: Int
     public var maxResults: Int
+    public var maxVisited: Int
 
     public init(
         nameContains: String? = nil,
@@ -303,14 +304,18 @@ public struct FileSearchQuery: Sendable {
         modifiedAfter: Date? = nil,
         modifiedBefore: Date? = nil,
         maxDepth: Int = 4,
-        maxResults: Int = 500
+        maxResults: Int = 500,
+        maxVisited: Int = 20_000
     ) {
         self.nameContains = nameContains
         self.extensions = extensions
         self.modifiedAfter = modifiedAfter
         self.modifiedBefore = modifiedBefore
+        // Preserve the existing query semantics for depth/result budgets. Public/Agent callers
+        // already apply their own bounds; maxVisited is the new independent traversal circuit breaker.
         self.maxDepth = maxDepth
         self.maxResults = maxResults
+        self.maxVisited = min(max(maxVisited, 128), 100_000)
     }
 }
 
@@ -368,7 +373,7 @@ public struct FileService: @unchecked Sendable {
 
     public func list(directory: URL, allowedRoot: URL? = nil) throws -> [FileEntry] {
         let safe = try pathGuard.validate(target: directory, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
-        let urls = try fileManager.contentsOfDirectory(at: safe, includingPropertiesForKeys: [.isDirectoryKey, .fileAllocatedSizeKey, .contentModificationDateKey], options: [.skipsHiddenFiles])
+        let urls = try fileManager.contentsOfDirectory(at: safe, includingPropertiesForKeys: [.isDirectoryKey, .fileAllocatedSizeKey, .totalFileAllocatedSizeKey, .contentModificationDateKey], options: [.skipsHiddenFiles])
         return urls.compactMap(entry(for:)).sorted { lhs, rhs in
             if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory && !rhs.isDirectory }
             return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
@@ -378,13 +383,14 @@ public struct FileService: @unchecked Sendable {
     public func search(root: URL, query: FileSearchQuery, allowedRoot: URL? = nil) throws -> [FileEntry] {
         let safe = try pathGuard.validate(target: root, allowedRoot: allowedRoot, rejectSymlink: true, fileManager: fileManager)
         let baseDepth = safe.pathComponents.count
-        guard let enumerator = fileManager.enumerator(at: safe, includingPropertiesForKeys: [.isDirectoryKey, .fileAllocatedSizeKey, .contentModificationDateKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles]) else { return [] }
+        guard let enumerator = fileManager.enumerator(at: safe, includingPropertiesForKeys: [.isDirectoryKey, .fileAllocatedSizeKey, .totalFileAllocatedSizeKey, .contentModificationDateKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles]) else { return [] }
         var results: [FileEntry] = []
         var visitedCount = 0
 
         for case let url as URL in enumerator {
             visitedCount += 1
             if visitedCount % 128 == 0 { try Task.checkCancellation() }
+            if visitedCount > query.maxVisited { break }
             let depth = url.pathComponents.count - baseDepth
             if depth > query.maxDepth {
                 enumerator.skipDescendants()
@@ -415,7 +421,7 @@ public struct FileService: @unchecked Sendable {
     }
 
     public func analyzeStorage(root: URL, allowedRoot: URL? = nil, top: Int = 50) throws -> [FileEntry] {
-        var query = FileSearchQuery(maxDepth: 16, maxResults: 20_000)
+        var query = FileSearchQuery(maxDepth: 16, maxResults: 20_000, maxVisited: 100_000)
         query.extensions = []
         let files = try search(root: root, query: query, allowedRoot: allowedRoot).filter { !$0.isDirectory }
         return files.sorted { $0.size > $1.size }.prefix(top).map { $0 }
@@ -500,7 +506,11 @@ public struct FileService: @unchecked Sendable {
     private func entry(for url: URL) -> FileEntry? {
         guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileAllocatedSizeKey, .totalFileAllocatedSizeKey, .contentModificationDateKey]) else { return nil }
         let isDirectory = values.isDirectory == true
-        let size = isDirectory ? (try? fileManager.allocatedSizeOfItem(at: url)) ?? 0 : Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
+        // Directory listing must remain shallow. Recursively calculating every child folder size
+        // makes a single `files.list` or Resource Explorer directory open behave like a deep scan.
+        // Folder size is therefore unknown/omitted at list time (represented as 0 by FileEntry's
+        // existing non-optional field); explicit storage analysis remains the separate deep path.
+        let size = isDirectory ? 0 : Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
         return FileEntry(path: url.path, name: url.lastPathComponent, isDirectory: isDirectory, size: size, modificationDate: values.contentModificationDate)
     }
 }

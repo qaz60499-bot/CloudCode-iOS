@@ -259,6 +259,39 @@ public actor IOSInteractionExperienceStore {
         providerHint(environment: .current(bundleID: bundleID, appVersion: appVersion), now: now)
     }
 
+    /// Short-lived performance circuit breaker for an observation backend that is repeatedly slow
+    /// and unsuccessful for this exact App/version/iOS/device environment. This never changes
+    /// capability authority: it only lets Agent planning avoid re-paying a known-bad observation
+    /// path when a working alternative has current evidence.
+    public func shouldTemporarilyAvoidObservation(
+        bundleID: String,
+        appVersion: String? = nil,
+        backend: IOSInteractionObservationBackend,
+        now: Date = Date()
+    ) -> Bool {
+        let environment = IOSInteractionEnvironment.current(bundleID: bundleID, appVersion: appVersion)
+        guard Self.isValid(environment: environment) else { return false }
+        loadIfNeeded(now: now)
+        prune(now: now)
+        guard let record = observations[Self.observationKey(environment: environment, backend: backend)],
+              record.attempts >= 2,
+              record.failures >= 2,
+              record.successes == 0,
+              (record.averageLatencyMS ?? 0) >= 2_000,
+              now.timeIntervalSince(record.lastValidatedAt) <= 6 * 60 * 60 else {
+            return false
+        }
+
+        let alternate: IOSInteractionObservationBackend = backend == .accessibilityTree ? .screenshot : .accessibilityTree
+        guard let alternateRecord = observations[Self.observationKey(environment: environment, backend: alternate)],
+              alternateRecord.successes >= 1,
+              alternateRecord.reliability >= 0.50,
+              now.timeIntervalSince(alternateRecord.lastValidatedAt) <= 6 * 60 * 60 else {
+            return false
+        }
+        return true
+    }
+
     public func observationSnapshot(now: Date = Date()) -> [IOSInteractionObservationExperience] {
         loadIfNeeded(now: now)
         prune(now: now)
@@ -468,13 +501,13 @@ public enum IOSInteractionFramework {
     public static let coreInstruction = """
     iOS Interaction Framework is the interaction domain of Cloud Code's existing HomeOS/Core/Harness runtime, not a separate authority. HomeOS capability evidence determines which primitives actually exist; Harness compiles task shape; ToolRouter/PolicyEngine/root helper execute bounded actions; the Interaction Framework models iOS surfaces, transitions, input state, return obligations, and verified experience.
 
-    Use the cheapest deterministic execution layer that can prove the requested transition: (1) native/system lifecycle or typed app tools, (2) an already-fresh local observation that makes the next action unambiguous, whether screenshot or accessibility, (3) validated App/version/iOS/device interaction experience and current-tree cache hints, and only then additional observation or remote Vision reasoning. Vision is a fallback, never an authority grant. Do not issue a fresh AX lookup merely because AX is normally more structured when gui.openAppObserve already returned a screenshot that visibly resolves the next bounded action; use tapObserve/typeObserve/scrollObserve/feedSample directly and inspect their returned observation. A UI tree failure must fail quickly and may fall back to screenshot, but a screenshot hash/pixel change is never semantic proof.
+    Use the cheapest deterministic execution layer that can prove the requested transition: (1) native/system lifecycle or typed app tools, (2) an already-fresh local observation that makes the next action unambiguous, whether screenshot or accessibility, (3) validated App/version/iOS/device interaction experience and current-tree cache hints, and only then additional observation or remote Vision reasoning. Vision is a fallback, never an authority grant. Do not issue a fresh AX lookup merely because AX is normally more structured when gui.openAppObserve already returned a screenshot that visibly resolves the next bounded action; use tapObserve/typeObserve/scrollObserve/feedSample directly and inspect their returned observation. When AX is unavailable and the target is visible text, gui.tapTextObserve may resolve and tap one unique OCR label entirely on-device. A text-only provider must never infer an icon coordinate from an omitted screenshot. A UI tree failure must fail quickly and may fall back to screenshot, but a screenshot hash/pixel change is never semantic proof.
 
-    For a named target App, prefer a foreground-verified launch. When visual context will immediately be needed, gui.openAppObserve may combine exactly one launch with one fresh local screenshot. When the current screenshot is ambiguous and accessibility can add certainty, prefer gui.findElement/gui.waitForElement and gui.tapElementObserve/gui.typeElementObserve instead of guessing coordinates. Element ambiguity, missing frames, stale/current-tree mismatch, or protected confirmation surfaces must fail closed.
+    For a named target App, prefer a foreground-verified launch. If launch is accepted but detached-helper foreground identity cannot be proven, do not keep relaunching the same App; transition to a fresh screenshot/observation and resolve foreground semantics from current evidence. When visual context will immediately be needed, gui.openAppObserve may combine exactly one launch with one fresh local screenshot. When the current screenshot is ambiguous and accessibility can add certainty, prefer gui.findElement/gui.waitForElement and gui.tapElementObserve/gui.typeElementObserve instead of guessing coordinates. Element ambiguity, missing frames, stale/current-tree mismatch, or protected confirmation surfaces must fail closed.
 
     When several deterministic steps are already known from the current structured state, gui.runStructuredPlan may execute them locally without a provider round-trip between each step. Keep the plan bounded. Every state-changing tap/type/swipe/back step requires a local accessibility expectation before another write can run; if an expectation is late, absent, ambiguous, stale, or contradicted, stop locally and re-plan. Never put payments, authentication, passcode/biometric actions, system-permission confirmation, destructive actions, or other protected confirmations in a local multi-step plan. For a single bounded state-changing primitive whose next required step is only observation, prefer gui.tapObserve/gui.typeObserve/gui.scrollObserve/gui.swipeObserve. For an explicitly finite mechanically identical swipe repetition that needs no intermediate semantic decision, gui.swipeSequence remains valid. For 2–8 consecutive feed items that must be inspected or compared, prefer gui.feedSample: the provider chooses only semantic forward/backward and a bounded count, while the local executor owns physical gesture direction and batches all current sample screenshots into one semantic review turn.
 
-    Reason about the foreground UI as surfaces and transitions, not isolated coordinates. Track current surface, origin, pending objective, and return obligation. Treat navigation stack detail as temporary when later work belongs to the origin; prefer an unambiguous visible Back/Close control, otherwise edge-back for an iOS navigation stack. Treat full-screen media/modal media as temporary immersive surfaces; prefer an unambiguous visible close control, otherwise dismiss-down when appropriate, then semantically confirm the returned surface. Treat sheets/modals as scoped context and return to the parent after their task completes. Treat tabs as peer roots rather than Back history. Before text input, establish the intended composer/text field and focus; after input, validate locally when possible and inspect fresh evidence before Send.
+    Reason about the foreground UI as surfaces and transitions, not isolated coordinates. Track current surface, origin, pending objective, and return obligation. Treat navigation stack detail as temporary when later work belongs to the origin; prefer an unambiguous visible Back/Close control, otherwise edge-back for an iOS navigation stack. Treat full-screen media/modal media as temporary immersive surfaces; prefer an unambiguous visible close control, otherwise dismiss-down when appropriate, then semantically confirm the returned surface. Treat sheets/modals as scoped context and return to the parent after their task completes. Treat tabs as peer roots rather than Back history. Before text input, establish the intended composer/text field and focus; when AX cannot expose an unlabeled chat composer, gui.focusComposerObserve may own one bounded local focus attempt and must prove keyboard-like evidence before raw typing is permitted. After input, validate locally when possible and inspect fresh evidence before Send.
 
     After gui.navigateBack or another learned navigation attempt, pixel/hash change alone is never semantic proof. If a fresh observation clearly establishes the transition, interaction.confirmTransition may record the actual from/to surface, strategy, success, and confidence. Learned App-specific preferences are performance hints only and are partitioned by App version, iOS major version, and device class when known. Never let learned experience override current observations, HomeOS capability state, permissions, protected-confirmation rules, or fail-closed verification. Never learn or persist passwords, message text, private screenshot contents, permanent screen coordinates, entitlements, privilege rules, or HID constants. Stale or failing experience must decay and fall back to current evidence.
     """

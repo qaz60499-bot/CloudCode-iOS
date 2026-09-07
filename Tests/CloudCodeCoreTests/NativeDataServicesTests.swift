@@ -108,6 +108,47 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertThrowsError(try sqlite.query(path: databaseURL, sql: "DELETE FROM items", parametersJSON: nil, allowedRoot: root))
     }
 
+    func testFileServiceDirectoryListingIsShallowAndDoesNotAggregateChildDirectorySize() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let child = root.appendingPathComponent("child", isDirectory: true)
+        let deep = child.appendingPathComponent("deep", isDirectory: true)
+        try FileManager.default.createDirectory(at: deep, withIntermediateDirectories: true)
+        try Data(repeating: 0x41, count: 64 * 1024).write(to: deep.appendingPathComponent("payload.bin"))
+
+        let entries = try FileService().list(directory: root, allowedRoot: root)
+        let childEntry = try XCTUnwrap(entries.first(where: { $0.name == "child" }))
+        XCTAssertTrue(childEntry.isDirectory)
+        XCTAssertEqual(childEntry.size, 0, "shallow listing must not recursively aggregate a directory subtree")
+    }
+
+    func testFileSearchQueryAddsTraversalCircuitBreakerWithoutChangingExistingBudgets() {
+        let defaults = FileSearchQuery()
+        XCTAssertEqual(defaults.maxVisited, 20_000)
+        XCTAssertEqual(defaults.maxDepth, 4)
+        XCTAssertEqual(defaults.maxResults, 500)
+
+        let boundedTraversal = FileSearchQuery(maxDepth: 99, maxResults: 99_999, maxVisited: 999_999)
+        XCTAssertEqual(boundedTraversal.maxDepth, 99)
+        XCTAssertEqual(boundedTraversal.maxResults, 99_999)
+        XCTAssertEqual(boundedTraversal.maxVisited, 100_000)
+    }
+
+    func testFileSearchStopsAtVisitedBudgetEvenWhenMoreEntriesMatch() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for index in 0..<220 {
+            try Data("x".utf8).write(to: root.appendingPathComponent(String(format: "match-%03d.txt", index)))
+        }
+
+        let results = try FileService().search(
+            root: root,
+            query: FileSearchQuery(nameContains: "match-", maxDepth: 1, maxResults: 500, maxVisited: 128),
+            allowedRoot: root
+        )
+        XCTAssertEqual(results.count, 128, "bounded scan must stop before processing entries beyond maxVisited")
+    }
+
     func testPersistentResourceIndexServesSearchBeforeFilesystemScanAndRevalidatesStalePaths() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

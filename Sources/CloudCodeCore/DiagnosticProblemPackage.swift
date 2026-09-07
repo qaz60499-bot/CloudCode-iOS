@@ -205,7 +205,9 @@ public struct DiagnosticReplayEvidence: Codable, Equatable, Sendable {
             "perceptionOCRInvoked", "perceptionOCRSucceeded", "perceptionOCRLatencyMS", "perceptionLocalSufficient",
             "perceptionRemoteVisionRequired", "perceptionFallbackReason", "providerVisualRoundTripAvoided",
             "sha256", "screenPointWidth", "screenPointHeight", "localVisionOCR", "localVisionElementCount",
-            "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion", "treeHash",
+            "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion", "localVisionRecognitionLevel", "localVisionFallbackUsed",
+            "localVisionErrorDomain", "localVisionErrorCode", "localVisionPrimaryErrorDomain", "localVisionPrimaryErrorCode", "treeHash",
+            "coordinateSafety", "providerImageRoute", "keyboardLikely", "focusStrategy", "textInputSafety", "cache", "idempotency",
             "routeSelectionLatencyMS", "executionLatencyMS", "totalLatencyMS"
         ])
         var result: [String: String] = [:]

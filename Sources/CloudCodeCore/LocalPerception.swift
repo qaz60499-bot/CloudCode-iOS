@@ -225,6 +225,66 @@ public enum LocalFeedMetricExtractor {
     }
 }
 
+public enum LocalKeyboardHeuristic {
+    /// Conservative OCR-only keyboard detector used after a bounded semantic composer-focus tap.
+    /// It looks for many key-like labels distributed across multiple rows in the lower screen.
+    /// A mere screenshot hash change is intentionally insufficient evidence of text-input focus.
+    public static func isLikelyVisible(elements: [LocalPerceptionTextElement], screenHeight: Double) -> Bool {
+        guard screenHeight.isFinite, screenHeight >= 200 else { return false }
+        let lower = elements.filter {
+            $0.confidence >= 0.12
+                && $0.centerY >= screenHeight * 0.55
+                && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard !lower.isEmpty else { return false }
+
+        var keyEvidence = 0
+        var rowBuckets = Set<Int>()
+        for element in lower {
+            let normalized = element.text
+                .replacingOccurrences(of: "，", with: " ")
+                .replacingOccurrences(of: ",", with: " ")
+                .replacingOccurrences(of: "。", with: " ")
+                .replacingOccurrences(of: ".", with: " ")
+                .replacingOccurrences(of: "·", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty else { continue }
+            let tokens = normalized.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            var elementEvidence = 0
+            for token in tokens {
+                if isKeyLike(token) { elementEvidence += 1 }
+            }
+            if elementEvidence == 0,
+               normalized.count >= 5,
+               normalized.count <= 14,
+               normalized.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) }) {
+                // Vision can merge an entire QWERTY row into one OCR fragment.
+                elementEvidence = min(normalized.count, 10)
+            }
+            if elementEvidence > 0 {
+                keyEvidence += elementEvidence
+                rowBuckets.insert(Int((element.centerY / max(24, screenHeight * 0.055)).rounded(.down)))
+            }
+        }
+        return keyEvidence >= 8 && rowBuckets.count >= 2
+    }
+
+    private static func isKeyLike(_ raw: String) -> Bool {
+        let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty, token.count <= 8 else { return false }
+        let lowered = token.lowercased()
+        let namedKeys: Set<String> = [
+            "space", "return", "enter", "delete", "shift", "abc", "123", "#+=", "空格", "换行", "发送", "删除", "中", "英"
+        ]
+        if namedKeys.contains(lowered) { return true }
+        if token.count <= 2,
+           token.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) }) {
+            return true
+        }
+        return false
+    }
+}
+
 public enum LocalPerceptionRoutingPolicy {
     /// AX is a structural source. When it has already answered the current observation question,
     /// running OCR is redundant work.

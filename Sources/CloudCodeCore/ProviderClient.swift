@@ -561,6 +561,18 @@ private func providerImageCompatibilityRouteKey(configuration: ProviderConfigura
     ].joined(separator: "|")
 }
 
+/// Runtime visibility for the Agent executor. ProviderClient can transparently recover from an
+/// AgentRouter image-shape 400 by retrying the same proven route as text-only; the executor must
+/// also know about that downgrade so it never turns an omitted screenshot into guessed tap
+/// coordinates. The API deliberately exposes only a boolean and never the Key-derived route key.
+enum ProviderImageCompatibilityPolicy {
+    static func isCurrentRouteTextOnly(configuration: ProviderConfiguration, apiKey: String) async -> Bool {
+        guard configuration.providerID == ProviderCatalog.agentRouterID else { return false }
+        let routeKey = providerImageCompatibilityRouteKey(configuration: configuration, apiKey: apiKey)
+        return await ProviderImageCompatibilityState.shared.isTextOnly(routeKey)
+    }
+}
+
 private protocol ProviderRequestBuilding {
     var session: URLSession { get }
     var retryPolicy: RetryPolicy { get }
@@ -684,7 +696,7 @@ private extension ProviderRequestBuilding {
                                     subsystem: "provider",
                                     action: "request.compatibility-fallback",
                                     result: "retry_agentrouter_text_only_observation",
-                                    diagnostic: "AgentRouter accepted this exact route before the current screenshot but rejected the multimodal content block shape. Retrying once on the same Host/Key/protocol with internal observation images omitted; do not rotate a proven route solely because this model is text-only.",
+                                    diagnostic: "AgentRouter accepted this exact Host/Key/protocol before the current screenshot but rejected image-bearing input on this model route. Retrying once on the same route with internal observation images omitted and caching the exact route as text-only/incompatible for bounded runtime use; do not misclassify this as a Key or host failure.",
                                     metadata: [
                                         "providerID": configuration.providerID ?? "",
                                         "model": configuration.model,
