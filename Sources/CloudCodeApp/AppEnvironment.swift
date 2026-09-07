@@ -8,6 +8,7 @@ import UIKit
 private enum ProviderLiveVerificationState {
     case verified
     case inconclusive
+    case incompatible
     case authenticationRejected
     case clientRejected
     case capacityBlocked
@@ -503,7 +504,7 @@ public final class CloudCodeViewModel: ObservableObject {
                     providerProfiles[providerIndex].keySlots[slotIndex].status = .authFailed
                 case .capacityBlocked:
                     providerProfiles[providerIndex].keySlots[slotIndex].status = .capacity
-                case .clientRejected, .inconclusive, .failed:
+                case .clientRejected, .inconclusive, .incompatible, .failed:
                     providerProfiles[providerIndex].keySlots[slotIndex].status = .needsValidation
                 }
             }
@@ -524,6 +525,9 @@ public final class CloudCodeViewModel: ObservableObject {
                 lastError = providerKeyCheckMessage
             case .inconclusive:
                 providerKeyCheckMessage = "Keychain 中已找到当前 Key；上游可达，但模型 / 协议验证未完成。原模型目录已保留。"
+                lastError = providerKeyCheckMessage
+            case .incompatible:
+                providerKeyCheckMessage = "INCOMPATIBLE：Keychain 中已找到当前 Key，但当前允许的 Host × 协议最小推理均未验证通过；不会把网页式 HTTP 200 或仅目录可达误判为 Key 可用。"
                 lastError = providerKeyCheckMessage
             case .failed:
                 providerKeyCheckMessage = "Keychain 中已找到当前 Key，但实时验证失败：\(refresh.diagnostic)"
@@ -2335,14 +2339,24 @@ public final class CloudCodeViewModel: ObservableObject {
                     "host": acceptedBaseURL.host ?? ""
                 ]
             )
-            let refreshState: ProviderLiveVerificationState = shouldApplyDiscovery
-                ? .verified
-                : (discovery.readiness == .capacity ? .capacityBlocked : .inconclusive)
+            let refreshState: ProviderLiveVerificationState
+            if shouldApplyDiscovery {
+                refreshState = .verified
+            } else if discovery.readiness == .capacity {
+                refreshState = .capacityBlocked
+            } else if providerID == ProviderCatalog.agentRouterID,
+                      discovery.readiness == .needsValidation || discovery.readiness == .unavailable {
+                refreshState = .incompatible
+            } else {
+                refreshState = .inconclusive
+            }
             let diagnostic: String
             if shouldApplyDiscovery {
                 diagnostic = "上游认证和最小推理验证均已通过。"
             } else if discovery.readiness == .capacity {
                 diagnostic = "模型目录可读，但推理当前被容量/额度限制阻断；Key 未被判定为无效。"
+            } else if refreshState == .incompatible {
+                diagnostic = "当前允许的 Host × 协议没有得到真实推理成功证据；非 API 的 HTTP 2xx 不计为 READY。"
             } else {
                 diagnostic = "上游可达，但当前模型/协议尚未完成可用性验证。"
             }

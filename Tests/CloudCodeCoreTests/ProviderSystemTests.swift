@@ -127,14 +127,14 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(provider.protocolCandidates(for: "gpt-5.6-sol", keySlotID: "slot-1"), [.openAIChat, .anthropic])
     }
 
-    func testAgentRouterEndpointCandidatesAreKeyGenerationScoped() throws {
+    func testAgentRouterEndpointCandidatesStartCurrentHostEvenForHistoricalFingerprint() throws {
         let configured = try XCTUnwrap(URL(string: "https://co.agentrouter.org"))
         let legacy = ProviderEndpointRoutingPolicy.candidateBaseURLs(
             providerID: ProviderCatalog.agentRouterID,
             configuredBaseURL: configured,
             keyFingerprint: ProviderEndpointRoutingPolicy.agentRouterLegacyKeyFingerprint
         )
-        XCTAssertEqual(legacy.map(\.host), ["agentrouter.org", "co.agentrouter.org"])
+        XCTAssertEqual(legacy.map(\.host), ["co.agentrouter.org", "agentrouter.org"])
         let current = ProviderEndpointRoutingPolicy.candidateBaseURLs(
             providerID: ProviderCatalog.agentRouterID,
             configuredBaseURL: configured,

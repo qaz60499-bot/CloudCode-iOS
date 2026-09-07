@@ -253,13 +253,15 @@ public struct ProviderDiscoveryClient: Sendable {
         let url = try ProviderEndpoint.endpoint(baseURL: baseURL, path: "models")
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
         ProviderCompatibilityHeaders.apply(to: &request)
         applyAuth(apiKey, mode: authMode, request: &request)
         request.timeoutInterval = 30
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("缺少 HTTP 响应") }
         if let error = ProviderHTTPClassifier.error(for: http.statusCode, body: data) { throw error }
-        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard let rawObject = try? JSONSerialization.jsonObject(with: data),
+              let object = rawObject as? [String: Any],
               let catalog = object["data"] ?? object["models"] else { throw ProviderError.malformedEvent }
         return Self.extractModelIdentifiers(from: catalog)
     }
@@ -412,18 +414,19 @@ public struct ProviderDiscoveryClient: Sendable {
         switch protocolName {
         case .anthropic:
             path = "messages"
-            body = ["model": model, "max_tokens": 1, "messages": [["role": "user", "content": "Reply OK"]]]
+            body = ["model": model, "max_tokens": 1, "stream": false, "messages": [["role": "user", "content": "Reply OK"]]]
         case .openAIChat:
             path = "chat/completions"
-            body = ["model": model, "max_tokens": 1, "messages": [["role": "user", "content": "Reply OK"]]]
+            body = ["model": model, "max_tokens": 1, "stream": false, "messages": [["role": "user", "content": "Reply OK"]]]
         case .openAIResponses:
             path = "responses"
-            body = ["model": model, "max_output_tokens": 1, "input": "Reply OK"]
+            body = ["model": model, "max_output_tokens": 1, "stream": false, "input": "Reply OK"]
         }
         let url = try ProviderEndpoint.endpoint(baseURL: baseURL, path: path)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
         ProviderCompatibilityHeaders.apply(to: &request)
         if protocolName == .anthropic { request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version") }
         applyAuth(apiKey, mode: authMode, request: &request)
@@ -432,13 +435,55 @@ public struct ProviderDiscoveryClient: Sendable {
         do {
             let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse else { return .unsupported }
-            if (200..<300).contains(http.statusCode) { return .supported }
+            if (200..<300).contains(http.statusCode) {
+                return Self.isSupportedInferenceResponse(protocolName, data: data, response: http) ? .supported : .unsupported
+            }
             if case .capacityExhausted? = ProviderHTTPClassifier.error(for: http.statusCode, body: data) {
                 return .capacityBlocked
             }
             return .unsupported
         } catch let error as URLError where error.code == .timedOut || error.code == .networkConnectionLost {
             return .unsupported
+        }
+    }
+
+    private static func isSupportedInferenceResponse(_ protocolName: ProviderProtocol, data: Data, response: HTTPURLResponse) -> Bool {
+        let mediaType = response.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+        if mediaType.contains("text/html") { return false }
+
+        if mediaType.contains("text/event-stream") || data.starts(with: Data("data:".utf8)) {
+            let text = String(data: data.prefix(262_144), encoding: .utf8) ?? ""
+            for rawLine in text.split(whereSeparator: { $0.isNewline }) {
+                var line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+                if line.hasPrefix("data:") {
+                    line = String(line.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                guard !line.isEmpty, line != "[DONE]", let payload = line.data(using: .utf8),
+                      let object = try? JSONSerialization.jsonObject(with: payload) else { continue }
+                if isSupportedInferenceEnvelope(protocolName, object: object) { return true }
+            }
+            return false
+        }
+
+        guard let object = try? JSONSerialization.jsonObject(with: data) else { return false }
+        return isSupportedInferenceEnvelope(protocolName, object: object)
+    }
+
+    private static func isSupportedInferenceEnvelope(_ protocolName: ProviderProtocol, object: Any) -> Bool {
+        guard let dictionary = object as? [String: Any] else { return false }
+        switch protocolName {
+        case .anthropic:
+            if dictionary["content"] is [Any] { return true }
+            if let type = dictionary["type"] as? String {
+                return type == "message" || type == "message_start" || type.hasPrefix("content_block_") || type == "message_delta" || type == "message_stop"
+            }
+            return false
+        case .openAIChat:
+            return dictionary["choices"] is [Any]
+        case .openAIResponses:
+            if dictionary["output"] is [Any] || dictionary["output_text"] is String { return true }
+            if let type = dictionary["type"] as? String { return type.hasPrefix("response.") || type == "response" }
+            return false
         }
     }
 

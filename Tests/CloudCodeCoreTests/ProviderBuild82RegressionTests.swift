@@ -65,6 +65,27 @@ final class ProviderBuild82RegressionTests: XCTestCase {
         XCTAssertEqual(seenProtocols, [ProviderProtocol.openAIChat.rawValue])
     }
 
+    func testDiscoveryRejectsNonAPIHTTP200AsInferenceReadiness() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [Build82NonAPI200URLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let result = try await ProviderDiscoveryClient(session: session).discover(
+            baseURL: URL(string: "https://agentrouter.org")!,
+            apiKey: "test-key",
+            preferredAuthMode: .bearer,
+            fallbackInferenceCandidates: ["glm-5.3"],
+            inferenceProtocols: [.anthropic, .openAIChat],
+            allowAlternateAuthModes: false
+        )
+
+        XCTAssertTrue(result.models.isEmpty)
+        XCTAssertTrue(result.protocols.isEmpty)
+        XCTAssertEqual(result.authMode, .bearer)
+        XCTAssertEqual(result.readiness, .needsValidation)
+    }
+
     func testDiscoveryCapacityIsNotInferenceReady() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [Build82CapacityURLProtocol.self]
@@ -152,6 +173,30 @@ private actor Build82ProtocolRecorder: ProviderStreaming {
     private func record(_ protocolName: String) {
         seen.append(protocolName)
     }
+}
+
+private final class Build82NonAPI200URLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let body = Data("<html><body>AgentRouter</body></html>".utf8)
+        let response = HTTPURLResponse(
+            url: url,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "text/html; charset=utf-8"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
 
 private final class Build82CapacityURLProtocol: URLProtocol, @unchecked Sendable {

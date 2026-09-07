@@ -95,11 +95,9 @@ jobs:
           agent_fingerprint_matches_catalog = hashlib.sha256(agent_key.encode("utf-8")).hexdigest() == expected_agent_fingerprint
           print(f"AGENTROUTER_SECRET_MATCHES_CATALOG={str(agent_fingerprint_matches_catalog).lower()}")
 
-          agent_origins = (
-              ["https://agentrouter.org", "https://co.agentrouter.org"]
-              if agent_fingerprint_matches_catalog
-              else ["https://co.agentrouter.org", "https://agentrouter.org"]
-          )
+          # Historical fingerprint is diagnostic metadata only. Match runtime route-evidence
+          # revision 3: current documented API origin first, verified exact evidence may reorder.
+          agent_origins = ["https://co.agentrouter.org", "https://agentrouter.org"]
           agent_client_headers = {
               "User-Agent": "claude-cli/1.0.120 (external, cli)",
               "x-app": "cli",
