@@ -2025,11 +2025,11 @@ final class ProviderProtocolClientTests: XCTestCase {
     func testHostFallbackClassificationCoversRouteLayersWithoutReplayingCapacity() {
         XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(ProviderError.authenticationFailed(403)))
         XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(ProviderError.clientRejected(401)))
-        XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(ProviderError.invalidResponse(400)))
+        XCTAssertFalse(ProviderHostFallbackClassifier.shouldFallback(ProviderError.invalidResponse(400)))
         XCTAssertTrue(ProviderProtocolFallbackClassifier.shouldFallback(ProviderError.invalidResponse(400)))
         XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(ProviderError.invalidResponse(404)))
         XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(ProviderError.invalidResponse(405)))
-        XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(ProviderError.invalidResponse(422)))
+        XCTAssertFalse(ProviderHostFallbackClassifier.shouldFallback(ProviderError.invalidResponse(422)))
         XCTAssertTrue(ProviderProtocolFallbackClassifier.shouldFallback(ProviderError.invalidResponse(422)))
         XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(ProviderError.invalidResponse(503)))
         XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(ProviderError.protocolIncompatible("route mismatch")))
