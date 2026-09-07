@@ -97,34 +97,58 @@ final class ProviderCatalogTests: XCTestCase {
         }
     }
 
-    func testAgentRouterUsesCurrentDocumentedOriginAndExplicitPerModelProtocols() throws {
+    func testAgentRouterUsesDocumentedProviderOriginButLegacyKeyEvidenceKeepsBoundedProtocols() throws {
         let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-agentrouter-org" }))
         XCTAssertEqual(provider.baseURL.absoluteString, "https://co.agentrouter.org")
         XCTAssertEqual(provider.authMode, .bearer)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-4-8", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-5", keySlotID: "slot-1"), .anthropic)
-        XCTAssertEqual(provider.protocolFor(model: "claude-opus-4-7", keySlotID: "slot-1"), .anthropic)
-        XCTAssertEqual(provider.protocolFor(model: "claude-opus-4-6", keySlotID: "slot-1"), .anthropic)
-        XCTAssertEqual(provider.protocolFor(model: "deepseek-v4-flash", keySlotID: "slot-1"), .openAIChat)
-        XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.openAIChat])
-        XCTAssertEqual(provider.protocolFor(model: "gpt-5.6-sol", keySlotID: "slot-1"), .openAIChat)
-        XCTAssertEqual(provider.protocolCandidates(for: "gpt-5.6-sol", keySlotID: "slot-1"), [.openAIChat])
-        XCTAssertEqual(provider.protocolFor(model: "gpt-5.5", keySlotID: "slot-1"), .openAIChat)
-        XCTAssertEqual(provider.protocolFor(model: "kimi-k2.6", keySlotID: "slot-1"), .openAIChat)
-        XCTAssertEqual(provider.protocolFor(model: "glm-5.1", keySlotID: "slot-1"), .openAIChat)
-        XCTAssertEqual(provider.protocolFor(model: "glm-5.2", keySlotID: "slot-1"), .openAIChat)
-        XCTAssertEqual(provider.protocolFor(model: "glm-5.3", keySlotID: "slot-1"), .openAIChat)
-        XCTAssertEqual(provider.protocolCandidates(for: "glm-5.3", keySlotID: "slot-1"), [.openAIChat])
+        XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.anthropic, .openAIChat])
+        XCTAssertEqual(provider.protocolCandidates(for: "gpt-5.6-sol", keySlotID: "slot-1"), [.anthropic, .openAIChat])
+        XCTAssertEqual(provider.protocolCandidates(for: "glm-5.3", keySlotID: "slot-1"), [.anthropic, .openAIChat])
         XCTAssertTrue(provider.selectableModels(for: "slot-1").contains("glm-5.3"))
-        XCTAssertEqual(provider.protocolFor(model: "step3p5-code-alpha", keySlotID: "slot-1"), .openAIChat)
+        XCTAssertEqual(provider.protocolFor(model: "gpt-5.5", keySlotID: "slot-1"), .openAIChat)
+        XCTAssertEqual(provider.protocolCandidates(for: "gpt-5.5", keySlotID: "slot-1"), [.openAIChat, .anthropic])
         XCTAssertFalse(provider.protocols.contains(.openAIResponses))
     }
 
-    func testAgentRouterUnknownDiscoveredModelUsesModelFamilyProtocol() throws {
+    func testAgentRouterUnknownDiscoveredModelUsesModelFamilyOrderingButKeepsFallback() throws {
         var provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.agentRouterID }))
         provider.keySlots[0].models.append(contentsOf: ["claude-future-model", "future-general-model"])
-        XCTAssertEqual(provider.protocolCandidates(for: "claude-future-model", keySlotID: "slot-1"), [.anthropic])
-        XCTAssertEqual(provider.protocolCandidates(for: "future-general-model", keySlotID: "slot-1"), [.openAIChat])
+        XCTAssertEqual(provider.protocolCandidates(for: "claude-future-model", keySlotID: "slot-1"), [.anthropic, .openAIChat])
+        XCTAssertEqual(provider.protocolCandidates(for: "future-general-model", keySlotID: "slot-1"), [.openAIChat, .anthropic])
+    }
+
+    func testAgentRouterKeyReplacementClearsOldModelProtocolEvidence() throws {
+        var provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.agentRouterID }))
+        XCTAssertEqual(provider.protocolCandidates(for: "gpt-5.6-sol", keySlotID: "slot-1"), [.anthropic, .openAIChat])
+        provider.updateKeyFingerprint(String(repeating: "a", count: 64), keySlotID: "slot-1", status: .needsValidation)
+        XCTAssertTrue(provider.keySlots[0].modelProtocols.isEmpty)
+        XCTAssertEqual(provider.protocolCandidates(for: "gpt-5.6-sol", keySlotID: "slot-1"), [.openAIChat, .anthropic])
+    }
+
+    func testAgentRouterEndpointCandidatesAreKeyGenerationScoped() throws {
+        let configured = try XCTUnwrap(URL(string: "https://co.agentrouter.org"))
+        let legacy = ProviderEndpointRoutingPolicy.candidateBaseURLs(
+            providerID: ProviderCatalog.agentRouterID,
+            configuredBaseURL: configured,
+            keyFingerprint: ProviderEndpointRoutingPolicy.agentRouterLegacyKeyFingerprint
+        )
+        XCTAssertEqual(legacy.map(\.host), ["agentrouter.org", "co.agentrouter.org"])
+        let current = ProviderEndpointRoutingPolicy.candidateBaseURLs(
+            providerID: ProviderCatalog.agentRouterID,
+            configuredBaseURL: configured,
+            keyFingerprint: String(repeating: "b", count: 64)
+        )
+        XCTAssertEqual(current.map(\.host), ["co.agentrouter.org", "agentrouter.org"])
+
+        let unapproved = ProviderEndpointRoutingPolicy.candidateBaseURLs(
+            providerID: ProviderCatalog.agentRouterID,
+            configuredBaseURL: URL(string: "https://unapproved.example.com/v1")!,
+            keyFingerprint: String(repeating: "c", count: 64)
+        )
+        XCTAssertEqual(unapproved.map(\.host), ["co.agentrouter.org", "agentrouter.org"])
+        XCTAssertFalse(unapproved.contains { $0.host == "unapproved.example.com" })
     }
 
     func testVyceLunaPrefersDeviceVerifiedChatCompletionsWithBoundedFallbacks() throws {
@@ -152,6 +176,54 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(preferred, ProviderProtocol.openAIChat.rawValue)
     }
 
+    func testProviderRequestKeyStateDegradesAndReverifiesExactRouteEvidence() async {
+        let state = ProviderRequestKeyState(ttl: 3600)
+        let routingKey = "provider|model|key|host|auth"
+        let reference = "provider.key.slot-1"
+        await state.markSuccessful(
+            routingKey: routingKey,
+            reference: reference,
+            protocolName: ProviderProtocol.openAIChat.rawValue
+        )
+        await state.markDegraded(routingKey: routingKey, reference: reference)
+        let degraded = await state.preferredProtocol(
+            routingKey: routingKey,
+            reference: reference,
+            allowedProtocols: [ProviderProtocol.openAIChat.rawValue, ProviderProtocol.anthropic.rawValue],
+            fallback: ProviderProtocol.anthropic.rawValue
+        )
+        XCTAssertEqual(degraded, ProviderProtocol.anthropic.rawValue)
+
+        await state.markSuccessful(
+            routingKey: routingKey,
+            reference: reference,
+            protocolName: ProviderProtocol.openAIChat.rawValue
+        )
+        let reverified = await state.preferredProtocol(
+            routingKey: routingKey,
+            reference: reference,
+            allowedProtocols: [ProviderProtocol.openAIChat.rawValue, ProviderProtocol.anthropic.rawValue],
+            fallback: ProviderProtocol.anthropic.rawValue
+        )
+        XCTAssertEqual(reverified, ProviderProtocol.openAIChat.rawValue)
+    }
+
+    func testProviderRequestKeyStateDoesNotReuseHostEvidenceAfterConfiguredHostChanges() async {
+        let state = ProviderRequestKeyState(ttl: 3600)
+        let reference = "provider.key.slot-1"
+        let routingKey = "provider|key|host"
+        let oldURL = URL(string: "https://old.example.com/v1")!
+        let newURL = URL(string: "https://new.example.com/v1")!
+        await state.markSuccessfulBaseURL(routingKey: routingKey, reference: reference, baseURL: oldURL)
+        let preferred = await state.preferredBaseURL(
+            routingKey: routingKey,
+            reference: reference,
+            allowedBaseURLs: [newURL],
+            fallback: newURL
+        )
+        XCTAssertEqual(preferred, newURL)
+    }
+
     func testAgentRouterLiveCatalogReplacesStaticPickerForSelectedKey() throws {
         var provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.agentRouterID }))
         XCTAssertGreaterThan(provider.selectableModels(for: "slot-1").count, 5)
@@ -168,7 +240,7 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(provider.selectableModels(for: "slot-1"), liveModels)
         XCTAssertEqual(provider.models, liveModels)
         XCTAssertFalse(provider.selectableModels(for: "slot-1").contains("gpt-5.5"))
-        XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.openAIChat])
+        XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.anthropic, .openAIChat])
     }
 
     func testPerKeyModelScopeOverridesProviderCatalog() throws {
@@ -290,8 +362,8 @@ final class ProviderCatalogTests: XCTestCase {
             "provider.sameProviderFailover": "false"
         ], profiles: profiles)
         XCTAssertEqual(migratedAgentRouter.baseURL.absoluteString, "https://co.agentrouter.org")
-        XCTAssertEqual(migratedAgentRouter.protocolName, ProviderProtocol.openAIChat.rawValue)
-        XCTAssertEqual(migratedAgentRouter.fallbackProtocolNames, [])
+        XCTAssertEqual(migratedAgentRouter.protocolName, ProviderProtocol.anthropic.rawValue)
+        XCTAssertEqual(migratedAgentRouter.fallbackProtocolNames, [ProviderProtocol.openAIChat.rawValue])
 
         let otherProvider = try XCTUnwrap(profiles.first(where: { $0.id != provider.id }))
         var crossProvider = payload
@@ -745,6 +817,8 @@ final class ProviderRouterTests: XCTestCase {
         let firstSeen = await firstRecorder.protocolsSeen()
         XCTAssertEqual(firstText, "chat-good")
         XCTAssertEqual(firstSeen, [ProviderProtocol.anthropic.rawValue, ProviderProtocol.openAIChat.rawValue])
+        let persistedRouteState = try String(contentsOf: stateURL, encoding: .utf8)
+        XCTAssertFalse(persistedRouteState.contains("same-key"))
 
         let restartedRecorder = RecordingProtocolOutcomeProvider()
         let restartedRouter = ProviderClientRouter(
@@ -758,6 +832,191 @@ final class ProviderRouterTests: XCTestCase {
         let restartedSeen = await restartedRecorder.protocolsSeen()
         XCTAssertEqual(restartedText, "chat-good")
         XCTAssertEqual(restartedSeen, [ProviderProtocol.openAIChat.rawValue])
+    }
+
+    func testChangingAuthModeDoesNotReuseOldProtocolEvidence() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeProviderAuthIsolation-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stateURL = root.appendingPathComponent("verified-routes.json")
+        let vault = MemoryKeyVault()
+        var bearerConfiguration = config(protocolName: .anthropic)
+        bearerConfiguration.fallbackProtocolNames = [ProviderProtocol.openAIChat.rawValue]
+        bearerConfiguration.authModeName = ProviderAuthMode.bearer.rawValue
+
+        let firstRecorder = RecordingProtocolOutcomeProvider()
+        let firstRouter = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: firstRecorder,
+            openAIChat: firstRecorder,
+            responses: firstRecorder,
+            requestKeyState: ProviderRequestKeyState(fileURL: stateURL)
+        )
+        _ = try await collectText(firstRouter.stream(configuration: bearerConfiguration, apiKey: "same-key", messages: [], tools: []))
+        XCTAssertEqual(await firstRecorder.protocolsSeen(), [ProviderProtocol.anthropic.rawValue, ProviderProtocol.openAIChat.rawValue])
+
+        var changedAuthConfiguration = bearerConfiguration
+        changedAuthConfiguration.authModeName = ProviderAuthMode.xAPIKey.rawValue
+        let changedRecorder = RecordingProtocolOutcomeProvider()
+        let changedRouter = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: changedRecorder,
+            openAIChat: changedRecorder,
+            responses: changedRecorder,
+            requestKeyState: ProviderRequestKeyState(fileURL: stateURL)
+        )
+        _ = try await collectText(changedRouter.stream(configuration: changedAuthConfiguration, apiKey: "same-key", messages: [], tools: []))
+        XCTAssertEqual(await changedRecorder.protocolsSeen(), [ProviderProtocol.anthropic.rawValue, ProviderProtocol.openAIChat.rawValue])
+    }
+
+    func testPersistedHostPreferencePreservesConfiguredAPIPath() async {
+        let state = ProviderRequestKeyState(ttl: 3600)
+        let configured = URL(string: "https://api.example.com/v1")!
+        await state.markSuccessfulBaseURL(routingKey: "provider|key|host", reference: "key", baseURL: configured)
+        let preferred = await state.preferredBaseURL(
+            routingKey: "provider|key|host",
+            reference: "key",
+            allowedBaseURLs: [configured],
+            fallback: configured
+        )
+        XCTAssertEqual(preferred.absoluteString, "https://api.example.com/v1")
+    }
+
+    func testAgentRouterHostFallbackPersistsForExactKeyAcrossRouterRestart() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeProviderHostRoute-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stateURL = root.appendingPathComponent("verified-routes.json")
+        let vault = MemoryKeyVault()
+        var configuration = config(protocolName: .anthropic)
+        configuration.providerID = ProviderCatalog.agentRouterID
+        configuration.baseURL = URL(string: "https://co.agentrouter.org")!
+
+        let firstRecorder = RecordingHostOutcomeProvider()
+        let firstRouter = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: firstRecorder,
+            openAIChat: firstRecorder,
+            responses: firstRecorder,
+            requestKeyState: ProviderRequestKeyState(fileURL: stateURL)
+        )
+        let firstText = try await collectText(firstRouter.stream(configuration: configuration, apiKey: "unknown-key-content", messages: [], tools: []))
+        let firstHosts = await firstRecorder.hostsSeen()
+        XCTAssertEqual(firstText, "legacy-host-good")
+        XCTAssertEqual(firstHosts, ["co.agentrouter.org", "agentrouter.org"])
+
+        let restartedRecorder = RecordingHostOutcomeProvider()
+        let restartedRouter = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: restartedRecorder,
+            openAIChat: restartedRecorder,
+            responses: restartedRecorder,
+            requestKeyState: ProviderRequestKeyState(fileURL: stateURL)
+        )
+        let restartedText = try await collectText(restartedRouter.stream(configuration: configuration, apiKey: "unknown-key-content", messages: [], tools: []))
+        let restartedHosts = await restartedRecorder.hostsSeen()
+        XCTAssertEqual(restartedText, "legacy-host-good")
+        XCTAssertEqual(restartedHosts, ["agentrouter.org"])
+    }
+
+    func testAgentRouterHostEvidenceIsIsolatedWhenKeyContentChanges() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeProviderHostIsolation-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stateURL = root.appendingPathComponent("verified-routes.json")
+        let vault = MemoryKeyVault()
+        var configuration = config(protocolName: .anthropic)
+        configuration.providerID = ProviderCatalog.agentRouterID
+        configuration.baseURL = URL(string: "https://co.agentrouter.org")!
+
+        let firstRecorder = RecordingHostOutcomeProvider()
+        let firstRouter = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: firstRecorder,
+            openAIChat: firstRecorder,
+            responses: firstRecorder,
+            requestKeyState: ProviderRequestKeyState(fileURL: stateURL)
+        )
+        _ = try await collectText(firstRouter.stream(configuration: configuration, apiKey: "first-key", messages: [], tools: []))
+
+        let changedRecorder = RecordingHostOutcomeProvider()
+        let changedRouter = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: changedRecorder,
+            openAIChat: changedRecorder,
+            responses: changedRecorder,
+            requestKeyState: ProviderRequestKeyState(fileURL: stateURL)
+        )
+        _ = try await collectText(changedRouter.stream(configuration: configuration, apiKey: "second-key", messages: [], tools: []))
+        let changedHosts = await changedRecorder.hostsSeen()
+        XCTAssertEqual(changedHosts, ["co.agentrouter.org", "agentrouter.org"])
+    }
+
+    func testAgentRouterProtocolEvidenceIsScopedToExactHost() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeProviderHostProtocolScope-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stateURL = root.appendingPathComponent("verified-routes.json")
+        let vault = MemoryKeyVault()
+        let recorder = RecordingHostProtocolOutcomeProvider()
+        var configuration = config(protocolName: .anthropic)
+        configuration.providerID = ProviderCatalog.agentRouterID
+        configuration.baseURL = URL(string: "https://co.agentrouter.org")!
+        configuration.fallbackProtocolNames = [ProviderProtocol.openAIChat.rawValue]
+
+        let router = ProviderClientRouter(
+            keyVault: vault,
+            anthropic: recorder,
+            openAIChat: recorder,
+            responses: recorder,
+            requestKeyState: ProviderRequestKeyState(fileURL: stateURL)
+        )
+        let first = try await collectText(router.stream(configuration: configuration, apiKey: "same-key", messages: [], tools: []))
+        XCTAssertEqual(first, "first-good")
+        let second = try await collectText(router.stream(configuration: configuration, apiKey: "same-key", messages: [], tools: []))
+        XCTAssertEqual(second, "second-good")
+        let seen = await recorder.routesSeen()
+        XCTAssertEqual(seen, [
+            "co.agentrouter.org|\(ProviderProtocol.anthropic.rawValue)",
+            "agentrouter.org|\(ProviderProtocol.anthropic.rawValue)",
+            "agentrouter.org|\(ProviderProtocol.openAIChat.rawValue)",
+            "agentrouter.org|\(ProviderProtocol.openAIChat.rawValue)",
+            "co.agentrouter.org|\(ProviderProtocol.anthropic.rawValue)"
+        ])
+    }
+
+    func testAgentRouterRateLimitDoesNotReplayOnAlternateHost() async throws {
+        let vault = MemoryKeyVault()
+        let recorder = RecordingRateLimitedHostProvider()
+        var configuration = config(protocolName: .anthropic)
+        configuration.providerID = ProviderCatalog.agentRouterID
+        configuration.baseURL = URL(string: "https://co.agentrouter.org")!
+        let router = ProviderClientRouter(keyVault: vault, anthropic: recorder, openAIChat: recorder, responses: recorder)
+        do {
+            _ = try await collectText(router.stream(configuration: configuration, apiKey: "unknown-key", messages: [], tools: []))
+            XCTFail("429/rate-limit must not replay on the alternate AgentRouter host")
+        } catch {
+            XCTAssertEqual(error as? ProviderError, .rateLimited)
+        }
+        let seenHosts = await recorder.hostsSeen()
+        XCTAssertEqual(seenHosts, ["co.agentrouter.org"])
+    }
+
+    func testAgentRouterOutputThenFailureDoesNotReplayOnAlternateHost() async throws {
+        let vault = MemoryKeyVault()
+        let recorder = RecordingPartialHostProvider()
+        var configuration = config(protocolName: .anthropic)
+        configuration.providerID = ProviderCatalog.agentRouterID
+        configuration.baseURL = URL(string: "https://co.agentrouter.org")!
+        let router = ProviderClientRouter(keyVault: vault, anthropic: recorder, openAIChat: recorder, responses: recorder)
+        var text = ""
+        do {
+            for try await event in router.stream(configuration: configuration, apiKey: "unknown-key", messages: [], tools: []) {
+                if case .token(let token) = event { text += token }
+            }
+            XCTFail("Provider output must prohibit host replay")
+        } catch {
+            XCTAssertEqual(error as? ProviderError, .streamInterrupted)
+        }
+        XCTAssertEqual(text, "partial")
+        let seenHosts = await recorder.hostsSeen()
+        XCTAssertEqual(seenHosts, ["co.agentrouter.org"])
     }
 
     func testReplacingKeyContentDoesNotReuseOldExactProtocolEvidence() async throws {
@@ -882,6 +1141,35 @@ final class ProviderDiscoveryTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
         XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "claude-cli/1.0.120 (external, cli)")
         XCTAssertEqual(request.value(forHTTPHeaderField: "x-app"), "cli")
+    }
+
+    func testAgentRouterDiscoveryCanRestrictCatalogToPreferredAuthMode() async throws {
+        ProviderTestURLProtocol.install(
+            status: 401,
+            body: Data("{\"error\":\"invalid api key\"}".utf8),
+            headers: ["Content-Type": "application/json"]
+        )
+        defer { ProviderTestURLProtocol.reset() }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProviderTestURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        do {
+            _ = try await ProviderDiscoveryClient(session: session).discover(
+                baseURL: URL(string: "https://co.agentrouter.org")!,
+                apiKey: "test-secret",
+                preferredAuthMode: .bearer,
+                allowAlternateAuthModes: false
+            )
+            XCTFail("401 should remain a route/auth failure for the caller to handle")
+        } catch {
+            XCTAssertEqual(error as? ProviderError, .authenticationFailed(401))
+        }
+        XCTAssertEqual(ProviderTestURLProtocol.requestCount(), 1)
+        let request = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
+        XCTAssertNil(request.value(forHTTPHeaderField: "x-api-key"))
     }
 
     func testDiscoveryFindsInferenceAuthModeInsteadOfTrustingModelsEndpointAlone() async throws {
@@ -1263,20 +1551,27 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(events.last, .finished)
     }
 
-    func testAgentRouterDeepSeekUsesOpenAICompatibleCurrentOriginAndBearerAuth() async throws {
+    func testAgentRouterLegacyDeepSeekSeedUsesAnthropicOnLegacyOriginAndBearerAuth() async throws {
         let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-agentrouter-org" }))
+        let slot = try XCTUnwrap(provider.keySlots.first(where: { $0.id == "slot-1" }))
         let protocolName = provider.protocolFor(model: "deepseek-v4-flash", keySlotID: "slot-1")
-        XCTAssertEqual(protocolName, .openAIChat)
-        XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.openAIChat])
+        XCTAssertEqual(protocolName, .anthropic)
+        XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.anthropic, .openAIChat])
+        let baseURL = try XCTUnwrap(ProviderEndpointRoutingPolicy.candidateBaseURLs(
+            providerID: provider.id,
+            configuredBaseURL: provider.baseURL,
+            keyFingerprint: slot.fingerprint
+        ).first)
+        XCTAssertEqual(baseURL.host, "agentrouter.org")
         ProviderTestURLProtocol.install(
             status: 200,
-            body: Data("data: [DONE]\n\n".utf8),
+            body: Data("data: {\"type\":\"message_stop\"}\n\n".utf8),
             headers: ["Content-Type": "text/event-stream"]
         )
-        let client = OpenAICompatibleProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
+        let client = AnthropicProviderClient(session: testSession(), retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0))
         let configuration = ProviderConfiguration(
             name: provider.displayName,
-            baseURL: provider.baseURL,
+            baseURL: baseURL,
             model: "deepseek-v4-flash",
             apiKeyReference: ProviderCatalog.keyReference(providerID: provider.id, keySlotID: "slot-1"),
             providerID: provider.id,
@@ -1285,9 +1580,10 @@ final class ProviderProtocolClientTests: XCTestCase {
         )
         for try await _ in client.stream(configuration: configuration, apiKey: "test-secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
         let request = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
-        XCTAssertEqual(request.url?.absoluteString, "https://co.agentrouter.org/v1/chat/completions")
+        XCTAssertEqual(request.url?.absoluteString, "https://agentrouter.org/v1/messages")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
         XCTAssertNil(request.value(forHTTPHeaderField: "x-api-key"))
+        XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-version"), "2023-06-01")
         XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "claude-cli/1.0.120 (external, cli)")
         XCTAssertEqual(request.value(forHTTPHeaderField: "x-app"), "cli")
         XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-beta"), "claude-code-20250219")
@@ -1705,13 +2001,57 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(error, .clientRejected(401))
         XCTAssertFalse(ProviderRetryClassifier.isRetryableBeforeOutput(try! XCTUnwrap(error)))
         XCTAssertFalse(ProviderProtocolFallbackClassifier.shouldFallback(try! XCTUnwrap(error)))
+        XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(try! XCTUnwrap(error)))
         XCTAssertFalse(ProviderKeyRotationClassifier.shouldRotate(try! XCTUnwrap(error)))
         XCTAssertFalse(ProviderEndpointHealthClassifier.shouldMarkDegraded(try! XCTUnwrap(error)))
     }
 
     func testHTTP403QuotaIsCapacityNotCredentialFailure() {
         let body = Data("{\"error\":\"insufficient_user_quota\"}".utf8)
-        XCTAssertEqual(ProviderHTTPClassifier.error(for: 403, body: body), .capacityExhausted(403))
+        let error = ProviderHTTPClassifier.error(for: 403, body: body)
+        XCTAssertEqual(error, .capacityExhausted(403))
+        XCTAssertFalse(ProviderHostFallbackClassifier.shouldFallback(try! XCTUnwrap(error)))
+    }
+
+    func testHTTP401CanTryAlternateSameProviderHostBeforeInvalidatingKey() {
+        let error = try! XCTUnwrap(ProviderHTTPClassifier.error(for: 401, body: Data("{\"msg\":\"Invalid API Key!\"}".utf8)))
+        XCTAssertEqual(error, .authenticationFailed(401))
+        XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(error))
+        XCTAssertFalse(ProviderProtocolFallbackClassifier.shouldFallback(error))
+    }
+
+    func testHostFallbackClassificationCoversRouteLayersWithoutReplayingCapacity() {
+        XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(ProviderError.authenticationFailed(403)))
+        XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(ProviderError.clientRejected(401)))
+        XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(ProviderError.invalidResponse(400)))
+        XCTAssertTrue(ProviderProtocolFallbackClassifier.shouldFallback(ProviderError.invalidResponse(400)))
+        XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(ProviderError.invalidResponse(404)))
+        XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(ProviderError.invalidResponse(405)))
+        XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(ProviderError.invalidResponse(422)))
+        XCTAssertTrue(ProviderProtocolFallbackClassifier.shouldFallback(ProviderError.invalidResponse(422)))
+        XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(ProviderError.invalidResponse(503)))
+        XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(ProviderError.protocolIncompatible("route mismatch")))
+        XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(URLError(.timedOut)))
+        XCTAssertFalse(ProviderHostFallbackClassifier.shouldFallback(ProviderError.capacityExhausted(403)))
+        XCTAssertFalse(ProviderHostFallbackClassifier.shouldFallback(ProviderError.rateLimited))
+        XCTAssertFalse(ProviderHostFallbackClassifier.shouldFallback(ProviderError.streamInterrupted))
+    }
+
+    func testCompatibilityDriftDegradesOnlyExactProtocolOrAgentRouterAuthHostEvidence() {
+        XCTAssertTrue(ProviderCompatibilityDriftClassifier.shouldDegradeProtocol(ProviderError.protocolIncompatible("shape changed")))
+        XCTAssertTrue(ProviderCompatibilityDriftClassifier.shouldDegradeProtocol(ProviderError.malformedEvent))
+        XCTAssertFalse(ProviderCompatibilityDriftClassifier.shouldDegradeProtocol(ProviderError.invalidResponse(400)))
+        XCTAssertTrue(ProviderCompatibilityDriftClassifier.shouldDegradeProtocol(ProviderError.invalidResponse(404)))
+        XCTAssertFalse(ProviderCompatibilityDriftClassifier.shouldDegradeProtocol(ProviderError.invalidResponse(422)))
+        XCTAssertFalse(ProviderCompatibilityDriftClassifier.shouldDegradeProtocol(ProviderError.invalidResponse(503)))
+        XCTAssertFalse(ProviderCompatibilityDriftClassifier.shouldDegradeProtocol(ProviderError.capacityExhausted(403)))
+        XCTAssertFalse(ProviderCompatibilityDriftClassifier.shouldDegradeProtocol(ProviderError.rateLimited))
+        XCTAssertFalse(ProviderCompatibilityDriftClassifier.shouldDegradeProtocol(ProviderError.streamInterrupted))
+        XCTAssertTrue(ProviderCompatibilityDriftClassifier.shouldDegradeHost(ProviderError.authenticationFailed(401), providerID: ProviderCatalog.agentRouterID))
+        XCTAssertTrue(ProviderCompatibilityDriftClassifier.shouldDegradeHost(ProviderError.clientRejected(403), providerID: ProviderCatalog.agentRouterID))
+        XCTAssertFalse(ProviderCompatibilityDriftClassifier.shouldDegradeHost(ProviderError.authenticationFailed(401), providerID: "other-provider"))
+        XCTAssertFalse(ProviderCompatibilityDriftClassifier.shouldDegradeHost(ProviderError.capacityExhausted(403), providerID: ProviderCatalog.agentRouterID))
+        XCTAssertFalse(ProviderCompatibilityDriftClassifier.shouldDegradeHost(ProviderError.rateLimited, providerID: ProviderCatalog.agentRouterID))
     }
 
     func testHTTP403InvalidKeyIsCredentialFailure() {
@@ -2276,6 +2616,119 @@ private struct AlwaysFailureProvider: ProviderStreaming {
     }
 }
 
+private actor RecordingHostOutcomeProvider: ProviderStreaming {
+    private var seenHosts: [String] = []
+
+    func hostsSeen() -> [String] { seenHosts }
+
+    nonisolated func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                let host = configuration.baseURL.host ?? ""
+                await record(host)
+                if host == "co.agentrouter.org" {
+                    continuation.finish(throwing: ProviderError.authenticationFailed(401))
+                } else if host == "agentrouter.org" {
+                    continuation.yield(.token("legacy-host-good"))
+                    continuation.yield(.finished)
+                    continuation.finish()
+                } else {
+                    continuation.finish(throwing: ProviderError.invalidEndpoint)
+                }
+            }
+        }
+    }
+
+    private func record(_ host: String) {
+        seenHosts.append(host)
+    }
+}
+
+private actor RecordingHostProtocolOutcomeProvider: ProviderStreaming {
+    private var seen: [String] = []
+    private var legacyChatAttempts = 0
+    private var coAnthropicAttempts = 0
+
+    func routesSeen() -> [String] { seen }
+
+    nonisolated func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                let host = configuration.baseURL.host ?? ""
+                let protocolName = configuration.protocolName ?? ""
+                let route = "\(host)|\(protocolName)"
+                let outcome = await recordAndResolve(host: host, protocolName: protocolName, route: route)
+                switch outcome {
+                case .success(let token):
+                    continuation.yield(.token(token))
+                    continuation.yield(.finished)
+                    continuation.finish()
+                case .failure(let error):
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    private enum Outcome {
+        case success(String)
+        case failure(ProviderError)
+    }
+
+    private func recordAndResolve(host: String, protocolName: String, route: String) -> Outcome {
+        seen.append(route)
+        if host == "co.agentrouter.org", protocolName == ProviderProtocol.anthropic.rawValue {
+            coAnthropicAttempts += 1
+            return coAnthropicAttempts == 1
+                ? .failure(.authenticationFailed(401))
+                : .success("second-good")
+        }
+        if host == "agentrouter.org", protocolName == ProviderProtocol.anthropic.rawValue {
+            return .failure(.protocolIncompatible("anthropic adapter mismatch"))
+        }
+        if host == "agentrouter.org", protocolName == ProviderProtocol.openAIChat.rawValue {
+            legacyChatAttempts += 1
+            return legacyChatAttempts == 1
+                ? .success("first-good")
+                : .failure(.authenticationFailed(401))
+        }
+        return .failure(.invalidEndpoint)
+    }
+}
+
+private actor RecordingRateLimitedHostProvider: ProviderStreaming {
+    private var seenHosts: [String] = []
+    func hostsSeen() -> [String] { seenHosts }
+
+    nonisolated func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                await record(configuration.baseURL.host ?? "")
+                continuation.finish(throwing: ProviderError.rateLimited)
+            }
+        }
+    }
+
+    private func record(_ host: String) { seenHosts.append(host) }
+}
+
+private actor RecordingPartialHostProvider: ProviderStreaming {
+    private var seenHosts: [String] = []
+    func hostsSeen() -> [String] { seenHosts }
+
+    nonisolated func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                await record(configuration.baseURL.host ?? "")
+                continuation.yield(.token("partial"))
+                continuation.finish(throwing: ProviderError.streamInterrupted)
+            }
+        }
+    }
+
+    private func record(_ host: String) { seenHosts.append(host) }
+}
+
 private struct KeyOutcomeProvider: ProviderStreaming {
     func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -2704,6 +3157,7 @@ private final class ProviderTestURLProtocol: URLProtocol, @unchecked Sendable {
     private static var responseHeaders: [String: String] = [:]
     private static var capturedRequest: URLRequest?
     private static var capturedBody: Data?
+    private static var capturedRequestCount = 0
 
     static func install(status: Int, body: Data, headers: [String: String] = [:]) {
         lock.lock()
@@ -2712,6 +3166,7 @@ private final class ProviderTestURLProtocol: URLProtocol, @unchecked Sendable {
         responseHeaders = headers
         capturedRequest = nil
         capturedBody = nil
+        capturedRequestCount = 0
         lock.unlock()
     }
 
@@ -2729,6 +3184,12 @@ private final class ProviderTestURLProtocol: URLProtocol, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return capturedBody
+    }
+
+    static func requestCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return capturedRequestCount
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -2753,6 +3214,7 @@ private final class ProviderTestURLProtocol: URLProtocol, @unchecked Sendable {
         Self.lock.lock()
         Self.capturedRequest = request
         Self.capturedBody = requestBody
+        Self.capturedRequestCount += 1
         let status = Self.responseStatus
         let body = Self.responseBody
         let headers = Self.responseHeaders

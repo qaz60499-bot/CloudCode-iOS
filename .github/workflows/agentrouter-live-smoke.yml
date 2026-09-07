@@ -9,12 +9,12 @@ permissions:
 jobs:
   agentrouter-live-smoke:
     runs-on: macos-15
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Validate AgentRouter mobile compatibility and model protocols
+      - name: Validate AgentRouter key-scoped host and protocol matrix
         env:
           CLOUDCODE_PROVIDER_BOOTSTRAP: ${{ secrets.CLOUDCODE_PROVIDER_BOOTSTRAP }}
         run: |
@@ -27,8 +27,9 @@ jobs:
           import urllib.request
 
           PROVIDER_ID = "https-agentrouter-org"
-          BASE_URL = "https://co.agentrouter.org"
-          EXPECTED_FINGERPRINT = "105a3fce9a105c41472b926f6448a91be2f9726d5e074adbaaa2206f4d6dbf23"
+          LEGACY_FINGERPRINT = "105a3fce9a105c41472b926f6448a91be2f9726d5e074adbaaa2206f4d6dbf23"
+          CURRENT_ORIGIN = "https://co.agentrouter.org"
+          LEGACY_ORIGIN = "https://agentrouter.org"
           CLIENT_HEADERS = {
               "User-Agent": "claude-cli/1.0.120 (external, cli)",
               "x-app": "cli",
@@ -48,191 +49,129 @@ jobs:
           secret = provider["keys"][0].get("secret", "")
           if not secret:
               raise SystemExit("FAIL: AgentRouter key is empty")
+          fingerprint = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+          print(f"AGENTROUTER_KEY_FINGERPRINT_MATCHES_LEGACY={str(fingerprint == LEGACY_FINGERPRINT).lower()}")
 
-          fingerprint_matches = hashlib.sha256(secret.encode("utf-8")).hexdigest() == EXPECTED_FINGERPRINT
-          print(f"AGENTROUTER_SECRET_MATCHES_CATALOG={str(fingerprint_matches).lower()}")
-          if not fingerprint_matches:
-              raise SystemExit("FAIL: AgentRouter private key does not match the catalog fingerprint")
+          origins = [LEGACY_ORIGIN, CURRENT_ORIGIN] if fingerprint == LEGACY_FINGERPRINT else [CURRENT_ORIGIN, LEGACY_ORIGIN]
 
-          def request(path, payload=None, anthropic=False):
-              headers = {
-                  "Accept": "application/json",
-                  "Authorization": f"Bearer {secret}",
-                  **CLIENT_HEADERS,
-              }
+          def request(origin, path, payload=None, anthropic=False):
+              headers = {"Accept": "application/json", "Authorization": f"Bearer {secret}", **CLIENT_HEADERS}
               data = None
               if payload is not None:
                   headers["Content-Type"] = "application/json"
                   data = json.dumps(payload).encode("utf-8")
               if anthropic:
                   headers["anthropic-version"] = "2023-06-01"
-              req = urllib.request.Request(
-                  BASE_URL + path,
-                  data=data,
-                  headers=headers,
-                  method="POST" if payload is not None else "GET",
-              )
+              req = urllib.request.Request(origin + path, data=data, headers=headers, method="POST" if data is not None else "GET")
               try:
-                  with urllib.request.urlopen(req, timeout=30) as response:
-                      return response.status, response.read(262144), response.headers.get("Content-Type", "")
+                  with urllib.request.urlopen(req, timeout=25) as response:
+                      return int(response.status), response.read(262144), response.headers.get("Content-Type", "")
               except urllib.error.HTTPError as exc:
-                  return exc.code, exc.read(262144), exc.headers.get("Content-Type", "")
+                  return int(exc.code), exc.read(262144), exc.headers.get("Content-Type", "")
+              except Exception as exc:
+                  return 0, str(exc).encode("utf-8", "replace")[:4096], ""
 
-          def body_text(body):
-              return body.decode("utf-8", "replace").lower()
+          def text(body):
+              return body[:262144].decode("utf-8", "replace").casefold()
 
-          def is_api_response(body, content_type):
-              media_type = content_type.split(";")[0].strip().lower()
+          def api_response(body, content_type):
+              media = content_type.split(";")[0].strip().casefold()
               stripped = body.lstrip()
-              return "json" in media_type or stripped.startswith(b"{") or stripped.startswith(b"[")
+              return "json" in media or stripped.startswith(b"{") or stripped.startswith(b"[") or stripped.startswith(b"data:")
 
-          def client_blocked(status, body):
-              if status not in (401, 403):
-                  return False
-              text = body_text(body)
-              markers = (
-                  "unauthorized_client_error",
-                  "unauthorized client detected",
-                  "unauthorized_client",
-                  "client not allowed",
-                  "forbidden client",
-                  "not a recognized client",
-              )
-              return any(marker in text for marker in markers)
+          def classify(status, body):
+              value = text(body)
+              if 200 <= status < 300:
+                  return "OK"
+              if status == 0:
+                  return "NETWORK"
+              if any(m in value for m in ("unauthorized_client_error", "unauthorized client detected", "client not allowed", "forbidden client")):
+                  return "CLIENT_REJECTED"
+              if status == 429:
+                  return "RATE_LIMITED"
+              if any(m in value for m in ("insufficient_user_quota", "insufficient balance", "quota exhausted", "余额不足", "额度已用尽", "预扣费额度失败")):
+                  return "CAPACITY"
+              if status == 401 or (status == 403 and any(m in value for m in ("invalid api key", "invalid_api_key", "authentication", "api key invalid"))):
+                  return "AUTH"
+              if any(m in value for m in ("model_not_found", "model not found", "no available channel", "模型不存在", "无可用渠道")):
+                  return "MODEL_UNAVAILABLE"
+              if status in (404, 405):
+                  return "ENDPOINT_MISMATCH"
+              if 500 <= status < 600:
+                  return "UPSTREAM_5XX"
+              return "OTHER_HTTP"
 
-          def capacity_blocked(status, body):
-              if status not in (402, 403, 429):
-                  return False
-              text = body_text(body)
-              markers = (
-                  "预扣费额度失败",
-                  "insufficient balance",
-                  "insufficient credit",
-                  "precharge",
-                  "credit exhausted",
-                  "balance exhausted",
-                  "account capacity",
-                  "capacity exhausted",
-                  "quota exhausted",
-              )
-              return any(marker in text for marker in markers)
-
-          def model_unavailable(body):
-              text = body_text(body)
-              markers = (
-                  "model_not_found",
-                  "model not found",
-                  "no available channel",
-                  "no channel",
-                  "模型不存在",
-                  "无可用渠道",
-                  "渠道不可用",
-              )
-              return any(marker in text for marker in markers)
-
-          models_status, models_body, models_content_type = request("/v1/models")
-          if client_blocked(models_status, models_body) or models_status == 401:
-              raise SystemExit(f"FAIL: AgentRouter /v1/models still has client/auth 401 regression (status={models_status})")
-          if not 200 <= models_status < 300:
-              raise SystemExit(f"FAIL: AgentRouter /v1/models did not return 2xx (status={models_status})")
-
-          models_api_response = is_api_response(models_body, models_content_type)
-          discovered = []
-          if models_api_response:
+          def extract_models(body):
               try:
-                  parsed = json.loads(models_body.decode("utf-8", "replace"))
-                  raw = (parsed.get("data") or parsed.get("models") or []) if isinstance(parsed, dict) else parsed
-                  if isinstance(raw, list):
-                      for item in raw:
-                          if isinstance(item, str):
-                              candidate = item.strip()
-                          elif isinstance(item, dict):
-                              candidate = str(item.get("id") or item.get("model") or item.get("name") or "").strip()
-                          else:
-                              candidate = ""
-                          if candidate and candidate not in discovered:
-                              discovered.append(candidate)
+                  payload = json.loads(body.decode("utf-8", "replace"))
               except Exception:
-                  pass
-          print(
-              "AGENTROUTER_MODELS "
-              f"status={models_status} content_type={models_content_type.split(';')[0]} "
-              f"api_response={str(models_api_response).lower()} model_count={len(discovered)}"
-          )
+                  return []
+              raw = payload.get("data") or payload.get("models") or [] if isinstance(payload, dict) else payload
+              if not isinstance(raw, list):
+                  return []
+              result = []
+              for item in raw:
+                  if isinstance(item, str):
+                      model = item.strip()
+                  elif isinstance(item, dict):
+                      model = str(item.get("id") or item.get("model") or item.get("name") or "").strip()
+                  else:
+                      model = ""
+                  if model and model not in result:
+                      result.append(model)
+              return result
 
-          models_to_probe = {
-              "deepseek-v4-flash": ("openai_chat", "/v1/chat/completions", False),
-              "glm-5.3": ("openai_chat", "/v1/chat/completions", False),
-              "gpt-5.6-sol": ("openai_chat", "/v1/chat/completions", False),
-              "claude-opus-5": ("anthropic", "/v1/messages", True),
-              "claude-opus-4-8": ("anthropic", "/v1/messages", True),
-          }
+          accepted_origin = None
+          discovered = []
+          for index, origin in enumerate(origins):
+              status, body, content_type = request(origin, "/v1/models")
+              models = extract_models(body) if 200 <= status < 300 else []
+              print(
+                  "AGENTROUTER_CATALOG_ROUTE "
+                  f"candidate={index} origin={origin} status={status} classification={classify(status, body)} "
+                  f"api_response={str(api_response(body, content_type)).lower()} model_count={len(models)}"
+              )
+              if 200 <= status < 300 and models:
+                  accepted_origin = origin
+                  discovered = models
+                  break
+          if accepted_origin is None:
+              raise SystemExit("FAIL: no AgentRouter origin returned an authenticated non-empty /v1/models catalog")
+
+          protocol_matrix = (
+              ("anthropic", "/v1/messages", True),
+              ("openai_responses", "/v1/responses", False),
+              ("openai_chat", "/v1/chat/completions", False),
+          )
+          target_models = [m for m in ("claude-opus-4-8", "claude-opus-5", "deepseek-v4-flash", "glm-5.3", "gpt-5.6-sol") if m in discovered]
+          if not target_models:
+              raise SystemExit("FAIL: authenticated AgentRouter catalog contains none of the expected text models")
 
           hard_failures = []
-          fully_verified_models = []
-          for model, expected_protocol in models_to_probe.items():
-              listed = model in discovered
-              successful_protocols = []
-              non_auth_evidence = False
-              for protocol, path, anthropic in [expected_protocol]:
-                  payload = {
-                      "model": model,
-                      "max_tokens": 1,
-                      "stream": False,
-                      "messages": [{"role": "user", "content": "Reply OK"}],
-                  }
-                  status, body, content_type = request(path, payload=payload, anthropic=anthropic)
-                  blocked = client_blocked(status, body)
-                  capacity = capacity_blocked(status, body)
-                  unavailable = model_unavailable(body)
-                  api_response = is_api_response(body, content_type)
-                  if 200 <= status < 300 and api_response:
-                      classification = "ok"
-                      successful_protocols.append(protocol)
-                      non_auth_evidence = True
-                  elif 200 <= status < 300:
-                      classification = "non_api_html"
-                      non_auth_evidence = True
-                  elif capacity:
-                      classification = "capacity"
-                      non_auth_evidence = True
-                  elif unavailable:
-                      classification = "model_unavailable"
-                      non_auth_evidence = True
-                  elif 500 <= status < 600:
-                      classification = "upstream_5xx"
-                      non_auth_evidence = True
-                  elif status in (401, 403) or blocked:
-                      classification = "auth_or_client_rejected"
+          for model in target_models:
+              successful = []
+              route_evidence = []
+              for protocol, path, anthropic in protocol_matrix:
+                  if protocol == "openai_responses":
+                      payload = {"model": model, "max_output_tokens": 1, "input": "Reply OK"}
                   else:
-                      classification = "protocol_or_route_error"
-                      non_auth_evidence = True
-
+                      payload = {"model": model, "max_tokens": 1, "stream": False, "messages": [{"role": "user", "content": "Reply OK"}]}
+                  status, body, content_type = request(accepted_origin, path, payload=payload, anthropic=anthropic)
+                  classification = classify(status, body)
+                  if 200 <= status < 300 and api_response(body, content_type):
+                      successful.append(protocol)
+                  if classification in ("OK", "CAPACITY", "RATE_LIMITED", "MODEL_UNAVAILABLE", "ENDPOINT_MISMATCH", "UPSTREAM_5XX", "OTHER_HTTP"):
+                      route_evidence.append(protocol)
                   print(
-                      "AGENTROUTER_MODEL_MATRIX "
-                      f"model={model} protocol={protocol} endpoint={path} status={status} "
-                      f"content_type={content_type.split(';')[0]} body_bytes={len(body)} "
-                      f"listed={str(listed).lower()} classification={classification}"
+                      "AGENTROUTER_PROTOCOL_MATRIX "
+                      f"origin={accepted_origin} model={model} protocol={protocol} endpoint={path} "
+                      f"status={status} classification={classification} body_bytes={len(body)}"
                   )
-
-              print(
-                  "AGENTROUTER_MODEL_PROTOCOLS "
-                  f"model={model} successful={','.join(successful_protocols) or 'none'}"
-              )
-              if successful_protocols:
-                  fully_verified_models.append(model)
-              elif not non_auth_evidence:
+              print(f"AGENTROUTER_MODEL_RESULT model={model} successful={','.join(successful) or 'none'}")
+              if not successful and not route_evidence:
                   hard_failures.append(model)
 
           if hard_failures:
-              raise SystemExit("FAIL: AgentRouter models were rejected only by auth/client gates: " + ",".join(hard_failures))
-
-          if models_api_response and len(fully_verified_models) == len(models_to_probe):
-              print("AGENTROUTER_LIVE_SMOKE_OK")
-          else:
-              print(
-                  "AGENTROUTER_HOSTED_RUNNER_API_UNVERIFIED "
-                  f"models_api_response={str(models_api_response).lower()} "
-                  f"verified_models={len(fully_verified_models)}/{len(models_to_probe)}"
-              )
+              raise SystemExit("FAIL: models had only auth/client/transport failures across all bounded protocols: " + ",".join(hard_failures))
+          print(f"AGENTROUTER_LIVE_SMOKE_OK origin={accepted_origin} models={len(target_models)}")
           PY

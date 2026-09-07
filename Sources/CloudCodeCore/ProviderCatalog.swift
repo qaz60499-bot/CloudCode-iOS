@@ -50,14 +50,11 @@ public enum ProviderEndpointHealthClassifier {
     public static func shouldMarkDegraded(_ error: Error) -> Bool {
         if let providerError = error as? ProviderError {
             switch providerError {
-            case .rateLimited:
-                return true
             case .invalidResponse(let code):
                 return (500...599).contains(code)
-            case .streamInterrupted, .malformedEvent, .authenticationFailed:
-                return true
-            case .missingAPIKey, .invalidEndpoint, .capacityExhausted, .modelUnavailable, .clientRejected,
-                 .attachmentUnavailable, .attachmentTooLarge,
+            case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .clientRejected,
+                 .capacityExhausted, .modelUnavailable, .rateLimited, .malformedEvent,
+                 .streamInterrupted, .attachmentUnavailable, .attachmentTooLarge,
                  .unsupportedAttachmentType, .protocolIncompatible, .transport:
                 return false
             }
@@ -199,32 +196,40 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
         }
 
         if let keySlotID,
-           let slot = keySlots.first(where: { $0.id == keySlotID }) {
-            if let verified = slot.modelProtocols[model], !verified.isEmpty {
-                // Key+model evidence owns the ordering. A Provider-wide preferred protocol must
-                // never reorder a model-specific result; doing so made a dynamically verified
-                // OpenAI model start on Anthropic merely because the Provider default was Anthropic.
-                append(verified)
-                if id == ProviderCatalog.agentRouterID {
-                    // AgentRouter documents distinct wire families per model family. Mixing the
-                    // alternate wire format for the same model adds long failed streams and can
-                    // surface gateway-specific 400s, so exact model evidence is terminal here.
-                    return ordered
-                }
-                return ordered
+           let slot = keySlots.first(where: { $0.id == keySlotID }),
+           let verified = slot.modelProtocols[model], !verified.isEmpty {
+            // Exact Key+model evidence owns the first position only while the runtime credential
+            // still matches this slot's declared fingerprint. ProviderClientRouter performs that
+            // comparison after the authoritative Keychain read and falls back to safe candidates
+            // when the credential changed out-of-band.
+            append(verified)
+            if id == ProviderCatalog.agentRouterID { append(safeProtocolCandidates(for: model, keySlotID: keySlotID)) }
+            return ordered
+        }
+        return safeProtocolCandidates(for: model, keySlotID: keySlotID)
+    }
+
+    public func safeProtocolCandidates(for model: String, keySlotID: String?) -> [ProviderProtocol] {
+        var ordered: [ProviderProtocol] = []
+        func append(_ values: [ProviderProtocol]) {
+            for value in values where !ordered.contains(value) {
+                ordered.append(value)
             }
+        }
+
+        if let keySlotID,
+           let slot = keySlots.first(where: { $0.id == keySlotID }) {
             if id == ProviderCatalog.agentRouterID {
-                // AgentRouter's current public integration contract separates Claude-family models
-                // onto Anthropic Messages and general/OpenAI-compatible models onto Chat Completions.
-                // Keep this model-family rule adaptive for newly discovered models instead of forcing
-                // every unknown model through Anthropic first and paying a long failed stream.
                 let normalizedModel = model.lowercased()
                 if normalizedModel.hasPrefix("claude-") || normalizedModel.contains("/claude-") {
                     if slot.protocols.contains(.anthropic) { append([.anthropic]) }
-                } else if slot.protocols.contains(.openAIChat) {
-                    append([.openAIChat])
+                    if slot.protocols.contains(.openAIChat) { append([.openAIChat]) }
+                } else {
+                    if slot.protocols.contains(.openAIChat) { append([.openAIChat]) }
+                    if slot.protocols.contains(.anthropic) { append([.anthropic]) }
                 }
-                return ordered.isEmpty ? slot.protocols : ordered
+                append(slot.protocols)
+                return ordered
             }
             if slot.protocols.contains(preferredProtocol) { append([preferredProtocol]) }
             append(slot.protocols)
@@ -275,6 +280,29 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
             models = Self.unique(models + discoveredModels)
             keySlots[targetSlotIndex].models = Self.unique(keySlots[targetSlotIndex].models + discoveredModels)
         }
+    }
+
+    public mutating func updateKeyFingerprint(
+        _ fingerprint: String,
+        keySlotID: String,
+        status: ProviderKeyStatus? = nil
+    ) {
+        guard let targetSlotIndex = keySlots.firstIndex(where: { $0.id == keySlotID }) else { return }
+        if keySlots[targetSlotIndex].fingerprint != fingerprint {
+            // Exact protocol evidence and an authoritative live model catalog both belong to the
+            // previous credential. Clear the former and, for built-in profiles, restore the bundled
+            // selectable baseline instead of presenting the previous Key's live catalog as verified.
+            keySlots[targetSlotIndex].modelProtocols = [:]
+            if source != .custom,
+               let baselineProfile = ProviderCatalog.desktopSnapshot.first(where: { $0.id == id }),
+               let baselineSlot = baselineProfile.keySlots.first(where: { $0.id == keySlotID }) {
+                keySlots[targetSlotIndex].models = baselineSlot.models
+                keySlots[targetSlotIndex].protocols = baselineSlot.protocols
+                models = Self.unique(baselineProfile.models + keySlots.flatMap(\.models))
+            }
+        }
+        keySlots[targetSlotIndex].fingerprint = fingerprint
+        if let status { keySlots[targetSlotIndex].status = status }
     }
 
     public mutating func applyDiscovery(_ discovery: ProviderDiscoveryResult, keySlotID: String) {
@@ -744,12 +772,12 @@ public enum ProviderCatalog {
                         "claude-opus-4-6": [.anthropic],
                         "claude-opus-5": [.anthropic],
                         "gpt-5.5": [.openAIChat],
-                        "gpt-5.6-sol": [.openAIChat],
+                        "gpt-5.6-sol": [.anthropic],
                         "kimi-k2.6": [.openAIChat],
                         "glm-5.1": [.openAIChat],
                         "glm-5.2": [.openAIChat],
-                        "glm-5.3": [.openAIChat],
-                        "deepseek-v4-flash": [.openAIChat],
+                        "glm-5.3": [.anthropic],
+                        "deepseek-v4-flash": [.anthropic],
                         "step3p5-code-alpha": [.openAIChat]
                     ]
                 )],

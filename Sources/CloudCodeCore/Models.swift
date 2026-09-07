@@ -449,6 +449,8 @@ public struct ProviderConfiguration: Codable, Equatable, Identifiable, Sendable 
     public var fallbackAPIKeyReferences: [String]?
     public var fallbackProtocolNames: [String]?
     public var protocolNamesByKeyReference: [String: [String]]?
+    public var safeProtocolNamesByKeyReference: [String: [String]]?
+    public var keyFingerprintsByReference: [String: String]?
     public var allowSameProviderKeyFailover: Bool?
     public var reasoningEffort: ModelReasoningEffort?
 
@@ -464,6 +466,8 @@ public struct ProviderConfiguration: Codable, Equatable, Identifiable, Sendable 
         fallbackAPIKeyReferences: [String]? = nil,
         fallbackProtocolNames: [String]? = nil,
         protocolNamesByKeyReference: [String: [String]]? = nil,
+        safeProtocolNamesByKeyReference: [String: [String]]? = nil,
+        keyFingerprintsByReference: [String: String]? = nil,
         allowSameProviderKeyFailover: Bool? = nil,
         reasoningEffort: ModelReasoningEffort? = nil
     ) {
@@ -478,6 +482,8 @@ public struct ProviderConfiguration: Codable, Equatable, Identifiable, Sendable 
         self.fallbackAPIKeyReferences = fallbackAPIKeyReferences
         self.fallbackProtocolNames = fallbackProtocolNames
         self.protocolNamesByKeyReference = protocolNamesByKeyReference
+        self.safeProtocolNamesByKeyReference = safeProtocolNamesByKeyReference
+        self.keyFingerprintsByReference = keyFingerprintsByReference
         self.allowSameProviderKeyFailover = allowSameProviderKeyFailover
         self.reasoningEffort = reasoningEffort
     }

@@ -18,6 +18,59 @@ public enum ProviderEndpointPolicy {
     }
 }
 
+public enum ProviderEndpointRoutingPolicy {
+    // AgentRouter currently documents co.agentrouter.org for newly provisioned clients, while
+    // an older Key generation used by the desktop NativeCloud installation is still accepted by
+    // agentrouter.org and rejected by co.agentrouter.org. Host selection therefore belongs to the
+    // exact Key, not to the Provider globally. This fingerprint is public routing metadata only;
+    // the raw Key never leaves Keychain.
+    public static let agentRouterLegacyKeyFingerprint = "105a3fce9a105c41472b926f6448a91be2f9726d5e074adbaaa2206f4d6dbf23"
+    public static let compatibilityEvidenceRevision = "2"
+
+    public static func candidateBaseURLs(
+        providerID: String?,
+        configuredBaseURL: URL,
+        keyFingerprint: String? = nil
+    ) -> [URL] {
+        guard providerID == ProviderCatalog.agentRouterID else { return [configuredBaseURL] }
+        let current = URL(string: "https://co.agentrouter.org")!
+        let legacy = URL(string: "https://agentrouter.org")!
+        // AgentRouter host failover is an allowlisted Provider capability. Never let an arbitrary
+        // configured URL become a fallback merely because the Provider id was set to AgentRouter.
+        // Exact Key generation decides only the order of these two approved origins.
+        let seed = keyFingerprint == agentRouterLegacyKeyFingerprint
+            ? [legacy, current]
+            : [current, legacy]
+        var seen = Set<String>()
+        return seed.filter { url in
+            let key = normalizedOrigin(url)
+            return ProviderEndpointPolicy.allowsBaseURL(url) && seen.insert(key).inserted
+        }
+    }
+
+    public static func normalizedOrigin(_ url: URL) -> String {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return url.absoluteString
+        }
+        components.path = ""
+        components.query = nil
+        components.fragment = nil
+        return components.string?.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? url.absoluteString
+    }
+
+    public static func normalizedRouteBase(_ url: URL) -> String {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return url.absoluteString
+        }
+        components.query = nil
+        components.fragment = nil
+        if components.path.count > 1 {
+            components.path = components.path.replacingOccurrences(of: "/+$", with: "", options: .regularExpression)
+        }
+        return components.string ?? url.absoluteString
+    }
+}
+
 public enum ProviderRedirectPolicy {
     public static func allows(original: URL, destination: URL) -> Bool {
         guard let originalScheme = original.scheme?.lowercased(),
@@ -1228,9 +1281,16 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
 }
 
 public actor ProviderRequestKeyState {
+    private enum EvidenceState: String, Codable, Sendable {
+        case verified
+        case degraded
+    }
+
     private struct Entry: Codable, Sendable {
         var reference: String
         var protocolName: String?
+        var baseURLString: String?
+        var evidenceState: EvidenceState?
         var touchedAt: Date
     }
 
@@ -1257,7 +1317,9 @@ public actor ProviderRequestKeyState {
     public func preferredReference(routingKey: String, allowedReferences: [String], fallback: String) -> String {
         loadIfNeeded()
         prune()
-        guard let entry = entries[routingKey], allowedReferences.contains(entry.reference) else { return fallback }
+        guard let entry = entries[routingKey],
+              entry.evidenceState != .degraded,
+              allowedReferences.contains(entry.reference) else { return fallback }
         entries[routingKey]?.touchedAt = Date()
         return entry.reference
     }
@@ -1270,6 +1332,7 @@ public actor ProviderRequestKeyState {
         loadIfNeeded()
         prune()
         guard let entry = entries[routingKey],
+              entry.evidenceState != .degraded,
               entry.reference == reference,
               let protocolName = entry.protocolName,
               allowedProtocols.contains(protocolName) else { return fallback }
@@ -1284,7 +1347,56 @@ public actor ProviderRequestKeyState {
     public func markSuccessful(routingKey: String, reference: String, protocolName: String? = nil) {
         loadIfNeeded()
         prune()
-        entries[routingKey] = Entry(reference: reference, protocolName: protocolName, touchedAt: Date())
+        entries[routingKey] = Entry(
+            reference: reference,
+            protocolName: protocolName,
+            baseURLString: entries[routingKey]?.baseURLString,
+            evidenceState: .verified,
+            touchedAt: Date()
+        )
+        persistIfConfigured()
+    }
+
+    public func preferredBaseURL(
+        routingKey: String,
+        reference: String,
+        allowedBaseURLs: [URL],
+        fallback: URL
+    ) -> URL {
+        loadIfNeeded()
+        prune()
+        guard let entry = entries[routingKey],
+              entry.evidenceState != .degraded,
+              entry.reference == reference,
+              let raw = entry.baseURLString,
+              let storedURL = URL(string: raw),
+              let matched = allowedBaseURLs.first(where: {
+                  ProviderEndpointRoutingPolicy.normalizedOrigin($0) == ProviderEndpointRoutingPolicy.normalizedOrigin(storedURL)
+              }) else { return fallback }
+        entries[routingKey]?.touchedAt = Date()
+        return matched
+    }
+
+    public func markSuccessfulBaseURL(routingKey: String, reference: String, baseURL: URL) {
+        loadIfNeeded()
+        prune()
+        entries[routingKey] = Entry(
+            reference: reference,
+            protocolName: entries[routingKey]?.protocolName,
+            baseURLString: ProviderEndpointRoutingPolicy.normalizedOrigin(baseURL),
+            evidenceState: .verified,
+            touchedAt: Date()
+        )
+        persistIfConfigured()
+    }
+
+    public func markDegraded(routingKey: String, reference: String) {
+        loadIfNeeded()
+        prune()
+        guard var entry = entries[routingKey], entry.reference == reference else { return }
+        entry.evidenceState = .degraded
+        entry.touchedAt = Date()
+        entries[routingKey] = entry
         persistIfConfigured()
     }
 
@@ -1377,9 +1489,13 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                         availableKeyCandidates.append((reference, key))
                     }
                 }
+                let authModeIdentity = configuration.authModeName ?? ProviderAuthMode.bearer.rawValue
                 let providerModelIdentity = [
-                    configuration.providerID ?? configuration.baseURL.absoluteString,
-                    configuration.model.lowercased()
+                    "evidence:\(ProviderEndpointRoutingPolicy.compatibilityEvidenceRevision)",
+                    configuration.providerID ?? ProviderEndpointRoutingPolicy.normalizedRouteBase(configuration.baseURL),
+                    "configuredBase:\(ProviderEndpointRoutingPolicy.normalizedRouteBase(configuration.baseURL))",
+                    configuration.model.lowercased(),
+                    "auth:\(authModeIdentity)"
                 ].joined(separator: "|")
                 let poolMaterial = availableKeyCandidates.map { candidate in
                     "\(candidate.0):\(Self.keyFingerprint(candidate.1))"
@@ -1411,30 +1527,77 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
 
                 var lastError: Error = ProviderError.missingAPIKey
                 keyLoop: for (keyIndex, keyCandidate) in keyCandidates.enumerated() {
+                    var keyRouteErrors: [Error] = []
+                    let keyFingerprint = Self.keyFingerprint(keyCandidate.1)
+                    let declaredFingerprint = configuration.keyFingerprintsByReference?[keyCandidate.0]
+                    let declaredFingerprintMatches = declaredFingerprint == nil
+                        || declaredFingerprint?.isEmpty == true
+                        || declaredFingerprint == keyFingerprint
+                    let configuredProtocolNames = declaredFingerprintMatches
+                        ? (configuration.protocolNamesByKeyReference?[keyCandidate.0] ?? [])
+                        : (configuration.safeProtocolNamesByKeyReference?[keyCandidate.0] ?? [])
                     var keyProtocolCandidates: [ProviderProtocol] = []
-                    for raw in configuration.protocolNamesByKeyReference?[keyCandidate.0] ?? [] {
+                    for raw in configuredProtocolNames {
                         guard let value = ProviderProtocol(rawValue: raw), !keyProtocolCandidates.contains(value) else { continue }
                         keyProtocolCandidates.append(value)
                     }
-                    if keyProtocolCandidates.isEmpty { keyProtocolCandidates = defaultProtocolCandidates }
+                    if keyProtocolCandidates.isEmpty {
+                        if !declaredFingerprintMatches,
+                           let safeNames = configuration.safeProtocolNamesByKeyReference?[keyCandidate.0] {
+                            for raw in safeNames {
+                                guard let value = ProviderProtocol(rawValue: raw), !keyProtocolCandidates.contains(value) else { continue }
+                                keyProtocolCandidates.append(value)
+                            }
+                        }
+                        if keyProtocolCandidates.isEmpty { keyProtocolCandidates = defaultProtocolCandidates }
+                    }
                     let protocolNames = keyProtocolCandidates.map(\.rawValue)
-                    let protocolRoutingStateKey = "\(providerModelIdentity)|reference:\(keyCandidate.0)|key:\(Self.keyFingerprint(keyCandidate.1))"
-                    let preferredProtocolName = await requestKeyState.preferredProtocol(
-                        routingKey: protocolRoutingStateKey,
-                        reference: keyCandidate.0,
-                        allowedProtocols: protocolNames,
-                        fallback: keyProtocolCandidates[0].rawValue
+                    let hostRoutingStateKey = "evidence:\(ProviderEndpointRoutingPolicy.compatibilityEvidenceRevision)|\(configuration.providerID ?? ProviderEndpointRoutingPolicy.normalizedRouteBase(configuration.baseURL))|configuredBase:\(ProviderEndpointRoutingPolicy.normalizedRouteBase(configuration.baseURL))|reference:\(keyCandidate.0)|key:\(keyFingerprint)|auth:\(authModeIdentity)|host"
+                    let candidateBaseURLs = ProviderEndpointRoutingPolicy.candidateBaseURLs(
+                        providerID: configuration.providerID,
+                        configuredBaseURL: configuration.baseURL,
+                        keyFingerprint: keyFingerprint
                     )
-                    let orderedProtocols: [ProviderProtocol]
-                    if let preferredProtocolIndex = keyProtocolCandidates.firstIndex(where: { $0.rawValue == preferredProtocolName }) {
-                        orderedProtocols = (0..<keyProtocolCandidates.count).map { offset in
-                            keyProtocolCandidates[(preferredProtocolIndex + offset) % keyProtocolCandidates.count]
+                    let preferredBaseURL = await requestKeyState.preferredBaseURL(
+                        routingKey: hostRoutingStateKey,
+                        reference: keyCandidate.0,
+                        allowedBaseURLs: candidateBaseURLs,
+                        fallback: candidateBaseURLs[0]
+                    )
+                    let orderedBaseURLs: [URL]
+                    if let preferredBaseURLIndex = candidateBaseURLs.firstIndex(where: {
+                        ProviderEndpointRoutingPolicy.normalizedOrigin($0) == ProviderEndpointRoutingPolicy.normalizedOrigin(preferredBaseURL)
+                    }) {
+                        orderedBaseURLs = (0..<candidateBaseURLs.count).map { offset in
+                            candidateBaseURLs[(preferredBaseURLIndex + offset) % candidateBaseURLs.count]
                         }
                     } else {
-                        orderedProtocols = keyProtocolCandidates
+                        orderedBaseURLs = candidateBaseURLs
                     }
-                    for (protocolIndex, protocolCandidate) in orderedProtocols.enumerated() {
+                    hostLoop: for (baseURLIndex, baseURLCandidate) in orderedBaseURLs.enumerated() {
+                        let protocolRoutingStateKey = [
+                            providerModelIdentity,
+                            "reference:\(keyCandidate.0)",
+                            "key:\(keyFingerprint)",
+                            "routeBase:\(ProviderEndpointRoutingPolicy.normalizedRouteBase(baseURLCandidate))"
+                        ].joined(separator: "|")
+                        let preferredProtocolName = await requestKeyState.preferredProtocol(
+                            routingKey: protocolRoutingStateKey,
+                            reference: keyCandidate.0,
+                            allowedProtocols: protocolNames,
+                            fallback: keyProtocolCandidates[0].rawValue
+                        )
+                        let orderedProtocols: [ProviderProtocol]
+                        if let preferredProtocolIndex = keyProtocolCandidates.firstIndex(where: { $0.rawValue == preferredProtocolName }) {
+                            orderedProtocols = (0..<keyProtocolCandidates.count).map { offset in
+                                keyProtocolCandidates[(preferredProtocolIndex + offset) % keyProtocolCandidates.count]
+                            }
+                        } else {
+                            orderedProtocols = keyProtocolCandidates
+                        }
+                        for (protocolIndex, protocolCandidate) in orderedProtocols.enumerated() {
                         var attemptConfiguration = configuration
+                        attemptConfiguration.baseURL = baseURLCandidate
                         attemptConfiguration.protocolName = protocolCandidate.rawValue
                         let client = clientFor(attemptConfiguration)
                         var emittedOutput = false
@@ -1447,11 +1610,15 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                             result: "started",
                             metadata: [
                                 "providerID": configuration.providerID ?? "",
+                                "host": baseURLCandidate.host ?? "",
+                                "baseURL": ProviderEndpointRoutingPolicy.normalizedOrigin(baseURLCandidate),
                                 "protocol": protocolCandidate.rawValue,
                                 "keyReference": keyCandidate.0,
                                 "keyCandidateIndex": String(keyIndex),
+                                "hostCandidateIndex": String(baseURLIndex),
                                 "protocolCandidateIndex": String(protocolIndex),
                                 "fallbackKey": keyIndex == 0 ? "false" : "true",
+                                "fallbackHost": baseURLIndex == 0 ? "false" : "true",
                                 "fallbackProtocol": protocolIndex == 0 ? "false" : "true"
                             ]
                         )
@@ -1480,6 +1647,11 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                                 reference: keyCandidate.0,
                                 protocolName: protocolCandidate.rawValue
                             )
+                            await requestKeyState.markSuccessfulBaseURL(
+                                routingKey: hostRoutingStateKey,
+                                reference: keyCandidate.0,
+                                baseURL: baseURLCandidate
+                            )
                             try? await diagnosticLogger?.log(
                                 level: .info,
                                 subsystem: "provider",
@@ -1487,9 +1659,12 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                                 result: "completed",
                                 metadata: [
                                     "providerID": configuration.providerID ?? "",
+                                    "host": baseURLCandidate.host ?? "",
+                                    "baseURL": ProviderEndpointRoutingPolicy.normalizedOrigin(baseURLCandidate),
                                     "protocol": protocolCandidate.rawValue,
                                     "keyReference": keyCandidate.0,
                                     "fallbackKey": keyIndex == 0 ? "false" : "true",
+                                    "fallbackHost": baseURLIndex == 0 ? "false" : "true",
                                     "fallbackProtocol": protocolIndex == 0 ? "false" : "true",
                                     "emittedToken": String(emittedToken),
                                     "emittedToolCall": String(emittedToolCall)
@@ -1501,11 +1676,20 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                             continuation.finish(throwing: CancellationError())
                             return
                         } catch {
+                            keyRouteErrors.append(error)
                             lastError = error
                             let hasAnotherProtocol = protocolIndex + 1 < orderedProtocols.count
+                            let hasAnotherHost = baseURLIndex + 1 < orderedBaseURLs.count
                             let hasAnotherKey = keyIndex + 1 < keyCandidates.count
                             let mayFallbackProtocol = !emittedOutput && hasAnotherProtocol && ProviderProtocolFallbackClassifier.shouldFallback(error)
+                            let mayFallbackHost = !emittedOutput && hasAnotherHost && ProviderHostFallbackClassifier.shouldFallback(error)
                             let mayRotateKey = !emittedOutput && hasAnotherKey && configuration.allowSameProviderKeyFailover == true && ProviderKeyRotationClassifier.shouldRotate(error)
+                            if !emittedOutput && ProviderCompatibilityDriftClassifier.shouldDegradeProtocol(error) {
+                                await requestKeyState.markDegraded(routingKey: protocolRoutingStateKey, reference: keyCandidate.0)
+                            }
+                            if !emittedOutput && ProviderCompatibilityDriftClassifier.shouldDegradeHost(error, providerID: configuration.providerID) {
+                                await requestKeyState.markDegraded(routingKey: hostRoutingStateKey, reference: keyCandidate.0)
+                            }
                             try? await diagnosticLogger?.log(
                                 level: .error,
                                 subsystem: "provider",
@@ -1514,15 +1698,20 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                                 error: error,
                                 metadata: [
                                     "providerID": configuration.providerID ?? "",
+                                    "host": baseURLCandidate.host ?? "",
+                                    "baseURL": ProviderEndpointRoutingPolicy.normalizedOrigin(baseURLCandidate),
                                     "protocol": protocolCandidate.rawValue,
                                     "keyReference": keyCandidate.0,
                                     "keyCandidateIndex": String(keyIndex),
+                                    "hostCandidateIndex": String(baseURLIndex),
                                     "protocolCandidateIndex": String(protocolIndex),
                                     "fallbackKey": keyIndex == 0 ? "false" : "true",
+                                    "fallbackHost": baseURLIndex == 0 ? "false" : "true",
                                     "fallbackProtocol": protocolIndex == 0 ? "false" : "true",
                                     "emittedToken": String(emittedToken),
                                     "emittedToolCall": String(emittedToolCall),
                                     "protocolFallbackAllowed": String(mayFallbackProtocol),
+                                    "hostFallbackAllowed": String(mayFallbackHost),
                                     "keyRotationAllowed": String(mayRotateKey)
                                 ]
                             )
@@ -1535,12 +1724,30 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                                     error: error,
                                     metadata: [
                                         "providerID": configuration.providerID ?? "",
+                                        "host": baseURLCandidate.host ?? "",
                                         "keyReference": keyCandidate.0,
                                         "fromProtocol": protocolCandidate.rawValue,
                                         "nextProtocol": orderedProtocols[protocolIndex + 1].rawValue
                                     ]
                                 )
                                 continue
+                            }
+                            if mayFallbackHost {
+                                try? await diagnosticLogger?.log(
+                                    level: .warning,
+                                    subsystem: "provider",
+                                    action: "host.rotate",
+                                    result: "rotating",
+                                    error: error,
+                                    metadata: [
+                                        "providerID": configuration.providerID ?? "",
+                                        "keyReference": keyCandidate.0,
+                                        "protocol": protocolCandidate.rawValue,
+                                        "fromHost": baseURLCandidate.host ?? "",
+                                        "nextHost": orderedBaseURLs[baseURLIndex + 1].host ?? ""
+                                    ]
+                                )
+                                continue hostLoop
                             }
                             if mayRotateKey {
                                 try? await diagnosticLogger?.log(
@@ -1560,9 +1767,12 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                                 )
                                 continue keyLoop
                             }
-                            continuation.finish(throwing: error)
+                            let surfacedError = ProviderRouteFailureAggregator.preferredFailure(keyRouteErrors)
+                            lastError = surfacedError
+                            continuation.finish(throwing: surfacedError)
                             return
                         }
+                    }
                     }
                 }
                 continuation.finish(throwing: lastError)
@@ -1619,11 +1829,14 @@ public enum ProviderCompatibilityClassifier {
         if ProviderFailureEvidence.isCapacity(text) || ProviderFailureEvidence.isCredential(text) || ProviderFailureEvidence.isModelUnavailable(text) {
             return false
         }
+        if text.contains("content-blocked") || text.contains("content blocked") {
+            return false
+        }
         // AgentRouter can accept the same model/protocol for small requests yet reject a later
         // multi-round tool envelope with a generic 400. One bounded retry is safe before output:
         // compact complete tool-call pairs and scope the advertised tool list to the active task
         // family instead of resending the full device toolbox.
-        return messageCount >= 48 || toolCount >= 40 || text.contains("content-blocked") || text.contains("content blocked")
+        return messageCount >= 48 || toolCount >= 40
     }
 
     public static func recoveryToolSchemas(from tools: [ProviderToolSchema], messages: [ChatMessage]) -> [ProviderToolSchema] {
@@ -1721,6 +1934,103 @@ public enum ProviderHTTPClassifier {
     }
 }
 
+public enum ProviderRouteFailureAggregator {
+    /// Prefer evidence that does not condemn the whole credential. An exact Key is considered
+    /// authentication-rejected only when every attempted compatibility route for that Key failed
+    /// as authentication failure. Host/client/protocol/transport evidence stays scoped to the
+    /// attempted route and must not poison the entire Key.
+    public static func preferredFailure(_ errors: [Error]) -> Error {
+        guard let last = errors.last else { return ProviderError.invalidEndpoint }
+        if errors.allSatisfy({ isAuthenticationFailure($0) }) { return last }
+        if let clientRejected = errors.first(where: { ($0 as? ProviderError).map(isClientRejected) == true }) {
+            return clientRejected
+        }
+        if let capacity = errors.first(where: { ($0 as? ProviderError).map(isCapacityOrRateFailure) == true }) {
+            return capacity
+        }
+        if let nonCredential = errors.first(where: { !isAuthenticationFailure($0) }) {
+            return nonCredential
+        }
+        return last
+    }
+
+    public static func isAuthenticationFailure(_ error: Error) -> Bool {
+        guard let providerError = error as? ProviderError else { return false }
+        if case .authenticationFailed = providerError { return true }
+        return false
+    }
+
+    private static func isClientRejected(_ error: ProviderError) -> Bool {
+        if case .clientRejected = error { return true }
+        return false
+    }
+
+    private static func isCapacityOrRateFailure(_ error: ProviderError) -> Bool {
+        switch error {
+        case .capacityExhausted, .rateLimited:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+public enum ProviderCompatibilityDriftClassifier {
+    /// Only exact route evidence is degraded. Transient capacity, rate-limit, upstream 5xx,
+    /// transport, or post-output interruption must never poison the learned compatibility route.
+    public static func shouldDegradeProtocol(_ error: Error) -> Bool {
+        guard let providerError = error as? ProviderError else { return false }
+        switch providerError {
+        case .protocolIncompatible, .malformedEvent:
+            return true
+        case .invalidResponse(let code):
+            return code == 404 || code == 405
+        case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .clientRejected,
+             .capacityExhausted, .modelUnavailable, .rateLimited, .streamInterrupted,
+             .attachmentUnavailable, .attachmentTooLarge, .unsupportedAttachmentType, .transport:
+            return false
+        }
+    }
+
+    public static func shouldDegradeHost(_ error: Error, providerID: String?) -> Bool {
+        guard providerID == ProviderCatalog.agentRouterID,
+              let providerError = error as? ProviderError else { return false }
+        switch providerError {
+        case .authenticationFailed, .clientRejected:
+            return true
+        case .missingAPIKey, .invalidEndpoint, .capacityExhausted, .modelUnavailable,
+             .rateLimited, .malformedEvent, .streamInterrupted, .attachmentUnavailable,
+             .attachmentTooLarge, .unsupportedAttachmentType, .protocolIncompatible,
+             .transport, .invalidResponse:
+            return false
+        }
+    }
+}
+
+public enum ProviderHostFallbackClassifier {
+    /// Host fallback is bounded to alternate API origins owned by the same Provider and is
+    /// considered only before any token/tool output. A 401 on one AgentRouter origin is not
+    /// sufficient to invalidate the Key because legacy and current Key generations can be scoped
+    /// to different origins. Capacity/rate-limit failures stay on the proven host instead.
+    public static func shouldFallback(_ error: Error) -> Bool {
+        guard let providerError = error as? ProviderError else {
+            return ProviderRetryClassifier.isRetryableBeforeOutput(error)
+        }
+        switch providerError {
+        case .authenticationFailed, .clientRejected, .modelUnavailable, .invalidEndpoint, .transport:
+            return true
+        case .invalidResponse(let code):
+            return code == 401 || code == 403 || code == 404 || code == 405
+                || (500...599).contains(code)
+        case .protocolIncompatible, .malformedEvent:
+            return true
+        case .missingAPIKey, .capacityExhausted, .rateLimited, .streamInterrupted,
+             .attachmentUnavailable, .attachmentTooLarge, .unsupportedAttachmentType:
+            return false
+        }
+    }
+}
+
 public enum ProviderProtocolFallbackClassifier {
     /// Protocol failover is only allowed before any provider output. It is reserved for
     /// errors that can plausibly be route/protocol specific; credential/quota/rate-limit
@@ -1733,7 +2043,7 @@ public enum ProviderProtocolFallbackClassifier {
         case .clientRejected:
             return false
         case .invalidResponse(let code):
-            return code == 404 || code == 405 || (500...599).contains(code)
+            return code == 400 || code == 404 || code == 405 || code == 422 || (500...599).contains(code)
         case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .capacityExhausted,
              .rateLimited, .streamInterrupted, .attachmentUnavailable, .attachmentTooLarge,
              .unsupportedAttachmentType, .transport:

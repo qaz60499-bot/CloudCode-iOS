@@ -18,6 +18,12 @@ public struct ProviderDiscoveryResult: Sendable, Equatable {
 }
 
 public struct ProviderDiscoveryClient: Sendable {
+    private enum ProbeOutcome: Sendable, Equatable {
+        case supported
+        case capacityBlocked
+        case unsupported
+    }
+
     private let session: URLSession
 
     public init(session: URLSession = ProviderURLSessionFactory.make()) {
@@ -30,7 +36,8 @@ public struct ProviderDiscoveryClient: Sendable {
         preferredAuthMode: ProviderAuthMode? = nil,
         allowPricingCatalogFallback: Bool = false,
         fallbackInferenceCandidates: [String] = [],
-        inferenceProtocols: [ProviderProtocol] = ProviderProtocol.allCases
+        inferenceProtocols: [ProviderProtocol] = ProviderProtocol.allCases,
+        allowAlternateAuthModes: Bool = true
     ) async throws -> ProviderDiscoveryResult {
         var lastError: Error = ProviderError.missingAPIKey
         var sawAuthoritativeEmptyCatalog = false
@@ -39,6 +46,9 @@ public struct ProviderDiscoveryClient: Sendable {
         if let preferredAuthMode {
             authModes.removeAll { $0.rawValue == preferredAuthMode.rawValue }
             authModes.insert(preferredAuthMode, at: 0)
+        }
+        if !allowAlternateAuthModes {
+            authModes = [preferredAuthMode ?? .bearer]
         }
 
         // Catalog auth and inference auth are deliberately independent. Some compatible
@@ -128,17 +138,23 @@ public struct ProviderDiscoveryClient: Sendable {
             // a real inference probe first, and only live-validated IDs are returned.
             let candidates = Self.unique(fallbackInferenceCandidates)
             let protocolsToProbe = Self.uniqueProtocols(inferenceProtocols)
+            var sawCapacityBlockedProbe = false
             for inferenceAuthMode in authModes {
                 var validatedModels: [String] = []
                 var validatedProtocols: [ProviderProtocol] = []
                 for model in candidates.prefix(12) {
                     var modelSupported = false
                     for protocolName in protocolsToProbe {
-                        if try await probe(protocolName, baseURL: baseURL, apiKey: apiKey, authMode: inferenceAuthMode, model: model) {
+                        switch try await probe(protocolName, baseURL: baseURL, apiKey: apiKey, authMode: inferenceAuthMode, model: model) {
+                        case .supported:
                             modelSupported = true
                             if !validatedProtocols.contains(protocolName) {
                                 validatedProtocols.append(protocolName)
                             }
+                        case .capacityBlocked:
+                            sawCapacityBlockedProbe = true
+                        case .unsupported:
+                            break
                         }
                     }
                     if modelSupported {
@@ -153,6 +169,14 @@ public struct ProviderDiscoveryClient: Sendable {
                         readiness: .ready
                     )
                 }
+            }
+            if sawCapacityBlockedProbe {
+                return ProviderDiscoveryResult(
+                    models: [],
+                    protocols: [],
+                    authMode: preferredAuthMode ?? .both,
+                    readiness: .capacity
+                )
             }
         }
 
@@ -182,12 +206,18 @@ public struct ProviderDiscoveryClient: Sendable {
         // and legacy entries. Do not assume the first row is inference-compatible.
         // Probe a bounded prefix under each inference auth mode and only the protocols
         // this profile actually advertises, keeping validation bounded and fast.
+        var capacityBlockedAuthMode: ProviderAuthMode?
         for inferenceAuthMode in authModes {
             for model in models.prefix(12) {
                 var supported: [ProviderProtocol] = []
                 for protocolName in protocolsToProbe {
-                    if try await probe(protocolName, baseURL: baseURL, apiKey: apiKey, authMode: inferenceAuthMode, model: model) {
+                    switch try await probe(protocolName, baseURL: baseURL, apiKey: apiKey, authMode: inferenceAuthMode, model: model) {
+                    case .supported:
                         supported.append(protocolName)
+                    case .capacityBlocked:
+                        if capacityBlockedAuthMode == nil { capacityBlockedAuthMode = inferenceAuthMode }
+                    case .unsupported:
+                        break
                     }
                 }
                 if !supported.isEmpty {
@@ -200,6 +230,15 @@ public struct ProviderDiscoveryClient: Sendable {
                     )
                 }
             }
+        }
+
+        if let capacityBlockedAuthMode {
+            return ProviderDiscoveryResult(
+                models: models,
+                protocols: [],
+                authMode: capacityBlockedAuthMode,
+                readiness: .capacity
+            )
         }
 
         return ProviderDiscoveryResult(
@@ -367,7 +406,7 @@ public struct ProviderDiscoveryClient: Sendable {
         return result
     }
 
-    private func probe(_ protocolName: ProviderProtocol, baseURL: URL, apiKey: String, authMode: ProviderAuthMode, model: String) async throws -> Bool {
+    private func probe(_ protocolName: ProviderProtocol, baseURL: URL, apiKey: String, authMode: ProviderAuthMode, model: String) async throws -> ProbeOutcome {
         let path: String
         let body: [String: Any]
         switch protocolName {
@@ -392,12 +431,14 @@ public struct ProviderDiscoveryClient: Sendable {
         request.timeoutInterval = 30
         do {
             let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else { return false }
-            if (200..<300).contains(http.statusCode) { return true }
-            if case .capacityExhausted? = ProviderHTTPClassifier.error(for: http.statusCode, body: data) { return true }
-            return false
+            guard let http = response as? HTTPURLResponse else { return .unsupported }
+            if (200..<300).contains(http.statusCode) { return .supported }
+            if case .capacityExhausted? = ProviderHTTPClassifier.error(for: http.statusCode, body: data) {
+                return .capacityBlocked
+            }
+            return .unsupported
         } catch let error as URLError where error.code == .timedOut || error.code == .networkConnectionLost {
-            return false
+            return .unsupported
         }
     }
 

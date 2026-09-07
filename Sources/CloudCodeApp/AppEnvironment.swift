@@ -84,6 +84,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private let sessionStore: SessionStore
     private let attachmentStore: ChatAttachmentStore
     private let keyVault: KeychainAPIKeyVault
+    private let providerRouteState: ProviderRequestKeyState
     private let steeringMailbox: AgentSteeringMailbox
     private let hermesStore: HermesMemoryStore
     private let interactionExperienceStore: IOSInteractionExperienceStore
@@ -276,6 +277,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.sessionStore = sessions
         self.attachmentStore = attachments
         self.keyVault = keyVault
+        self.providerRouteState = providerRouteState
         self.steeringMailbox = steeringMailbox
         self.hermesStore = hermesStore
         self.interactionExperienceStore = interactionExperienceStore
@@ -429,7 +431,8 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public var selectedProviderEndpointHealth: ProviderEndpointHealth? {
-        providerEndpointHealth[selectedProviderID]
+        guard let configuration = currentProviderConfiguration() else { return nil }
+        return providerEndpointHealth[providerEndpointHealthKey(configuration)]
     }
 
     public var availableKeySlots: [ProviderKeySlot] {
@@ -563,6 +566,71 @@ public final class CloudCodeViewModel: ObservableObject {
         }
     }
 
+    private func providerHostRoutingKey(
+        providerID: String,
+        configuredBaseURL: URL,
+        reference: String,
+        keyFingerprint: String,
+        authMode: ProviderAuthMode
+    ) -> String {
+        "evidence:\(ProviderEndpointRoutingPolicy.compatibilityEvidenceRevision)|\(providerID)|configuredBase:\(ProviderEndpointRoutingPolicy.normalizedRouteBase(configuredBaseURL))|reference:\(reference)|key:\(keyFingerprint)|auth:\(authMode.rawValue)|host"
+    }
+
+    private func orderedProviderBaseURLs(
+        provider: ProviderProfile,
+        keySlotID: String,
+        apiKey: String
+    ) async -> [URL] {
+        let reference = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: keySlotID)
+        let fingerprint = ProviderFingerprint.sha256(apiKey)
+        let candidates = ProviderEndpointRoutingPolicy.candidateBaseURLs(
+            providerID: provider.id,
+            configuredBaseURL: provider.baseURL,
+            keyFingerprint: fingerprint
+        )
+        guard !candidates.isEmpty else { return [provider.baseURL] }
+        let routingKey = providerHostRoutingKey(
+            providerID: provider.id,
+            configuredBaseURL: provider.baseURL,
+            reference: reference,
+            keyFingerprint: fingerprint,
+            authMode: provider.authMode
+        )
+        let persisted = await providerRouteState.preferredBaseURL(
+            routingKey: routingKey,
+            reference: reference,
+            allowedBaseURLs: candidates,
+            fallback: candidates[0]
+        )
+        if let index = candidates.firstIndex(where: {
+            ProviderEndpointRoutingPolicy.normalizedOrigin($0) == ProviderEndpointRoutingPolicy.normalizedOrigin(persisted)
+        }) {
+            return (0..<candidates.count).map { offset in candidates[(index + offset) % candidates.count] }
+        }
+        return candidates
+    }
+
+    private func rememberVerifiedProviderBaseURL(
+        _ baseURL: URL,
+        provider: ProviderProfile,
+        keySlotID: String,
+        apiKey: String
+    ) async {
+        let reference = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: keySlotID)
+        let fingerprint = ProviderFingerprint.sha256(apiKey)
+        await providerRouteState.markSuccessfulBaseURL(
+            routingKey: providerHostRoutingKey(
+                providerID: provider.id,
+                configuredBaseURL: provider.baseURL,
+                reference: reference,
+                keyFingerprint: fingerprint,
+                authMode: provider.authMode
+            ),
+            reference: reference,
+            baseURL: baseURL
+        )
+    }
+
     @discardableResult
     public func refreshSelectedProviderModelCatalog(showStatus: Bool = true) async -> Bool {
         guard let provider = selectedProvider,
@@ -579,12 +647,85 @@ public final class CloudCodeViewModel: ObservableObject {
         do {
             let apiKey = try await keyVault.key(for: reference)
             guard !apiKey.isEmpty else { throw ProviderError.missingAPIKey }
-            let models = try await ProviderDiscoveryClient().discoverModels(
-                baseURL: provider.baseURL,
-                apiKey: apiKey,
-                authMode: provider.authMode
-            )
-            guard !models.isEmpty else { throw ProviderError.malformedEvent }
+            let operationKey = "provider-refresh:\(provider.id):\(keySlotID):\(ProviderFingerprint.sha256(apiKey))"
+            guard beginExclusiveOperation(operationKey) else {
+                try? await diagnosticLogStore.log(
+                    level: .info,
+                    subsystem: "provider-discovery",
+                    action: "catalog-refresh",
+                    result: "deduplicated-inflight",
+                    metadata: ["providerID": provider.id, "keySlotID": keySlotID]
+                )
+                return false
+            }
+            defer { endExclusiveOperation(operationKey) }
+            let discoveryClient = ProviderDiscoveryClient()
+            let baseURLs = await orderedProviderBaseURLs(provider: provider, keySlotID: keySlotID, apiKey: apiKey)
+            var discoveredModels: [String]?
+            var acceptedBaseURL: URL?
+            var routeErrors: [Error] = []
+            for (index, candidateBaseURL) in baseURLs.enumerated() {
+                try? await diagnosticLogStore.log(
+                    level: .info,
+                    subsystem: "provider-discovery",
+                    action: "catalog-route.attempt",
+                    result: "started",
+                    metadata: [
+                        "providerID": provider.id,
+                        "keySlotID": keySlotID,
+                        "host": candidateBaseURL.host ?? "",
+                        "candidateIndex": String(index)
+                    ]
+                )
+                do {
+                    let candidateModels = try await discoveryClient.discoverModels(
+                        baseURL: candidateBaseURL,
+                        apiKey: apiKey,
+                        authMode: provider.authMode
+                    )
+                    guard !candidateModels.isEmpty else { throw ProviderError.malformedEvent }
+                    discoveredModels = candidateModels
+                    acceptedBaseURL = candidateBaseURL
+                    try? await diagnosticLogStore.log(
+                        level: .info,
+                        subsystem: "provider-discovery",
+                        action: "catalog-route.attempt",
+                        result: "accepted",
+                        metadata: [
+                            "providerID": provider.id,
+                            "keySlotID": keySlotID,
+                            "host": candidateBaseURL.host ?? "",
+                            "candidateIndex": String(index),
+                            "modelCount": String(candidateModels.count)
+                        ]
+                    )
+                    break
+                } catch {
+                    routeErrors.append(error)
+                    let hasAlternateHost = index + 1 < baseURLs.count
+                    let hostFallbackAllowed = hasAlternateHost && ProviderHostFallbackClassifier.shouldFallback(error)
+                    try? await diagnosticLogStore.log(
+                        level: .warning,
+                        subsystem: "provider-discovery",
+                        action: "catalog-route.attempt",
+                        result: "rejected",
+                        error: error,
+                        metadata: [
+                            "providerID": provider.id,
+                            "keySlotID": keySlotID,
+                            "host": candidateBaseURL.host ?? "",
+                            "candidateIndex": String(index),
+                            "hasAlternateHost": String(hasAlternateHost),
+                            "hostFallbackAllowed": String(hostFallbackAllowed)
+                        ]
+                    )
+                    if !hostFallbackAllowed { break }
+                }
+            }
+            guard let models = discoveredModels, let acceptedBaseURL else {
+                throw ProviderRouteFailureAggregator.preferredFailure(routeErrors)
+            }
+            await rememberVerifiedProviderBaseURL(acceptedBaseURL, provider: provider, keySlotID: keySlotID, apiKey: apiKey)
             guard let providerIndex = providerProfiles.firstIndex(where: { $0.id == provider.id }) else { return false }
             providerProfiles[providerIndex].applyLiveModelCatalog(models, keySlotID: keySlotID, authoritative: true)
             let reconciled = ProviderSelectionResolver.reconcile(
@@ -604,7 +745,8 @@ public final class CloudCodeViewModel: ObservableObject {
                     "providerID": provider.id,
                     "keySlotID": keySlotID,
                     "modelCount": String(models.count),
-                    "source": "authenticated-v1-models"
+                    "source": "authenticated-v1-models",
+                    "host": acceptedBaseURL.host ?? ""
                 ]
             )
             return true
@@ -673,15 +815,18 @@ public final class CloudCodeViewModel: ObservableObject {
 
             if let providerIndex = providerProfiles.firstIndex(where: { $0.id == providerID }),
                let slotIndex = providerProfiles[providerIndex].keySlots.firstIndex(where: { $0.id == keySlotID }) {
-                providerProfiles[providerIndex].keySlots[slotIndex].fingerprint = incomingFingerprint
-                providerProfiles[providerIndex].keySlots[slotIndex].status = .needsValidation
+                providerProfiles[providerIndex].updateKeyFingerprint(
+                    incomingFingerprint,
+                    keySlotID: keySlotID,
+                    status: .needsValidation
+                )
                 if providerProfiles[providerIndex].source == .custom {
                     try? persistCustomProviders()
                 }
             }
 
             await refreshLiveProviderMetadataIfNeeded(providerID: providerID, keySlotID: keySlotID, apiKey: normalizedSecret)
-            providerEndpointHealth.removeValue(forKey: providerID)
+            clearProviderEndpointHealth(providerID: providerID)
             providerFailureSessionIDs.remove(session.id)
             retryableProviderFailureSessionIDs.remove(session.id)
             sessionErrors.removeValue(forKey: session.id)
@@ -2019,8 +2164,11 @@ public final class CloudCodeViewModel: ObservableObject {
             updateManualProviderKeyOverrides { $0.remove(reference) }
             if let providerIndex = providerProfiles.firstIndex(where: { $0.id == provider.id }),
                let slotIndex = providerProfiles[providerIndex].keySlots.firstIndex(where: { $0.id == selectedKeySlotID }) {
-                providerProfiles[providerIndex].keySlots[slotIndex].fingerprint = fingerprint
-                providerProfiles[providerIndex].keySlots[slotIndex].status = .needsValidation
+                providerProfiles[providerIndex].updateKeyFingerprint(
+                    fingerprint,
+                    keySlotID: selectedKeySlotID,
+                    status: .needsValidation
+                )
             }
             let refresh = await refreshLiveProviderMetadataIfNeeded(providerID: provider.id, keySlotID: selectedKeySlotID, apiKey: key.secret)
             providerKeyCheckMessage = refresh.usable
@@ -2044,7 +2192,6 @@ public final class CloudCodeViewModel: ObservableObject {
             return ProviderLiveMetadataRefreshResult(catalogApplied: false, state: .failed, readiness: .needsValidation, modelCount: 0, diagnostic: "厂商、Key 槽位或 Key 内容缺失。")
         }
         let profile = providerProfiles[providerIndex]
-        let baseURL = profile.baseURL
         let preferredAuthMode = profile.authMode
         let inferenceProtocols = profile.protocols
         var fallbackInferenceCandidates = profile.models(for: keySlotID)
@@ -2054,15 +2201,111 @@ public final class CloudCodeViewModel: ObservableObject {
             }
         }
         let allowPricingCatalogFallback = providerID == ProviderCatalog.tabitokenID
-        do {
-            let discovery = try await ProviderDiscoveryClient().discover(
-                baseURL: baseURL,
-                apiKey: apiKey,
-                preferredAuthMode: preferredAuthMode,
-                allowPricingCatalogFallback: allowPricingCatalogFallback,
-                fallbackInferenceCandidates: fallbackInferenceCandidates,
-                inferenceProtocols: inferenceProtocols
+        let operationKey = "provider-refresh:\(providerID):\(keySlotID):\(ProviderFingerprint.sha256(apiKey))"
+        guard beginExclusiveOperation(operationKey) else {
+            try? await diagnosticLogStore.log(
+                level: .info,
+                subsystem: "provider-discovery",
+                action: "refresh",
+                result: "deduplicated-inflight",
+                metadata: ["providerID": providerID, "keySlotID": keySlotID]
             )
+            return ProviderLiveMetadataRefreshResult(
+                catalogApplied: false,
+                state: .inconclusive,
+                readiness: profile.readiness,
+                modelCount: profile.models(for: keySlotID).count,
+                diagnostic: "同一 Key 的实时验证已经在进行中。"
+            )
+        }
+        defer { endExclusiveOperation(operationKey) }
+        do {
+            let discoveryClient = ProviderDiscoveryClient()
+            let baseURLs = await orderedProviderBaseURLs(provider: profile, keySlotID: keySlotID, apiKey: apiKey)
+            var acceptedDiscovery: ProviderDiscoveryResult?
+            var acceptedBaseURL: URL?
+            var routeErrors: [Error] = []
+            for (index, candidateBaseURL) in baseURLs.enumerated() {
+                try? await diagnosticLogStore.log(
+                    level: .info,
+                    subsystem: "provider-discovery",
+                    action: "metadata-route.attempt",
+                    result: "started",
+                    metadata: [
+                        "providerID": providerID,
+                        "keySlotID": keySlotID,
+                        "host": candidateBaseURL.host ?? "",
+                        "candidateIndex": String(index)
+                    ]
+                )
+                do {
+                    let candidateDiscovery = try await discoveryClient.discover(
+                        baseURL: candidateBaseURL,
+                        apiKey: apiKey,
+                        preferredAuthMode: preferredAuthMode,
+                        allowPricingCatalogFallback: allowPricingCatalogFallback,
+                        fallbackInferenceCandidates: fallbackInferenceCandidates,
+                        inferenceProtocols: inferenceProtocols,
+                        allowAlternateAuthModes: providerID != ProviderCatalog.agentRouterID
+                    )
+                    acceptedDiscovery = candidateDiscovery
+                    acceptedBaseURL = candidateBaseURL
+                    let hasAlternateHost = index + 1 < baseURLs.count
+                    let hostFallbackAllowed = hasAlternateHost && candidateDiscovery.readiness != .capacity
+                    try? await diagnosticLogStore.log(
+                        level: candidateDiscovery.readiness == .ready ? .info : .warning,
+                        subsystem: "provider-discovery",
+                        action: "metadata-route.attempt",
+                        result: candidateDiscovery.readiness == .ready ? "accepted" : "inconclusive",
+                        metadata: [
+                            "providerID": providerID,
+                            "keySlotID": keySlotID,
+                            "host": candidateBaseURL.host ?? "",
+                            "candidateIndex": String(index),
+                            "readiness": candidateDiscovery.readiness.rawValue,
+                            "modelCount": String(candidateDiscovery.models.count),
+                            "hasAlternateHost": String(hasAlternateHost),
+                            "hostFallbackAllowed": String(hostFallbackAllowed)
+                        ]
+                    )
+                    if candidateDiscovery.readiness == .ready || !hostFallbackAllowed {
+                        break
+                    }
+                } catch {
+                    routeErrors.append(error)
+                    let hasAlternateHost = index + 1 < baseURLs.count
+                    let hostFallbackAllowed = hasAlternateHost && ProviderHostFallbackClassifier.shouldFallback(error)
+                    try? await diagnosticLogStore.log(
+                        level: .warning,
+                        subsystem: "provider-discovery",
+                        action: "metadata-route.attempt",
+                        result: "rejected",
+                        error: error,
+                        metadata: [
+                            "providerID": providerID,
+                            "keySlotID": keySlotID,
+                            "host": candidateBaseURL.host ?? "",
+                            "candidateIndex": String(index),
+                            "hasAlternateHost": String(hasAlternateHost),
+                            "hostFallbackAllowed": String(hostFallbackAllowed)
+                        ]
+                    )
+                    if !hostFallbackAllowed {
+                        // Preserve evidence from an earlier reachable Host. A later Host-specific
+                        // 401/403 must not overwrite an inconclusive-but-reachable route and mark
+                        // the exact Key globally auth-failed. Only throw when no Host produced any
+                        // discovery evidence at all.
+                        if acceptedDiscovery != nil { break }
+                        throw ProviderRouteFailureAggregator.preferredFailure(routeErrors)
+                    }
+                }
+            }
+            guard let discovery = acceptedDiscovery, let acceptedBaseURL else {
+                throw ProviderRouteFailureAggregator.preferredFailure(routeErrors)
+            }
+            if discovery.readiness == .ready {
+                await rememberVerifiedProviderBaseURL(acceptedBaseURL, provider: profile, keySlotID: keySlotID, apiKey: apiKey)
+            }
             let shouldApplyDiscovery = discovery.readiness == .ready && !discovery.models.isEmpty
             if shouldApplyDiscovery {
                 providerProfiles[providerIndex].applyDiscovery(discovery, keySlotID: keySlotID)
@@ -2088,15 +2331,27 @@ public final class CloudCodeViewModel: ObservableObject {
                     "modelCount": String(discovery.models.count),
                     "readiness": discovery.readiness.rawValue,
                     "catalogApplied": shouldApplyDiscovery ? "true" : "false",
-                    "preservedModelCount": String(profile.models(for: keySlotID).count)
+                    "preservedModelCount": String(profile.models(for: keySlotID).count),
+                    "host": acceptedBaseURL.host ?? ""
                 ]
             )
+            let refreshState: ProviderLiveVerificationState = shouldApplyDiscovery
+                ? .verified
+                : (discovery.readiness == .capacity ? .capacityBlocked : .inconclusive)
+            let diagnostic: String
+            if shouldApplyDiscovery {
+                diagnostic = "上游认证和最小推理验证均已通过。"
+            } else if discovery.readiness == .capacity {
+                diagnostic = "模型目录可读，但推理当前被容量/额度限制阻断；Key 未被判定为无效。"
+            } else {
+                diagnostic = "上游可达，但当前模型/协议尚未完成可用性验证。"
+            }
             return ProviderLiveMetadataRefreshResult(
                 catalogApplied: shouldApplyDiscovery,
-                state: shouldApplyDiscovery ? .verified : .inconclusive,
+                state: refreshState,
                 readiness: discovery.readiness,
                 modelCount: discovery.models.count,
-                diagnostic: shouldApplyDiscovery ? "上游认证和最小推理验证均已通过。" : "上游可达，但当前模型/协议尚未完成可用性验证。"
+                diagnostic: diagnostic
             )
         } catch {
             let state: ProviderLiveVerificationState
@@ -2155,6 +2410,15 @@ public final class CloudCodeViewModel: ObservableObject {
             let names = provider.protocolCandidates(for: selectedModel, keySlotID: candidateSlot.id).map(\.rawValue)
             return (reference, names)
         })
+        let safeProtocolNamesByKeyReference = Dictionary(uniqueKeysWithValues: provider.keySlots.map { candidateSlot in
+            let reference = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: candidateSlot.id)
+            let names = provider.safeProtocolCandidates(for: selectedModel, keySlotID: candidateSlot.id).map(\.rawValue)
+            return (reference, names)
+        })
+        let keyFingerprintsByReference = Dictionary(uniqueKeysWithValues: provider.keySlots.map { candidateSlot in
+            let reference = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: candidateSlot.id)
+            return (reference, candidateSlot.fingerprint)
+        })
         return ProviderConfiguration(
             name: provider.displayName,
             baseURL: provider.baseURL,
@@ -2166,6 +2430,8 @@ public final class CloudCodeViewModel: ObservableObject {
             fallbackAPIKeyReferences: provider.autoRotateKeys ? Array(references.dropFirst()) : [],
             fallbackProtocolNames: Array(protocolCandidates.dropFirst()).map(\.rawValue),
             protocolNamesByKeyReference: protocolNamesByKeyReference,
+            safeProtocolNamesByKeyReference: safeProtocolNamesByKeyReference,
+            keyFingerprintsByReference: keyFingerprintsByReference,
             allowSameProviderKeyFailover: provider.autoRotateKeys,
             reasoningEffort: selectedReasoningEffort
         )
@@ -2316,8 +2582,11 @@ public final class CloudCodeViewModel: ObservableObject {
                 if let declared = key.fingerprint, !declared.isEmpty, declared != fingerprint {
                     throw CocoaError(.fileReadCorruptFile)
                 }
-                providerProfiles[providerIndex].keySlots[slotIndex].fingerprint = fingerprint
-                if let status { providerProfiles[providerIndex].keySlots[slotIndex].status = status }
+                providerProfiles[providerIndex].updateKeyFingerprint(
+                    fingerprint,
+                    keySlotID: key.slotID,
+                    status: status
+                )
                 customProviderChanged = customProviderChanged || providerProfiles[providerIndex].source == .custom
             }
         }
@@ -2493,7 +2762,19 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private func providerEndpointHealthKey(_ configuration: ProviderConfiguration) -> String {
-        configuration.providerID ?? configuration.baseURL.host ?? configuration.baseURL.absoluteString
+        [
+            configuration.providerID ?? "custom",
+            ProviderEndpointRoutingPolicy.normalizedRouteBase(configuration.baseURL),
+            configuration.apiKeyReference,
+            configuration.model.lowercased(),
+            configuration.authModeName ?? ProviderAuthMode.bearer.rawValue,
+            configuration.protocolName ?? ""
+        ].joined(separator: "|")
+    }
+
+    private func clearProviderEndpointHealth(providerID: String) {
+        let prefix = providerID + "|"
+        providerEndpointHealth = providerEndpointHealth.filter { !$0.key.hasPrefix(prefix) }
     }
 
     private func markProviderEndpointHealthy(_ configuration: ProviderConfiguration) {
