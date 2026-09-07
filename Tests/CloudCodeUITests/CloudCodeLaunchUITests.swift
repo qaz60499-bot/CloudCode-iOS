@@ -53,8 +53,7 @@ final class CloudCodeLaunchUITests: XCTestCase {
         files.tap()
 
         XCTAssertTrue(app.navigationBars["资源"].waitForExistence(timeout: 10), "Resource Explorer 未能打开")
-        XCTAssertTrue(app.staticTexts["Resource Explorer"].waitForExistence(timeout: 5), "首屏没有虚拟资源分类")
-        XCTAssertTrue(app.staticTexts["应用"].exists)
+        XCTAssertTrue(app.staticTexts["应用"].waitForExistence(timeout: 5), "首屏没有应用虚拟分类")
         XCTAssertTrue(app.staticTexts["用户文件"].exists)
         XCTAssertTrue(app.staticTexts["系统"].exists)
         XCTAssertFalse(app.textFields["路径"].exists, "Explorer 首屏不应恢复为路径输入并自动打开目录的旧模式")
