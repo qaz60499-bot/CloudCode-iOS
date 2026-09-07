@@ -1629,32 +1629,47 @@ public actor AgentCore {
                                             }
                                         }
                                         if var explanation = resolvedExplanation {
-                                        let budgetKey = Self.diagnosticRecoveryBudgetKey(for: explanation.failureSignature)
-                                        let usedRecovery = max(0, Int(checkpoint.payload[budgetKey] ?? "0") ?? 0)
-                                        if usedRecovery >= 2 {
-                                            explanation.automaticRecoveryAllowed = false
-                                            explanation.recoveryReason = "recovery_budget_exhausted"
-                                            explanation.developerPatchLikelyRequired = true
-                                            explanation.recommendedNextAction = "stop_automatic_retry_and_emit_developer_diagnosis"
-                                            exhaustedDiagnosticFailureSignature = explanation.failureSignature
-                                        } else if explanation.automaticRecoveryAllowed {
-                                            checkpoint.payload[budgetKey] = String(usedRecovery + 1)
-                                        }
-                                        let diagnosisInstruction = explanation.recoveryReason == "diagnostic_only_route_degradation"
-                                            ? "A bounded local route-degradation diagnosis is available from existing redacted evidence. The selected route already completed successfully; continue from that result and do not spend a recovery attempt solely because fallback depth increased."
-                                            : "A bounded local failure diagnosis is available from existing redacted evidence. Use it for the next re-plan; do not call diagnostics again for this same failure unless new evidence appears."
-                                        session.messages.append(ChatMessage(
-                                            role: .system,
-                                            content: "\(diagnosisInstruction) \(Self.boundedDiagnosisContext(explanation))",
-                                            providerMetadata: [
-                                                "context_layer": "automatic_failure_diagnosis",
-                                                "failure_signature": explanation.failureSignature,
-                                                "automatic_recovery_allowed": explanation.automaticRecoveryAllowed ? "true" : "false",
-                                                "recovery_reason": explanation.recoveryReason
-                                            ]
-                                        ))
-                                        checkpoint.updatedAt = Date()
-                                        try? await checkpointStore.upsert(checkpoint)
+                                            let budgetKey = Self.diagnosticRecoveryBudgetKey(for: explanation.failureSignature)
+                                            let usedRecovery = max(0, Int(checkpoint.payload[budgetKey] ?? "0") ?? 0)
+                                            if usedRecovery >= 2 {
+                                                explanation.automaticRecoveryAllowed = false
+                                                explanation.recoveryReason = "recovery_budget_exhausted"
+                                                explanation.developerPatchLikelyRequired = true
+                                                explanation.recommendedNextAction = "stop_automatic_retry_and_emit_developer_diagnosis"
+                                                exhaustedDiagnosticFailureSignature = explanation.failureSignature
+                                            } else if explanation.automaticRecoveryAllowed {
+                                                checkpoint.payload[budgetKey] = String(usedRecovery + 1)
+                                            }
+                                            let diagnosisInstruction = explanation.recoveryReason == "diagnostic_only_route_degradation"
+                                                ? "A bounded local route-degradation diagnosis is available from existing redacted evidence. The selected route already completed successfully; continue from that result and do not spend a recovery attempt solely because fallback depth increased."
+                                                : "A bounded local failure diagnosis is available from existing redacted evidence. Use it for the next re-plan; do not call diagnostics again for this same failure unless new evidence appears."
+                                            session.messages.append(ChatMessage(
+                                                role: .system,
+                                                content: "\(diagnosisInstruction) \(Self.boundedDiagnosisContext(explanation))",
+                                                providerMetadata: [
+                                                    "context_layer": "automatic_failure_diagnosis",
+                                                    "failure_signature": explanation.failureSignature,
+                                                    "automatic_recovery_allowed": explanation.automaticRecoveryAllowed ? "true" : "false",
+                                                    "recovery_reason": explanation.recoveryReason
+                                                ]
+                                            ))
+                                            checkpoint.updatedAt = Date()
+                                            try? await checkpointStore.upsert(checkpoint)
+                                        } else if successfulRouteDegradation {
+                                            // A successful route mismatch/deep fallback is already sufficient bounded
+                                            // routing evidence. Never silently lose it just because the richer diagnostic
+                                            // package could not be reconstructed from file-backed logs. This path is
+                                            // diagnostic-only: it performs no probe, executor call, or automatic retry.
+                                            session.messages.append(ChatMessage(
+                                                role: .system,
+                                                content: "A bounded local route-degradation diagnosis is available from the completed tool result. The selected fallback route succeeded; continue from that result and do not spend a recovery attempt solely because the preferred route was unavailable.",
+                                                providerMetadata: [
+                                                    "context_layer": "automatic_failure_diagnosis",
+                                                    "failure_signature": "tool_routing.route_selection.deep_route_fallback",
+                                                    "automatic_recovery_allowed": "false",
+                                                    "recovery_reason": "diagnostic_only_route_degradation"
+                                                ]
+                                            ))
                                         }
                                     }
                                     if result.success {
