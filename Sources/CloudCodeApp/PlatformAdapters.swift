@@ -13,6 +13,60 @@ public enum AppUninstallOutcome: Sendable, Equatable {
     case verificationTimedOut(String)
 }
 
+enum EmbeddedVisionHelper {
+    static let executableName = "CloudCodeVisionHelper"
+    static let expectedProtocolMarker = "cloudcode-vision-helper-protocol=1"
+
+    static var executablePath: String {
+        Bundle.main.bundleURL.appendingPathComponent(executableName, isDirectory: false).path
+    }
+
+    private static let embeddedHelperMatchesExpectedProtocol: Bool = {
+        guard let markerData = expectedProtocolMarker.data(using: .utf8),
+              let helperData = try? Data(contentsOf: URL(fileURLWithPath: executablePath), options: [.mappedIfSafe]) else {
+            return false
+        }
+        return helperData.range(of: markerData) != nil
+    }()
+
+    static func guiOCR(jpegData: Data, maximumElements: Int) -> (json: String?, detail: String) {
+        guard embeddedHelperMatchesExpectedProtocol,
+              FileManager.default.isExecutableFile(atPath: executablePath),
+              GUIAutomationPayloadPolicy.isValidScreenshotJPEG(jpegData) else {
+            return (nil, "轻量 Vision helper 当前不可用或输入不是有效 bounded JPEG。")
+        }
+        let boundedMaximum = min(max(maximumElements, 1), 48)
+        let inputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CloudCode-GUI-OCR-\(UUID().uuidString).jpg", isDirectory: false)
+        guard FileManager.default.createFile(atPath: inputURL.path, contents: jpegData) else {
+            return (nil, "无法为轻量 Vision helper 创建受控 tmp JPEG。")
+        }
+        // The ordinary helper runs under the same mobile user as the host App. Keep the transient
+        // screenshot owner-only so introducing a non-root OCR fallback does not widen local read access.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: inputURL.path)
+        defer { try? FileManager.default.removeItem(at: inputURL) }
+
+        var standardOutput: NSString?
+        var standardError: NSString?
+        let code = CloudCodeSpawnHelperWithSeparatedOutput(
+            executablePath,
+            ["ocr-file", inputURL.path, String(boundedMaximum)],
+            false,
+            4,
+            &standardOutput,
+            &standardError
+        )
+        let stdout = (standardOutput as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let stderr = (standardError as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard code == 0, !stdout.isEmpty, stdout.utf8.count <= 64 * 1024 else {
+            let diagnostic = stderr.isEmpty ? stdout : stderr
+            return (nil, diagnostic.isEmpty ? "轻量 Vision helper 退出码 \(code)。" : "轻量 Vision helper 退出码 \(code)：\(diagnostic)")
+        }
+        let suffix = stderr.isEmpty ? "" : " helper diagnostics: \(stderr)"
+        return (stdout, "OCR 已在无 root/private GUI entitlement 的轻量 Vision helper 中执行。\(suffix)")
+    }
+}
+
 enum EmbeddedRootHelper {
     struct EnumeratedApp: Decodable {
         var bundleID: String
@@ -412,20 +466,22 @@ enum EmbeddedRootHelper {
     }
 
     static func guiTree() -> (tree: String?, detail: String) {
-        // Structured UI is the preferred fast path, but an inaccessible/custom-rendered foreground
-        // must fail quickly so the router can fall back to screenshot/Vision rather than burning a
-        // provider-scale latency budget inside AX. The helper also applies sub-second AX request
-        // timeouts per candidate root; this outer deadline bounds the whole fallback chain.
-        let result = runSeparated(["gui-tree-json"], privilege: .root, timeout: 3)
+        // AX is an accessibility-client capability, not a UID-0 capability. The real-device build
+        // repeatedly timed out when the detached helper was spawned as persona-99/root. Execute the
+        // same entitlement-bearing helper as the ordinary mobile user instead; if iOS refuses this
+        // standalone client, fail quickly and let screenshot/OCR remain the deterministic path.
+        // Full XCTest/XCAXClient behavior requires an automation session and cannot be manufactured
+        // merely by adding root privileges to a TrollStore process.
+        let result = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 1.5)
         guard result.code == 0, !result.stdout.isEmpty else {
             let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
-            return (nil, failureDetail(prefix: "GUI tree", code: result.code, diagnostic: diagnostic))
+            return (nil, failureDetail(prefix: "GUI tree (mobile AX client)", code: result.code, diagnostic: diagnostic))
         }
         guard result.stdout.utf8.count <= 256 * 1024 else {
             return (nil, "GUI tree 输出超过 256 KiB 限制，已 fail closed。")
         }
         let diagnosticSuffix = result.stderr.isEmpty ? "" : " helper diagnostics: \(result.stderr)"
-        return (result.stdout, "AXRuntime tree 已返回。\(diagnosticSuffix)")
+        return (result.stdout, "AXRuntime tree 已由 mobile 身份 helper 返回。\(diagnosticSuffix)")
     }
 
     static func guiScreenshot() -> (data: Data?, detail: String) {
@@ -442,6 +498,9 @@ enum EmbeddedRootHelper {
         guard FileManager.default.createFile(atPath: outputURL.path, contents: Data()) else {
             return (nil, "GUI screenshot 无法在 App tmp 中创建受控输出文件。")
         }
+        // Root must overwrite this app-owned inode in place. Keep the transient screenshot private
+        // to the mobile owner while still allowing the privileged helper to write it.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: outputURL.path)
         defer { try? FileManager.default.removeItem(at: outputURL) }
         let result = run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)
         guard result.code == 0 else {
@@ -453,32 +512,6 @@ enum EmbeddedRootHelper {
         }
         let routeDetail = result.diagnostic.isEmpty ? "" : " helper diagnostics: \(result.diagnostic)"
         return (data, "全局截图已通过独立 tmp JPEG 通道返回。\(routeDetail)")
-    }
-
-    static func guiOCR(jpegData: Data, maximumElements: Int) -> (json: String?, detail: String) {
-        guard embeddedHelperMatchesExpectedProtocol,
-              FileManager.default.isExecutableFile(atPath: executablePath),
-              GUIAutomationPayloadPolicy.isValidScreenshotJPEG(jpegData) else {
-            return (nil, "隔离 OCR helper 当前不可用或输入不是有效 bounded JPEG。")
-        }
-        let boundedMaximum = min(max(maximumElements, 1), 48)
-        let inputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("CloudCode-GUI-OCR-\(UUID().uuidString).jpg", isDirectory: false)
-        guard FileManager.default.createFile(atPath: inputURL.path, contents: jpegData) else {
-            return (nil, "无法为隔离 OCR helper 创建受控 tmp JPEG。")
-        }
-        defer { try? FileManager.default.removeItem(at: inputURL) }
-        let result = runSeparated(
-            ["gui-ocr-file", inputURL.path, String(boundedMaximum)],
-            privilege: .root,
-            timeout: 4
-        )
-        guard result.code == 0, !result.stdout.isEmpty, result.stdout.utf8.count <= 64 * 1024 else {
-            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
-            return (nil, failureDetail(prefix: "隔离本地 Vision OCR", code: result.code, diagnostic: diagnostic))
-        }
-        let diagnosticSuffix = result.stderr.isEmpty ? "" : " helper diagnostics: \(result.stderr)"
-        return (result.stdout, "本地 Vision OCR 已在隔离 root helper 内执行。\(diagnosticSuffix)")
     }
 
     static func guiTap(x: Double, y: Double) -> (success: Bool, detail: String) {
@@ -1833,8 +1866,38 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 attachments: attachment.map { [$0] }
             )
         case "gui.tree":
+            let axStartedAt = Date()
             let tree = try await backend.tree()
-            return ToolResult(toolCallID: call.id, success: true, summary: "GUI tree read", payload: ["tree": ToolOutputEnvelope(trust: .untrustedData, source: "gui.tree", content: tree).promptSafeRepresentation])
+            let axLatencyMS = max(0, Int(Date().timeIntervalSince(axStartedAt) * 1_000))
+            var payload: [String: String] = [
+                "tree": ToolOutputEnvelope(trust: .untrustedData, source: "gui.tree", content: tree).promptSafeRepresentation,
+                "perceptionClass": "accessibility_tree",
+                "perceptionAXAttempted": "true",
+                "perceptionAXSucceeded": "true",
+                "perceptionOCRInvoked": "false",
+                "perceptionOCRSucceeded": "false",
+                "axStage": "direct_root_then_sampled_hit_test",
+                "axLatencyMS": String(axLatencyMS)
+            ]
+            if let data = tree.data(using: .utf8),
+               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let scope = object["scope"] as? String ?? "unknown"
+                payload["axScope"] = scope
+                payload["axBackend"] = object["backend"] as? String ?? "unknown"
+                if let nodeCount = object["nodeCount"] as? NSNumber { payload["axNodeCount"] = nodeCount.stringValue }
+                let complete = scope == "full_application_tree_opportunistic"
+                payload["perceptionLocalSufficient"] = complete ? "true" : "false"
+                payload["perceptionRemoteVisionRequired"] = complete ? "false" : "true"
+                payload["perceptionFallbackReason"] = complete ? "fresh_ax_application_tree" : "bounded_ax_sampled_semantics"
+                payload["providerVisualRoundTripAvoided"] = complete ? "1" : "0"
+            } else {
+                payload["axScope"] = "unknown"
+                payload["perceptionLocalSufficient"] = "false"
+                payload["perceptionRemoteVisionRequired"] = "true"
+                payload["perceptionFallbackReason"] = "ax_tree_scope_unparsed"
+                payload["providerVisualRoundTripAvoided"] = "0"
+            }
+            return ToolResult(toolCallID: call.id, success: true, summary: "GUI tree read", payload: payload)
         case "gui.findElement":
             let resolved = try await resolveElement(call)
             return ToolResult(
@@ -1886,7 +1949,33 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.tapTextObserve":
             let baseline = try await backend.screenshot()
             let baselineSHA256 = GUIAutomationPayloadPolicy.sha256Hex(baseline)
-            let resolved = try await resolveLocalVisionText(call, screenshot: baseline)
+            let resolution = await resolveLocalVisionText(call, screenshot: baseline)
+            guard let resolved = resolution.match else {
+                let attachment = try persistScreenshotAttachment(baseline, sessionID: call.sessionID)
+                var payload: [String: String] = [
+                    "sha256": baselineSHA256,
+                    "baselineSHA256": baselineSHA256,
+                    "effectVerification": "not_dispatched",
+                    "localObservation": "baseline_screenshot_attached",
+                    "perceptionClass": "local_ocr_text_lookup",
+                    "perceptionAXAttempted": "false",
+                    "perceptionAXSucceeded": "false",
+                    "perceptionAnchorCacheHit": "false",
+                    "perceptionLocalSufficient": "false",
+                    "perceptionRemoteVisionRequired": "true",
+                    "perceptionFallbackReason": resolution.failureReason ?? "ocr_target_not_recognized",
+                    "providerVisualRoundTripAvoided": "0"
+                ]
+                enrichWithLocalVision(&payload, observation: resolution.observation)
+                payload["localVisionFailureClass"] = resolution.failureReason ?? "ocr_target_not_recognized"
+                return ToolResult(
+                    toolCallID: call.id,
+                    success: false,
+                    summary: resolution.failureSummary ?? "Local OCR text lookup did not produce one unique current-frame target.",
+                    payload: payload,
+                    attachments: attachment.map { [$0] }
+                )
+            }
             guard !Self.isProtectedLocalVisionText(resolved.text) else {
                 throw ToolRouterError.noExecutionRoute("protected/system-confirmation OCR text cannot be automated")
             }
@@ -1938,7 +2027,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             try Task.checkCancellation()
             let data = try await backend.screenshot()
             let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
-            let observation = await LocalVisionTextObservation.observe(for: data, maximumElements: 48)
+            let observation = await LocalVisionTextObservation.observe(for: data, maximumElements: 48, requiresText: true)
             let screenHeight = Double(observation.payload["screenPointHeight"] ?? "") ?? Double(image.size.height)
             let keyboardLikely = LocalKeyboardHeuristic.isLikelyVisible(elements: observation.elements, screenHeight: screenHeight)
             var payload: [String: String] = [
@@ -2181,14 +2270,19 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             }
             hashes.append(hash)
             sampledCount += 1
-            let observation = await LocalVisionTextObservation.observe(for: data, maximumElements: 32)
+            let observation = await LocalVisionTextObservation.observe(
+                for: data,
+                maximumElements: requestedMetric == nil ? 32 : 48,
+                requiresText: requestedMetric != nil
+            )
             let local = observation.payload
             localElementSamples.append(observation.elements)
             let localWidth = Double(local["screenPointWidth"] ?? "") ?? 0
             let localHeight = Double(local["screenPointHeight"] ?? "") ?? 0
             localScreenSamples.append(LocalPerceptionScreenSize(width: localWidth, height: localHeight))
             totalOCRLatencyMS += Int(local["localVisionLatencyMS"] ?? "0") ?? 0
-            if local["localVisionOCR"] == "recognized" { successfulOCRSamples += 1 }
+            let ocrStatus = local["localVisionOCR"] ?? ""
+            if ocrStatus == "recognized" || ocrStatus == "available_empty" { successfulOCRSamples += 1 }
             localVisionSamples.append([
                 "sample": String(sampledCount),
                 "status": local["localVisionOCR"] ?? "unavailable",
@@ -2292,7 +2386,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                     if let attachment = try persistScreenshotAttachment(returnedFrameData, sessionID: call.sessionID) {
                         attachments.append(attachment)
                     }
-                    let returnedObservation = await LocalVisionTextObservation.observe(for: returnedFrameData, maximumElements: 32)
+                    let returnedObservation = await LocalVisionTextObservation.observe(for: returnedFrameData, maximumElements: 48, requiresText: true)
                     totalOCRLatencyMS += Int(returnedObservation.payload["localVisionLatencyMS"] ?? "0") ?? 0
                     let returnedScreenSize = LocalPerceptionScreenSize(
                         width: Double(returnedObservation.payload["screenPointWidth"] ?? "") ?? 0,
@@ -2320,8 +2414,36 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             } else {
                 payload["perceptionFallbackReason"] = "selected_item_return_unverified"
             }
-        } else if requestedMetric != nil && requestedSelection != nil {
+        } else if let metric = requestedMetric, requestedSelection != nil {
             payload["localMetricExtraction"] = completed ? "incomplete_or_ambiguous" : "sequence_incomplete"
+            if completed {
+                let statuses = localVisionSamples.compactMap { $0["status"] }
+                let failureReason: String
+                if statuses.contains(where: { $0.hasPrefix("unavailable") }) {
+                    failureReason = "ocr_request_failed"
+                } else if statuses.contains("available_empty") {
+                    failureReason = "ocr_completed_no_text"
+                } else {
+                    let reasons = localElementSamples.indices.compactMap { index in
+                        LocalFeedMetricExtractor.failureReason(
+                            metric: metric,
+                            elements: localElementSamples[index],
+                            screenSize: localScreenSamples.indices.contains(index) ? localScreenSamples[index] : nil
+                        )
+                    }
+                    if reasons.contains("compact_count_normalization_failed") {
+                        failureReason = "compact_count_normalization_failed"
+                    } else if reasons.contains("right_rail_anchor_classification_failed") {
+                        failureReason = "right_rail_anchor_classification_failed"
+                    } else if let first = reasons.first {
+                        failureReason = first
+                    } else {
+                        failureReason = "local_metric_incomplete_or_ambiguous"
+                    }
+                }
+                payload["localVisionFailureClass"] = failureReason
+                payload["perceptionFallbackReason"] = failureReason
+            }
         }
 
         let localSufficient = payload["perceptionLocalSufficient"] == "true"
@@ -2651,33 +2773,36 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         throw lastError ?? ToolRouterError.noExecutionRoute("structured element did not appear before timeout")
     }
 
-    private func resolveLocalVisionText(_ call: ToolCall, screenshot: Data) async throws -> LocalPerceptionTextElement {
-        let query = (call.arguments["query"] ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+    private func resolveLocalVisionText(
+        _ call: ToolCall,
+        screenshot: Data
+    ) async -> (match: LocalPerceptionTextElement?, observation: LocalVisionTextObservation.Observation, failureReason: String?, failureSummary: String?) {
+        let query = call.arguments["query"] ?? ""
         let mode = GUIElementMatchMode(rawValue: call.arguments["match"] ?? "exact") ?? .exact
-        let observation = await LocalVisionTextObservation.observe(for: screenshot, maximumElements: 40)
-        guard observation.payload["localVisionOCR"] == "recognized" else {
-            let status = observation.payload["localVisionOCR"] ?? "unavailable"
-            throw ToolRouterError.noExecutionRoute("local OCR text lookup unavailable: \(status)")
+        let observation = await LocalVisionTextObservation.observe(for: screenshot, maximumElements: 48, requiresText: true)
+        let status = observation.payload["localVisionOCR"] ?? "unavailable"
+        guard status == "recognized" else {
+            let reason = status == "available_empty" ? "ocr_completed_no_text" : "ocr_request_failed"
+            return (nil, observation, reason, "Local OCR text lookup could not resolve a target: \(status).")
         }
-        let matches = observation.elements.filter { element in
-            guard element.confidence >= 0.12, element.width > 0, element.height > 0 else { return false }
-            let candidate = element.text
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
-            switch mode {
-            case .exact: return candidate == query
-            case .contains: return candidate.contains(query)
-            }
+        switch LocalPerceptionTextMatcher.resolve(query: query, mode: mode, elements: observation.elements) {
+        case .unique(let match):
+            return (match, observation, nil, nil)
+        case .ambiguous(let count):
+            return (
+                nil,
+                observation,
+                "ocr_unique_match_ambiguous",
+                "Local OCR text query is ambiguous (\(count) matches); refine the query instead of guessing coordinates."
+            )
+        case .notFound:
+            return (
+                nil,
+                observation,
+                "ocr_target_not_recognized",
+                "Local OCR completed, but the requested visible text did not produce one unique current-frame match."
+            )
         }
-        guard matches.count == 1 else {
-            if matches.isEmpty {
-                throw ToolRouterError.noExecutionRoute("local OCR text query returned no unique visible match")
-            }
-            throw ToolRouterError.noExecutionRoute("local OCR text query is ambiguous (\(matches.count) matches); refine the query instead of guessing coordinates")
-        }
-        return matches[0]
     }
 
     private func elementPayload(_ match: GUIElementMatch, treeHash: String, cacheHit: Bool) -> [String: String] {
@@ -2743,7 +2868,8 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             payload[key] = value
         }
         payload["perceptionOCRInvoked"] = "true"
-        payload["perceptionOCRSucceeded"] = local["localVisionOCR"] == "recognized" ? "true" : "false"
+        let ocrStatus = local["localVisionOCR"] ?? ""
+        payload["perceptionOCRSucceeded"] = (ocrStatus == "recognized" || ocrStatus == "available_empty") ? "true" : "false"
         payload["perceptionOCRLatencyMS"] = local["localVisionLatencyMS"] ?? "0"
         if payload["perceptionAXAttempted"] == nil { payload["perceptionAXAttempted"] = "false" }
         if payload["perceptionAXSucceeded"] == nil { payload["perceptionAXSucceeded"] = "false" }

@@ -206,8 +206,11 @@ public struct DiagnosticReplayEvidence: Codable, Equatable, Sendable {
             "perceptionRemoteVisionRequired", "perceptionFallbackReason", "providerVisualRoundTripAvoided",
             "sha256", "screenPointWidth", "screenPointHeight", "localVisionOCR", "localVisionElementCount",
             "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion", "localVisionRecognitionLevel", "localVisionFallbackUsed", "localVisionBackend",
-            "localVisionErrorDomain", "localVisionErrorCode", "localVisionPrimaryErrorDomain", "localVisionPrimaryErrorCode", "treeHash",
-            "coordinateSafety", "providerImageRoute", "keyboardLikely", "focusStrategy", "textInputSafety", "cache", "idempotency",
+            "localVisionFailureClass", "localVisionErrorDomain", "localVisionErrorCode", "localVisionPrimaryErrorDomain", "localVisionPrimaryErrorCode",
+            "localVisionSecondaryBackend", "localVisionSecondaryStatus", "localVisionSecondaryErrorDomain", "localVisionSecondaryErrorCode", "treeHash",
+            "coordinateSafety", "providerImageRoute", "keyboardLikely", "focusStrategy", "textInputSafety", "localMetric", "localMetricSelection", "localMetricExtraction", "cache", "idempotency",
+            "axBackend", "axStage", "axScope", "axNodeCount", "axErrorDomain", "axErrorCode", "axLatencyMS",
+            "providerVisionCapability", "providerVisionCapabilitySource", "selectedPerceptionRoute",
             "routeSelectionLatencyMS", "executionLatencyMS", "totalLatencyMS"
         ])
         var result: [String: String] = [:]
@@ -368,6 +371,109 @@ public struct DiagnosticProblemPackage: Sendable {
     }
 }
 
+public struct DiagnosticFailureExplanation: Codable, Equatable, Sendable {
+    public var failureSignature: String
+    public var failureLayer: DiagnosticFailureLayer
+    public var failureStage: String
+    public var observedOutcome: String
+    public var verificationStatus: String
+    public var affectedSubsystem: String
+    public var recentAttemptCount: Int
+    public var routeCandidates: [String]
+    public var selectedRoute: String?
+    public var fallbackReason: String?
+    public var fallbackDepth: Int
+    public var axAttempted: Bool
+    public var axSucceeded: Bool
+    public var axLatencyMS: Int?
+    public var ocrInvoked: Bool
+    public var ocrSucceeded: Bool
+    public var ocrLatencyMS: Int?
+    public var screenshotStatus: String
+    public var localVisionStatus: String
+    public var foregroundVerificationStatus: String
+    public var relevantCapabilities: [String: String]
+    public var probableCauses: [String]
+    public var evidenceSummary: [String]
+    public var recommendedNextAction: String
+    public var automaticRecoveryAllowed: Bool
+    public var recoveryReason: String
+    public var developerPatchLikelyRequired: Bool
+    public var previousFailureSignature: String?
+    public var currentFailureSignature: String
+    public var changedLayer: String?
+    public var progressObserved: Bool?
+    public var remainingFailure: String
+
+    public init(
+        failureSignature: String,
+        failureLayer: DiagnosticFailureLayer,
+        failureStage: String,
+        observedOutcome: String,
+        verificationStatus: String,
+        affectedSubsystem: String,
+        recentAttemptCount: Int,
+        routeCandidates: [String],
+        selectedRoute: String?,
+        fallbackReason: String?,
+        fallbackDepth: Int,
+        axAttempted: Bool,
+        axSucceeded: Bool,
+        axLatencyMS: Int?,
+        ocrInvoked: Bool,
+        ocrSucceeded: Bool,
+        ocrLatencyMS: Int?,
+        screenshotStatus: String,
+        localVisionStatus: String,
+        foregroundVerificationStatus: String,
+        relevantCapabilities: [String: String],
+        probableCauses: [String],
+        evidenceSummary: [String],
+        recommendedNextAction: String,
+        automaticRecoveryAllowed: Bool,
+        recoveryReason: String,
+        developerPatchLikelyRequired: Bool,
+        previousFailureSignature: String?,
+        currentFailureSignature: String,
+        changedLayer: String?,
+        progressObserved: Bool?,
+        remainingFailure: String
+    ) {
+        self.failureSignature = failureSignature
+        self.failureLayer = failureLayer
+        self.failureStage = failureStage
+        self.observedOutcome = observedOutcome
+        self.verificationStatus = verificationStatus
+        self.affectedSubsystem = affectedSubsystem
+        self.recentAttemptCount = max(1, recentAttemptCount)
+        self.routeCandidates = Array(routeCandidates.prefix(8))
+        self.selectedRoute = selectedRoute
+        self.fallbackReason = fallbackReason
+        self.fallbackDepth = max(0, fallbackDepth)
+        self.axAttempted = axAttempted
+        self.axSucceeded = axSucceeded
+        self.axLatencyMS = axLatencyMS
+        self.ocrInvoked = ocrInvoked
+        self.ocrSucceeded = ocrSucceeded
+        self.ocrLatencyMS = ocrLatencyMS
+        self.screenshotStatus = screenshotStatus
+        self.localVisionStatus = localVisionStatus
+        self.foregroundVerificationStatus = foregroundVerificationStatus
+        self.relevantCapabilities = relevantCapabilities
+        self.probableCauses = Array(probableCauses.prefix(6))
+        self.evidenceSummary = Array(evidenceSummary.prefix(12))
+        self.recommendedNextAction = recommendedNextAction
+        self.automaticRecoveryAllowed = automaticRecoveryAllowed
+        self.recoveryReason = recoveryReason
+        self.developerPatchLikelyRequired = developerPatchLikelyRequired
+        self.previousFailureSignature = previousFailureSignature
+        self.currentFailureSignature = currentFailureSignature
+        self.changedLayer = changedLayer
+        self.progressObserved = progressObserved
+        self.remainingFailure = remainingFailure
+    }
+}
+
 public enum DiagnosticProblemPackageBuilder {
     public static func build(
         records: [DiagnosticLogRecord],
@@ -440,12 +546,219 @@ public enum DiagnosticProblemPackageBuilder {
         artifact.replayability
     }
 
+    /// Builds one bounded, redacted, Agent-consumable explanation from evidence that already exists.
+    /// This function never probes capabilities, executes a tool, captures a screenshot, or mutates state.
+    public static func explainFailure(
+        records: [DiagnosticLogRecord],
+        executionMetrics: [ExecutionPathMetric],
+        capabilities: CapabilityProfile,
+        sessionID: UUID? = nil,
+        toolCallID: UUID? = nil,
+        recoveryAttemptCount: Int = 0,
+        maximumRecoveryAttempts: Int = 2
+    ) -> DiagnosticFailureExplanation? {
+        let safeSessionRecords = records.map(DiagnosticRedactor.redact(record:)).filter { record in
+            if let sessionID, record.sessionID != sessionID { return false }
+            return true
+        }
+        let targetRecords: [DiagnosticLogRecord]
+        if let toolCallID {
+            targetRecords = safeSessionRecords.filter { $0.toolCallID == toolCallID }
+        } else {
+            targetRecords = safeSessionRecords
+        }
+        let candidates = targetRecords.filter(isCapsuleCandidate)
+        guard let latest = candidates.last else { return nil }
+
+        let sessionCandidates = safeSessionRecords.filter(isCapsuleCandidate)
+        let latestHistoryIndex = sessionCandidates.lastIndex(where: { $0.id == latest.id })
+        let historyThroughLatest: [DiagnosticLogRecord]
+        if let latestHistoryIndex {
+            historyThroughLatest = Array(sessionCandidates[...latestHistoryIndex])
+        } else {
+            historyThroughLatest = candidates
+        }
+
+        let layer = failureLayer(for: latest)
+        let stage = failureStage(for: latest, layer: layer)
+        let signature = failureSignature(for: latest, layer: layer, stage: stage)
+        let reason = specificFailureReason(for: latest, layer: layer)
+        let matchingAttemptKeys = historyThroughLatest.compactMap { record -> String? in
+            let candidateLayer = failureLayer(for: record)
+            let candidateStage = failureStage(for: record, layer: candidateLayer)
+            guard failureSignature(for: record, layer: candidateLayer, stage: candidateStage) == signature else { return nil }
+            if let toolCallID = record.toolCallID { return "tool:\(toolCallID.uuidString)" }
+            return "record:\(record.id.uuidString)"
+        }
+        let matchingAttempts = Set(matchingAttemptKeys).count
+
+        let latestMetric: ExecutionPathMetric? = {
+            if let toolCallID = latest.toolCallID,
+               let exact = executionMetrics.last(where: { $0.toolCallID == toolCallID && $0.recordedAt <= latest.timestamp }) {
+                return exact
+            }
+            if let recordSessionID = latest.sessionID,
+               let sessionScoped = executionMetrics.last(where: {
+                   $0.sessionID == recordSessionID
+                       && $0.tool == latest.action
+                       && $0.recordedAt <= latest.timestamp
+               }) {
+                return sessionScoped
+            }
+            // Legacy diagnostic packages predate metric session/tool-call identity. Keep them
+            // decodable and useful, but never use a metric recorded after the target failure.
+            return executionMetrics.last(where: { $0.tool == latest.action && $0.recordedAt <= latest.timestamp })
+        }()
+        let routeCandidates = latestMetric?.routeCandidates.map(\.rawValue)
+            ?? splitCSV(safeMetadata(latest, keys: ["routeCandidates"]))
+        let selectedRoute = latestMetric?.selectedRoute?.rawValue ?? safeMetadata(latest, keys: ["route"])
+        let metricFallback = latestMetric?.fallbackReason.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallbackReason = (metricFallback?.isEmpty == false ? metricFallback : nil)
+            ?? safeMetadata(latest, keys: ["fallbackReason", "perceptionFallbackReason"])
+        let fallbackDepth = latestMetric?.fallbackDepth
+            ?? safeMetadata(latest, keys: ["fallbackDepth"]).flatMap(Int.init)
+            ?? 0
+
+        let axAttempted = latestMetric?.axAttempted
+            ?? boolMetadata(latest, "perceptionAXAttempted")
+            ?? (layer == .axObservation)
+        let axSucceeded = latestMetric?.axSucceeded
+            ?? boolMetadata(latest, "perceptionAXSucceeded")
+            ?? false
+        let ocrInvoked = latestMetric?.ocrInvoked
+            ?? boolMetadata(latest, "perceptionOCRInvoked")
+            ?? latest.metadata["localVisionOCR"].map { _ in true }
+            ?? false
+        let localVisionStatus = safeMetadata(latest, keys: ["localVisionOCR"])
+            ?? (ocrInvoked ? (latestMetric?.ocrSucceeded == true ? "recognized" : "unavailable") : "not_invoked")
+        let ocrSucceeded = latestMetric?.ocrSucceeded
+            ?? boolMetadata(latest, "perceptionOCRSucceeded")
+            ?? (localVisionStatus == "recognized" || localVisionStatus == "available_empty")
+        let screenshotStatus: String = {
+            if safeMetadata(latest, keys: ["sha256", "frameSHA256"]) != nil { return "succeeded" }
+            if latest.action.lowercased().contains("screenshot") && (latest.level == .error || latest.result.lowercased().contains("fail")) { return "failed" }
+            return "unknown"
+        }()
+        let foregroundStatus = safeMetadata(latest, keys: ["foregroundVerified", "verification"])
+            ?? (reason == "foreground_target_mismatch" ? "mismatch" : "unknown")
+
+        var causes = probableCauses(for: latest, layer: layer, reason: reason)
+        let providerVisionContext = historyThroughLatest.reversed().compactMap { record -> (capability: String, source: String?)? in
+            guard let capability = record.metadata["providerVisionCapability"], !capability.isEmpty else { return nil }
+            return (capability, record.metadata["providerVisionCapabilitySource"])
+        }.first
+        if providerVisionContext?.capability == "text_only",
+           !causes.contains("provider_route_cannot_consume_image_observation") {
+            causes.append("provider_route_cannot_consume_image_observation")
+        }
+        causes = Array(Set(causes)).sorted()
+        let maxRecovery = max(0, min(maximumRecoveryAttempts, 4))
+        let recoverable = isAutomaticRecoverySafe(reason: reason, layer: layer)
+        // When no Agent checkpoint count is supplied (for example an explicit
+        // diagnostics.explainFailure call), repeated same-signature *recoverable failures* are
+        // bounded evidence of already-consumed re-plan opportunities. Diagnostic-only degradation
+        // such as a successful deep route fallback must never consume the failure recovery budget.
+        // Deduplication above prevents helper and outer logs from double-counting one tool call.
+        let inferredRecoveryUse = recoverable ? max(0, matchingAttempts - 1) : 0
+        let usedRecovery = max(max(0, recoveryAttemptCount), inferredRecoveryUse)
+        let recoveryAllowed = recoverable && usedRecovery < maxRecovery
+        let recoveryReason: String
+        if reason == "deep_route_fallback" {
+            recoveryReason = "diagnostic_only_route_degradation"
+        } else if !recoverable {
+            recoveryReason = "failure_requires_developer_or_manual_resolution"
+        } else if usedRecovery >= maxRecovery {
+            recoveryReason = "recovery_budget_exhausted"
+        } else {
+            recoveryReason = "bounded_replan_available"
+        }
+        let developerPatchLikelyRequired = usedRecovery >= maxRecovery
+            || ["ax_backend_unavailable", "ax_request_failed", "coreml_runtime_failed", "corevideo_allocation_failed", "ocr_coordinate_normalization_failed", "right_rail_anchor_classification_failed", "provider_text_only_local_fallback_missing"].contains(reason) && matchingAttempts >= 2
+
+        var evidence: [String] = []
+        evidence.append("result=\(stableToken(latest.result))")
+        evidence.append("layer=\(layer.rawValue)")
+        evidence.append("stage=\(stage)")
+        evidence.append("ax_attempted=\(axAttempted);ax_succeeded=\(axSucceeded)")
+        evidence.append("ocr_invoked=\(ocrInvoked);ocr_succeeded=\(ocrSucceeded);local_vision=\(stableToken(localVisionStatus))")
+        evidence.append("screenshot=\(screenshotStatus);foreground=\(stableToken(foregroundStatus))")
+        if let providerVisionContext {
+            let source = providerVisionContext.source.map(stableToken) ?? "unknown"
+            evidence.append("provider_vision=\(stableToken(providerVisionContext.capability));source=\(source)")
+        }
+        if let domain = safeMetadata(latest, keys: ["localVisionErrorDomain", "errorDomain"]), !domain.isEmpty {
+            evidence.append("error_domain=\(stableToken(domain))")
+        }
+        if let code = safeMetadata(latest, keys: ["localVisionErrorCode", "errorCode"]), !code.isEmpty {
+            evidence.append("error_code=\(stableToken(code))")
+        }
+        if let fallbackReason, !fallbackReason.isEmpty { evidence.append("fallback=\(String(stableToken(fallbackReason).prefix(120)))") }
+        if let metric = latestMetric {
+            evidence.append("latency_ms=route:\(metric.routeSelectionLatencyMS),execute:\(metric.executionLatencyMS),total:\(metric.totalLatencyMS)")
+        }
+
+        let previous = historyThroughLatest.dropLast().last(where: { record in
+            guard let latestToolCallID = latest.toolCallID else { return true }
+            return record.toolCallID != latestToolCallID
+        })
+        let previousSignature: String? = previous.map { record in
+            let previousLayer = failureLayer(for: record)
+            return failureSignature(for: record, layer: previousLayer, stage: failureStage(for: record, layer: previousLayer))
+        }
+        let previousLayer = previous.map { failureLayer(for: $0) }
+        let changedLayer = previousLayer.flatMap { $0 == layer ? nil : "\($0.rawValue)->\(layer.rawValue)" }
+        let progressObserved = previousSignature.map { $0 != signature }
+
+        return DiagnosticFailureExplanation(
+            failureSignature: signature,
+            failureLayer: layer,
+            failureStage: stage,
+            observedOutcome: observedOutcome(for: latest),
+            verificationStatus: verificationStatus(for: latest),
+            affectedSubsystem: stableToken(latest.subsystem),
+            recentAttemptCount: matchingAttempts,
+            routeCandidates: routeCandidates,
+            selectedRoute: selectedRoute,
+            fallbackReason: fallbackReason,
+            fallbackDepth: fallbackDepth,
+            axAttempted: axAttempted,
+            axSucceeded: axSucceeded,
+            axLatencyMS: latestMetric?.axLatencyMS,
+            ocrInvoked: ocrInvoked,
+            ocrSucceeded: ocrSucceeded,
+            ocrLatencyMS: latestMetric?.ocrLatencyMS ?? safeMetadata(latest, keys: ["perceptionOCRLatencyMS", "localVisionLatencyMS"]).flatMap(Int.init),
+            screenshotStatus: screenshotStatus,
+            localVisionStatus: localVisionStatus,
+            foregroundVerificationStatus: foregroundStatus,
+            relevantCapabilities: relevantCapabilities(for: layer, capabilities: capabilities),
+            probableCauses: causes,
+            evidenceSummary: evidence,
+            recommendedNextAction: recommendedNextAction(for: reason, layer: layer, recoveryAllowed: recoveryAllowed),
+            automaticRecoveryAllowed: recoveryAllowed,
+            recoveryReason: recoveryReason,
+            developerPatchLikelyRequired: developerPatchLikelyRequired,
+            previousFailureSignature: previousSignature,
+            currentFailureSignature: signature,
+            changedLayer: changedLayer,
+            progressObserved: progressObserved,
+            remainingFailure: reason
+        )
+    }
+
     private static func isCapsuleCandidate(_ record: DiagnosticLogRecord) -> Bool {
         if record.level == .error { return true }
         let result = record.result.lowercased()
         let diagnostic = (record.diagnostic ?? "").lowercased()
+        let localVisionStatus = (record.metadata["localVisionOCR"] ?? "").lowercased()
         let failureMarkers = ["failed", "failure", "exhausted", "timeout", "timed out", "interrupted", "insufficient", "unverified", "no_effect", "no effect", "premature"]
         if failureMarkers.contains(where: { result.contains($0) || diagnostic.contains($0) }) { return true }
+        // A screenshot/action can succeed while a required perception sub-stage fails. Preserve that
+        // partial failure as a capsule candidate instead of letting the outer tool success hide it.
+        if localVisionStatus.hasPrefix("unavailable") { return true }
+        if let failureClass = record.metadata["localVisionFailureClass"], !failureClass.isEmpty { return true }
+        if record.metadata["localMetricExtraction"] == "incomplete_or_ambiguous" { return true }
+        if record.metadata["perceptionOCRInvoked"] == "true" && record.metadata["perceptionOCRSucceeded"] == "false" { return true }
+        if record.metadata["perceptionAXAttempted"] == "true" && record.metadata["perceptionAXSucceeded"] == "false" { return true }
         if record.metadata["verification"] == "failed" || record.metadata["effectVerification"] == "failed" { return true }
         if let depth = record.metadata["fallbackDepth"].flatMap(Int.init), depth >= 2 { return true }
         if let latency = record.metadata["totalLatencyMS"].flatMap(Int.init), latency >= 30_000 { return true }
@@ -467,8 +780,28 @@ public enum DiagnosticProblemPackageBuilder {
         }
         if combined.contains("privileged") || combined.contains("roothelper") || combined.contains("root helper") { return .privilegedHelper }
         if combined.contains("resolveapp") || combined.contains("app_resolution") || combined.contains("foreground") && action.contains("launch") { return .appResolution }
-        if action.contains("findelement") || action.contains("waitforelement") || combined.contains("accessibility") || combined.contains(" ax") { return .axObservation }
-        if combined.contains("localvision") || combined.contains("ocr") { return .localVision }
+        // Completion-guard perception failures can carry both a prior AX failure and the current
+        // OCR/local-vision outcome. Prefer the most recent local-perception stage here so the
+        // diagnosis can distinguish OCR not-invoked/empty/semantic-fallback failures instead of
+        // collapsing the whole chain back to "AX unavailable".
+        if record.metadata["perceptionStatus"] == "perception_insufficient",
+           record.metadata["perceptionOCRInvoked"] != nil || record.metadata["localVisionOCR"] != nil {
+            return .localVision
+        }
+        if action == "gui.tree" || action.contains("findelement") || action.contains("waitforelement")
+            || action.contains("tapelementobserve") || action.contains("typeelementobserve") || action.contains("runstructuredplan")
+            || combined.contains("accessibility") || combined.contains(" ax")
+            || record.metadata["perceptionAXAttempted"] == "true" && record.metadata["perceptionAXSucceeded"] == "false" { return .axObservation }
+        let ocrInvoked = record.metadata["perceptionOCRInvoked"] == "true"
+        let localVisionSemanticFailure = ocrInvoked && (
+            record.result.lowercased().contains("fail")
+                || record.metadata["localVisionFailureClass"] != nil
+                || record.metadata["perceptionLocalSufficient"] == "false" && record.metadata["perceptionFallbackReason"] != nil
+        )
+        if action.contains("screenshot") || combined.contains("localvision") || combined.contains("ocr")
+            || (record.metadata["localVisionOCR"] ?? "").lowercased().hasPrefix("unavailable")
+            || record.metadata["perceptionOCRInvoked"] == "true" && record.metadata["perceptionOCRSucceeded"] == "false"
+            || localVisionSemanticFailure { return .localVision }
         if action.contains("type") { return .guiTextInput }
         if action.contains("swipe") || action.contains("scroll") || action.contains("feedsample") || action.contains("tap") { return .guiGesture }
         if action.contains("navigate") || action.contains("openapp") || action.contains("openurl") { return .guiNavigation }
@@ -482,6 +815,31 @@ public enum DiagnosticProblemPackageBuilder {
     private static func failureStage(for record: DiagnosticLogRecord, layer: DiagnosticFailureLayer) -> String {
         if let explicit = safeMetadata(record, keys: ["failureStage", "stage"]) { return stableToken(explicit) }
         let action = record.action.lowercased()
+        if layer == .localVision {
+            let failureClass = (record.metadata["localVisionFailureClass"] ?? "").lowercased()
+            if failureClass.contains("right_rail") || failureClass.contains("compact_count") || failureClass.contains("metric_anchor") {
+                return "metric_extraction"
+            }
+            if failureClass.contains("target_not_recognized") || failureClass.contains("unique_match") {
+                return "semantic_matching"
+            }
+            if failureClass.contains("coordinate") || failureClass.contains("bounding_box") {
+                return "coordinate_normalization"
+            }
+            if failureClass.contains("region") || failureClass.contains("crop") { return "region_selection" }
+            if action.contains("screenshot") { return "screenshot_capture" }
+            if record.metadata["perceptionOCRInvoked"] == "false" { return "ocr_invocation" }
+            let localStatus = (record.metadata["localVisionOCR"] ?? "").lowercased()
+            if record.metadata["perceptionOCRSucceeded"] == "false"
+                || localStatus == "available_empty"
+                || localStatus.hasPrefix("unavailable") {
+                return "ocr_recognition"
+            }
+            if record.metadata["selectedPerceptionRoute"] == "local_only_provider_vision_unavailable" {
+                return "semantic_fallback"
+            }
+            return "local_vision"
+        }
         if action.contains("launch") || action.contains("openapp") { return "post_launch" }
         if action.contains("verify") { return "verification" }
         if action.contains("type") { return "text_input" }
@@ -492,21 +850,7 @@ public enum DiagnosticProblemPackageBuilder {
     }
 
     private static func failureSignature(for record: DiagnosticLogRecord, layer: DiagnosticFailureLayer, stage: String) -> String {
-        let combined = (record.result + " " + (record.diagnostic ?? "")).lowercased()
-        let reason: String
-        if let latency = record.metadata["totalLatencyMS"].flatMap(Int.init), latency >= 30_000 { reason = "latency_threshold_exceeded" }
-        else if record.metadata["statusCode"] == "401" || combined.contains("401") || combined.contains("unauthorized") { reason = "unauthorized" }
-        else if record.metadata["statusCode"] == "400" || combined.contains("400") || combined.contains("bad request") { reason = "bad_request" }
-        else if combined.contains("timeout") || combined.contains("timed out") { reason = "timeout" }
-        else if combined.contains("foreground") && combined.contains("verify") { reason = "foreground_unverified" }
-        else if combined.contains("no effect") || combined.contains("no_effect") { reason = "no_observed_effect" }
-        else if combined.contains("premature") { reason = "premature_completion" }
-        else if combined.contains("ambiguous") { reason = "ambiguous_observation" }
-        else if combined.contains("exhaust") { reason = "route_exhausted" }
-        else if record.metadata["verification"] == "failed" { reason = "verification_failed" }
-        else if let fallback = record.metadata["perceptionFallbackReason"], !fallback.isEmpty { reason = stableToken(fallback) }
-        else { reason = stableToken(record.result.isEmpty ? "failed" : record.result) }
-        return "\(layer.rawValue).\(stage).\(reason)"
+        "\(layer.rawValue).\(stage).\(specificFailureReason(for: record, layer: layer))"
     }
 
     private static func replayability(for record: DiagnosticLogRecord, layer: DiagnosticFailureLayer) -> DiagnosticReplayability {
@@ -544,6 +888,12 @@ public enum DiagnosticProblemPackageBuilder {
 
     private static func observedOutcome(for record: DiagnosticLogRecord) -> String {
         let result = record.result.lowercased()
+        if let failureClass = safeMetadata(record, keys: ["localVisionFailureClass"]), !failureClass.isEmpty {
+            return "perception_substage_failed_\(stableToken(failureClass))"
+        }
+        if record.metadata["localMetricExtraction"] == "incomplete_or_ambiguous" {
+            return "perception_substage_failed_local_metric_incomplete_or_ambiguous"
+        }
         if let statusCode = record.metadata["statusCode"], !statusCode.isEmpty { return "http_\(stableToken(statusCode))" }
         if result.contains("timeout") { return "timeout" }
         if result.contains("failed") || record.level == .error { return "failed" }
@@ -553,6 +903,10 @@ public enum DiagnosticProblemPackageBuilder {
     }
 
     private static func verificationStatus(for record: DiagnosticLogRecord) -> String {
+        if let failureClass = safeMetadata(record, keys: ["localVisionFailureClass"]), !failureClass.isEmpty {
+            return "perception_failed"
+        }
+        if record.metadata["localMetricExtraction"] == "incomplete_or_ambiguous" { return "insufficient" }
         if let value = safeMetadata(record, keys: ["verification", "effectVerification"]) { return stableToken(value) }
         if record.result.lowercased().contains("unverified") || record.result.lowercased().contains("insufficient") { return "insufficient" }
         return record.level == .error ? "failed_or_not_reached" : "unknown"
@@ -602,6 +956,211 @@ public enum DiagnosticProblemPackageBuilder {
             guiActionCount: guiCount,
             fallbackCount: fallbackCount
         )
+    }
+
+    private static func specificFailureReason(for record: DiagnosticLogRecord, layer: DiagnosticFailureLayer) -> String {
+        let primaryText = [record.result, record.diagnostic ?? ""].joined(separator: " ").lowercased()
+        let combined = ([record.result, record.diagnostic ?? ""] + record.metadata.values).joined(separator: " ").lowercased()
+        if let latency = record.metadata["totalLatencyMS"].flatMap(Int.init), latency >= 30_000 { return "latency_threshold_exceeded" }
+        let explicitStatusCode = record.metadata["statusCode"]
+        if explicitStatusCode == "401"
+            || primaryText.contains("unauthorized")
+            || primaryText.contains("http 401")
+            || primaryText.contains("http_401")
+            || primaryText.contains("status 401") { return "unauthorized" }
+        if explicitStatusCode == "400"
+            || primaryText.contains("bad request")
+            || primaryText.contains("http 400")
+            || primaryText.contains("http_400")
+            || primaryText.contains("status 400") { return "bad_request" }
+
+        if layer == .toolRouting,
+           let fallbackDepth = record.metadata["fallbackDepth"].flatMap(Int.init),
+           fallbackDepth >= 2 {
+            return "deep_route_fallback"
+        }
+
+        if layer == .axObservation {
+            if combined.contains("required axruntime") || combined.contains("creation/copy symbols are unavailable") || combined.contains("missingcapability") || combined.contains("noexecutionroute") {
+                return "ax_backend_unavailable"
+            }
+            if combined.contains("output exceeded") || combined.contains("tree_bytes") || combined.contains("tree nodes") || combined.contains("node budget") {
+                return "ax_tree_budget_truncated"
+            }
+            if combined.contains("stale") { return "ax_stale_tree" }
+            if combined.contains("frame") && (combined.contains("invalid") || combined.contains("coordinate")) { return "ax_frame_coordinate_invalid" }
+            if combined.contains("ambiguous") { return "ax_semantic_match_ambiguous" }
+            if (combined.contains("target") && (combined.contains("not found") || combined.contains("no match")))
+                || combined.contains("structured element query returned no usable visible match")
+                || combined.contains("structured element did not appear before timeout")
+                || combined.contains("structured plan local expectation did not become true before timeout") {
+                return "ax_target_absent"
+            }
+            if combined.contains("no readable ui nodes") || combined.contains("empty tree") { return "ax_tree_empty" }
+            if combined.contains("timeout") || combined.contains("timed out") { return "ax_request_timeout" }
+            return "ax_request_failed"
+        }
+
+        if layer == .localVision || record.metadata["perceptionOCRInvoked"] != nil || record.metadata["localVisionOCR"] != nil {
+            let ocrInvoked = boolMetadata(record, "perceptionOCRInvoked") ?? (record.metadata["localVisionOCR"] != nil)
+            let localStatus = record.metadata["localVisionOCR"]?.lowercased() ?? ""
+            if record.action.lowercased().contains("screenshot") && (record.level == .error || combined.contains("screenshot") && combined.contains("failed")) {
+                return "screenshot_capture_failed"
+            }
+            if !ocrInvoked { return "ocr_not_invoked" }
+            if record.metadata["localVisionFailureClass"]?.isEmpty == false {
+                return stableToken(record.metadata["localVisionFailureClass"] ?? "ocr_request_failed")
+            }
+            if record.metadata["localVisionErrorDomain"] == NSOSStatusErrorDomain,
+               record.metadata["localVisionErrorCode"] == "-6662" {
+                return "corevideo_allocation_failed"
+            }
+            if (record.metadata["localVisionErrorDomain"] ?? "").localizedCaseInsensitiveContains("CoreML") {
+                return "coreml_runtime_failed"
+            }
+            if localStatus == "available_empty" { return "ocr_completed_no_text" }
+            if ocrInvoked && record.metadata["perceptionOCRSucceeded"] == "false" { return "ocr_request_failed" }
+            if combined.contains("right_rail") || combined.contains("right rail") || combined.contains("anchor classification") { return "right_rail_anchor_classification_failed" }
+            if combined.contains("compact") && combined.contains("count") { return "compact_count_normalization_failed" }
+            if combined.contains("region") || combined.contains("crop") { return "ocr_region_invalid" }
+            if combined.contains("coordinate") || combined.contains("bounding box") || combined.contains("bounding_box") { return "ocr_coordinate_normalization_failed" }
+            if combined.contains("ambiguous") || combined.contains("unique") && combined.contains("match") { return "ocr_unique_match_ambiguous" }
+            if combined.contains("target") && (combined.contains("not found") || combined.contains("no match") || combined.contains("not recognized")) { return "ocr_target_not_recognized" }
+            if record.metadata["perceptionLocalSufficient"] == "true" && record.metadata["perceptionRemoteVisionRequired"] == "true" {
+                return "local_sufficient_remote_vision_routing_error"
+            }
+            if record.metadata["providerVisionCapability"] == "text_only",
+               record.metadata["perceptionLocalSufficient"] != "true",
+               record.metadata["selectedPerceptionRoute"] == "local_only_provider_vision_unavailable",
+               localStatus == "recognized" {
+                return "provider_text_only_local_fallback_missing"
+            }
+            if localStatus.contains("unavailable") || combined.contains("ocr") && combined.contains("failed") { return "ocr_request_failed" }
+        }
+
+        if record.result.lowercased().contains("route_failed") { return "route_selection_failed" }
+        if combined.contains("foreground") && (combined.contains("mismatch") || combined.contains("wrong app")) { return "foreground_target_mismatch" }
+        if combined.contains("foreground") && combined.contains("verify") { return "foreground_unverified" }
+        if combined.contains("no effect") || combined.contains("no_effect") { return "no_observed_effect" }
+        if combined.contains("premature") { return "premature_completion" }
+        if combined.contains("action dispatch") || combined.contains("dispatch failed") { return "action_dispatch_failed" }
+        if combined.contains("route") && combined.contains("exhaust") { return "route_exhausted" }
+        if record.metadata["verification"] == "failed" || combined.contains("verification_failed") { return "verification_failed" }
+        if combined.contains("timeout") || combined.contains("timed out") { return "timeout" }
+        if combined.contains("ambiguous") { return "ambiguous_observation" }
+        if let fallback = record.metadata["perceptionFallbackReason"], !fallback.isEmpty { return stableToken(fallback) }
+        return stableToken(record.result.isEmpty ? "failed" : record.result)
+    }
+
+    private static func probableCauses(for record: DiagnosticLogRecord, layer: DiagnosticFailureLayer, reason: String) -> [String] {
+        var causes = [reason]
+        if layer == .axObservation {
+            if reason == "ax_request_timeout" || reason == "ax_request_failed" {
+                causes.append("cross_process_accessibility_transport_unavailable_for_current_foreground")
+            }
+            if (record.diagnostic ?? "").localizedCaseInsensitiveContains("SpringBoardServices") {
+                causes.append("frontmost_app_or_accessibility_server_resolution_failed")
+            }
+        }
+        if layer == .localVision || reason.hasPrefix("ocr_") || reason.contains("coreml") || reason.contains("corevideo") {
+            if record.metadata["localVisionBackend"]?.contains("root") == true {
+                causes.append("vision_executed_in_privileged_helper_context")
+            }
+            if record.metadata["perceptionRemoteVisionRequired"] == "true", record.metadata["perceptionLocalSufficient"] == "true" {
+                causes.append("router_ignored_sufficient_local_observation")
+            }
+        }
+        if record.metadata["providerImageRoute"] == "text_only"
+            || record.metadata["providerImageRoute"] == "unsupported"
+            || record.metadata["providerVisionCapability"] == "text_only" {
+            causes.append("provider_route_cannot_consume_image_observation")
+        }
+        if reason == "provider_text_only_local_fallback_missing" {
+            causes.append("local_semantic_fallback_did_not_resolve_current_observation")
+        }
+        return Array(Set(causes)).sorted()
+    }
+
+    private static func isAutomaticRecoverySafe(reason: String, layer: DiagnosticFailureLayer) -> Bool {
+        if ["unauthorized", "bad_request", "foreground_target_mismatch", "ax_backend_unavailable", "ax_tree_budget_truncated", "ocr_coordinate_normalization_failed", "deep_route_fallback"].contains(reason) {
+            return false
+        }
+        switch layer {
+        case .axObservation, .localVision, .guiVerification, .guiGesture, .guiNavigation, .toolRouting, .providerRoute, .appResolution:
+            return true
+        default:
+            return ["no_observed_effect", "verification_failed", "route_exhausted", "premature_completion", "ocr_not_invoked", "ocr_completed_no_text", "ocr_target_not_recognized", "ocr_unique_match_ambiguous", "right_rail_anchor_classification_failed", "compact_count_normalization_failed"].contains(reason)
+        }
+    }
+
+    private static func recommendedNextAction(for reason: String, layer: DiagnosticFailureLayer, recoveryAllowed: Bool) -> String {
+        if reason == "deep_route_fallback" {
+            return "continue_with_successful_selected_route_and_record_degradation;do_not_replan_only_for_fallback_depth"
+        }
+        guard recoveryAllowed else {
+            if reason == "recovery_budget_exhausted" { return "stop_automatic_retry_and_emit_developer_diagnosis" }
+            return "stop_same_route_retry_and_escalate_with_existing_bug_capsule"
+        }
+        switch reason {
+        case "ax_request_timeout", "ax_request_failed", "ax_tree_empty", "ax_target_absent", "ax_semantic_match_ambiguous":
+            return "avoid_repeating_ax_for_same_foreground;use_fresh_screenshot_then_local_ocr_or_existing_visual_fallback"
+        case "corevideo_allocation_failed", "coreml_runtime_failed", "ocr_request_failed":
+            return "capture_one_fresh_screenshot;retry_local_ocr_once_in_non_privileged_cpu_only_context;then_escalate"
+        case "ocr_not_invoked":
+            return "invoke_existing_local_ocr_path_once_before_remote_vision"
+        case "ocr_completed_no_text", "ocr_target_not_recognized", "ocr_unique_match_ambiguous", "ocr_region_invalid":
+            return "refresh_screenshot_and_replan_local_semantic_query_or_region_once"
+        case "right_rail_anchor_classification_failed", "compact_count_normalization_failed":
+            return "reuse_current_ocr_elements_and_replan_metric_anchor_extraction_once"
+        case "local_sufficient_remote_vision_routing_error":
+            return "consume_existing_local_observation_without_remote_image_round_trip"
+        case "provider_text_only_local_fallback_missing":
+            return "reuse_current_screenshot_ocr_elements_with_existing_semantic_local_tool_once;do_not_send_image_to_text_only_provider"
+        case "no_observed_effect", "verification_failed":
+            return "revalidate_foreground_and_replan_from_fresh_observation_without_repeating_same_write"
+        case "route_selection_failed", "route_exhausted":
+            return "replan_to_next_existing_compatible_route_once"
+        default:
+            return layer == .providerRoute ? "use_existing_provider_compatibility_fallback_once" : "obtain_one_fresh_bounded_observation_and_replan"
+        }
+    }
+
+    private static func relevantCapabilities(for layer: DiagnosticFailureLayer, capabilities: CapabilityProfile) -> [String: String] {
+        let prefixes: [String]
+        switch layer {
+        case .axObservation:
+            prefixes = ["automation.gui.tree", "automation.gui.screenshot", "execution.root_helper"]
+        case .localVision:
+            prefixes = ["automation.gui.screenshot", "automation.gui.tree"]
+        case .guiGesture:
+            prefixes = ["automation.gui.touch", "automation.gui.gestures", "automation.gui.screenshot"]
+        case .guiTextInput:
+            prefixes = ["automation.gui.text_input", "automation.gui.touch", "automation.gui.screenshot"]
+        case .guiNavigation, .guiVerification:
+            prefixes = ["automation.gui", "apps."]
+        case .privilegedHelper:
+            prefixes = ["execution.root_helper"]
+        default:
+            prefixes = []
+        }
+        var result: [String: String] = [:]
+        for record in capabilities.records where prefixes.contains(where: { record.id == $0 || record.id.hasPrefix($0) }) {
+            result[record.id] = record.status.rawValue
+            if result.count >= 12 { break }
+        }
+        return result
+    }
+
+    private static func splitCSV(_ raw: String?) -> [String] {
+        guard let raw else { return [] }
+        return raw.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }.prefix(8).map { $0 }
+    }
+
+    private static func boolMetadata(_ record: DiagnosticLogRecord, _ key: String) -> Bool? {
+        guard let value = record.metadata[key] else { return nil }
+        if value == "true" { return true }
+        if value == "false" { return false }
+        return nil
     }
 
     private static func safeMetadata(_ record: DiagnosticLogRecord, keys: [String]) -> String? {

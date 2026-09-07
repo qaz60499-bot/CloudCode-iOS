@@ -3,7 +3,6 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <UIKit/UIKit.h>
-#import <Vision/Vision.h>
 #import <dlfcn.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
@@ -12,11 +11,15 @@
 #import <objc/runtime.h>
 #import <stdint.h>
 #import <stdio.h>
+#import <stdlib.h>
 #import <unistd.h>
 
 #define CLOUDCODE_GUI_MAX_TREE_NODES 400
 #define CLOUDCODE_GUI_MAX_TREE_BYTES (256 * 1024)
-#define CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS 0.65f
+// Keep detached AX requests fail-fast. SpringBoard-resident clients such as ios-mcp use a 0.25s
+// messaging budget; a detached TrollStore helper must not turn one missing AX service into a
+// multi-second provider-scale stall.
+#define CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS 0.25f
 #define CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES (700 * 1024)
 #define CLOUDCODE_GUI_MAX_TEXT_UTF8_BYTES (16 * 1024)
 #define CLOUDCODE_GUI_SENDER_ID 0x8000000817319371ULL
@@ -55,6 +58,7 @@ typedef CloudCodeAXUIElementRef (*CloudCodeAXCreateApplicationFn)(pid_t);
 typedef CloudCodeAXUIElementRef (*CloudCodeAXCreateSystemWideFn)(void);
 typedef CloudCodeAXError (*CloudCodeAXGetPidFn)(CloudCodeAXUIElementRef, pid_t *);
 typedef CloudCodeAXError (*CloudCodeAXCopyAttributeFn)(CloudCodeAXUIElementRef, CFStringRef, CFTypeRef *);
+typedef CloudCodeAXError (*CloudCodeAXCopyMultipleAttributesFn)(CloudCodeAXUIElementRef, CFArrayRef, CFOptionFlags, CFArrayRef *);
 typedef CloudCodeAXError (*CloudCodeAXSetAttributeFn)(CloudCodeAXUIElementRef, CFStringRef, CFTypeRef);
 typedef CloudCodeAXError (*CloudCodeAXCopyElementAtPositionFn)(CloudCodeAXUIElementRef, float, float, CloudCodeAXUIElementRef *);
 typedef CloudCodeAXError (*CloudCodeAXCopyApplicationAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, float, float);
@@ -119,6 +123,7 @@ typedef struct {
     CloudCodeAXCreateSystemWideFn createSystemWide;
     CloudCodeAXGetPidFn getPid;
     CloudCodeAXCopyAttributeFn copyAttribute;
+    CloudCodeAXCopyMultipleAttributesFn copyMultipleAttributes;
     CloudCodeAXSetAttributeFn setAttribute;
     CloudCodeAXCopyElementAtPositionFn copyElementAtPosition;
     CloudCodeAXCopyApplicationAtPositionFn copyApplicationAtPosition;
@@ -707,12 +712,30 @@ static UIImage *CloudCodePointSizedScreenshot(UIImage *image)
     BOOL screenLandscape = screen.width > screen.height;
     CGSize target = imageLandscape == screenLandscape ? screen : CGSizeMake(screen.height, screen.width);
     if (target.width <= 1 || target.height <= 1) { return image; }
-    if (image.size.width <= target.width * 1.05 && image.size.height <= target.height * 1.05) { return image; }
+
+    // UIImage.size is expressed in points. _UICreateScreenUIImage can therefore report the exact
+    // logical screen size while still carrying a 2x/3x native-pixel CGImage. JPEG serialization
+    // preserves those backing pixels, so using UIImage.size here previously let a 1170x2532 JPEG
+    // masquerade as a 390x844 point-sized screenshot. Local Vision then returned coordinates in
+    // the native-pixel space while HID/tap consumes logical points. Compare the backing CGImage
+    // dimensions instead and redraw at scale=1 whenever they differ from the logical target.
+    CGImageRef backing = image.CGImage;
+    CGFloat backingWidth = backing ? (CGFloat)CGImageGetWidth(backing) : image.size.width * MAX(image.scale, 1.0);
+    CGFloat backingHeight = backing ? (CGFloat)CGImageGetHeight(backing) : image.size.height * MAX(image.scale, 1.0);
+    BOOL backingMatchesTarget = fabs(backingWidth - target.width) <= 1.0 && fabs(backingHeight - target.height) <= 1.0;
+    if (backingMatchesTarget) { return image; }
+
+    fprintf(stderr, "gui-screenshot: normalize-backing-pixels source=%.0fx%.0f imagePoints=%.0fx%.0f scale=%.2f targetPoints=%.0fx%.0f\n",
+            backingWidth, backingHeight, image.size.width, image.size.height, image.scale, target.width, target.height);
     UIGraphicsBeginImageContextWithOptions(target, YES, 1.0);
     [image drawInRect:CGRectMake(0, 0, target.width, target.height)];
     UIImage *scaled = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
-    return scaled ?: image;
+    if (!scaled) {
+        fprintf(stderr, "gui-screenshot: point-space normalization failed; rejecting mismatched backing image\n");
+        return nil;
+    }
+    return scaled;
 }
 
 static BOOL CloudCodeScreenshotLooksInformative(UIImage *image)
@@ -915,6 +938,7 @@ static CloudCodeAXRuntime CloudCodeResolveAX(void)
         runtime.getPid = (CloudCodeAXGetPidFn)CloudCodeResolveAcrossFrameworks(paths, "_AXUIElementGetPid");
     }
     runtime.copyAttribute = (CloudCodeAXCopyAttributeFn)CloudCodeResolveAcrossFrameworks(paths, "AXUIElementCopyAttributeValue");
+    runtime.copyMultipleAttributes = (CloudCodeAXCopyMultipleAttributesFn)CloudCodeResolveAcrossFrameworks(paths, "AXUIElementCopyMultipleAttributeValues");
     runtime.setAttribute = (CloudCodeAXSetAttributeFn)CloudCodeResolveAcrossFrameworks(paths, "AXUIElementSetAttributeValue");
     runtime.copyElementAtPosition = (CloudCodeAXCopyElementAtPositionFn)CloudCodeResolveAcrossFrameworks(paths, "AXUIElementCopyElementAtPosition");
     runtime.copyApplicationAtPosition = (CloudCodeAXCopyApplicationAtPositionFn)CloudCodeResolveAcrossFrameworks(paths, "AXUIElementCopyApplicationAtPosition");
@@ -936,6 +960,21 @@ static CloudCodeAXRuntime CloudCodeResolveAX(void)
     runtime.attributePlaceholder = CloudCodeResolveCFStringAcrossFrameworks(paths, "kAXXCAttributePlaceholderValue", CFSTR("AXPlaceholderValue"));
     runtime.attributeElementType = CloudCodeResolveCFStringAcrossFrameworks(paths, "kAXXCAttributeElementType", CFSTR("AXRole"));
     return runtime;
+}
+
+static void CloudCodePrintAXRuntimeDiagnostic(CloudCodeAXRuntime runtime, const char *stage)
+{
+    fprintf(stderr,
+        "gui-tree-ax-runtime: stage=%s authority=standalone-trollstore-best-effort requesting_client=%d create_app=%d create_systemwide=%d copy_attribute=%d copy_multiple=%d element_at_position=%d app_at_position=%d app_context_at_position=%d\n",
+        stage ?: "unknown",
+        runtime.setRequestingClient ? 1 : 0,
+        (runtime.createApplication || runtime.createAppElementWithPid) ? 1 : 0,
+        runtime.createSystemWide ? 1 : 0,
+        runtime.copyAttribute ? 1 : 0,
+        runtime.copyMultipleAttributes ? 1 : 0,
+        runtime.copyElementAtPosition ? 1 : 0,
+        runtime.copyApplicationAtPosition ? 1 : 0,
+        runtime.copyApplicationAndContextAtPosition ? 1 : 0);
 }
 
 static NSString *CloudCodeBoundedString(id value)
@@ -965,6 +1004,35 @@ static id CloudCodeAXCopy(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef el
     }
     if (code != 0 || !value) { if (value) CFRelease(value); return nil; }
     return CFBridgingRelease(value);
+}
+
+static NSArray *CloudCodeAXCopyMany(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef element, NSArray *attributes)
+{
+    if (!runtime.copyMultipleAttributes || !element || attributes.count == 0) { return nil; }
+    CFArrayRef values = NULL;
+    CloudCodeAXError code = -1;
+    @try {
+        code = runtime.copyMultipleAttributes(element, (__bridge CFArrayRef)attributes, 0, &values);
+    } @catch (__unused NSException *exception) {
+        values = NULL;
+    }
+    if (code != 0 || !values) { if (values) CFRelease(values); return nil; }
+    NSArray *bridged = CFBridgingRelease(values);
+    return bridged.count == attributes.count ? bridged : nil;
+}
+
+static BOOL CloudCodeAXValueRepresentsError(CloudCodeAXRuntime runtime, id value)
+{
+    if (!value || !runtime.valueGetType || !runtime.valueGetTypeID) { return NO; }
+    CFTypeRef ref = (__bridge CFTypeRef)value;
+    @try {
+        // Public AXValueType uses 5 for kAXValueAXErrorType. Batched AX reads may place one of
+        // these at a slot whose attribute is unsupported; never serialize that error code as if it
+        // were a real label/value/role.
+        return CFGetTypeID(ref) == runtime.valueGetTypeID() && runtime.valueGetType(ref) == 5;
+    } @catch (__unused NSException *exception) {
+        return NO;
+    }
 }
 
 static NSDictionary *CloudCodeFrameDictionary(CloudCodeAXRuntime runtime, id value)
@@ -999,18 +1067,46 @@ static NSDictionary *CloudCodeAXNode(CloudCodeAXRuntime runtime, CloudCodeAXUIEl
         @{@"key": @"value", @"attribute": (__bridge id)(runtime.attributeValue ?: CFSTR("AXValue"))},
         @{@"key": @"title", @"attribute": @"AXTitle"},
         @{@"key": @"identifier", @"attribute": (__bridge id)(runtime.attributeIdentifier ?: CFSTR("AXIdentifier"))},
-        @{@"key": @"placeholder", @"attribute": (__bridge id)(runtime.attributePlaceholder ?: CFSTR("AXPlaceholderValue"))}
+        @{@"key": @"placeholder", @"attribute": (__bridge id)(runtime.attributePlaceholder ?: CFSTR("AXPlaceholderValue"))},
+        @{@"key": @"frame", @"attribute": (__bridge id)(runtime.attributeFrame ?: CFSTR("AXFrame"))},
+        @{@"key": @"children", @"attribute": (__bridge id)(runtime.attributeChildren ?: CFSTR("AXChildren"))}
     ];
-    for (NSDictionary *pair in attributes) {
-        id raw = CloudCodeAXCopy(runtime, element, (__bridge CFStringRef)pair[@"attribute"]);
-        NSString *text = CloudCodeBoundedString(raw);
-        if (text) { node[pair[@"key"]] = text; }
-    }
-    id frameValue = CloudCodeAXCopy(runtime, element, runtime.attributeFrame ?: CFSTR("AXFrame"));
-    NSDictionary *frame = CloudCodeFrameDictionary(runtime, frameValue);
-    if (frame) { node[@"frame"] = frame; }
 
-    id childrenValue = CloudCodeAXCopy(runtime, element, runtime.attributeChildren ?: CFSTR("AXChildren"));
+    // Prefer one AX IPC for the attributes needed by a node. A detached client paying one
+    // messaging timeout per role/label/value/frame/children call scales catastrophically when an
+    // App exposes a large hierarchy. Keep the legacy individual reads as a compatibility fallback.
+    NSArray *attributeRefs = [attributes valueForKey:@"attribute"];
+    NSArray *batched = CloudCodeAXCopyMany(runtime, element, attributeRefs);
+    id childrenValue = nil;
+    if (batched) {
+        for (NSUInteger index = 0; index < attributes.count; index++) {
+            NSDictionary *pair = attributes[index];
+            id raw = batched[index];
+            if (raw == NSNull.null || CloudCodeAXValueRepresentsError(runtime, raw)) { raw = nil; }
+            NSString *key = pair[@"key"];
+            if ([key isEqualToString:@"frame"]) {
+                NSDictionary *frame = CloudCodeFrameDictionary(runtime, raw);
+                if (frame) { node[@"frame"] = frame; }
+            } else if ([key isEqualToString:@"children"]) {
+                childrenValue = raw;
+            } else {
+                NSString *text = CloudCodeBoundedString(raw);
+                if (text) { node[key] = text; }
+            }
+        }
+    } else {
+        for (NSUInteger index = 0; index < 6; index++) {
+            NSDictionary *pair = attributes[index];
+            id raw = CloudCodeAXCopy(runtime, element, (__bridge CFStringRef)pair[@"attribute"]);
+            NSString *text = CloudCodeBoundedString(raw);
+            if (text) { node[pair[@"key"]] = text; }
+        }
+        id frameValue = CloudCodeAXCopy(runtime, element, runtime.attributeFrame ?: CFSTR("AXFrame"));
+        NSDictionary *frame = CloudCodeFrameDictionary(runtime, frameValue);
+        if (frame) { node[@"frame"] = frame; }
+        childrenValue = CloudCodeAXCopy(runtime, element, runtime.attributeChildren ?: CFSTR("AXChildren"));
+    }
+
     if ([childrenValue isKindOfClass:NSArray.class] && depth < 20) {
         NSMutableArray *children = [NSMutableArray array];
         for (id child in (NSArray *)childrenValue) {
@@ -1289,6 +1385,7 @@ static NSData *CloudCodeFrontmostTreeData(void)
 {
     CloudCodeAXRuntime runtime = CloudCodeResolveAX();
     if ((!runtime.createApplication && !runtime.createAppElementWithPid && !runtime.createSystemWide) || !runtime.copyAttribute) {
+        CloudCodePrintAXRuntimeDiagnostic(runtime, "missing-symbols");
         fprintf(stderr, "gui-tree: required AXRuntime creation/copy symbols are unavailable\n");
         return nil;
     }
@@ -1315,49 +1412,11 @@ static NSData *CloudCodeFrontmostTreeData(void)
         }
     }
 
-    // On iOS 15+ the SpringBoardServices frontmost identifier can be unavailable to a detached
-    // root helper even when Accessibility can still identify the focused application. Do not make
-    // SBS a single point of failure: ask the system-wide AX root for its focused/frontmost app and
-    // recover the display identifier from the resulting PID when possible.
-    if (!root) {
-        pid_t focusedPID = 0;
-        root = CloudCodeAXFocusedApplicationRoot(runtime, &focusedPID, &backend);
-        if (root && focusedPID > 0) {
-            pid = focusedPID;
-            NSString *focusedBundleID = CloudCodeBundleIDForPID(pid);
-            if (focusedBundleID.length > 0) { bundleID = focusedBundleID; }
-            if (runtime.addAssociatedPid) {
-                runtime.addAssociatedPid(getpid(), pid, 0);
-                runtime.addAssociatedPid(getpid(), pid, 1);
-                runtime.addAssociatedPid(pid, getpid(), 0);
-                runtime.addAssociatedPid(pid, getpid(), 1);
-            }
-        }
-    }
-
-    // Some detached helpers cannot read AXFocusedApplication even though AXRuntime can still
-    // hit-test the visible display. Resolve the application element at a few bounded screen points
-    // as another read-only fallback without depending on SpringBoard injection.
-    if (!root) {
-        pid_t positionPID = 0;
-        root = CloudCodeAXApplicationAtScreenPointRoot(runtime, &positionPID, &backend);
-        if (root && positionPID > 0) {
-            pid = positionPID;
-            NSString *positionBundleID = CloudCodeBundleIDForPID(pid);
-            if (positionBundleID.length > 0) { bundleID = positionBundleID; }
-            if (runtime.addAssociatedPid) {
-                runtime.addAssociatedPid(getpid(), pid, 0);
-                runtime.addAssociatedPid(getpid(), pid, 1);
-                runtime.addAssociatedPid(pid, getpid(), 0);
-                runtime.addAssociatedPid(pid, getpid(), 1);
-            }
-        }
-    }
-
-    // Public AXUIElementCopyElementAtPosition is a separate system-wide hit-test primitive. It can
-    // still return topmost foreground elements when the application-level AX constructors above are
-    // unavailable to a detached TrollStore root helper. Keep the result explicitly labeled as a
-    // sampled snapshot so the agent never mistakes it for a complete hierarchy.
+    // A standalone TrollStore helper is neither SpringBoard-injected nor attached to an XCTest /
+    // testmanagerd automation session. Once the direct foreground-PID application root fails, do
+    // not pay a serial chain of focused-app and application-at-position probes that depend on the
+    // same missing authority. Keep one bounded system-wide hit-test sample as the explicitly
+    // degraded semantic capability.
     NSUInteger nodeCount = 0;
     NSDictionary *rootNode = nil;
     if (!root) {
@@ -1369,7 +1428,8 @@ static NSData *CloudCodeFrontmostTreeData(void)
     }
 
     if (!root && !rootNode) {
-        fprintf(stderr, "gui-tree: SpringBoardServices, AX focused-app, AX application-at-position, and AX element-at-position fallbacks all failed to produce readable foreground UI\n");
+        CloudCodePrintAXRuntimeDiagnostic(runtime, "foreground-resolution-failed");
+        fprintf(stderr, "gui-tree: stage=standalone-sampled-semantics result=unavailable direct-application-root-and-bounded-hit-test-produced-no-readable-ui\n");
         return nil;
     }
 
@@ -1378,10 +1438,19 @@ static NSData *CloudCodeFrontmostTreeData(void)
         CFRelease(root);
     }
     if (!rootNode || nodeCount == 0) {
+        CloudCodePrintAXRuntimeDiagnostic(runtime, "empty-tree");
         fprintf(stderr, "gui-tree: AX root existed but no readable UI nodes were returned\n");
         return nil;
     }
-    NSDictionary *payload = @{@"backend": backend ?: @"AXRuntime", @"bundleId": bundleID ?: @"", @"pid": @(pid), @"nodeCount": @(nodeCount), @"tree": rootNode};
+    NSString *scope = [rootNode[@"role"] isEqual:@"AXHitTestSnapshot"] ? @"sampled_semantics" : @"full_application_tree_opportunistic";
+    NSDictionary *payload = @{
+        @"backend": backend ?: @"AXRuntime",
+        @"scope": scope,
+        @"bundleId": bundleID ?: @"",
+        @"pid": @(pid),
+        @"nodeCount": @(nodeCount),
+        @"tree": rootNode
+    };
     NSError *error = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
     if (!data || error || data.length == 0) {
@@ -1435,6 +1504,9 @@ int CloudCodeGUIProbeJSON(void)
 int CloudCodeGUITreeJSON(void)
 {
     @autoreleasepool {
+        // A detached TrollStore helper is not an XCTest/testmanagerd automation client. Do not
+        // mutate the process-global AX automation switch here: timeout recovery uses SIGKILL, which
+        // cannot run atexit cleanup and could otherwise leave that global state changed.
         NSData *data = CloudCodeFrontmostTreeData();
         if (!data) { return 62; }
         CloudCodePrintData(data);
@@ -1491,144 +1563,6 @@ int CloudCodeGUIScreenshotFile(NSString *path)
             fprintf(stderr, "gui-screenshot-file: write failed: %s\n", error.localizedDescription.UTF8String ?: "unknown");
             return 63;
         }
-        return 0;
-    }
-}
-
-int CloudCodeGUIOCRFile(NSString *path, NSUInteger maximumElements)
-{
-    @autoreleasepool {
-        CFAbsoluteTime startedAt = CFAbsoluteTimeGetCurrent();
-        NSString *normalized = [path isKindOfClass:NSString.class] ? path.stringByStandardizingPath : nil;
-        NSString *parent = normalized.stringByDeletingLastPathComponent;
-        NSString *filename = normalized.lastPathComponent;
-        BOOL appContainer = [normalized hasPrefix:@"/var/mobile/Containers/Data/Application/"]
-            || [normalized hasPrefix:@"/private/var/mobile/Containers/Data/Application/"];
-        BOOL boundedTempSource = appContainer
-            && [parent.lastPathComponent isEqualToString:@"tmp"]
-            && [filename hasPrefix:@"CloudCode-GUI-OCR-"]
-            && [[filename.pathExtension lowercaseString] isEqualToString:@"jpg"];
-        if (!boundedTempSource) {
-            fprintf(stderr, "gui-ocr-file: rejected input path outside the app tmp boundary\n");
-            return 71;
-        }
-
-        NSError *readError = nil;
-        NSData *jpeg = [NSData dataWithContentsOfFile:normalized options:NSDataReadingMappedIfSafe error:&readError];
-        if (!jpeg || jpeg.length == 0 || jpeg.length > CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES) {
-            fprintf(stderr, "gui-ocr-file: bounded JPEG read failed: %s\n", readError.localizedDescription.UTF8String ?: "invalid-or-oversized-input");
-            return 71;
-        }
-        UIImage *uiImage = [UIImage imageWithData:jpeg scale:1.0];
-        CGImageRef image = uiImage.CGImage;
-        if (!image) {
-            fprintf(stderr, "gui-ocr-file: JPEG could not be decoded to CGImage\n");
-            return 71;
-        }
-
-        size_t pixelWidth = MAX((size_t)1, CGImageGetWidth(image));
-        size_t pixelHeight = MAX((size_t)1, CGImageGetHeight(image));
-        NSUInteger boundedMaximum = MIN(MAX(maximumElements, (NSUInteger)1), (NSUInteger)48);
-
-        VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] init];
-        request.usesLanguageCorrection = NO;
-        request.minimumTextHeight = 0.009f;
-        NSString *recognitionLevelName = @"accurate";
-        NSError *languageError = nil;
-        request.recognitionLevel = VNRequestTextRecognitionLevelFast;
-        NSArray<NSString *> *fastLanguages = [request supportedRecognitionLanguagesAndReturnError:&languageError] ?: @[];
-        if ([fastLanguages containsObject:@"zh-Hans"]) {
-            recognitionLevelName = @"fast";
-            NSMutableArray<NSString *> *preferred = [NSMutableArray array];
-            for (NSString *language in @[@"zh-Hans", @"en-US"]) {
-                if ([fastLanguages containsObject:language]) { [preferred addObject:language]; }
-            }
-            if (preferred.count > 0) { request.recognitionLanguages = preferred; }
-        } else {
-            request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
-            languageError = nil;
-            NSArray<NSString *> *accurateLanguages = [request supportedRecognitionLanguagesAndReturnError:&languageError] ?: @[];
-            NSMutableArray<NSString *> *preferred = [NSMutableArray array];
-            for (NSString *language in @[@"zh-Hans", @"en-US"]) {
-                if ([accurateLanguages containsObject:language]) { [preferred addObject:language]; }
-            }
-            if (preferred.count > 0) {
-                request.recognitionLanguages = preferred;
-            } else if (@available(iOS 16.0, *)) {
-                request.automaticallyDetectsLanguage = YES;
-            }
-        }
-
-        NSError *visionError = nil;
-        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithData:jpeg options:@{}];
-        BOOL performed = [handler performRequests:@[request] error:&visionError];
-        if (!performed || visionError) {
-            NSDictionary *failure = @{
-                @"status": @"unavailable_request_failed",
-                @"screenPointWidth": @(pixelWidth),
-                @"screenPointHeight": @(pixelHeight),
-                @"latencyMS": @((NSInteger)MAX(0.0, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000.0)),
-                @"recognitionLevel": recognitionLevelName,
-                @"backend": @"root_helper_vision",
-                @"errorDomain": visionError.domain ?: @"",
-                @"errorCode": @(visionError.code),
-                @"elements": @[]
-            };
-            NSData *failureData = [NSJSONSerialization dataWithJSONObject:failure options:0 error:nil];
-            if (!failureData) { return 71; }
-            CloudCodePrintData(failureData);
-            return 0;
-        }
-
-        NSMutableArray<NSDictionary *> *elements = [NSMutableArray arrayWithCapacity:boundedMaximum];
-        NSMutableArray<NSString *> *textParts = [NSMutableArray array];
-        NSUInteger textCharacters = 0;
-        for (VNRecognizedTextObservation *observation in request.results ?: @[]) {
-            if (elements.count >= boundedMaximum) { break; }
-            VNRecognizedText *candidate = [observation topCandidates:1].firstObject;
-            if (!candidate || candidate.confidence < 0.12f) { continue; }
-            NSString *cleaned = [[candidate.string stringByReplacingOccurrencesOfString:@"\n" withString:@" "]
-                stringByReplacingOccurrencesOfString:@"\r" withString:@" "];
-            cleaned = [cleaned stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-            if (cleaned.length == 0) { continue; }
-            NSString *text = cleaned.length > 120 ? [cleaned substringToIndex:120] : cleaned;
-            CGRect box = observation.boundingBox;
-            double x = box.origin.x * (double)pixelWidth;
-            double y = (1.0 - CGRectGetMaxY(box)) * (double)pixelHeight;
-            double width = box.size.width * (double)pixelWidth;
-            double height = box.size.height * (double)pixelHeight;
-            [elements addObject:@{
-                @"text": text,
-                @"confidence": @(round((double)candidate.confidence * 1000.0) / 1000.0),
-                @"x": @(round(x * 10.0) / 10.0),
-                @"y": @(round(y * 10.0) / 10.0),
-                @"width": @(round(width * 10.0) / 10.0),
-                @"height": @(round(height * 10.0) / 10.0)
-            }];
-            if (textCharacters < 4096) {
-                NSUInteger remaining = 4096 - textCharacters;
-                NSString *part = text.length > remaining ? [text substringToIndex:remaining] : text;
-                [textParts addObject:part];
-                textCharacters += part.length + 3;
-            }
-        }
-
-        NSDictionary *payload = @{
-            @"status": elements.count > 0 ? @"recognized" : @"available_empty",
-            @"screenPointWidth": @(pixelWidth),
-            @"screenPointHeight": @(pixelHeight),
-            @"latencyMS": @((NSInteger)MAX(0.0, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000.0)),
-            @"recognitionLevel": recognitionLevelName,
-            @"backend": @"root_helper_vision",
-            @"visibleText": [textParts componentsJoinedByString:@" | "],
-            @"elements": elements
-        };
-        NSData *output = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
-        if (!output || output.length > (64 * 1024)) {
-            fprintf(stderr, "gui-ocr-file: OCR JSON exceeded bounded output limit\n");
-            return 71;
-        }
-        CloudCodePrintData(output);
         return 0;
     }
 }

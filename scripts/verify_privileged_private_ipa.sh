@@ -121,7 +121,25 @@ test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' 
 /usr/libexec/PlistBuddy -c 'Print :keychain-access-groups:0' "$ENTITLEMENTS" | grep -F 'TROLLTROLL.*' >/dev/null
 
 HELPER="$APP_PATH/CloudCodeRootHelper"
+VISION_HELPER="$APP_PATH/CloudCodeVisionHelper"
 test -f "$HELPER"
+test -f "$VISION_HELPER"
+if ! lipo -info "$VISION_HELPER" | grep -q 'arm64'; then
+  echo "FAIL: CloudCodeVisionHelper does not contain arm64" >&2
+  exit 12
+fi
+if ! strings "$VISION_HELPER" | grep -Fq 'cloudcode-vision-helper-protocol=1'; then
+  echo "FAIL: CloudCodeVisionHelper protocol marker missing" >&2
+  exit 12
+fi
+VISION_ENTITLEMENTS="$(ldid -e "$VISION_HELPER" 2>/dev/null || true)"
+for forbidden_vision_entitlement in 'platform-application' 'com.apple.private.persona-mgmt' 'com.apple.accessibility.api' 'com.apple.private.hid.client.event-dispatch'; do
+  if grep -Fq "$forbidden_vision_entitlement" <<<"$VISION_ENTITLEMENTS"; then
+    echo "FAIL: lightweight Vision helper unexpectedly carries privileged entitlement: $forbidden_vision_entitlement" >&2
+    exit 12
+  fi
+done
+codesign --verify "$VISION_HELPER"
 HELPER_ENTITLEMENTS="$TMP_DIR/root-helper-entitlements.plist"
 ldid -e "$HELPER" > "$HELPER_ENTITLEMENTS"
 plutil -lint "$HELPER_ENTITLEMENTS" >/dev/null

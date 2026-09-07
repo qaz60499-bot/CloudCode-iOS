@@ -58,7 +58,12 @@ public enum DiagnosticContext {
 
 public enum DiagnosticRedactor {
     private static let sensitiveKeyFragments = [
-        "authorization", "api_key", "apikey", "api-key", "token", "cookie", "secret", "password", "credential", "x-api-key"
+        "authorization", "api_key", "apikey", "api-key", "token", "cookie", "secret", "password", "credential", "x-api-key",
+        // Diagnostic metadata must never preserve raw user/provider payloads or binary observations.
+        // Keep these specific enough that aggregate counters/hashes remain available for diagnosis.
+        "usertext", "user_text", "screenshotbytes", "screenshot_bytes", "imagebase64", "image_base64",
+        "attachmentbytes", "attachment_bytes", "rawimage", "raw_image", "rawdatabase", "raw_database",
+        "databasecontent", "database_content", "sqliterows", "sqlite_rows", "rawcontent", "raw_content", "rawdata", "raw_data"
     ]
 
     private static let patterns: [NSRegularExpression] = {

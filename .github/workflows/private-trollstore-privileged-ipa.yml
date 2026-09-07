@@ -114,8 +114,15 @@ jobs:
           done < <(find "$APP_PATH" -type d -name '*.framework' -print)
           MAIN_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
           ROOT_HELPER="$APP_PATH/CloudCodeRootHelper"
+          VISION_HELPER="$APP_PATH/CloudCodeVisionHelper"
           test -f "$ROOT_HELPER"
+          test -f "$VISION_HELPER"
           ldid -SEntitlements/CloudCodeRootHelper.entitlements "$ROOT_HELPER"
+          # Vision OCR intentionally runs outside the privileged GUI execution profile. Keep this
+          # helper ad-hoc signed with no private/root entitlement dictionary so Vision/CoreML uses
+          # the ordinary application execution class on-device.
+          ldid -S "$VISION_HELPER"
+          codesign --force --sign - "$VISION_HELPER"
           # Procursus ldid 2.1.5 can emit an entitlement blob that macOS codesign/Security.framework
           # refuses to parse. Preserve the TrollStore-native ldid pass, then normalize only the
           # embedded helper with Apple's ad-hoc signer so the packaged entitlement claim is readable

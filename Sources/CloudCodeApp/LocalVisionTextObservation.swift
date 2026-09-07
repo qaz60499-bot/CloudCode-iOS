@@ -28,8 +28,11 @@ enum LocalVisionTextObservation {
         var latencyMS: Int
         var recognitionLevel: String?
         var backend: String?
+        var cpuFallbackUsed: Bool?
         var errorDomain: String?
         var errorCode: Int?
+        var primaryErrorDomain: String?
+        var primaryErrorCode: Int?
         var elements: [LocalPerceptionTextElement]
     }
 
@@ -54,23 +57,45 @@ enum LocalVisionTextObservation {
         await observe(for: jpegData, maximumElements: maximumElements, regionInScreenPoints: regionInScreenPoints).payload
     }
 
-    static func observe(for jpegData: Data, maximumElements: Int = 28, regionInScreenPoints: CGRect? = nil) async -> Observation {
+    static func observe(
+        for jpegData: Data,
+        maximumElements: Int = 28,
+        regionInScreenPoints: CGRect? = nil,
+        requiresText: Bool = false
+    ) async -> Observation {
         let boundedMaximum = min(max(maximumElements, 1), 48)
         return await Task.detached(priority: .utility) {
-            // Cross-app automation backgrounds the SwiftUI host. On affected iOS 16 devices,
-            // Vision in that background process can fail with CoreVideo allocation errors even
-            // though the same screenshot is valid. Prefer the already-embedded privileged helper
-            // for OCR so screenshot decoding + Vision run in the same isolated execution class as
-            // the working global capture path. Public/simulator builds retain the in-process path.
+            // Vision/Core ML is an App compute workload, not a privilege workload. Running OCR as
+            // persona-99/root caused real-device failures in CoreVideo/CoreML even though capture
+            // itself succeeded. Prefer the host App process with a CPU-only/background-friendly
+            // request, then use the embedded helper only as an isolated secondary execution context.
+            let inProcess = recognizeInProcess(
+                jpegData,
+                maximumElements: boundedMaximum,
+                regionInScreenPoints: regionInScreenPoints
+            )
+            if Self.isUsable(inProcess, requiresText: requiresText) { return inProcess }
             if let helperObservation = recognizeWithHelper(
                 jpegData,
                 maximumElements: boundedMaximum,
                 regionInScreenPoints: regionInScreenPoints
             ) {
-                return helperObservation
+                if Self.isUsable(helperObservation, requiresText: requiresText) { return helperObservation }
+                var combined = inProcess
+                combined.payload["localVisionSecondaryBackend"] = helperObservation.payload["localVisionBackend"] ?? "vision_helper_public_api"
+                combined.payload["localVisionSecondaryStatus"] = helperObservation.payload["localVisionOCR"] ?? "unavailable"
+                combined.payload["localVisionSecondaryErrorDomain"] = helperObservation.payload["localVisionErrorDomain"] ?? ""
+                combined.payload["localVisionSecondaryErrorCode"] = helperObservation.payload["localVisionErrorCode"] ?? ""
+                return combined
             }
-            return recognizeInProcess(jpegData, maximumElements: boundedMaximum, regionInScreenPoints: regionInScreenPoints)
+            return inProcess
         }.value
+    }
+
+    private static func isUsable(_ observation: Observation, requiresText: Bool) -> Bool {
+        let status = observation.payload["localVisionOCR"] ?? ""
+        if status == "recognized" { return true }
+        return status == "available_empty" && !requiresText
     }
 
     private static func recognizeWithHelper(
@@ -78,7 +103,7 @@ enum LocalVisionTextObservation {
         maximumElements: Int,
         regionInScreenPoints: CGRect?
     ) -> Observation? {
-        let helper = EmbeddedRootHelper.guiOCR(jpegData: jpegData, maximumElements: maximumElements)
+        let helper = EmbeddedVisionHelper.guiOCR(jpegData: jpegData, maximumElements: maximumElements)
         guard let json = helper.json,
               let data = json.data(using: .utf8),
               let response = try? JSONDecoder().decode(HelperResponse.self, from: data) else {
@@ -113,8 +138,8 @@ enum LocalVisionTextObservation {
             "localVisionCoordinateSpace": "screen_points_top_left",
             "localVisionLatencyMS": String(max(0, response.latencyMS)),
             "localVisionRecognitionLevel": response.recognitionLevel ?? "accurate",
-            "localVisionFallbackUsed": "false",
-            "localVisionBackend": response.backend ?? "root_helper_vision",
+            "localVisionFallbackUsed": response.cpuFallbackUsed == true ? "true" : "false",
+            "localVisionBackend": response.backend ?? "vision_helper_public_api",
             "localVisionRegion": boundedRegion.map { "\($0.minX),\($0.minY),\($0.width),\($0.height)" } ?? "full_screen"
         ]
         if let errorDomain = response.errorDomain, !errorDomain.isEmpty {
@@ -122,6 +147,12 @@ enum LocalVisionTextObservation {
         }
         if let errorCode = response.errorCode {
             payload["localVisionErrorCode"] = String(errorCode)
+        }
+        if let primaryErrorDomain = response.primaryErrorDomain, !primaryErrorDomain.isEmpty {
+            payload["localVisionPrimaryErrorDomain"] = primaryErrorDomain
+        }
+        if let primaryErrorCode = response.primaryErrorCode {
+            payload["localVisionPrimaryErrorCode"] = String(primaryErrorCode)
         }
         return Observation(payload: payload, elements: boundedElements)
     }
@@ -164,6 +195,10 @@ enum LocalVisionTextObservation {
             request.recognitionLevel = level
             request.usesLanguageCorrection = false
             request.minimumTextHeight = 0.009
+            // Cross-app automation backgrounds this host on iOS 16. Keep Vision away from
+            // GPU/ANE-backed paths that can fail in background with CoreVideo/CoreML errors.
+            request.usesCPUOnly = true
+            request.preferBackgroundProcessing = true
             if let languages, !languages.isEmpty {
                 request.recognitionLanguages = languages
             } else {
@@ -211,7 +246,7 @@ enum LocalVisionTextObservation {
                     "localVisionErrorCode": String(allocationFailure.code),
                     "localVisionPrimaryErrorDomain": firstFailure?.domain ?? "",
                     "localVisionPrimaryErrorCode": firstFailure.map { String($0.code) } ?? "",
-                    "localVisionBackend": "app_process_vision_fallback"
+                    "localVisionBackend": "app_process_vision_cpu_only"
                 ], elements: [])
             }
             // A request revision/device can still reject the chosen language/model combination.
@@ -233,7 +268,7 @@ enum LocalVisionTextObservation {
                     "localVisionErrorCode": String(finalFailure.code),
                     "localVisionPrimaryErrorDomain": firstFailure?.domain ?? "",
                     "localVisionPrimaryErrorCode": firstFailure.map { String($0.code) } ?? "",
-                    "localVisionBackend": "app_process_vision_fallback"
+                    "localVisionBackend": "app_process_vision_cpu_only"
                 ], elements: [])
             }
         }
@@ -260,17 +295,21 @@ enum LocalVisionTextObservation {
             let text = String(cleaned.prefix(120))
             let box = observation.boundingBox
             // Vision uses normalized lower-left coordinates; GUI automation uses upper-left points.
-            let x = box.minX * screenWidth
-            let y = (1.0 - box.maxY) * screenHeight
-            let width = box.width * screenWidth
-            let height = box.height * screenHeight
+            guard let screenRect = LocalPerceptionGeometry.topLeftScreenRect(
+                normalizedLowerLeftX: Double(box.minX),
+                y: Double(box.minY),
+                width: Double(box.width),
+                height: Double(box.height),
+                screenWidth: Double(screenWidth),
+                screenHeight: Double(screenHeight)
+            ) else { continue }
             elements.append(LocalPerceptionTextElement(
                 text: text,
                 confidence: (Double(candidate.confidence) * 1_000).rounded() / 1_000,
-                x: (Double(x) * 10).rounded() / 10,
-                y: (Double(y) * 10).rounded() / 10,
-                width: (Double(width) * 10).rounded() / 10,
-                height: (Double(height) * 10).rounded() / 10
+                x: (screenRect.x * 10).rounded() / 10,
+                y: (screenRect.y * 10).rounded() / 10,
+                width: (screenRect.width * 10).rounded() / 10,
+                height: (screenRect.height * 10).rounded() / 10
             ))
             if visibleTextCharacters < 4_096 {
                 let remaining = max(0, 4_096 - visibleTextCharacters)
@@ -297,7 +336,7 @@ enum LocalVisionTextObservation {
             "localVisionLatencyMS": String(max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))),
             "localVisionRecognitionLevel": request.recognitionLevel == .fast ? "fast" : "accurate",
             "localVisionFallbackUsed": fallbackUsed ? "true" : "false",
-            "localVisionBackend": "app_process_vision_fallback"
+            "localVisionBackend": "app_process_vision_cpu_only"
         ]
         if let boundedRegion {
             payload["localVisionRegion"] = "\(boundedRegion.minX),\(boundedRegion.minY),\(boundedRegion.width),\(boundedRegion.height)"

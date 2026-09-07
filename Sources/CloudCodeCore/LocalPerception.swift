@@ -71,6 +71,52 @@ public struct LocalPerceptionTextElement: Codable, Equatable, Sendable {
     public var centerY: Double { y + height / 2 }
 }
 
+public enum LocalPerceptionTextMatchResult: Equatable, Sendable {
+    case unique(LocalPerceptionTextElement)
+    case notFound
+    case ambiguous(Int)
+}
+
+public enum LocalPerceptionTextMatcher {
+    public static func resolve(
+        query rawQuery: String,
+        mode: GUIElementMatchMode = .exact,
+        elements: [LocalPerceptionTextElement]
+    ) -> LocalPerceptionTextMatchResult {
+        let query = normalized(rawQuery)
+        guard !query.isEmpty else { return .notFound }
+        let usable = elements.compactMap { element -> (element: LocalPerceptionTextElement, normalized: String)? in
+            guard element.confidence >= 0.12, element.width > 0, element.height > 0 else { return nil }
+            let candidate = normalized(element.text)
+            guard !candidate.isEmpty else { return nil }
+            return (element, candidate)
+        }
+        let primary = usable.filter { candidate in
+            switch mode {
+            case .exact: return candidate.normalized == query
+            case .contains: return candidate.normalized.contains(query)
+            }
+        }.map(\.element)
+        if primary.count == 1 { return .unique(primary[0]) }
+        if primary.count > 1 { return .ambiguous(primary.count) }
+
+        // Accurate Vision OCR can return a complete UI row as one box. Preserve exact matching
+        // first, then accept a non-trivial requested label inside exactly one current-frame row.
+        if mode == .exact, query.count >= 2 {
+            let containment = usable.filter { $0.normalized.contains(query) }.map(\.element)
+            if containment.count == 1 { return .unique(containment[0]) }
+            if containment.count > 1 { return .ambiguous(containment.count) }
+        }
+        return .notFound
+    }
+
+    private static func normalized(_ value: String) -> String {
+        value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+    }
+}
+
 public enum LocalFeedMetric: String, Codable, Sendable {
     case likeCount
     case commentCount
@@ -97,6 +143,51 @@ public struct LocalPerceptionScreenSize: Equatable, Sendable {
     public init(width: Double, height: Double) {
         self.width = width
         self.height = height
+    }
+}
+
+public struct LocalPerceptionScreenRect: Equatable, Sendable {
+    public var x: Double
+    public var y: Double
+    public var width: Double
+    public var height: Double
+
+    public init(x: Double, y: Double, width: Double, height: Double) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+}
+
+public enum LocalPerceptionGeometry {
+    /// Converts a normalized Vision-style lower-left rectangle into the top-left screen-point
+    /// coordinate space used by GUI automation. The input is intersected with the normalized unit
+    /// image bounds so tiny detector overshoots cannot produce off-screen coordinates.
+    public static func topLeftScreenRect(
+        normalizedLowerLeftX x: Double,
+        y: Double,
+        width: Double,
+        height: Double,
+        screenWidth: Double,
+        screenHeight: Double
+    ) -> LocalPerceptionScreenRect? {
+        guard x.isFinite, y.isFinite, width.isFinite, height.isFinite,
+              screenWidth.isFinite, screenHeight.isFinite,
+              width > 0, height > 0, screenWidth > 0, screenHeight > 0 else { return nil }
+
+        let minX = max(0, min(1, x))
+        let minY = max(0, min(1, y))
+        let maxX = max(0, min(1, x + width))
+        let maxY = max(0, min(1, y + height))
+        guard maxX > minX, maxY > minY else { return nil }
+
+        return LocalPerceptionScreenRect(
+            x: minX * screenWidth,
+            y: (1 - maxY) * screenHeight,
+            width: (maxX - minX) * screenWidth,
+            height: (maxY - minY) * screenHeight
+        )
     }
 }
 
@@ -146,7 +237,8 @@ public enum LocalFeedMetricExtractor {
         screenSize: LocalPerceptionScreenSize? = nil
     ) -> LocalFeedMetricExtraction? {
         let usable = elements.filter { $0.confidence >= 0.35 && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        guard !usable.isEmpty else { return nil }
+        let rightRailUsable = elements.filter { $0.confidence >= 0.18 && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard !rightRailUsable.isEmpty else { return nil }
 
         var candidates: [(score: Double, extraction: LocalFeedMetricExtraction)] = []
         for anchor in usable where containsAnchor(anchor.text, metric: metric) {
@@ -192,7 +284,7 @@ public enum LocalFeedMetricExtractor {
             return lhs.score > rhs.score
         }
         guard let best = sorted.first else {
-            return extractFromRightRail(metric: metric, usable: usable, screenSize: screenSize)
+            return extractFromRightRail(metric: metric, usable: rightRailUsable, screenSize: screenSize)
         }
         if sorted.count > 1 {
             let second = sorted[1]
@@ -202,6 +294,55 @@ public enum LocalFeedMetricExtractor {
             }
         }
         return best.extraction
+    }
+
+    public static func failureReason(
+        metric: LocalFeedMetric,
+        elements: [LocalPerceptionTextElement],
+        screenSize: LocalPerceptionScreenSize?
+    ) -> String? {
+        if extract(metric: metric, elements: elements, screenSize: screenSize) != nil { return nil }
+        let recognized = elements.filter {
+            $0.confidence >= 0.18 && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard !recognized.isEmpty else { return "ocr_completed_no_text" }
+
+        if let screenSize,
+           screenSize.width.isFinite, screenSize.height.isFinite,
+           screenSize.width >= 200, screenSize.height >= 400 {
+            let geometricRail = recognized.filter { element in
+                element.centerX >= screenSize.width * 0.72
+                    && element.centerX <= screenSize.width * 0.99
+                    && element.centerY >= screenSize.height * 0.24
+                    && element.centerY <= screenSize.height * 0.90
+                    && element.width <= screenSize.width * 0.24
+            }
+            let countLike = geometricRail.filter { looksLikeCompactCountFragment($0.text) }
+            let parsedCount = countLike.filter { CompactVisibleCountParser.parse($0.text) != nil }.count
+            if countLike.count >= 3 && parsedCount < 3 {
+                return "compact_count_normalization_failed"
+            }
+            if !geometricRail.isEmpty {
+                return "right_rail_anchor_classification_failed"
+            }
+        }
+
+        let semanticAnchors = recognized.filter { containsAnchor($0.text, metric: metric) }
+        if !semanticAnchors.isEmpty {
+            let nearbyCountLike = recognized.filter { element in
+                guard looksLikeCompactCountFragment(element.text) else { return false }
+                return semanticAnchors.contains { anchor in
+                    abs(element.centerX - anchor.centerX) <= max(120, anchor.width * 4)
+                        && abs(element.centerY - anchor.centerY) <= max(72, anchor.height * 6)
+                }
+            }
+            if !nearbyCountLike.isEmpty,
+               nearbyCountLike.allSatisfy({ CompactVisibleCountParser.parse($0.text) == nil }) {
+                return "compact_count_normalization_failed"
+            }
+            return "metric_anchor_classification_failed"
+        }
+        return "right_rail_anchor_classification_failed"
     }
 
     public static func select(
@@ -277,6 +418,8 @@ public enum LocalFeedMetricExtractor {
         switch (metric, rightRail.count) {
         case (.likeCount, _): slot = 0
         case (.commentCount, _): slot = 1
+        // With only three numeric slots, the final item can be favorite or share depending on
+        // the current feed layout. Geometry alone cannot disambiguate that semantic role.
         case (.shareCount, 4): slot = 3
         default: return nil
         }
@@ -300,6 +443,14 @@ public enum LocalFeedMetricExtractor {
     private static func containsAnchor(_ text: String, metric: LocalFeedMetric) -> Bool {
         let normalized = text.lowercased()
         return metric.anchors.contains { normalized.contains($0) }
+    }
+
+    private static func looksLikeCompactCountFragment(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.unicodeScalars.contains(where: { CharacterSet.decimalDigits.contains($0) }) else { return false }
+        let allowed = CharacterSet(charactersIn: "0123456789.,， kKmMbBwW万亿")
+        return trimmed.unicodeScalars.allSatisfy { allowed.contains($0) }
     }
 }
 

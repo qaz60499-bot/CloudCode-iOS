@@ -297,6 +297,9 @@ public enum HarnessContextManager {
 
         guard !prefixes.isEmpty else { return availableNames }
         var scoped = Set(availableNames.filter { name in prefixes.contains(where: name.hasPrefix) })
+        // Failure explanation is a local read-only introspection tool and remains useful even when
+        // the provider schema is domain-scoped. It never broadens execution authority.
+        if availableNames.contains("diagnostics.explainFailure") { scoped.insert("diagnostics.explainFailure") }
         if shouldExposeNativeMessagingDiscovery {
             let nativeReadOnlyDiscovery: Set<String> = [
                 "apps.inspect", "container.resolve", "container.list", "container.search",

@@ -521,6 +521,22 @@ public struct ProviderToolNameMap: Sendable, Equatable {
     }
 }
 
+public enum ProviderImageCapability: String, Sendable, Equatable {
+    case supported
+    case textOnly = "text_only"
+    case unknown
+}
+
+public struct ProviderImageCapabilityAssessment: Sendable, Equatable {
+    public var capability: ProviderImageCapability
+    public var source: String
+
+    public init(capability: ProviderImageCapability, source: String) {
+        self.capability = capability
+        self.source = source
+    }
+}
+
 public protocol ProviderStreaming: Sendable {
     func stream(
         configuration: ProviderConfiguration,
@@ -528,25 +544,52 @@ public protocol ProviderStreaming: Sendable {
         messages: [ChatMessage],
         tools: [ProviderToolSchema]
     ) -> AsyncThrowingStream<ProviderEvent, Error>
+
+    func imageCapability(
+        configuration: ProviderConfiguration,
+        apiKey: String
+    ) async -> ProviderImageCapabilityAssessment
+}
+
+public extension ProviderStreaming {
+    func imageCapability(
+        configuration: ProviderConfiguration,
+        apiKey: String
+    ) async -> ProviderImageCapabilityAssessment {
+        await ProviderImageCompatibilityPolicy.currentAssessment(configuration: configuration, apiKey: apiKey)
+    }
 }
 
 private actor ProviderImageCompatibilityState {
-    static let shared = ProviderImageCompatibilityState()
-    private var textOnlyRoutes: [String: Date] = [:]
-    private let ttl: TimeInterval = 6 * 60 * 60
-
-    func isTextOnly(_ routeKey: String, now: Date = Date()) -> Bool {
-        prune(now: now)
-        return textOnlyRoutes[routeKey] != nil
+    struct Entry: Sendable {
+        var capability: ProviderImageCapability
+        var source: String
+        var touchedAt: Date
     }
 
-    func markTextOnly(_ routeKey: String, now: Date = Date()) {
+    static let shared = ProviderImageCompatibilityState()
+    private var routes: [String: Entry] = [:]
+    private let resolvedTTL: TimeInterval = 6 * 60 * 60
+    // Unknown is still a real bounded probe outcome. Keep it for the same runtime window so a
+    // long GUI task cannot re-send the fixed 1px capability probe every few minutes.
+    private let unknownTTL: TimeInterval = 6 * 60 * 60
+
+    func assessment(_ routeKey: String, now: Date = Date()) -> ProviderImageCapabilityAssessment? {
         prune(now: now)
-        textOnlyRoutes[routeKey] = now
+        guard let entry = routes[routeKey] else { return nil }
+        return ProviderImageCapabilityAssessment(capability: entry.capability, source: entry.source)
+    }
+
+    func mark(_ capability: ProviderImageCapability, source: String, routeKey: String, now: Date = Date()) {
+        prune(now: now)
+        routes[routeKey] = Entry(capability: capability, source: source, touchedAt: now)
     }
 
     private func prune(now: Date) {
-        textOnlyRoutes = textOnlyRoutes.filter { now.timeIntervalSince($0.value) <= ttl }
+        routes = routes.filter { _, entry in
+            let ttl = entry.capability == .unknown ? unknownTTL : resolvedTTL
+            return now.timeIntervalSince(entry.touchedAt) <= ttl
+        }
     }
 }
 
@@ -561,15 +604,169 @@ private func providerImageCompatibilityRouteKey(configuration: ProviderConfigura
     ].joined(separator: "|")
 }
 
-/// Runtime visibility for the Agent executor. ProviderClient can transparently recover from an
-/// AgentRouter image-shape 400 by retrying the same proven route as text-only; the executor must
-/// also know about that downgrade so it never turns an omitted screenshot into guessed tap
-/// coordinates. The API deliberately exposes only a boolean and never the Key-derived route key.
+/// Runtime visibility for the Agent executor. Image capability is scoped to the exact
+/// Key×Host×protocol×model route and is never inferred from model naming alone.
 enum ProviderImageCompatibilityPolicy {
-    static func isCurrentRouteTextOnly(configuration: ProviderConfiguration, apiKey: String) async -> Bool {
-        guard configuration.providerID == ProviderCatalog.agentRouterID else { return false }
+    static func currentAssessment(configuration: ProviderConfiguration, apiKey: String) async -> ProviderImageCapabilityAssessment {
         let routeKey = providerImageCompatibilityRouteKey(configuration: configuration, apiKey: apiKey)
-        return await ProviderImageCompatibilityState.shared.isTextOnly(routeKey)
+        if let cached = await ProviderImageCompatibilityState.shared.assessment(routeKey) {
+            return cached
+        }
+        return ProviderImageCapabilityAssessment(capability: .unknown, source: "unprobed")
+    }
+
+    static func isCurrentRouteTextOnly(configuration: ProviderConfiguration, apiKey: String) async -> Bool {
+        await currentAssessment(configuration: configuration, apiKey: apiKey).capability == .textOnly
+    }
+
+    static func mark(
+        _ capability: ProviderImageCapability,
+        source: String,
+        configuration: ProviderConfiguration,
+        apiKey: String
+    ) async {
+        let routeKey = providerImageCompatibilityRouteKey(configuration: configuration, apiKey: apiKey)
+        await ProviderImageCompatibilityState.shared.mark(capability, source: source, routeKey: routeKey)
+    }
+}
+
+private let providerTinyImageProbeBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+
+private func providerMessagesWithoutImages(_ messages: [ChatMessage], capability: ProviderImageCapability) -> [ChatMessage] {
+    messages.map { message in
+        guard !message.attachments.isEmpty else { return message }
+        var stripped = message
+        stripped.attachments = []
+        stripped.providerMetadata["provider_image_compatibility"] = capability.rawValue
+        if message.providerMetadata["internal_observation"] != nil {
+            stripped.content = "A device screenshot was captured locally, but the selected Provider route is not proven able to consume image input. The image is intentionally omitted. Continue only from current local OCR/AX/structured evidence; do not claim to have seen the omitted image and do not guess icon coordinates."
+        } else {
+            stripped.content += "\n[Image attachment omitted because image-input capability is not proven for this exact Provider route.]"
+        }
+        return stripped
+    }
+}
+
+private func providerToolsWithoutFreeCoordinates(_ tools: [ProviderToolSchema]) -> [ProviderToolSchema] {
+    let blocked: Set<String> = ["gui.tap", "gui.tapObserve"]
+    return tools.filter { schema in
+        guard let internalName = try? ProviderToolNameMap.decode(schema.name) else { return true }
+        return !blocked.contains(internalName)
+    }
+}
+
+private func applyProviderProbeAuth(_ apiKey: String, configuration: ProviderConfiguration, request: inout URLRequest) {
+    switch ProviderRequestFactory.authMode(configuration) {
+    case .bearer:
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+    case .xAPIKey:
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+    case .both:
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+    }
+}
+
+private func providerModelImageCapability(from data: Data, model: String) -> ProviderImageCapability? {
+    guard let root = try? JSONSerialization.jsonObject(with: data) else { return nil }
+    let target = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !target.isEmpty else { return nil }
+    let identifierKeys = ["id", "model", "model_id", "modelId", "model_name", "modelName", "name", "slug", "value"]
+
+    func recordIdentifier(_ record: [String: Any]) -> String? {
+        for key in identifierKeys {
+            if let value = record[key] as? String, value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == target {
+                return value
+            }
+        }
+        return nil
+    }
+
+    func strings(_ value: Any?) -> [String] {
+        if let values = value as? [String] { return values.map { $0.lowercased() } }
+        if let values = value as? [Any] { return values.compactMap { ($0 as? String)?.lowercased() } }
+        if let value = value as? String { return [value.lowercased()] }
+        return []
+    }
+
+    func hasImageMarker(_ values: [String]) -> Bool {
+        values.contains { value in
+            value.contains("image") || value.contains("vision") || value.contains("multimodal")
+        }
+    }
+
+    func assessment(_ record: [String: Any]) -> ProviderImageCapability? {
+        for key in ["vision", "supports_vision", "supportsVision", "image_input", "imageInput", "supports_images", "supportsImages"] {
+            if let value = record[key] as? Bool { return value ? .supported : .textOnly }
+        }
+        if let capabilities = record["capabilities"] as? [String: Any] {
+            for key in ["vision", "image", "images", "image_input", "imageInput"] {
+                if let value = capabilities[key] as? Bool { return value ? .supported : .textOnly }
+            }
+        }
+        let authoritativeInputKeys = ["input_modalities", "inputModalities", "supported_input_modalities", "supportedInputModalities"]
+        for key in authoritativeInputKeys {
+            let values = strings(record[key])
+            if !values.isEmpty { return hasImageMarker(values) ? .supported : .textOnly }
+        }
+        if let architecture = record["architecture"] as? [String: Any] {
+            for key in authoritativeInputKeys {
+                let values = strings(architecture[key])
+                if !values.isEmpty { return hasImageMarker(values) ? .supported : .textOnly }
+            }
+        }
+        for key in ["modalities", "supported_modalities", "supportedModalities", "modality"] {
+            let values = strings(record[key])
+            if hasImageMarker(values) { return .supported }
+        }
+        return nil
+    }
+
+    func find(_ value: Any) -> ProviderImageCapability? {
+        if let record = value as? [String: Any] {
+            if recordIdentifier(record) != nil, let capability = assessment(record) { return capability }
+            for key in ["data", "models", "items", "results"] {
+                if let nested = record[key], let capability = find(nested) { return capability }
+            }
+        } else if let values = value as? [Any] {
+            for value in values {
+                if let capability = find(value) { return capability }
+            }
+        }
+        return nil
+    }
+
+    return find(root)
+}
+
+private enum ProviderImageProbeClassifier {
+    static func classify(statusCode: Int, body: Data) -> ProviderImageCapability {
+        let text = String(data: body.prefix(262_144), encoding: .utf8)?.lowercased() ?? ""
+        if ProviderFailureEvidence.isCredential(text) || ProviderFailureEvidence.isCapacity(text) || ProviderFailureEvidence.isModelUnavailable(text) {
+            return .unknown
+        }
+        if (200..<300).contains(statusCode) {
+            // A generic HTML/login/front-door 2xx is not capability proof. Require a recognizable
+            // inference completion/stream envelope from the exact API endpoint before promoting
+            // this route to image-supported.
+            let successMarkers = [
+                "\"choices\"", "\"message_start\"", "\"message_stop\"", "\"content_block_",
+                "\"response.completed\"", "\"response.output_", "data: [done]"
+            ]
+            let errorMarkers = ["\"error\"", "event: error", "\"type\":\"error\""]
+            guard !errorMarkers.contains(where: text.contains),
+                  successMarkers.contains(where: text.contains) else { return .unknown }
+            return .supported
+        }
+        guard statusCode == 400 || statusCode == 415 || statusCode == 422 else { return .unknown }
+        let imageMarkers = ["image", "vision", "multimodal", "input_image", "image_url", "image content"]
+        let rejectionMarkers = ["unsupported", "not support", "does not support", "text only", "text-only", "invalid", "not allowed", "must be text", "only text", "参数非法"]
+        if imageMarkers.contains(where: text.contains) && rejectionMarkers.contains(where: text.contains) {
+            return .textOnly
+        }
+        let typeConstraint = (text.contains(".type") || text.contains(" type ") || text.contains("type 参数"))
+            && (text.contains("['text']") || text.contains("[\"text\"]"))
+        return typeConstraint ? .textOnly : .unknown
     }
 }
 
@@ -582,6 +779,102 @@ private protocol ProviderRequestBuilding {
 }
 
 private extension ProviderRequestBuilding {
+    func resolveImageCapability(
+        configuration: ProviderConfiguration,
+        apiKey: String
+    ) async -> ProviderImageCapabilityAssessment {
+        let cached = await ProviderImageCompatibilityPolicy.currentAssessment(configuration: configuration, apiKey: apiKey)
+        if cached.source != "unprobed" { return cached }
+
+        do {
+            let modelsURL = try ProviderEndpoint.endpoint(baseURL: configuration.baseURL, path: "models")
+            var request = URLRequest(url: modelsURL)
+            request.httpMethod = "GET"
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            ProviderCompatibilityHeaders.apply(to: &request)
+            applyProviderProbeAuth(apiKey, configuration: configuration, request: &request)
+            request.timeoutInterval = 6
+            let (data, response) = try await session.data(for: request)
+            if let http = response as? HTTPURLResponse,
+               (200..<300).contains(http.statusCode),
+               let capability = providerModelImageCapability(from: data, model: configuration.model) {
+                let assessment = ProviderImageCapabilityAssessment(capability: capability, source: "models_metadata")
+                await ProviderImageCompatibilityPolicy.mark(capability, source: assessment.source, configuration: configuration, apiKey: apiKey)
+                try? await diagnosticLogger?.log(
+                    level: .info,
+                    subsystem: "provider",
+                    action: "vision-capability",
+                    result: capability.rawValue,
+                    metadata: [
+                        "providerVisionCapability": capability.rawValue,
+                        "providerVisionCapabilitySource": assessment.source,
+                        "providerID": configuration.providerID ?? "",
+                        "host": configuration.baseURL.host ?? "",
+                        "protocol": configuration.protocolName ?? "",
+                        "model": configuration.model
+                    ]
+                )
+                return assessment
+            }
+        } catch {
+            // Catalog metadata is optional. Continue to one bounded, non-private tiny-image probe.
+        }
+
+        do {
+            let probeMessage = ChatMessage(
+                role: .user,
+                content: "Image-input capability probe. Reply with OK.",
+                providerMetadata: [
+                    "internal_image_capability_probe": "true",
+                    ChatMessageProviderMetadataKey.imageBase64: providerTinyImageProbeBase64,
+                    ChatMessageProviderMetadataKey.imageMimeType: "image/png"
+                ]
+            )
+            var request = try makeRequest(configuration: configuration, apiKey: apiKey, messages: [probeMessage], tools: [])
+            request.timeoutInterval = 8
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("missing image capability probe response") }
+            let capability = ProviderImageProbeClassifier.classify(statusCode: http.statusCode, body: data)
+            let source = capability == .unknown ? "tiny_image_probe_inconclusive" : "tiny_image_probe"
+            await ProviderImageCompatibilityPolicy.mark(capability, source: source, configuration: configuration, apiKey: apiKey)
+            try? await diagnosticLogger?.log(
+                level: capability == .unknown ? .warning : .info,
+                subsystem: "provider",
+                action: "vision-capability",
+                result: capability.rawValue,
+                metadata: [
+                    "providerVisionCapability": capability.rawValue,
+                    "providerVisionCapabilitySource": source,
+                    "providerID": configuration.providerID ?? "",
+                    "host": configuration.baseURL.host ?? "",
+                    "protocol": configuration.protocolName ?? "",
+                    "model": configuration.model,
+                    "probeStatusCode": String(http.statusCode)
+                ]
+            )
+            return ProviderImageCapabilityAssessment(capability: capability, source: source)
+        } catch {
+            let assessment = ProviderImageCapabilityAssessment(capability: .unknown, source: "tiny_image_probe_unavailable")
+            await ProviderImageCompatibilityPolicy.mark(.unknown, source: assessment.source, configuration: configuration, apiKey: apiKey)
+            try? await diagnosticLogger?.log(
+                level: .warning,
+                subsystem: "provider",
+                action: "vision-capability",
+                result: ProviderImageCapability.unknown.rawValue,
+                error: error,
+                metadata: [
+                    "providerVisionCapability": ProviderImageCapability.unknown.rawValue,
+                    "providerVisionCapabilitySource": assessment.source,
+                    "providerID": configuration.providerID ?? "",
+                    "host": configuration.baseURL.host ?? "",
+                    "protocol": configuration.protocolName ?? "",
+                    "model": configuration.model
+                ]
+            )
+            return assessment
+        }
+    }
+
     func requestStream(
         configuration: ProviderConfiguration,
         apiKey: String,
@@ -597,25 +890,41 @@ private extension ProviderRequestBuilding {
                 var didDropReasoningEffortForCompatibility = false
                 var didCompactContextForGatewayRecovery = false
                 var didDropAgentRouterImagesForCompatibility = false
-                let imageCompatibilityRouteKey = providerImageCompatibilityRouteKey(configuration: configuration, apiKey: apiKey)
-                if configuration.providerID == ProviderCatalog.agentRouterID,
-                   messages.contains(where: { !$0.attachments.isEmpty }),
-                   await ProviderImageCompatibilityState.shared.isTextOnly(imageCompatibilityRouteKey) {
-                    requestMessages = ProviderCompatibilityClassifier.agentRouterTextOnlyMessages(from: messages)
-                    didDropAgentRouterImagesForCompatibility = true
-                    try? await diagnosticLogger?.log(
-                        level: .info,
-                        subsystem: "provider",
-                        action: "request.compatibility-cache",
-                        result: "agentrouter_text_only_route_hit",
-                        diagnostic: "This exact Key×Host×protocol×model route already rejected image content during the current process. Reusing bounded text-only compatibility without repeating the known 400; local GUI observation payload remains available.",
-                        metadata: [
-                            "providerID": configuration.providerID ?? "",
-                            "model": configuration.model,
-                            "protocol": configuration.protocolName ?? "",
-                            "host": configuration.baseURL.host ?? ""
-                        ]
-                    )
+                let hasImageAttachments = messages.contains(where: { !$0.attachments.isEmpty })
+                let visionAssessment: ProviderImageCapabilityAssessment
+                if hasImageAttachments {
+                    visionAssessment = await resolveImageCapability(configuration: configuration, apiKey: apiKey)
+                } else {
+                    visionAssessment = await ProviderImageCompatibilityPolicy.currentAssessment(configuration: configuration, apiKey: apiKey)
+                }
+                if visionAssessment.capability != .supported {
+                    if hasImageAttachments {
+                        requestMessages = providerMessagesWithoutImages(messages, capability: visionAssessment.capability)
+                        didDropAgentRouterImagesForCompatibility = configuration.providerID == ProviderCatalog.agentRouterID
+                    }
+                    let gatedTools = providerToolsWithoutFreeCoordinates(tools)
+                    let removedFreeCoordinateTools = gatedTools.count != tools.count
+                    requestTools = gatedTools
+                    if hasImageAttachments || removedFreeCoordinateTools {
+                        try? await diagnosticLogger?.log(
+                            level: visionAssessment.capability == .textOnly ? .info : .warning,
+                            subsystem: "provider",
+                            action: "request.vision-gate",
+                            result: hasImageAttachments ? "image_omitted_before_provider_request" : "free_coordinate_tools_omitted_before_provider_request",
+                            diagnostic: hasImageAttachments
+                                ? "The exact Key×Host×protocol×model route is not proven image-capable. Real screenshots are omitted before serialization and free-coordinate tap tools are withheld for this request."
+                                : "The exact Key×Host×protocol×model route is not proven image-capable. No capability probe was triggered for this text-only round; free-coordinate tap tools are withheld until image capability is proven supported or coordinates are grounded locally.",
+                            metadata: [
+                                "providerVisionCapability": visionAssessment.capability.rawValue,
+                                "providerVisionCapabilitySource": visionAssessment.source,
+                                "providerID": configuration.providerID ?? "",
+                                "model": configuration.model,
+                                "protocol": configuration.protocolName ?? "",
+                                "host": configuration.baseURL.host ?? "",
+                                "imageAttachmentPresent": hasImageAttachments ? "true" : "false"
+                            ]
+                        )
+                    }
                 }
                 while attempt <= retryPolicy.maxAttempts {
                     var responseStarted = false
@@ -690,7 +999,13 @@ private extension ProviderRequestBuilding {
                                ) {
                                 didDropAgentRouterImagesForCompatibility = true
                                 requestMessages = ProviderCompatibilityClassifier.agentRouterTextOnlyMessages(from: requestMessages)
-                                await ProviderImageCompatibilityState.shared.markTextOnly(imageCompatibilityRouteKey)
+                                requestTools = providerToolsWithoutFreeCoordinates(requestTools)
+                                await ProviderImageCompatibilityPolicy.mark(
+                                    .textOnly,
+                                    source: "compatibility_fallback",
+                                    configuration: configuration,
+                                    apiKey: apiKey
+                                )
                                 try? await diagnosticLogger?.log(
                                     level: .warning,
                                     subsystem: "provider",
@@ -964,6 +1279,10 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
         requestStream(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
     }
 
+    public func imageCapability(configuration: ProviderConfiguration, apiKey: String) async -> ProviderImageCapabilityAssessment {
+        await resolveImageCapability(configuration: configuration, apiKey: apiKey)
+    }
+
     fileprivate func makeRequest(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) throws -> URLRequest {
         let url = try ProviderEndpoint.endpoint(baseURL: configuration.baseURL, path: "chat/completions")
         var body: [String: Any] = [
@@ -1078,6 +1397,10 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
 
     public func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
         requestStream(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
+    }
+
+    public func imageCapability(configuration: ProviderConfiguration, apiKey: String) async -> ProviderImageCapabilityAssessment {
+        await resolveImageCapability(configuration: configuration, apiKey: apiKey)
     }
 
     fileprivate func makeRequest(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) throws -> URLRequest {
@@ -1269,6 +1592,10 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
 
     public func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
         requestStream(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
+    }
+
+    public func imageCapability(configuration: ProviderConfiguration, apiKey: String) async -> ProviderImageCapabilityAssessment {
+        await resolveImageCapability(configuration: configuration, apiKey: apiKey)
     }
 
     fileprivate func makeRequest(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) throws -> URLRequest {
@@ -1582,6 +1909,10 @@ public struct DeferredProviderClient: ProviderStreaming, Sendable {
         // iOS app's first-frame path, including privileged TrollStore builds.
         factory().stream(configuration: configuration, apiKey: apiKey, messages: messages, tools: tools)
     }
+
+    public func imageCapability(configuration: ProviderConfiguration, apiKey: String) async -> ProviderImageCapabilityAssessment {
+        await factory().imageCapability(configuration: configuration, apiKey: apiKey)
+    }
 }
 
 public struct ProviderClientRouter: ProviderStreaming, Sendable {
@@ -1606,6 +1937,148 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
         self.responses = responses
         self.requestKeyState = requestKeyState
         self.diagnosticLogger = diagnosticLogger
+    }
+
+    public func imageCapability(configuration: ProviderConfiguration, apiKey: String) async -> ProviderImageCapabilityAssessment {
+        guard let selected = await preferredCapabilityRoute(configuration: configuration, apiKey: apiKey) else {
+            return ProviderImageCapabilityAssessment(capability: .unknown, source: "router_route_unavailable")
+        }
+        let assessment = await clientFor(selected.configuration).imageCapability(
+            configuration: selected.configuration,
+            apiKey: selected.apiKey
+        )
+        try? await diagnosticLogger?.log(
+            level: assessment.capability == .unknown ? .warning : .info,
+            subsystem: "provider",
+            action: "vision-capability.route",
+            result: assessment.capability.rawValue,
+            metadata: [
+                "providerVisionCapability": assessment.capability.rawValue,
+                "providerVisionCapabilitySource": assessment.source,
+                "providerID": configuration.providerID ?? "",
+                "host": selected.configuration.baseURL.host ?? "",
+                "protocol": selected.configuration.protocolName ?? "",
+                "model": selected.configuration.model,
+                "keyReference": selected.keyReference,
+                "routeSelection": "router_preferred_exact_route"
+            ]
+        )
+        return assessment
+    }
+
+    private func preferredCapabilityRoute(
+        configuration: ProviderConfiguration,
+        apiKey: String
+    ) async -> (configuration: ProviderConfiguration, apiKey: String, keyReference: String)? {
+        let fallbackReferences = (configuration.fallbackAPIKeyReferences ?? []).filter { $0 != configuration.apiKeyReference }
+        let allowedReferences = [configuration.apiKeyReference] + fallbackReferences
+        var availableKeyCandidates: [(String, String)] = []
+        for reference in allowedReferences {
+            if reference == configuration.apiKeyReference {
+                availableKeyCandidates.append((reference, apiKey))
+            } else if let key = try? await keyVault.key(for: reference) {
+                availableKeyCandidates.append((reference, key))
+            }
+        }
+        guard !availableKeyCandidates.isEmpty else { return nil }
+
+        let authModeIdentity = configuration.authModeName ?? ProviderAuthMode.bearer.rawValue
+        let providerModelIdentity = [
+            "evidence:\(ProviderEndpointRoutingPolicy.compatibilityEvidenceRevision)",
+            configuration.providerID ?? ProviderEndpointRoutingPolicy.normalizedRouteBase(configuration.baseURL),
+            "configuredBase:\(ProviderEndpointRoutingPolicy.normalizedRouteBase(configuration.baseURL))",
+            configuration.model.lowercased(),
+            "auth:\(authModeIdentity)"
+        ].joined(separator: "|")
+        let poolMaterial = availableKeyCandidates.map { candidate in
+            "\(candidate.0):\(Self.keyFingerprint(candidate.1))"
+        }.joined(separator: "|")
+        let selectionRoutingStateKey = "\(providerModelIdentity)|pool:\(Self.stableHash(poolMaterial))"
+        let availableReferences = availableKeyCandidates.map(\.0)
+        let preferredReference = await requestKeyState.preferredReference(
+            routingKey: selectionRoutingStateKey,
+            allowedReferences: availableReferences,
+            fallback: configuration.apiKeyReference
+        )
+
+        let keyCandidate: (String, String)
+        if configuration.allowSameProviderKeyFailover == true,
+           let preferred = availableKeyCandidates.first(where: { $0.0 == preferredReference }) {
+            keyCandidate = preferred
+        } else if let primary = availableKeyCandidates.first(where: { $0.0 == configuration.apiKeyReference }) {
+            keyCandidate = primary
+        } else {
+            return nil
+        }
+
+        var defaultProtocolCandidates: [ProviderProtocol] = []
+        for raw in [configuration.protocolName ?? ""] + (configuration.fallbackProtocolNames ?? []) {
+            guard let value = ProviderProtocol(rawValue: raw), !defaultProtocolCandidates.contains(value) else { continue }
+            defaultProtocolCandidates.append(value)
+        }
+        if defaultProtocolCandidates.isEmpty { defaultProtocolCandidates = [.openAIChat] }
+
+        let keyFingerprint = Self.keyFingerprint(keyCandidate.1)
+        let declaredFingerprint = configuration.keyFingerprintsByReference?[keyCandidate.0]
+        let declaredFingerprintMatches = declaredFingerprint == nil
+            || declaredFingerprint?.isEmpty == true
+            || declaredFingerprint == keyFingerprint
+        let configuredProtocolNames = declaredFingerprintMatches
+            ? (configuration.protocolNamesByKeyReference?[keyCandidate.0] ?? [])
+            : (configuration.safeProtocolNamesByKeyReference?[keyCandidate.0] ?? [])
+        var keyProtocolCandidates: [ProviderProtocol] = []
+        for raw in configuredProtocolNames {
+            guard let value = ProviderProtocol(rawValue: raw), !keyProtocolCandidates.contains(value) else { continue }
+            keyProtocolCandidates.append(value)
+        }
+        if keyProtocolCandidates.isEmpty {
+            if !declaredFingerprintMatches,
+               let safeNames = configuration.safeProtocolNamesByKeyReference?[keyCandidate.0] {
+                for raw in safeNames {
+                    guard let value = ProviderProtocol(rawValue: raw), !keyProtocolCandidates.contains(value) else { continue }
+                    keyProtocolCandidates.append(value)
+                }
+            }
+            if keyProtocolCandidates.isEmpty { keyProtocolCandidates = defaultProtocolCandidates }
+        }
+        guard !keyProtocolCandidates.isEmpty else { return nil }
+
+        let hostRoutingStateKey = "evidence:\(ProviderEndpointRoutingPolicy.compatibilityEvidenceRevision)|\(configuration.providerID ?? ProviderEndpointRoutingPolicy.normalizedRouteBase(configuration.baseURL))|configuredBase:\(ProviderEndpointRoutingPolicy.normalizedRouteBase(configuration.baseURL))|reference:\(keyCandidate.0)|key:\(keyFingerprint)|auth:\(authModeIdentity)|host"
+        let candidateBaseURLs = ProviderEndpointRoutingPolicy.candidateBaseURLs(
+            providerID: configuration.providerID,
+            configuredBaseURL: configuration.baseURL,
+            keyFingerprint: keyFingerprint
+        )
+        guard !candidateBaseURLs.isEmpty else { return nil }
+        let preferredBaseURL = await requestKeyState.preferredBaseURL(
+            routingKey: hostRoutingStateKey,
+            reference: keyCandidate.0,
+            allowedBaseURLs: candidateBaseURLs,
+            fallback: candidateBaseURLs[0]
+        )
+        let selectedBaseURL = candidateBaseURLs.first(where: {
+            ProviderEndpointRoutingPolicy.normalizedOrigin($0) == ProviderEndpointRoutingPolicy.normalizedOrigin(preferredBaseURL)
+        }) ?? candidateBaseURLs[0]
+
+        let protocolRoutingStateKey = [
+            providerModelIdentity,
+            "reference:\(keyCandidate.0)",
+            "key:\(keyFingerprint)",
+            "routeBase:\(ProviderEndpointRoutingPolicy.normalizedRouteBase(selectedBaseURL))"
+        ].joined(separator: "|")
+        let protocolNames = keyProtocolCandidates.map(\.rawValue)
+        let preferredProtocolName = await requestKeyState.preferredProtocol(
+            routingKey: protocolRoutingStateKey,
+            reference: keyCandidate.0,
+            allowedProtocols: protocolNames,
+            fallback: keyProtocolCandidates[0].rawValue
+        )
+        let selectedProtocol = keyProtocolCandidates.first(where: { $0.rawValue == preferredProtocolName }) ?? keyProtocolCandidates[0]
+
+        var selectedConfiguration = configuration
+        selectedConfiguration.baseURL = selectedBaseURL
+        selectedConfiguration.protocolName = selectedProtocol.rawValue
+        return (selectedConfiguration, keyCandidate.1, keyCandidate.0)
     }
 
     public func stream(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) -> AsyncThrowingStream<ProviderEvent, Error> {
@@ -2471,7 +2944,14 @@ private struct ProviderImageAttachment {
 }
 
 private func providerImageAttachments(_ message: ChatMessage) throws -> [ProviderImageAttachment] {
-    guard message.role == .user, !message.attachments.isEmpty else { return [] }
+    guard message.role == .user else { return [] }
+    if message.attachments.isEmpty,
+       message.providerMetadata["internal_image_capability_probe"] == "true",
+       message.providerMetadata[ChatMessageProviderMetadataKey.imageBase64] == providerTinyImageProbeBase64,
+       message.providerMetadata[ChatMessageProviderMetadataKey.imageMimeType] == "image/png" {
+        return [ProviderImageAttachment(base64: providerTinyImageProbeBase64, mimeType: "image/png")]
+    }
+    guard !message.attachments.isEmpty else { return [] }
     guard message.attachments.count <= 8 else {
         throw ProviderError.transport("单条消息最多向厂商发送 8 张当前观察图片")
     }

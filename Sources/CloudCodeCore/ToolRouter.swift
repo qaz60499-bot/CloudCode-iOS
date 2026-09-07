@@ -368,6 +368,7 @@ public actor ToolRegistry {
 
     public static let phaseOneDefaults: [ToolDescriptor] = [
         ToolDescriptor(name: "capability.probe", summary: "Return the capability snapshot already validated for this session; never initiates privileged probing.", risk: .readOnly),
+        ToolDescriptor(name: "diagnostics.explainFailure", summary: "Explain the most recent bounded failure from already-recorded redacted diagnostics, execution metrics, ledger state and the current capability snapshot. Optional sessionId/toolCallId narrow the evidence. This tool is read-only and never runs capability probes or recovery actions.", risk: .readOnly),
         ToolDescriptor(name: "apps.list", summary: "Search or page the cached installed-app index. Optional query matches app name/bundle ID; offset/limit are bounded. Device enumeration is reused until explicitly invalidated.", risk: .readOnly),
         ToolDescriptor(name: "apps.inspect", summary: "Inspect an installed app by bundle ID through the bounded resolver; missing targets fail closed.", risk: .readOnly),
         ToolDescriptor(name: "container.resolve", summary: "Resolve the current data container for a bundle ID without caching UUID paths; missing targets fail closed.", risk: .readOnly),
@@ -442,6 +443,8 @@ public actor ToolRegistry {
 
 public struct ExecutionPathMetric: Codable, Equatable, Sendable {
     public var tool: String
+    public var sessionID: UUID?
+    public var toolCallID: UUID?
     public var routeCandidates: [AppExecutionRoute]
     public var selectedRoute: AppExecutionRoute?
     public var fallbackReason: String
@@ -490,9 +493,13 @@ public struct ExecutionPathMetric: Codable, Equatable, Sendable {
         perceptionFallbackReason: String? = nil,
         providerVisualRoundTripAvoided: Int = 0,
         finalVerificationPassed: Bool? = nil,
+        sessionID: UUID? = nil,
+        toolCallID: UUID? = nil,
         recordedAt: Date = Date()
     ) {
         self.tool = tool
+        self.sessionID = sessionID
+        self.toolCallID = toolCallID
         self.routeCandidates = routeCandidates
         self.selectedRoute = selectedRoute
         self.fallbackReason = fallbackReason
@@ -520,6 +527,8 @@ public struct ExecutionPathMetric: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case tool
+        case sessionID
+        case toolCallID
         case routeCandidates
         case selectedRoute
         case fallbackReason
@@ -548,6 +557,8 @@ public struct ExecutionPathMetric: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         tool = try container.decode(String.self, forKey: .tool)
+        sessionID = try container.decodeIfPresent(UUID.self, forKey: .sessionID)
+        toolCallID = try container.decodeIfPresent(UUID.self, forKey: .toolCallID)
         routeCandidates = try container.decode([AppExecutionRoute].self, forKey: .routeCandidates)
         selectedRoute = try container.decodeIfPresent(AppExecutionRoute.self, forKey: .selectedRoute)
         fallbackReason = try container.decode(String.self, forKey: .fallbackReason)
@@ -683,6 +694,34 @@ public actor ToolRouter {
         await executionPathMetrics.localPerceptionSummary(limit: limit)
     }
 
+    /// Read-only Agent-facing diagnosis from already-recorded evidence. This never calls
+    /// CapabilityProbe or an executor and therefore cannot expand privilege while diagnosing it.
+    public func explainFailure(
+        sessionID: UUID?,
+        toolCallID: UUID?,
+        capabilities: CapabilityProfile,
+        recoveryAttemptCount: Int = 0,
+        maximumRecoveryAttempts: Int = 2
+    ) async -> DiagnosticFailureExplanation? {
+        guard let diagnosticLogger else { return nil }
+        let records = (try? await diagnosticLogger.recent(sessionID: sessionID, limit: 384)) ?? []
+        let metrics = await executionPathMetrics.recent(limit: 256)
+        guard var explanation = DiagnosticProblemPackageBuilder.explainFailure(
+            records: records,
+            executionMetrics: metrics,
+            capabilities: capabilities,
+            sessionID: sessionID,
+            toolCallID: toolCallID,
+            recoveryAttemptCount: recoveryAttemptCount,
+            maximumRecoveryAttempts: maximumRecoveryAttempts
+        ) else { return nil }
+        if let toolCallID, let executionLedger, let record = await executionLedger.record(for: toolCallID) {
+            explanation.evidenceSummary.append("ledger_state=\(record.state.rawValue);ledger_tool=\(DiagnosticRedactor.redact(record.toolName))")
+            explanation.evidenceSummary = Array(explanation.evidenceSummary.prefix(12))
+        }
+        return explanation
+    }
+
     /// Returns only tools that have a side-effect-free route decision for the current capability
     /// profile. This keeps impossible/unavailable schemas out of every provider request while
     /// retaining exact-operation deferred self-validation routes such as the TrollStore GUI tools.
@@ -705,6 +744,15 @@ public actor ToolRouter {
     private func routeDecision(for call: ToolCall, capabilities: CapabilityProfile) async throws -> RouteDecision {
         let startedAt = Date()
         guard let descriptor = await registry.descriptor(named: call.name) else { throw ToolRouterError.unknownTool(call.name) }
+        if call.name == "diagnostics.explainFailure" {
+            return RouteDecision(
+                route: .structuredTool,
+                candidates: [.structuredTool],
+                fallbackReason: "local_read_only_diagnostics",
+                fallbackDepth: 0,
+                latencyMS: max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))
+            )
+        }
         let candidates = routeOrder(preferred: descriptor.preferredRoute)
         var deferredCapabilities: [String] = []
         for required in descriptor.requiredCapabilities {
@@ -764,6 +812,10 @@ public actor ToolRouter {
     }
 
     public func execute(_ call: ToolCall, context: ToolExecutionContext) async throws -> ToolResult {
+        if call.name == "diagnostics.explainFailure" {
+            guard await registry.descriptor(named: call.name) != nil else { throw ToolRouterError.unknownTool(call.name) }
+            return await executeFailureExplanation(call, context: context)
+        }
         let executionStartedAt = Date()
         try? await diagnosticLogger?.log(
             level: .info,
@@ -809,7 +861,9 @@ public actor ToolRouter {
                 routeSelectionLatencyMS: totalMS,
                 executionLatencyMS: 0,
                 totalLatencyMS: totalMS,
-                outcome: "route_failed"
+                outcome: "route_failed",
+                sessionID: call.sessionID,
+                toolCallID: call.id
             ))
             try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "route_failed", sessionID: call.sessionID, toolCallID: call.id, error: error, metadata: ["routeCandidates": candidates.map(\.rawValue).joined(separator: ","), "routeSelectionLatencyMS": String(totalMS)])
             throw error
@@ -828,17 +882,18 @@ public actor ToolRouter {
         if descriptor.risk == .readOnly {
             let executorStartedAt = Date()
             do {
-                let result = try await DiagnosticContext.$sessionID.withValue(call.sessionID) {
+                let executorResult = try await DiagnosticContext.$sessionID.withValue(call.sessionID) {
                     try await DiagnosticContext.$toolCallID.withValue(call.id) {
                         try await executor.execute(call, descriptor: descriptor, context: context)
                     }
                 }
+                let result = Self.attachingRouteMetadata(executorResult, decision: decision)
                 await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, outcome: result.success ? "completed" : "failed", context: context, result: result)
-                try? await diagnosticLogger?.log(level: result.success ? .info : .warning, subsystem: "tool", action: call.name, result: result.success ? "completed" : "failed", sessionID: call.sessionID, toolCallID: call.id, diagnostic: result.summary, metadata: executionMetadata(decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: result.verification, result: result))
+                try? await diagnosticLogger?.log(level: result.success ? .info : .warning, subsystem: "tool", action: call.name, result: result.success ? "completed" : "failed", sessionID: call.sessionID, toolCallID: call.id, diagnostic: result.summary, metadata: executionMetadata(toolName: call.name, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: result.verification, result: result))
                 return result
             } catch {
                 await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, outcome: "failed", context: context, result: nil)
-                try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "failed", sessionID: call.sessionID, toolCallID: call.id, error: error, metadata: executionMetadata(decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: nil, result: nil))
+                try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "failed", sessionID: call.sessionID, toolCallID: call.id, error: error, metadata: executionMetadata(toolName: call.name, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: nil, result: nil))
                 throw error
             }
         }
@@ -858,11 +913,12 @@ public actor ToolRouter {
                 try? await diagnosticLogger?.log(level: .info, subsystem: "tool", action: call.name, result: "idempotent_cached", sessionID: call.sessionID, toolCallID: call.id, diagnostic: cached.summary)
                 return cached
             }
-            let result = try await DiagnosticContext.$sessionID.withValue(call.sessionID) {
+            let executorResult = try await DiagnosticContext.$sessionID.withValue(call.sessionID) {
                 try await DiagnosticContext.$toolCallID.withValue(call.id) {
                     try await executor.execute(call, descriptor: descriptor, context: context)
                 }
             }
+            let result = Self.attachingRouteMetadata(executorResult, decision: decision)
             if result.success, let executionLedger {
                 try await executionLedger.complete(result, for: call)
             }
@@ -881,14 +937,89 @@ public actor ToolRouter {
                 sessionID: call.sessionID,
                 toolCallID: call.id,
                 diagnostic: result.summary,
-                metadata: executionMetadata(decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: result.verification, result: result)
+                metadata: executionMetadata(toolName: call.name, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: result.verification, result: result)
             )
             return result
         } catch {
             await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, outcome: "failed", context: context, result: nil)
-            try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "failed", sessionID: call.sessionID, toolCallID: call.id, error: error, metadata: executionMetadata(decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: nil, result: nil))
+            try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "failed", sessionID: call.sessionID, toolCallID: call.id, error: error, metadata: executionMetadata(toolName: call.name, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: nil, result: nil))
             throw error
         }
+    }
+
+    private func executeFailureExplanation(_ call: ToolCall, context: ToolExecutionContext) async -> ToolResult {
+        func parsedUUID(_ key: String) -> UUID? {
+            guard let raw = call.arguments[key], !raw.isEmpty else { return nil }
+            return UUID(uuidString: raw)
+        }
+        if let raw = call.arguments["sessionId"], !raw.isEmpty, parsedUUID("sessionId") == nil {
+            return ToolResult(toolCallID: call.id, success: false, summary: "diagnostics.explainFailure rejected an invalid sessionId.", payload: ["diagnosisAvailable": "false", "error": "invalid_session_id"])
+        }
+        if let raw = call.arguments["toolCallId"], !raw.isEmpty, parsedUUID("toolCallId") == nil {
+            return ToolResult(toolCallID: call.id, success: false, summary: "diagnostics.explainFailure rejected an invalid toolCallId.", payload: ["diagnosisAvailable": "false", "error": "invalid_tool_call_id"])
+        }
+        let sessionID = parsedUUID("sessionId") ?? call.sessionID
+        let toolCallID = parsedUUID("toolCallId")
+        guard let explanation = await explainFailure(
+            sessionID: sessionID,
+            toolCallID: toolCallID,
+            capabilities: context.capabilityProfile
+        ) else {
+            return ToolResult(
+                toolCallID: call.id,
+                success: true,
+                summary: "No bounded failure evidence is currently available for the requested scope.",
+                payload: ["diagnosisAvailable": "false", "automaticRecoveryAllowed": "false", "developerPatchLikelyRequired": "false"]
+            )
+        }
+        let encoded = (try? JSONEncoder.pretty.encode(explanation)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        let relevantCapabilitiesJSON = (try? JSONSerialization.data(withJSONObject: explanation.relevantCapabilities, options: [.sortedKeys]))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        let probableCausesJSON = (try? JSONEncoder().encode(explanation.probableCauses))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        let evidenceSummaryJSON = (try? JSONEncoder().encode(explanation.evidenceSummary))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        return ToolResult(
+            toolCallID: call.id,
+            success: true,
+            summary: "Explained the most recent failure from existing redacted diagnostics without probing or executing recovery.",
+            payload: [
+                "diagnosisAvailable": "true",
+                "failureSignature": explanation.failureSignature,
+                "failureLayer": explanation.failureLayer.rawValue,
+                "failureStage": explanation.failureStage,
+                "observedOutcome": explanation.observedOutcome,
+                "verificationStatus": explanation.verificationStatus,
+                "affectedSubsystem": explanation.affectedSubsystem,
+                "recentAttemptCount": String(explanation.recentAttemptCount),
+                "routeCandidates": explanation.routeCandidates.joined(separator: ","),
+                "selectedRoute": explanation.selectedRoute ?? "",
+                "fallbackReason": explanation.fallbackReason ?? "",
+                "fallbackDepth": String(explanation.fallbackDepth),
+                "axAttempted": String(explanation.axAttempted),
+                "axSucceeded": String(explanation.axSucceeded),
+                "axLatencyMS": explanation.axLatencyMS.map(String.init) ?? "",
+                "ocrInvoked": String(explanation.ocrInvoked),
+                "ocrSucceeded": String(explanation.ocrSucceeded),
+                "ocrLatencyMS": explanation.ocrLatencyMS.map(String.init) ?? "",
+                "screenshotStatus": explanation.screenshotStatus,
+                "localVisionStatus": explanation.localVisionStatus,
+                "foregroundVerificationStatus": explanation.foregroundVerificationStatus,
+                "relevantCapabilitiesJSON": String(DiagnosticRedactor.redact(relevantCapabilitiesJSON).prefix(8_000)),
+                "probableCausesJSON": String(DiagnosticRedactor.redact(probableCausesJSON).prefix(8_000)),
+                "evidenceSummaryJSON": String(DiagnosticRedactor.redact(evidenceSummaryJSON).prefix(12_000)),
+                "recommendedNextAction": explanation.recommendedNextAction,
+                "automaticRecoveryAllowed": String(explanation.automaticRecoveryAllowed),
+                "recoveryReason": explanation.recoveryReason,
+                "developerPatchLikelyRequired": String(explanation.developerPatchLikelyRequired),
+                "previousFailureSignature": explanation.previousFailureSignature ?? "",
+                "currentFailureSignature": explanation.currentFailureSignature,
+                "changedLayer": explanation.changedLayer ?? "",
+                "progressObserved": explanation.progressObserved.map { $0 ? "true" : "false" } ?? "",
+                "remainingFailure": explanation.remainingFailure,
+                "diagnosisJSON": String(DiagnosticRedactor.redact(encoded).prefix(24_000))
+            ]
+        )
     }
 
     private func recordExecutionPath(
@@ -904,7 +1035,9 @@ public actor ToolRouter {
         let executionMS = max(0, Int(now.timeIntervalSince(executorStartedAt) * 1_000))
         let totalMS = max(0, Int(now.timeIntervalSince(executionStartedAt) * 1_000))
         let payload = result?.payload ?? [:]
+        let axToolNames: Set<String> = ["gui.tree", "gui.findElement", "gui.waitForElement", "gui.tapElementObserve", "gui.typeElementObserve", "gui.runStructuredPlan", "gui.verify"]
         let axAttempted = Self.payloadBool(payload["perceptionAXAttempted"])
+            ?? (axToolNames.contains(call.name) ? true : nil)
         await executionPathMetrics.record(ExecutionPathMetric(
             tool: call.name,
             routeCandidates: decision.candidates,
@@ -919,7 +1052,7 @@ public actor ToolRouter {
             perceptionClass: payload["perceptionClass"],
             axAttempted: axAttempted,
             axSucceeded: Self.payloadBool(payload["perceptionAXSucceeded"]),
-            axLatencyMS: axAttempted == true ? executionMS : nil,
+            axLatencyMS: axAttempted == true ? (payload["axLatencyMS"].flatMap(Int.init) ?? executionMS) : nil,
             anchorCacheHit: Self.payloadBool(payload["perceptionAnchorCacheHit"]),
             ocrInvoked: Self.payloadBool(payload["perceptionOCRInvoked"]),
             ocrSucceeded: Self.payloadBool(payload["perceptionOCRSucceeded"]),
@@ -928,11 +1061,14 @@ public actor ToolRouter {
             remoteVisionRequired: Self.payloadBool(payload["perceptionRemoteVisionRequired"]),
             perceptionFallbackReason: payload["perceptionFallbackReason"],
             providerVisualRoundTripAvoided: payload["providerVisualRoundTripAvoided"].flatMap(Int.init) ?? 0,
-            finalVerificationPassed: result?.verification?.passed ?? Self.payloadBool(payload["localMetricSelectedReturnVerified"])
+            finalVerificationPassed: result?.verification?.passed ?? Self.payloadBool(payload["localMetricSelectedReturnVerified"]),
+            sessionID: call.sessionID,
+            toolCallID: call.id
         ))
     }
 
     private func executionMetadata(
+        toolName: String,
         decision: RouteDecision,
         executionStartedAt: Date,
         executorStartedAt: Date,
@@ -950,22 +1086,42 @@ public actor ToolRouter {
             "totalLatencyMS": String(max(0, Int(now.timeIntervalSince(executionStartedAt) * 1_000))),
             "verification": verification.map { $0.passed ? "passed" : "failed" } ?? "none"
         ]
+        let axToolNames: Set<String> = ["gui.tree", "gui.findElement", "gui.waitForElement", "gui.tapElementObserve", "gui.typeElementObserve", "gui.runStructuredPlan", "gui.verify"]
+        if axToolNames.contains(toolName) {
+            metadata["perceptionAXAttempted"] = result?.payload["perceptionAXAttempted"] ?? "true"
+            metadata["axLatencyMS"] = result?.payload["axLatencyMS"] ?? metadata["executionLatencyMS"] ?? "0"
+        }
         if let payload = result?.payload {
             for key in [
                 "perceptionClass", "perceptionAXAttempted", "perceptionAXSucceeded", "perceptionAnchorCacheHit",
                 "perceptionOCRInvoked", "perceptionOCRSucceeded", "perceptionOCRLatencyMS",
                 "perceptionLocalSufficient", "perceptionRemoteVisionRequired", "perceptionFallbackReason",
                 "providerVisualRoundTripAvoided", "sha256", "frameSHA256", "baselineSHA256", "treeSHA256", "treeHash",
+                "axScope", "axBackend", "axStage", "axNodeCount", "axErrorDomain", "axErrorCode", "axLatencyMS",
                 "foregroundBundleID", "foregroundVerified", "appVersion", "effectVerification", "localObservation",
                 "localVisionOCR", "localVisionElementCount", "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion", "localVisionBackend",
+                "localVisionFailureClass", "localVisionErrorDomain", "localVisionErrorCode", "localVisionPrimaryErrorDomain", "localVisionPrimaryErrorCode", "localVisionFallbackUsed",
+                "localVisionSecondaryBackend", "localVisionSecondaryStatus", "localVisionSecondaryErrorDomain", "localVisionSecondaryErrorCode",
                 "screenPointWidth", "screenPointHeight", "keyboardLikely", "focusStrategy", "textInputSafety",
-                "localMetric", "localMetricSelection", "localMetricSelectedSample",
+                "localMetric", "localMetricSelection", "localMetricExtraction", "localMetricSelectedSample",
                 "localMetricSelectedValue", "localMetricSelectedReturnVerified"
             ] where payload[key] != nil {
                 metadata[key] = payload[key]
             }
         }
         return metadata
+    }
+
+    private static func attachingRouteMetadata(_ input: ToolResult, decision: RouteDecision) -> ToolResult {
+        var result = input
+        if result.payload["route"] == nil { result.payload["route"] = decision.route.rawValue }
+        if result.payload["routeCandidates"] == nil {
+            result.payload["routeCandidates"] = decision.candidates.map(\.rawValue).joined(separator: ",")
+        }
+        if result.payload["fallbackReason"] == nil { result.payload["fallbackReason"] = decision.fallbackReason }
+        if result.payload["fallbackDepth"] == nil { result.payload["fallbackDepth"] = String(decision.fallbackDepth) }
+        if result.payload["routeSelectionLatencyMS"] == nil { result.payload["routeSelectionLatencyMS"] = String(decision.latencyMS) }
+        return result
     }
 
     private static func payloadBool(_ value: String?) -> Bool? {

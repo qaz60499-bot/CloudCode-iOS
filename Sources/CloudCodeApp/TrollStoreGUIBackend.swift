@@ -100,15 +100,49 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             let seconds = max(1, Int(treeRetryAfter.timeIntervalSinceNow.rounded(.up)))
             throw ToolRouterError.noExecutionRoute("AX tree recently timed out for the current device; retry is suppressed for \(seconds)s so screenshot-driven computer use can continue.")
         }
+        let startedAt = Date()
         let outcome = EmbeddedRootHelper.guiTree()
+        let latencyMS = max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))
         guard let tree = outcome.tree else {
             treeRetryAfter = Date().addingTimeInterval(treeFailureCooldown)
+            try? await diagnosticLogger?.log(
+                level: .warning,
+                subsystem: "gui",
+                action: "tree.helper",
+                result: "unavailable",
+                diagnostic: outcome.detail,
+                metadata: [
+                    "axBackend": "standalone_trollstore_axruntime",
+                    "axStage": "direct_root_then_sampled_hit_test",
+                    "axScope": "unavailable",
+                    "axLatencyMS": String(latencyMS)
+                ]
+            )
             throw ToolRouterError.noExecutionRoute(outcome.detail)
         }
         guard tree.utf8.count <= 256 * 1024 else {
             treeRetryAfter = Date().addingTimeInterval(treeFailureCooldown)
             throw ToolRouterError.noExecutionRoute("GUI tree exceeded the 256 KiB app-layer output limit")
         }
+        var axBackend = "standalone_trollstore_axruntime"
+        var axScope = "unknown"
+        if let data = tree.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            axBackend = object["backend"] as? String ?? axBackend
+            axScope = object["scope"] as? String ?? axScope
+        }
+        try? await diagnosticLogger?.log(
+            level: .info,
+            subsystem: "gui",
+            action: "tree.helper",
+            result: "observed",
+            metadata: [
+                "axBackend": axBackend,
+                "axStage": "direct_root_then_sampled_hit_test",
+                "axScope": axScope,
+                "axLatencyMS": String(latencyMS)
+            ]
+        )
         treeRetryAfter = nil
         return tree
     }

@@ -21,7 +21,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.core
         PRODUCT_NAME: CloudCodeCore
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 86
+        CURRENT_PROJECT_VERSION: 87
         VERSIONING_SYSTEM: apple-generic
         DEFINES_MODULE: YES
         GENERATE_INFOPLIST_FILE: YES
@@ -41,7 +41,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios
         PRODUCT_NAME: CloudCode
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 86
+        CURRENT_PROJECT_VERSION: 87
         VERSIONING_SYSTEM: apple-generic
         SWIFT_VERSION: 5.9
         SWIFT_OBJC_BRIDGING_HEADER: Sources/CloudCodeApp/RootHelperBridge.h
@@ -73,6 +73,7 @@ targets:
             exit 0
           fi
           HELPER="$TARGET_BUILD_DIR/$WRAPPER_NAME/CloudCodeRootHelper"
+          VISION_HELPER="$TARGET_BUILD_DIR/$WRAPPER_NAME/CloudCodeVisionHelper"
           xcrun --sdk iphoneos clang \
             -fobjc-arc \
             -fblocks \
@@ -83,9 +84,20 @@ targets:
             -framework Foundation \
             -framework UIKit \
             -framework CoreGraphics \
-            -framework Vision \
             -o "$HELPER"
-          chmod 0755 "$HELPER"
+          xcrun --sdk iphoneos clang \
+            -fobjc-arc \
+            -fblocks \
+            -fmodules \
+            -target arm64-apple-ios16.0 \
+            "$SRCROOT/Sources/CloudCodeVisionHelper/main.m" \
+            -framework Foundation \
+            -framework CoreGraphics \
+            -framework ImageIO \
+            -framework Vision \
+            -o "$VISION_HELPER"
+          chmod 0755 "$HELPER" "$VISION_HELPER"
+          codesign --force --sign - "$VISION_HELPER"
           INFO="$TARGET_BUILD_DIR/$WRAPPER_NAME/Info.plist"
           /usr/libexec/PlistBuddy -c 'Delete :TSRootBinaries' "$INFO" >/dev/null 2>&1 || true
           /usr/libexec/PlistBuddy -c 'Add :TSRootBinaries array' "$INFO"

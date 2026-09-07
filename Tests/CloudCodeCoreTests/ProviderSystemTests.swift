@@ -1980,6 +1980,279 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertTrue(compacted[0].content.contains("do not claim to have seen"))
     }
 
+    func testProviderVisionCapabilityUsesMetadataBeforeTinyProbe() async throws {
+        ProviderVisionCapabilityURLProtocol.install(mode: .metadataSupported)
+        defer { ProviderVisionCapabilityURLProtocol.reset() }
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [ProviderVisionCapabilityURLProtocol.self]
+        let client = OpenAICompatibleProviderClient(
+            session: URLSession(configuration: sessionConfiguration),
+            retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0)
+        )
+        let configuration = ProviderConfiguration(
+            name: "vision-metadata",
+            baseURL: URL(string: "https://vision-metadata.example/v1")!,
+            model: "vision-model-metadata",
+            apiKeyReference: "key",
+            protocolName: ProviderProtocol.openAIChat.rawValue
+        )
+
+        let assessment = await client.imageCapability(configuration: configuration, apiKey: "metadata-secret")
+
+        XCTAssertEqual(assessment.capability, .supported)
+        XCTAssertEqual(assessment.source, "models_metadata")
+        XCTAssertEqual(ProviderVisionCapabilityURLProtocol.requestCount(), 1)
+        XCTAssertEqual(ProviderVisionCapabilityURLProtocol.paths(), ["/v1/models"])
+
+        let support = (FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).appendingPathComponent("Library/Application Support", isDirectory: true))
+            .appendingPathComponent("CloudCode/Attachments/provider-vision-supported-tests", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let imageURL = support.appendingPathComponent("supported-screenshot-\(UUID().uuidString).jpg")
+        let imageBytes = Data([0xFF, 0xD8, 0x44, 0x55, 0x66, 0xFF, 0xD9])
+        try imageBytes.write(to: imageURL, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: imageURL) }
+        let screenshot = ChatMessage(
+            role: .user,
+            content: "Device screenshot",
+            providerMetadata: ["internal_observation": "gui.screenshot"],
+            attachments: [ChatAttachment(filename: imageURL.lastPathComponent, path: imageURL.path, mimeType: "image/jpeg", byteSize: Int64(imageBytes.count))]
+        )
+        for try await _ in client.stream(configuration: configuration, apiKey: "metadata-secret", messages: [screenshot], tools: []) {}
+
+        XCTAssertEqual(ProviderVisionCapabilityURLProtocol.requestCount(), 2, "cached metadata support must avoid a second capability probe")
+        let realRequestText = String(data: try XCTUnwrap(ProviderVisionCapabilityURLProtocol.bodies().last), encoding: .utf8) ?? ""
+        XCTAssertTrue(realRequestText.contains("image_url"))
+        XCTAssertTrue(realRequestText.contains(imageBytes.base64EncodedString()))
+    }
+
+    func testProviderVisionCapabilityTinyProbeRunsOnceAndPreventsRealScreenshotSerializationWhenTextOnly() async throws {
+        ProviderVisionCapabilityURLProtocol.install(mode: .tinyProbeTextOnly)
+        defer { ProviderVisionCapabilityURLProtocol.reset() }
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [ProviderVisionCapabilityURLProtocol.self]
+        let client = OpenAICompatibleProviderClient(
+            session: URLSession(configuration: sessionConfiguration),
+            retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0)
+        )
+        let configuration = ProviderConfiguration(
+            name: "vision-probe",
+            baseURL: URL(string: "https://vision-probe.example/v1")!,
+            model: "vision-probe-model-\(UUID().uuidString)",
+            apiKeyReference: "key",
+            protocolName: ProviderProtocol.openAIChat.rawValue
+        )
+
+        let first = await client.imageCapability(configuration: configuration, apiKey: "probe-secret")
+        let second = await client.imageCapability(configuration: configuration, apiKey: "probe-secret")
+        XCTAssertEqual(first.capability, .textOnly)
+        XCTAssertEqual(first.source, "tiny_image_probe")
+        XCTAssertEqual(second, first)
+        XCTAssertEqual(ProviderVisionCapabilityURLProtocol.requestCount(), 2, "metadata GET + exactly one tiny-image POST")
+        let probeBodies = ProviderVisionCapabilityURLProtocol.bodies()
+        XCTAssertTrue(probeBodies.contains { body in
+            String(data: body, encoding: .utf8)?.contains("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB") == true
+        })
+
+        let support = (FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).appendingPathComponent("Library/Application Support", isDirectory: true))
+            .appendingPathComponent("CloudCode/Attachments/provider-vision-gate-tests", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let imageURL = support.appendingPathComponent("real-screenshot-\(UUID().uuidString).jpg")
+        let imageBytes = Data([0xFF, 0xD8, 0x11, 0x22, 0x33, 0xFF, 0xD9])
+        try imageBytes.write(to: imageURL, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: imageURL) }
+        let screenshot = ChatMessage(
+            role: .user,
+            content: "Device screenshot",
+            providerMetadata: ["internal_observation": "gui.screenshot"],
+            attachments: [ChatAttachment(filename: imageURL.lastPathComponent, path: imageURL.path, mimeType: "image/jpeg", byteSize: Int64(imageBytes.count))]
+        )
+        let toolSchemas = try ["gui.tap", "gui.tapObserve", "gui.tapTextObserve"].map { internalName in
+            ProviderToolSchema(name: try ProviderToolNameMap.encode(internalName), description: internalName)
+        }
+        for try await _ in client.stream(configuration: configuration, apiKey: "probe-secret", messages: [screenshot], tools: toolSchemas) {}
+
+        XCTAssertEqual(ProviderVisionCapabilityURLProtocol.requestCount(), 3)
+        let realRequestBody = try XCTUnwrap(ProviderVisionCapabilityURLProtocol.bodies().last)
+        let realRequestText = String(data: realRequestBody, encoding: .utf8) ?? ""
+        XCTAssertFalse(realRequestText.contains(imageBytes.base64EncodedString()))
+        XCTAssertFalse(realRequestText.contains("image_url"))
+        XCTAssertTrue(realRequestText.contains("image-input capability is not proven") || realRequestText.contains("not proven able to consume image input"))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: realRequestBody) as? [String: Any])
+        let tools = try XCTUnwrap(object["tools"] as? [[String: Any]])
+        let names = tools.compactMap { tool -> String? in
+            (tool["function"] as? [String: Any])?["name"] as? String
+        }
+        XCTAssertFalse(names.contains(try ProviderToolNameMap.encode("gui.tap")))
+        XCTAssertFalse(names.contains(try ProviderToolNameMap.encode("gui.tapObserve")))
+        XCTAssertTrue(names.contains(try ProviderToolNameMap.encode("gui.tapTextObserve")))
+    }
+
+    func testProviderVisionCapabilityInconclusiveTinyProbeStaysUnknown() async throws {
+        ProviderVisionCapabilityURLProtocol.install(mode: .tinyProbeUnknown)
+        defer { ProviderVisionCapabilityURLProtocol.reset() }
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [ProviderVisionCapabilityURLProtocol.self]
+        let client = OpenAICompatibleProviderClient(
+            session: URLSession(configuration: sessionConfiguration),
+            retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0)
+        )
+        let configuration = ProviderConfiguration(
+            name: "vision-unknown",
+            baseURL: URL(string: "https://vision-unknown.example/v1")!,
+            model: "vision-unknown-model-\(UUID().uuidString)",
+            apiKeyReference: "key",
+            protocolName: ProviderProtocol.openAIChat.rawValue
+        )
+
+        let assessment = await client.imageCapability(configuration: configuration, apiKey: "unknown-secret")
+        let cached = await client.imageCapability(configuration: configuration, apiKey: "unknown-secret")
+
+        XCTAssertEqual(assessment.capability, .unknown)
+        XCTAssertEqual(assessment.source, "tiny_image_probe_inconclusive")
+        XCTAssertEqual(cached, assessment)
+        XCTAssertEqual(ProviderVisionCapabilityURLProtocol.requestCount(), 2, "metadata GET + one bounded 1px probe; unknown must remain cached for the runtime window")
+        let cachedPolicyAssessment = await ProviderImageCompatibilityPolicy.currentAssessment(configuration: configuration, apiKey: "unknown-secret")
+        XCTAssertEqual(cachedPolicyAssessment.capability, .unknown)
+
+        let support = (FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).appendingPathComponent("Library/Application Support", isDirectory: true))
+            .appendingPathComponent("CloudCode/Attachments/provider-vision-unknown-tests", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let imageURL = support.appendingPathComponent("unknown-route-screen-\(UUID().uuidString).jpg")
+        let imageBytes = Data([0xFF, 0xD8, 0x44, 0x55, 0x66, 0xFF, 0xD9])
+        try imageBytes.write(to: imageURL, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: imageURL) }
+        let screenshot = ChatMessage(
+            role: .user,
+            content: "Device screenshot",
+            providerMetadata: ["internal_observation": "gui.screenshot"],
+            attachments: [ChatAttachment(filename: imageURL.lastPathComponent, path: imageURL.path, mimeType: "image/jpeg", byteSize: Int64(imageBytes.count))]
+        )
+        let toolSchemas = try ["gui.tap", "gui.tapObserve", "gui.tapTextObserve"].map { internalName in
+            ProviderToolSchema(name: try ProviderToolNameMap.encode(internalName), description: internalName)
+        }
+        for try await _ in client.stream(configuration: configuration, apiKey: "unknown-secret", messages: [screenshot], tools: toolSchemas) {}
+        XCTAssertEqual(ProviderVisionCapabilityURLProtocol.requestCount(), 3)
+        let body = ProviderVisionCapabilityURLProtocol.bodies().last ?? Data()
+        let text = String(data: body, encoding: .utf8) ?? ""
+        XCTAssertFalse(text.contains(imageBytes.base64EncodedString()))
+        XCTAssertFalse(text.contains("image_url"))
+        let rawObject = try JSONSerialization.jsonObject(with: body)
+        let object = try XCTUnwrap(rawObject as? [String: Any])
+        let tools = object["tools"] as? [[String: Any]] ?? []
+        let names = tools.compactMap { tool -> String? in
+            (tool["function"] as? [String: Any])?["name"] as? String
+        }
+        XCTAssertFalse(names.contains(try ProviderToolNameMap.encode("gui.tap")))
+        XCTAssertFalse(names.contains(try ProviderToolNameMap.encode("gui.tapObserve")))
+        XCTAssertTrue(names.contains(try ProviderToolNameMap.encode("gui.tapTextObserve")))
+    }
+
+    func testUnknownVisionRouteWithoutAttachmentWithholdsFreeCoordinateToolsWithoutCapabilityProbe() async throws {
+        ProviderVisionCapabilityURLProtocol.install(mode: .tinyProbeUnknown)
+        defer { ProviderVisionCapabilityURLProtocol.reset() }
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [ProviderVisionCapabilityURLProtocol.self]
+        let client = OpenAICompatibleProviderClient(
+            session: URLSession(configuration: sessionConfiguration),
+            retryPolicy: RetryPolicy(maxAttempts: 1, initialDelayNanoseconds: 0)
+        )
+        let configuration = ProviderConfiguration(
+            name: "vision-unknown-text-round",
+            baseURL: URL(string: "https://vision-unknown-text-round.example/v1")!,
+            model: "vision-unknown-text-round-model-\(UUID().uuidString)",
+            apiKeyReference: "key",
+            protocolName: ProviderProtocol.openAIChat.rawValue
+        )
+        let toolSchemas = try ["gui.tap", "gui.tapObserve", "gui.tapTextObserve"].map { internalName in
+            ProviderToolSchema(name: try ProviderToolNameMap.encode(internalName), description: internalName)
+        }
+
+        for try await _ in client.stream(
+            configuration: configuration,
+            apiKey: "unknown-text-round-secret",
+            messages: [ChatMessage(role: .user, content: "continue from local OCR evidence")],
+            tools: toolSchemas
+        ) {}
+
+        XCTAssertEqual(ProviderVisionCapabilityURLProtocol.requestCount(), 1, "a text-only round must not trigger /models or a tiny-image capability probe")
+        XCTAssertFalse(ProviderVisionCapabilityURLProtocol.paths().contains(where: { $0.hasSuffix("/models") }))
+        let body = try XCTUnwrap(ProviderVisionCapabilityURLProtocol.bodies().last)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let tools = try XCTUnwrap(object["tools"] as? [[String: Any]])
+        let names = tools.compactMap { tool -> String? in
+            (tool["function"] as? [String: Any])?["name"] as? String
+        }
+        XCTAssertFalse(names.contains(try ProviderToolNameMap.encode("gui.tap")))
+        XCTAssertFalse(names.contains(try ProviderToolNameMap.encode("gui.tapObserve")))
+        XCTAssertTrue(names.contains(try ProviderToolNameMap.encode("gui.tapTextObserve")))
+    }
+
+    func testProviderClientRouterVisionPreflightUsesRouterPreferredExactHostAndProtocol() async throws {
+        let recorder = ImageCapabilityRecordingProvider(
+            assessment: ProviderImageCapabilityAssessment(capability: .supported, source: "router_mock")
+        )
+        let router = ProviderClientRouter(
+            keyVault: MemoryKeyVault(keys: [:]),
+            anthropic: recorder,
+            openAIChat: recorder,
+            responses: recorder,
+            requestKeyState: ProviderRequestKeyState()
+        )
+        let configuration = ProviderConfiguration(
+            name: "AgentRouter",
+            baseURL: URL(string: "https://agentrouter.org")!,
+            model: "router-vision-model",
+            apiKeyReference: "primary",
+            providerID: ProviderCatalog.agentRouterID,
+            protocolName: ProviderProtocol.openAIChat.rawValue,
+            authModeName: ProviderAuthMode.bearer.rawValue,
+            protocolNamesByKeyReference: ["primary": [ProviderProtocol.openAIChat.rawValue]]
+        )
+
+        let assessment = await router.imageCapability(configuration: configuration, apiKey: "unrecognized-test-key")
+
+        XCTAssertEqual(assessment.capability, .supported)
+        let recordedRequest = await recorder.lastCapabilityRequest()
+        let snapshot = try XCTUnwrap(recordedRequest)
+        XCTAssertEqual(snapshot.configuration.baseURL.host, "co.agentrouter.org", "vision preflight must use the same preferred AgentRouter host as request routing")
+        XCTAssertEqual(snapshot.configuration.protocolName, ProviderProtocol.openAIChat.rawValue)
+        XCTAssertEqual(snapshot.configuration.model, configuration.model)
+        XCTAssertEqual(snapshot.apiKey, "unrecognized-test-key")
+    }
+
+    func testProviderVisionCapabilityCacheIsExactKeyHostProtocolModel() async {
+        let base = ProviderConfiguration(
+            name: "vision-cache",
+            baseURL: URL(string: "https://vision-cache.example/v1")!,
+            model: "model-a-\(UUID().uuidString)",
+            apiKeyReference: "key",
+            protocolName: ProviderProtocol.openAIChat.rawValue
+        )
+        await ProviderImageCompatibilityPolicy.mark(.textOnly, source: "test", configuration: base, apiKey: "key-a")
+        let sameRoute = await ProviderImageCompatibilityPolicy.currentAssessment(configuration: base, apiKey: "key-a")
+        XCTAssertEqual(sameRoute.capability, .textOnly)
+
+        var differentHost = base
+        differentHost.baseURL = URL(string: "https://vision-cache-alt.example/v1")!
+        let hostAssessment = await ProviderImageCompatibilityPolicy.currentAssessment(configuration: differentHost, apiKey: "key-a")
+        XCTAssertEqual(hostAssessment.capability, .unknown)
+
+        var differentProtocol = base
+        differentProtocol.protocolName = ProviderProtocol.anthropic.rawValue
+        let protocolAssessment = await ProviderImageCompatibilityPolicy.currentAssessment(configuration: differentProtocol, apiKey: "key-a")
+        XCTAssertEqual(protocolAssessment.capability, .unknown)
+
+        var differentModel = base
+        differentModel.model += "-other"
+        let modelAssessment = await ProviderImageCompatibilityPolicy.currentAssessment(configuration: differentModel, apiKey: "key-a")
+        let keyAssessment = await ProviderImageCompatibilityPolicy.currentAssessment(configuration: base, apiKey: "key-b")
+        XCTAssertEqual(modelAssessment.capability, .unknown)
+        XCTAssertEqual(keyAssessment.capability, .unknown)
+    }
+
     func testAgentRouterLargeToolEnvelopeGetsOneBoundedCompatibilityRecovery() throws {
         XCTAssertTrue(ProviderCompatibilityClassifier.shouldRetryAgentRouterCompatibilityEnvelope(
             providerID: ProviderCatalog.agentRouterID,
@@ -3397,6 +3670,149 @@ private final class ProviderTestURLProtocol: URLProtocol, @unchecked Sendable {
         }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         if !body.isEmpty { client?.urlProtocol(self, didLoad: body) }
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private actor ImageCapabilityRecordingProvider: ProviderStreaming {
+    struct CapabilityRequest: Sendable {
+        var configuration: ProviderConfiguration
+        var apiKey: String
+    }
+
+    private let assessment: ProviderImageCapabilityAssessment
+    private var lastRequest: CapabilityRequest?
+
+    init(assessment: ProviderImageCapabilityAssessment) {
+        self.assessment = assessment
+    }
+
+    func imageCapability(configuration: ProviderConfiguration, apiKey: String) async -> ProviderImageCapabilityAssessment {
+        lastRequest = CapabilityRequest(configuration: configuration, apiKey: apiKey)
+        return assessment
+    }
+
+    func lastCapabilityRequest() -> CapabilityRequest? {
+        lastRequest
+    }
+
+    nonisolated func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.yield(.finished)
+            continuation.finish()
+        }
+    }
+}
+
+private final class ProviderVisionCapabilityURLProtocol: URLProtocol, @unchecked Sendable {
+    enum Mode: Equatable {
+        case metadataSupported
+        case tinyProbeTextOnly
+        case tinyProbeUnknown
+    }
+
+    private static let lock = NSLock()
+    private static var mode: Mode = .metadataSupported
+    private static var capturedPaths: [String] = []
+    private static var capturedBodies: [Data] = []
+
+    static func install(mode: Mode) {
+        lock.lock()
+        self.mode = mode
+        capturedPaths = []
+        capturedBodies = []
+        lock.unlock()
+    }
+
+    static func reset() {
+        install(mode: .metadataSupported)
+    }
+
+    static func requestCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return capturedPaths.count
+    }
+
+    static func paths() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return capturedPaths
+    }
+
+    static func bodies() -> [Data] {
+        lock.lock()
+        defer { lock.unlock() }
+        return capturedBodies
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        var body = request.httpBody
+        if body == nil, let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var data = Data()
+            let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+            defer { buffer.deallocate() }
+            while true {
+                let count = stream.read(buffer, maxLength: 4096)
+                if count <= 0 { break }
+                data.append(buffer, count: count)
+            }
+            body = data
+        }
+
+        let path = request.url?.path ?? ""
+        Self.lock.lock()
+        Self.capturedPaths.append(path)
+        if let body { Self.capturedBodies.append(body) }
+        let currentMode = Self.mode
+        let requestIndex = Self.capturedPaths.count
+        Self.lock.unlock()
+
+        let status: Int
+        let responseBody: Data
+        let headers: [String: String]
+        if path.hasSuffix("/models") {
+            status = 200
+            headers = ["Content-Type": "application/json"]
+            switch currentMode {
+            case .metadataSupported:
+                responseBody = Data("{\"data\":[{\"id\":\"vision-model-metadata\",\"input_modalities\":[\"text\",\"image\"]}]}".utf8)
+            case .tinyProbeTextOnly, .tinyProbeUnknown:
+                responseBody = Data("{\"data\":[{\"id\":\"unrelated-model\"}]}".utf8)
+            }
+        } else if currentMode == .tinyProbeTextOnly && requestIndex == 2 {
+            status = 400
+            headers = ["Content-Type": "application/json"]
+            responseBody = Data("{\"error\":{\"message\":\"image_url is unsupported; only text input is allowed\"}}".utf8)
+        } else if currentMode == .tinyProbeUnknown && requestIndex == 2 {
+            status = 200
+            headers = ["Content-Type": "text/html"]
+            responseBody = Data("<html><body>gateway front door</body></html>".utf8)
+        } else {
+            status = 200
+            headers = ["Content-Type": "text/event-stream"]
+            responseBody = Data("data: [DONE]\n\n".utf8)
+        }
+
+        guard let url = request.url,
+              let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        if !responseBody.isEmpty { client?.urlProtocol(self, didLoad: responseBody) }
         client?.urlProtocolDidFinishLoading(self)
     }
 

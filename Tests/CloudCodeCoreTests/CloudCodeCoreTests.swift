@@ -304,6 +304,21 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(safe.metadata["Authorization"], "<redacted>")
         XCTAssertEqual(safe.metadata["model"], "safe-model")
         XCTAssertFalse((safe.diagnostic ?? "").contains("another-secret"))
+
+        let payloadSafe = DiagnosticRedactor.redact(metadata: [
+            "userText": "my private message",
+            "screenshotBytesBase64": "raw-image-payload",
+            "databaseContent": "private sqlite row",
+            "rawData": "opaque provider payload",
+            "localVisionElementCount": "12",
+            "sha256": "safe-hash"
+        ])
+        XCTAssertEqual(payloadSafe["userText"], "<redacted>")
+        XCTAssertEqual(payloadSafe["screenshotBytesBase64"], "<redacted>")
+        XCTAssertEqual(payloadSafe["databaseContent"], "<redacted>")
+        XCTAssertEqual(payloadSafe["rawData"], "<redacted>")
+        XCTAssertEqual(payloadSafe["localVisionElementCount"], "12")
+        XCTAssertEqual(payloadSafe["sha256"], "safe-hash")
     }
 
     func testDiagnosticLogStoreCapturesNSErrorDomainCodeAndDiagnostic() async throws {
@@ -604,6 +619,779 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(package.regressionManifest.entries[0].lastSeenBuild, "84")
     }
 
+    func testDiagnosticFailureExplanationReturnsNilForNormalSuccessfulTask() {
+        let completed = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "tool",
+            action: "files.read",
+            result: "completed",
+            metadata: ["verification": "passed"]
+        )
+
+        XCTAssertNil(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [completed], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+        ))
+    }
+
+    func testDiagnosticFailureExplanationDistinguishesAXAndOCRFailureStages() throws {
+        let sessionID = UUID()
+        let axCallID = UUID()
+        let ax = DiagnosticLogRecord(
+            timestamp: Date(timeIntervalSinceReferenceDate: 10),
+            sessionID: sessionID,
+            toolCallID: axCallID,
+            level: .error,
+            subsystem: "tool",
+            action: "gui.tree",
+            result: "failed",
+            diagnostic: "GUI tree helper timed out",
+            metadata: ["perceptionAXAttempted": "true", "perceptionAXSucceeded": "false"]
+        )
+        let profile = CapabilityProfile(records: [
+            CapabilityRecord(id: GUIAutomationFeature.tree.capabilityID, domain: .automation, status: .deviceValidationRequired, detail: "existing snapshot")
+        ])
+        let axExplanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [ax], executionMetrics: [], capabilities: profile, sessionID: sessionID, toolCallID: axCallID
+        ))
+        XCTAssertEqual(axExplanation.failureLayer, .axObservation)
+        XCTAssertTrue(axExplanation.failureSignature.contains("ax_request_timeout"))
+        XCTAssertTrue(axExplanation.axAttempted)
+        XCTAssertFalse(axExplanation.axSucceeded)
+        XCTAssertEqual(axExplanation.relevantCapabilities[GUIAutomationFeature.tree.capabilityID], CapabilityStatus.deviceValidationRequired.rawValue)
+
+        let noInvocation = DiagnosticLogRecord(
+            timestamp: Date(timeIntervalSinceReferenceDate: 11),
+            sessionID: sessionID,
+            level: .warning,
+            subsystem: "localVision",
+            action: "localVision.lookup",
+            result: "failed",
+            metadata: ["perceptionOCRInvoked": "false"]
+        )
+        let noInvocationExplanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [noInvocation], executionMetrics: [], capabilities: profile, sessionID: sessionID
+        ))
+        XCTAssertTrue(noInvocationExplanation.failureSignature.contains("ocr_not_invoked"))
+        XCTAssertFalse(noInvocationExplanation.ocrInvoked)
+
+        let emptyOCR = DiagnosticLogRecord(
+            timestamp: Date(timeIntervalSinceReferenceDate: 12),
+            sessionID: sessionID,
+            level: .warning,
+            subsystem: "tool",
+            action: "gui.tapTextObserve",
+            result: "failed",
+            diagnostic: "target not recognized",
+            metadata: [
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "available_empty",
+                "localVisionElementCount": "0"
+            ]
+        )
+        let emptyExplanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [emptyOCR], executionMetrics: [], capabilities: profile, sessionID: sessionID
+        ))
+        XCTAssertTrue(emptyExplanation.failureSignature.contains("ocr_completed_no_text"))
+        XCTAssertTrue(emptyExplanation.ocrInvoked)
+        XCTAssertTrue(emptyExplanation.ocrSucceeded)
+
+        let targetMissing = DiagnosticLogRecord(
+            timestamp: Date(timeIntervalSinceReferenceDate: 13),
+            sessionID: sessionID,
+            level: .warning,
+            subsystem: "tool",
+            action: "gui.tapTextObserve",
+            result: "failed",
+            diagnostic: "Local OCR completed, but the requested visible text did not produce one unique current-frame match.",
+            metadata: [
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "recognized",
+                "localVisionElementCount": "17",
+                "localVisionFailureClass": "ocr_target_not_recognized"
+            ]
+        )
+        let targetMissingExplanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [targetMissing], executionMetrics: [], capabilities: profile, sessionID: sessionID
+        ))
+        XCTAssertEqual(targetMissingExplanation.failureLayer, .localVision)
+        XCTAssertEqual(targetMissingExplanation.failureStage, "semantic_matching")
+        XCTAssertTrue(targetMissingExplanation.failureSignature.contains("ocr_target_not_recognized"))
+        XCTAssertTrue(targetMissingExplanation.ocrInvoked)
+        XCTAssertTrue(targetMissingExplanation.ocrSucceeded)
+    }
+
+    func testDiagnosticFailureTaxonomyKeepsAXAndOCRRootCausesDistinct() throws {
+        let axCases: [(DiagnosticLogRecord, String)] = [
+            (DiagnosticLogRecord(level: .error, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "required AXRuntime creation/copy symbols are unavailable"), "ax_backend_unavailable"),
+            (DiagnosticLogRecord(level: .error, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "AX request transport failed"), "ax_request_failed"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "no readable UI nodes; empty tree"), "ax_tree_empty"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.findElement", result: "failed", diagnostic: "structured element query returned no usable visible match"), "ax_target_absent"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.waitForElement", result: "failed", diagnostic: "structured plan local expectation did not become true before timeout"), "ax_target_absent"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "node budget output exceeded"), "ax_tree_budget_truncated"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "stale tree"), "ax_stale_tree"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "frame coordinate invalid"), "ax_frame_coordinate_invalid"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.findElement", result: "failed", diagnostic: "semantic match ambiguous"), "ax_semantic_match_ambiguous")
+        ]
+        for (record, expectedReason) in axCases {
+            let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+                records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+            ))
+            XCTAssertEqual(explanation.failureLayer, .axObservation)
+            XCTAssertTrue(explanation.failureSignature.contains(expectedReason), "expected \(expectedReason), got \(explanation.failureSignature)")
+        }
+
+        let ocrCases: [(DiagnosticLogRecord, String)] = [
+            (DiagnosticLogRecord(level: .error, subsystem: "tool", action: "gui.screenshot", result: "failed", diagnostic: "screenshot capture failed"), "screenshot_capture_failed"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "localVision", action: "lookup", result: "failed", metadata: ["perceptionOCRInvoked": "false"]), "ocr_not_invoked"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.tapTextObserve", result: "failed", metadata: ["perceptionOCRInvoked": "true", "perceptionOCRSucceeded": "true", "localVisionOCR": "available_empty"]), "ocr_completed_no_text"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.tapTextObserve", result: "failed", metadata: ["perceptionOCRInvoked": "true", "perceptionOCRSucceeded": "true", "localVisionOCR": "recognized", "localVisionFailureClass": "ocr_target_not_recognized"]), "ocr_target_not_recognized"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.tapTextObserve", result: "failed", metadata: ["perceptionOCRInvoked": "true", "perceptionOCRSucceeded": "true", "localVisionOCR": "recognized", "localVisionFailureClass": "ocr_unique_match_ambiguous"]), "ocr_unique_match_ambiguous"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "localVision", action: "lookup", result: "failed", diagnostic: "bounding box coordinate normalization failed", metadata: ["perceptionOCRInvoked": "true", "perceptionOCRSucceeded": "true", "localVisionOCR": "recognized"]), "ocr_coordinate_normalization_failed"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "localVision", action: "lookup", result: "failed", diagnostic: "crop region invalid", metadata: ["perceptionOCRInvoked": "true", "perceptionOCRSucceeded": "true", "localVisionOCR": "recognized"]), "ocr_region_invalid"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.feedSample", result: "failed", diagnostic: "right_rail anchor classification failed", metadata: ["perceptionOCRInvoked": "true", "perceptionOCRSucceeded": "true", "localVisionOCR": "recognized"]), "right_rail_anchor_classification_failed"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.feedSample", result: "failed", diagnostic: "compact count normalization failed", metadata: ["perceptionOCRInvoked": "true", "perceptionOCRSucceeded": "true", "localVisionOCR": "recognized"]), "compact_count_normalization_failed"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "perception", action: "routing", result: "failed", metadata: ["perceptionOCRInvoked": "true", "perceptionOCRSucceeded": "true", "localVisionOCR": "recognized", "perceptionLocalSufficient": "true", "perceptionRemoteVisionRequired": "true"]), "local_sufficient_remote_vision_routing_error")
+        ]
+        for (record, expectedReason) in ocrCases {
+            let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+                records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+            ))
+            XCTAssertEqual(explanation.failureLayer, .localVision)
+            XCTAssertTrue(explanation.failureSignature.contains(expectedReason), "expected \(expectedReason), got \(explanation.failureSignature)")
+        }
+    }
+
+    func testDiagnosticFailureTaxonomyDoesNotMistakeScreenWidth400ForHTTP400() throws {
+        let record = DiagnosticLogRecord(
+            level: .warning,
+            subsystem: "tool",
+            action: "gui.tapTextObserve",
+            result: "failed",
+            diagnostic: "target not recognized",
+            metadata: [
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "recognized",
+                "localVisionFailureClass": "ocr_target_not_recognized",
+                "screenPointWidth": "400",
+                "screenPointHeight": "800"
+            ]
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+        ))
+        XCTAssertTrue(explanation.failureSignature.contains("ocr_target_not_recognized"))
+        XCTAssertFalse(explanation.failureSignature.contains("bad_request"))
+    }
+
+    func testDiagnosticFailureExplanationTreatsSuccessfulFeedSamplingWithMetricFailureAsPerceptionFailure() throws {
+        let record = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "tool",
+            action: "gui.feedSample",
+            result: "completed",
+            diagnostic: "feed sampling completed",
+            metadata: [
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "recognized",
+                "localVisionFailureClass": "right_rail_anchor_classification_failed",
+                "localMetricExtraction": "incomplete_or_ambiguous",
+                "perceptionLocalSufficient": "false",
+                "perceptionRemoteVisionRequired": "true"
+            ]
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+        ))
+        XCTAssertEqual(explanation.failureLayer, .localVision)
+        XCTAssertEqual(explanation.failureStage, "metric_extraction")
+        XCTAssertTrue(explanation.failureSignature.contains("right_rail_anchor_classification_failed"))
+        XCTAssertTrue(explanation.observedOutcome.contains("perception_substage_failed"))
+        XCTAssertEqual(explanation.verificationStatus, "perception_failed")
+        XCTAssertTrue(explanation.automaticRecoveryAllowed)
+    }
+
+    func testCompletionGuardPerceptionEvidenceDistinguishesOCRAndTextOnlyLocalFallbackFailures() throws {
+        let base: [String: String] = [
+            "perceptionStatus": "perception_insufficient",
+            "providerVisionCapability": "text_only",
+            "selectedPerceptionRoute": "local_only_provider_vision_unavailable",
+            "perceptionAXAttempted": "true",
+            "perceptionAXSucceeded": "false",
+            "perceptionLocalSufficient": "false",
+            "perceptionFallbackReason": "provider_vision_not_supported_local_grounding_insufficient"
+        ]
+
+        func explain(_ additions: [String: String]) throws -> DiagnosticFailureExplanation {
+            let record = DiagnosticLogRecord(
+                level: .warning,
+                subsystem: "agent",
+                action: "completion-guard",
+                result: "premature_completion",
+                diagnostic: "perception_insufficient",
+                metadata: base.merging(additions, uniquingKeysWith: { _, new in new })
+            )
+            return try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+                records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+            ))
+        }
+
+        let notInvoked = try explain([
+            "perceptionOCRInvoked": "false",
+            "perceptionOCRSucceeded": "false",
+            "localVisionOCR": "not_invoked",
+            "localVisionElementCount": "0"
+        ])
+        XCTAssertEqual(notInvoked.failureLayer, .localVision)
+        XCTAssertEqual(notInvoked.failureStage, "ocr_invocation")
+        XCTAssertTrue(notInvoked.failureSignature.contains("ocr_not_invoked"))
+
+        let empty = try explain([
+            "perceptionOCRInvoked": "true",
+            "perceptionOCRSucceeded": "true",
+            "localVisionOCR": "available_empty",
+            "localVisionElementCount": "0"
+        ])
+        XCTAssertEqual(empty.failureLayer, .localVision)
+        XCTAssertEqual(empty.failureStage, "ocr_recognition")
+        XCTAssertTrue(empty.failureSignature.contains("ocr_completed_no_text"))
+
+        let requestFailed = try explain([
+            "perceptionOCRInvoked": "true",
+            "perceptionOCRSucceeded": "false",
+            "localVisionOCR": "unavailable_request_failed",
+            "localVisionElementCount": "0"
+        ])
+        XCTAssertEqual(requestFailed.failureLayer, .localVision)
+        XCTAssertEqual(requestFailed.failureStage, "ocr_recognition")
+        XCTAssertTrue(requestFailed.failureSignature.contains("ocr_request_failed"))
+
+        let localFallbackGap = try explain([
+            "perceptionOCRInvoked": "true",
+            "perceptionOCRSucceeded": "true",
+            "localVisionOCR": "recognized",
+            "localVisionElementCount": "12"
+        ])
+        XCTAssertEqual(localFallbackGap.failureLayer, .localVision)
+        XCTAssertEqual(localFallbackGap.failureStage, "semantic_fallback")
+        XCTAssertTrue(localFallbackGap.failureSignature.contains("provider_text_only_local_fallback_missing"))
+        XCTAssertTrue(localFallbackGap.probableCauses.contains("provider_route_cannot_consume_image_observation"))
+    }
+
+    func testCompletionPerceptionRecoveryDoesNotBlockAlreadyCompletedExplicitAction() {
+        XCTAssertTrue(AgentCore.completionRequiresPerceptionRecovery(
+            requiresMessageSend: false,
+            successfulCommitAfterTextInput: false,
+            requiresExplicitTapAction: true,
+            successfulTapActionCount: 0,
+            providerVisionCapability: .textOnly,
+            axFailedForCurrentForegroundState: true,
+            localPerceptionSufficient: false
+        ))
+        XCTAssertFalse(AgentCore.completionRequiresPerceptionRecovery(
+            requiresMessageSend: false,
+            successfulCommitAfterTextInput: false,
+            requiresExplicitTapAction: true,
+            successfulTapActionCount: 1,
+            providerVisionCapability: .textOnly,
+            axFailedForCurrentForegroundState: true,
+            localPerceptionSufficient: false
+        ))
+        XCTAssertFalse(AgentCore.completionRequiresPerceptionRecovery(
+            requiresMessageSend: true,
+            successfulCommitAfterTextInput: true,
+            requiresExplicitTapAction: false,
+            successfulTapActionCount: 0,
+            providerVisionCapability: .unknown,
+            axFailedForCurrentForegroundState: true,
+            localPerceptionSufficient: false
+        ))
+    }
+
+    func testDiagnosticFailureExplanationClassifiesTextOnlyProviderLocalFallbackGap() throws {
+        let record = DiagnosticLogRecord(
+            level: .warning,
+            subsystem: "perception",
+            action: "remote-vision",
+            result: "failed",
+            diagnostic: "local semantic target remains unresolved",
+            metadata: [
+                "providerVisionCapability": "text_only",
+                "selectedPerceptionRoute": "local_only_provider_vision_unavailable",
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "perceptionLocalSufficient": "false",
+                "localVisionOCR": "recognized",
+                "localVisionElementCount": "12"
+            ]
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+        ))
+        XCTAssertEqual(explanation.failureLayer, .localVision)
+        XCTAssertTrue(explanation.failureSignature.contains("provider_text_only_local_fallback_missing"))
+        XCTAssertTrue(explanation.probableCauses.contains("provider_route_cannot_consume_image_observation"))
+        XCTAssertTrue(explanation.recommendedNextAction.contains("semantic_local_tool"))
+    }
+
+    func testDiagnosticFailureHistoryReportsChangedLayerAndRemainingFailureWithoutGuessing() throws {
+        let sessionID = UUID()
+        let previousCallID = UUID()
+        let currentCallID = UUID()
+        let previous = DiagnosticLogRecord(
+            timestamp: Date(timeIntervalSinceReferenceDate: 1),
+            sessionID: sessionID,
+            toolCallID: previousCallID,
+            level: .error,
+            subsystem: "tool",
+            action: "gui.tree",
+            result: "failed",
+            diagnostic: "required AXRuntime creation/copy symbols are unavailable",
+            metadata: ["perceptionAXAttempted": "true", "perceptionAXSucceeded": "false"]
+        )
+        let current = DiagnosticLogRecord(
+            timestamp: Date(timeIntervalSinceReferenceDate: 2),
+            sessionID: sessionID,
+            toolCallID: currentCallID,
+            level: .warning,
+            subsystem: "tool",
+            action: "gui.tapTextObserve",
+            result: "failed",
+            diagnostic: "target not recognized",
+            metadata: [
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "recognized",
+                "localVisionFailureClass": "ocr_target_not_recognized"
+            ]
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [previous, current], executionMetrics: [], capabilities: CapabilityProfile(records: []), sessionID: sessionID, toolCallID: currentCallID
+        ))
+        XCTAssertNotNil(explanation.previousFailureSignature)
+        XCTAssertEqual(explanation.changedLayer, "ax_observation->local_vision")
+        XCTAssertEqual(explanation.progressObserved, true)
+        XCTAssertEqual(explanation.remainingFailure, "ocr_target_not_recognized")
+    }
+
+    func testDiagnosticFailureHistoryDeduplicatesSameToolCallAndSkipsItsInternalRecordsForPreviousFailure() throws {
+        let sessionID = UUID()
+        let previousCallID = UUID()
+        let currentCallID = UUID()
+        let previous = DiagnosticLogRecord(
+            timestamp: Date(timeIntervalSinceReferenceDate: 1),
+            sessionID: sessionID,
+            toolCallID: previousCallID,
+            level: .warning,
+            subsystem: "tool",
+            action: "gui.tapTextObserve",
+            result: "failed",
+            diagnostic: "target not recognized",
+            metadata: [
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "recognized",
+                "localVisionFailureClass": "ocr_target_not_recognized"
+            ]
+        )
+        let currentHelper = DiagnosticLogRecord(
+            timestamp: Date(timeIntervalSinceReferenceDate: 2),
+            sessionID: sessionID,
+            toolCallID: currentCallID,
+            level: .error,
+            subsystem: "gui",
+            action: "gui.tree",
+            result: "failed",
+            diagnostic: "required AXRuntime creation/copy symbols are unavailable"
+        )
+        let currentOuter = DiagnosticLogRecord(
+            timestamp: Date(timeIntervalSinceReferenceDate: 3),
+            sessionID: sessionID,
+            toolCallID: currentCallID,
+            level: .error,
+            subsystem: "tool",
+            action: "gui.tree",
+            result: "failed",
+            diagnostic: "required AXRuntime creation/copy symbols are unavailable"
+        )
+
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [previous, currentHelper, currentOuter],
+            executionMetrics: [],
+            capabilities: CapabilityProfile(records: []),
+            sessionID: sessionID,
+            toolCallID: currentCallID
+        ))
+        XCTAssertEqual(explanation.recentAttemptCount, 1, "multiple diagnostic records from one tool call must count as one recovery attempt")
+        XCTAssertEqual(explanation.changedLayer, "local_vision->ax_observation")
+        XCTAssertEqual(explanation.remainingFailure, "ax_backend_unavailable")
+        XCTAssertTrue(explanation.previousFailureSignature?.contains("ocr_target_not_recognized") == true)
+    }
+
+    func testDiagnosticFailureExplanationInfersRecoveryBudgetFromRepeatedToolCallsWhenCheckpointCountIsUnavailable() throws {
+        let sessionID = UUID()
+        let records = (1...3).map { index in
+            DiagnosticLogRecord(
+                timestamp: Date(timeIntervalSinceReferenceDate: Double(index)),
+                sessionID: sessionID,
+                toolCallID: UUID(),
+                level: .warning,
+                subsystem: "tool",
+                action: "gui.feedSample",
+                result: "failed",
+                diagnostic: "right_rail anchor classification failed",
+                metadata: [
+                    "perceptionOCRInvoked": "true",
+                    "perceptionOCRSucceeded": "true",
+                    "localVisionOCR": "recognized",
+                    "localVisionFailureClass": "right_rail_anchor_classification_failed"
+                ]
+            )
+        }
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: records,
+            executionMetrics: [],
+            capabilities: CapabilityProfile(records: []),
+            sessionID: sessionID
+        ))
+        XCTAssertEqual(explanation.recentAttemptCount, 3)
+        XCTAssertFalse(explanation.automaticRecoveryAllowed)
+        XCTAssertEqual(explanation.recoveryReason, "recovery_budget_exhausted")
+        XCTAssertTrue(explanation.developerPatchLikelyRequired)
+    }
+
+    func testDiagnosticFailureExplanationPreservesRoutingAnchorAndRecoveryBudget() throws {
+        let sessionID = UUID()
+        let record = DiagnosticLogRecord(
+            timestamp: Date(timeIntervalSinceReferenceDate: 20),
+            sessionID: sessionID,
+            level: .warning,
+            subsystem: "tool",
+            action: "gui.feedSample",
+            result: "failed",
+            diagnostic: "right_rail anchor classification failed",
+            metadata: [
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "recognized",
+                "perceptionLocalSufficient": "false"
+            ]
+        )
+        let metric = ExecutionPathMetric(
+            tool: "gui.feedSample",
+            routeCandidates: [.guiFallback, .structuredTool],
+            selectedRoute: .guiFallback,
+            fallbackReason: "structuredTool:unsupported",
+            fallbackDepth: 1,
+            routeSelectionLatencyMS: 2,
+            executionLatencyMS: 41,
+            totalLatencyMS: 43,
+            outcome: "failed",
+            ocrInvoked: true,
+            ocrSucceeded: true,
+            ocrLatencyMS: 17,
+            recordedAt: record.timestamp
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [record],
+            executionMetrics: [metric],
+            capabilities: CapabilityProfile(records: []),
+            sessionID: sessionID,
+            recoveryAttemptCount: 2,
+            maximumRecoveryAttempts: 2
+        ))
+        XCTAssertTrue(explanation.failureSignature.contains("right_rail_anchor_classification_failed"))
+        XCTAssertEqual(explanation.selectedRoute, AppExecutionRoute.guiFallback.rawValue)
+        XCTAssertEqual(explanation.fallbackDepth, 1)
+        XCTAssertEqual(explanation.ocrLatencyMS, 17)
+        XCTAssertFalse(explanation.automaticRecoveryAllowed)
+        XCTAssertEqual(explanation.recoveryReason, "recovery_budget_exhausted")
+        XCTAssertTrue(explanation.developerPatchLikelyRequired)
+    }
+
+    func testDiagnosticFailureExplanationUsesExactSessionAndToolCallMetric() throws {
+        let sessionID = UUID()
+        let toolCallID = UUID()
+        let otherSessionID = UUID()
+        let record = DiagnosticLogRecord(
+            sessionID: sessionID,
+            toolCallID: toolCallID,
+            level: .error,
+            subsystem: "tool",
+            action: "gui.tree",
+            result: "failed",
+            diagnostic: "AX request failed"
+        )
+        let unrelated = ExecutionPathMetric(
+            tool: "gui.tree",
+            routeCandidates: [.structuredTool],
+            selectedRoute: .structuredTool,
+            fallbackReason: "wrong-session-metric",
+            fallbackDepth: 7,
+            routeSelectionLatencyMS: 99,
+            executionLatencyMS: 99,
+            totalLatencyMS: 198,
+            outcome: "failed",
+            sessionID: otherSessionID,
+            toolCallID: UUID()
+        )
+        let exact = ExecutionPathMetric(
+            tool: "gui.tree",
+            routeCandidates: [.guiFallback],
+            selectedRoute: .guiFallback,
+            fallbackReason: "exact-current-call",
+            fallbackDepth: 1,
+            routeSelectionLatencyMS: 2,
+            executionLatencyMS: 8,
+            totalLatencyMS: 10,
+            outcome: "failed",
+            sessionID: sessionID,
+            toolCallID: toolCallID
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [record], executionMetrics: [unrelated, exact], capabilities: CapabilityProfile(records: []), sessionID: sessionID, toolCallID: toolCallID
+        ))
+        XCTAssertEqual(explanation.selectedRoute, AppExecutionRoute.guiFallback.rawValue)
+        XCTAssertEqual(explanation.fallbackReason, "exact-current-call")
+        XCTAssertEqual(explanation.fallbackDepth, 1)
+    }
+
+    func testDiagnosticFailureExplanationDoesNotUseFutureMetricOrProviderContextForHistoricalToolCall() throws {
+        let sessionID = UUID()
+        let targetCallID = UUID()
+        let target = DiagnosticLogRecord(
+            timestamp: Date(timeIntervalSinceReferenceDate: 100),
+            sessionID: sessionID,
+            toolCallID: targetCallID,
+            level: .error,
+            subsystem: "tool",
+            action: "gui.tree",
+            result: "failed",
+            diagnostic: "AX request failed",
+            metadata: ["perceptionAXAttempted": "true", "perceptionAXSucceeded": "false"]
+        )
+        let futureProvider = DiagnosticLogRecord(
+            timestamp: Date(timeIntervalSinceReferenceDate: 200),
+            sessionID: sessionID,
+            level: .warning,
+            subsystem: "provider",
+            action: "vision-capability",
+            result: "text_only",
+            metadata: ["providerVisionCapability": "text_only", "providerVisionCapabilitySource": "future_probe"]
+        )
+        let futureMetric = ExecutionPathMetric(
+            tool: "gui.tree",
+            routeCandidates: [.structuredTool],
+            selectedRoute: .structuredTool,
+            fallbackReason: "future-route-must-not-leak",
+            fallbackDepth: 3,
+            routeSelectionLatencyMS: 4,
+            executionLatencyMS: 5,
+            totalLatencyMS: 9,
+            outcome: "failed",
+            sessionID: sessionID,
+            recordedAt: Date(timeIntervalSinceReferenceDate: 200)
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [target, futureProvider],
+            executionMetrics: [futureMetric],
+            capabilities: CapabilityProfile(records: []),
+            sessionID: sessionID,
+            toolCallID: targetCallID
+        ))
+        XCTAssertNil(explanation.selectedRoute)
+        XCTAssertNotEqual(explanation.fallbackReason, "future-route-must-not-leak")
+        XCTAssertFalse(explanation.probableCauses.contains("provider_route_cannot_consume_image_observation"))
+        XCTAssertFalse(explanation.evidenceSummary.contains { $0.contains("provider_vision=text_only") })
+    }
+
+    func testDiagnosticFailureExplanationTreatsSuccessfulScreenshotWithBrokenOCRAsFailure() throws {
+        let record = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "tool",
+            action: "gui.screenshot",
+            result: "completed",
+            metadata: [
+                "sha256": "abc123",
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "false",
+                "localVisionOCR": "unavailable_request_failed",
+                "localVisionErrorDomain": "com.apple.CoreML",
+                "localVisionErrorCode": "0"
+            ]
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+        ))
+        XCTAssertEqual(explanation.failureLayer, .localVision)
+        XCTAssertTrue(explanation.failureSignature.contains("coreml_runtime_failed"))
+        XCTAssertEqual(explanation.screenshotStatus, "succeeded")
+        XCTAssertFalse(explanation.ocrSucceeded)
+    }
+
+    func testDiagnosticsExplainFailureToolIsReadOnlyDoesNotRouteThroughExecutorAndDoesNotRecurse() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let logStore = DiagnosticLogStore(directory: root.appendingPathComponent("logs", isDirectory: true))
+        let sessionID = UUID()
+        let failedCallID = UUID()
+        try await logStore.log(
+            level: .error,
+            subsystem: "tool",
+            action: "gui.tree",
+            result: "failed",
+            sessionID: sessionID,
+            toolCallID: failedCallID,
+            diagnostic: "AX request timed out Authorization: Bearer should-not-leak Cookie: session-cookie-do-not-leak api_key=placeholder-thisshouldnotleak123456",
+            metadata: [
+                "userText": "private-user-value-should-not-surface",
+                "screenshotBytesBase64": "raw-screenshot-bytes-should-not-surface"
+            ]
+        )
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "diagnostics.explainFailure", summary: "", risk: .readOnly)
+        ])
+        let executorCounter = InvocationCounter()
+        let router = ToolRouter(
+            registry: registry,
+            executors: [CountingExecutor(route: .structuredTool, names: ["diagnostics.explainFailure"], counter: executorCounter)],
+            diagnosticLogger: logStore
+        )
+        let context = ToolExecutionContext(
+            permissionMode: .safe,
+            capabilityProfile: CapabilityProfile(records: [
+                CapabilityRecord(id: GUIAutomationFeature.tree.capabilityID, domain: .automation, status: .deviceValidationRequired, detail: "must stay snapshot-only")
+            ])
+        )
+        let before = try await logStore.recent(sessionID: sessionID, limit: 50).count
+        let result = try await router.execute(
+            ToolCall(name: "diagnostics.explainFailure", arguments: ["toolCallId": failedCallID.uuidString], sessionID: sessionID),
+            context: context
+        )
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.payload["diagnosisAvailable"], "true")
+        XCTAssertFalse((result.payload["diagnosisJSON"] ?? "").contains("should-not-leak"))
+        XCTAssertFalse((result.payload["diagnosisJSON"] ?? "").contains("private-user-value-should-not-surface"))
+        XCTAssertFalse((result.payload["diagnosisJSON"] ?? "").contains("raw-screenshot-bytes-should-not-surface"))
+        XCTAssertNotNil(result.payload["relevantCapabilitiesJSON"])
+        XCTAssertNotNil(result.payload["probableCausesJSON"])
+        XCTAssertNotNil(result.payload["evidenceSummaryJSON"])
+        XCTAssertNotNil(result.payload["currentFailureSignature"])
+        XCTAssertNotNil(result.payload["remainingFailure"])
+        let executorInvocationCount = await executorCounter.value()
+        XCTAssertEqual(executorInvocationCount, 0, "read-only diagnosis must bypass executors/deferred privileged self-validation entirely")
+        let after = try await logStore.recent(sessionID: sessionID, limit: 50).count
+        XCTAssertEqual(after, before, "diagnostics.explainFailure must not log itself and recurse")
+
+        let invalid = try await router.execute(
+            ToolCall(name: "diagnostics.explainFailure", arguments: ["toolCallId": "not-a-uuid"], sessionID: sessionID),
+            context: context
+        )
+        XCTAssertFalse(invalid.success)
+        let afterInvalid = try await logStore.recent(sessionID: sessionID, limit: 50).count
+        XCTAssertEqual(afterInvalid, before)
+    }
+
+    func testAgentAutomaticFailureDiagnosisStopsSameSignatureAfterTwoRecoveries() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let logStore = DiagnosticLogStore(directory: root.appendingPathComponent("logs", isDirectory: true))
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "files.read", summary: "read", risk: .readOnly, preferredRoute: .structuredTool)
+        ])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let checkpoints = TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json"))
+        let router = ToolRouter(
+            registry: registry,
+            executors: [FailingExecutor(route: .structuredTool, names: ["files.read"])],
+            diagnosticLogger: logStore
+        )
+        let provider = RepeatedFailureDiagnosisProvider()
+        let agent = AgentCore(
+            provider: provider,
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: router,
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: checkpoints,
+            diagnosticLogger: logStore,
+            maxToolRounds: 6
+        )
+        let session = AgentSession(permissionMode: .safe)
+        let stream = await agent.send(
+            text: "read the current fixture",
+            session: session,
+            providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key")
+        )
+        var exhaustedError: Error?
+        do {
+            for try await _ in stream {}
+        } catch {
+            exhaustedError = error
+        }
+
+        XCTAssertNotNil(exhaustedError, "the third same-signature failure must hard-stop automatic re-planning")
+        XCTAssertTrue(String(describing: exhaustedError ?? ProviderError.transport("")).contains("Automatic recovery budget exhausted"))
+        let saved = try await sessions.load(session.id)
+        let diagnoses = saved.messages.filter { $0.providerMetadata["context_layer"] == "automatic_failure_diagnosis" }
+        XCTAssertEqual(diagnoses.count, 3)
+        XCTAssertEqual(diagnoses[0].providerMetadata["automatic_recovery_allowed"], "true")
+        XCTAssertEqual(diagnoses[1].providerMetadata["automatic_recovery_allowed"], "true")
+        XCTAssertEqual(diagnoses[2].providerMetadata["automatic_recovery_allowed"], "false")
+        XCTAssertEqual(diagnoses[2].providerMetadata["recovery_reason"], "recovery_budget_exhausted")
+        let providerStreamCalls = await provider.streamCallCount()
+        XCTAssertEqual(providerStreamCalls, 3, "recovery budget exhaustion must stop before a fourth Provider re-plan round")
+    }
+
+    func testAgentAutomaticallyDiagnosesDeepFallbackEvenWhenToolExecutionSucceeds() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let logStore = DiagnosticLogStore(directory: root.appendingPathComponent("logs", isDirectory: true))
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "files.list", summary: "list", risk: .readOnly, preferredRoute: .structuredTool)
+        ])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let router = ToolRouter(
+            registry: registry,
+            executors: [StubExecutor(route: .guiFallback, names: ["files.list"])],
+            diagnosticLogger: logStore
+        )
+        let agent = AgentCore(
+            provider: ToolThenFinishProvider(events: [
+                .toolCall(id: "deep-fallback-list", name: "files_list", argumentsJSON: "{}"),
+                .finished
+            ]),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: router,
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            diagnosticLogger: logStore,
+            maxToolRounds: 3
+        )
+        let session = AgentSession(permissionMode: .safe)
+        let stream = await agent.send(
+            text: "list the current fixture",
+            session: session,
+            providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key")
+        )
+        for try await _ in stream {}
+
+        let saved = try await sessions.load(session.id)
+        let diagnosis = try XCTUnwrap(saved.messages.last(where: {
+            $0.providerMetadata["context_layer"] == "automatic_failure_diagnosis"
+        }))
+        XCTAssertTrue((diagnosis.providerMetadata["failure_signature"] ?? "").contains("tool_routing"))
+        XCTAssertTrue((diagnosis.providerMetadata["failure_signature"] ?? "").contains("deep_route_fallback"))
+        XCTAssertEqual(diagnosis.providerMetadata["automatic_recovery_allowed"], "false")
+        XCTAssertEqual(diagnosis.providerMetadata["recovery_reason"], "diagnostic_only_route_degradation")
+    }
+
     func testDiagnosticBundleExporterBoundsOptionalLargeFilesButKeepsMachineSummary() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -775,6 +1563,44 @@ final class CloudCodeCoreTests: XCTestCase {
         ), "the right-rail fallback requires normalized screen context")
     }
 
+    func testLocalFeedMetricExtractorKeepsThreeSlotRightRailShareAmbiguous() throws {
+        let screen = LocalPerceptionScreenSize(width: 390, height: 844)
+        let rail = [
+            LocalPerceptionTextElement(text: "5.4万", confidence: 0.24, x: 330, y: 360, width: 48, height: 20),
+            LocalPerceptionTextElement(text: "2783", confidence: 0.23, x: 334, y: 450, width: 42, height: 20),
+            LocalPerceptionTextElement(text: "3.6万", confidence: 0.22, x: 330, y: 540, width: 48, height: 20)
+        ]
+        let like = try XCTUnwrap(LocalFeedMetricExtractor.extract(metric: .likeCount, elements: rail, screenSize: screen))
+        let comment = try XCTUnwrap(LocalFeedMetricExtractor.extract(metric: .commentCount, elements: rail, screenSize: screen))
+        XCTAssertEqual(like.value, 54_000)
+        XCTAssertEqual(comment.value, 2_783)
+        XCTAssertNil(LocalFeedMetricExtractor.extract(metric: .shareCount, elements: rail, screenSize: screen), "a three-slot numeric rail cannot distinguish favorite from share by geometry alone")
+        XCTAssertEqual(LocalFeedMetricExtractor.failureReason(metric: .shareCount, elements: rail, screenSize: screen), "right_rail_anchor_classification_failed")
+    }
+
+    func testLocalFeedMetricFailureReasonDistinguishesRightRailGeometryFromCountNormalization() {
+        let screen = LocalPerceptionScreenSize(width: 390, height: 844)
+        let malformedCountRail = [
+            LocalPerceptionTextElement(text: "5.4.万", confidence: 0.24, x: 330, y: 360, width: 48, height: 20),
+            LocalPerceptionTextElement(text: "2783", confidence: 0.23, x: 334, y: 450, width: 42, height: 20),
+            LocalPerceptionTextElement(text: "3.6万", confidence: 0.22, x: 330, y: 540, width: 48, height: 20)
+        ]
+        XCTAssertEqual(
+            LocalFeedMetricExtractor.failureReason(metric: .shareCount, elements: malformedCountRail, screenSize: screen),
+            "compact_count_normalization_failed"
+        )
+
+        let incoherentRail = [
+            LocalPerceptionTextElement(text: "5.4万", confidence: 0.24, x: 330, y: 360, width: 48, height: 20),
+            LocalPerceptionTextElement(text: "2783", confidence: 0.23, x: 286, y: 450, width: 42, height: 20),
+            LocalPerceptionTextElement(text: "3.6万", confidence: 0.22, x: 330, y: 700, width: 48, height: 20)
+        ]
+        XCTAssertEqual(
+            LocalFeedMetricExtractor.failureReason(metric: .shareCount, elements: incoherentRail, screenSize: screen),
+            "right_rail_anchor_classification_failed"
+        )
+    }
+
     func testLocalFeedMetricExtractorFailsClosedOnAmbiguityAndEnforcesSampleBounds() throws {
         let ambiguous = [
             LocalPerceptionTextElement(text: "点赞", confidence: 0.98, x: 300, y: 420, width: 34, height: 20),
@@ -908,6 +1734,8 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(decoded.tool, "gui.screenshot")
         XCTAssertEqual(decoded.providerVisualRoundTripAvoided, 0)
         XCTAssertNil(decoded.appBundleID)
+        XCTAssertNil(decoded.sessionID)
+        XCTAssertNil(decoded.toolCallID)
         XCTAssertNil(decoded.ocrInvoked)
         XCTAssertNil(decoded.finalVerificationPassed)
     }
@@ -2883,20 +3711,24 @@ final class CloudCodeCoreTests: XCTestCase {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let logStore = DiagnosticLogStore(directory: root.appendingPathComponent("logs", isDirectory: true))
+        let provider = PrematureGUICompletionProvider()
         let registry = ToolRegistry(descriptors: [
             ToolDescriptor(name: "apps.launch", summary: "launch", risk: .safeWrite, preferredRoute: .privateFramework)
         ])
         let agent = AgentCore(
-            provider: PrematureGUICompletionProvider(),
+            provider: provider,
             keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
             toolRouter: ToolRouter(
                 registry: registry,
-                executors: [CountingExecutor(route: .privateFramework, names: ["apps.launch"], counter: InvocationCounter())]
+                executors: [CountingExecutor(route: .privateFramework, names: ["apps.launch"], counter: InvocationCounter())],
+                diagnosticLogger: logStore
             ),
             registry: registry,
             capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
             sessionStore: sessions,
             checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            diagnosticLogger: logStore,
             maxToolRounds: 5
         )
         let session = AgentSession(permissionMode: .full)
@@ -2920,6 +3752,16 @@ final class CloudCodeCoreTests: XCTestCase {
                 && $0.content.contains("明确要求执行 3")
                 && $0.content.contains("不能只打开 App")
         })
+        let diagnoses = saved.messages.filter { $0.providerMetadata["context_layer"] == "automatic_completion_diagnosis" }
+        XCTAssertEqual(diagnoses.count, 3)
+        XCTAssertEqual(diagnoses[0].providerMetadata["automatic_recovery_allowed"], "true")
+        XCTAssertEqual(diagnoses[0].providerMetadata["recovery_reason"], "bounded_replan_available")
+        XCTAssertEqual(diagnoses[1].providerMetadata["automatic_recovery_allowed"], "true")
+        XCTAssertEqual(diagnoses[1].providerMetadata["recovery_reason"], "bounded_replan_available")
+        XCTAssertEqual(diagnoses[2].providerMetadata["automatic_recovery_allowed"], "false")
+        XCTAssertEqual(diagnoses[2].providerMetadata["recovery_reason"], "recovery_budget_exhausted")
+        let providerStreamCalls = await provider.streamCallCount()
+        XCTAssertEqual(providerStreamCalls, 4, "one launch round plus three completion attempts must stop before any fourth completion re-plan")
     }
 
     func testMessagingRawTypeIsBlockedUntilComposerFocusIsLocallyVerified() async throws {
@@ -5526,6 +6368,26 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(route, .structuredTool)
     }
 
+    func testToolRouterReturnsFallbackRouteMetadataInToolResult() async throws {
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "files.list", summary: "", risk: .readOnly, preferredRoute: .structuredTool)
+        ])
+        let router = ToolRouter(
+            registry: registry,
+            executors: [StubExecutor(route: .guiFallback, names: ["files.list"])]
+        )
+        let result = try await router.execute(
+            ToolCall(name: "files.list", arguments: [:], sessionID: UUID()),
+            context: ToolExecutionContext(permissionMode: .safe, capabilityProfile: CapabilityProfile(records: []))
+        )
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.payload["route"], AppExecutionRoute.guiFallback.rawValue)
+        XCTAssertEqual(result.payload["fallbackDepth"], "4")
+        XCTAssertTrue((result.payload["fallbackReason"] ?? "").contains("structured_tool:no_executor"))
+        XCTAssertNotNil(result.payload["routeCandidates"])
+        XCTAssertNotNil(result.payload["routeSelectionLatencyMS"])
+    }
+
     func testFileSearchSkipsSymlink() throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -5949,22 +6811,33 @@ private struct DuplicateStateChangeProvider: ProviderStreaming, Sendable {
     }
 }
 
-private struct PrematureGUICompletionProvider: ProviderStreaming, Sendable {
-    func stream(
+private actor PrematureGUICompletionProvider: ProviderStreaming {
+    private var calls = 0
+
+    func streamCallCount() -> Int { calls }
+
+    private func recordCallAndCompletedToolCount(_ messages: [ChatMessage]) -> Int {
+        calls += 1
+        return messages.filter { $0.role == .tool }.count
+    }
+
+    nonisolated func stream(
         configuration: ProviderConfiguration,
         apiKey: String,
         messages: [ChatMessage],
         tools: [ProviderToolSchema]
     ) -> AsyncThrowingStream<ProviderEvent, Error> {
-        let completedTools = messages.filter { $0.role == .tool }.count
-        return AsyncThrowingStream { continuation in
-            if completedTools == 0 {
-                continuation.yield(.toolCall(id: "launch-only", name: "apps_launch", argumentsJSON: "{\"bundleId\":\"com.ss.iphone.ugc.aweme.lite\"}"))
-            } else {
-                continuation.yield(.token("done"))
+        AsyncThrowingStream { continuation in
+            Task {
+                let completedTools = await self.recordCallAndCompletedToolCount(messages)
+                if completedTools == 0 {
+                    continuation.yield(.toolCall(id: "launch-only", name: "apps_launch", argumentsJSON: "{\"bundleId\":\"com.ss.iphone.ugc.aweme.lite\"}"))
+                } else {
+                    continuation.yield(.token("done"))
+                }
+                continuation.yield(.finished)
+                continuation.finish()
             }
-            continuation.yield(.finished)
-            continuation.finish()
         }
     }
 }
@@ -6020,6 +6893,13 @@ private actor TreeFailureScreenshotSwipeProvider: ProviderStreaming {
     private var recorded: [Snapshot] = []
 
     func snapshots() -> [Snapshot] { recorded }
+
+    nonisolated func imageCapability(
+        configuration: ProviderConfiguration,
+        apiKey: String
+    ) async -> ProviderImageCapabilityAssessment {
+        ProviderImageCapabilityAssessment(capability: .supported, source: "test_mock")
+    }
 
     nonisolated func stream(
         configuration: ProviderConfiguration,
@@ -6122,7 +7002,49 @@ private struct UnchangedScreenshotRepeatProvider: ProviderStreaming, Sendable {
     }
 }
 
+private actor RepeatedFailureDiagnosisProvider: ProviderStreaming {
+    private var calls = 0
+
+    func streamCallCount() -> Int { calls }
+
+    private func recordCallAndCompletedToolCount(_ messages: [ChatMessage]) -> Int {
+        calls += 1
+        return messages.filter { $0.role == .tool }.count
+    }
+
+    nonisolated func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                let completed = await self.recordCallAndCompletedToolCount(messages)
+                if completed < 3 {
+                    continuation.yield(.toolCall(
+                        id: "verify-failure-\(completed + 1)",
+                        name: "files_read",
+                        argumentsJSON: "{\"path\":\"/tmp/diagnostic-fixture\"}"
+                    ))
+                } else {
+                    continuation.yield(.token("done"))
+                }
+                continuation.yield(.finished)
+                continuation.finish()
+            }
+        }
+    }
+}
+
 private actor SequencedGUIProvider: ProviderStreaming {
+    nonisolated func imageCapability(
+        configuration: ProviderConfiguration,
+        apiKey: String
+    ) async -> ProviderImageCapabilityAssessment {
+        ProviderImageCapabilityAssessment(capability: .supported, source: "test_mock")
+    }
+
     nonisolated func stream(
         configuration: ProviderConfiguration,
         apiKey: String,
@@ -6157,6 +7079,13 @@ private actor ScreenshotRoundProvider: ProviderStreaming {
     private var recorded: [Snapshot] = []
 
     func snapshots() -> [Snapshot] { recorded }
+
+    nonisolated func imageCapability(
+        configuration: ProviderConfiguration,
+        apiKey: String
+    ) async -> ProviderImageCapabilityAssessment {
+        ProviderImageCapabilityAssessment(capability: .supported, source: "test_mock")
+    }
 
     nonisolated func stream(
         configuration: ProviderConfiguration,

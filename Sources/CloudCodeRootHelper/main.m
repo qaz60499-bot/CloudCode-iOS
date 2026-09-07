@@ -1173,12 +1173,6 @@ int main(int argc, const char *argv[])
             NSString *outputPath = [NSString stringWithUTF8String:argv[2]];
             return CloudCodeGUIScreenshotFile(outputPath);
         }
-        if ([command isEqualToString:@"gui-ocr-file"]) {
-            if (argc < 4) { return 10; }
-            NSString *inputPath = [NSString stringWithUTF8String:argv[2]];
-            NSUInteger maximumElements = (NSUInteger)strtoul(argv[3], NULL, 10);
-            return CloudCodeGUIOCRFile(inputPath, maximumElements);
-        }
         if ([command isEqualToString:@"gui-tap"]) {
             if (argc < 4) { return 10; }
             return CloudCodeGUITap(strtod(argv[2], NULL), strtod(argv[3], NULL));
