@@ -746,6 +746,35 @@ final class CloudCodeCoreTests: XCTestCase {
         ]), "A naked visible number must not be classified as a like count without a current-frame semantic anchor")
     }
 
+    func testLocalFeedMetricExtractorRecognizesBoundedRightRailWithoutInventingIconCoordinates() throws {
+        let screen = LocalPerceptionScreenSize(width: 390, height: 844)
+        let rail = [
+            LocalPerceptionTextElement(text: "5.4万", confidence: 0.94, x: 330, y: 344, width: 48, height: 20),
+            LocalPerceptionTextElement(text: "2783", confidence: 0.93, x: 334, y: 430, width: 42, height: 20),
+            LocalPerceptionTextElement(text: "5363", confidence: 0.92, x: 333, y: 516, width: 42, height: 20),
+            LocalPerceptionTextElement(text: "3.6万", confidence: 0.91, x: 330, y: 602, width: 48, height: 20)
+        ]
+        let like = try XCTUnwrap(LocalFeedMetricExtractor.extract(metric: .likeCount, elements: rail, screenSize: screen))
+        let comment = try XCTUnwrap(LocalFeedMetricExtractor.extract(metric: .commentCount, elements: rail, screenSize: screen))
+        let share = try XCTUnwrap(LocalFeedMetricExtractor.extract(metric: .shareCount, elements: rail, screenSize: screen))
+        XCTAssertEqual(like.value, 54_000)
+        XCTAssertEqual(comment.value, 2_783)
+        XCTAssertEqual(share.value, 36_000)
+        XCTAssertEqual(like.anchorText, "right_rail_4_slot_like")
+        XCTAssertEqual(share.anchorText, "right_rail_4_slot_share")
+
+        XCTAssertNil(LocalFeedMetricExtractor.extract(
+            metric: .likeCount,
+            elements: Array(rail.prefix(2)),
+            screenSize: screen
+        ), "a partial right-side numeric cluster must remain ambiguous")
+        XCTAssertNil(LocalFeedMetricExtractor.extract(
+            metric: .likeCount,
+            elements: rail,
+            screenSize: nil
+        ), "the right-rail fallback requires normalized screen context")
+    }
+
     func testLocalFeedMetricExtractorFailsClosedOnAmbiguityAndEnforcesSampleBounds() throws {
         let ambiguous = [
             LocalPerceptionTextElement(text: "点赞", confidence: 0.98, x: 300, y: 420, width: 34, height: 20),
@@ -4684,6 +4713,19 @@ final class CloudCodeCoreTests: XCTestCase {
         let avoidScreenshot = await store.shouldTemporarilyAvoidObservation(bundleID: bundleID, backend: .screenshot)
         XCTAssertTrue(avoidAX)
         XCTAssertFalse(avoidScreenshot)
+    }
+
+    func testIOSInteractionExperienceSuppressesOneTimeoutScaleAXFailureWhenScreenshotWorks() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = IOSInteractionExperienceStore(fileURL: root.appendingPathComponent("experience.json"))
+        let bundleID = "com.example.video"
+
+        await store.recordObservation(bundleID: bundleID, backend: .screenshot, success: true, latencyMS: 260)
+        await store.recordObservation(bundleID: bundleID, backend: .accessibilityTree, success: false, latencyMS: 3_100)
+
+        let avoidAX = await store.shouldTemporarilyAvoidObservation(bundleID: bundleID, backend: .accessibilityTree)
+        XCTAssertTrue(avoidAX)
     }
 
     func testIOSInteractionExperienceDoesNotSuppressAXWithoutWorkingAlternative() async throws {

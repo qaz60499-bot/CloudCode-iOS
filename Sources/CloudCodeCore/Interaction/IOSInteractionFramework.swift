@@ -274,13 +274,17 @@ public actor IOSInteractionExperienceStore {
         loadIfNeeded(now: now)
         prune(now: now)
         guard let record = observations[Self.observationKey(environment: environment, backend: backend)],
-              record.attempts >= 2,
-              record.failures >= 2,
               record.successes == 0,
-              (record.averageLatencyMS ?? 0) >= 2_000,
               now.timeIntervalSince(record.lastValidatedAt) <= 6 * 60 * 60 else {
             return false
         }
+        let averageLatencyMS = record.averageLatencyMS ?? 0
+        let repeatedSlowFailure = record.attempts >= 2 && record.failures >= 2 && averageLatencyMS >= 2_000
+        // One pathological AX stall is sufficient evidence to stop paying it again when a current
+        // screenshot backend is already proven. The diagnostic run that motivated this guard had
+        // nominal 3s helper timeouts turning into >15s user-visible tool latency.
+        let extremeSingleFailure = record.attempts >= 1 && record.failures == record.attempts && averageLatencyMS >= 3_000
+        guard repeatedSlowFailure || extremeSingleFailure else { return false }
 
         let alternate: IOSInteractionObservationBackend = backend == .accessibilityTree ? .screenshot : .accessibilityTree
         guard let alternateRecord = observations[Self.observationKey(environment: environment, backend: alternate)],

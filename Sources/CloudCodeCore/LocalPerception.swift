@@ -90,6 +90,16 @@ public enum LocalFeedMetricSelection: String, Codable, Sendable {
     case min
 }
 
+public struct LocalPerceptionScreenSize: Equatable, Sendable {
+    public var width: Double
+    public var height: Double
+
+    public init(width: Double, height: Double) {
+        self.width = width
+        self.height = height
+    }
+}
+
 public struct LocalFeedMetricExtraction: Codable, Equatable, Sendable {
     public var value: Double
     public var sourceText: String
@@ -130,7 +140,11 @@ public struct LocalFeedMetricSelectionResult: Codable, Equatable, Sendable {
 public enum LocalFeedMetricExtractor {
     /// Extracts a metric only when OCR supplies semantic anchor evidence in the same current frame.
     /// A naked number with no current-frame like/comment/share anchor is not classified.
-    public static func extract(metric: LocalFeedMetric, elements: [LocalPerceptionTextElement]) -> LocalFeedMetricExtraction? {
+    public static func extract(
+        metric: LocalFeedMetric,
+        elements: [LocalPerceptionTextElement],
+        screenSize: LocalPerceptionScreenSize? = nil
+    ) -> LocalFeedMetricExtraction? {
         let usable = elements.filter { $0.confidence >= 0.35 && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !usable.isEmpty else { return nil }
 
@@ -177,7 +191,9 @@ public enum LocalFeedMetricExtractor {
             if lhs.score == rhs.score { return lhs.extraction.confidence > rhs.extraction.confidence }
             return lhs.score > rhs.score
         }
-        guard let best = sorted.first else { return nil }
+        guard let best = sorted.first else {
+            return extractFromRightRail(metric: metric, usable: usable, screenSize: screenSize)
+        }
         if sorted.count > 1 {
             let second = sorted[1]
             // Fail closed when two different visible values are similarly plausible for the same metric.
@@ -191,12 +207,15 @@ public enum LocalFeedMetricExtractor {
     public static func select(
         metric: LocalFeedMetric,
         selection: LocalFeedMetricSelection,
-        samples: [[LocalPerceptionTextElement]]
+        samples: [[LocalPerceptionTextElement]],
+        screenSizes: [LocalPerceptionScreenSize]? = nil
     ) -> LocalFeedMetricSelectionResult? {
         guard samples.count >= 2, samples.count <= 8 else { return nil }
+        if let screenSizes, screenSizes.count != samples.count { return nil }
         var extractions: [LocalFeedMetricExtraction] = []
-        for sample in samples {
-            guard let extraction = extract(metric: metric, elements: sample) else { return nil }
+        for index in samples.indices {
+            let screenSize = screenSizes?[index]
+            guard let extraction = extract(metric: metric, elements: samples[index], screenSize: screenSize) else { return nil }
             extractions.append(extraction)
         }
         let values = extractions.map(\.value)
@@ -216,6 +235,65 @@ public enum LocalFeedMetricExtractor {
             selectedSample: selectedOffset + 1,
             selectedValue: values[selectedOffset],
             extractions: extractions
+        )
+    }
+
+    private static func extractFromRightRail(
+        metric: LocalFeedMetric,
+        usable: [LocalPerceptionTextElement],
+        screenSize: LocalPerceptionScreenSize?
+    ) -> LocalFeedMetricExtraction? {
+        guard let screenSize,
+              screenSize.width.isFinite, screenSize.height.isFinite,
+              screenSize.width >= 200, screenSize.height >= 400 else { return nil }
+
+        let rightRail = usable.compactMap { element -> (element: LocalPerceptionTextElement, value: Double)? in
+            guard element.centerX >= screenSize.width * 0.72,
+                  element.centerX <= screenSize.width * 0.99,
+                  element.centerY >= screenSize.height * 0.24,
+                  element.centerY <= screenSize.height * 0.90,
+                  element.width <= screenSize.width * 0.24,
+                  let value = CompactVisibleCountParser.parse(element.text) else { return nil }
+            return (element, value)
+        }.sorted { $0.element.centerY < $1.element.centerY }
+
+        // Common short-video feeds expose like/comment/(favorite)/share as a right-edge vertical
+        // numeric rail. We only infer semantics when the whole rail is structurally coherent;
+        // arbitrary naked numbers remain unclassified. This is normalized geometry, never a
+        // permanent screen coordinate or an authority to tap the icon itself.
+        guard rightRail.count == 3 || rightRail.count == 4 else { return nil }
+        let xValues = rightRail.map(\.element.centerX)
+        guard let minX = xValues.min(), let maxX = xValues.max(),
+              maxX - minX <= screenSize.width * 0.14 else { return nil }
+        for pair in zip(rightRail, rightRail.dropFirst()) {
+            let gap = pair.1.element.centerY - pair.0.element.centerY
+            guard gap >= screenSize.height * 0.035,
+                  gap <= screenSize.height * 0.18 else { return nil }
+        }
+        guard let first = rightRail.first, let last = rightRail.last,
+              last.element.centerY - first.element.centerY >= screenSize.height * 0.12 else { return nil }
+
+        let slot: Int
+        switch (metric, rightRail.count) {
+        case (.likeCount, _): slot = 0
+        case (.commentCount, _): slot = 1
+        case (.shareCount, 4): slot = 3
+        default: return nil
+        }
+        let selected = rightRail[slot]
+        let slotName: String
+        switch metric {
+        case .likeCount: slotName = "like"
+        case .commentCount: slotName = "comment"
+        case .shareCount: slotName = "share"
+        }
+        return LocalFeedMetricExtraction(
+            value: selected.value,
+            sourceText: selected.element.text,
+            confidence: selected.element.confidence * 0.72,
+            x: selected.element.centerX,
+            y: selected.element.centerY,
+            anchorText: "right_rail_\(rightRail.count)_slot_\(slotName)"
         )
     }
 

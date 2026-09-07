@@ -205,7 +205,7 @@ public struct DiagnosticReplayEvidence: Codable, Equatable, Sendable {
             "perceptionOCRInvoked", "perceptionOCRSucceeded", "perceptionOCRLatencyMS", "perceptionLocalSufficient",
             "perceptionRemoteVisionRequired", "perceptionFallbackReason", "providerVisualRoundTripAvoided",
             "sha256", "screenPointWidth", "screenPointHeight", "localVisionOCR", "localVisionElementCount",
-            "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion", "localVisionRecognitionLevel", "localVisionFallbackUsed",
+            "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion", "localVisionRecognitionLevel", "localVisionFallbackUsed", "localVisionBackend",
             "localVisionErrorDomain", "localVisionErrorCode", "localVisionPrimaryErrorDomain", "localVisionPrimaryErrorCode", "treeHash",
             "coordinateSafety", "providerImageRoute", "keyboardLikely", "focusStrategy", "textInputSafety", "cache", "idempotency",
             "routeSelectionLatencyMS", "executionLatencyMS", "totalLatencyMS"

@@ -1,6 +1,7 @@
 #import "RootHelperBridge.h"
 
 #import <dlfcn.h>
+#import <dispatch/dispatch.h>
 #import <errno.h>
 #import <fcntl.h>
 #import <poll.h>
@@ -224,11 +225,33 @@ static NSInteger CloudCodeSpawnHelperInternal(
                 double elapsed = CloudCodeMonotonicSeconds() - start;
                 if (elapsed >= timeout) {
                     (void)kill(pid, SIGKILL);
+                    // A helper can be wedged inside private AX IPC. A blocking waitpid after SIGKILL
+                    // made the nominal 3s AX deadline stretch past 15s on-device. Reap synchronously
+                    // only for a short bounded grace period; if the kernel has not released the child
+                    // yet, finish the user-facing timeout immediately and reap it off the caller path.
+                    BOOL reaped = NO;
+                    double reapDeadline = CloudCodeMonotonicSeconds() + 0.25;
                     do {
-                        waited = waitpid(pid, &status, 0);
-                    } while (waited == -1 && errno == EINTR);
+                        waited = waitpid(pid, &status, WNOHANG);
+                        if (waited == pid || (waited == -1 && errno == ECHILD)) {
+                            reaped = YES;
+                            break;
+                        }
+                        if (waited == -1 && errno != EINTR) { break; }
+                        usleep(10000);
+                    } while (CloudCodeMonotonicSeconds() < reapDeadline);
+                    if (!reaped) {
+                        pid_t timedOutPID = pid;
+                        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                            int reaperStatus = 0;
+                            pid_t reaperWaited = 0;
+                            do {
+                                reaperWaited = waitpid(timedOutPID, &reaperStatus, 0);
+                            } while (reaperWaited == -1 && errno == EINTR);
+                        });
+                    }
                     result = -7000 - ETIMEDOUT;
-                    diagnosticSuffix = [NSString stringWithFormat:@"helper timed out after %.1f seconds and was terminated", timeout];
+                    diagnosticSuffix = [NSString stringWithFormat:@"helper timed out after %.1f seconds and was terminated%@", timeout, reaped ? @"" : @"; process reap deferred"];
                     finished = YES;
                     break;
                 }

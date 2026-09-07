@@ -3,6 +3,7 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <UIKit/UIKit.h>
+#import <Vision/Vision.h>
 #import <dlfcn.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
@@ -1200,7 +1201,7 @@ static CloudCodeAXUIElementRef CloudCodeAXApplicationAtScreenPointRoot(CloudCode
 
 static NSDictionary *CloudCodeAXHitTestTree(CloudCodeAXRuntime runtime, NSUInteger *nodeCount, pid_t *pidOut, NSString **backend)
 {
-    if (!runtime.createSystemWide || !runtime.copyElementAtPosition || !runtime.getPid || !nodeCount) { return nil; }
+    if (!runtime.createSystemWide || !runtime.copyElementAtPosition || !nodeCount) { return nil; }
     CGSize size = CloudCodeScreenSize();
     if (size.width <= 1 || size.height <= 1) { return nil; }
 
@@ -1240,21 +1241,30 @@ static NSDictionary *CloudCodeAXHitTestTree(CloudCodeAXRuntime runtime, NSUInteg
 
         pid_t candidatePID = 0;
         CloudCodeAXError pidCode = -1;
-        @try { pidCode = runtime.getPid(candidate, &candidatePID); } @catch (__unused NSException *exception) { pidCode = -1; }
-        if (pidCode != 0 || candidatePID <= 0 || candidatePID == getpid()) {
-            CFRelease(candidate);
-            continue;
+        if (runtime.getPid) {
+            @try { pidCode = runtime.getPid(candidate, &candidatePID); } @catch (__unused NSException *exception) { pidCode = -1; }
         }
-        if (foregroundPID == 0) { foregroundPID = candidatePID; }
-        if (candidatePID != foregroundPID) {
-            CFRelease(candidate);
-            continue;
-        }
-        if (runtime.addAssociatedPid) {
-            runtime.addAssociatedPid(getpid(), candidatePID, 0);
-            runtime.addAssociatedPid(getpid(), candidatePID, 1);
-            runtime.addAssociatedPid(candidatePID, getpid(), 0);
-            runtime.addAssociatedPid(candidatePID, getpid(), 1);
+        // Detached TrollStore helpers can sometimes read the topmost AX element while PID lookup
+        // for that same element is denied/unavailable. PID is useful ownership evidence, but it
+        // must not erase otherwise readable system-wide hit-test semantics. When PID is known we
+        // still reject the helper itself and cross-PID mixing; when unknown, keep the node explicitly
+        // inside the sampled/unverified hit-test snapshot rather than pretending it is a full tree.
+        if (pidCode == 0 && candidatePID > 0) {
+            if (candidatePID == getpid()) {
+                CFRelease(candidate);
+                continue;
+            }
+            if (foregroundPID == 0) { foregroundPID = candidatePID; }
+            if (candidatePID != foregroundPID) {
+                CFRelease(candidate);
+                continue;
+            }
+            if (runtime.addAssociatedPid) {
+                runtime.addAssociatedPid(getpid(), candidatePID, 0);
+                runtime.addAssociatedPid(getpid(), candidatePID, 1);
+                runtime.addAssociatedPid(candidatePID, getpid(), 0);
+                runtime.addAssociatedPid(candidatePID, getpid(), 1);
+            }
         }
 
         NSDictionary *node = CloudCodeAXNode(runtime, candidate, 0, nodeCount);
@@ -1265,10 +1275,14 @@ static NSDictionary *CloudCodeAXHitTestTree(CloudCodeAXRuntime runtime, NSUInteg
         [hits addObject:annotated];
     }
     CFRelease(systemWide);
-    if (hits.count == 0 || foregroundPID <= 0) { return nil; }
+    if (hits.count == 0) { return nil; }
     if (pidOut) { *pidOut = foregroundPID; }
-    if (backend) { *backend = @"AXRuntime.systemWide.elementAtPosition"; }
-    return @{@"role": @"AXHitTestSnapshot", @"children": hits};
+    if (backend) { *backend = foregroundPID > 0 ? @"AXRuntime.systemWide.elementAtPosition" : @"AXRuntime.systemWide.elementAtPosition.pid-unavailable"; }
+    return @{
+        @"role": @"AXHitTestSnapshot",
+        @"scope": foregroundPID > 0 ? @"sampled-foreground-pid" : @"sampled-topmost-pid-unavailable",
+        @"children": hits
+    };
 }
 
 static NSData *CloudCodeFrontmostTreeData(void)
@@ -1354,7 +1368,7 @@ static NSData *CloudCodeFrontmostTreeData(void)
         }
     }
 
-    if (!root && (!rootNode || pid <= 0)) {
+    if (!root && !rootNode) {
         fprintf(stderr, "gui-tree: SpringBoardServices, AX focused-app, AX application-at-position, and AX element-at-position fallbacks all failed to produce readable foreground UI\n");
         return nil;
     }
@@ -1477,6 +1491,144 @@ int CloudCodeGUIScreenshotFile(NSString *path)
             fprintf(stderr, "gui-screenshot-file: write failed: %s\n", error.localizedDescription.UTF8String ?: "unknown");
             return 63;
         }
+        return 0;
+    }
+}
+
+int CloudCodeGUIOCRFile(NSString *path, NSUInteger maximumElements)
+{
+    @autoreleasepool {
+        CFAbsoluteTime startedAt = CFAbsoluteTimeGetCurrent();
+        NSString *normalized = [path isKindOfClass:NSString.class] ? path.stringByStandardizingPath : nil;
+        NSString *parent = normalized.stringByDeletingLastPathComponent;
+        NSString *filename = normalized.lastPathComponent;
+        BOOL appContainer = [normalized hasPrefix:@"/var/mobile/Containers/Data/Application/"]
+            || [normalized hasPrefix:@"/private/var/mobile/Containers/Data/Application/"];
+        BOOL boundedTempSource = appContainer
+            && [parent.lastPathComponent isEqualToString:@"tmp"]
+            && [filename hasPrefix:@"CloudCode-GUI-OCR-"]
+            && [[filename.pathExtension lowercaseString] isEqualToString:@"jpg"];
+        if (!boundedTempSource) {
+            fprintf(stderr, "gui-ocr-file: rejected input path outside the app tmp boundary\n");
+            return 71;
+        }
+
+        NSError *readError = nil;
+        NSData *jpeg = [NSData dataWithContentsOfFile:normalized options:NSDataReadingMappedIfSafe error:&readError];
+        if (!jpeg || jpeg.length == 0 || jpeg.length > CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES) {
+            fprintf(stderr, "gui-ocr-file: bounded JPEG read failed: %s\n", readError.localizedDescription.UTF8String ?: "invalid-or-oversized-input");
+            return 71;
+        }
+        UIImage *uiImage = [UIImage imageWithData:jpeg scale:1.0];
+        CGImageRef image = uiImage.CGImage;
+        if (!image) {
+            fprintf(stderr, "gui-ocr-file: JPEG could not be decoded to CGImage\n");
+            return 71;
+        }
+
+        size_t pixelWidth = MAX((size_t)1, CGImageGetWidth(image));
+        size_t pixelHeight = MAX((size_t)1, CGImageGetHeight(image));
+        NSUInteger boundedMaximum = MIN(MAX(maximumElements, (NSUInteger)1), (NSUInteger)48);
+
+        VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] init];
+        request.usesLanguageCorrection = NO;
+        request.minimumTextHeight = 0.009f;
+        NSString *recognitionLevelName = @"accurate";
+        NSError *languageError = nil;
+        request.recognitionLevel = VNRequestTextRecognitionLevelFast;
+        NSArray<NSString *> *fastLanguages = [request supportedRecognitionLanguagesAndReturnError:&languageError] ?: @[];
+        if ([fastLanguages containsObject:@"zh-Hans"]) {
+            recognitionLevelName = @"fast";
+            NSMutableArray<NSString *> *preferred = [NSMutableArray array];
+            for (NSString *language in @[@"zh-Hans", @"en-US"]) {
+                if ([fastLanguages containsObject:language]) { [preferred addObject:language]; }
+            }
+            if (preferred.count > 0) { request.recognitionLanguages = preferred; }
+        } else {
+            request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+            languageError = nil;
+            NSArray<NSString *> *accurateLanguages = [request supportedRecognitionLanguagesAndReturnError:&languageError] ?: @[];
+            NSMutableArray<NSString *> *preferred = [NSMutableArray array];
+            for (NSString *language in @[@"zh-Hans", @"en-US"]) {
+                if ([accurateLanguages containsObject:language]) { [preferred addObject:language]; }
+            }
+            if (preferred.count > 0) {
+                request.recognitionLanguages = preferred;
+            } else if (@available(iOS 16.0, *)) {
+                request.automaticallyDetectsLanguage = YES;
+            }
+        }
+
+        NSError *visionError = nil;
+        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithData:jpeg options:@{}];
+        BOOL performed = [handler performRequests:@[request] error:&visionError];
+        if (!performed || visionError) {
+            NSDictionary *failure = @{
+                @"status": @"unavailable_request_failed",
+                @"screenPointWidth": @(pixelWidth),
+                @"screenPointHeight": @(pixelHeight),
+                @"latencyMS": @((NSInteger)MAX(0.0, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000.0)),
+                @"recognitionLevel": recognitionLevelName,
+                @"backend": @"root_helper_vision",
+                @"errorDomain": visionError.domain ?: @"",
+                @"errorCode": @(visionError.code),
+                @"elements": @[]
+            };
+            NSData *failureData = [NSJSONSerialization dataWithJSONObject:failure options:0 error:nil];
+            if (!failureData) { return 71; }
+            CloudCodePrintData(failureData);
+            return 0;
+        }
+
+        NSMutableArray<NSDictionary *> *elements = [NSMutableArray arrayWithCapacity:boundedMaximum];
+        NSMutableArray<NSString *> *textParts = [NSMutableArray array];
+        NSUInteger textCharacters = 0;
+        for (VNRecognizedTextObservation *observation in request.results ?: @[]) {
+            if (elements.count >= boundedMaximum) { break; }
+            VNRecognizedText *candidate = [observation topCandidates:1].firstObject;
+            if (!candidate || candidate.confidence < 0.12f) { continue; }
+            NSString *cleaned = [[candidate.string stringByReplacingOccurrencesOfString:@"\n" withString:@" "]
+                stringByReplacingOccurrencesOfString:@"\r" withString:@" "];
+            cleaned = [cleaned stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if (cleaned.length == 0) { continue; }
+            NSString *text = cleaned.length > 120 ? [cleaned substringToIndex:120] : cleaned;
+            CGRect box = observation.boundingBox;
+            double x = box.origin.x * (double)pixelWidth;
+            double y = (1.0 - CGRectGetMaxY(box)) * (double)pixelHeight;
+            double width = box.size.width * (double)pixelWidth;
+            double height = box.size.height * (double)pixelHeight;
+            [elements addObject:@{
+                @"text": text,
+                @"confidence": @(round((double)candidate.confidence * 1000.0) / 1000.0),
+                @"x": @(round(x * 10.0) / 10.0),
+                @"y": @(round(y * 10.0) / 10.0),
+                @"width": @(round(width * 10.0) / 10.0),
+                @"height": @(round(height * 10.0) / 10.0)
+            }];
+            if (textCharacters < 4096) {
+                NSUInteger remaining = 4096 - textCharacters;
+                NSString *part = text.length > remaining ? [text substringToIndex:remaining] : text;
+                [textParts addObject:part];
+                textCharacters += part.length + 3;
+            }
+        }
+
+        NSDictionary *payload = @{
+            @"status": elements.count > 0 ? @"recognized" : @"available_empty",
+            @"screenPointWidth": @(pixelWidth),
+            @"screenPointHeight": @(pixelHeight),
+            @"latencyMS": @((NSInteger)MAX(0.0, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000.0)),
+            @"recognitionLevel": recognitionLevelName,
+            @"backend": @"root_helper_vision",
+            @"visibleText": [textParts componentsJoinedByString:@" | "],
+            @"elements": elements
+        };
+        NSData *output = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+        if (!output || output.length > (64 * 1024)) {
+            fprintf(stderr, "gui-ocr-file: OCR JSON exceeded bounded output limit\n");
+            return 71;
+        }
+        CloudCodePrintData(output);
         return 0;
     }
 }

@@ -159,6 +159,7 @@ enum EmbeddedRootHelper {
         case 68: meaning = "IOHID Unicode 文本输入后端不可用"
         case 69: meaning = "内嵌 root helper 协议/构建指纹不匹配"
         case 70: meaning = "文本输入事件已派发，但可读的聚焦输入框内容没有变化"
+        case 71: meaning = "隔离 helper 的本地 Vision OCR 输入或执行失败"
         case 73: meaning = "后台 assertion 目标进程不存在或无效"
         case 74: meaning = "后台 assertion worker 创建失败"
         case 75: meaning = "AssertionServices 拒绝或未建立后台保活 assertion"
@@ -452,6 +453,32 @@ enum EmbeddedRootHelper {
         }
         let routeDetail = result.diagnostic.isEmpty ? "" : " helper diagnostics: \(result.diagnostic)"
         return (data, "全局截图已通过独立 tmp JPEG 通道返回。\(routeDetail)")
+    }
+
+    static func guiOCR(jpegData: Data, maximumElements: Int) -> (json: String?, detail: String) {
+        guard embeddedHelperMatchesExpectedProtocol,
+              FileManager.default.isExecutableFile(atPath: executablePath),
+              GUIAutomationPayloadPolicy.isValidScreenshotJPEG(jpegData) else {
+            return (nil, "隔离 OCR helper 当前不可用或输入不是有效 bounded JPEG。")
+        }
+        let boundedMaximum = min(max(maximumElements, 1), 48)
+        let inputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CloudCode-GUI-OCR-\(UUID().uuidString).jpg", isDirectory: false)
+        guard FileManager.default.createFile(atPath: inputURL.path, contents: jpegData) else {
+            return (nil, "无法为隔离 OCR helper 创建受控 tmp JPEG。")
+        }
+        defer { try? FileManager.default.removeItem(at: inputURL) }
+        let result = runSeparated(
+            ["gui-ocr-file", inputURL.path, String(boundedMaximum)],
+            privilege: .root,
+            timeout: 4
+        )
+        guard result.code == 0, !result.stdout.isEmpty, result.stdout.utf8.count <= 64 * 1024 else {
+            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+            return (nil, failureDetail(prefix: "隔离本地 Vision OCR", code: result.code, diagnostic: diagnostic))
+        }
+        let diagnosticSuffix = result.stderr.isEmpty ? "" : " helper diagnostics: \(result.stderr)"
+        return (result.stdout, "本地 Vision OCR 已在隔离 root helper 内执行。\(diagnosticSuffix)")
     }
 
     static func guiTap(x: Double, y: Double) -> (success: Bool, detail: String) {
@@ -2140,6 +2167,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         var hashes: [String] = []
         var localVisionSamples: [[String: String]] = []
         var localElementSamples: [[LocalPerceptionTextElement]] = []
+        var localScreenSamples: [LocalPerceptionScreenSize] = []
         var sampledCount = 0
         var stoppedAtSample: Int?
         var totalOCRLatencyMS = 0
@@ -2153,18 +2181,22 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             }
             hashes.append(hash)
             sampledCount += 1
-            let observation = await LocalVisionTextObservation.observe(for: data, maximumElements: 16)
+            let observation = await LocalVisionTextObservation.observe(for: data, maximumElements: 32)
             let local = observation.payload
             localElementSamples.append(observation.elements)
+            let localWidth = Double(local["screenPointWidth"] ?? "") ?? 0
+            let localHeight = Double(local["screenPointHeight"] ?? "") ?? 0
+            localScreenSamples.append(LocalPerceptionScreenSize(width: localWidth, height: localHeight))
             totalOCRLatencyMS += Int(local["localVisionLatencyMS"] ?? "0") ?? 0
             if local["localVisionOCR"] == "recognized" { successfulOCRSamples += 1 }
             localVisionSamples.append([
                 "sample": String(sampledCount),
                 "status": local["localVisionOCR"] ?? "unavailable",
                 "text": String((local["localVisionText"] ?? "").prefix(1_600)),
-                "elements": String((local["localVisionElements"] ?? "[]").prefix(3_000)),
+                "elements": String((local["localVisionElements"] ?? "[]").prefix(6_000)),
                 "width": local["screenPointWidth"] ?? "",
-                "height": local["screenPointHeight"] ?? ""
+                "height": local["screenPointHeight"] ?? "",
+                "backend": local["localVisionBackend"] ?? "unknown"
             ])
             return hash
         }
@@ -2219,7 +2251,12 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
 
         var localMetricSelection: LocalFeedMetricSelectionResult?
         if completed, let metric = requestedMetric, let selection = requestedSelection {
-            localMetricSelection = LocalFeedMetricExtractor.select(metric: metric, selection: selection, samples: localElementSamples)
+            localMetricSelection = LocalFeedMetricExtractor.select(
+                metric: metric,
+                selection: selection,
+                samples: localElementSamples,
+                screenSizes: localScreenSamples
+            )
         }
         if let localMetricSelection {
             payload["localMetric"] = localMetricSelection.metric.rawValue
@@ -2255,9 +2292,17 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                     if let attachment = try persistScreenshotAttachment(returnedFrameData, sessionID: call.sessionID) {
                         attachments.append(attachment)
                     }
-                    let returnedObservation = await LocalVisionTextObservation.observe(for: returnedFrameData, maximumElements: 16)
+                    let returnedObservation = await LocalVisionTextObservation.observe(for: returnedFrameData, maximumElements: 32)
                     totalOCRLatencyMS += Int(returnedObservation.payload["localVisionLatencyMS"] ?? "0") ?? 0
-                    if let returnedMetric = LocalFeedMetricExtractor.extract(metric: localMetricSelection.metric, elements: returnedObservation.elements) {
+                    let returnedScreenSize = LocalPerceptionScreenSize(
+                        width: Double(returnedObservation.payload["screenPointWidth"] ?? "") ?? 0,
+                        height: Double(returnedObservation.payload["screenPointHeight"] ?? "") ?? 0
+                    )
+                    if let returnedMetric = LocalFeedMetricExtractor.extract(
+                        metric: localMetricSelection.metric,
+                        elements: returnedObservation.elements,
+                        screenSize: returnedScreenSize
+                    ) {
                         selectedReturnVerified = abs(returnedMetric.value - localMetricSelection.selectedValue) < 0.5
                     }
                 }

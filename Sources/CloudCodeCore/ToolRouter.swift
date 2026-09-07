@@ -957,7 +957,7 @@ public actor ToolRouter {
                 "perceptionLocalSufficient", "perceptionRemoteVisionRequired", "perceptionFallbackReason",
                 "providerVisualRoundTripAvoided", "sha256", "frameSHA256", "baselineSHA256", "treeSHA256", "treeHash",
                 "foregroundBundleID", "foregroundVerified", "appVersion", "effectVerification", "localObservation",
-                "localVisionOCR", "localVisionElementCount", "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion",
+                "localVisionOCR", "localVisionElementCount", "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion", "localVisionBackend",
                 "screenPointWidth", "screenPointHeight", "keyboardLikely", "focusStrategy", "textInputSafety",
                 "localMetric", "localMetricSelection", "localMetricSelectedSample",
                 "localMetricSelectedValue", "localMetricSelectedReturnVerified"
