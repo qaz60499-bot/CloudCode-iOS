@@ -23,17 +23,20 @@ public struct ToolExecutionContext: Sendable {
     public var capabilityProfile: CapabilityProfile
     public var allowedRoot: URL?
     public var currentUserRequest: String?
+    public var currentAppBundleID: String?
 
     public init(
         permissionMode: PermissionMode,
         capabilityProfile: CapabilityProfile,
         allowedRoot: URL? = nil,
-        currentUserRequest: String? = nil
+        currentUserRequest: String? = nil,
+        currentAppBundleID: String? = nil
     ) {
         self.permissionMode = permissionMode
         self.capabilityProfile = capabilityProfile
         self.allowedRoot = allowedRoot
         self.currentUserRequest = currentUserRequest
+        self.currentAppBundleID = currentAppBundleID
     }
 }
 
@@ -420,7 +423,7 @@ public actor ToolRegistry {
         ToolDescriptor(name: "gui.scroll", summary: "Scroll through the configured backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.swipe", summary: "Swipe through the configured backend using screen-point coordinates. duration is seconds (0.05–5.0; typically about 0.3).", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.swipeSequence", summary: "Execute an explicitly requested finite sequence of identical swipes locally using screen-point coordinates. duration is seconds (0.05–5.0; typically about 0.3). The bounded executor captures lightweight screenshots between gestures, stops early on byte-identical observations, and returns the final screenshot so the model does not need a full round-trip between every repeated swipe.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.feedSample", summary: "Sample 2–8 consecutive feed items locally in one bounded tool call. direction=forward means advance to later feed items and direction=backward means return toward earlier items; the model never chooses raw swipe coordinates. The executor captures the current item plus each locally advanced item and returns all current sample screenshots together, avoiding one provider round-trip per feed item.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.feedSample", summary: "Sample 2–8 consecutive feed items locally in one bounded tool call. direction=forward means advance to later feed items and direction=backward means return toward earlier items; the model never chooses raw swipe coordinates. Optional metric=likeCount/commentCount/shareCount plus selection=max/min asks the executor to parse anchored compact counts locally, compare them deterministically, and by default return to the selected sample. Only complete, unambiguous local metric evidence may suppress remote visual comparison; otherwise all sampled screenshots remain available as the fallback.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.navigateBack", summary: "Navigate back from a temporary iOS detail/media surface using one explicit bounded strategy: edge for a left-edge navigation-pop gesture, or dismissDown for a fullscreen/modal downward dismiss. The tool returns a fresh final screenshot; that screenshot, not motion/hash alone, must be inspected semantically before continuing.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.tapObserve", summary: "Execute one bounded tap and immediately capture a fresh screenshot locally. This is a one-write micro-plan; the returned image must be interpreted before any dependent write.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.typeObserve", summary: "Execute one bounded text-input action and immediately capture a fresh screenshot locally. This is a one-write micro-plan; do not send or perform another dependent write before interpreting the returned image.", risk: .sensitiveWrite, requiredCapabilities: [GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
@@ -441,9 +444,48 @@ public struct ExecutionPathMetric: Codable, Equatable, Sendable {
     public var executionLatencyMS: Int
     public var totalLatencyMS: Int
     public var outcome: String
+    public var appBundleID: String?
+    public var perceptionClass: String?
+    public var axAttempted: Bool?
+    public var axSucceeded: Bool?
+    public var axLatencyMS: Int?
+    public var anchorCacheHit: Bool?
+    public var ocrInvoked: Bool?
+    public var ocrSucceeded: Bool?
+    public var ocrLatencyMS: Int?
+    public var localObservationSufficient: Bool?
+    public var remoteVisionRequired: Bool?
+    public var perceptionFallbackReason: String?
+    public var providerVisualRoundTripAvoided: Int
+    public var finalVerificationPassed: Bool?
     public var recordedAt: Date
 
-    public init(tool: String, routeCandidates: [AppExecutionRoute], selectedRoute: AppExecutionRoute?, fallbackReason: String, fallbackDepth: Int, routeSelectionLatencyMS: Int, executionLatencyMS: Int, totalLatencyMS: Int, outcome: String, recordedAt: Date = Date()) {
+    public init(
+        tool: String,
+        routeCandidates: [AppExecutionRoute],
+        selectedRoute: AppExecutionRoute?,
+        fallbackReason: String,
+        fallbackDepth: Int,
+        routeSelectionLatencyMS: Int,
+        executionLatencyMS: Int,
+        totalLatencyMS: Int,
+        outcome: String,
+        appBundleID: String? = nil,
+        perceptionClass: String? = nil,
+        axAttempted: Bool? = nil,
+        axSucceeded: Bool? = nil,
+        axLatencyMS: Int? = nil,
+        anchorCacheHit: Bool? = nil,
+        ocrInvoked: Bool? = nil,
+        ocrSucceeded: Bool? = nil,
+        ocrLatencyMS: Int? = nil,
+        localObservationSufficient: Bool? = nil,
+        remoteVisionRequired: Bool? = nil,
+        perceptionFallbackReason: String? = nil,
+        providerVisualRoundTripAvoided: Int = 0,
+        finalVerificationPassed: Bool? = nil,
+        recordedAt: Date = Date()
+    ) {
         self.tool = tool
         self.routeCandidates = routeCandidates
         self.selectedRoute = selectedRoute
@@ -453,7 +495,125 @@ public struct ExecutionPathMetric: Codable, Equatable, Sendable {
         self.executionLatencyMS = executionLatencyMS
         self.totalLatencyMS = totalLatencyMS
         self.outcome = outcome
+        self.appBundleID = appBundleID
+        self.perceptionClass = perceptionClass
+        self.axAttempted = axAttempted
+        self.axSucceeded = axSucceeded
+        self.axLatencyMS = axLatencyMS
+        self.anchorCacheHit = anchorCacheHit
+        self.ocrInvoked = ocrInvoked
+        self.ocrSucceeded = ocrSucceeded
+        self.ocrLatencyMS = ocrLatencyMS
+        self.localObservationSufficient = localObservationSufficient
+        self.remoteVisionRequired = remoteVisionRequired
+        self.perceptionFallbackReason = perceptionFallbackReason
+        self.providerVisualRoundTripAvoided = max(0, providerVisualRoundTripAvoided)
+        self.finalVerificationPassed = finalVerificationPassed
         self.recordedAt = recordedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case tool
+        case routeCandidates
+        case selectedRoute
+        case fallbackReason
+        case fallbackDepth
+        case routeSelectionLatencyMS
+        case executionLatencyMS
+        case totalLatencyMS
+        case outcome
+        case appBundleID
+        case perceptionClass
+        case axAttempted
+        case axSucceeded
+        case axLatencyMS
+        case anchorCacheHit
+        case ocrInvoked
+        case ocrSucceeded
+        case ocrLatencyMS
+        case localObservationSufficient
+        case remoteVisionRequired
+        case perceptionFallbackReason
+        case providerVisualRoundTripAvoided
+        case finalVerificationPassed
+        case recordedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        tool = try container.decode(String.self, forKey: .tool)
+        routeCandidates = try container.decode([AppExecutionRoute].self, forKey: .routeCandidates)
+        selectedRoute = try container.decodeIfPresent(AppExecutionRoute.self, forKey: .selectedRoute)
+        fallbackReason = try container.decode(String.self, forKey: .fallbackReason)
+        fallbackDepth = try container.decode(Int.self, forKey: .fallbackDepth)
+        routeSelectionLatencyMS = try container.decode(Int.self, forKey: .routeSelectionLatencyMS)
+        executionLatencyMS = try container.decode(Int.self, forKey: .executionLatencyMS)
+        totalLatencyMS = try container.decode(Int.self, forKey: .totalLatencyMS)
+        outcome = try container.decode(String.self, forKey: .outcome)
+        appBundleID = try container.decodeIfPresent(String.self, forKey: .appBundleID)
+        perceptionClass = try container.decodeIfPresent(String.self, forKey: .perceptionClass)
+        axAttempted = try container.decodeIfPresent(Bool.self, forKey: .axAttempted)
+        axSucceeded = try container.decodeIfPresent(Bool.self, forKey: .axSucceeded)
+        axLatencyMS = try container.decodeIfPresent(Int.self, forKey: .axLatencyMS)
+        anchorCacheHit = try container.decodeIfPresent(Bool.self, forKey: .anchorCacheHit)
+        ocrInvoked = try container.decodeIfPresent(Bool.self, forKey: .ocrInvoked)
+        ocrSucceeded = try container.decodeIfPresent(Bool.self, forKey: .ocrSucceeded)
+        ocrLatencyMS = try container.decodeIfPresent(Int.self, forKey: .ocrLatencyMS)
+        localObservationSufficient = try container.decodeIfPresent(Bool.self, forKey: .localObservationSufficient)
+        remoteVisionRequired = try container.decodeIfPresent(Bool.self, forKey: .remoteVisionRequired)
+        perceptionFallbackReason = try container.decodeIfPresent(String.self, forKey: .perceptionFallbackReason)
+        providerVisualRoundTripAvoided = max(0, try container.decodeIfPresent(Int.self, forKey: .providerVisualRoundTripAvoided) ?? 0)
+        finalVerificationPassed = try container.decodeIfPresent(Bool.self, forKey: .finalVerificationPassed)
+        recordedAt = try container.decode(Date.self, forKey: .recordedAt)
+    }
+}
+
+public struct LocalPerceptionTelemetrySummary: Codable, Equatable, Sendable {
+    public var observationCount: Int
+    public var axAttemptCount: Int
+    public var axSuccessCount: Int
+    public var averageAXLatencyMS: Int
+    public var ocrInvocationCount: Int
+    public var ocrSuccessCount: Int
+    public var averageOCRLatencyMS: Int
+    public var anchorCacheHitCount: Int
+    public var localObservationSufficientCount: Int
+    public var remoteVisionFallbackCount: Int
+    public var providerVisualRoundTripsAvoided: Int
+    public var finalVerificationCount: Int
+    public var finalVerificationSuccessCount: Int
+    public var appCounts: [String: Int]
+    public var perceptionClassCounts: [String: Int]
+    public var fallbackReasonCounts: [String: Int]
+
+    public init(metrics: [ExecutionPathMetric]) {
+        let perception = metrics.filter {
+            $0.axAttempted != nil || $0.ocrInvoked != nil || $0.perceptionClass != nil || $0.localObservationSufficient != nil
+        }
+        observationCount = perception.count
+        axAttemptCount = perception.filter { $0.axAttempted == true }.count
+        axSuccessCount = perception.filter { $0.axSucceeded == true }.count
+        let axLatencies = perception.compactMap { $0.axAttempted == true ? $0.axLatencyMS : nil }
+        averageAXLatencyMS = axLatencies.isEmpty ? 0 : axLatencies.reduce(0, +) / axLatencies.count
+        ocrInvocationCount = perception.filter { $0.ocrInvoked == true }.count
+        ocrSuccessCount = perception.filter { $0.ocrSucceeded == true }.count
+        let ocrLatencies = perception.compactMap { $0.ocrInvoked == true ? $0.ocrLatencyMS : nil }
+        averageOCRLatencyMS = ocrLatencies.isEmpty ? 0 : ocrLatencies.reduce(0, +) / ocrLatencies.count
+        anchorCacheHitCount = perception.filter { $0.anchorCacheHit == true }.count
+        localObservationSufficientCount = perception.filter { $0.localObservationSufficient == true }.count
+        remoteVisionFallbackCount = perception.filter { $0.remoteVisionRequired == true }.count
+        providerVisualRoundTripsAvoided = perception.reduce(0) { $0 + $1.providerVisualRoundTripAvoided }
+        finalVerificationCount = perception.filter { $0.finalVerificationPassed != nil }.count
+        finalVerificationSuccessCount = perception.filter { $0.finalVerificationPassed == true }.count
+        appCounts = Self.count(perception.compactMap(\.appBundleID))
+        perceptionClassCounts = Self.count(perception.compactMap(\.perceptionClass))
+        fallbackReasonCounts = Self.count(perception.compactMap(\.perceptionFallbackReason))
+    }
+
+    private static func count(_ values: [String]) -> [String: Int] {
+        var result: [String: Int] = [:]
+        for value in values where !value.isEmpty { result[value, default: 0] += 1 }
+        return result
     }
 }
 
@@ -472,6 +632,10 @@ public actor ExecutionPathMetrics {
 
     public func recent(limit: Int = 100) -> [ExecutionPathMetric] {
         Array(values.suffix(min(max(limit, 1), maximumCount)))
+    }
+
+    public func localPerceptionSummary(limit: Int = 1_000) -> LocalPerceptionTelemetrySummary {
+        LocalPerceptionTelemetrySummary(metrics: recent(limit: limit))
     }
 }
 
@@ -507,6 +671,10 @@ public actor ToolRouter {
 
     public func recentExecutionPathMetrics(limit: Int = 100) async -> [ExecutionPathMetric] {
         await executionPathMetrics.recent(limit: limit)
+    }
+
+    public func localPerceptionTelemetrySummary(limit: Int = 1_000) async -> LocalPerceptionTelemetrySummary {
+        await executionPathMetrics.localPerceptionSummary(limit: limit)
     }
 
     /// Returns only tools that have a side-effect-free route decision for the current capability
@@ -659,12 +827,12 @@ public actor ToolRouter {
                         try await executor.execute(call, descriptor: descriptor, context: context)
                     }
                 }
-                await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, outcome: result.success ? "completed" : "failed")
-                try? await diagnosticLogger?.log(level: result.success ? .info : .warning, subsystem: "tool", action: call.name, result: result.success ? "completed" : "failed", sessionID: call.sessionID, toolCallID: call.id, diagnostic: result.summary, metadata: executionMetadata(decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: result.verification))
+                await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, outcome: result.success ? "completed" : "failed", context: context, result: result)
+                try? await diagnosticLogger?.log(level: result.success ? .info : .warning, subsystem: "tool", action: call.name, result: result.success ? "completed" : "failed", sessionID: call.sessionID, toolCallID: call.id, diagnostic: result.summary, metadata: executionMetadata(decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: result.verification, result: result))
                 return result
             } catch {
-                await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, outcome: "failed")
-                try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "failed", sessionID: call.sessionID, toolCallID: call.id, error: error, metadata: executionMetadata(decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: nil))
+                await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, outcome: "failed", context: context, result: nil)
+                try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "failed", sessionID: call.sessionID, toolCallID: call.id, error: error, metadata: executionMetadata(decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: nil, result: nil))
                 throw error
             }
         }
@@ -673,7 +841,7 @@ public actor ToolRouter {
             guard existing.call == call else { throw ToolExecutionLedgerError.idempotencyConflict(call.id) }
             let reusedAt = Date()
             let result = try await existing.task.value
-            await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: reusedAt, outcome: "inflight_reused")
+            await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: reusedAt, outcome: "inflight_reused", context: context, result: result)
             return result
         }
 
@@ -698,7 +866,7 @@ public actor ToolRouter {
         defer { inFlight.removeValue(forKey: call.id) }
         do {
             let result = try await task.value
-            await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, outcome: result.success ? "completed" : "failed")
+            await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, outcome: result.success ? "completed" : "failed", context: context, result: result)
             try? await diagnosticLogger?.log(
                 level: result.success ? .info : .warning,
                 subsystem: "tool",
@@ -707,12 +875,12 @@ public actor ToolRouter {
                 sessionID: call.sessionID,
                 toolCallID: call.id,
                 diagnostic: result.summary,
-                metadata: executionMetadata(decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: result.verification)
+                metadata: executionMetadata(decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: result.verification, result: result)
             )
             return result
         } catch {
-            await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, outcome: "failed")
-            try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "failed", sessionID: call.sessionID, toolCallID: call.id, error: error, metadata: executionMetadata(decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: nil))
+            await recordExecutionPath(call: call, decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, outcome: "failed", context: context, result: nil)
+            try? await diagnosticLogger?.log(level: .error, subsystem: "tool", action: call.name, result: "failed", sessionID: call.sessionID, toolCallID: call.id, error: error, metadata: executionMetadata(decision: decision, executionStartedAt: executionStartedAt, executorStartedAt: executorStartedAt, verification: nil, result: nil))
             throw error
         }
     }
@@ -722,11 +890,15 @@ public actor ToolRouter {
         decision: RouteDecision,
         executionStartedAt: Date,
         executorStartedAt: Date,
-        outcome: String
+        outcome: String,
+        context: ToolExecutionContext,
+        result: ToolResult?
     ) async {
         let now = Date()
         let executionMS = max(0, Int(now.timeIntervalSince(executorStartedAt) * 1_000))
         let totalMS = max(0, Int(now.timeIntervalSince(executionStartedAt) * 1_000))
+        let payload = result?.payload ?? [:]
+        let axAttempted = Self.payloadBool(payload["perceptionAXAttempted"])
         await executionPathMetrics.record(ExecutionPathMetric(
             tool: call.name,
             routeCandidates: decision.candidates,
@@ -736,7 +908,21 @@ public actor ToolRouter {
             routeSelectionLatencyMS: decision.latencyMS,
             executionLatencyMS: executionMS,
             totalLatencyMS: totalMS,
-            outcome: outcome
+            outcome: outcome,
+            appBundleID: context.currentAppBundleID ?? call.arguments["bundleId"],
+            perceptionClass: payload["perceptionClass"],
+            axAttempted: axAttempted,
+            axSucceeded: Self.payloadBool(payload["perceptionAXSucceeded"]),
+            axLatencyMS: axAttempted == true ? executionMS : nil,
+            anchorCacheHit: Self.payloadBool(payload["perceptionAnchorCacheHit"]),
+            ocrInvoked: Self.payloadBool(payload["perceptionOCRInvoked"]),
+            ocrSucceeded: Self.payloadBool(payload["perceptionOCRSucceeded"]),
+            ocrLatencyMS: payload["perceptionOCRLatencyMS"].flatMap(Int.init),
+            localObservationSufficient: Self.payloadBool(payload["perceptionLocalSufficient"]),
+            remoteVisionRequired: Self.payloadBool(payload["perceptionRemoteVisionRequired"]),
+            perceptionFallbackReason: payload["perceptionFallbackReason"],
+            providerVisualRoundTripAvoided: payload["providerVisualRoundTripAvoided"].flatMap(Int.init) ?? 0,
+            finalVerificationPassed: result?.verification?.passed ?? Self.payloadBool(payload["localMetricSelectedReturnVerified"])
         ))
     }
 
@@ -744,10 +930,11 @@ public actor ToolRouter {
         decision: RouteDecision,
         executionStartedAt: Date,
         executorStartedAt: Date,
-        verification: VerificationResult?
+        verification: VerificationResult?,
+        result: ToolResult?
     ) -> [String: String] {
         let now = Date()
-        return [
+        var metadata: [String: String] = [
             "route": decision.route.rawValue,
             "routeCandidates": decision.candidates.map(\.rawValue).joined(separator: ","),
             "fallbackReason": decision.fallbackReason,
@@ -757,6 +944,24 @@ public actor ToolRouter {
             "totalLatencyMS": String(max(0, Int(now.timeIntervalSince(executionStartedAt) * 1_000))),
             "verification": verification.map { $0.passed ? "passed" : "failed" } ?? "none"
         ]
+        if let payload = result?.payload {
+            for key in [
+                "perceptionClass", "perceptionAXAttempted", "perceptionAXSucceeded", "perceptionAnchorCacheHit",
+                "perceptionOCRInvoked", "perceptionOCRSucceeded", "perceptionOCRLatencyMS",
+                "perceptionLocalSufficient", "perceptionRemoteVisionRequired", "perceptionFallbackReason",
+                "providerVisualRoundTripAvoided"
+            ] where payload[key] != nil {
+                metadata[key] = payload[key]
+            }
+        }
+        return metadata
+    }
+
+    private static func payloadBool(_ value: String?) -> Bool? {
+        guard let value else { return nil }
+        if value == "true" { return true }
+        if value == "false" { return false }
+        return nil
     }
 
     private func routeOrder(preferred: AppExecutionRoute) -> [AppExecutionRoute] {

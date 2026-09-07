@@ -1679,6 +1679,20 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                   rawCount >= 2, rawCount <= 8 else {
                 throw ToolRouterError.noExecutionRoute("feedSample count must be an integer from 2 through 8")
             }
+            if let metric = call.arguments["metric"], !metric.isEmpty,
+               LocalFeedMetric(rawValue: metric) == nil {
+                throw ToolRouterError.noExecutionRoute("feedSample metric must be likeCount, commentCount, or shareCount")
+            }
+            if let selection = call.arguments["selection"], !selection.isEmpty,
+               LocalFeedMetricSelection(rawValue: selection) == nil {
+                throw ToolRouterError.noExecutionRoute("feedSample selection must be max or min")
+            }
+            if call.arguments["selection"] != nil, call.arguments["metric"] == nil {
+                throw ToolRouterError.noExecutionRoute("feedSample selection requires a metric")
+            }
+            if let returnToSelected = call.arguments["returnToSelected"], returnToSelected != "true", returnToSelected != "false" {
+                throw ToolRouterError.noExecutionRoute("feedSample returnToSelected must be boolean")
+            }
         case "gui.swipe", "gui.swipeSequence", "gui.swipeObserve":
             let keys = ["fromX", "fromY", "toX", "toY"]
             let coordinates = keys.compactMap { Double(call.arguments[$0] ?? "") }
@@ -1805,7 +1819,15 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             payload["effectVerification"] = "semantic_required"
             payload["localObservation"] = "final_screenshot_attached"
             payload["structuredPath"] = "accessibility_tree_element"
-            await enrichWithLocalVision(&payload, screenshot: data)
+            payload["perceptionClass"] = "ax_element_action"
+            payload["perceptionAXAttempted"] = "true"
+            payload["perceptionAXSucceeded"] = "true"
+            payload["perceptionOCRInvoked"] = "false"
+            payload["perceptionOCRSucceeded"] = "false"
+            payload["perceptionLocalSufficient"] = "false"
+            payload["perceptionRemoteVisionRequired"] = "true"
+            payload["perceptionFallbackReason"] = "ax_resolved_target_post_action_semantics_need_fresh_observation"
+            payload["providerVisualRoundTripAvoided"] = "0"
             return ToolResult(
                 toolCallID: call.id,
                 success: true,
@@ -1832,7 +1854,15 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             payload["localObservation"] = "final_screenshot_attached"
             payload["structuredPath"] = "accessibility_tree_element_input"
             payload["characters"] = String(call.arguments["text"]?.count ?? 0)
-            await enrichWithLocalVision(&payload, screenshot: data)
+            payload["perceptionClass"] = "ax_element_input"
+            payload["perceptionAXAttempted"] = "true"
+            payload["perceptionAXSucceeded"] = "true"
+            payload["perceptionOCRInvoked"] = "false"
+            payload["perceptionOCRSucceeded"] = "false"
+            payload["perceptionLocalSufficient"] = "false"
+            payload["perceptionRemoteVisionRequired"] = "true"
+            payload["perceptionFallbackReason"] = "ax_resolved_input_post_action_semantics_need_fresh_observation"
+            payload["providerVisualRoundTripAvoided"] = "0"
             return ToolResult(
                 toolCallID: call.id,
                 success: true,
@@ -1982,6 +2012,9 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
     private func executeFeedSample(_ call: ToolCall) async throws -> ToolResult {
         let count = Int(Double(call.arguments["count"] ?? "0") ?? 0)
         let direction = call.arguments["direction"] ?? "forward"
+        let requestedMetric = call.arguments["metric"].flatMap(LocalFeedMetric.init(rawValue:))
+        let requestedSelection = call.arguments["selection"].flatMap(LocalFeedMetricSelection.init(rawValue:))
+        let returnToSelected = call.arguments["returnToSelected"].map { $0 == "true" } ?? (requestedMetric != nil && requestedSelection != nil)
         // Keep physical finger direction private to the executor. The provider only reasons in
         // semantic feed order (forward/backward), avoiding the common Chinese "往下刷" vs
         // "手指向上滑" ambiguity. Positive scroll delta means advancing the scroll/feed content;
@@ -1992,8 +2025,11 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         var attachments: [ChatAttachment] = []
         var hashes: [String] = []
         var localVisionSamples: [[String: String]] = []
+        var localElementSamples: [[LocalPerceptionTextElement]] = []
         var sampledCount = 0
         var stoppedAtSample: Int?
+        var totalOCRLatencyMS = 0
+        var successfulOCRSamples = 0
 
         func captureSample() async throws -> String {
             let data = try await backend.screenshot()
@@ -2003,7 +2039,11 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             }
             hashes.append(hash)
             sampledCount += 1
-            let local = await LocalVisionTextObservation.payload(for: data, maximumElements: 12)
+            let observation = await LocalVisionTextObservation.observe(for: data, maximumElements: 16)
+            let local = observation.payload
+            localElementSamples.append(observation.elements)
+            totalOCRLatencyMS += Int(local["localVisionLatencyMS"] ?? "0") ?? 0
+            if local["localVisionOCR"] == "recognized" { successfulOCRSamples += 1 }
             localVisionSamples.append([
                 "sample": String(sampledCount),
                 "status": local["localVisionOCR"] ?? "unavailable",
@@ -2043,7 +2083,17 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             "sha256": hashes.last ?? baselineHash,
             "settleMs": "650",
             "effectVerification": "semantic_review_required",
-            "localObservation": "feed_samples_attached"
+            "localObservation": "feed_samples_attached",
+            "perceptionClass": "feed_sample",
+            "perceptionAXAttempted": "false",
+            "perceptionAXSucceeded": "false",
+            "perceptionOCRInvoked": "true",
+            "perceptionOCRSucceeded": successfulOCRSamples == sampledCount ? "true" : "false",
+            "perceptionOCRLatencyMS": String(totalOCRLatencyMS),
+            "perceptionLocalSufficient": "false",
+            "perceptionRemoteVisionRequired": "true",
+            "perceptionFallbackReason": requestedMetric == nil ? "no_local_metric_requested" : "local_metric_incomplete_or_ambiguous",
+            "providerVisualRoundTripAvoided": "0"
         ]
         if let stoppedAtSample { payload["stoppedAtSample"] = String(stoppedAtSample) }
         if let encoded = try? JSONSerialization.data(withJSONObject: localVisionSamples, options: []),
@@ -2052,12 +2102,82 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             payload["localVisionSamples"] = json
             payload["localVisionSampleCount"] = String(localVisionSamples.count)
         }
+
+        var localMetricSelection: LocalFeedMetricSelectionResult?
+        if completed, let metric = requestedMetric, let selection = requestedSelection {
+            localMetricSelection = LocalFeedMetricExtractor.select(metric: metric, selection: selection, samples: localElementSamples)
+        }
+        if let localMetricSelection {
+            payload["localMetric"] = localMetricSelection.metric.rawValue
+            payload["localMetricSelection"] = localMetricSelection.selection.rawValue
+            payload["localMetricValues"] = localMetricSelection.values.map { String(format: "%.6f", $0) }.joined(separator: ",")
+            payload["localMetricSelectedSample"] = String(localMetricSelection.selectedSample)
+            payload["localMetricSelectedValue"] = String(format: "%.6f", localMetricSelection.selectedValue)
+            payload["localMetricExtraction"] = "complete"
+
+            var selectedReturnVerified = localMetricSelection.selectedSample == sampledCount
+            if returnToSelected, localMetricSelection.selectedSample < sampledCount {
+                let returnSteps = sampledCount - localMetricSelection.selectedSample
+                var completedReturnSteps = 0
+                var returnHash = hashes.last ?? baselineHash
+                var returnedFrameData: Data?
+                for _ in 0..<returnSteps {
+                    try Task.checkCancellation()
+                    try await backend.scroll(deltaX: 0, deltaY: -deltaY)
+                    try await Task.sleep(nanoseconds: settleNanoseconds)
+                    try Task.checkCancellation()
+                    let frame = try await backend.screenshot()
+                    let currentHash = GUIAutomationPayloadPolicy.sha256Hex(frame)
+                    if currentHash == returnHash {
+                        returnedFrameData = frame
+                        break
+                    }
+                    completedReturnSteps += 1
+                    returnHash = currentHash
+                    returnedFrameData = frame
+                }
+                if completedReturnSteps == returnSteps, let returnedFrameData {
+                    payload["sha256"] = GUIAutomationPayloadPolicy.sha256Hex(returnedFrameData)
+                    if let attachment = try persistScreenshotAttachment(returnedFrameData, sessionID: call.sessionID) {
+                        attachments.append(attachment)
+                    }
+                    let returnedObservation = await LocalVisionTextObservation.observe(for: returnedFrameData, maximumElements: 16)
+                    totalOCRLatencyMS += Int(returnedObservation.payload["localVisionLatencyMS"] ?? "0") ?? 0
+                    if let returnedMetric = LocalFeedMetricExtractor.extract(metric: localMetricSelection.metric, elements: returnedObservation.elements) {
+                        selectedReturnVerified = abs(returnedMetric.value - localMetricSelection.selectedValue) < 0.5
+                    }
+                }
+                payload["localMetricReturnSteps"] = String(returnSteps)
+                payload["localMetricCompletedReturnSteps"] = String(completedReturnSteps)
+            }
+            payload["perceptionOCRLatencyMS"] = String(totalOCRLatencyMS)
+            payload["localMetricSelectedReturnVerified"] = selectedReturnVerified ? "true" : "false"
+            if !returnToSelected || selectedReturnVerified {
+                payload["perceptionLocalSufficient"] = "true"
+                payload["perceptionRemoteVisionRequired"] = "false"
+                payload["perceptionFallbackReason"] = "deterministic_local_metric_complete"
+                payload["providerVisualRoundTripAvoided"] = "1"
+                payload["effectVerification"] = returnToSelected ? "local_metric_selected_and_return_verified" : "local_metric_selection_complete"
+            } else {
+                payload["perceptionFallbackReason"] = "selected_item_return_unverified"
+            }
+        } else if requestedMetric != nil && requestedSelection != nil {
+            payload["localMetricExtraction"] = completed ? "incomplete_or_ambiguous" : "sequence_incomplete"
+        }
+
+        let localSufficient = payload["perceptionLocalSufficient"] == "true"
+        let summary: String
+        if localSufficient, let localMetricSelection {
+            summary = "Locally sampled \(sampledCount) feed items and deterministically selected sample \(localMetricSelection.selectedSample) by \(localMetricSelection.metric.rawValue) \(localMetricSelection.selection.rawValue); remote visual comparison is not required."
+        } else if completed {
+            summary = "Locally sampled \(sampledCount) consecutive feed items in one bounded execution; local metric evidence was insufficient or not requested, so sample screenshots remain available for one semantic review."
+        } else {
+            summary = "Local feed sampling stopped at sample \(sampledCount) because the next frame was byte-identical; collected screenshots remain available for re-planning."
+        }
         return ToolResult(
             toolCallID: call.id,
             success: true,
-            summary: completed
-                ? "Locally sampled \(sampledCount) consecutive feed items in one bounded execution; all sample screenshots are attached for one semantic review."
-                : "Local feed sampling stopped at sample \(sampledCount) because the next frame was byte-identical; collected screenshots are attached for re-planning.",
+            summary: summary,
             payload: payload,
             attachments: attachments
         )
@@ -2377,6 +2497,16 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             "path": match.path,
             "treeSHA256": treeHash,
             "cache": cacheHit ? "tree_signature_hit" : "tree_signature_miss",
+            "perceptionClass": "accessibility_element",
+            "perceptionAXAttempted": "true",
+            "perceptionAXSucceeded": "true",
+            "perceptionAnchorCacheHit": cacheHit ? "true" : "false",
+            "perceptionOCRInvoked": "false",
+            "perceptionOCRSucceeded": "false",
+            "perceptionLocalSufficient": "true",
+            "perceptionRemoteVisionRequired": "false",
+            "perceptionFallbackReason": cacheHit ? "validated_ax_cache_hit" : "fresh_ax_unique_match",
+            "providerVisualRoundTripAvoided": "1",
             "x": String(match.frame.x),
             "y": String(match.frame.y),
             "width": String(match.frame.width),
@@ -2415,6 +2545,16 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         for (key, value) in local {
             payload[key] = value
         }
+        payload["perceptionOCRInvoked"] = "true"
+        payload["perceptionOCRSucceeded"] = local["localVisionOCR"] == "recognized" ? "true" : "false"
+        payload["perceptionOCRLatencyMS"] = local["localVisionLatencyMS"] ?? "0"
+        if payload["perceptionAXAttempted"] == nil { payload["perceptionAXAttempted"] = "false" }
+        if payload["perceptionAXSucceeded"] == nil { payload["perceptionAXSucceeded"] = "false" }
+        if payload["perceptionAnchorCacheHit"] == nil { payload["perceptionAnchorCacheHit"] = "false" }
+        if payload["perceptionLocalSufficient"] == nil { payload["perceptionLocalSufficient"] = "false" }
+        if payload["perceptionRemoteVisionRequired"] == nil { payload["perceptionRemoteVisionRequired"] = "true" }
+        if payload["perceptionFallbackReason"] == nil { payload["perceptionFallbackReason"] = "local_ocr_observation_requires_task_semantic_review" }
+        if payload["providerVisualRoundTripAvoided"] == nil { payload["providerVisualRoundTripAvoided"] = "0" }
     }
 
     private func persistScreenshotAttachment(_ data: Data, sessionID: UUID) throws -> ChatAttachment? {

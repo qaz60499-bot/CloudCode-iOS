@@ -538,6 +538,157 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(target.contains("×5"))
     }
 
+    func testCompactVisibleCountParserHandlesCommonChineseAndEnglishCounts() {
+        XCTAssertEqual(CompactVisibleCountParser.parse("123"), 123)
+        XCTAssertEqual(CompactVisibleCountParser.parse("1.2万"), 12_000)
+        XCTAssertEqual(CompactVisibleCountParser.parse("12.3 万"), 123_000)
+        XCTAssertEqual(CompactVisibleCountParser.parse("1.1M"), 1_100_000)
+        XCTAssertEqual(CompactVisibleCountParser.parse("2.5K"), 2_500)
+        XCTAssertEqual(CompactVisibleCountParser.parse("1.2亿"), 120_000_000)
+        XCTAssertNil(CompactVisibleCountParser.parse("12:34"))
+        XCTAssertNil(CompactVisibleCountParser.parse("12 34"))
+    }
+
+    func testLocalFeedMetricExtractorRequiresCurrentFrameSemanticAnchorAndSelectsMaxLocally() throws {
+        func sample(_ value: String) -> [LocalPerceptionTextElement] {
+            [
+                LocalPerceptionTextElement(text: "点赞", confidence: 0.96, x: 300, y: 420, width: 34, height: 20),
+                LocalPerceptionTextElement(text: value, confidence: 0.94, x: 302, y: 446, width: 48, height: 20)
+            ]
+        }
+        let result = try XCTUnwrap(LocalFeedMetricExtractor.select(
+            metric: .likeCount,
+            selection: .max,
+            samples: [sample("123"), sample("1.2万"), sample("9800"), sample("1.1M"), sample("12.3万")]
+        ))
+        XCTAssertEqual(result.selectedSample, 4)
+        XCTAssertEqual(result.selectedValue, 1_100_000)
+        XCTAssertEqual(result.values, [123, 12_000, 9_800, 1_100_000, 123_000])
+
+        XCTAssertNil(LocalFeedMetricExtractor.extract(metric: .likeCount, elements: [
+            LocalPerceptionTextElement(text: "1.2万", confidence: 0.99, x: 300, y: 440, width: 50, height: 20)
+        ]), "A naked visible number must not be classified as a like count without a current-frame semantic anchor")
+    }
+
+    func testLocalFeedMetricExtractorFailsClosedOnAmbiguityAndEnforcesSampleBounds() throws {
+        let ambiguous = [
+            LocalPerceptionTextElement(text: "点赞", confidence: 0.98, x: 300, y: 420, width: 34, height: 20),
+            LocalPerceptionTextElement(text: "123", confidence: 0.96, x: 302, y: 446, width: 40, height: 20),
+            LocalPerceptionTextElement(text: "456", confidence: 0.96, x: 302, y: 448, width: 40, height: 20)
+        ]
+        XCTAssertNil(LocalFeedMetricExtractor.extract(metric: .likeCount, elements: ambiguous))
+
+        let low = [
+            LocalPerceptionTextElement(text: "点赞", confidence: 0.98, x: 300, y: 420, width: 34, height: 20),
+            LocalPerceptionTextElement(text: "123", confidence: 0.96, x: 302, y: 446, width: 40, height: 20)
+        ]
+        let high = [
+            LocalPerceptionTextElement(text: "点赞", confidence: 0.98, x: 300, y: 420, width: 34, height: 20),
+            LocalPerceptionTextElement(text: "1.2万", confidence: 0.96, x: 302, y: 446, width: 50, height: 20)
+        ]
+        let minimum = try XCTUnwrap(LocalFeedMetricExtractor.select(metric: .likeCount, selection: .min, samples: [high, low]))
+        XCTAssertEqual(minimum.selectedSample, 2)
+        XCTAssertEqual(minimum.selectedValue, 123)
+        XCTAssertNil(LocalFeedMetricExtractor.select(metric: .likeCount, selection: .max, samples: [low]))
+        XCTAssertNil(LocalFeedMetricExtractor.select(metric: .likeCount, selection: .max, samples: Array(repeating: low, count: 9)))
+    }
+
+    func testLocalPerceptionRoutingShortCircuitsOCRAndRemoteVisionOnlyWhenEvidenceIsSufficient() {
+        XCTAssertFalse(LocalPerceptionRoutingPolicy.shouldInvokeOCR(axObservationSufficient: true))
+        XCTAssertTrue(LocalPerceptionRoutingPolicy.shouldInvokeOCR(axObservationSufficient: false))
+        XCTAssertFalse(LocalPerceptionRoutingPolicy.shouldAttachRemoteVision(localObservationSufficient: true, remoteVisionRequired: false))
+        XCTAssertTrue(LocalPerceptionRoutingPolicy.shouldAttachRemoteVision(localObservationSufficient: false, remoteVisionRequired: true))
+        XCTAssertTrue(LocalPerceptionRoutingPolicy.shouldAttachRemoteVision(localObservationSufficient: true, remoteVisionRequired: true))
+    }
+
+    func testExecutionPathMetricsAggregatesLocalPerceptionWithoutObservationContent() async {
+        let metrics = ExecutionPathMetrics(maximumCount: 64)
+        await metrics.record(ExecutionPathMetric(
+            tool: "gui.findElement",
+            routeCandidates: [.guiFallback],
+            selectedRoute: .guiFallback,
+            fallbackReason: "first_candidate_supported",
+            fallbackDepth: 0,
+            routeSelectionLatencyMS: 1,
+            executionLatencyMS: 18,
+            totalLatencyMS: 19,
+            outcome: "completed",
+            appBundleID: "com.example.app",
+            perceptionClass: "accessibility_element",
+            axAttempted: true,
+            axSucceeded: true,
+            axLatencyMS: 18,
+            anchorCacheHit: true,
+            ocrInvoked: false,
+            ocrSucceeded: false,
+            localObservationSufficient: true,
+            remoteVisionRequired: false,
+            perceptionFallbackReason: "validated_ax_cache_hit",
+            providerVisualRoundTripAvoided: 1,
+            finalVerificationPassed: true
+        ))
+        await metrics.record(ExecutionPathMetric(
+            tool: "gui.feedSample",
+            routeCandidates: [.guiFallback],
+            selectedRoute: .guiFallback,
+            fallbackReason: "first_candidate_supported",
+            fallbackDepth: 0,
+            routeSelectionLatencyMS: 1,
+            executionLatencyMS: 90,
+            totalLatencyMS: 91,
+            outcome: "completed",
+            appBundleID: "com.example.app",
+            perceptionClass: "feed_sample",
+            axAttempted: false,
+            axSucceeded: false,
+            ocrInvoked: true,
+            ocrSucceeded: true,
+            ocrLatencyMS: 24,
+            localObservationSufficient: false,
+            remoteVisionRequired: true,
+            perceptionFallbackReason: "local_metric_incomplete_or_ambiguous"
+        ))
+        let summary = await metrics.localPerceptionSummary(limit: 1_000)
+        XCTAssertEqual(summary.observationCount, 2)
+        XCTAssertEqual(summary.axAttemptCount, 1)
+        XCTAssertEqual(summary.axSuccessCount, 1)
+        XCTAssertEqual(summary.averageAXLatencyMS, 18)
+        XCTAssertEqual(summary.ocrInvocationCount, 1)
+        XCTAssertEqual(summary.ocrSuccessCount, 1)
+        XCTAssertEqual(summary.averageOCRLatencyMS, 24)
+        XCTAssertEqual(summary.anchorCacheHitCount, 1)
+        XCTAssertEqual(summary.localObservationSufficientCount, 1)
+        XCTAssertEqual(summary.remoteVisionFallbackCount, 1)
+        XCTAssertEqual(summary.providerVisualRoundTripsAvoided, 1)
+        XCTAssertEqual(summary.appCounts["com.example.app"], 2)
+        XCTAssertEqual(summary.fallbackReasonCounts["local_metric_incomplete_or_ambiguous"], 1)
+    }
+
+    func testExecutionPathMetricDecodesLegacyPayloadWithoutPerceptionFields() throws {
+        let metric = ExecutionPathMetric(
+            tool: "gui.screenshot",
+            routeCandidates: [.guiFallback],
+            selectedRoute: .guiFallback,
+            fallbackReason: "first_candidate_supported",
+            fallbackDepth: 0,
+            routeSelectionLatencyMS: 1,
+            executionLatencyMS: 2,
+            totalLatencyMS: 3,
+            outcome: "completed",
+            recordedAt: Date(timeIntervalSinceReferenceDate: 123)
+        )
+        let encoded = try JSONEncoder().encode(metric)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "providerVisualRoundTripAvoided")
+        let legacy = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(ExecutionPathMetric.self, from: legacy)
+        XCTAssertEqual(decoded.tool, "gui.screenshot")
+        XCTAssertEqual(decoded.providerVisualRoundTripAvoided, 0)
+        XCTAssertNil(decoded.appBundleID)
+        XCTAssertNil(decoded.ocrInvoked)
+        XCTAssertNil(decoded.finalVerificationPassed)
+    }
+
     func testDefaultToolRegistryIncludesNavigateBackWithGestureAndScreenshotCapabilities() async {
         let registry = ToolRegistry()
         let descriptor = await registry.descriptor(named: "gui.navigateBack")
