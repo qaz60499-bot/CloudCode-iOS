@@ -1899,7 +1899,7 @@ final class ProviderProtocolClientTests: XCTestCase {
 
         XCTAssertNotNil(ProviderCompatibilityClassifier.agentRouterTransientStreamPendingDetail(unknown), "Within the AgentRouter HTTP-200/body/no-output guard, the opaque gateway sentinel is not protocol-incompatibility evidence.")
         XCTAssertNotNil(ProviderCompatibilityClassifier.agentRouterTransientStreamPendingDetail(wait))
-        XCTAssertNotNil(ProviderCompatibilityClassifier.agentRouterTransientStreamPendingDetail(.protocolIncompatible("Anthropic 流返回错误事件")))
+        XCTAssertNotNil(ProviderCompatibilityClassifier.agentRouterTransientStreamPendingDetail(ProviderError.protocolIncompatible("Anthropic 流返回错误事件")))
         XCTAssertNil(ProviderCompatibilityClassifier.agentRouterTransientStreamPendingDetail(hard))
 
         let pending = ProviderError.upstreamPending("Waiting for API response")
