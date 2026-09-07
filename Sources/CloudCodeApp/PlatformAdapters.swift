@@ -1639,7 +1639,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.tree", "gui.screenshot":
             break
         case "gui.focusComposerObserve":
-            guard Self.requestLooksLikeMessaging(context.currentUserRequest) else {
+            guard Self.requestLooksLikeMessaging(context.currentUserRequest ?? "") else {
                 throw ToolRouterError.noExecutionRoute("focusComposerObserve is available only for an explicit messaging/chat request")
             }
         case "gui.findElement", "gui.waitForElement", "gui.tapElementObserve", "gui.typeElementObserve", "gui.tapTextObserve":
