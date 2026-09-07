@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UIKit
 import CloudCodeCore
 #if canImport(Darwin)
 import Darwin
@@ -25,6 +26,23 @@ enum EmbeddedRootHelper {
     struct EnumerationPayload: Decodable {
         var backend: String
         var apps: [EnumeratedApp]
+    }
+
+    struct AppIntrospectionPayload: Decodable, Sendable {
+        var bundleID: String
+        var displayName: String
+        var version: String
+        var build: String
+        var bundlePath: String
+        var dataContainerPath: String
+        var executable: String
+        var urlSchemes: [String]
+        var documentTypes: [String]
+        var utTypes: [String]
+        var extensions: [String]
+        var frameworks: [String]
+        var appGroups: [String]
+        var localData: [String: String]
     }
 
     struct GUIProbePayload: Decodable {
@@ -146,6 +164,10 @@ enum EmbeddedRootHelper {
         case 75: meaning = "AssertionServices 拒绝或未建立后台保活 assertion"
         case 76: meaning = "后台 assertion worker 停止失败"
         case 77: meaning = "后台 assertion worker 已退出"
+        case 78: meaning = "App Info.plist 无法读取或 Bundle ID 不匹配"
+        case 79: meaning = "App introspection 输出无法安全序列化或超过上限"
+        case 80: meaning = "URL 已被系统接受，但目标 App 前台状态无法验证"
+        case 81: meaning = "URL 路由被系统拒绝"
         default: meaning = ""
         }
         let suffix = meaning.isEmpty ? "" : "（\(meaning)）"
@@ -174,6 +196,20 @@ enum EmbeddedRootHelper {
         return (nil, "\(executableName) 枚举输出无法解析；已按 fail-closed 处理。")
     }
 
+    static func appIntrospection(bundleID: String) -> (payload: AppIntrospectionPayload?, detail: String) {
+        let result = runSeparated(["app-introspect-json", bundleID], privilege: .root, timeout: 5)
+        guard result.code == 0 else {
+            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+            return (nil, failureDetail(prefix: "App introspection", code: result.code, diagnostic: diagnostic))
+        }
+        guard let data = result.stdout.data(using: .utf8), data.count <= 256 * 1024,
+              let payload = try? JSONDecoder().decode(AppIntrospectionPayload.self, from: data),
+              payload.bundleID == bundleID else {
+            return (nil, "App introspection 返回内容无法验证；已按 fail-closed 处理。")
+        }
+        return (payload, "已通过 bounded root helper 读取当前 App 静态 metadata；结果仅作为 discovery/performance hint。")
+    }
+
     static func launchCapability() -> RootHelperCapabilitySnapshot {
         let result = run(["probe-launch"], privilege: .isolatedUser, timeout: 4)
         if result.code == 0 {
@@ -200,6 +236,12 @@ enum EmbeddedRootHelper {
         default:
             return (nil, failureDetail(prefix: "helper 安装状态查询", code: result.code, diagnostic: result.diagnostic))
         }
+    }
+
+    static func verifyFrontmost(bundleID: String) -> (verified: Bool, detail: String) {
+        let result = run(["is-frontmost", bundleID], privilege: .root, timeout: 3)
+        if result.code == 0 { return (true, "root helper 已确认目标 App 成为前台。") }
+        return (false, failureDetail(prefix: "目标 App 前台验证", code: result.code, diagnostic: result.diagnostic))
     }
 
     static func launch(bundleID: String) -> LaunchOutcome {
@@ -475,7 +517,7 @@ enum EmbeddedRootHelper {
     }
 }
 
-public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, RootHelperCapabilityProviding, PrivilegedFilesystemCapabilityProviding, AppLifecycleCapabilityProviding {
+public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, RootHelperCapabilityProviding, PrivilegedFilesystemCapabilityProviding, AppLifecycleCapabilityProviding {
     private var cachedApps: [ResourceNode] = []
     private var bundlePaths: [String: String] = [:]
     private var containerPaths: [String: String] = [:]
@@ -488,6 +530,7 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
     private var uninstallDetail = "尚未检测 App 卸载后端。"
     private var pendingUninstallBundleID: String?
     private var cachedLaunchCapability: AppLifecycleCapabilitySnapshot?
+    private var cachedIntrospection: [String: AppStaticIntrospection] = [:]
     private let diagnosticLogger: DiagnosticLogStore?
 
     public init(diagnosticLogger: DiagnosticLogStore? = nil) {
@@ -525,6 +568,58 @@ public actor IOSAppResolver: AppContainerResolving, AppEnumerationCapabilityProv
 
     public func cachedDisplayName(for bundleID: String) -> String? {
         cachedApps.first(where: { $0.ownerBundleID == bundleID })?.displayName
+    }
+
+    public func appIntrospection(bundleID: String) async -> AppStaticIntrospection? {
+        let indexedVersion = cachedVersion(for: bundleID)
+        if let cached = cachedIntrospection[bundleID], indexedVersion == nil || cached.version == indexedVersion {
+            return cached
+        }
+        let result = EmbeddedRootHelper.appIntrospection(bundleID: bundleID)
+        guard let payload = result.payload else {
+            try? await diagnosticLogger?.log(
+                level: .warning,
+                subsystem: "app-introspection",
+                action: "metadata",
+                result: "unavailable",
+                diagnostic: result.detail,
+                metadata: ["bundleID": bundleID]
+            )
+            return nil
+        }
+        try? await diagnosticLogger?.log(
+            level: .info,
+            subsystem: "app-introspection",
+            action: "metadata",
+            result: "completed",
+            diagnostic: result.detail,
+            metadata: [
+                "bundleID": bundleID,
+                "urlSchemeCount": String(payload.urlSchemes.count),
+                "utiCount": String(payload.utTypes.count),
+                "extensionCount": String(payload.extensions.count),
+                "frameworkCount": String(payload.frameworks.count),
+                "localDataAliasCount": String(payload.localData.count)
+            ]
+        )
+        let introspection = AppStaticIntrospection(
+            bundleID: payload.bundleID,
+            displayName: payload.displayName,
+            version: payload.version,
+            build: payload.build,
+            bundlePath: payload.bundlePath,
+            dataContainerPath: payload.dataContainerPath,
+            executable: payload.executable,
+            urlSchemes: payload.urlSchemes,
+            documentTypes: payload.documentTypes,
+            utTypes: payload.utTypes,
+            extensions: payload.extensions,
+            frameworks: payload.frameworks,
+            appGroups: payload.appGroups,
+            localData: payload.localData
+        )
+        cachedIntrospection[bundleID] = introspection
+        return introspection
     }
 
     public func bundlePath(for bundleID: String) async -> String? {
@@ -1305,10 +1400,122 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
 
 public struct URLSchemeExecutor: ToolExecuting, Sendable {
     public let route: AppExecutionRoute = .urlScheme
-    public init() {}
-    public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool { false }
+    private let appKnowledgeRegistry: AppKnowledgeRegistry
+    private let policy: PolicyEngine
+    private let approval: ApprovalRequesting
+
+    public init(appKnowledgeRegistry: AppKnowledgeRegistry, policy: PolicyEngine, approval: ApprovalRequesting) {
+        self.appKnowledgeRegistry = appKnowledgeRegistry
+        self.policy = policy
+        self.approval = approval
+    }
+
+    public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
+        tool.name == "apps.openURL"
+    }
+
     public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
-        throw ToolRouterError.noExecutionRoute(call.name)
+        guard call.name == "apps.openURL" else { throw ToolRouterError.noExecutionRoute(call.name) }
+        guard let bundleID = call.arguments["bundleId"], Self.isValidBundleIdentifier(bundleID),
+              let rawURL = call.arguments["url"], rawURL.utf8.count <= 4_096,
+              let url = URL(string: rawURL), let scheme = url.scheme?.lowercased(), !scheme.isEmpty,
+              url.user == nil, url.password == nil else {
+            throw ToolRouterError.noExecutionRoute("apps.openURL requires a bounded URL without embedded credentials and a valid target bundleId")
+        }
+
+        let knowledge = await appKnowledgeRegistry.knowledge(for: bundleID)
+        let discoveredScheme = knowledge?.urlSchemes.contains(where: { $0.caseInsensitiveCompare(scheme) == .orderedSame }) == true
+        let exactUserProvided = context.currentUserRequest?.contains(rawURL) == true
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let rootSchemeOnly = discoveredScheme
+            && (components?.host?.isEmpty ?? true)
+            && (components?.path.isEmpty ?? true)
+            && components?.query == nil
+            && components?.fragment == nil
+        let sanitized = Self.sanitizedURLString(url)
+        let knownPage = components?.query == nil && components?.fragment == nil
+            && (knowledge?.knownPages.contains(where: { Self.sanitizedURLString(URL(string: $0)) == sanitized }) == true)
+        guard exactUserProvided || rootSchemeOnly || knownPage else {
+            throw ToolRouterError.noExecutionRoute("Deep link rejected: only an exact user-provided URL, a discovered root URL scheme, or a previously validated AppKnowledge page may execute. Provider-invented deep-link paths are not allowed.")
+        }
+
+        let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: sanitized)
+        if decision == .deny { throw TransactionError.confirmationDenied }
+        if decision == .requireConfirmation {
+            let preview = ApprovalPreview(
+                title: "打开 App 链接",
+                target: sanitized,
+                reason: "Deep link 会改变目标 App 的前台页面；只允许已发现/已验证或用户明确提供的 URL。",
+                plan: ["验证 URL 来源", "调用现有系统 URL 路由", "验证目标 App 成为前台", "目标页面语义仍由后续观察确认"],
+                risk: descriptor.risk
+            )
+            guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
+        }
+
+        let startedAt = Date()
+        let accepted = await Self.openSystemURL(url)
+        let foreground = accepted
+            ? EmbeddedRootHelper.verifyFrontmost(bundleID: bundleID)
+            : (verified: false, detail: "UIApplication.open rejected the URL")
+        let latencyMS = max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))
+        let environment = AppActionEnvironment(
+            appVersion: knowledge?.appVersion,
+            iOSMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
+            deviceClass: nil
+        )
+        try? await appKnowledgeRegistry.recordActionOutcome(
+            bundleID: bundleID,
+            semanticAction: "open_url",
+            route: .urlScheme,
+            environment: environment,
+            success: foreground.verified,
+            latencyMS: latencyMS
+        )
+        let verification = VerificationResult(
+            passed: foreground.verified,
+            checks: foreground.verified ? ["UIApplication.open 接受 URL", "目标 Bundle 已验证成为前台"] : (accepted ? ["UIApplication.open 接受 URL"] : []),
+            failures: foreground.verified ? [] : [foreground.detail]
+        )
+        return ToolResult(
+            toolCallID: call.id,
+            success: foreground.verified,
+            summary: foreground.verified
+                ? "URL 路由已打开目标 App；具体目标页面仍需新鲜观察确认"
+                : "URL 路由未能验证目标 App 前台：\(foreground.detail)",
+            payload: [
+                "bundleId": bundleID,
+                "url": sanitized,
+                "accepted": accepted ? "true" : "false",
+                "foregroundVerified": foreground.verified ? "true" : "false",
+                "effectVerification": foreground.verified ? "target_surface_observation_required" : "failed"
+            ],
+            verification: verification
+        )
+    }
+
+    private static func openSystemURL(_ url: URL) async -> Bool {
+        await withCheckedContinuation { continuation in
+            Task { @MainActor in
+                UIApplication.shared.open(url, options: [:]) { accepted in
+                    continuation.resume(returning: accepted)
+                }
+            }
+        }
+    }
+
+    private static func sanitizedURLString(_ url: URL?) -> String {
+        guard let url, var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return "" }
+        components.query = nil
+        components.fragment = nil
+        components.user = nil
+        components.password = nil
+        return components.string ?? ""
+    }
+
+    private static func isValidBundleIdentifier(_ value: String) -> Bool {
+        guard !value.isEmpty, value.count <= 255, value.contains(".") else { return false }
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: ".-"))
+        return value.unicodeScalars.allSatisfy { allowed.contains($0) }
     }
 }
 
@@ -1516,26 +1723,51 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         switch call.name {
         case "gui.openApp":
             guard let bundle = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
-            try await backend.openApp(bundleID: bundle)
-            return ToolResult(toolCallID: call.id, success: true, summary: "Opened app after target-foreground verification")
-        case "gui.openAppObserve":
-            guard let bundle = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
-            try await backend.openApp(bundleID: bundle)
-            try await Task.sleep(nanoseconds: 200_000_000)
-            try Task.checkCancellation()
-            let data = try await backend.screenshot()
-            let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
+            let outcome = call.arguments["_reuseVerifiedForeground"] == "true"
+                ? GUIOpenAppOutcome(accepted: true, foregroundVerified: true, detail: "current verified foreground reused")
+                : try await backend.openApp(bundleID: bundle)
             return ToolResult(
                 toolCallID: call.id,
                 success: true,
-                summary: "Target app became foreground and one fresh screenshot was captured locally for semantic planning.",
+                summary: outcome.foregroundVerified
+                    ? "App launch accepted and target foreground verified"
+                    : "App launch accepted; target foreground remains unverified",
                 payload: [
                     "bundleId": bundle,
-                    "byteCount": String(data.count),
-                    "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
-                    "effectVerification": "target_foreground_verified_screenshot_semantic_required",
-                    "localObservation": "final_screenshot_attached"
-                ],
+                    "foregroundVerified": outcome.foregroundVerified ? "true" : "false",
+                    "effectVerification": outcome.foregroundVerified ? "verified" : "screenshot_required"
+                ]
+            )
+        case "gui.openAppObserve":
+            guard let bundle = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
+            let reusedForeground = call.arguments["_reuseVerifiedForeground"] == "true"
+            let outcome = reusedForeground
+                ? GUIOpenAppOutcome(accepted: true, foregroundVerified: true, detail: "current verified foreground reused")
+                : try await backend.openApp(bundleID: bundle)
+            if !reusedForeground {
+                try await Task.sleep(nanoseconds: 200_000_000)
+            }
+            try Task.checkCancellation()
+            let data = try await backend.screenshot()
+            let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
+            var payload: [String: String] = [
+                "bundleId": bundle,
+                "byteCount": String(data.count),
+                "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
+                "foregroundVerified": outcome.foregroundVerified ? "true" : "false",
+                "effectVerification": outcome.foregroundVerified
+                    ? "target_foreground_verified_screenshot_semantic_required"
+                    : "launch_accepted_foreground_unverified_screenshot_semantic_required",
+                "localObservation": "final_screenshot_attached"
+            ]
+            await enrichWithLocalVision(&payload, screenshot: data)
+            return ToolResult(
+                toolCallID: call.id,
+                success: true,
+                summary: outcome.foregroundVerified
+                    ? "Target app became foreground and one fresh screenshot was captured locally for semantic planning."
+                    : "App launch was accepted but foreground identity was not independently verified; a fresh screenshot was captured for bounded visual re-planning.",
+                payload: payload,
                 attachments: attachment.map { [$0] }
             )
         case "gui.tree":
@@ -1573,6 +1805,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             payload["effectVerification"] = "semantic_required"
             payload["localObservation"] = "final_screenshot_attached"
             payload["structuredPath"] = "accessibility_tree_element"
+            await enrichWithLocalVision(&payload, screenshot: data)
             return ToolResult(
                 toolCallID: call.id,
                 success: true,
@@ -1599,6 +1832,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             payload["localObservation"] = "final_screenshot_attached"
             payload["structuredPath"] = "accessibility_tree_element_input"
             payload["characters"] = String(call.arguments["text"]?.count ?? 0)
+            await enrichWithLocalVision(&payload, screenshot: data)
             return ToolResult(
                 toolCallID: call.id,
                 success: true,
@@ -1611,14 +1845,16 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.screenshot":
             let data = try await backend.screenshot()
             let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
+            var payload: [String: String] = [
+                "byteCount": String(data.count),
+                "sha256": GUIAutomationPayloadPolicy.sha256Hex(data)
+            ]
+            await enrichWithLocalVision(&payload, screenshot: data)
             return ToolResult(
                 toolCallID: call.id,
                 success: true,
-                summary: "Screenshot captured",
-                payload: [
-                    "byteCount": String(data.count),
-                    "sha256": GUIAutomationPayloadPolicy.sha256Hex(data)
-                ],
+                summary: "Screenshot captured with bounded on-device text observation when available",
+                payload: payload,
                 attachments: attachment.map { [$0] }
             )
         case "gui.tap":
@@ -1646,17 +1882,19 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             try await backend.navigateBack(strategy: strategy)
             let data = try await backend.screenshot()
             let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
+            var payload: [String: String] = [
+                "baselineSHA256": baselineSHA256,
+                "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
+                "strategy": strategy,
+                "effectVerification": "semantic_required",
+                "localObservation": "final_screenshot_attached"
+            ]
+            await enrichWithLocalVision(&payload, screenshot: data)
             return ToolResult(
                 toolCallID: call.id,
                 success: true,
                 summary: "iOS back/dismiss gesture changed the foreground frame; final screenshot attached for semantic return verification.",
-                payload: [
-                    "baselineSHA256": baselineSHA256,
-                    "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
-                    "strategy": strategy,
-                    "effectVerification": "semantic_required",
-                    "localObservation": "final_screenshot_attached"
-                ],
+                payload: payload,
                 attachments: attachment.map { [$0] }
             )
         case "gui.verify":
@@ -1728,6 +1966,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         if let stoppedAtGesture {
             payload["stoppedAtGesture"] = String(stoppedAtGesture)
         }
+        await enrichWithLocalVision(&payload, screenshot: latestScreenshot)
         let summary = sequenceCompleted
             ? "Bounded swipe sequence dispatched \(dispatchedCount)/\(count); each local post-gesture frame changed. Final screenshot attached; semantic foreground outcome remains unverified."
             : "Bounded swipe sequence stopped after \(dispatchedCount)/\(count) gestures because the next local screenshot was byte-identical. Final screenshot attached for re-planning."
@@ -1752,6 +1991,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
 
         var attachments: [ChatAttachment] = []
         var hashes: [String] = []
+        var localVisionSamples: [[String: String]] = []
         var sampledCount = 0
         var stoppedAtSample: Int?
 
@@ -1763,6 +2003,15 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             }
             hashes.append(hash)
             sampledCount += 1
+            let local = await LocalVisionTextObservation.payload(for: data, maximumElements: 12)
+            localVisionSamples.append([
+                "sample": String(sampledCount),
+                "status": local["localVisionOCR"] ?? "unavailable",
+                "text": String((local["localVisionText"] ?? "").prefix(1_600)),
+                "elements": String((local["localVisionElements"] ?? "[]").prefix(3_000)),
+                "width": local["screenPointWidth"] ?? "",
+                "height": local["screenPointHeight"] ?? ""
+            ])
             return hash
         }
 
@@ -1797,6 +2046,12 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             "localObservation": "feed_samples_attached"
         ]
         if let stoppedAtSample { payload["stoppedAtSample"] = String(stoppedAtSample) }
+        if let encoded = try? JSONSerialization.data(withJSONObject: localVisionSamples, options: []),
+           encoded.count <= 48 * 1024,
+           let json = String(data: encoded, encoding: .utf8) {
+            payload["localVisionSamples"] = json
+            payload["localVisionSampleCount"] = String(localVisionSamples.count)
+        }
         return ToolResult(
             toolCallID: call.id,
             success: true,
@@ -1842,17 +2097,19 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         let observed = try await backend.screenshot()
         let observedSHA256 = GUIAutomationPayloadPolicy.sha256Hex(observed)
         let attachment = try persistScreenshotAttachment(observed, sessionID: call.sessionID)
+        var payload: [String: String] = [
+            "baselineSHA256": baselineSHA256,
+            "sha256": observedSHA256,
+            "screenChanged": observedSHA256 == baselineSHA256 ? "false" : "true",
+            "effectVerification": "semantic_required",
+            "localObservation": "final_screenshot_attached"
+        ]
+        await enrichWithLocalVision(&payload, screenshot: observed)
         return ToolResult(
             toolCallID: call.id,
             success: true,
             summary: "Bounded local action→observe micro-plan completed; final screenshot attached and semantic effect remains unverified.",
-            payload: [
-                "baselineSHA256": baselineSHA256,
-                "sha256": observedSHA256,
-                "screenChanged": observedSHA256 == baselineSHA256 ? "false" : "true",
-                "effectVerification": "semantic_required",
-                "localObservation": "final_screenshot_attached"
-            ],
+            payload: payload,
             attachments: attachment.map { [$0] }
         )
     }
@@ -1876,7 +2133,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 switch step.action {
                 case "openApp":
                     guard let bundleID = step.bundleId else { throw ToolRouterError.noExecutionRoute("openApp step missing bundleId") }
-                    try await backend.openApp(bundleID: bundleID)
+                    _ = try await backend.openApp(bundleID: bundleID)
                     stateChanges += 1
                 case "waitForElement":
                     let elementCall = Self.elementLookupCall(from: step, sessionID: call.sessionID, toolName: "gui.waitForElement")
@@ -1948,7 +2205,10 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 "replanRequired": "true",
                 "failure": String(describing: error)
             ]
-            if let screenshot { payload["sha256"] = GUIAutomationPayloadPolicy.sha256Hex(screenshot) }
+            if let screenshot {
+                payload["sha256"] = GUIAutomationPayloadPolicy.sha256Hex(screenshot)
+                await enrichWithLocalVision(&payload, screenshot: screenshot)
+            }
             return ToolResult(
                 toolCallID: call.id,
                 success: false,
@@ -1961,21 +2221,23 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         let screenshot = try await backend.screenshot()
         let attachment = try persistScreenshotAttachment(screenshot, sessionID: call.sessionID)
         let elapsedMS = max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))
+        var payload: [String: String] = [
+            "completedSteps": String(completedSteps),
+            "requestedSteps": String(plan.steps.count),
+            "stateChanges": String(stateChanges),
+            "elementCacheHits": String(elementCacheHits),
+            "localExecutionMS": String(elapsedMS),
+            "sha256": GUIAutomationPayloadPolicy.sha256Hex(screenshot),
+            "effectVerification": "local_structured_validators_passed_final_semantic_review_required",
+            "localObservation": "final_screenshot_attached",
+            "structuredPath": "local_plan"
+        ]
+        await enrichWithLocalVision(&payload, screenshot: screenshot)
         return ToolResult(
             toolCallID: call.id,
             success: true,
             summary: "Structured local plan completed \(completedSteps) steps with local validation; one final screenshot is attached for semantic completion review.",
-            payload: [
-                "completedSteps": String(completedSteps),
-                "requestedSteps": String(plan.steps.count),
-                "stateChanges": String(stateChanges),
-                "elementCacheHits": String(elementCacheHits),
-                "localExecutionMS": String(elapsedMS),
-                "sha256": GUIAutomationPayloadPolicy.sha256Hex(screenshot),
-                "effectVerification": "local_structured_validators_passed_final_semantic_review_required",
-                "localObservation": "final_screenshot_attached",
-                "structuredPath": "local_plan"
-            ],
+            payload: payload,
             attachments: attachment.map { [$0] }
         )
     }
@@ -2146,6 +2408,13 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             "发送", "提交", "发布", "删除", "移除", "购买", "支付", "结算", "确认订单", "卸载"
         ]
         return commitMarkers.contains(where: { haystack.contains($0) })
+    }
+
+    private func enrichWithLocalVision(_ payload: inout [String: String], screenshot: Data) async {
+        let local = await LocalVisionTextObservation.payload(for: screenshot)
+        for (key, value) in local {
+            payload[key] = value
+        }
     }
 
     private func persistScreenshotAttachment(_ data: Data, sessionID: UUID) throws -> ChatAttachment? {

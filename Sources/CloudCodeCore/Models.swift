@@ -133,6 +133,68 @@ public enum AppExecutionRoute: String, Codable, Sendable {
     case guiFallback
 }
 
+public struct AppActionEnvironment: Codable, Hashable, Sendable {
+    public var appVersion: String?
+    public var iOSMajorVersion: Int?
+    public var deviceClass: String?
+
+    public init(appVersion: String? = nil, iOSMajorVersion: Int? = nil, deviceClass: String? = nil) {
+        self.appVersion = appVersion
+        self.iOSMajorVersion = iOSMajorVersion
+        self.deviceClass = deviceClass
+    }
+
+    public func matches(_ other: AppActionEnvironment) -> Bool {
+        appVersion == other.appVersion
+            && iOSMajorVersion == other.iOSMajorVersion
+            && deviceClass == other.deviceClass
+    }
+}
+
+public struct AppActionRouteHint: Codable, Hashable, Sendable {
+    public var semanticAction: String
+    public var route: AppExecutionRoute
+    public var environment: AppActionEnvironment
+    public var reliability: Double
+    public var estimatedLatencyMS: Int
+    public var successCount: Int
+    public var failureCount: Int
+    public var lastValidatedAt: Date?
+    public var lastFailureAt: Date?
+
+    public init(
+        semanticAction: String,
+        route: AppExecutionRoute,
+        environment: AppActionEnvironment,
+        reliability: Double = 0.5,
+        estimatedLatencyMS: Int = 1_000,
+        successCount: Int = 0,
+        failureCount: Int = 0,
+        lastValidatedAt: Date? = nil,
+        lastFailureAt: Date? = nil
+    ) {
+        self.semanticAction = semanticAction
+        self.route = route
+        self.environment = environment
+        self.reliability = min(max(reliability, 0), 1)
+        self.estimatedLatencyMS = max(0, estimatedLatencyMS)
+        self.successCount = max(0, successCount)
+        self.failureCount = max(0, failureCount)
+        self.lastValidatedAt = lastValidatedAt
+        self.lastFailureAt = lastFailureAt
+    }
+}
+
+public struct AppActionCandidate: Sendable, Equatable {
+    public var hint: AppActionRouteHint
+    public var requiresRevalidation: Bool
+
+    public init(hint: AppActionRouteHint, requiresRevalidation: Bool) {
+        self.hint = hint
+        self.requiresRevalidation = requiresRevalidation
+    }
+}
+
 public struct AppKnowledge: Codable, Hashable, Identifiable, Sendable {
     public var id: String { bundleID }
     public var appName: String
@@ -145,6 +207,15 @@ public struct AppKnowledge: Codable, Hashable, Identifiable, Sendable {
     public var knownPages: [String]
     public var failureNotes: [String]
     public var appVersion: String?
+    /// Bounded, rebuildable static/runtime-discovery metadata. Values are intentionally scalar
+    /// summaries only; no credentials, screenshot contents, message bodies, or authority grants.
+    public var introspectionMetadata: [String: String]?
+    /// Semantic local-data aliases such as preferences/applicationSupport/documents/cache. Paths are
+    /// candidates only and must be re-resolved/revalidated against the live container before use.
+    public var localDataMap: [String: String]?
+    /// Rebuildable performance/discovery hints only. This intentionally has no coordinate,
+    /// credential, entitlement, message-body, or screenshot fields.
+    public var actionMap: [AppActionRouteHint]?
 
     public init(
         appName: String,
@@ -156,7 +227,10 @@ public struct AppKnowledge: Codable, Hashable, Identifiable, Sendable {
         estimatedCost: Double = 1,
         knownPages: [String] = [],
         failureNotes: [String] = [],
-        appVersion: String? = nil
+        appVersion: String? = nil,
+        introspectionMetadata: [String: String]? = nil,
+        localDataMap: [String: String]? = nil,
+        actionMap: [AppActionRouteHint]? = nil
     ) {
         self.appName = appName
         self.bundleID = bundleID
@@ -168,6 +242,9 @@ public struct AppKnowledge: Codable, Hashable, Identifiable, Sendable {
         self.knownPages = knownPages
         self.failureNotes = failureNotes
         self.appVersion = appVersion
+        self.introspectionMetadata = introspectionMetadata
+        self.localDataMap = localDataMap
+        self.actionMap = actionMap
     }
 }
 

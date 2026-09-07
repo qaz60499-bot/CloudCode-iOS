@@ -530,6 +530,37 @@ public protocol ProviderStreaming: Sendable {
     ) -> AsyncThrowingStream<ProviderEvent, Error>
 }
 
+private actor ProviderImageCompatibilityState {
+    static let shared = ProviderImageCompatibilityState()
+    private var textOnlyRoutes: [String: Date] = [:]
+    private let ttl: TimeInterval = 6 * 60 * 60
+
+    func isTextOnly(_ routeKey: String, now: Date = Date()) -> Bool {
+        prune(now: now)
+        return textOnlyRoutes[routeKey] != nil
+    }
+
+    func markTextOnly(_ routeKey: String, now: Date = Date()) {
+        prune(now: now)
+        textOnlyRoutes[routeKey] = now
+    }
+
+    private func prune(now: Date) {
+        textOnlyRoutes = textOnlyRoutes.filter { now.timeIntervalSince($0.value) <= ttl }
+    }
+}
+
+private func providerImageCompatibilityRouteKey(configuration: ProviderConfiguration, apiKey: String) -> String {
+    let keyDigest = SHA256.hash(data: Data(apiKey.utf8)).map { String(format: "%02x", $0) }.joined()
+    return [
+        configuration.providerID ?? "",
+        ProviderEndpointRoutingPolicy.normalizedRouteBase(configuration.baseURL),
+        configuration.protocolName ?? "",
+        configuration.model.lowercased(),
+        keyDigest
+    ].joined(separator: "|")
+}
+
 private protocol ProviderRequestBuilding {
     var session: URLSession { get }
     var retryPolicy: RetryPolicy { get }
@@ -554,6 +585,26 @@ private extension ProviderRequestBuilding {
                 var didDropReasoningEffortForCompatibility = false
                 var didCompactContextForGatewayRecovery = false
                 var didDropAgentRouterImagesForCompatibility = false
+                let imageCompatibilityRouteKey = providerImageCompatibilityRouteKey(configuration: configuration, apiKey: apiKey)
+                if configuration.providerID == ProviderCatalog.agentRouterID,
+                   messages.contains(where: { !$0.attachments.isEmpty }),
+                   await ProviderImageCompatibilityState.shared.isTextOnly(imageCompatibilityRouteKey) {
+                    requestMessages = ProviderCompatibilityClassifier.agentRouterTextOnlyMessages(from: messages)
+                    didDropAgentRouterImagesForCompatibility = true
+                    try? await diagnosticLogger?.log(
+                        level: .info,
+                        subsystem: "provider",
+                        action: "request.compatibility-cache",
+                        result: "agentrouter_text_only_route_hit",
+                        diagnostic: "This exact Key×Host×protocol×model route already rejected image content during the current process. Reusing bounded text-only compatibility without repeating the known 400; local GUI observation payload remains available.",
+                        metadata: [
+                            "providerID": configuration.providerID ?? "",
+                            "model": configuration.model,
+                            "protocol": configuration.protocolName ?? "",
+                            "host": configuration.baseURL.host ?? ""
+                        ]
+                    )
+                }
                 while attempt <= retryPolicy.maxAttempts {
                     var responseStarted = false
                     var successfulStreamEstablished = false
@@ -627,6 +678,7 @@ private extension ProviderRequestBuilding {
                                ) {
                                 didDropAgentRouterImagesForCompatibility = true
                                 requestMessages = ProviderCompatibilityClassifier.agentRouterTextOnlyMessages(from: requestMessages)
+                                await ProviderImageCompatibilityState.shared.markTextOnly(imageCompatibilityRouteKey)
                                 try? await diagnosticLogger?.log(
                                     level: .warning,
                                     subsystem: "provider",

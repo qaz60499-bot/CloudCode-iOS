@@ -153,6 +153,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let resourceResolver = ResourceResolver(appResolver: resolver)
         let fileService = FileService()
         let resourceIndex = ProgressiveResourceIndex(fileURL: support.appendingPathComponent("Index/resource-graph.json"))
+        let appKnowledge = AppKnowledgeRegistry(fileURL: support.appendingPathComponent("Index/app-knowledge.json"))
         let policy = PolicyEngine()
         let audit = AuditLogStore(fileURL: support.appendingPathComponent("Audit/audit.jsonl"))
         let trash = TrashService(root: support.appendingPathComponent("Trash", isDirectory: true))
@@ -174,7 +175,8 @@ public final class CloudCodeViewModel: ObservableObject {
             policy: policy,
             audit: audit,
             approval: approval,
-            resourceIndex: resourceIndex
+            resourceIndex: resourceIndex,
+            appKnowledgeRegistry: appKnowledge
         )
         let registry = ToolRegistry()
         let cli = IOSSystemExecutor(policy: policy, approval: approval)
@@ -187,7 +189,8 @@ public final class CloudCodeViewModel: ObservableObject {
         let interactionLearning = IOSInteractionLearningExecutor(experienceStore: interactionExperienceStore)
         let executionLedgerURL = support.appendingPathComponent("Execution/tool-results.json")
         let executionLedger = ToolExecutionLedger(fileURL: executionLedgerURL)
-        let router = ToolRouter(registry: registry, executors: [structured, interactionLearning, cli, privateApps, URLSchemeExecutor(), gui], executionLedger: executionLedger, diagnosticLogger: diagnosticLogStore)
+        let urlScheme = URLSchemeExecutor(appKnowledgeRegistry: appKnowledge, policy: policy, approval: approval)
+        let router = ToolRouter(registry: registry, executors: [structured, interactionLearning, cli, privateApps, urlScheme, gui], executionLedger: executionLedger, diagnosticLogger: diagnosticLogStore)
         let keyVault = KeychainAPIKeyVault()
         let sessions = SessionStore(root: support.appendingPathComponent("Sessions", isDirectory: true))
         let attachments = ChatAttachmentStore(root: attachmentRoot)
@@ -217,6 +220,7 @@ public final class CloudCodeViewModel: ObservableObject {
             steeringMailbox: steeringMailbox,
             memoryProvider: hermesStore,
             interactionExperienceStore: interactionExperienceStore,
+            appKnowledgeRegistry: appKnowledge,
             diagnosticLogger: diagnosticLogStore,
             runtimeBreadcrumb: { stage in
                 startupBreadcrumbStore.append(runID: resolvedStartupRunID, stage: stage)
@@ -284,7 +288,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.interactionExperienceStore = interactionExperienceStore
         self.agentCore = agent
         self.resourceIndex = resourceIndex
-        self.appKnowledge = AppKnowledgeRegistry(fileURL: support.appendingPathComponent("Index/app-knowledge.json"))
+        self.appKnowledge = appKnowledge
         self.customProviderFileURL = customProviderFileURL
         startupBreadcrumbStore.append(runID: resolvedStartupRunID, stage: "viewModel.init.end")
     }
@@ -1145,7 +1149,12 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func refreshAfterForeground() {
-        endBackgroundExecutionIfNeeded()
+        // Returning to the foreground ends UIKit's temporary background task, but an active
+        // Agent run must keep its detached privileged assertion worker alive. Stopping that worker
+        // here caused rapid acquire/stop churn whenever cross-app automation bounced through
+        // foreground/background scene transitions. finishSessionRun remains the authoritative
+        // place that tears the privileged worker down after the final active session finishes.
+        endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: runningSessionIDs.isEmpty)
         Task {
             try? await diagnosticLogStore.log(level: .info, subsystem: "app", action: "foreground", result: "entered", metadata: ["runningSessions": String(runningSessionIDs.count), "lifecycleInterruptedSessions": String(lifecycleInterruptedSessionIDs.count)])
             await settleLifecycleInterruptedRunsBeforeResume()

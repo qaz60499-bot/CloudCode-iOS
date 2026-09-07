@@ -125,6 +125,16 @@ public enum HarnessContextManager {
                 ]
             ))
         }
+        if requiresMessageSend(in: request) {
+            hints.append(ChatMessage(
+                role: .system,
+                content: "Harness execution hint: this is a messaging/contact task. Prefer deterministic local discovery before visual navigation when the target App exposes accessible container data: apps.inspect/container.resolve/container.search/data.localQuery/sqlite.* are read-only discovery aids for locating the contact/conversation and must never be used to forge a sent-message state by editing an App database. After the destination is resolved, use the cheapest verified App/private/deep-link/AX-text path and reserve screenshot GUI for the remaining state-dependent steps. A final send/commit is an external App action and still requires a real send control/private route plus fresh postcondition verification.",
+                providerMetadata: [
+                    "context_layer": "harness_execution",
+                    "execution_mode": "native_messaging_discovery"
+                ]
+            ))
+        }
         if transientNavigationNeedsReturn(in: request) {
             hints.append(ChatMessage(
                 role: .system,
@@ -256,9 +266,21 @@ public enum HarnessContextManager {
         let likelyNamedAppOpen = normalized.contains("打开") && [
             "微信", "抖音", "小红书", "浏览器", "设置", "相册", "照片", "视频", "app", "应用", "软件"
         ].contains(where: normalized.contains)
-        if likelyNamedAppOpen || guiMarkers.contains(where: normalized.contains) {
+        let isGUIRequest = likelyNamedAppOpen || guiMarkers.contains(where: normalized.contains)
+        if isGUIRequest {
             prefixes.formUnion(["apps.", "gui.", "interaction.", "capability."])
         }
+
+        // Messaging/contact requests often have useful deterministic data available in the target
+        // App container before any GUI action is needed. Keep this exposure deliberately read-only:
+        // native discovery may resolve a container, locate/index files, and inspect structured data,
+        // but it never grants permission to forge an App's outgoing message by editing its private
+        // database. The final state-changing send still belongs to a verified App/GUI/private bridge.
+        let messagingMarkers = ["微信", "wechat", "文件传输助手", "联系人", "群聊", "聊天", "发消息", "发送消息", "reply", "message", "chat"]
+        let messagingActions = ["找", "搜索", "发", "发送", "回复", "联系", "find", "search", "send", "reply"]
+        let shouldExposeNativeMessagingDiscovery = isGUIRequest
+            && messagingMarkers.contains(where: normalized.contains)
+            && messagingActions.contains(where: normalized.contains)
 
         let dataMarkers = [
             "读取文件", "删除文件", "复制文件", "移动文件", "搜索文件", "文件路径", "文件夹", "目录", "json", "plist", "sqlite", "数据库", "container"
@@ -274,7 +296,18 @@ public enum HarnessContextManager {
         }
 
         guard !prefixes.isEmpty else { return availableNames }
-        let scoped = Set(availableNames.filter { name in prefixes.contains(where: name.hasPrefix) })
+        var scoped = Set(availableNames.filter { name in prefixes.contains(where: name.hasPrefix) })
+        if shouldExposeNativeMessagingDiscovery {
+            let nativeReadOnlyDiscovery: Set<String> = [
+                "apps.inspect", "container.resolve", "container.list", "container.search",
+                "files.list", "files.search", "files.read", "files.stat", "files.metadata", "files.hash",
+                "plist.read", "plist.query", "plist.metadata",
+                "json.read", "json.query", "json.filter", "json.aggregate",
+                "sqlite.discover", "sqlite.tables", "sqlite.schema", "sqlite.query", "sqlite.filter", "sqlite.aggregate", "sqlite.sample",
+                "data.localQuery", "storage.analyze"
+            ]
+            scoped.formUnion(availableNames.intersection(nativeReadOnlyDiscovery))
+        }
         return scoped.isEmpty ? availableNames : scoped
     }
 

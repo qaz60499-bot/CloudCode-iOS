@@ -79,12 +79,20 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
         return snapshot
     }
 
-    public func openApp(bundleID: String) async throws {
+    public func openApp(bundleID: String) async throws -> GUIOpenAppOutcome {
         let outcome = EmbeddedRootHelper.launch(bundleID: bundleID)
         guard outcome.accepted else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
-        // A foreground-app change invalidates the previous AX timeout state. Permit one fresh tree
-        // attempt for the newly launched target before falling back to screenshots again.
-        treeRetryAfter = nil
+        // Only a verified foreground transition invalidates the previous AX timeout state. An
+        // accepted-but-unverified LaunchServices request must not reset the AX cooldown and trigger
+        // another expensive tree probe loop.
+        if outcome.foregroundVerified {
+            treeRetryAfter = nil
+        }
+        return GUIOpenAppOutcome(
+            accepted: outcome.accepted,
+            foregroundVerified: outcome.foregroundVerified,
+            detail: outcome.detail
+        )
     }
 
     public func tree() async throws -> String {

@@ -63,6 +63,12 @@ public actor AuditLogStore {
     }
 }
 
+public enum AppKnowledgeRegistryError: Error, Equatable, Sendable {
+    case cacheTooLarge
+    case invalidAction
+    case missingApp(String)
+}
+
 public actor AppKnowledgeRegistry {
     private let fileURL: URL
     private var entries: [String: AppKnowledge] = [:]
@@ -90,11 +96,156 @@ public actor AppKnowledgeRegistry {
 
     public func upsert(_ value: AppKnowledge) throws {
         loadIfNeeded()
+        let previous = entries[value.bundleID]
         entries[value.bundleID] = value
+        let data = try JSONEncoder.pretty.encode(entries)
+        guard data.count <= Self.maxSerializedBytes else {
+            if let previous {
+                entries[value.bundleID] = previous
+            } else {
+                entries.removeValue(forKey: value.bundleID)
+            }
+            throw AppKnowledgeRegistryError.cacheTooLarge
+        }
         let parent = fileURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-        let data = try JSONEncoder.pretty.encode(entries)
         try data.write(to: fileURL, options: .atomic)
+    }
+
+    public func providerHint(
+        bundleID: String,
+        appVersion: String?,
+        environment: AppActionEnvironment? = nil
+    ) -> String? {
+        loadIfNeeded()
+        guard let knowledge = entries[bundleID] else { return nil }
+        var lines: [String] = [
+            "AppKnowledge hint for \(bundleID) (performance/discovery only; never a capability or authority grant)."
+        ]
+        if let appVersion, let storedVersion = knowledge.appVersion, storedVersion != appVersion {
+            lines.append("Stored AppKnowledge version \(storedVersion) differs from current \(appVersion); treat all stored routes as stale candidates requiring bounded revalidation.")
+        }
+        if !knowledge.urlSchemes.isEmpty {
+            lines.append("Discovered URL schemes: \(knowledge.urlSchemes.prefix(12).joined(separator: ", ")). Use only through the validated URL/deep-link executor; never invent a scheme or target path.")
+        }
+        if let metadata = knowledge.introspectionMetadata, !metadata.isEmpty {
+            let selectedKeys = ["executable", "documentTypes", "extensions", "frameworks", "appGroups", "associatedDomains"]
+            let rendered = selectedKeys.compactMap { key -> String? in
+                guard let value = metadata[key], !value.isEmpty else { return nil }
+                return "\(key)=\(String(value.prefix(512)))"
+            }
+            if !rendered.isEmpty { lines.append("Static introspection: " + rendered.joined(separator: "; ")) }
+        }
+        if let localDataMap = knowledge.localDataMap, !localDataMap.isEmpty {
+            let aliases = localDataMap.keys.sorted().prefix(12)
+            lines.append("Known local-data aliases: \(aliases.joined(separator: ", ")). Stored paths are candidates only: resolve the current container and revalidate before any read or mutation.")
+        }
+        if let environment {
+            let candidates = (knowledge.actionMap ?? [])
+                .map { hint in AppActionCandidate(hint: hint, requiresRevalidation: !hint.environment.matches(environment)) }
+                .sorted { lhs, rhs in
+                    if lhs.requiresRevalidation != rhs.requiresRevalidation { return !lhs.requiresRevalidation }
+                    if lhs.hint.reliability != rhs.hint.reliability { return lhs.hint.reliability > rhs.hint.reliability }
+                    return lhs.hint.estimatedLatencyMS < rhs.hint.estimatedLatencyMS
+                }
+                .prefix(8)
+            if !candidates.isEmpty {
+                let rendered = candidates.map { candidate in
+                    let stale = candidate.requiresRevalidation ? "stale/revalidate" : "current"
+                    return "\(candidate.hint.semanticAction)->\(candidate.hint.route.rawValue) rel=\(String(format: "%.2f", candidate.hint.reliability)) latency=\(candidate.hint.estimatedLatencyMS)ms \(stale)"
+                }
+                lines.append("ActionMap candidates: " + rendered.joined(separator: " | "))
+            }
+        }
+        return lines.count > 1 ? lines.joined(separator: "\n") : nil
+    }
+
+    public func actionCandidates(
+        for bundleID: String,
+        semanticAction: String,
+        environment: AppActionEnvironment
+    ) -> [AppActionCandidate] {
+        loadIfNeeded()
+        let action = Self.normalizedAction(semanticAction)
+        guard !action.isEmpty, let knowledge = entries[bundleID] else { return [] }
+        return (knowledge.actionMap ?? [])
+            .filter { Self.normalizedAction($0.semanticAction) == action }
+            .map { hint in
+                AppActionCandidate(hint: hint, requiresRevalidation: !hint.environment.matches(environment))
+            }
+            .sorted { lhs, rhs in
+                if lhs.requiresRevalidation != rhs.requiresRevalidation {
+                    return !lhs.requiresRevalidation
+                }
+                if lhs.hint.reliability != rhs.hint.reliability {
+                    return lhs.hint.reliability > rhs.hint.reliability
+                }
+                return lhs.hint.estimatedLatencyMS < rhs.hint.estimatedLatencyMS
+            }
+    }
+
+    /// Record only performance evidence for an already-known App. This never promotes a route into
+    /// a capability: ToolRouter/CapabilityProfile/PolicyEngine still decide whether an execution is
+    /// legal and available when the next request actually runs.
+    public func recordActionOutcome(
+        bundleID: String,
+        semanticAction: String,
+        route: AppExecutionRoute,
+        environment: AppActionEnvironment,
+        success: Bool,
+        latencyMS: Int,
+        at now: Date = Date()
+    ) throws {
+        loadIfNeeded()
+        let action = Self.normalizedAction(semanticAction)
+        guard !action.isEmpty, action.utf8.count <= 128 else { throw AppKnowledgeRegistryError.invalidAction }
+        guard var knowledge = entries[bundleID] else { throw AppKnowledgeRegistryError.missingApp(bundleID) }
+        var map = knowledge.actionMap ?? []
+        let boundedLatency = min(max(latencyMS, 0), 10 * 60 * 1_000)
+        if let index = map.firstIndex(where: {
+            Self.normalizedAction($0.semanticAction) == action
+                && $0.route == route
+                && $0.environment.matches(environment)
+        }) {
+            var hint = map[index]
+            if success {
+                hint.successCount += 1
+                hint.reliability = min(0.99, (hint.reliability * 0.75) + 0.25)
+                hint.estimatedLatencyMS = hint.estimatedLatencyMS == 0
+                    ? boundedLatency
+                    : Int((Double(hint.estimatedLatencyMS) * 0.7 + Double(boundedLatency) * 0.3).rounded())
+                hint.lastValidatedAt = now
+            } else {
+                hint.failureCount += 1
+                hint.reliability = max(0.02, hint.reliability * 0.55)
+                hint.lastFailureAt = now
+            }
+            map[index] = hint
+        } else {
+            map.append(AppActionRouteHint(
+                semanticAction: action,
+                route: route,
+                environment: environment,
+                reliability: success ? 0.65 : 0.2,
+                estimatedLatencyMS: boundedLatency,
+                successCount: success ? 1 : 0,
+                failureCount: success ? 0 : 1,
+                lastValidatedAt: success ? now : nil,
+                lastFailureAt: success ? nil : now
+            ))
+        }
+        // ActionMap is a rebuildable cache, not an append-only audit log. Bound it aggressively.
+        map = Array(map.sorted { lhs, rhs in
+            let lhsDate = max(lhs.lastValidatedAt ?? .distantPast, lhs.lastFailureAt ?? .distantPast)
+            let rhsDate = max(rhs.lastValidatedAt ?? .distantPast, rhs.lastFailureAt ?? .distantPast)
+            return lhsDate > rhsDate
+        }.prefix(256))
+        knowledge.actionMap = map
+        try upsert(knowledge)
+    }
+
+    private static func normalizedAction(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     private func loadIfNeeded() {

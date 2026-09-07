@@ -368,6 +368,42 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertTrue(graph.nodes.contains(where: { $0.ownerBundleID == "com.example.app" }))
     }
 
+    func testLocalDataSemanticAliasRevalidatesAgainstCurrentContainerInsteadOfStoredUUIDPath() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let container = root.appendingPathComponent("CURRENT", isDirectory: true)
+        let preferences = container.appendingPathComponent("Library/Preferences", isDirectory: true)
+        try FileManager.default.createDirectory(at: preferences, withIntermediateDirectories: true)
+        let jsonURL = preferences.appendingPathComponent("settings.json")
+        try JSONSerialization.data(withJSONObject: ["enabled": true]).write(to: jsonURL)
+
+        let resolver = StaticAppResolver(containerPaths: ["com.example.app": container.path])
+        let resourceIndex = ProgressiveResourceIndex(fileURL: root.appendingPathComponent("index/resource-graph.json"))
+        let knowledge = AppKnowledgeRegistry(fileURL: root.appendingPathComponent("index/app-knowledge.json"))
+        try await knowledge.upsert(AppKnowledge(
+            appName: "Example",
+            bundleID: "com.example.app",
+            appVersion: "1.0",
+            localDataMap: ["preferences": "/var/mobile/Containers/Data/Application/STALE/Library/Preferences"]
+        ))
+        let executor = try makeStructuredExecutor(root: root, resolver: resolver, resourceIndex: resourceIndex, appKnowledgeRegistry: knowledge)
+        let descriptor = ToolDescriptor(name: "data.localQuery", summary: "", risk: .readOnly, requiredCapabilities: ["native.data_macro"])
+        let call = ToolCall(name: "data.localQuery", arguments: [
+            "bundleId": "com.example.app",
+            "semanticAlias": "preferences",
+            "format": "json",
+            "query": "settings.json",
+            "keyPath": "enabled"
+        ], sessionID: UUID())
+        let result = try await executor.execute(call, descriptor: descriptor, context: ToolExecutionContext(permissionMode: .safe, capabilityProfile: publicNativeProfile(), allowedRoot: root))
+        XCTAssertTrue(result.success)
+        XCTAssertTrue(result.summary.contains("lookup:semantic_alias"))
+        XCTAssertTrue(result.summary.contains("resolve:container_revalidated_alias"))
+        XCTAssertFalse(result.summary.contains("STALE"))
+        let graph = await resourceIndex.snapshot()
+        XCTAssertTrue(graph.nodes.contains(where: { $0.resolvedPath == jsonURL.path }))
+    }
+
     func testToolRouterProviderSchemaEligibilityOmitsUnavailableCapabilities() async throws {
         let registry = ToolRegistry(descriptors: [
             ToolDescriptor(name: "test.routable", summary: "", risk: .readOnly),
@@ -401,7 +437,7 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertEqual(metric.outcome, "completed")
     }
 
-    private func makeStructuredExecutor(root: URL, resolver: StaticAppResolver, resourceIndex: ProgressiveResourceIndex) throws -> StructuredToolExecutor {
+    private func makeStructuredExecutor(root: URL, resolver: StaticAppResolver, resourceIndex: ProgressiveResourceIndex, appKnowledgeRegistry: AppKnowledgeRegistry? = nil) throws -> StructuredToolExecutor {
         let policy = PolicyEngine()
         let audit = AuditLogStore(fileURL: root.appendingPathComponent("audit/audit.jsonl"))
         let journal = TransactionJournal(fileURL: root.appendingPathComponent("transactions/transactions.json"))
@@ -416,7 +452,8 @@ final class NativeDataServicesTests: XCTestCase {
             policy: policy,
             audit: audit,
             approval: FixedApprovalRequester(approved: true),
-            resourceIndex: resourceIndex
+            resourceIndex: resourceIndex,
+            appKnowledgeRegistry: appKnowledgeRegistry
         )
     }
 

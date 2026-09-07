@@ -128,6 +128,12 @@ static BOOL WaitForFrontmostApplication(NSString *bundleID, useconds_t timeoutMi
     return NO;
 }
 
+static int VerifyFrontmostApplication(NSString *bundleID)
+{
+    if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0 || bundleID.length > 255) { return 10; }
+    return WaitForFrontmostApplication(bundleID, 1200000) ? 0 : 80;
+}
+
 static void LoadBoardFramework(NSString *frameworkName)
 {
     if (frameworkName.length == 0) { return; }
@@ -624,6 +630,130 @@ static NSArray<NSString *> *PluginDataPaths(NSString *bundleID)
     return paths.copy;
 }
 
+static NSArray<NSString *> *CloudCodeBoundedStringArray(id value, NSUInteger limit)
+{
+    if (![value isKindOfClass:NSArray.class]) { return @[]; }
+    NSMutableOrderedSet<NSString *> *result = [NSMutableOrderedSet orderedSet];
+    for (id item in (NSArray *)value) {
+        if (result.count >= limit) { break; }
+        if ([item isKindOfClass:NSString.class] && [(NSString *)item length] > 0 && [(NSString *)item length] <= 512) {
+            [result addObject:item];
+        }
+    }
+    return result.array;
+}
+
+static int PrintAppIntrospectionJSON(NSString *bundleID)
+{
+    if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0 || bundleID.length > 255) { return 10; }
+    id proxy = ApplicationProxy(bundleID);
+    if (!proxy) { return 44; }
+    NSURL *bundleURL = SafeValue(proxy, @"bundleURL");
+    NSURL *dataURL = SafeValue(proxy, @"dataContainerURL");
+    NSString *bundlePath = [bundleURL isKindOfClass:NSURL.class] ? bundleURL.path : nil;
+    NSString *dataPath = [dataURL isKindOfClass:NSURL.class] ? dataURL.path : nil;
+    if (!IsSafeBundlePath(bundlePath)) { return 20; }
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"Info.plist"]];
+    if (![info isKindOfClass:NSDictionary.class]) { return 78; }
+    NSString *actualBundleID = [info[@"CFBundleIdentifier"] isKindOfClass:NSString.class] ? info[@"CFBundleIdentifier"] : nil;
+    if (![actualBundleID isEqualToString:bundleID]) { return 78; }
+
+    NSMutableOrderedSet<NSString *> *schemes = [NSMutableOrderedSet orderedSet];
+    for (id rawType in ([info[@"CFBundleURLTypes"] isKindOfClass:NSArray.class] ? info[@"CFBundleURLTypes"] : @[])) {
+        if (![rawType isKindOfClass:NSDictionary.class]) { continue; }
+        for (NSString *scheme in CloudCodeBoundedStringArray(rawType[@"CFBundleURLSchemes"], 32)) {
+            if (schemes.count >= 64) { break; }
+            [schemes addObject:scheme];
+        }
+    }
+
+    NSMutableOrderedSet<NSString *> *documentTypes = [NSMutableOrderedSet orderedSet];
+    for (id rawType in ([info[@"CFBundleDocumentTypes"] isKindOfClass:NSArray.class] ? info[@"CFBundleDocumentTypes"] : @[])) {
+        if (![rawType isKindOfClass:NSDictionary.class]) { continue; }
+        for (NSString *uti in CloudCodeBoundedStringArray(rawType[@"LSItemContentTypes"], 32)) {
+            if (documentTypes.count >= 64) { break; }
+            [documentTypes addObject:uti];
+        }
+    }
+
+    NSMutableOrderedSet<NSString *> *utTypes = [NSMutableOrderedSet orderedSetWithArray:documentTypes.array];
+    for (NSString *key in @[@"UTExportedTypeDeclarations", @"UTImportedTypeDeclarations"]) {
+        for (id rawDecl in ([info[key] isKindOfClass:NSArray.class] ? info[key] : @[])) {
+            if (![rawDecl isKindOfClass:NSDictionary.class]) { continue; }
+            NSString *identifier = [rawDecl[@"UTTypeIdentifier"] isKindOfClass:NSString.class] ? rawDecl[@"UTTypeIdentifier"] : nil;
+            if (identifier.length > 0 && identifier.length <= 512 && utTypes.count < 96) { [utTypes addObject:identifier]; }
+        }
+    }
+
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSMutableArray<NSString *> *extensions = [NSMutableArray array];
+    NSString *pluginsPath = [bundlePath stringByAppendingPathComponent:@"PlugIns"];
+    for (NSString *entry in ([fm contentsOfDirectoryAtPath:pluginsPath error:nil] ?: @[])) {
+        if (extensions.count >= 48) { break; }
+        if ([entry.pathExtension.lowercaseString isEqualToString:@"appex"]) { [extensions addObject:entry]; }
+    }
+    NSMutableArray<NSString *> *frameworks = [NSMutableArray array];
+    NSString *frameworksPath = [bundlePath stringByAppendingPathComponent:@"Frameworks"];
+    for (NSString *entry in ([fm contentsOfDirectoryAtPath:frameworksPath error:nil] ?: @[])) {
+        if (frameworks.count >= 64) { break; }
+        if ([entry.pathExtension.lowercaseString isEqualToString:@"framework"] || [entry.pathExtension.lowercaseString isEqualToString:@"dylib"]) {
+            [frameworks addObject:entry];
+        }
+    }
+
+    NSMutableOrderedSet<NSString *> *appGroups = [NSMutableOrderedSet orderedSet];
+    id rawGroups = SafeValue(proxy, @"groupContainerURLs");
+    if ([rawGroups isKindOfClass:NSDictionary.class]) {
+        for (id key in [(NSDictionary *)rawGroups allKeys]) {
+            if (appGroups.count >= 48) { break; }
+            if ([key isKindOfClass:NSString.class] && [(NSString *)key length] <= 512) { [appGroups addObject:key]; }
+        }
+    }
+
+    NSMutableDictionary<NSString *, NSString *> *localData = [NSMutableDictionary dictionary];
+    if (IsSafeDataPath(dataPath)) {
+        NSDictionary<NSString *, NSString *> *aliases = @{
+            @"preferences": [dataPath stringByAppendingPathComponent:@"Library/Preferences"],
+            @"applicationSupport": [dataPath stringByAppendingPathComponent:@"Library/Application Support"],
+            @"documents": [dataPath stringByAppendingPathComponent:@"Documents"],
+            @"cache": [dataPath stringByAppendingPathComponent:@"Library/Caches"]
+        };
+        [aliases enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *path, BOOL *stop) {
+            BOOL isDirectory = NO;
+            if ([fm fileExistsAtPath:path isDirectory:&isDirectory] && isDirectory && IsSafeDataPath(path)) { localData[key] = path; }
+        }];
+    }
+
+    NSString *displayName = [info[@"CFBundleDisplayName"] isKindOfClass:NSString.class] ? info[@"CFBundleDisplayName"] : nil;
+    if (displayName.length == 0 && [info[@"CFBundleName"] isKindOfClass:NSString.class]) { displayName = info[@"CFBundleName"]; }
+    NSString *version = [info[@"CFBundleShortVersionString"] isKindOfClass:NSString.class] ? info[@"CFBundleShortVersionString"] : @"";
+    NSString *build = [info[@"CFBundleVersion"] isKindOfClass:NSString.class] ? info[@"CFBundleVersion"] : @"";
+    NSString *executable = [info[@"CFBundleExecutable"] isKindOfClass:NSString.class] ? info[@"CFBundleExecutable"] : @"";
+
+    NSDictionary *payload = @{
+        @"bundleID": actualBundleID ?: @"",
+        @"displayName": displayName ?: bundleID,
+        @"version": version ?: @"",
+        @"build": build ?: @"",
+        @"bundlePath": bundlePath ?: @"",
+        @"dataContainerPath": IsSafeDataPath(dataPath) ? dataPath : @"",
+        @"executable": executable ?: @"",
+        @"urlSchemes": schemes.array ?: @[],
+        @"documentTypes": documentTypes.array ?: @[],
+        @"utTypes": utTypes.array ?: @[],
+        @"extensions": extensions ?: @[],
+        @"frameworks": frameworks ?: @[],
+        @"appGroups": appGroups.array ?: @[],
+        @"localData": localData ?: @{}
+    };
+    NSError *error = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
+    if (!data || error || data.length == 0 || data.length > (256 * 1024)) { return 79; }
+    fwrite(data.bytes, 1, data.length, stdout);
+    fputc('\n', stdout);
+    return 0;
+}
+
 static BOOL RemovePath(NSString *path, BOOL required)
 {
     if (path.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:path]) { return YES; }
@@ -1001,6 +1131,11 @@ int main(int argc, const char *argv[])
         if ([command isEqualToString:@"enumerate-json"]) {
             return PrintInstalledApplicationsJSON();
         }
+        if ([command isEqualToString:@"app-introspect-json"]) {
+            if (argc < 3) { return 10; }
+            NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
+            return PrintAppIntrospectionJSON(bundleID);
+        }
         if ([command isEqualToString:@"probe-launch"]) {
             return ProbeLaunchCapability();
         }
@@ -1018,6 +1153,11 @@ int main(int argc, const char *argv[])
             if (argc < 3) { return 10; }
             NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
             return LaunchApplication(bundleID);
+        }
+        if ([command isEqualToString:@"is-frontmost"]) {
+            if (argc < 3) { return 10; }
+            NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
+            return VerifyFrontmostApplication(bundleID);
         }
         if ([command isEqualToString:@"gui-probe-json"]) {
             return CloudCodeGUIProbeJSON();

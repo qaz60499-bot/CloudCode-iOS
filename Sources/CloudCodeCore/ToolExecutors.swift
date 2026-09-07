@@ -28,6 +28,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
     private let jsonService: NativeJSONService
     private let sqliteService: NativeSQLiteService
     private let resourceIndex: ProgressiveResourceIndex?
+    private let appKnowledgeRegistry: AppKnowledgeRegistry?
 
     public init(
         capabilityProbe: CapabilityProbing,
@@ -44,7 +45,8 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
         plistService: NativePropertyListService = NativePropertyListService(),
         jsonService: NativeJSONService = NativeJSONService(),
         sqliteService: NativeSQLiteService = NativeSQLiteService(),
-        resourceIndex: ProgressiveResourceIndex? = nil
+        resourceIndex: ProgressiveResourceIndex? = nil,
+        appKnowledgeRegistry: AppKnowledgeRegistry? = nil
     ) {
         self.capabilityProbe = capabilityProbe
         self.appResolver = appResolver
@@ -61,6 +63,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
         self.jsonService = jsonService
         self.sqliteService = sqliteService
         self.resourceIndex = resourceIndex
+        self.appKnowledgeRegistry = appKnowledgeRegistry
     }
 
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
@@ -144,7 +147,69 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             payload["bundleId"] = bundleID
             payload["bundlePath"] = node.resolvedPath ?? ""
             payload["dataContainer"] = dataContainer ?? ""
-            return try untrustedResult(call.id, summary: "已解析 \(bundleID)", key: "app", value: payload, source: "apps.inspect")
+
+            if let provider = appResolver as? any AppIntrospectionProviding,
+               let introspection = await provider.appIntrospection(bundleID: bundleID) {
+                payload["build"] = introspection.build
+                payload["executable"] = introspection.executable
+                payload["urlSchemes"] = introspection.urlSchemes.joined(separator: ",")
+                payload["documentTypes"] = introspection.documentTypes.joined(separator: ",")
+                payload["utTypes"] = introspection.utTypes.joined(separator: ",")
+                payload["extensions"] = introspection.extensions.joined(separator: ",")
+                payload["frameworks"] = introspection.frameworks.joined(separator: ",")
+                payload["appGroups"] = introspection.appGroups.joined(separator: ",")
+                payload["introspection"] = "bounded_cached"
+
+                var metadata: [String: String] = [
+                    "build": introspection.build,
+                    "executable": introspection.executable,
+                    "documentTypes": introspection.documentTypes.joined(separator: ","),
+                    "extensions": introspection.extensions.joined(separator: ","),
+                    "frameworks": introspection.frameworks.joined(separator: ","),
+                    "appGroups": introspection.appGroups.joined(separator: ",")
+                ]
+                metadata = metadata.filter { !$0.value.isEmpty }
+                if let existing = await appKnowledgeRegistry?.knowledge(for: bundleID) {
+                    var updated = existing
+                    updated.appName = introspection.displayName
+                    updated.appVersion = introspection.version
+                    updated.supportedUTTypes = introspection.utTypes
+                    updated.urlSchemes = introspection.urlSchemes
+                    updated.introspectionMetadata = metadata
+                    updated.localDataMap = introspection.localData
+                    try? await appKnowledgeRegistry?.upsert(updated)
+                } else if appKnowledgeRegistry != nil {
+                    let knowledge = AppKnowledge(
+                        appName: introspection.displayName,
+                        bundleID: bundleID,
+                        supportedUTTypes: introspection.utTypes,
+                        urlSchemes: introspection.urlSchemes,
+                        preferredRoutes: [.structuredTool, .privateFramework, .urlScheme, .guiFallback],
+                        successRate: 0.5,
+                        estimatedCost: 0.5,
+                        appVersion: introspection.version,
+                        introspectionMetadata: metadata,
+                        localDataMap: introspection.localData
+                    )
+                    try? await appKnowledgeRegistry?.upsert(knowledge)
+                }
+
+                if let resourceIndex {
+                    let localNodes = introspection.localData.map { alias, path in
+                        ResourceNode(
+                            id: ResourceID(URL(fileURLWithPath: path).absoluteString),
+                            kind: .directory,
+                            displayName: alias,
+                            logicalLocation: "appdata://\(bundleID)/\(alias)",
+                            resolvedPath: path,
+                            ownerBundleID: bundleID,
+                            metadata: ["semanticAlias": alias, "source": "app_introspection"]
+                        )
+                    }
+                    if !localNodes.isEmpty { try? await resourceIndex.add(localNodes, source: "app_introspection") }
+                }
+            }
+            return try untrustedResult(call.id, summary: "已解析 \(bundleID) 并按需更新 AppKnowledge", key: "app", value: payload, source: "apps.inspect")
 
         case "container.resolve":
             guard let bundleID = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
@@ -668,6 +733,16 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
         ISO8601DateFormatter().date(from: value)
     }
 
+    private static func semanticLocalDataRelativePath(_ alias: String) -> String? {
+        switch alias.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "preferences": return "Library/Preferences"
+        case "applicationsupport", "application_support": return "Library/Application Support"
+        case "documents": return "Documents"
+        case "cache", "caches": return "Library/Caches"
+        default: return nil
+        }
+    }
+
     private func containerResourceID(bundleID: String, relativePath: String?) -> ResourceID {
         var components = URLComponents()
         components.scheme = "container"
@@ -813,7 +888,22 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
         if let bundleID = call.arguments["bundleId"], !bundleID.isEmpty {
             ownerBundleID = bundleID
             let rootNode = try await resourceResolver.resolve(containerResourceID(bundleID: bundleID, relativePath: nil))
-            let node = try await resourceResolver.resolve(containerResourceID(bundleID: bundleID, relativePath: call.arguments["relativePath"]))
+            let resolvedRelativePath: String?
+            if let semanticAlias = call.arguments["semanticAlias"]?.trimmingCharacters(in: .whitespacesAndNewlines), !semanticAlias.isEmpty {
+                guard call.arguments["relativePath"] == nil else {
+                    throw ToolRouterError.noExecutionRoute("data.localQuery accepts semanticAlias or relativePath, not both")
+                }
+                guard let knowledge = await appKnowledgeRegistry?.knowledge(for: bundleID),
+                      knowledge.localDataMap?[semanticAlias] != nil,
+                      let relative = Self.semanticLocalDataRelativePath(semanticAlias) else {
+                    throw ToolRouterError.noExecutionRoute("semantic local-data alias is unknown or stale; run apps.inspect to refresh AppKnowledge first")
+                }
+                resolvedRelativePath = relative
+                stages.append("lookup:semantic_alias")
+            } else {
+                resolvedRelativePath = call.arguments["relativePath"]
+            }
+            let node = try await resourceResolver.resolve(containerResourceID(bundleID: bundleID, relativePath: resolvedRelativePath))
             guard let rootPath = rootNode.resolvedPath, let resolvedPath = node.resolvedPath else { throw ToolRouterError.noExecutionRoute("container path unavailable") }
             let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true)
             target = URL(fileURLWithPath: resolvedPath)
@@ -821,7 +911,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             executionAllowedRoot = rootURL
             try? await resourceIndex?.add(rootNode)
             try? await resourceIndex?.add(node)
-            stages.append("resolve:container")
+            stages.append(call.arguments["semanticAlias"] == nil ? "resolve:container" : "resolve:container_revalidated_alias")
         } else {
             target = try requiredURL(call, key: "path")
             stages.append("resolve:path")

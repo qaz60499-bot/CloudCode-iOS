@@ -4311,6 +4311,79 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertNil(hint)
     }
 
+    func testAppKnowledgeActionMapPartitionsVersionsAndDecaysFailedRoutes() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent("app-knowledge.json")
+        let registry = AppKnowledgeRegistry(fileURL: fileURL)
+        try await registry.upsert(AppKnowledge(
+            appName: "Chat",
+            bundleID: "com.example.chat",
+            urlSchemes: ["examplechat"],
+            preferredRoutes: [.structuredTool, .urlScheme, .guiFallback],
+            appVersion: "1.0",
+            introspectionMetadata: ["executable": "Chat", "extensions": "Share.appex"],
+            localDataMap: ["preferences": "/var/mobile/Containers/Data/Application/OLD/Library/Preferences"]
+        ))
+        let v1 = AppActionEnvironment(appVersion: "1.0", iOSMajorVersion: 18, deviceClass: "iphone")
+        try await registry.recordActionOutcome(bundleID: "com.example.chat", semanticAction: "open_chat", route: .urlScheme, environment: v1, success: true, latencyMS: 120)
+        try await registry.recordActionOutcome(bundleID: "com.example.chat", semanticAction: "open_chat", route: .urlScheme, environment: v1, success: true, latencyMS: 80)
+        let current = await registry.actionCandidates(for: "com.example.chat", semanticAction: "open_chat", environment: v1)
+        XCTAssertEqual(current.count, 1)
+        XCTAssertFalse(current[0].requiresRevalidation)
+        let reliabilityBeforeFailure = current[0].hint.reliability
+
+        let v2 = AppActionEnvironment(appVersion: "2.0", iOSMajorVersion: 18, deviceClass: "iphone")
+        let stale = await registry.actionCandidates(for: "com.example.chat", semanticAction: "open_chat", environment: v2)
+        XCTAssertEqual(stale.count, 1)
+        XCTAssertTrue(stale[0].requiresRevalidation)
+
+        try await registry.recordActionOutcome(bundleID: "com.example.chat", semanticAction: "open_chat", route: .urlScheme, environment: v1, success: false, latencyMS: 140)
+        let decayed = await registry.actionCandidates(for: "com.example.chat", semanticAction: "open_chat", environment: v1)
+        XCTAssertLessThan(decayed[0].hint.reliability, reliabilityBeforeFailure)
+
+        let restarted = AppKnowledgeRegistry(fileURL: fileURL)
+        let persisted = await restarted.knowledge(for: "com.example.chat")
+        XCTAssertEqual(persisted?.urlSchemes, ["examplechat"])
+        XCTAssertEqual(persisted?.localDataMap?["preferences"], "/var/mobile/Containers/Data/Application/OLD/Library/Preferences")
+        let hint = await restarted.providerHint(bundleID: "com.example.chat", appVersion: "2.0", environment: v2)
+        XCTAssertTrue(hint?.contains("requiring bounded revalidation") == true)
+        XCTAssertTrue(hint?.contains("examplechat") == true)
+    }
+
+    func testAppKnowledgeOversizedCacheFailsSafeOnReload() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent("app-knowledge.json")
+        try Data(repeating: 0x41, count: 8 * 1024 * 1024 + 1).write(to: fileURL)
+        let registry = AppKnowledgeRegistry(fileURL: fileURL)
+        let values = await registry.all()
+        XCTAssertTrue(values.isEmpty)
+    }
+
+    func testHarnessMessagingScopeExposesReadOnlyNativeDiscoveryWithoutWriteTools() {
+        let available: Set<String> = [
+            "apps.launch", "apps.inspect", "gui.screenshot", "gui.typeObserve", "capability.probe",
+            "container.resolve", "container.search", "files.search", "files.modify", "sqlite.query", "data.localQuery", "advanced.shell"
+        ]
+        let scoped = HarnessContextManager.scopedProviderToolNames(for: "打开微信找到文件传输助手并发消息", availableNames: available)
+        XCTAssertTrue(scoped.contains("container.resolve"))
+        XCTAssertTrue(scoped.contains("container.search"))
+        XCTAssertTrue(scoped.contains("files.search"))
+        XCTAssertTrue(scoped.contains("sqlite.query"))
+        XCTAssertTrue(scoped.contains("data.localQuery"))
+        XCTAssertFalse(scoped.contains("files.modify"), "messaging discovery must not gain arbitrary database/file write authority")
+        XCTAssertFalse(scoped.contains("advanced.shell"))
+    }
+
+    func testOpenURLToolUsesValidatedURLSchemeRoute() async throws {
+        let registry = ToolRegistry()
+        let resolved = await registry.descriptor(named: "apps.openURL")
+        let descriptor = try XCTUnwrap(resolved)
+        XCTAssertEqual(descriptor.preferredRoute, .urlScheme)
+        XCTAssertEqual(descriptor.risk, .sensitiveWrite)
+    }
+
     func testHarnessContextCompressionDropsAssistantToolCallWhenLargeResultDoesNotFit() {
         let messages = [
             ChatMessage(role: .system, content: "safety"),

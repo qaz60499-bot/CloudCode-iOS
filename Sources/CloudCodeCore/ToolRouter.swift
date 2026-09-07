@@ -389,7 +389,7 @@ public actor ToolRegistry {
         ToolDescriptor(name: "sqlite.sample", summary: "Sample a bounded number of rows from one validated SQLite table.", risk: .readOnly, requiredCapabilities: ["native.sqlite"]),
         ToolDescriptor(name: "container.list", summary: "Resolve the current app data container and list a bounded subdirectory; cached UUID paths are never trusted for execution.", risk: .readOnly, requiredCapabilities: ["native.container"]),
         ToolDescriptor(name: "container.search", summary: "Resolve the current app data container, query the persistent local resource index first, revalidate every returned candidate against the live container path, and fall back to a bounded scan on index miss. Accessed containers are progressively warm-indexed for later near-instant lookup.", risk: .readOnly, requiredCapabilities: ["native.container"]),
-        ToolDescriptor(name: "data.localQuery", summary: "Bounded local resolve→search→inspect→query/aggregate macro for plist/JSON/SQLite data, reducing provider round-trips while keeping every real path revalidated.", risk: .readOnly, requiredCapabilities: ["native.data_macro"]),
+        ToolDescriptor(name: "data.localQuery", summary: "Bounded local resolve→search→inspect→query/aggregate macro for plist/JSON/SQLite data. With bundleId + semanticAlias (preferences/applicationSupport/documents/cache), it uses AppKnowledge only as an alias hint, re-resolves the current App container UUID, and revalidates the live path before reading. Reduces provider round-trips without trusting stale cached paths.", risk: .readOnly, requiredCapabilities: ["native.data_macro"]),
         ToolDescriptor(name: "storage.analyze", summary: "Analyze file sizes in a resolved directory/container.", risk: .readOnly),
         ToolDescriptor(name: "files.create", summary: "Create a new ordinary file.", risk: .safeWrite),
         ToolDescriptor(name: "files.modify", summary: "Transactionally modify an existing file with diff, backup and verification.", risk: .sensitiveWrite),
@@ -402,6 +402,7 @@ public actor ToolRegistry {
         ToolDescriptor(name: "ipa.repack", summary: "Repack a modified IPA.", risk: .sensitiveWrite),
         ToolDescriptor(name: "ipa.install", summary: "Install an IPA through an available privileged adapter.", risk: .systemChange, requiredCapabilities: ["ipa.install"], preferredRoute: .privateFramework),
         ToolDescriptor(name: "apps.launch", summary: "Launch an installed app after a bounded, isolated runtime validation of the LaunchServices backend and target installation state.", risk: .safeWrite, preferredRoute: .privateFramework),
+        ToolDescriptor(name: "apps.openURL", summary: "Open an exact user-provided URL, a discovered root URL scheme, or a previously validated AppKnowledge deep-link candidate. Provider-invented deep-link paths are rejected. Success requires the requested target App to become foreground; target-surface semantics still require fresh observation.", risk: .sensitiveWrite, preferredRoute: .urlScheme),
         ToolDescriptor(name: "apps.uninstall", summary: "Uninstall an app.", risk: .permanentDestructive, requiredCapabilities: ["apps.uninstall"], preferredRoute: .privateFramework),
         ToolDescriptor(name: "apps.terminate", summary: "Terminate an app/process.", risk: .systemChange, requiredCapabilities: ["apps.terminate"], preferredRoute: .privateFramework),
         ToolDescriptor(name: "advanced.shell", summary: "Execute an advanced shell command. High risk and never the default tool path.", risk: .systemChange, requiredCapabilities: ["execution.ios_system"], preferredRoute: .cli),
@@ -769,10 +770,22 @@ public actor ToolRouter {
     }
 }
 
+public struct GUIOpenAppOutcome: Sendable, Equatable {
+    public var accepted: Bool
+    public var foregroundVerified: Bool
+    public var detail: String
+
+    public init(accepted: Bool, foregroundVerified: Bool, detail: String) {
+        self.accepted = accepted
+        self.foregroundVerified = foregroundVerified
+        self.detail = detail
+    }
+}
+
 public protocol GUIAutomationBackend: GUIAutomationCapabilityProviding, Sendable {
     var identifier: String { get }
     func isAvailable() async -> Bool
-    func openApp(bundleID: String) async throws
+    func openApp(bundleID: String) async throws -> GUIOpenAppOutcome
     func tree() async throws -> String
     func screenshot() async throws -> Data
     func tap(x: Double, y: Double) async throws
@@ -794,7 +807,7 @@ public struct UnavailableGUIBackend: GUIAutomationBackend, Sendable {
             details: Dictionary(uniqueKeysWithValues: GUIAutomationFeature.allCases.map { ($0, "No GUI automation runtime is connected.") })
         )
     }
-    public func openApp(bundleID: String) async throws { throw ToolRouterError.noExecutionRoute("gui.openApp") }
+    public func openApp(bundleID: String) async throws -> GUIOpenAppOutcome { throw ToolRouterError.noExecutionRoute("gui.openApp") }
     public func tree() async throws -> String { throw ToolRouterError.noExecutionRoute("gui.tree") }
     public func screenshot() async throws -> Data { throw ToolRouterError.noExecutionRoute("gui.screenshot") }
     public func tap(x: Double, y: Double) async throws { throw ToolRouterError.noExecutionRoute("gui.tap") }

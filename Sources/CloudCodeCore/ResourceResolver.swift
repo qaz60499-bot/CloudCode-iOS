@@ -13,6 +13,44 @@ public protocol AppContainerResolving: Sendable {
     func dataContainerPath(for bundleID: String) async -> String?
 }
 
+public struct AppStaticIntrospection: Codable, Equatable, Sendable {
+    public var bundleID: String
+    public var displayName: String
+    public var version: String
+    public var build: String
+    public var bundlePath: String
+    public var dataContainerPath: String
+    public var executable: String
+    public var urlSchemes: [String]
+    public var documentTypes: [String]
+    public var utTypes: [String]
+    public var extensions: [String]
+    public var frameworks: [String]
+    public var appGroups: [String]
+    public var localData: [String: String]
+
+    public init(bundleID: String, displayName: String, version: String, build: String, bundlePath: String, dataContainerPath: String, executable: String, urlSchemes: [String], documentTypes: [String], utTypes: [String], extensions: [String], frameworks: [String], appGroups: [String], localData: [String: String]) {
+        self.bundleID = bundleID
+        self.displayName = displayName
+        self.version = version
+        self.build = build
+        self.bundlePath = bundlePath
+        self.dataContainerPath = dataContainerPath
+        self.executable = executable
+        self.urlSchemes = urlSchemes
+        self.documentTypes = documentTypes
+        self.utTypes = utTypes
+        self.extensions = extensions
+        self.frameworks = frameworks
+        self.appGroups = appGroups
+        self.localData = localData
+    }
+}
+
+public protocol AppIntrospectionProviding: Sendable {
+    func appIntrospection(bundleID: String) async -> AppStaticIntrospection?
+}
+
 public protocol AppEnumerationCapabilityProviding: Sendable {
     func canEnumerateInstalledApps() async -> Bool
     func installedAppEnumerationDetail() async -> String
