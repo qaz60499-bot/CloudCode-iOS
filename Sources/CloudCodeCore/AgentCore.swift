@@ -1575,14 +1575,17 @@ public actor AgentCore {
                                     let rawContent = String(data: data, encoding: .utf8) ?? result.summary
                                     let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name)", content: rawContent).promptSafeRepresentation
                                     session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: ["tool_call_id": providerCallID, "tool_name": name, "provider_tool_name": providerToolName]))
-                                    if Self.shouldExplainFailure(toolName: name, result: result) {
+                                    let selectedExecutionRoute = result.payload["route"].flatMap(AppExecutionRoute.init(rawValue:))
+                                    let successfulRouteDegradation = result.success
+                                        && selectedExecutionRoute.map { $0 != descriptor.preferredRoute } == true
+                                    if Self.shouldExplainFailure(toolName: name, result: result) || successfulRouteDegradation {
                                         var resolvedExplanation = await toolRouter.explainFailure(
                                             sessionID: session.id,
                                             toolCallID: call.id,
                                             capabilities: capabilities
                                         )
                                         if resolvedExplanation == nil,
-                                           let fallbackDepth = result.payload["fallbackDepth"].flatMap(Int.init), fallbackDepth >= 2 {
+                                           successfulRouteDegradation || (result.payload["fallbackDepth"].flatMap(Int.init) ?? 0) >= 2 {
                                             // A successful deep fallback is diagnostic-only degradation. If the exact
                                             // tool-call log is unavailable, use the immediately current session evidence
                                             // once rather than silently dropping the diagnosis; tools execute serially.

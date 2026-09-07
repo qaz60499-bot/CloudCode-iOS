@@ -661,9 +661,10 @@ public enum DiagnosticProblemPackageBuilder {
         // Deduplication above prevents helper and outer logs from double-counting one tool call.
         let inferredRecoveryUse = recoverable ? max(0, matchingAttempts - 1) : 0
         let usedRecovery = max(max(0, recoveryAttemptCount), inferredRecoveryUse)
-        let recoveryAllowed = recoverable && usedRecovery < maxRecovery
+        let diagnosticOnlyRouteDegradation = reason == "deep_route_fallback"
+        let recoveryAllowed = !diagnosticOnlyRouteDegradation && recoverable && usedRecovery < maxRecovery
         let recoveryReason: String
-        if reason == "deep_route_fallback" {
+        if diagnosticOnlyRouteDegradation {
             recoveryReason = "diagnostic_only_route_degradation"
         } else if !recoverable {
             recoveryReason = "failure_requires_developer_or_manual_resolution"
