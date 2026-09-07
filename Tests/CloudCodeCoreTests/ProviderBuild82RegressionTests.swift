@@ -61,7 +61,8 @@ final class ProviderBuild82RegressionTests: XCTestCase {
             if case .token(let token) = event { output += token }
         }
         XCTAssertEqual(output, "ok")
-        XCTAssertEqual(await recorder.protocolsSeen(), [ProviderProtocol.openAIChat.rawValue])
+        let seenProtocols = await recorder.protocolsSeen()
+        XCTAssertEqual(seenProtocols, [ProviderProtocol.openAIChat.rawValue])
     }
 
     func testDiscoveryCapacityIsNotInferenceReady() async throws {

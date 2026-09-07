@@ -852,7 +852,8 @@ final class ProviderRouterTests: XCTestCase {
             requestKeyState: ProviderRequestKeyState(fileURL: stateURL)
         )
         _ = try await collectText(firstRouter.stream(configuration: bearerConfiguration, apiKey: "same-key", messages: [], tools: []))
-        XCTAssertEqual(await firstRecorder.protocolsSeen(), [ProviderProtocol.anthropic.rawValue, ProviderProtocol.openAIChat.rawValue])
+        let firstSeenProtocols = await firstRecorder.protocolsSeen()
+        XCTAssertEqual(firstSeenProtocols, [ProviderProtocol.anthropic.rawValue, ProviderProtocol.openAIChat.rawValue])
 
         var changedAuthConfiguration = bearerConfiguration
         changedAuthConfiguration.authModeName = ProviderAuthMode.xAPIKey.rawValue
@@ -865,7 +866,8 @@ final class ProviderRouterTests: XCTestCase {
             requestKeyState: ProviderRequestKeyState(fileURL: stateURL)
         )
         _ = try await collectText(changedRouter.stream(configuration: changedAuthConfiguration, apiKey: "same-key", messages: [], tools: []))
-        XCTAssertEqual(await changedRecorder.protocolsSeen(), [ProviderProtocol.anthropic.rawValue, ProviderProtocol.openAIChat.rawValue])
+        let changedSeenProtocols = await changedRecorder.protocolsSeen()
+        XCTAssertEqual(changedSeenProtocols, [ProviderProtocol.anthropic.rawValue, ProviderProtocol.openAIChat.rawValue])
     }
 
     func testPersistedHostPreferencePreservesConfiguredAPIPath() async {
