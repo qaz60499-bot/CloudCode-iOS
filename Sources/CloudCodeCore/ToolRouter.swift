@@ -949,7 +949,11 @@ public actor ToolRouter {
                 "perceptionClass", "perceptionAXAttempted", "perceptionAXSucceeded", "perceptionAnchorCacheHit",
                 "perceptionOCRInvoked", "perceptionOCRSucceeded", "perceptionOCRLatencyMS",
                 "perceptionLocalSufficient", "perceptionRemoteVisionRequired", "perceptionFallbackReason",
-                "providerVisualRoundTripAvoided"
+                "providerVisualRoundTripAvoided", "sha256", "frameSHA256", "baselineSHA256", "treeSHA256", "treeHash",
+                "foregroundBundleID", "foregroundVerified", "appVersion", "effectVerification", "localObservation",
+                "localVisionOCR", "localVisionElementCount", "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion",
+                "screenPointWidth", "screenPointHeight", "localMetric", "localMetricSelection", "localMetricSelectedSample",
+                "localMetricSelectedValue", "localMetricSelectedReturnVerified"
             ] where payload[key] != nil {
                 metadata[key] = payload[key]
             }

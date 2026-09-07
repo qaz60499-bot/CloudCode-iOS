@@ -459,6 +459,182 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(copied.contains("secret-secret-secret"))
     }
 
+    func testDiagnosticProblemPackageBuildsStableCapsulesReplayAndRegressionManifestWithoutSecrets() throws {
+        let sessionID = UUID()
+        let providerFailure = DiagnosticLogRecord(
+            id: UUID(uuidString: "11111111-1111-1111-1111-111111111111")!,
+            timestamp: Date(timeIntervalSinceReferenceDate: 100),
+            sessionID: sessionID,
+            level: .error,
+            subsystem: "provider",
+            action: "request",
+            result: "failed",
+            diagnostic: "route exhausted Authorization: Bearer super-secret-token-123456789",
+            metadata: [
+                "providerID": "agentrouter",
+                "modelID": "model-a",
+                "protocolClass": "openai_chat",
+                "fallbackReason": "route_exhausted",
+                "fallbackDepth": "2",
+                "route": "structured_tool",
+                "routeCandidates": "structured_tool,gui_fallback",
+                "build": "84",
+                "api_key": "sk-secret-secret-secret"
+            ]
+        )
+        let guiFailure = DiagnosticLogRecord(
+            id: UUID(uuidString: "22222222-2222-2222-2222-222222222222")!,
+            timestamp: Date(timeIntervalSinceReferenceDate: 101),
+            sessionID: sessionID,
+            level: .error,
+            subsystem: "tool",
+            action: "gui.verify",
+            result: "failed",
+            metadata: [
+                "verification": "failed",
+                "sha256": "abcdef",
+                "perceptionOCRInvoked": "true",
+                "localVisionOCR": "recognized",
+                "localVisionElementCount": "7",
+                "totalLatencyMS": "42"
+            ]
+        )
+        let normal = DiagnosticLogRecord(
+            timestamp: Date(timeIntervalSinceReferenceDate: 102),
+            sessionID: sessionID,
+            level: .info,
+            subsystem: "tool",
+            action: "files.read",
+            result: "completed"
+        )
+        let context = DiagnosticProblemContext(
+            build: "84",
+            commitSHA: "abc123",
+            iOSVersion: "18.0",
+            deviceClass: "phone",
+            providerId: "fallback-provider",
+            modelId: "fallback-model"
+        )
+        let first = DiagnosticProblemPackageBuilder.build(records: [providerFailure, guiFailure, normal], executionMetrics: [], context: context)
+        let second = DiagnosticProblemPackageBuilder.build(records: [providerFailure, guiFailure, normal], executionMetrics: [], context: context)
+        XCTAssertEqual(first.capsules.count, 2)
+        XCTAssertEqual(first.capsules.map(\.failureSignature), second.capsules.map(\.failureSignature))
+        XCTAssertEqual(first.summary.capsuleCount, 2)
+        XCTAssertEqual(first.summary.sessionsWithFailures, 1)
+        XCTAssertEqual(first.regressionManifest.entries.count, 2)
+        XCTAssertEqual(first.capsules.first(where: { $0.failureLayer == .providerRoute })?.replayability, .deterministic)
+        XCTAssertEqual(first.capsules.first(where: { $0.failureLayer == .guiVerification })?.replayability, .observationReplay)
+        XCTAssertFalse(first.capsules.contains { $0.userGoalSummary.contains("super-secret") })
+
+        let files = try first.generatedFiles()
+        XCTAssertNotNil(files["diagnostics/summary.json"])
+        XCTAssertNotNil(files["diagnostics/bug-capsules.json"])
+        XCTAssertNotNil(files["regression/regression-manifest.json"])
+        XCTAssertNotNil(files["regression/golden-task-matrix.json"])
+        XCTAssertEqual(DiagnosticGoldenTaskMatrix.scenarios.count, 14)
+        XCTAssertTrue(files.keys.contains { $0.hasPrefix("replay/") })
+        let combined = files.values.compactMap { String(data: $0, encoding: .utf8) }.joined(separator: "\n")
+        XCTAssertFalse(combined.contains("super-secret-token"))
+        XCTAssertFalse(combined.contains("sk-secret-secret-secret"))
+        XCTAssertFalse(combined.contains("Authorization"))
+    }
+
+    func testDiagnosticProblemPackageDoesNotCreateCapsulesForNormalCallsAndNeverMarksLiveSideEffectsReplayable() {
+        let normal = DiagnosticLogRecord(level: .info, subsystem: "tool", action: "gui.screenshot", result: "completed")
+        let liveFailure = DiagnosticLogRecord(
+            level: .error,
+            subsystem: "tool",
+            action: "gui.swipeSequence",
+            result: "failed",
+            metadata: ["sha256": "abc"]
+        )
+        let context = DiagnosticProblemContext(build: "84", iOSVersion: "18", deviceClass: "phone")
+        let normalPackage = DiagnosticProblemPackageBuilder.build(records: [normal], executionMetrics: [], context: context)
+        XCTAssertTrue(normalPackage.capsules.isEmpty)
+
+        let slowButCompleted = DiagnosticLogRecord(
+            level: .warning,
+            subsystem: "tool",
+            action: "files.search",
+            result: "completed",
+            metadata: ["totalLatencyMS": "30001", "route": "structured_tool"]
+        )
+        let slowPackage = DiagnosticProblemPackageBuilder.build(records: [slowButCompleted], executionMetrics: [], context: context)
+        XCTAssertEqual(slowPackage.capsules.count, 1)
+        XCTAssertTrue(slowPackage.capsules[0].failureSignature.contains("latency_threshold_exceeded"))
+
+        let livePackage = DiagnosticProblemPackageBuilder.build(records: [liveFailure], executionMetrics: [], context: context)
+        XCTAssertEqual(livePackage.capsules.count, 1)
+        XCTAssertEqual(livePackage.capsules[0].replayability, .realDeviceRequired)
+        XCTAssertEqual(livePackage.capsules[0].regressionStatus, .realDeviceOnly)
+        XCTAssertEqual(livePackage.replayArtifacts[0].requiresLiveSideEffect, true)
+        XCTAssertEqual(DiagnosticProblemPackageBuilder.replayClassification(livePackage.replayArtifacts[0]), .realDeviceRequired)
+    }
+
+    func testDiagnosticRegressionManifestGroupsRepeatedFailureSignature() {
+        let sessionID = UUID()
+        let first = DiagnosticLogRecord(
+            timestamp: Date(timeIntervalSinceReferenceDate: 1),
+            sessionID: sessionID,
+            level: .error,
+            subsystem: "provider",
+            action: "request",
+            result: "failed",
+            diagnostic: "route exhausted",
+            metadata: ["build": "83", "fallbackReason": "route_exhausted"]
+        )
+        let second = DiagnosticLogRecord(
+            timestamp: Date(timeIntervalSinceReferenceDate: 2),
+            sessionID: sessionID,
+            level: .error,
+            subsystem: "provider",
+            action: "request",
+            result: "failed",
+            diagnostic: "route exhausted",
+            metadata: ["build": "84", "fallbackReason": "route_exhausted"]
+        )
+        let package = DiagnosticProblemPackageBuilder.build(
+            records: [first, second],
+            executionMetrics: [],
+            context: DiagnosticProblemContext(build: "84", iOSVersion: "18", deviceClass: "phone")
+        )
+        XCTAssertEqual(package.capsules.count, 2)
+        XCTAssertEqual(package.regressionManifest.entries.count, 1)
+        XCTAssertEqual(package.regressionManifest.entries[0].firstSeenBuild, "83")
+        XCTAssertEqual(package.regressionManifest.entries[0].lastSeenBuild, "84")
+    }
+
+    func testDiagnosticBundleExporterBoundsOptionalLargeFilesButKeepsMachineSummary() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let logStore = DiagnosticLogStore(directory: root.appendingPathComponent("logs", isDirectory: true))
+        try await logStore.log(level: .error, subsystem: "test", action: "failure", result: "failed")
+        let exporter = DiagnosticBundleExporter(
+            logStore: logStore,
+            policy: DiagnosticBundleExporter.Policy(
+                maxArchiveInputBytes: 16 * 1024 * 1024,
+                maxGeneratedFileBytes: 256 * 1024,
+                maxSourceFileBytes: 256 * 1024
+            )
+        )
+        let largeSource = root.appendingPathComponent("large-source.json")
+        try Data(repeating: 0x61, count: 300 * 1024).write(to: largeSource)
+        let output = try await exporter.export(
+            destinationDirectory: root.appendingPathComponent("exports", isDirectory: true),
+            sources: [DiagnosticBundleSource(archivePath: "index/large-source.json", fileURL: largeSource)],
+            generatedFiles: [
+                "diagnostics/summary.json": Data("{\"schemaVersion\":1}".utf8),
+                "diagnostics/oversized.json": Data(repeating: 0x62, count: 300 * 1024)
+            ]
+        )
+        let archive = try Archive(url: output, accessMode: .read)
+        XCTAssertNotNil(archive["diagnostics/summary.json"])
+        XCTAssertNil(archive["diagnostics/oversized.json"])
+        XCTAssertNil(archive["index/large-source.json"])
+        XCTAssertNotNil(archive["manifest.json"])
+        XCTAssertLessThanOrEqual(Int64((try output.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0), 16 * 1024 * 1024)
+    }
+
     func testSafeModeRequiresConfirmationForImportantModification() {
         let engine = PolicyEngine()
         let tool = ToolDescriptor(name: "files.modify", summary: "", risk: .sensitiveWrite)

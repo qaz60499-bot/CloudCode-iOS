@@ -417,12 +417,30 @@ public struct DiagnosticBundleSource: Sendable {
 }
 
 public actor DiagnosticBundleExporter {
+    public struct Policy: Sendable, Equatable {
+        public var maxArchiveInputBytes: Int64
+        public var maxGeneratedFileBytes: Int64
+        public var maxSourceFileBytes: Int64
+
+        public init(
+            maxArchiveInputBytes: Int64 = 128 * 1024 * 1024,
+            maxGeneratedFileBytes: Int64 = 8 * 1024 * 1024,
+            maxSourceFileBytes: Int64 = 24 * 1024 * 1024
+        ) {
+            self.maxArchiveInputBytes = max(16 * 1024 * 1024, maxArchiveInputBytes)
+            self.maxGeneratedFileBytes = max(256 * 1024, min(maxGeneratedFileBytes, self.maxArchiveInputBytes))
+            self.maxSourceFileBytes = max(256 * 1024, min(maxSourceFileBytes, self.maxArchiveInputBytes))
+        }
+    }
+
     private let logStore: DiagnosticLogStore
     private let fileManager: FileManager
+    private let policy: Policy
 
-    public init(logStore: DiagnosticLogStore, fileManager: FileManager = .default) {
+    public init(logStore: DiagnosticLogStore, fileManager: FileManager = .default, policy: Policy = Policy()) {
         self.logStore = logStore
         self.fileManager = fileManager
+        self.policy = policy
     }
 
     public func export(
@@ -442,19 +460,34 @@ public actor DiagnosticBundleExporter {
         let runtimeDirectory = working.appendingPathComponent("runtime", isDirectory: true)
         try fileManager.createDirectory(at: runtimeDirectory, withIntermediateDirectories: true)
         try await logStore.snapshotForExport(to: runtimeDirectory)
-
-        for source in sources {
-            guard fileManager.fileExists(atPath: source.fileURL.path),
-                  let data = try? Data(contentsOf: source.fileURL) else { continue }
-            let target = working.appendingPathComponent(source.archivePath)
-            try fileManager.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try DiagnosticRedactor.redact(data: data).write(to: target, options: .atomic)
+        var stagedBytes = try Self.directorySize(runtimeDirectory, fileManager: fileManager)
+        guard stagedBytes <= policy.maxArchiveInputBytes else {
+            throw CocoaError(.fileWriteOutOfSpace)
         }
 
-        for (path, data) in generatedFiles {
+        // Machine-friendly generated diagnostics are written before optional historical source files
+        // so summary/capsule/replay manifests remain present even when an old index snapshot is large.
+        for path in generatedFiles.keys.sorted() {
+            guard let data = generatedFiles[path] else { continue }
+            let safeData = DiagnosticRedactor.redact(data: data)
+            guard Int64(safeData.count) <= policy.maxGeneratedFileBytes,
+                  stagedBytes + Int64(safeData.count) <= policy.maxArchiveInputBytes else { continue }
             let target = working.appendingPathComponent(path)
             try fileManager.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try DiagnosticRedactor.redact(data: data).write(to: target, options: .atomic)
+            try safeData.write(to: target, options: .atomic)
+            stagedBytes += Int64(safeData.count)
+        }
+
+        for source in sources.sorted(by: { $0.archivePath < $1.archivePath }) {
+            guard fileManager.fileExists(atPath: source.fileURL.path),
+                  let data = try? Data(contentsOf: source.fileURL) else { continue }
+            let safeData = DiagnosticRedactor.redact(data: data)
+            guard Int64(safeData.count) <= policy.maxSourceFileBytes,
+                  stagedBytes + Int64(safeData.count) <= policy.maxArchiveInputBytes else { continue }
+            let target = working.appendingPathComponent(source.archivePath)
+            try fileManager.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try safeData.write(to: target, options: .atomic)
+            stagedBytes += Int64(safeData.count)
         }
 
         let manifest: [String: Any] = [
@@ -463,13 +496,26 @@ public actor DiagnosticBundleExporter {
             "redacted": true,
             "localOnly": true,
             "retentionHours": 72,
-            "logCapacityBytes": 100 * 1024 * 1024
+            "logCapacityBytes": 100 * 1024 * 1024,
+            "maxArchiveInputBytes": policy.maxArchiveInputBytes,
+            "stagedInputBytes": stagedBytes
         ]
         let manifestData = try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
         try manifestData.write(to: working.appendingPathComponent("manifest.json"), options: .atomic)
 
         try Self.createArchive(from: working, to: output, fileManager: fileManager)
         return output
+    }
+
+    private static func directorySize(_ directory: URL, fileManager: FileManager) throws -> Int64 {
+        guard fileManager.fileExists(atPath: directory.path),
+              let enumerator = fileManager.enumerator(at: directory, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey], options: []) else { return 0 }
+        var total: Int64 = 0
+        for case let item as URL in enumerator {
+            let values = try item.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            if values.isRegularFile == true { total += Int64(values.fileSize ?? 0) }
+        }
+        return total
     }
 
     private static func createArchive(from working: URL, to output: URL, fileManager: FileManager) throws {

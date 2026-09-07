@@ -71,6 +71,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private let appResolver: IOSAppResolver
     private let capabilityProbe: CapabilityProbe
     private let toolRegistry: ToolRegistry
+    private let toolRouter: ToolRouter
     private let fileService: FileService
     private let trashService: TrashService
     private let policyEngine: PolicyEngine
@@ -265,6 +266,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.appResolver = resolver
         self.capabilityProbe = probe
         self.toolRegistry = registry
+        self.toolRouter = router
         self.fileService = fileService
         self.trashService = trash
         self.policyEngine = policy
@@ -273,6 +275,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.diagnosticBundleExporter = DiagnosticBundleExporter(logStore: diagnosticLogStore)
         self.diagnosticSourceFiles = [
             DiagnosticBundleSource(archivePath: "index/resource-graph.json", fileURL: support.appendingPathComponent("Index/resource-graph.json")),
+            DiagnosticBundleSource(archivePath: "index/app-knowledge.json", fileURL: support.appendingPathComponent("Index/app-knowledge.json")),
             DiagnosticBundleSource(archivePath: "provider/verified-routes.json", fileURL: support.appendingPathComponent("Provider/verified-routes.json"))
         ]
         self.transactionJournal = transactionJournal
@@ -1901,20 +1904,51 @@ public final class CloudCodeViewModel: ObservableObject {
             "fts5Available": indexStatistics.fts5Available,
             "rebuiltCorruptSidecar": indexStatistics.rebuiltCorruptSidecar
         ], options: [.prettyPrinted, .sortedKeys])
+        let recentLogs = (try? await diagnosticLogStore.readAll(limit: 10_000)) ?? []
+        let executionMetrics = await toolRouter.recentExecutionPathMetrics(limit: 512)
+        #if canImport(UIKit)
+        let iOSVersion = UIDevice.current.systemVersion
+        let deviceClass: String
+        switch UIDevice.current.userInterfaceIdiom {
+        case .phone: deviceClass = "phone"
+        case .pad: deviceClass = "pad"
+        case .tv: deviceClass = "tv"
+        case .carPlay: deviceClass = "carplay"
+        case .mac: deviceClass = "mac"
+        default: deviceClass = "unspecified"
+        }
+        #else
+        let iOSVersion = ProcessInfo.processInfo.operatingSystemVersionString
+        let deviceClass = "non_ios_test_host"
+        #endif
+        let diagnosticProblemPackage = DiagnosticProblemPackageBuilder.build(
+            records: recentLogs,
+            executionMetrics: executionMetrics,
+            context: DiagnosticProblemContext(
+                build: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "",
+                commitSHA: Bundle.main.object(forInfoDictionaryKey: "CloudCodeCommitSHA") as? String,
+                iOSVersion: iOSVersion,
+                deviceClass: deviceClass,
+                providerId: selectedProviderID,
+                modelId: selectedModel
+            )
+        )
+        var generatedFiles = try diagnosticProblemPackage.generatedFiles()
+        generatedFiles.merge([
+            "runtime/runtime.json": runtimeData,
+            "capabilities/capabilities.json": capabilitiesData,
+            "audit/audit.jsonl": auditData,
+            "tool-results/tool-results.json": toolResultsData,
+            "checkpoints/checkpoints.json": checkpointData,
+            "transactions/transactions.json": transactionData,
+            "startup/breadcrumbs.txt": startupBreadcrumbData,
+            "index/resource-index-stats.json": indexStatisticsData
+        ], uniquingKeysWith: { existing, _ in existing })
         let destination = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeDiagnostics", isDirectory: true)
         let url = try await diagnosticBundleExporter.export(
             destinationDirectory: destination,
             sources: diagnosticSourceFiles,
-            generatedFiles: [
-                "runtime/runtime.json": runtimeData,
-                "capabilities/capabilities.json": capabilitiesData,
-                "audit/audit.jsonl": auditData,
-                "tool-results/tool-results.json": toolResultsData,
-                "checkpoints/checkpoints.json": checkpointData,
-                "transactions/transactions.json": transactionData,
-                "startup/breadcrumbs.txt": startupBreadcrumbData,
-                "index/resource-index-stats.json": indexStatisticsData
-            ]
+            generatedFiles: generatedFiles
         )
         try? await diagnosticLogStore.log(
             level: .info,
