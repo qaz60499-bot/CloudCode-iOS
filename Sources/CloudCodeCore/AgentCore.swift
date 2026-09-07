@@ -1576,16 +1576,20 @@ public actor AgentCore {
                                     let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name)", content: rawContent).promptSafeRepresentation
                                     session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: ["tool_call_id": providerCallID, "tool_name": name, "provider_tool_name": providerToolName]))
                                     let selectedExecutionRoute = result.payload["route"].flatMap(AppExecutionRoute.init(rawValue:))
-                                    let successfulRouteDegradation = result.success
-                                        && selectedExecutionRoute.map { $0 != descriptor.preferredRoute } == true
+                                    let reportedFallbackDepth = result.payload["fallbackDepth"].flatMap(Int.init) ?? 0
+                                    let executorReportedRoute = AppExecutionRoute(rawValue: result.summary)
+                                    let successfulRouteDegradation = result.success && (
+                                        selectedExecutionRoute.map { $0 != descriptor.preferredRoute } == true
+                                            || reportedFallbackDepth >= 2
+                                            || executorReportedRoute.map { $0 != descriptor.preferredRoute } == true
+                                    )
                                     if Self.shouldExplainFailure(toolName: name, result: result) || successfulRouteDegradation {
                                         var resolvedExplanation = await toolRouter.explainFailure(
                                             sessionID: session.id,
                                             toolCallID: call.id,
                                             capabilities: capabilities
                                         )
-                                        if resolvedExplanation == nil,
-                                           successfulRouteDegradation || (result.payload["fallbackDepth"].flatMap(Int.init) ?? 0) >= 2 {
+                                        if resolvedExplanation == nil, successfulRouteDegradation {
                                             // A successful deep fallback is diagnostic-only degradation. If the exact
                                             // tool-call log is unavailable, use the immediately current session evidence
                                             // once rather than silently dropping the diagnosis; tools execute serially.
@@ -1595,6 +1599,16 @@ public actor AgentCore {
                                                 capabilities: capabilities
                                             )
                                             if resolvedExplanation == nil {
+                                                var derivedMetadata = result.payload
+                                                if derivedMetadata["route"] == nil, let executorReportedRoute {
+                                                    derivedMetadata["route"] = executorReportedRoute.rawValue
+                                                }
+                                                if (derivedMetadata["fallbackDepth"].flatMap(Int.init) ?? 0) < 2 {
+                                                    derivedMetadata["fallbackDepth"] = "2"
+                                                }
+                                                if derivedMetadata["fallbackReason"] == nil {
+                                                    derivedMetadata["fallbackReason"] = "successful_route_degradation"
+                                                }
                                                 let derived = DiagnosticLogRecord(
                                                     sessionID: session.id,
                                                     toolCallID: call.id,
@@ -1603,7 +1617,7 @@ public actor AgentCore {
                                                     action: name,
                                                     result: result.success ? "completed" : "failed",
                                                     diagnostic: result.summary,
-                                                    metadata: result.payload
+                                                    metadata: derivedMetadata
                                                 )
                                                 resolvedExplanation = DiagnosticProblemPackageBuilder.explainFailure(
                                                     records: [derived],
