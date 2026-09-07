@@ -1383,7 +1383,7 @@ final class CloudCodeCoreTests: XCTestCase {
         )
         let agent = AgentCore(
             provider: ToolThenFinishProvider(events: [
-                .toolCall(id: "deep-fallback-list", name: "files_list", argumentsJSON: "{}"),
+                .toolCall(id: "deep-fallback-list", name: "files_list", argumentsJSON: "{\"path\":\"/tmp\"}"),
                 .finished
             ]),
             keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
