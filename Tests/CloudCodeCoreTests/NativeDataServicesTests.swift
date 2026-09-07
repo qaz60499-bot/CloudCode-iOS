@@ -143,7 +143,7 @@ final class NativeDataServicesTests: XCTestCase {
 
         let results = try FileService().search(
             root: root,
-            query: FileSearchQuery(maxDepth: 1, maxResults: 500, maxVisited: 128),
+            query: FileSearchQuery(maxDepth: 5, maxResults: 500, maxVisited: 128),
             allowedRoot: root
         )
         XCTAssertEqual(results.count, 128, "bounded scan must stop before processing entries beyond maxVisited")
