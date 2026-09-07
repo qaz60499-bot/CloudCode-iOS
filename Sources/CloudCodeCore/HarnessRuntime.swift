@@ -111,14 +111,16 @@ public enum HarnessContextManager {
         var hints: [ChatMessage] = []
         if let count = boundedRepeatedSwipeCount(in: request) {
             let needsFeedReview = feedSamplingNeedsIntermediateReview(in: request)
+            let namesFeedItems = requestsConsecutiveFeedItems(in: request)
+            let useFeedSample = needsFeedReview || namesFeedItems
             hints.append(ChatMessage(
                 role: .system,
-                content: needsFeedReview
-                    ? "Harness execution hint: the latest user request asks to inspect/compare \(count) consecutive feed items. After the target feed is foreground, prefer one gui.feedSample with direction=forward and count=\(count). It captures all current samples locally and returns them together for one semantic review; do not spend one provider round-trip per item and do not translate forward into user-facing up/down swipe wording."
-                    : "Harness execution hint: the latest user request contains an explicit finite repeated swipe/feed-browse count of \(count). After a fresh foreground observation, prefer one gui.swipeSequence with count=\(count) when the repeated motion is mechanically identical and no intermediate semantic decision is required. This hint is advisory only: if the screen changes into a state that requires interpretation, use a bounded local semantic macro or individual observe/action steps instead. Never turn this hint into an unbounded loop.",
+                content: useFeedSample
+                    ? "Harness execution hint: the latest user request names \(count) consecutive feed/video items. After the target feed is foreground, prefer one gui.feedSample with direction=forward and count=\(count). This coordinate-free local macro owns the physical gesture direction, captures the requested consecutive items, and avoids raw swipe-coordinate/unit mistakes. Review the returned current screenshots when semantic comparison is required; do not translate forward into user-facing up/down finger-motion wording."
+                    : "Harness execution hint: the latest user request contains an explicit finite repeated swipe count of \(count). After a fresh foreground observation, prefer one gui.swipeSequence with count=\(count) when the repeated motion is mechanically identical and no intermediate semantic decision is required. Swipe coordinates are screen-point coordinates and duration is seconds (0.05–5.0, typically about 0.3); do not emit millisecond duration values. This hint is advisory only: if the screen changes into a state that requires interpretation, use a bounded local semantic macro or individual observe/action steps instead. Never turn this hint into an unbounded loop.",
                 providerMetadata: [
                     "context_layer": "harness_execution",
-                    "execution_mode": needsFeedReview ? "bounded_feed_sample" : "bounded_repeated_swipe",
+                    "execution_mode": useFeedSample ? "bounded_feed_sample" : "bounded_repeated_swipe",
                     "repeat_count": String(count)
                 ]
             ))
@@ -174,6 +176,12 @@ public enum HarnessContextManager {
         return markers.contains(where: normalized.contains)
     }
 
+    static func requestsConsecutiveFeedItems(in request: String) -> Bool {
+        let normalized = request.lowercased()
+        let feedMarkers = ["个视频", "条视频", "條視頻", "个帖子", "条帖子", "條帖子", "videos", "posts", "feed"]
+        return feedMarkers.contains(where: normalized.contains)
+    }
+
     static func boundedRepeatedSwipeCount(in request: String) -> Int? {
         let normalized = request.lowercased()
         let actionMarkers = ["swipe", "滑", "刷"]
@@ -200,6 +208,32 @@ public enum HarnessContextManager {
             }
         }
         return nil
+    }
+
+    static func requiresPostLaunchGUIAction(in request: String) -> Bool {
+        let normalized = request.lowercased()
+        let actionMarkers = [
+            "刷", "滑", "滚动", "点赞", "点", "点击", "输入", "发送", "回复", "聊天", "搜索", "选择", "切换",
+            "swipe", "scroll", "tap", "type", "send", "reply", "like", "search", "select"
+        ]
+        return actionMarkers.contains(where: normalized.contains)
+    }
+
+    static func requiresMessageSend(in request: String) -> Bool {
+        let normalized = request.lowercased()
+        let sendMarkers = [
+            "发消息", "发送消息", "发微信", "微信发", "给他发", "给她发", "给它发", "发一个", "发一条", "回复",
+            "send message", "send a message", "reply"
+        ]
+        if sendMarkers.contains(where: normalized.contains) { return true }
+        let messagingContext = ["微信", "文件传输助手", "联系人", "朋友", "群聊", "聊天", "message", "wechat", "chat"]
+        return normalized.contains("发") && messagingContext.contains(where: normalized.contains)
+    }
+
+    static func requiresExplicitTapAction(in request: String) -> Bool {
+        let normalized = request.lowercased()
+        let markers = ["点赞", "点开", "点击", "按一下", "like", "tap", "click"]
+        return markers.contains(where: normalized.contains)
     }
 
     static func scopedProviderToolNames(for request: String, availableNames: Set<String>) -> Set<String> {

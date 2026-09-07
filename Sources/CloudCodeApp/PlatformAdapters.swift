@@ -1475,9 +1475,9 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.swipe", "gui.swipeSequence", "gui.swipeObserve":
             let keys = ["fromX", "fromY", "toX", "toY"]
             let coordinates = keys.compactMap { Double(call.arguments[$0] ?? "") }
-            let duration = Double(call.arguments["duration"] ?? "0.3")
+            let duration = GUIAutomationPayloadPolicy.normalizedSwipeDuration(call.arguments["duration"])
             guard coordinates.count == keys.count, coordinates.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 10_000 }),
-                  let duration, duration.isFinite, duration >= 0.05, duration <= 5.0 else {
+                  duration != nil else {
                 throw ToolRouterError.noExecutionRoute("swipe coordinates/duration missing, invalid, or outside bounded range")
             }
             if call.name == "gui.swipeSequence" {
@@ -1631,7 +1631,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             try await backend.scroll(deltaX: Double(call.arguments["dx"] ?? "0") ?? 0, deltaY: Double(call.arguments["dy"] ?? "0") ?? 0)
             return ToolResult(toolCallID: call.id, success: true, summary: "Scroll dispatched; foreground effect unverified", payload: ["effectVerification": "required"])
         case "gui.swipe":
-            try await backend.swipe(fromX: Double(call.arguments["fromX"] ?? "0") ?? 0, fromY: Double(call.arguments["fromY"] ?? "0") ?? 0, toX: Double(call.arguments["toX"] ?? "0") ?? 0, toY: Double(call.arguments["toY"] ?? "0") ?? 0, duration: Double(call.arguments["duration"] ?? "0.3") ?? 0.3)
+            try await backend.swipe(fromX: Double(call.arguments["fromX"] ?? "0") ?? 0, fromY: Double(call.arguments["fromY"] ?? "0") ?? 0, toX: Double(call.arguments["toX"] ?? "0") ?? 0, toY: Double(call.arguments["toY"] ?? "0") ?? 0, duration: GUIAutomationPayloadPolicy.normalizedSwipeDuration(call.arguments["duration"]) ?? 0.3)
             return ToolResult(toolCallID: call.id, success: true, summary: "Swipe dispatched; foreground effect unverified", payload: ["effectVerification": "required"])
         case "gui.swipeSequence":
             return try await executeSwipeSequence(call)
@@ -1672,7 +1672,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         let fromY = Double(call.arguments["fromY"] ?? "0") ?? 0
         let toX = Double(call.arguments["toX"] ?? "0") ?? 0
         let toY = Double(call.arguments["toY"] ?? "0") ?? 0
-        let duration = Double(call.arguments["duration"] ?? "0.3") ?? 0.3
+        let duration = GUIAutomationPayloadPolicy.normalizedSwipeDuration(call.arguments["duration"]) ?? 0.3
         let count = Int(Double(call.arguments["count"] ?? "0") ?? 0)
         let settleSeconds = max(0.35, min(0.9, duration + 0.2))
         let settleNanoseconds = UInt64(settleSeconds * 1_000_000_000)
@@ -1831,7 +1831,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 fromY: Double(call.arguments["fromY"] ?? "0") ?? 0,
                 toX: Double(call.arguments["toX"] ?? "0") ?? 0,
                 toY: Double(call.arguments["toY"] ?? "0") ?? 0,
-                duration: Double(call.arguments["duration"] ?? "0.3") ?? 0.3
+                duration: GUIAutomationPayloadPolicy.normalizedSwipeDuration(call.arguments["duration"]) ?? 0.3
             )
         default:
             throw ToolRouterError.noExecutionRoute(call.name)

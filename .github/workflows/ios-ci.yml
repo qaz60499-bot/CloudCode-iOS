@@ -622,7 +622,7 @@ jobs:
           agent_router = catalog.split('id: "https-agentrouter-org"', 1)[1].split('source: .desktopSnapshot', 1)[0]
           if 'authMode: .bearer' not in agent_router:
               raise SystemExit('FAIL: AgentRouter catalog auth mode drifted without live evidence')
-          for marker in ('baseURL: URL(string: "https://co.agentrouter.org")!', 'protocols: [.anthropic, .openAIChat]', '"gpt-5.6-sol": [.anthropic]', '"glm-5.3": [.anthropic]', '"deepseek-v4-flash": [.anthropic]'):
+          for marker in ('baseURL: URL(string: "https://co.agentrouter.org")!', 'protocols: [.anthropic, .openAIChat]', '"gpt-5.6-sol": [.openAIChat, .anthropic]', '"glm-5.3": [.openAIChat, .anthropic]', '"deepseek-v4-flash": [.openAIChat, .anthropic]'):
               if marker not in agent_router:
                   raise SystemExit(f'FAIL: AgentRouter legacy-Key compatibility seed regressed: {marker}')
           harness = Path('Sources/CloudCodeCore/HarnessRuntime.swift').read_text(encoding='utf-8')

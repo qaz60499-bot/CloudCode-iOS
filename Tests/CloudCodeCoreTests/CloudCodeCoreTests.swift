@@ -2407,6 +2407,15 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(GUIAutomationPayloadPolicy.isValidScreenshotJPEG(oversized))
     }
 
+    func testGUISwipeDurationNormalizesBoundedMillisecondsWithoutClampingUnsafeValues() {
+        XCTAssertEqual(GUIAutomationPayloadPolicy.normalizedSwipeDuration("0.3"), 0.3)
+        XCTAssertEqual(GUIAutomationPayloadPolicy.normalizedSwipeDuration("300"), 0.3)
+        XCTAssertEqual(GUIAutomationPayloadPolicy.normalizedSwipeDuration(nil), 0.3)
+        XCTAssertNil(GUIAutomationPayloadPolicy.normalizedSwipeDuration("0"))
+        XCTAssertNil(GUIAutomationPayloadPolicy.normalizedSwipeDuration("6000"))
+        XCTAssertNil(GUIAutomationPayloadPolicy.normalizedSwipeDuration("not-a-number"))
+    }
+
     func testGUIScreenshotHashGateRequiresBaselineAndDetectsNoChange() {
         XCTAssertEqual(
             GUIAutomationPayloadPolicy.sha256Hex(Data("abc".utf8)),
@@ -2455,6 +2464,49 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(observation?.content.contains("untrusted observation") == true)
         XCTAssertTrue(snapshots[1].messages.contains {
             $0.role == .system && $0.content.contains("A gui.tree failure by itself must never block the screenshot path")
+        })
+    }
+
+    func testGUICompletionGuardRejectsOpenOnlyFinishForFiniteBrowseRequest() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "apps.launch", summary: "launch", risk: .safeWrite, preferredRoute: .privateFramework)
+        ])
+        let agent = AgentCore(
+            provider: PrematureGUICompletionProvider(),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(
+                registry: registry,
+                executors: [CountingExecutor(route: .privateFramework, names: ["apps.launch"], counter: InvocationCounter())]
+            ),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 5
+        )
+        let session = AgentSession(permissionMode: .full)
+        let stream = await agent.send(
+            text: "打开抖音极速版刷三条视频",
+            session: session,
+            providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key")
+        )
+        var caughtError: Error?
+        do {
+            for try await _ in stream {}
+        } catch {
+            caughtError = error
+        }
+        XCTAssertNotNil(caughtError, "An open-only provider must not be allowed to complete a finite browse request.")
+
+        let saved = try await sessions.load(session.id)
+        XCTAssertTrue(saved.messages.contains {
+            $0.role == .system
+                && $0.providerMetadata["context_layer"] == "gui_completion_guard"
+                && $0.content.contains("明确要求执行 3")
+                && $0.content.contains("不能只打开 App")
         })
     }
 
@@ -4049,6 +4101,32 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertNil(HarnessContextManager.boundedRepeatedSwipeCount(in: "刷 20 次"), "fast sequence is intentionally bounded to at most 12 gestures")
     }
 
+    func testHarnessClassifiesPostLaunchGUIAndMessageSendRequirements() {
+        XCTAssertTrue(HarnessContextManager.requiresPostLaunchGUIAction(in: "打开抖音极速版刷五条视频"))
+        XCTAssertTrue(HarnessContextManager.requiresPostLaunchGUIAction(in: "打开微信给他发消息"))
+        XCTAssertFalse(HarnessContextManager.requiresPostLaunchGUIAction(in: "打开微信"))
+        XCTAssertTrue(HarnessContextManager.requiresMessageSend(in: "打开微信给他发消息"))
+        XCTAssertTrue(HarnessContextManager.requiresMessageSend(in: "发微信告诉他我到了"))
+        XCTAssertTrue(HarnessContextManager.requiresMessageSend(in: "打开微信给文件传输助手发一个一"))
+        XCTAssertTrue(HarnessContextManager.requiresExplicitTapAction(in: "刷三条抖音然后点赞"))
+        XCTAssertFalse(HarnessContextManager.requiresExplicitTapAction(in: "打开微信看看"))
+        XCTAssertFalse(HarnessContextManager.requiresMessageSend(in: "打开微信看看"))
+    }
+
+    func testHarnessFiniteSwipeHintStatesCoordinateAndDurationUnits() {
+        let hint = HarnessContextManager.executionHint(from: [ChatMessage(role: .user, content: "打开页面向上滑 5 次")])
+        XCTAssertTrue(hint?.content.contains("screen-point coordinates") == true)
+        XCTAssertTrue(hint?.content.contains("duration is seconds") == true)
+        XCTAssertTrue(hint?.content.contains("do not emit millisecond") == true)
+    }
+
+    func testHarnessFiniteVideoBrowsePrefersCoordinateFreeFeedSample() {
+        let hint = HarnessContextManager.executionHint(from: [ChatMessage(role: .user, content: "打开抖音刷 5 条视频")])
+        XCTAssertTrue(hint?.content.contains("gui.feedSample") == true)
+        XCTAssertTrue(hint?.content.contains("coordinate-free") == true)
+        XCTAssertEqual(hint?.providerMetadata["execution_mode"], "bounded_feed_sample")
+    }
+
     func testHarnessExecutionHintTracksTransientVideoReturnBeforeTyping() {
         let messages = [ChatMessage(role: .user, content: "打开抖音群聊里的视频看一下，然后回来评价并发送")]
         let hints = HarnessContextManager.executionHints(from: messages)
@@ -5220,6 +5298,26 @@ private struct DuplicateStateChangeProvider: ProviderStreaming, Sendable {
             case 1:
                 continuation.yield(.toolCall(id: "create-2", name: "files_create", argumentsJSON: "{\"content\":\"x\",\"path\":\"/tmp/semantic-once\"}"))
             default:
+                continuation.yield(.token("done"))
+            }
+            continuation.yield(.finished)
+            continuation.finish()
+        }
+    }
+}
+
+private struct PrematureGUICompletionProvider: ProviderStreaming, Sendable {
+    func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        let completedTools = messages.filter { $0.role == .tool }.count
+        return AsyncThrowingStream { continuation in
+            if completedTools == 0 {
+                continuation.yield(.toolCall(id: "launch-only", name: "apps_launch", argumentsJSON: "{\"bundleId\":\"com.ss.iphone.ugc.aweme.lite\"}"))
+            } else {
                 continuation.yield(.token("done"))
             }
             continuation.yield(.finished)

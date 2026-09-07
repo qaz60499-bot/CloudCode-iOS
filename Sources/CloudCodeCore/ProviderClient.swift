@@ -25,7 +25,7 @@ public enum ProviderEndpointRoutingPolicy {
     // never counts as success evidence: non-API 2xx responses are rejected and only exact verified
     // Key×Host evidence may persistently reorder these two allowlisted origins.
     public static let agentRouterLegacyKeyFingerprint = "105a3fce9a105c41472b926f6448a91be2f9726d5e074adbaaa2206f4d6dbf23"
-    public static let compatibilityEvidenceRevision = "3"
+    public static let compatibilityEvidenceRevision = "4"
 
     public static func candidateBaseURLs(
         providerID: String?,
@@ -316,6 +316,7 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
     case attachmentTooLarge(Int64)
     case unsupportedAttachmentType(String)
     case protocolIncompatible(String)
+    case upstreamPending(String)
     case transport(String)
 
     public var description: String {
@@ -341,6 +342,7 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
         case .attachmentTooLarge(let bytes): return "图片附件过大（\(bytes) 字节）；单张图片限制为 4 MB"
         case .unsupportedAttachmentType(let mimeType): return "暂不支持的图片类型：\(mimeType)"
         case .protocolIncompatible(let detail): return "当前模型的兼容协议返回错误：\(detail)"
+        case .upstreamPending(let detail): return "厂商上游暂未就绪，保持当前已验证路由并有限重试：\(detail)"
         case .transport(let value): return value
         }
     }
@@ -551,6 +553,7 @@ private extension ProviderRequestBuilding {
                 var requestTools = tools
                 var didDropReasoningEffortForCompatibility = false
                 var didCompactContextForGatewayRecovery = false
+                var didDropAgentRouterImagesForCompatibility = false
                 while attempt <= retryPolicy.maxAttempts {
                     var responseStarted = false
                     var successfulStreamEstablished = false
@@ -614,6 +617,31 @@ private extension ProviderRequestBuilding {
                             } catch {
                                 // HTTP status is authoritative for classification; a truncated
                                 // error body must not turn a known 4xx/5xx into a transport replay.
+                            }
+                            if !didDropAgentRouterImagesForCompatibility,
+                               ProviderCompatibilityClassifier.shouldRetryAgentRouterWithoutImageAttachments(
+                                   providerID: configuration.providerID,
+                                   statusCode: http.statusCode,
+                                   body: body,
+                                   messages: requestMessages
+                               ) {
+                                didDropAgentRouterImagesForCompatibility = true
+                                requestMessages = ProviderCompatibilityClassifier.agentRouterTextOnlyMessages(from: requestMessages)
+                                try? await diagnosticLogger?.log(
+                                    level: .warning,
+                                    subsystem: "provider",
+                                    action: "request.compatibility-fallback",
+                                    result: "retry_agentrouter_text_only_observation",
+                                    diagnostic: "AgentRouter accepted this exact route before the current screenshot but rejected the multimodal content block shape. Retrying once on the same Host/Key/protocol with internal observation images omitted; do not rotate a proven route solely because this model is text-only.",
+                                    metadata: [
+                                        "providerID": configuration.providerID ?? "",
+                                        "model": configuration.model,
+                                        "statusCode": String(http.statusCode),
+                                        "protocol": configuration.protocolName ?? "",
+                                        "host": http.url?.host ?? request.url?.host ?? ""
+                                    ]
+                                )
+                                continue
                             }
                             let genericContextRecovery = ProviderCompatibilityClassifier.shouldRetryWithCompactContext(statusCode: http.statusCode, body: body)
                             let agentRouterEnvelopeRecovery = ProviderCompatibilityClassifier.shouldRetryAgentRouterCompatibilityEnvelope(
@@ -715,6 +743,16 @@ private extension ProviderRequestBuilding {
                         if successfulStreamEstablished, bodyDataReceived, error is URLError {
                             effectiveError = ProviderError.streamInterrupted
                             responseStarted = true
+                        } else if configuration.providerID == ProviderCatalog.agentRouterID,
+                                  successfulStreamEstablished,
+                                  bodyDataReceived,
+                                  !responseStarted,
+                                  let pendingDetail = ProviderCompatibilityClassifier.agentRouterTransientStreamPendingDetail(error) {
+                            // AgentRouter can return HTTP 200/SSE and immediately surface a gateway-side
+                            // waiting/pending event before any model output. This is not protocol/Host
+                            // incompatibility evidence. Keep the exact proven route and retry it within
+                            // the normal bounded per-request budget instead of degrading learned routing.
+                            effectiveError = ProviderError.upstreamPending(pendingDetail)
                         } else {
                             effectiveError = error
                         }
@@ -830,7 +868,7 @@ private func providerErrorDetail(from value: Any?) -> String? {
         return trimmed.isEmpty ? nil : trimmed
     }
     if let object = value as? [String: Any] {
-        for key in ["message", "detail", "error_description", "reason", "error"] {
+        for key in ["message", "msg", "detail", "description", "error_message", "error_description", "reason", "cause", "error"] {
             if let detail = providerErrorDetail(from: object[key]) { return detail }
         }
         if let type = object["type"] as? String, !type.isEmpty { return type }
@@ -1127,7 +1165,9 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
                     }
                     terminal = true
                 case "error":
-                    throw ProviderError.transport("Anthropic 流返回错误事件")
+                    let detail = providerErrorDetail(from: object["error"] ?? object)
+                        ?? "Anthropic 流返回错误事件"
+                    throw ProviderError.protocolIncompatible(detail)
                 default:
                     break
                 }
@@ -1388,6 +1428,33 @@ public actor ProviderRequestKeyState {
             evidenceState: .verified,
             touchedAt: Date()
         )
+        persistIfConfigured()
+    }
+
+    public func markProtocolDegraded(routingKey: String, reference: String, protocolName: String) {
+        loadIfNeeded()
+        prune()
+        guard var entry = entries[routingKey],
+              entry.reference == reference,
+              entry.protocolName == protocolName else { return }
+        entry.evidenceState = .degraded
+        entry.touchedAt = Date()
+        entries[routingKey] = entry
+        persistIfConfigured()
+    }
+
+    public func markBaseURLDegraded(routingKey: String, reference: String, baseURL: URL) {
+        loadIfNeeded()
+        prune()
+        guard var entry = entries[routingKey],
+              entry.reference == reference,
+              let stored = entry.baseURLString,
+              let storedURL = URL(string: stored),
+              ProviderEndpointRoutingPolicy.normalizedOrigin(storedURL)
+                == ProviderEndpointRoutingPolicy.normalizedOrigin(baseURL) else { return }
+        entry.evidenceState = .degraded
+        entry.touchedAt = Date()
+        entries[routingKey] = entry
         persistIfConfigured()
     }
 
@@ -1686,10 +1753,18 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                             let mayFallbackHost = !emittedOutput && hasAnotherHost && ProviderHostFallbackClassifier.shouldFallback(error)
                             let mayRotateKey = !emittedOutput && hasAnotherKey && configuration.allowSameProviderKeyFailover == true && ProviderKeyRotationClassifier.shouldRotate(error)
                             if !emittedOutput && ProviderCompatibilityDriftClassifier.shouldDegradeProtocol(error) {
-                                await requestKeyState.markDegraded(routingKey: protocolRoutingStateKey, reference: keyCandidate.0)
+                                await requestKeyState.markProtocolDegraded(
+                                    routingKey: protocolRoutingStateKey,
+                                    reference: keyCandidate.0,
+                                    protocolName: protocolCandidate.rawValue
+                                )
                             }
                             if !emittedOutput && ProviderCompatibilityDriftClassifier.shouldDegradeHost(error, providerID: configuration.providerID) {
-                                await requestKeyState.markDegraded(routingKey: hostRoutingStateKey, reference: keyCandidate.0)
+                                await requestKeyState.markBaseURLDegraded(
+                                    routingKey: hostRoutingStateKey,
+                                    reference: keyCandidate.0,
+                                    baseURL: baseURLCandidate
+                                )
                             }
                             try? await diagnosticLogger?.log(
                                 level: .error,
@@ -1816,6 +1891,62 @@ public enum ProviderCompatibilityClassifier {
         // generic 502/503/504. A single replay with a much smaller attachment-aware context is safe
         // because no provider output has been emitted yet; normal retry rules resume afterwards.
         return statusCode == 502 || statusCode == 503 || statusCode == 504
+    }
+
+    public static func agentRouterTransientStreamPendingDetail(_ error: Error) -> String? {
+        guard let providerError = error as? ProviderError else { return nil }
+        let detail: String
+        switch providerError {
+        case .protocolIncompatible(let value):
+            detail = value
+        default:
+            return nil
+        }
+        let normalized = detail.lowercased()
+        let pendingMarkers = [
+            "wait for api", "waiting for api", "waiting for upstream", "please wait", "upstream pending",
+            "temporarily busy", "upstream busy", "upstream not ready", "api response pending",
+            "等待 api", "等待api", "上游等待", "上游未就绪", "上游繁忙"
+        ]
+        return pendingMarkers.contains(where: normalized.contains) ? detail : nil
+    }
+
+    public static func shouldRetryAgentRouterWithoutImageAttachments(
+        providerID: String?,
+        statusCode: Int,
+        body: Data,
+        messages: [ChatMessage]
+    ) -> Bool {
+        guard providerID == ProviderCatalog.agentRouterID,
+              statusCode == 400 || statusCode == 422,
+              messages.contains(where: { !$0.attachments.isEmpty }) else { return false }
+        let text = String(data: body.prefix(262_144), encoding: .utf8)?.lowercased() ?? ""
+        guard !text.isEmpty else { return false }
+        // Current AgentRouter OpenAI-compatible routes can accept the exact model/key/tool request,
+        // then reject only after a screenshot is appended with errors such as "type ... ['text']".
+        // That is model/content-shape evidence, not credential or Host evidence.
+        let mentionsType = text.contains(".type") || text.contains(" type ") || text.contains("type 参数")
+        let textOnlyConstraint = text.contains("['text']") || text.contains("[\"text\"]")
+            || (text.contains("allowed") && text.contains("text") && !text.contains("image"))
+        return mentionsType && textOnlyConstraint
+            && !ProviderFailureEvidence.isCredential(text)
+            && !ProviderFailureEvidence.isCapacity(text)
+    }
+
+    public static func agentRouterTextOnlyMessages(from messages: [ChatMessage]) -> [ChatMessage] {
+        messages.map { message in
+            guard !message.attachments.isEmpty else { return message }
+            var compacted = message
+            compacted.attachments = []
+            if message.providerMetadata["internal_observation"] != nil {
+                compacted.content = "Device screenshot was captured locally but this selected AgentRouter model rejected image content. The image itself is omitted on this compatibility retry. Continue only with deterministic/local GUI tools that do not require visual interpretation; do not claim to have seen the omitted image."
+                compacted.providerMetadata["provider_image_compatibility"] = "text_only_retry"
+            } else {
+                compacted.content += "\n[Image attachment omitted because this selected AgentRouter model rejected image content on the same proven route.]"
+                compacted.providerMetadata["provider_image_compatibility"] = "text_only_retry"
+            }
+            return compacted
+        }
     }
 
     public static func shouldRetryAgentRouterCompatibilityEnvelope(
@@ -1987,7 +2118,7 @@ public enum ProviderCompatibilityDriftClassifier {
         case .invalidResponse(let code):
             return code == 404 || code == 405
         case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .clientRejected,
-             .capacityExhausted, .modelUnavailable, .rateLimited, .streamInterrupted,
+             .capacityExhausted, .modelUnavailable, .rateLimited, .streamInterrupted, .upstreamPending,
              .attachmentUnavailable, .attachmentTooLarge, .unsupportedAttachmentType, .transport:
             return false
         }
@@ -2000,7 +2131,7 @@ public enum ProviderCompatibilityDriftClassifier {
         case .authenticationFailed, .clientRejected:
             return true
         case .missingAPIKey, .invalidEndpoint, .capacityExhausted, .modelUnavailable,
-             .rateLimited, .malformedEvent, .streamInterrupted, .attachmentUnavailable,
+             .rateLimited, .malformedEvent, .streamInterrupted, .upstreamPending, .attachmentUnavailable,
              .attachmentTooLarge, .unsupportedAttachmentType, .protocolIncompatible,
              .transport, .invalidResponse:
             return false
@@ -2025,7 +2156,7 @@ public enum ProviderHostFallbackClassifier {
                 || (500...599).contains(code)
         case .protocolIncompatible, .malformedEvent:
             return true
-        case .missingAPIKey, .capacityExhausted, .rateLimited, .streamInterrupted,
+        case .missingAPIKey, .capacityExhausted, .rateLimited, .streamInterrupted, .upstreamPending,
              .attachmentUnavailable, .attachmentTooLarge, .unsupportedAttachmentType:
             return false
         }
@@ -2046,7 +2177,7 @@ public enum ProviderProtocolFallbackClassifier {
         case .invalidResponse(let code):
             return code == 400 || code == 404 || code == 405 || code == 422 || (500...599).contains(code)
         case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .capacityExhausted,
-             .rateLimited, .streamInterrupted, .attachmentUnavailable, .attachmentTooLarge,
+             .rateLimited, .streamInterrupted, .upstreamPending, .attachmentUnavailable, .attachmentTooLarge,
              .unsupportedAttachmentType, .transport:
             return false
         }
@@ -2071,7 +2202,7 @@ public enum ProviderKeyRotationClassifier {
                 // Channel availability is frequently Key/account scoped on compatible gateways.
                 // Before any output, another Key owned by the same Provider is a safe bounded route.
                 return true
-            case .missingAPIKey, .invalidEndpoint, .rateLimited, .malformedEvent, .streamInterrupted,
+            case .missingAPIKey, .invalidEndpoint, .rateLimited, .malformedEvent, .streamInterrupted, .upstreamPending,
                  .attachmentUnavailable, .attachmentTooLarge, .unsupportedAttachmentType,
                  .protocolIncompatible, .transport:
                 return false
@@ -2085,7 +2216,7 @@ public enum ProviderRetryClassifier {
     public static func isRetryableBeforeOutput(_ error: Error) -> Bool {
         if let providerError = error as? ProviderError {
             switch providerError {
-            case .rateLimited:
+            case .rateLimited, .upstreamPending:
                 return true
             case .invalidResponse(let code):
                 return (500...599).contains(code)
@@ -2120,7 +2251,9 @@ public enum ProviderRetryClassifier {
 
     public static func isReplaySafeAfterHTTPResponseBeforeOutput(_ error: Error) -> Bool {
         if let providerError = error as? ProviderError {
-            return providerError == .malformedEvent
+            if providerError == .malformedEvent { return true }
+            if case .upstreamPending = providerError { return true }
+            return false
         }
         guard let urlError = error as? URLError else { return false }
         return urlError.code == .cannotParseResponse

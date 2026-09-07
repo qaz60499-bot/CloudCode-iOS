@@ -54,7 +54,7 @@ public enum ProviderEndpointHealthClassifier {
                 return (500...599).contains(code)
             case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .clientRejected,
                  .capacityExhausted, .modelUnavailable, .rateLimited, .malformedEvent,
-                 .streamInterrupted, .attachmentUnavailable, .attachmentTooLarge,
+                 .streamInterrupted, .upstreamPending, .attachmentUnavailable, .attachmentTooLarge,
                  .unsupportedAttachmentType, .protocolIncompatible, .transport:
                 return false
             }
@@ -772,12 +772,12 @@ public enum ProviderCatalog {
                         "claude-opus-4-6": [.anthropic],
                         "claude-opus-5": [.anthropic],
                         "gpt-5.5": [.openAIChat],
-                        "gpt-5.6-sol": [.anthropic],
+                        "gpt-5.6-sol": [.openAIChat, .anthropic],
                         "kimi-k2.6": [.openAIChat],
                         "glm-5.1": [.openAIChat],
                         "glm-5.2": [.openAIChat],
-                        "glm-5.3": [.anthropic],
-                        "deepseek-v4-flash": [.anthropic],
+                        "glm-5.3": [.openAIChat, .anthropic],
+                        "deepseek-v4-flash": [.openAIChat, .anthropic],
                         "step3p5-code-alpha": [.openAIChat]
                     ]
                 )],
