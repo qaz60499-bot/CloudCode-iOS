@@ -258,9 +258,14 @@ public actor AppKnowledgeRegistry {
             entries = [:]
             return
         }
-        if let data = try? Data(contentsOf: fileURL),
-           let decoded = try? JSONDecoder().decode([String: AppKnowledge].self, from: data) {
-            entries = decoded
+        if let data = try? Data(contentsOf: fileURL) {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            if let decoded = try? decoder.decode([String: AppKnowledge].self, from: data) {
+                entries = decoded
+            } else {
+                entries = [:]
+            }
         } else {
             entries = [:]
         }
