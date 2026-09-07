@@ -1897,8 +1897,9 @@ final class ProviderProtocolClientTests: XCTestCase {
         let wait = ProviderError.protocolIncompatible("Waiting for API response")
         let hard = ProviderError.protocolIncompatible("tool schema is unsupported")
 
-        XCTAssertNil(ProviderCompatibilityClassifier.agentRouterTransientStreamPendingDetail(unknown), "Unknown HTTP 200 stream failures are not enough evidence to classify the route as merely pending.")
+        XCTAssertNotNil(ProviderCompatibilityClassifier.agentRouterTransientStreamPendingDetail(unknown), "Within the AgentRouter HTTP-200/body/no-output guard, the opaque gateway sentinel is not protocol-incompatibility evidence.")
         XCTAssertNotNil(ProviderCompatibilityClassifier.agentRouterTransientStreamPendingDetail(wait))
+        XCTAssertNotNil(ProviderCompatibilityClassifier.agentRouterTransientStreamPendingDetail(.protocolIncompatible("Anthropic 流返回错误事件")))
         XCTAssertNil(ProviderCompatibilityClassifier.agentRouterTransientStreamPendingDetail(hard))
 
         let pending = ProviderError.upstreamPending("Waiting for API response")
@@ -1909,6 +1910,44 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertFalse(ProviderKeyRotationClassifier.shouldRotate(pending))
         XCTAssertFalse(ProviderCompatibilityDriftClassifier.shouldDegradeProtocol(pending))
         XCTAssertFalse(ProviderCompatibilityDriftClassifier.shouldDegradeHost(pending, providerID: ProviderCatalog.agentRouterID))
+    }
+
+    func testAgentRouterOpaqueHTTP200PendingReplaysSameAnthropicRouteOnceBeforeOutput() async throws {
+        AgentRouterPendingReplayURLProtocol.reset()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [AgentRouterPendingReplayURLProtocol.self]
+        let client = AnthropicProviderClient(
+            session: URLSession(configuration: configuration),
+            retryPolicy: RetryPolicy(maxAttempts: 2, initialDelayNanoseconds: 0)
+        )
+        let provider = ProviderConfiguration(
+            name: "AgentRouter",
+            baseURL: URL(string: "https://agentrouter.org")!,
+            model: "glm-5.3",
+            apiKeyReference: "key",
+            providerID: ProviderCatalog.agentRouterID,
+            protocolName: ProviderProtocol.anthropic.rawValue,
+            authModeName: ProviderAuthMode.bearer.rawValue
+        )
+
+        var events: [ProviderEvent] = []
+        for try await event in client.stream(
+            configuration: provider,
+            apiKey: "test-secret",
+            messages: [ChatMessage(role: .user, content: "hi")],
+            tools: []
+        ) {
+            events.append(event)
+        }
+
+        XCTAssertEqual(events.last, .finished)
+        let requests = AgentRouterPendingReplayURLProtocol.requests()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests.map { $0.url?.absoluteString }, [
+            "https://agentrouter.org/v1/messages",
+            "https://agentrouter.org/v1/messages"
+        ])
+        XCTAssertTrue(requests.allSatisfy { $0.value(forHTTPHeaderField: "Authorization") == "Bearer test-secret" })
     }
 
     func testAgentRouterTextOnlyCompatibilityRetryIsScopedToImageTypeRejection() {
@@ -3160,6 +3199,55 @@ private final class ProviderPricingDiscoveryURLProtocol: URLProtocol, @unchecked
             body = Data(#"{"error":"unsupported"}"#.utf8)
         }
         guard let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"]) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class AgentRouterPendingReplayURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    private static var capturedRequests: [URLRequest] = []
+
+    static func reset() {
+        lock.lock()
+        capturedRequests = []
+        lock.unlock()
+    }
+
+    static func requests() -> [URLRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return capturedRequests
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.lock.lock()
+        let index = Self.capturedRequests.count
+        Self.capturedRequests.append(request)
+        Self.lock.unlock()
+
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let body = index == 0
+            ? Data("data: {\"error\":{}}\n\n".utf8)
+            : Data("data: {\"type\":\"message_stop\"}\n\n".utf8)
+        guard let response = HTTPURLResponse(
+            url: url,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "text/event-stream"]
+        ) else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return
         }

@@ -1908,7 +1908,18 @@ public enum ProviderCompatibilityClassifier {
             "temporarily busy", "upstream busy", "upstream not ready", "api response pending",
             "等待 api", "等待api", "上游等待", "上游未就绪", "上游繁忙"
         ]
-        return pendingMarkers.contains(where: normalized.contains) ? detail : nil
+        if pendingMarkers.contains(where: normalized.contains) { return detail }
+
+        // This exact sentinel is produced when an HTTP 200 SSE error event exists but its
+        // gateway payload has no parseable detail. requestStream invokes this classifier only
+        // for AgentRouter after a 2xx stream is established, body bytes were received, and no
+        // token/tool output was emitted. In that narrow state the event is insufficient evidence
+        // to condemn the protocol/Host, so keep the exact route and use the bounded replay budget.
+        let opaqueAgentRouterPendingSentinels = [
+            "上游未提供可解析的错误详情",
+            "anthropic 流返回错误事件"
+        ]
+        return opaqueAgentRouterPendingSentinels.contains(normalized) ? detail : nil
     }
 
     public static func shouldRetryAgentRouterWithoutImageAttachments(

@@ -2510,6 +2510,48 @@ final class CloudCodeCoreTests: XCTestCase {
         })
     }
 
+    func testGUICompletionGuardRejectsTypeOnlyFinishForMessageSend() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let registry = ToolRegistry(descriptors: [
+            ToolDescriptor(name: "gui.type", summary: "type", risk: .safeWrite, preferredRoute: .guiFallback)
+        ])
+        let agent = AgentCore(
+            provider: PrematureMessageTypeOnlyProvider(),
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(
+                registry: registry,
+                executors: [CountingExecutor(route: .guiFallback, names: ["gui.type"], counter: InvocationCounter())]
+            ),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            maxToolRounds: 5
+        )
+        let session = AgentSession(permissionMode: .full)
+        let stream = await agent.send(
+            text: "打开微信给文件传输助手发一个一",
+            session: session,
+            providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key")
+        )
+        var caughtError: Error?
+        do {
+            for try await _ in stream {}
+        } catch {
+            caughtError = error
+        }
+        XCTAssertNotNil(caughtError, "Typing text alone must not satisfy a message-send request.")
+
+        let saved = try await sessions.load(session.id)
+        XCTAssertTrue(saved.messages.contains {
+            $0.role == .system
+                && $0.providerMetadata["context_layer"] == "gui_completion_guard"
+                && $0.content.contains("文本输入后还没有确认执行提交/发送动作")
+        })
+    }
+
     func testTreeFailureThenFreshScreenshotActivatesComputerUseFallbackAndSwipe() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -4121,10 +4163,16 @@ final class CloudCodeCoreTests: XCTestCase {
     }
 
     func testHarnessFiniteVideoBrowsePrefersCoordinateFreeFeedSample() {
-        let hint = HarnessContextManager.executionHint(from: [ChatMessage(role: .user, content: "打开抖音刷 5 条视频")])
+        XCTAssertEqual(HarnessContextManager.boundedRepeatedSwipeCount(in: "打开抖音刷 3 条"), 3)
+        XCTAssertEqual(HarnessContextManager.boundedRepeatedSwipeCount(in: "刷 5 条"), 5)
+        XCTAssertEqual(HarnessContextManager.boundedRepeatedSwipeCount(in: "swipe 3 times"), 3)
+        XCTAssertTrue(HarnessContextManager.requestsConsecutiveFeedItems(in: "打开抖音刷 3 条"))
+
+        let hint = HarnessContextManager.executionHint(from: [ChatMessage(role: .user, content: "打开抖音刷 5 条")])
         XCTAssertTrue(hint?.content.contains("gui.feedSample") == true)
         XCTAssertTrue(hint?.content.contains("coordinate-free") == true)
         XCTAssertEqual(hint?.providerMetadata["execution_mode"], "bounded_feed_sample")
+        XCTAssertEqual(hint?.providerMetadata["repeat_count"], "5")
     }
 
     func testHarnessExecutionHintTracksTransientVideoReturnBeforeTyping() {
@@ -5317,6 +5365,26 @@ private struct PrematureGUICompletionProvider: ProviderStreaming, Sendable {
         return AsyncThrowingStream { continuation in
             if completedTools == 0 {
                 continuation.yield(.toolCall(id: "launch-only", name: "apps_launch", argumentsJSON: "{\"bundleId\":\"com.ss.iphone.ugc.aweme.lite\"}"))
+            } else {
+                continuation.yield(.token("done"))
+            }
+            continuation.yield(.finished)
+            continuation.finish()
+        }
+    }
+}
+
+private struct PrematureMessageTypeOnlyProvider: ProviderStreaming, Sendable {
+    func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        let completedTools = messages.filter { $0.role == .tool }.count
+        return AsyncThrowingStream { continuation in
+            if completedTools == 0 {
+                continuation.yield(.toolCall(id: "type-only", name: "gui_type", argumentsJSON: "{\"text\":\"一\"}"))
             } else {
                 continuation.yield(.token("done"))
             }

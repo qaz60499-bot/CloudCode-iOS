@@ -1064,8 +1064,8 @@ public actor AgentCore {
                                     subsystem: "agent",
                                     action: "completion-guard",
                                     result: "replan",
-                                    diagnostic: completionBlockReason,
                                     sessionID: session.id,
+                                    diagnostic: completionBlockReason,
                                     metadata: ["attempt": String(prematureCompletionReplanCount)]
                                 )
                                 continuation.yield(.status("模型尝试过早结束任务；已根据实际 GUI 执行证据继续。"))

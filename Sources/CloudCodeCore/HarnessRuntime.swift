@@ -179,17 +179,25 @@ public enum HarnessContextManager {
     static func requestsConsecutiveFeedItems(in request: String) -> Bool {
         let normalized = request.lowercased()
         let feedMarkers = ["个视频", "条视频", "條視頻", "个帖子", "条帖子", "條帖子", "videos", "posts", "feed"]
-        return feedMarkers.contains(where: normalized.contains)
+        if feedMarkers.contains(where: normalized.contains) { return true }
+
+        // Chinese users often abbreviate a feed request as “刷 3 条 / 刷五条” without repeating
+        // “视频”. Treat that bounded “刷 + item-count” shape as feed semantics so the provider can
+        // use coordinate-free gui.feedSample instead of inventing raw swipe coordinates.
+        let abbreviatedFeedPattern = #"刷\s*(?:[2-9]|1[0-2]|二|两|兩|三|四|五|六|七|八|九|十|十一|十二)\s*(?:条|條|个|個)"#
+        return (try? NSRegularExpression(pattern: abbreviatedFeedPattern)).map {
+            $0.firstMatch(in: request, range: NSRange(request.startIndex..., in: request)) != nil
+        } ?? false
     }
 
     static func boundedRepeatedSwipeCount(in request: String) -> Int? {
         let normalized = request.lowercased()
         let actionMarkers = ["swipe", "滑", "刷"]
         guard actionMarkers.contains(where: normalized.contains) else { return nil }
-        let finiteMarkers = ["次", "下", "个视频", "條視頻", "条视频", "videos", "times"]
+        let finiteMarkers = ["次", "下", "个视频", "條視頻", "条视频", "条", "條", "个", "個", "videos", "times"]
         guard finiteMarkers.contains(where: normalized.contains) else { return nil }
 
-        let digitPattern = #"(?<!\d)([2-9]|1[0-2])\s*(?:次|下|个视频|條視頻|条视频|videos?|times?)"#
+        let digitPattern = #"(?<!\d)([2-9]|1[0-2])\s*(?:次|下|个视频|條視頻|条视频|条|條|个|個|videos?|times?)"#
         if let regex = try? NSRegularExpression(pattern: digitPattern, options: [.caseInsensitive]),
            let match = regex.firstMatch(in: request, range: NSRange(request.startIndex..., in: request)),
            let range = Range(match.range(at: 1), in: request),
@@ -203,7 +211,7 @@ public enum HarnessContextManager {
             ("五", 5), ("四", 4), ("三", 3), ("二", 2), ("两", 2), ("兩", 2)
         ]
         for (token, count) in chineseCounts {
-            for suffix in ["次", "下", "个视频", "條視頻", "条视频"] where normalized.contains(token + suffix) {
+            for suffix in ["次", "下", "个视频", "條視頻", "条视频", "条", "條", "个", "個"] where normalized.contains(token + suffix) {
                 return count
             }
         }
