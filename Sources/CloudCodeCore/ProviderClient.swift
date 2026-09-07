@@ -19,11 +19,11 @@ public enum ProviderEndpointPolicy {
 }
 
 public enum ProviderEndpointRoutingPolicy {
-    // Keep the historical fingerprint only as non-secret compatibility metadata for old catalog
-    // snapshots. Live validation proved that the legacy origin can return HTTP 200 web content
-    // for /v1/* while the current API origin rejects that historical Key, so fingerprint alone
-    // must never select a Host. Start from the current documented API origin and let only exact,
-    // verified Key×Host evidence reorder these two allowlisted origins.
+    // Keep the historical fingerprint as a non-secret Host-order hint only. Desktop NativeCloud
+    // and direct local probes confirm that this exact Key generation still uses agentrouter.org,
+    // while newly provisioned/unknown Keys should start from co.agentrouter.org. A fingerprint
+    // never counts as success evidence: non-API 2xx responses are rejected and only exact verified
+    // Key×Host evidence may persistently reorder these two allowlisted origins.
     public static let agentRouterLegacyKeyFingerprint = "105a3fce9a105c41472b926f6448a91be2f9726d5e074adbaaa2206f4d6dbf23"
     public static let compatibilityEvidenceRevision = "3"
 
@@ -37,10 +37,11 @@ public enum ProviderEndpointRoutingPolicy {
         let legacy = URL(string: "https://agentrouter.org")!
         // AgentRouter host failover is an allowlisted Provider capability. Never let an arbitrary
         // configured URL become a fallback merely because the Provider id was set to AgentRouter.
-        // Historical fingerprint metadata is not route proof; persisted exact successful evidence
+        // Historical fingerprint metadata seeds order only; persisted exact successful evidence
         // may reorder these candidates later through ProviderRequestKeyState.
-        _ = keyFingerprint
-        let seed = [current, legacy]
+        let seed = keyFingerprint == agentRouterLegacyKeyFingerprint
+            ? [legacy, current]
+            : [current, legacy]
         var seen = Set<String>()
         return seed.filter { url in
             let key = normalizedOrigin(url)

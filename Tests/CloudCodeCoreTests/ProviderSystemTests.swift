@@ -127,14 +127,14 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(provider.protocolCandidates(for: "gpt-5.6-sol", keySlotID: "slot-1"), [.openAIChat, .anthropic])
     }
 
-    func testAgentRouterEndpointCandidatesStartCurrentHostEvenForHistoricalFingerprint() throws {
+    func testAgentRouterEndpointCandidatesUseHistoricalFingerprintOnlyAsHostOrderHint() throws {
         let configured = try XCTUnwrap(URL(string: "https://co.agentrouter.org"))
         let legacy = ProviderEndpointRoutingPolicy.candidateBaseURLs(
             providerID: ProviderCatalog.agentRouterID,
             configuredBaseURL: configured,
             keyFingerprint: ProviderEndpointRoutingPolicy.agentRouterLegacyKeyFingerprint
         )
-        XCTAssertEqual(legacy.map(\.host), ["co.agentrouter.org", "agentrouter.org"])
+        XCTAssertEqual(legacy.map(\.host), ["agentrouter.org", "co.agentrouter.org"])
         let current = ProviderEndpointRoutingPolicy.candidateBaseURLs(
             providerID: ProviderCatalog.agentRouterID,
             configuredBaseURL: configured,
@@ -1553,7 +1553,7 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(events.last, .finished)
     }
 
-    func testAgentRouterHistoricalDeepSeekSeedUsesAnthropicOnCurrentOriginAndBearerAuth() async throws {
+    func testAgentRouterHistoricalDeepSeekSeedUsesAnthropicOnLegacyOriginAndBearerAuth() async throws {
         let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-agentrouter-org" }))
         let slot = try XCTUnwrap(provider.keySlots.first(where: { $0.id == "slot-1" }))
         let protocolName = provider.protocolFor(model: "deepseek-v4-flash", keySlotID: "slot-1")
@@ -1564,7 +1564,7 @@ final class ProviderProtocolClientTests: XCTestCase {
             configuredBaseURL: provider.baseURL,
             keyFingerprint: slot.fingerprint
         ).first)
-        XCTAssertEqual(baseURL.host, "co.agentrouter.org")
+        XCTAssertEqual(baseURL.host, "agentrouter.org")
         ProviderTestURLProtocol.install(
             status: 200,
             body: Data("data: {\"type\":\"message_stop\"}\n\n".utf8),
@@ -1582,7 +1582,7 @@ final class ProviderProtocolClientTests: XCTestCase {
         )
         for try await _ in client.stream(configuration: configuration, apiKey: "test-secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
         let request = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
-        XCTAssertEqual(request.url?.absoluteString, "https://co.agentrouter.org/v1/messages")
+        XCTAssertEqual(request.url?.absoluteString, "https://agentrouter.org/v1/messages")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
         XCTAssertNil(request.value(forHTTPHeaderField: "x-api-key"))
         XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-version"), "2023-06-01")

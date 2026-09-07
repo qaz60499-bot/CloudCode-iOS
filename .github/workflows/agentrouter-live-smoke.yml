@@ -60,9 +60,9 @@ jobs:
           fingerprint = hashlib.sha256(secret.encode("utf-8")).hexdigest()
           legacy_key = fingerprint == LEGACY_FINGERPRINT
           print(f"AGENTROUTER_KEY_FINGERPRINT_MATCHES_LEGACY={str(legacy_key).lower()}")
-          # Historical fingerprint is diagnostic metadata only. Runtime revision 3 starts from
-          # the current documented API origin and lets only verified route evidence reorder Hosts.
-          origins = [CURRENT_ORIGIN, LEGACY_ORIGIN]
+          # Runtime revision 3 treats the historical fingerprint as a Host-order hint only;
+          # non-API 2xx is still rejected and only verified route evidence may persist preference.
+          origins = [LEGACY_ORIGIN, CURRENT_ORIGIN] if legacy_key else [CURRENT_ORIGIN, LEGACY_ORIGIN]
 
           def request(origin, path, payload=None, anthropic=False):
               headers = {
