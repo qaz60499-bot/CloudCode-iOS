@@ -1575,12 +1575,43 @@ public actor AgentCore {
                                     let rawContent = String(data: data, encoding: .utf8) ?? result.summary
                                     let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name)", content: rawContent).promptSafeRepresentation
                                     session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: ["tool_call_id": providerCallID, "tool_name": name, "provider_tool_name": providerToolName]))
-                                    if Self.shouldExplainFailure(toolName: name, result: result),
-                                       var explanation = await toolRouter.explainFailure(
-                                        sessionID: session.id,
-                                        toolCallID: call.id,
-                                        capabilities: capabilities
-                                       ) {
+                                    if Self.shouldExplainFailure(toolName: name, result: result) {
+                                        var resolvedExplanation = await toolRouter.explainFailure(
+                                            sessionID: session.id,
+                                            toolCallID: call.id,
+                                            capabilities: capabilities
+                                        )
+                                        if resolvedExplanation == nil,
+                                           let fallbackDepth = result.payload["fallbackDepth"].flatMap(Int.init), fallbackDepth >= 2 {
+                                            // A successful deep fallback is diagnostic-only degradation. If the exact
+                                            // tool-call log is unavailable, use the immediately current session evidence
+                                            // once rather than silently dropping the diagnosis; tools execute serially.
+                                            resolvedExplanation = await toolRouter.explainFailure(
+                                                sessionID: session.id,
+                                                toolCallID: nil,
+                                                capabilities: capabilities
+                                            )
+                                            if resolvedExplanation == nil {
+                                                let derived = DiagnosticLogRecord(
+                                                    sessionID: session.id,
+                                                    toolCallID: call.id,
+                                                    level: .warning,
+                                                    subsystem: "tool",
+                                                    action: name,
+                                                    result: result.success ? "completed" : "failed",
+                                                    diagnostic: result.summary,
+                                                    metadata: result.payload
+                                                )
+                                                resolvedExplanation = DiagnosticProblemPackageBuilder.explainFailure(
+                                                    records: [derived],
+                                                    executionMetrics: [],
+                                                    capabilities: capabilities,
+                                                    sessionID: session.id,
+                                                    toolCallID: call.id
+                                                )
+                                            }
+                                        }
+                                        if var explanation = resolvedExplanation {
                                         let budgetKey = Self.diagnosticRecoveryBudgetKey(for: explanation.failureSignature)
                                         let usedRecovery = max(0, Int(checkpoint.payload[budgetKey] ?? "0") ?? 0)
                                         if usedRecovery >= 2 {
@@ -1607,6 +1638,7 @@ public actor AgentCore {
                                         ))
                                         checkpoint.updatedAt = Date()
                                         try? await checkpointStore.upsert(checkpoint)
+                                        }
                                     }
                                     if result.success {
                                         let postLaunchGUIActions: Set<String> = [

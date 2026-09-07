@@ -430,14 +430,15 @@ final class CloudCodeCoreTests: XCTestCase {
         let directory = root.appendingPathComponent("logs", isDirectory: true)
         let first = DiagnosticLogStore(directory: directory)
         let sessionID = UUID()
-        let earlier = Date(timeIntervalSinceReferenceDate: 1_000.125)
-        let later = Date(timeIntervalSinceReferenceDate: 1_000.875)
+        let earlier = Date().addingTimeInterval(-1.0)
+        let later = earlier.addingTimeInterval(0.75)
         try await first.append(DiagnosticLogRecord(timestamp: earlier, sessionID: sessionID, level: .info, subsystem: "test", action: "earlier", result: "ok"))
         try await first.append(DiagnosticLogRecord(timestamp: later, sessionID: sessionID, level: .info, subsystem: "test", action: "later", result: "ok"))
 
         let restarted = DiagnosticLogStore(directory: directory)
         let records = try await restarted.recent(sessionID: sessionID, limit: 10)
         XCTAssertEqual(records.map(\.action), ["earlier", "later"])
+        guard records.count == 2 else { return }
         XCTAssertEqual(records[0].timestamp.timeIntervalSinceReferenceDate, earlier.timeIntervalSinceReferenceDate, accuracy: 0.001)
         XCTAssertEqual(records[1].timestamp.timeIntervalSinceReferenceDate, later.timeIntervalSinceReferenceDate, accuracy: 0.001)
     }

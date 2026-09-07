@@ -797,7 +797,8 @@ public enum DiagnosticProblemPackageBuilder {
         }
         let ocrInvoked = record.metadata["perceptionOCRInvoked"] == "true"
         let localVisionSemanticFailure = ocrInvoked && (
-            record.metadata["localVisionFailureClass"] != nil
+            record.result.lowercased().contains("fail")
+                || record.metadata["localVisionFailureClass"] != nil
                 || record.metadata["perceptionOCRSucceeded"] == "false"
                 || record.metadata["perceptionLocalSufficient"] == "false" && record.metadata["perceptionFallbackReason"] != nil
         )
