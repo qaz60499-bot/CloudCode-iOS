@@ -2021,9 +2021,13 @@ final class ProviderProtocolClientTests: XCTestCase {
         for try await _ in client.stream(configuration: configuration, apiKey: "metadata-secret", messages: [screenshot], tools: []) {}
 
         XCTAssertEqual(ProviderVisionCapabilityURLProtocol.requestCount(), 2, "cached metadata support must avoid a second capability probe")
-        let realRequestText = String(data: try XCTUnwrap(ProviderVisionCapabilityURLProtocol.bodies().last), encoding: .utf8) ?? ""
-        XCTAssertTrue(realRequestText.contains("image_url"))
-        XCTAssertTrue(realRequestText.contains(imageBytes.base64EncodedString()))
+        let realRequestData = try XCTUnwrap(ProviderVisionCapabilityURLProtocol.bodies().last)
+        let realRequest = try XCTUnwrap(JSONSerialization.jsonObject(with: realRequestData) as? [String: Any])
+        let messages = try XCTUnwrap(realRequest["messages"] as? [[String: Any]])
+        let content = try XCTUnwrap(messages.first?["content"] as? [[String: Any]])
+        let imagePart = try XCTUnwrap(content.first(where: { ($0["type"] as? String) == "image_url" }))
+        let imageDataURL = try XCTUnwrap((imagePart["image_url"] as? [String: Any])?["url"] as? String)
+        XCTAssertTrue(imageDataURL.hasSuffix(imageBytes.base64EncodedString()))
     }
 
     func testProviderVisionCapabilityTinyProbeRunsOnceAndPreventsRealScreenshotSerializationWhenTextOnly() async throws {

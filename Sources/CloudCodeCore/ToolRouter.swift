@@ -706,7 +706,7 @@ public actor ToolRouter {
         guard let diagnosticLogger else { return nil }
         let records = (try? await diagnosticLogger.recent(sessionID: sessionID, limit: 384)) ?? []
         let metrics = await executionPathMetrics.recent(limit: 256)
-        guard var explanation = DiagnosticProblemPackageBuilder.explainFailure(
+        var explanation = DiagnosticProblemPackageBuilder.explainFailure(
             records: records,
             executionMetrics: metrics,
             capabilities: capabilities,
@@ -714,7 +714,46 @@ public actor ToolRouter {
             toolCallID: toolCallID,
             recoveryAttemptCount: recoveryAttemptCount,
             maximumRecoveryAttempts: maximumRecoveryAttempts
-        ) else { return nil }
+        )
+        if explanation == nil,
+           let toolCallID,
+           let metric = metrics.last(where: { $0.toolCallID == toolCallID }),
+           metric.fallbackDepth >= 2 || metric.outcome.localizedCaseInsensitiveContains("fail") {
+            // ExecutionPathMetric is already bounded, local, redacted routing evidence. If the
+            // corresponding file-backed diagnostic record is unavailable, convert only this exact
+            // tool-call metric into one diagnostic record so diagnosis does not silently disappear.
+            // No probe or executor is invoked here.
+            let metadata: [String: String] = [
+                "route": metric.selectedRoute?.rawValue ?? "",
+                "routeCandidates": metric.routeCandidates.map(\.rawValue).joined(separator: ","),
+                "fallbackReason": metric.fallbackReason,
+                "fallbackDepth": String(metric.fallbackDepth),
+                "routeSelectionLatencyMS": String(metric.routeSelectionLatencyMS),
+                "executionLatencyMS": String(metric.executionLatencyMS),
+                "totalLatencyMS": String(metric.totalLatencyMS)
+            ]
+            let derivedRecord = DiagnosticLogRecord(
+                timestamp: metric.recordedAt,
+                sessionID: metric.sessionID ?? sessionID,
+                toolCallID: metric.toolCallID,
+                level: metric.outcome.localizedCaseInsensitiveContains("fail") ? .error : .warning,
+                subsystem: "tool",
+                action: metric.tool,
+                result: metric.outcome,
+                diagnostic: metric.fallbackDepth >= 2 ? "bounded execution path used a deep fallback route" : nil,
+                metadata: metadata
+            )
+            explanation = DiagnosticProblemPackageBuilder.explainFailure(
+                records: records + [derivedRecord],
+                executionMetrics: metrics,
+                capabilities: capabilities,
+                sessionID: sessionID,
+                toolCallID: toolCallID,
+                recoveryAttemptCount: recoveryAttemptCount,
+                maximumRecoveryAttempts: maximumRecoveryAttempts
+            )
+        }
+        guard var explanation else { return nil }
         if let toolCallID, let executionLedger, let record = await executionLedger.record(for: toolCallID) {
             explanation.evidenceSummary.append("ledger_state=\(record.state.rawValue);ledger_tool=\(DiagnosticRedactor.redact(record.toolName))")
             explanation.evidenceSummary = Array(explanation.evidenceSummary.prefix(12))

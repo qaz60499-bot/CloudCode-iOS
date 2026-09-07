@@ -792,10 +792,13 @@ public enum DiagnosticProblemPackageBuilder {
             || action.contains("tapelementobserve") || action.contains("typeelementobserve") || action.contains("runstructuredplan")
             || combined.contains("accessibility") || combined.contains(" ax")
             || record.metadata["perceptionAXAttempted"] == "true" && record.metadata["perceptionAXSucceeded"] == "false" { return .axObservation }
+        if action.contains("verify") || combined.contains("verification") {
+            return .guiVerification
+        }
         let ocrInvoked = record.metadata["perceptionOCRInvoked"] == "true"
         let localVisionSemanticFailure = ocrInvoked && (
-            record.result.lowercased().contains("fail")
-                || record.metadata["localVisionFailureClass"] != nil
+            record.metadata["localVisionFailureClass"] != nil
+                || record.metadata["perceptionOCRSucceeded"] == "false"
                 || record.metadata["perceptionLocalSufficient"] == "false" && record.metadata["perceptionFallbackReason"] != nil
         )
         if action.contains("screenshot") || combined.contains("localvision") || combined.contains("ocr")
@@ -805,7 +808,6 @@ public enum DiagnosticProblemPackageBuilder {
         if action.contains("type") { return .guiTextInput }
         if action.contains("swipe") || action.contains("scroll") || action.contains("feedsample") || action.contains("tap") { return .guiGesture }
         if action.contains("navigate") || action.contains("openapp") || action.contains("openurl") { return .guiNavigation }
-        if action.contains("verify") || combined.contains("verification") { return .guiVerification }
         if subsystem == "tool" && record.metadata["route"] != nil { return .toolRouting }
         if combined.contains("native") || combined.contains("cli") { return .nativeExecution }
         if subsystem.contains("agent") || combined.contains("planner") || combined.contains("planning") { return .agentPlanning }

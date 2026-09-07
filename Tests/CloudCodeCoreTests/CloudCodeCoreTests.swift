@@ -424,6 +424,24 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(Set(records.map(\.action)), Set(["before", "after"]))
     }
 
+    func testDiagnosticLogStorePreservesSubsecondOrderingAcrossRestart() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = root.appendingPathComponent("logs", isDirectory: true)
+        let first = DiagnosticLogStore(directory: directory)
+        let sessionID = UUID()
+        let earlier = Date(timeIntervalSinceReferenceDate: 1_000.125)
+        let later = Date(timeIntervalSinceReferenceDate: 1_000.875)
+        try await first.append(DiagnosticLogRecord(timestamp: earlier, sessionID: sessionID, level: .info, subsystem: "test", action: "earlier", result: "ok"))
+        try await first.append(DiagnosticLogRecord(timestamp: later, sessionID: sessionID, level: .info, subsystem: "test", action: "later", result: "ok"))
+
+        let restarted = DiagnosticLogStore(directory: directory)
+        let records = try await restarted.recent(sessionID: sessionID, limit: 10)
+        XCTAssertEqual(records.map(\.action), ["earlier", "later"])
+        XCTAssertEqual(records[0].timestamp.timeIntervalSinceReferenceDate, earlier.timeIntervalSinceReferenceDate, accuracy: 0.001)
+        XCTAssertEqual(records[1].timestamp.timeIntervalSinceReferenceDate, later.timeIntervalSinceReferenceDate, accuracy: 0.001)
+    }
+
     func testDiagnosticLogStoreSkipsCorruptLinesAndKeepsValidRecords() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1149,7 +1167,8 @@ final class CloudCodeCoreTests: XCTestCase {
             totalLatencyMS: 10,
             outcome: "failed",
             sessionID: sessionID,
-            toolCallID: toolCallID
+            toolCallID: toolCallID,
+            recordedAt: record.timestamp
         )
         let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
             records: [record], executionMetrics: [unrelated, exact], capabilities: CapabilityProfile(records: []), sessionID: sessionID, toolCallID: toolCallID
@@ -1193,6 +1212,7 @@ final class CloudCodeCoreTests: XCTestCase {
             totalLatencyMS: 9,
             outcome: "failed",
             sessionID: sessionID,
+            toolCallID: targetCallID,
             recordedAt: Date(timeIntervalSinceReferenceDate: 200)
         )
         let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
@@ -4080,10 +4100,12 @@ final class CloudCodeCoreTests: XCTestCase {
             CapabilityRecord(id: GUIAutomationFeature.verify.capabilityID, domain: .automation, status: .available, detail: "mock verify")
         ])
         let session = AgentSession(permissionMode: .full)
+        let providerConfiguration = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "gui-sequenced-vision-supported", apiKeyReference: "test-key")
+        await ProviderImageCompatibilityPolicy.mark(.supported, source: "test_mock", configuration: providerConfiguration, apiKey: "secret")
         let stream = await agent.send(
             text: "open the target and complete it",
             session: session,
-            providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key"),
+            providerConfiguration: providerConfiguration,
             capabilityProfile: validated
         )
         for try await _ in stream {}
@@ -6383,7 +6405,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(result.success)
         XCTAssertEqual(result.payload["route"], AppExecutionRoute.guiFallback.rawValue)
         XCTAssertEqual(result.payload["fallbackDepth"], "4")
-        XCTAssertTrue((result.payload["fallbackReason"] ?? "").contains("structured_tool:no_executor"))
+        XCTAssertTrue((result.payload["fallbackReason"] ?? "").contains("structuredTool:no_executor"))
         XCTAssertNotNil(result.payload["routeCandidates"])
         XCTAssertNotNil(result.payload["routeSelectionLatencyMS"])
     }
