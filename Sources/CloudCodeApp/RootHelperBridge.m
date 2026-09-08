@@ -190,9 +190,7 @@ static NSInteger CloudCodeSpawnHelperInternal(
         if (spawnError != 0) {
             result = -3000 - spawnError;
         } else {
-            NSString *command = arguments.firstObject ?: @"";
-            const BOOL tracePerception = [path.lastPathComponent hasPrefix:@"CloudCode"] &&
-                ([command hasPrefix:@"gui-"] || [command hasPrefix:@"ocr-"] || [command hasPrefix:@"probe-ocr-"]);
+            const BOOL tracePerception = [path.lastPathComponent hasPrefix:@"CloudCode"];
             BOOL parentTimeout = NO;
             int timeoutKillResult = 0;
             int timeoutKillErrno = 0;
