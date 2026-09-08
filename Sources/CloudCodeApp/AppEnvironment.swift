@@ -2715,6 +2715,31 @@ public final class CloudCodeViewModel: ObservableObject {
     public func recordPerceptionProbe(id: String, stage: String, json: String) async {
         try? await diagnosticLogStore.log(level: .info, subsystem: "perception-probe", action: stage,
             result: "recorded", diagnostic: json, metadata: ["probeID": id])
+        Self.emitPerceptionProbeToSystemLog(id: id, stage: stage, json: json)
+    }
+
+    /// Mirrors only an explicitly triggered perception probe to the Apple system log so a USB
+    /// capture can reconstruct the evidence without opening the app container. The normal runtime,
+    /// Provider traffic, Agent transcript, and general diagnostics never use this path.
+    private static func emitPerceptionProbeToSystemLog(id: String, stage: String, json: String) {
+        let byteLimit = 32 * 1024
+        guard json.utf8.count <= byteLimit else {
+            NSLog("%@", "[CloudCodePerceptionProbe] probeID=\(id) stage=\(stage) mirror=skipped_oversize bytes=\(json.utf8.count)")
+            return
+        }
+        let encoded = Array(Data(json.utf8).base64EncodedString().utf8)
+        let chunkSize = 700
+        let total = max(1, (encoded.count + chunkSize - 1) / chunkSize)
+        if encoded.isEmpty {
+            NSLog("%@", "[CloudCodePerceptionProbe] probeID=\(id) stage=\(stage) part=1/1 b64=")
+            return
+        }
+        for part in 0..<total {
+            let lower = part * chunkSize
+            let upper = min(encoded.count, lower + chunkSize)
+            let chunk = String(decoding: encoded[lower..<upper], as: UTF8.self)
+            NSLog("%@", "[CloudCodePerceptionProbe] probeID=\(id) stage=\(stage) part=\(part + 1)/\(total) b64=\(chunk)")
+        }
     }
 
     public func exportDiagnosticBundle() async throws -> URL {
