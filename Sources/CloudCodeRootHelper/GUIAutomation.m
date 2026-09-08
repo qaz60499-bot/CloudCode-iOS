@@ -2060,6 +2060,182 @@ int CloudCodeGUINavigateBack(NSString *strategy)
     }
 }
 
+static BOOL CloudCodeAXRoleIsComposerTextInput(NSString *role)
+{
+    if (![role isKindOfClass:NSString.class] || role.length == 0) { return NO; }
+    if ([role rangeOfString:@"SearchField" options:NSCaseInsensitiveSearch].location != NSNotFound) { return NO; }
+    return [role rangeOfString:@"TextField" options:NSCaseInsensitiveSearch].location != NSNotFound
+        || [role rangeOfString:@"TextArea" options:NSCaseInsensitiveSearch].location != NSNotFound
+        || [role rangeOfString:@"TextView" options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+static NSDictionary *CloudCodeAXComposerCandidateForElement(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef element, CGSize screenSize)
+{
+    if (!element || screenSize.width <= 1 || screenSize.height <= 1) { return nil; }
+    NSString *role = CloudCodeBoundedString(CloudCodeAXCopy(runtime, element, runtime.attributeElementType ?: CFSTR("AXRole")));
+    if (!CloudCodeAXRoleIsComposerTextInput(role)) { return nil; }
+    NSDictionary *frame = CloudCodeFrameDictionary(runtime, CloudCodeAXCopy(runtime, element, runtime.attributeFrame ?: CFSTR("AXFrame")));
+    if (!frame) { return nil; }
+    double x = [frame[@"x"] doubleValue];
+    double y = [frame[@"y"] doubleValue];
+    double width = [frame[@"width"] doubleValue];
+    double height = [frame[@"height"] doubleValue];
+    double centerX = x + width * 0.5;
+    double centerY = y + height * 0.5;
+    if (!isfinite(centerX) || !isfinite(centerY) || !isfinite(width) || !isfinite(height)
+        || width < MAX(44.0, screenSize.width * 0.18) || height < 18.0 || height > 180.0
+        || centerY < screenSize.height * 0.52 || centerY > screenSize.height * 0.985
+        || centerX < screenSize.width * 0.06 || centerX > screenSize.width * 0.94) {
+        return nil;
+    }
+    double vertical = centerY / screenSize.height;
+    double widthRatio = MIN(1.0, width / screenSize.width);
+    double centerPenalty = fabs(centerX - screenSize.width * 0.5) / screenSize.width;
+    double score = vertical * 100.0 + widthRatio * 24.0 - centerPenalty * 12.0;
+    if ([role rangeOfString:@"TextView" options:NSCaseInsensitiveSearch].location != NSNotFound) { score += 4.0; }
+    return @{
+        @"role": role ?: @"",
+        @"x": @(x), @"y": @(y), @"width": @(width), @"height": @(height),
+        @"centerX": @(centerX), @"centerY": @(centerY), @"score": @(score)
+    };
+}
+
+static NSDictionary *CloudCodeAXComposerCandidateNearElement(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef element, CGSize screenSize, NSUInteger depth)
+{
+    if (!element || depth > 2) { return nil; }
+    NSDictionary *direct = CloudCodeAXComposerCandidateForElement(runtime, element, screenSize);
+    if (direct) { return direct; }
+    id childrenValue = CloudCodeAXCopy(runtime, element, runtime.attributeChildren ?: CFSTR("AXChildren"));
+    if (![childrenValue isKindOfClass:NSArray.class]) { return nil; }
+    NSUInteger visited = 0;
+    NSDictionary *best = nil;
+    for (id child in (NSArray *)childrenValue) {
+        if (visited++ >= 12) { break; }
+        CloudCodeAXUIElementRef childElement = (CloudCodeAXUIElementRef)(__bridge CFTypeRef)child;
+        NSDictionary *candidate = CloudCodeAXComposerCandidateNearElement(runtime, childElement, screenSize, depth + 1);
+        if (candidate && (!best || [candidate[@"score"] doubleValue] > [best[@"score"] doubleValue])) { best = candidate; }
+    }
+    return best;
+}
+
+int CloudCodeGUIComposerCandidateJSON(void)
+{
+    @autoreleasepool {
+        CloudCodeAXRuntime ax = CloudCodeResolveAX();
+        CGSize size = CloudCodeScreenSize();
+        BOOL runtimeAvailable = ax.createSystemWide && ax.copyElementAtPosition && ax.copyAttribute && size.width > 1 && size.height > 1;
+        NSDictionary *best = nil;
+        pid_t bestPID = 0;
+        NSString *backend = @"";
+
+        if (runtimeAvailable) {
+            CloudCodeAXUIElementRef systemWide = NULL;
+            @try { systemWide = ax.createSystemWide(); } @catch (__unused NSException *exception) { systemWide = NULL; }
+            if (systemWide) {
+                if (ax.setTimeout) { @try { ax.setTimeout(systemWide, CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {} }
+                const CGPoint points[] = {
+                    {size.width * 0.50, size.height * 0.78},
+                    {size.width * 0.50, size.height * 0.84},
+                    {size.width * 0.50, size.height * 0.88},
+                    {size.width * 0.50, size.height * 0.91},
+                    {size.width * 0.50, size.height * 0.94},
+                    {size.width * 0.35, size.height * 0.88},
+                    {size.width * 0.65, size.height * 0.88},
+                    {size.width * 0.35, size.height * 0.92},
+                    {size.width * 0.65, size.height * 0.92}
+                };
+                for (NSUInteger index = 0; index < sizeof(points) / sizeof(points[0]); index++) {
+                    CloudCodeAXUIElementRef hit = NULL;
+                    CloudCodeAXError code = -1;
+                    @try { code = ax.copyElementAtPosition(systemWide, (float)points[index].x, (float)points[index].y, &hit); }
+                    @catch (__unused NSException *exception) { code = -1; hit = NULL; }
+                    if (code != 0 || !hit) { if (hit) CFRelease(hit); continue; }
+                    NSDictionary *candidate = CloudCodeAXComposerCandidateNearElement(ax, hit, size, 0);
+                    pid_t candidatePID = 0;
+                    if (candidate && ax.getPid) {
+                        @try { (void)ax.getPid(hit, &candidatePID); } @catch (__unused NSException *exception) { candidatePID = 0; }
+                    }
+                    if (candidate && (!best || [candidate[@"score"] doubleValue] > [best[@"score"] doubleValue])) {
+                        best = candidate;
+                        bestPID = candidatePID;
+                        backend = @"AXRuntime.systemWide.hitTest";
+                    }
+                    CFRelease(hit);
+                }
+                CFRelease(systemWide);
+            }
+        }
+
+        NSMutableDictionary *payload = [@{
+            @"runtimeAvailable": @(runtimeAvailable),
+            @"candidateFound": @(best != nil),
+            @"role": best[@"role"] ?: @"",
+            @"backend": backend ?: @"",
+            @"pid": @(bestPID),
+            @"screenWidth": @(size.width),
+            @"screenHeight": @(size.height)
+        } mutableCopy];
+        if (best) {
+            for (NSString *key in @[@"x", @"y", @"width", @"height", @"centerX", @"centerY"]) {
+                if (best[key]) { payload[key] = best[key]; }
+            }
+        }
+        NSError *error = nil;
+        NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
+        if (!data || error || data.length > 4096) { return 61; }
+        fwrite(data.bytes, 1, data.length, stdout);
+        fputc('\n', stdout);
+        return runtimeAvailable ? 0 : 62;
+    }
+}
+
+static CloudCodeAXUIElementRef CloudCodeAXCopyFocusedElement(CloudCodeAXRuntime runtime, pid_t *pidOut, NSString **backend)
+{
+    if (!runtime.copyAttribute) { return NULL; }
+
+    // A system-wide AX client can expose AXFocusedUIElement even when obtaining a separate
+    // AXFocusedApplication root fails for a detached helper. Try that shortest route first.
+    if (runtime.createSystemWide) {
+        CloudCodeAXUIElementRef systemWide = NULL;
+        @try { systemWide = runtime.createSystemWide(); } @catch (__unused NSException *exception) { systemWide = NULL; }
+        if (systemWide) {
+            if (runtime.setTimeout) { @try { runtime.setTimeout(systemWide, CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {} }
+            for (NSString *attribute in @[@"AXFocusedUIElement", @"AXFocusedElement"]) {
+                id candidate = CloudCodeAXCopy(runtime, systemWide, (__bridge CFStringRef)attribute);
+                if (!candidate) { continue; }
+                CloudCodeAXUIElementRef element = (CloudCodeAXUIElementRef)(__bridge CFTypeRef)candidate;
+                CFRetain(element);
+                if (runtime.getPid && pidOut) {
+                    pid_t pid = 0;
+                    @try { if (runtime.getPid(element, &pid) == 0) { *pidOut = pid; } } @catch (__unused NSException *exception) {}
+                }
+                if (backend) { *backend = [@"AXRuntime.systemWide." stringByAppendingString:attribute]; }
+                CFRelease(systemWide);
+                return element;
+            }
+            CFRelease(systemWide);
+        }
+    }
+
+    pid_t focusedPID = 0;
+    NSString *focusedBackend = nil;
+    CloudCodeAXUIElementRef focusedRoot = CloudCodeAXFocusedApplicationRoot(runtime, &focusedPID, &focusedBackend);
+    if (!focusedRoot) { return NULL; }
+    CloudCodeAXUIElementRef focusedElement = NULL;
+    for (NSString *attribute in @[@"AXFocusedUIElement", @"AXFocusedElement"]) {
+        id candidate = CloudCodeAXCopy(runtime, focusedRoot, (__bridge CFStringRef)attribute);
+        if (candidate) {
+            focusedElement = (CloudCodeAXUIElementRef)(__bridge CFTypeRef)candidate;
+            CFRetain(focusedElement);
+            if (backend) { *backend = [focusedBackend stringByAppendingFormat:@".%@", attribute]; }
+            break;
+        }
+    }
+    CFRelease(focusedRoot);
+    if (focusedElement && pidOut) { *pidOut = focusedPID; }
+    return focusedElement;
+}
+
 int CloudCodeGUIFocusedTextInputJSON(void)
 {
     @autoreleasepool {
@@ -2072,30 +2248,17 @@ int CloudCodeGUIFocusedTextInputJSON(void)
         NSString *focusedRole = @"";
 
         if (runtimeAvailable) {
-            CloudCodeAXUIElementRef focusedRoot = CloudCodeAXFocusedApplicationRoot(ax, &focusedPID, &focusedBackend);
-            if (focusedRoot) {
-                id focusedHolder = nil;
-                CloudCodeAXUIElementRef focusedElement = NULL;
-                for (NSString *attribute in @[@"AXFocusedUIElement", @"AXFocusedElement"]) {
-                    id candidate = CloudCodeAXCopy(ax, focusedRoot, (__bridge CFStringRef)attribute);
-                    if (candidate) {
-                        focusedHolder = candidate;
-                        focusedElement = (CloudCodeAXUIElementRef)(__bridge CFTypeRef)focusedHolder;
-                        break;
-                    }
-                }
-                CFRelease(focusedRoot);
-                if (focusedElement) {
-                    focusedElementAvailable = YES;
-                    id rawRole = CloudCodeAXCopy(ax, focusedElement, ax.attributeElementType ?: CFSTR("AXRole"));
-                    focusedRole = CloudCodeBoundedString(rawRole) ?: @"";
-                    focusedTextInput =
-                        [focusedRole rangeOfString:@"TextField" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                        [focusedRole rangeOfString:@"TextArea" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                        [focusedRole rangeOfString:@"TextView" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                        [focusedRole rangeOfString:@"SearchField" options:NSCaseInsensitiveSearch].location != NSNotFound;
-                    (void)focusedHolder;
-                }
+            CloudCodeAXUIElementRef focusedElement = CloudCodeAXCopyFocusedElement(ax, &focusedPID, &focusedBackend);
+            if (focusedElement) {
+                focusedElementAvailable = YES;
+                id rawRole = CloudCodeAXCopy(ax, focusedElement, ax.attributeElementType ?: CFSTR("AXRole"));
+                focusedRole = CloudCodeBoundedString(rawRole) ?: @"";
+                focusedTextInput =
+                    [focusedRole rangeOfString:@"TextField" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [focusedRole rangeOfString:@"TextArea" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [focusedRole rangeOfString:@"TextView" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [focusedRole rangeOfString:@"SearchField" options:NSCaseInsensitiveSearch].location != NSNotFound;
+                CFRelease(focusedElement);
             }
         }
 
@@ -2130,25 +2293,13 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
         // responder. Never overwrite a non-empty field through AX: in that case preserve normal
         // caret/append semantics and fall back to HID below.
         CloudCodeAXRuntime ax = CloudCodeResolveAX();
-        id focusedHolder = nil;
         CloudCodeAXUIElementRef focusedElement = NULL;
         NSString *focusedBackend = nil;
         NSString *focusedRole = nil;
         NSString *beforeText = nil;
         if (ax.copyAttribute && ax.setAttribute) {
             pid_t focusedPID = 0;
-            CloudCodeAXUIElementRef focusedRoot = CloudCodeAXFocusedApplicationRoot(ax, &focusedPID, &focusedBackend);
-            if (focusedRoot) {
-                for (NSString *attribute in @[@"AXFocusedUIElement", @"AXFocusedElement"]) {
-                    id candidate = CloudCodeAXCopy(ax, focusedRoot, (__bridge CFStringRef)attribute);
-                    if (candidate) {
-                        focusedHolder = candidate;
-                        focusedElement = (CloudCodeAXUIElementRef)(__bridge CFTypeRef)focusedHolder;
-                        break;
-                    }
-                }
-                CFRelease(focusedRoot);
-            }
+            focusedElement = CloudCodeAXCopyFocusedElement(ax, &focusedPID, &focusedBackend);
             if (focusedElement) {
                 id rawRole = CloudCodeAXCopy(ax, focusedElement, ax.attributeElementType ?: CFSTR("AXRole"));
                 focusedRole = CloudCodeBoundedString(rawRole);

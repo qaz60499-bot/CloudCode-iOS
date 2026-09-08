@@ -120,6 +120,22 @@ enum EmbeddedRootHelper {
         var pid: Int32
     }
 
+    struct ComposerCandidatePayload: Decodable {
+        var runtimeAvailable: Bool
+        var candidateFound: Bool
+        var role: String
+        var backend: String
+        var pid: Int32
+        var screenWidth: Double
+        var screenHeight: Double
+        var x: Double?
+        var y: Double?
+        var width: Double?
+        var height: Double?
+        var centerX: Double?
+        var centerY: Double?
+    }
+
     struct FilesystemProbePayload: Decodable {
         var sharedUserFiles: Bool
         var unrestricted: Bool
@@ -617,6 +633,22 @@ enum EmbeddedRootHelper {
             return (nil, failureDetail(prefix: "mobile AX focused text input", code: result.code, diagnostic: diagnostic))
         }
         return (payload, result.stderr.isEmpty ? "mobile AX 已完成隐私保护焦点探针。" : "mobile AX 已完成隐私保护焦点探针：\(result.stderr)")
+    }
+
+    static func composerCandidate() -> (payload: ComposerCandidatePayload?, detail: String) {
+        guard embeddedHelperMatchesExpectedProtocol,
+              FileManager.default.isExecutableFile(atPath: executablePath) else {
+            return (nil, "mobile RootHelper AX composer 候选探针当前不可用。")
+        }
+        let result = runSeparated(["gui-composer-candidate-json"], privilege: .isolatedUser, timeout: 2.5)
+        guard result.code == 0,
+              let data = result.stdout.data(using: .utf8),
+              data.count <= 4 * 1024,
+              let payload = try? JSONDecoder().decode(ComposerCandidatePayload.self, from: data) else {
+            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+            return (nil, failureDetail(prefix: "mobile AX composer candidate", code: result.code, diagnostic: diagnostic))
+        }
+        return (payload, result.stderr.isEmpty ? "mobile AX 已完成隐私保护 composer 候选探针。" : "mobile AX 已完成隐私保护 composer 候选探针：\(result.stderr)")
     }
 
     static func guiTap(x: Double, y: Double) -> (success: Bool, detail: String) {
@@ -2177,32 +2209,77 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 throw ToolRouterError.noExecutionRoute("composer focus could not determine a valid current screen size")
             }
             let baselineSHA256 = GUIAutomationPayloadPolicy.sha256Hex(baseline)
-            // The Provider never chooses this coordinate. This semantic micro-action owns one
-            // conservative bottom-center candidate and verifies keyboard evidence before raw typing
-            // is allowed. Side icons (voice/emoji/add) stay outside the center candidate.
-            let focusX = Double(image.size.width * 0.50)
-            let focusY = Double(image.size.height * 0.92)
+
+            // Do not disturb an already-focused composer. This also lets a provider-visible bounded
+            // tap recover an unusual chat layout and then use this tool purely as a local AX verifier.
+            let initialFocus = EmbeddedRootHelper.focusedTextInput()
+            if let focused = initialFocus.payload, focused.focusedTextInput {
+                let attachment = try persistScreenshotAttachment(baseline, sessionID: call.sessionID)
+                return ToolResult(
+                    toolCallID: call.id,
+                    success: true,
+                    summary: "Chat composer was already focused and was locally verified through system-wide AX; no tap or OCR was needed.",
+                    payload: [
+                        "baselineSHA256": baselineSHA256,
+                        "sha256": baselineSHA256,
+                        "focusStrategy": "already_focused_ax_text_input",
+                        "focusVerified": "true",
+                        "focusVerificationRoute": "ax_focused_text_input_preflight",
+                        "focusedRole": String(focused.role.prefix(128)),
+                        "effectVerification": "ax_focused_text_input_verified",
+                        "localObservation": "baseline_screenshot_attached",
+                        "perceptionClass": "semantic_composer_focus",
+                        "perceptionAXAttempted": "true",
+                        "perceptionAXSucceeded": "true",
+                        "perceptionOCRInvoked": "false",
+                        "perceptionOCRSucceeded": "false",
+                        "perceptionAnchorCacheHit": "false",
+                        "perceptionLocalSufficient": "true",
+                        "perceptionRemoteVisionRequired": "false",
+                        "perceptionFallbackReason": "ax_preflight_verified_existing_composer_focus",
+                        "providerVisualRoundTripAvoided": "1"
+                    ],
+                    attachments: attachment.map { [$0] }
+                )
+            }
+
+            // Resolve the composer as a semantic AX text-input element before falling back to a
+            // conservative geometric tap. The helper returns role + frame only; it never reads the
+            // field value, placeholder, or message text.
+            let axCandidateResult = EmbeddedRootHelper.composerCandidate()
+            let axCandidate = axCandidateResult.payload.flatMap { candidate -> EmbeddedRootHelper.ComposerCandidatePayload? in
+                guard candidate.candidateFound,
+                      let centerX = candidate.centerX,
+                      let centerY = candidate.centerY,
+                      centerX.isFinite, centerY.isFinite,
+                      centerX >= 0, centerY >= 0,
+                      centerX <= Double(image.size.width), centerY <= Double(image.size.height) else { return nil }
+                return candidate
+            }
+            let focusX = axCandidate?.centerX ?? Double(image.size.width * 0.50)
+            let focusY = axCandidate?.centerY ?? Double(image.size.height * 0.90)
+            let focusStrategy = axCandidate == nil ? "bounded_bottom_center_fallback" : "ax_composer_text_input_candidate"
+
             try await backend.tap(x: focusX, y: focusY)
-            try await Task.sleep(nanoseconds: 350_000_000)
+            try await Task.sleep(nanoseconds: 300_000_000)
             try Task.checkCancellation()
             let data = try await backend.screenshot()
             let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
 
-            // Focus verification is semantic, not visual by definition. Prefer the privacy-preserving
-            // focused AX role probe first: it returns only role/backend/pid and never reads the field
-            // value. Only when AX cannot prove a text input do we pay for Vision keyboard OCR.
+            // A focused text role is the authority for raw message typing. Build 93 used OCR keyboard
+            // detection here, but both real-device OCR helper routes are currently known to terminate
+            // on iOS 16.6. Never turn those helper crashes into a false negative or another crash loop.
             let axFocus = EmbeddedRootHelper.focusedTextInput()
             if let focused = axFocus.payload, focused.focusedTextInput {
-                let payload: [String: String] = [
+                var payload: [String: String] = [
                     "baselineSHA256": baselineSHA256,
                     "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
-                    "focusStrategy": "bounded_bottom_center_composer_candidate",
+                    "focusStrategy": focusStrategy,
                     "focusX": String(focusX),
                     "focusY": String(focusY),
                     "focusVerified": "true",
-                    "focusVerificationRoute": "ax_focused_text_input",
+                    "focusVerificationRoute": "ax_focused_text_input_post_tap",
                     "focusedRole": String(focused.role.prefix(128)),
-                    "keyboardLikely": "false",
                     "effectVerification": "ax_focused_text_input_verified",
                     "localObservation": "final_screenshot_attached",
                     "perceptionClass": "semantic_composer_focus",
@@ -2213,55 +2290,61 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                     "perceptionAnchorCacheHit": "false",
                     "perceptionLocalSufficient": "true",
                     "perceptionRemoteVisionRequired": "false",
-                    "perceptionFallbackReason": "ax_focused_text_input_verified_composer_focus",
+                    "perceptionFallbackReason": axCandidate == nil
+                        ? "ax_focus_verified_after_bounded_geometry_fallback"
+                        : "ax_candidate_tap_and_focus_verified",
                     "providerVisualRoundTripAvoided": "1"
                 ]
+                if let axCandidate {
+                    payload["composerCandidateRole"] = String(axCandidate.role.prefix(128))
+                    payload["composerCandidateBackend"] = String(axCandidate.backend.prefix(128))
+                    if let x = axCandidate.x { payload["composerCandidateX"] = String(x) }
+                    if let y = axCandidate.y { payload["composerCandidateY"] = String(y) }
+                    if let width = axCandidate.width { payload["composerCandidateWidth"] = String(width) }
+                    if let height = axCandidate.height { payload["composerCandidateHeight"] = String(height) }
+                }
                 return ToolResult(
                     toolCallID: call.id,
                     success: true,
-                    summary: "Chat composer focus was locally verified by the privacy-preserving AX focused-text-input probe; OCR was not invoked.",
+                    summary: axCandidate == nil
+                        ? "Bounded composer fallback was tapped and system-wide AX verified the resulting text-input focus; OCR was not invoked."
+                        : "AX resolved the chat composer frame, the element was tapped, and system-wide AX verified text-input focus; OCR was not invoked.",
                     payload: payload,
                     attachments: attachment.map { [$0] }
                 )
             }
 
-            let observation = await LocalVisionTextObservation.observe(for: data, maximumElements: 48, requiresText: true)
-            let screenHeight = Double(observation.payload["screenPointHeight"] ?? "") ?? Double(image.size.height)
-            let keyboardLikely = LocalKeyboardHeuristic.isLikelyVisible(elements: observation.elements, screenHeight: screenHeight)
             var payload: [String: String] = [
                 "baselineSHA256": baselineSHA256,
                 "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
-                "focusStrategy": "bounded_bottom_center_composer_candidate",
+                "focusStrategy": focusStrategy,
                 "focusX": String(focusX),
                 "focusY": String(focusY),
-                "focusVerified": keyboardLikely ? "true" : "false",
-                "focusVerificationRoute": "ocr_keyboard_fallback",
-                "keyboardLikely": keyboardLikely ? "true" : "false",
-                "effectVerification": keyboardLikely ? "local_keyboard_heuristic_passed" : "semantic_required",
+                "focusVerified": "false",
+                "focusVerificationRoute": "ax_unverified_no_ocr_crash_fallback",
+                "effectVerification": "semantic_required",
                 "localObservation": "final_screenshot_attached",
                 "perceptionClass": "semantic_composer_focus",
                 "perceptionAXAttempted": "true",
                 "perceptionAXSucceeded": "false",
-                "perceptionAnchorCacheHit": "false"
+                "perceptionOCRInvoked": "false",
+                "perceptionOCRSucceeded": "false",
+                "perceptionAnchorCacheHit": "false",
+                "perceptionLocalSufficient": "false",
+                "perceptionRemoteVisionRequired": "true",
+                "perceptionFallbackReason": axCandidate == nil
+                    ? "ax_candidate_unavailable_and_post_tap_focus_unverified"
+                    : "ax_candidate_found_but_post_tap_focus_unverified",
+                "providerVisualRoundTripAvoided": "0"
             ]
-            enrichWithLocalVision(&payload, observation: observation)
-            if keyboardLikely {
-                payload["perceptionLocalSufficient"] = "true"
-                payload["perceptionRemoteVisionRequired"] = "false"
-                payload["perceptionFallbackReason"] = "ax_focus_unavailable_local_keyboard_heuristic_verified_composer_focus"
-                payload["providerVisualRoundTripAvoided"] = "1"
-            } else {
-                payload["perceptionLocalSufficient"] = "false"
-                payload["perceptionRemoteVisionRequired"] = "true"
-                payload["perceptionFallbackReason"] = "ax_focus_unavailable_composer_keyboard_not_locally_verified"
-                payload["providerVisualRoundTripAvoided"] = "0"
+            if let axCandidate {
+                payload["composerCandidateRole"] = String(axCandidate.role.prefix(128))
+                payload["composerCandidateBackend"] = String(axCandidate.backend.prefix(128))
             }
             return ToolResult(
                 toolCallID: call.id,
-                success: keyboardLikely,
-                summary: keyboardLikely
-                    ? "AX could not prove composer focus, but keyboard-like OCR evidence verified the fallback focus route."
-                    : "Composer candidate was tapped, but neither AX focus nor local keyboard OCR evidence verified a text input; raw typing remains blocked.",
+                success: false,
+                summary: "Composer focus could not be proven by AX after one bounded local attempt. OCR crash fallbacks were intentionally skipped; the attached screenshot may be used for one provider-visible recovery tap, after which this tool can re-verify focus without tapping again.",
                 payload: payload,
                 attachments: attachment.map { [$0] }
             )

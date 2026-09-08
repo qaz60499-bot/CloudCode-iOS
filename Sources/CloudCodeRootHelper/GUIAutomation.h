@@ -14,6 +14,7 @@ int CloudCodeGUISwipe(double fromX, double fromY, double toX, double toY, double
 int CloudCodeGUIScroll(double deltaX, double deltaY);
 int CloudCodeGUINavigateBack(NSString *strategy);
 int CloudCodeGUIFocusedTextInputJSON(void);
+int CloudCodeGUIComposerCandidateJSON(void);
 int CloudCodeGUITypeBase64(NSString *base64Text);
 
 NS_ASSUME_NONNULL_END

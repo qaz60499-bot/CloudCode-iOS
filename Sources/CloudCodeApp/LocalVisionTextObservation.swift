@@ -113,16 +113,11 @@ enum LocalVisionTextObservation {
                 ], elements: [])
             }
 
-            let mobileHelperObservation = recognizeWithMobileRootHelper(
-                jpegData,
-                maximumElements: boundedMaximum,
-                regionInScreenPoints: regionInScreenPoints
-            )
-            if let mobileHelperObservation,
-               Self.isUsable(mobileHelperObservation, requiresText: requiresText) {
-                return mobileHelperObservation
-            }
-
+            // Build 93 proved that the ordinary standalone Vision helper is the only acceptable
+            // background OCR execution class to recover here: the TSRoot helper, even when spawned
+            // as uid/euid 501, repeatedly traps inside AppleNeuralEngine/TextRecognition on iOS 16.6.
+            // Try the minimal Vision-only process first and keep the crashing RootHelper route out of
+            // the iOS 16 production path entirely.
             let standaloneHelperObservation = recognizeWithVisionHelper(
                 jpegData,
                 maximumElements: boundedMaximum,
@@ -133,20 +128,40 @@ enum LocalVisionTextObservation {
                 return standaloneHelperObservation
             }
 
-            var combined = inProcess
-            if let mobileHelperObservation {
-                combined.payload["localVisionSecondaryBackend"] = mobileHelperObservation.payload["localVisionBackend"] ?? "root_helper_mobile_vision"
-                combined.payload["localVisionSecondaryStatus"] = mobileHelperObservation.payload["localVisionOCR"] ?? "unavailable"
-                combined.payload["localVisionSecondaryErrorDomain"] = mobileHelperObservation.payload["localVisionErrorDomain"] ?? ""
-                combined.payload["localVisionSecondaryErrorCode"] = mobileHelperObservation.payload["localVisionErrorCode"] ?? ""
-                combined.payload["localVisionSecondaryDiagnostic"] = mobileHelperObservation.payload["localVisionHelperDiagnostic"] ?? ""
+            let osMajor = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+            let mobileHelperObservation: Observation?
+            if osMajor >= 17 {
+                mobileHelperObservation = recognizeWithMobileRootHelper(
+                    jpegData,
+                    maximumElements: boundedMaximum,
+                    regionInScreenPoints: regionInScreenPoints
+                )
+                if let mobileHelperObservation,
+                   Self.isUsable(mobileHelperObservation, requiresText: requiresText) {
+                    return mobileHelperObservation
+                }
+            } else {
+                mobileHelperObservation = Observation(payload: [
+                    "localVisionOCR": "unavailable_known_ios16_roothelper_vision_crash_skipped",
+                    "localVisionBackend": "root_helper_mobile_vision",
+                    "localVisionFailureClass": "known_ios16_roothelper_vision_crash_skipped"
+                ], elements: [])
             }
+
+            var combined = inProcess
             if let standaloneHelperObservation {
-                combined.payload["localVisionTertiaryBackend"] = standaloneHelperObservation.payload["localVisionBackend"] ?? "vision_helper_public_api"
-                combined.payload["localVisionTertiaryStatus"] = standaloneHelperObservation.payload["localVisionOCR"] ?? "unavailable"
-                combined.payload["localVisionTertiaryErrorDomain"] = standaloneHelperObservation.payload["localVisionErrorDomain"] ?? ""
-                combined.payload["localVisionTertiaryErrorCode"] = standaloneHelperObservation.payload["localVisionErrorCode"] ?? ""
-                combined.payload["localVisionTertiaryDiagnostic"] = standaloneHelperObservation.payload["localVisionHelperDiagnostic"] ?? ""
+                combined.payload["localVisionSecondaryBackend"] = standaloneHelperObservation.payload["localVisionBackend"] ?? "vision_helper_public_api"
+                combined.payload["localVisionSecondaryStatus"] = standaloneHelperObservation.payload["localVisionOCR"] ?? "unavailable"
+                combined.payload["localVisionSecondaryErrorDomain"] = standaloneHelperObservation.payload["localVisionErrorDomain"] ?? ""
+                combined.payload["localVisionSecondaryErrorCode"] = standaloneHelperObservation.payload["localVisionErrorCode"] ?? ""
+                combined.payload["localVisionSecondaryDiagnostic"] = standaloneHelperObservation.payload["localVisionHelperDiagnostic"] ?? ""
+            }
+            if let mobileHelperObservation {
+                combined.payload["localVisionTertiaryBackend"] = mobileHelperObservation.payload["localVisionBackend"] ?? "root_helper_mobile_vision"
+                combined.payload["localVisionTertiaryStatus"] = mobileHelperObservation.payload["localVisionOCR"] ?? "unavailable"
+                combined.payload["localVisionTertiaryErrorDomain"] = mobileHelperObservation.payload["localVisionErrorDomain"] ?? ""
+                combined.payload["localVisionTertiaryErrorCode"] = mobileHelperObservation.payload["localVisionErrorCode"] ?? ""
+                combined.payload["localVisionTertiaryDiagnostic"] = mobileHelperObservation.payload["localVisionHelperDiagnostic"] ?? ""
             }
             return combined
         }.value

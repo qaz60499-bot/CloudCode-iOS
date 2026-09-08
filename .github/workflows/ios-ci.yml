@@ -531,7 +531,7 @@ jobs:
           if not vision_helper.exists():
               raise SystemExit('FAIL: lightweight public Vision OCR helper source is missing')
           vision_text = vision_helper.read_text(encoding='utf-8')
-          for marker in ('cloudcode-vision-helper-protocol=1', 'VNRecognizeTextRequest', 'VNImageRequestHandler', 'usesCPUOnly = cpuOnly', 'preferBackgroundProcessing = YES', 'CloudCodePerformOCR(image, &request, YES', 'vision_helper_public_api', 'CloudCodePerformFastFallbackOCR', 'kCGImageSourceThumbnailMaxPixelSize', 'vision_helper_public_api_fast_thumbnail_fallback', 'ocr-file'):
+          for marker in ('cloudcode-vision-helper-protocol=1', 'VNRecognizeTextRequest', 'VNImageRequestHandler', 'usesCPUOnly = cpuOnly', 'preferBackgroundProcessing = YES', 'CloudCodePerformOCR(image, &request, YES', 'vision_helper_public_api', 'CloudCodePerformFastFallbackOCR', 'kCGImageSourceThumbnailMaxPixelSize', 'vision_helper_public_api_fast_thumbnail_fallback', 'ocr-file', 'root execution is forbidden'):
               if marker not in vision_text:
                   raise SystemExit(f'FAIL: lightweight Vision helper lost public OCR isolation marker: {marker}')
           local_vision = Path('Sources/CloudCodeApp/LocalVisionTextObservation.swift').read_text(encoding='utf-8')
@@ -539,8 +539,11 @@ jobs:
               if marker not in local_vision:
                   raise SystemExit(f'FAIL: local OCR routing lost background-safe Vision fallback marker: {marker}')
           observe_route = local_vision.split('static func observe(', 1)[1].split('private static func isUsable', 1)[0]
-          if not (observe_route.index('recognizeInProcess(') < observe_route.index('recognizeWithMobileRootHelper(') < observe_route.index('recognizeWithVisionHelper(')):
-              raise SystemExit('FAIL: local OCR fallback order must remain in-process -> mobile RootHelper -> standalone VisionHelper')
+          if not (observe_route.index('recognizeInProcess(') < observe_route.index('recognizeWithVisionHelper(') < observe_route.index('recognizeWithMobileRootHelper(')):
+              raise SystemExit('FAIL: local OCR fallback order must remain in-process -> standalone VisionHelper -> gated mobile RootHelper')
+          for marker in ('osMajor >= 17', 'unavailable_known_ios16_roothelper_vision_crash_skipped', 'known_ios16_roothelper_vision_crash_skipped'):
+              if marker not in observe_route:
+                  raise SystemExit(f'FAIL: iOS 16 must skip the real-device-proven crashing RootHelper Vision route: {marker}')
           if 'EmbeddedRootHelper.guiOCR(' in local_vision:
               raise SystemExit('FAIL: local OCR routing regressed to the retired root-persona OCR API')
           project_text = Path('project.yml').read_text(encoding='utf-8')
@@ -549,8 +552,8 @@ jobs:
                   raise SystemExit(f'FAIL: lightweight Vision helper is not embedded in the iOS app build: {marker}')
           if project_text.count('-framework Vision') < 2:
               raise SystemExit('FAIL: build must link Vision into both the mobile RootHelper OCR path and standalone VisionHelper fallback')
-          if 'TSRootBinaries:1 string CloudCodeVisionHelper' in project_text:
-              raise SystemExit('FAIL: public Vision helper must never be declared as a TrollStore root binary')
+          if 'TSRootBinaries:1 string CloudCodeVisionHelper' not in project_text:
+              raise SystemExit('FAIL: standalone Vision helper must be declared in TSRootBinaries so TrollStore preserves an executable out-of-process helper on device')
           provider_client = Path('Sources/CloudCodeCore/ProviderClient.swift').read_text(encoding='utf-8')
           for marker in ('ProviderImageCapability', 'case textOnly = "text_only"', 'providerTinyImageProbeBase64', 'internal_image_capability_probe', 'models_metadata', 'tiny_image_probe', 'providerMessagesWithoutImages', 'providerToolsWithoutFreeCoordinates', 'image_omitted_before_provider_request', 'preferredCapabilityRoute', 'router_preferred_exact_route', 'case status(String)', '厂商正在等待上游 API', '厂商请求过多/触发限流'):
               if marker not in provider_client:

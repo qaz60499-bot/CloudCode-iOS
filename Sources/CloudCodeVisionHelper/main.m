@@ -4,6 +4,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <math.h>
 #import <stdio.h>
+#import <unistd.h>
 #import "../CloudCodeApp/PerceptionVisionProbe.h"
 
 static NSString * const CloudCodeVisionProtocolMarker = @"cloudcode-vision-helper-protocol=1";
@@ -258,6 +259,13 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements)
 int main(int argc, char *argv[])
 {
     @autoreleasepool {
+        // This binary may be listed in TSRootBinaries so TrollStore keeps it executable as an
+        // out-of-process helper, but Vision must never run under persona 99/root. Its only allowed
+        // execution identity is the ordinary mobile user inherited from Cloud Code.
+        if (getuid() == 0 || geteuid() == 0) {
+            fprintf(stderr, "vision-helper: root execution is forbidden\n");
+            return 11;
+        }
         if (argc < 2) {
             fprintf(stderr, "vision-helper: missing command\n");
             return 64;

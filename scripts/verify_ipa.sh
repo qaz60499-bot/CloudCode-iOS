@@ -103,8 +103,12 @@ if [[ "$(/usr/libexec/PlistBuddy -c 'Print :TSRootBinaries:0' "$INFO" 2>/dev/nul
   echo "FAIL: TSRootBinaries does not declare CloudCodeRootHelper" >&2
   exit 16
 fi
-if [[ -n "$(/usr/libexec/PlistBuddy -c 'Print :TSRootBinaries:1' "$INFO" 2>/dev/null || true)" ]]; then
-  echo "FAIL: TSRootBinaries contains an unexpected additional root binary; CloudCodeVisionHelper must remain non-privileged" >&2
+if [[ "$(/usr/libexec/PlistBuddy -c 'Print :TSRootBinaries:1' "$INFO" 2>/dev/null || true)" != "CloudCodeVisionHelper" ]]; then
+  echo "FAIL: TSRootBinaries does not declare CloudCodeVisionHelper as the trusted out-of-process OCR helper" >&2
+  exit 16
+fi
+if [[ -n "$(/usr/libexec/PlistBuddy -c 'Print :TSRootBinaries:2' "$INFO" 2>/dev/null || true)" ]]; then
+  echo "FAIL: TSRootBinaries contains an unexpected third helper" >&2
   exit 16
 fi
 if ! lipo -info "$HELPER" | grep -q 'arm64'; then
@@ -130,6 +134,10 @@ if ! lipo -info "$VISION_HELPER" | grep -q 'arm64'; then
 fi
 if ! grep -aFq 'cloudcode-vision-helper-protocol=1' "$VISION_HELPER"; then
   echo "FAIL: embedded CloudCodeVisionHelper protocol marker is missing or incompatible" >&2
+  exit 21
+fi
+if ! grep -aFq 'vision-helper: root execution is forbidden' "$VISION_HELPER"; then
+  echo "FAIL: CloudCodeVisionHelper lacks the runtime UID-0 rejection guard" >&2
   exit 21
 fi
 

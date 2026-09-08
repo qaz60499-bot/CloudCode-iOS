@@ -21,7 +21,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.core
         PRODUCT_NAME: CloudCodeCore
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 93
+        CURRENT_PROJECT_VERSION: 94
         VERSIONING_SYSTEM: apple-generic
         DEFINES_MODULE: YES
         GENERATE_INFOPLIST_FILE: YES
@@ -41,7 +41,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios
         PRODUCT_NAME: CloudCode
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 93
+        CURRENT_PROJECT_VERSION: 94
         VERSIONING_SYSTEM: apple-generic
         SWIFT_VERSION: 5.9
         SWIFT_OBJC_BRIDGING_HEADER: Sources/CloudCodeApp/RootHelperBridge.h
@@ -104,6 +104,7 @@ targets:
           /usr/libexec/PlistBuddy -c 'Delete :TSRootBinaries' "$INFO" >/dev/null 2>&1 || true
           /usr/libexec/PlistBuddy -c 'Add :TSRootBinaries array' "$INFO"
           /usr/libexec/PlistBuddy -c 'Add :TSRootBinaries:0 string CloudCodeRootHelper' "$INFO"
+          /usr/libexec/PlistBuddy -c 'Add :TSRootBinaries:1 string CloudCodeVisionHelper' "$INFO"
         basedOnDependencyAnalysis: false
     scheme:
       testTargets:

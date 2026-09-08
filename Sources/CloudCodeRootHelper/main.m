@@ -1227,6 +1227,10 @@ int main(int argc, const char *argv[])
             if (getuid() == 0 || geteuid() == 0) { return 11; }
             return CloudCodeGUIFocusedTextInputJSON();
         }
+        if ([command isEqualToString:@"gui-composer-candidate-json"]) {
+            if (getuid() == 0 || geteuid() == 0) { return 11; }
+            return CloudCodeGUIComposerCandidateJSON();
+        }
         if ([command isEqualToString:@"gui-tap"]) {
             if (argc < 4) { return 10; }
             return CloudCodeGUITap(strtod(argv[2], NULL), strtod(argv[3], NULL));
