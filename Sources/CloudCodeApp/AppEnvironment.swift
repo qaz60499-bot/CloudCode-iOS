@@ -140,6 +140,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private let previousStartupRun: StartupBreadcrumbRunSummary?
     private let previousStartupCompleted: Bool
     private let inheritedAutoResumeIntentAtLaunch: Bool
+    private let inheritedBackgroundRunIntentAtLaunch: Bool
     private var autoResumeArmedInCurrentProcess = false
     private var lifecycleInterruptedSessionIDs: Set<UUID> = []
     private var activeTasks: [UUID: Task<Void, Never>] = [:]
@@ -159,6 +160,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private static let providerKeyMutationOperationKey = "provider-key:mutation"
     private static let manualProviderKeyOverridesDefaultsKey = "provider.key.manualOverrides"
     private static let autoResumeTaskDefaultsKey = "task.autoResumeUnlessStopped"
+    private static let backgroundRunIntentDefaultsKey = "task.wasRunningInBackground"
     private static let backgroundContinuationWindow: TimeInterval = 90 * 60
 
     private enum BootstrapManualOverridePolicy: Equatable {
@@ -271,14 +273,19 @@ public final class CloudCodeViewModel: ObservableObject {
 
         let defaults = UserDefaults.standard
         let inheritedAutoResumeIntentAtLaunch = defaults.bool(forKey: Self.autoResumeTaskDefaultsKey)
+        let inheritedBackgroundRunIntentAtLaunch = defaults.bool(forKey: Self.backgroundRunIntentDefaultsKey)
         self.inheritedAutoResumeIntentAtLaunch = inheritedAutoResumeIntentAtLaunch
+        self.inheritedBackgroundRunIntentAtLaunch = inheritedBackgroundRunIntentAtLaunch
         if inheritedAutoResumeIntentAtLaunch {
-            // Never trust a persisted auto-resume bit across a process boundary. A previous
-            // process may have died in Keychain, Provider parsing, or tool execution; blindly
-            // replaying that request on cold launch can turn one send-time crash into a
-            // permanent launch crash loop. Same-process background recovery is tracked by the
-            // in-memory gate and remains available.
+            // Consume the persisted run intent as a one-shot token at process construction. A
+            // background-origin restart may re-arm it once after checkpoint recovery, but a crash
+            // during that cold-launch recovery must not create a permanent relaunch loop.
             defaults.set(false, forKey: Self.autoResumeTaskDefaultsKey)
+        }
+        if inheritedBackgroundRunIntentAtLaunch {
+            // Also consume the background provenance bit before any recovery work. It is written
+            // again only by a later real scene transition into background while a task is running.
+            defaults.set(false, forKey: Self.backgroundRunIntentDefaultsKey)
         }
         let initialPermissionMode = PermissionMode(rawValue: defaults.string(forKey: "permission.mode") ?? "safe") ?? .safe
         let customProviderFileURL = support.appendingPathComponent("Provider/custom-providers.json")
@@ -416,18 +423,40 @@ public final class CloudCodeViewModel: ObservableObject {
                 auditEvents = Array((try await auditStore.readNewest(limit: 200)).reversed())
                 interruptedTasks = await checkpointStore.interrupted()
                 if inheritedAutoResumeIntentAtLaunch && !interruptedTasks.isEmpty {
-                    recordStartupBreadcrumb("runtime.autoresume.coldlaunch.suppressed")
-                    let message = "检测到上一个进程在任务执行期间中断。为避免重复闪退或重复执行状态变更，本次冷启动已暂停自动续跑；界面会先保持可用，可在“活动/中断任务”中手动继续。"
-                    for checkpoint in interruptedTasks {
-                        sessionActivityLines[checkpoint.sessionID, default: []].append(message)
+                    if inheritedBackgroundRunIntentAtLaunch {
+                        // The previous process explicitly recorded a running -> background scene
+                        // transition before it disappeared. Recover the durable checkpoint once.
+                        // Both persisted bits were already consumed in init, so a crash during this
+                        // recovery cannot recursively auto-resume on the next launch unless the new
+                        // process actually enters background again.
+                        autoResumeArmedInCurrentProcess = true
+                        UserDefaults.standard.set(true, forKey: Self.autoResumeTaskDefaultsKey)
+                        recordStartupBreadcrumb("runtime.autoresume.coldlaunch.background-armed")
+                        let message = "检测到任务在后台期间发生进程重启；已从持久化检查点准备一次性自动续跑。这个恢复不会重放已经确认完成的事务步骤。"
+                        for checkpoint in interruptedTasks {
+                            sessionActivityLines[checkpoint.sessionID, default: []].append(message)
+                        }
+                        try? await diagnosticLogStore.log(
+                            level: .warning,
+                            subsystem: "agent",
+                            action: "cold-launch-auto-resume",
+                            result: "background-armed",
+                            metadata: ["interruptedTaskCount": String(interruptedTasks.count)]
+                        )
+                    } else {
+                        recordStartupBreadcrumb("runtime.autoresume.coldlaunch.suppressed")
+                        let message = "检测到上一个进程在任务执行期间中断，但没有可靠的后台退出证据。为避免重复闪退或重复执行状态变更，本次冷启动暂停自动续跑，可在“活动/中断任务”中手动继续。"
+                        for checkpoint in interruptedTasks {
+                            sessionActivityLines[checkpoint.sessionID, default: []].append(message)
+                        }
+                        try? await diagnosticLogStore.log(
+                            level: .warning,
+                            subsystem: "agent",
+                            action: "cold-launch-auto-resume",
+                            result: "suppressed",
+                            metadata: ["interruptedTaskCount": String(interruptedTasks.count)]
+                        )
                     }
-                    try? await diagnosticLogStore.log(
-                        level: .warning,
-                        subsystem: "agent",
-                        action: "cold-launch-auto-resume",
-                        result: "suppressed",
-                        metadata: ["interruptedTaskCount": String(interruptedTasks.count)]
-                    )
                 }
                 try await restoreSessionState()
                 // Resource Explorer starts from virtual/lightweight categories. Do not enumerate
@@ -1161,6 +1190,7 @@ public final class CloudCodeViewModel: ObservableObject {
         lifecycleInterruptedSessionIDs.remove(sessionID)
         autoResumeArmedInCurrentProcess = false
         UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
+        UserDefaults.standard.set(false, forKey: Self.backgroundRunIntentDefaultsKey)
         task.cancel()
         Task { await steeringMailbox.clear(sessionID: sessionID) }
         sessionActivityLines[sessionID, default: []].append("任务已按你的明确命令停止；正在收束当前执行步骤。检查点会保留，但这个会话不会自动继续。")
@@ -1183,6 +1213,10 @@ public final class CloudCodeViewModel: ObservableObject {
 
     public func suspendForBackground() {
         guard isRunning else { return }
+        // Persist the scene provenance separately from the generic run-resume bit. If iOS kills
+        // the process while it is backgrounded, the next process may safely distinguish that case
+        // from a foreground crash and perform one bounded checkpoint recovery.
+        UserDefaults.standard.set(true, forKey: Self.backgroundRunIntentDefaultsKey)
         Task {
             try? await diagnosticLogStore.log(level: .info, subsystem: "app", action: "background", result: "entered", metadata: ["runningSessions": String(runningSessionIDs.count)])
         }
@@ -1190,7 +1224,7 @@ public final class CloudCodeViewModel: ObservableObject {
         // 立即取消会把已经被系统接受的状态变更卡在“请求已发出、结果未校验”的窗口。
         // 申请一段有界后台时间，让当前步骤优先完成结果校验；只有系统明确收回后台时间时
         // 才取消并依赖持久化检查点恢复。
-        let message = "App 已进入后台；Cloud Code 会优先建立独立 root assertion worker，让当前 Agent 进程在 UI 退后台后继续运行。若设备拒绝该私有 assertion，才退回 iOS 有界后台时间 + checkpoint 恢复。"
+        let message = "App 已进入后台；Cloud Code 会优先建立独立 root assertion worker，并持续把任务状态写入检查点。若私有 assertion 后续失效或进程被系统回收，下次打开会仅在确认是后台退出时执行一次 checkpoint 自动恢复。"
         for sessionID in runningSessionIDs {
             sessionActivityLines[sessionID, default: []].append(message)
         }
@@ -1199,6 +1233,7 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func refreshAfterForeground() {
+        UserDefaults.standard.set(false, forKey: Self.backgroundRunIntentDefaultsKey)
         // Returning to the foreground ends UIKit's temporary background task, but an active
         // Agent run must keep its detached privileged assertion worker alive. Stopping that worker
         // here caused rapid acquire/stop churn whenever cross-app automation bounced through
@@ -1253,7 +1288,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 backgroundWindowTask = nil
                 let detail = assertion.detail
                 for sessionID in runningSessionIDs {
-                    sessionActivityLines[sessionID, default: []].append("已建立 detached root background assertion worker（PID \(workerPID)）；当前 Agent 不再依赖 UIApplication 的约 20–30 秒后台宽限。")
+                    sessionActivityLines[sessionID, default: []].append("已建立 detached root background assertion worker（PID \(workerPID)），并确认初始 assertion 有效；后台运行仍会以 assertion 实际有效性和 checkpoint 为准，不再仅凭 worker PID 宣称持续运行。")
                 }
                 Task {
                     try? await diagnosticLogStore.log(
@@ -1360,8 +1395,9 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private func resumeMostRecentInterruptedTaskIfRequested() {
-        // The persisted bit is only a same-process lifecycle hint. A newly constructed
-        // process must never replay a pre-crash Provider/tool request automatically.
+        // The in-memory arm is authoritative. It is set either by a same-process lifecycle
+        // interruption or, once per process, after bootstrap proves that the previous run was
+        // interrupted specifically while backgrounded. Foreground crashes remain fail-closed.
         guard autoResumeArmedInCurrentProcess else {
             if UserDefaults.standard.bool(forKey: Self.autoResumeTaskDefaultsKey) {
                 UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
@@ -3582,7 +3618,11 @@ public final class CloudCodeViewModel: ObservableObject {
         if let providerError = error as? ProviderError {
             switch providerError {
             case .streamInterrupted:
-                return "厂商输出连接已中断。检查点已保留，Cloud Code 不会自动重放已经开始的输出。可到“任务”中继续，或切换厂商。"
+                return "厂商已经建立连接并开始返回 SSE 数据，但在完成事件前中断。这个状态不同于“Wait for API”或限流；为避免重复执行已经开始的输出，Cloud Code 不会自动重放。检查点已保留，可在“任务”中继续。"
+            case .upstreamPending(let detail):
+                return "厂商正在等待上游 API，本轮有界等待/重试已耗尽；当前路由和 Key 不会因此被标记为断开。上游信息：\(detail)"
+            case .rateLimited:
+                return "厂商请求过多/触发限流，本轮有界等待/重试已耗尽；这不是厂商断开，当前路由和 Key 保持不变，可稍后直接继续。"
             case .malformedEvent:
                 return "厂商返回的数据格式异常。详细信息已写入诊断日志；可以重试当前厂商或切换厂商。"
             case .transport:
@@ -3612,7 +3652,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private static func isSafeProviderRetry(_ error: Error) -> Bool {
         if let providerError = error as? ProviderError {
             switch providerError {
-            case .rateLimited, .malformedEvent:
+            case .rateLimited, .upstreamPending, .malformedEvent:
                 return true
             case .invalidResponse(let code):
                 return (500...599).contains(code)
@@ -3816,6 +3856,7 @@ public final class CloudCodeViewModel: ObservableObject {
         runningSessionIDs.remove(sessionID)
         streamingAssistantMessageIDs.removeValue(forKey: sessionID)
         if runningSessionIDs.isEmpty {
+            UserDefaults.standard.set(false, forKey: Self.backgroundRunIntentDefaultsKey)
             if !preserveLifecycleResume {
                 autoResumeArmedInCurrentProcess = false
                 UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)

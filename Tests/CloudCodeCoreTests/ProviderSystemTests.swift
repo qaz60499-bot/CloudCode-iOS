@@ -1941,6 +1941,12 @@ final class ProviderProtocolClientTests: XCTestCase {
         }
 
         XCTAssertEqual(events.last, .finished)
+        XCTAssertTrue(events.contains { event in
+            if case .status(let value) = event {
+                return value.contains("等待上游 API") && value.contains("2/2")
+            }
+            return false
+        }, "AgentRouter pending retries must surface the wait reason and bounded retry progress instead of looking like a disconnect")
         let requests = AgentRouterPendingReplayURLProtocol.requests()
         XCTAssertEqual(requests.count, 2)
         XCTAssertEqual(requests.map { $0.url?.absoluteString }, [

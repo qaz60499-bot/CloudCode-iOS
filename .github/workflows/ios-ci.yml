@@ -426,6 +426,9 @@ jobs:
           background_section = helper_text.split('static int BackgroundAssertionWorker(', 1)[1].split('static int StopDetachedBackgroundAssertion(', 1)[0]
           if 'fork(' in background_section:
               raise SystemExit('FAIL: background assertion worker must not initialize Objective-C/private frameworks after fork')
+          for marker in ('assertionStillValid', 'sendBool0(assertion, validSelector)', 'if (!assertionStillValid) { break; }'):
+              if marker not in background_section:
+                  raise SystemExit(f'FAIL: background assertion worker can outlive an invalid BKS assertion: {marker}')
           for marker in ('enumerate-json', 'probe-filesystem-json', 'probe-launch', 'probe-uninstall', 'is-installed', 'launch', 'uninstall', 'cleanup-unregistered', 'MCMMetadataIdentifier', 'BundleFilesystemOrphans', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-screenshot-file', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-navigate-back', 'gui-type-base64', 'background-assert-worker', 'background-assert-start', 'background-assert-status', 'background-assert-stop', 'BKSProcessAssertion', 'CloudCode.BackgroundAgent'):
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: root helper command missing: {marker}')
@@ -471,7 +474,7 @@ jobs:
               raise SystemExit('FAIL: modern TrollStore GUI routing must prefer the global IOHID system client before BackBoard fallback')
           if '0x8000000817319375ULL' in gui_text or 'CLOUDCODE_GUI_FALLBACK_SENDER_ID' in gui_text:
               raise SystemExit('FAIL: build53 legacy IOHID sender/profile leaked into build54 GUI helper')
-          for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'run(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'CloudCodeSpawnHelperWithSeparatedOutput', 'runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)', 'runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 1.5)', 'result.stdout', 'result.stderr', 'run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)', 'EmbeddedVisionHelper', '["ocr-file", inputURL.path, String(boundedMaximum)]', '全局截图已通过独立 tmp JPEG 通道返回', 'run(["gui-navigate-back", strategy], privilege: .root, timeout: 4)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
+          for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'run(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'CloudCodeSpawnHelperWithSeparatedOutput', 'runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)', 'runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)', 'result.stdout', 'result.stderr', 'run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)', 'EmbeddedVisionHelper', '["ocr-file", inputURL.path, String(boundedMaximum)]', '全局截图已通过独立 tmp JPEG 通道返回', 'run(["gui-navigate-back", strategy], privilege: .root, timeout: 4)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
               if marker not in adapters:
                   raise SystemExit(f'FAIL: GUI adapter lost bounded helper marker: {marker}')
           gui_executor = adapters.split('public struct GUIFallbackExecutor', 1)[1]
@@ -497,11 +500,11 @@ jobs:
           for marker in ('gui.runStructuredPlan', 'executeStructuredPlan', '1...8 steps', 'every state-changing structured step requires expectQuery', 'structured plan stopped at protected', 'structured plan stopped before a commit/irreversible element', 'replanRequired', 'local_structured_validators_passed_final_semantic_review_required'):
               if marker not in gui_executor:
                   raise SystemExit(f'FAIL: bounded local structured plan lost validation/replan marker: {marker}')
-          if 'let result = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 1.5)' not in adapters:
+          if 'let result = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)' not in adapters:
               raise SystemExit('FAIL: structured UI-tree must use the bounded mobile AX client path instead of persona-99/root')
           if '#define CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS 0.25f' not in gui_text:
               raise SystemExit('FAIL: AX per-request timeout budget must remain fail-fast for detached/mobile AX clients')
-          for marker in ('AXUIElementCopyMultipleAttributeValues', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic'):
+          for marker in ('AXUIElementCopyMultipleAttributeValues', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic', 'CloudCodeAXNodeLimited', 'CloudCodeAXNodeLimited(runtime, candidate, 0, 0, nodeCount)'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: AX runtime lost bounded standalone-capability marker: {marker}')
           if '_AXSSetAutomationEnabled' in gui_text or 'CloudCodeEnableAXAutomationForRequest' in gui_text:
@@ -513,11 +516,11 @@ jobs:
           if not vision_helper.exists():
               raise SystemExit('FAIL: lightweight public Vision OCR helper source is missing')
           vision_text = vision_helper.read_text(encoding='utf-8')
-          for marker in ('cloudcode-vision-helper-protocol=1', 'VNRecognizeTextRequest', 'VNImageRequestHandler', 'usesCPUOnly = cpuOnly', 'preferBackgroundProcessing = YES', 'CloudCodePerformOCR(image, &request, YES', 'vision_helper_public_api', 'ocr-file'):
+          for marker in ('cloudcode-vision-helper-protocol=1', 'VNRecognizeTextRequest', 'VNImageRequestHandler', 'usesCPUOnly = cpuOnly', 'preferBackgroundProcessing = YES', 'CloudCodePerformOCR(image, &request, YES', 'vision_helper_public_api', 'CloudCodePerformFastFallbackOCR', 'kCGImageSourceThumbnailMaxPixelSize', 'vision_helper_public_api_fast_thumbnail_fallback', 'ocr-file'):
               if marker not in vision_text:
                   raise SystemExit(f'FAIL: lightweight Vision helper lost public OCR isolation marker: {marker}')
           local_vision = Path('Sources/CloudCodeApp/LocalVisionTextObservation.swift').read_text(encoding='utf-8')
-          for marker in ('EmbeddedVisionHelper.guiOCR', 'request.usesCPUOnly = true', 'request.preferBackgroundProcessing = true', 'app_process_vision_cpu_only'):
+          for marker in ('EmbeddedVisionHelper.guiOCR', 'request.usesCPUOnly = true', 'request.preferBackgroundProcessing = true', 'app_process_vision_cpu_only', 'app_process_vision_fast_thumbnail_fallback', 'kCGImageSourceThumbnailMaxPixelSize'):
               if marker not in local_vision:
                   raise SystemExit(f'FAIL: local OCR routing lost background-safe public Vision marker: {marker}')
           if 'EmbeddedRootHelper.guiOCR' in local_vision:
@@ -529,9 +532,12 @@ jobs:
           if 'TSRootBinaries:1 string CloudCodeVisionHelper' in project_text:
               raise SystemExit('FAIL: public Vision helper must never be declared as a TrollStore root binary')
           provider_client = Path('Sources/CloudCodeCore/ProviderClient.swift').read_text(encoding='utf-8')
-          for marker in ('ProviderImageCapability', 'case textOnly = "text_only"', 'providerTinyImageProbeBase64', 'internal_image_capability_probe', 'models_metadata', 'tiny_image_probe', 'providerMessagesWithoutImages', 'providerToolsWithoutFreeCoordinates', 'image_omitted_before_provider_request', 'preferredCapabilityRoute', 'router_preferred_exact_route'):
+          for marker in ('ProviderImageCapability', 'case textOnly = "text_only"', 'providerTinyImageProbeBase64', 'internal_image_capability_probe', 'models_metadata', 'tiny_image_probe', 'providerMessagesWithoutImages', 'providerToolsWithoutFreeCoordinates', 'image_omitted_before_provider_request', 'preferredCapabilityRoute', 'router_preferred_exact_route', 'case status(String)', '厂商正在等待上游 API', '厂商请求过多/触发限流'):
               if marker not in provider_client:
-                  raise SystemExit(f'FAIL: provider vision capability preflight lost required safety marker: {marker}')
+                  raise SystemExit(f'FAIL: provider vision/status capability preflight lost required safety marker: {marker}')
+          for marker in ('backgroundRunIntentDefaultsKey', 'runtime.autoresume.coldlaunch.background-armed', '检测到任务在后台期间发生进程重启'):
+              if marker not in app:
+                  raise SystemExit(f'FAIL: bounded background cold-launch checkpoint recovery lost required marker: {marker}')
           agent_core = Path('Sources/CloudCodeCore/AgentCore.swift').read_text(encoding='utf-8')
           for marker in ('providerVisionAssessment', 'providerVisionCapabilitySource', 'providerVisionAssessment.capability != .supported', 'blocked_unseen_visual_coordinate', 'perception_insufficient'):
               if marker not in agent_core:

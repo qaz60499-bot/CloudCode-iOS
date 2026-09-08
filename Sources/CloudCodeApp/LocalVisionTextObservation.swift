@@ -86,6 +86,7 @@ enum LocalVisionTextObservation {
                 combined.payload["localVisionSecondaryStatus"] = helperObservation.payload["localVisionOCR"] ?? "unavailable"
                 combined.payload["localVisionSecondaryErrorDomain"] = helperObservation.payload["localVisionErrorDomain"] ?? ""
                 combined.payload["localVisionSecondaryErrorCode"] = helperObservation.payload["localVisionErrorCode"] ?? ""
+                combined.payload["localVisionSecondaryDiagnostic"] = helperObservation.payload["localVisionHelperDiagnostic"] ?? ""
                 return combined
             }
             return inProcess
@@ -107,7 +108,11 @@ enum LocalVisionTextObservation {
         guard let json = helper.json,
               let data = json.data(using: .utf8),
               let response = try? JSONDecoder().decode(HelperResponse.self, from: data) else {
-            return nil
+            return Observation(payload: [
+                "localVisionOCR": "unavailable_helper_failed",
+                "localVisionBackend": "vision_helper_public_api",
+                "localVisionHelperDiagnostic": String(helper.detail.prefix(512))
+            ], elements: [])
         }
 
         let screenWidth = CGFloat(max(1, response.screenPointWidth))
@@ -226,36 +231,38 @@ enum LocalVisionTextObservation {
         let handler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
         var fallbackUsed = false
         var firstFailure: NSError?
+        var backend = "app_process_vision_cpu_only"
         do {
             try handler.perform([request])
         } catch {
             let primaryFailure = error as NSError
             firstFailure = primaryFailure
-            if let allocationFailure = Self.coreVideoAllocationFailure(in: primaryFailure) {
-                // CoreVideo -6662 is an allocation failure, not a recognition-language mismatch.
-                // Reissuing the same Vision pipeline with different language settings only repeats
-                // resource pressure and adds latency while CloudCode is backgrounded.
-                return Observation(payload: [
-                    "localVisionOCR": "unavailable_request_failed",
-                    "screenPointWidth": String(pixelWidth),
-                    "screenPointHeight": String(pixelHeight),
-                    "localVisionLatencyMS": String(max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))),
-                    "localVisionRecognitionLevel": request.recognitionLevel == .fast ? "fast" : "accurate",
-                    "localVisionFallbackUsed": "false",
-                    "localVisionErrorDomain": allocationFailure.domain,
-                    "localVisionErrorCode": String(allocationFailure.code),
-                    "localVisionPrimaryErrorDomain": firstFailure?.domain ?? "",
-                    "localVisionPrimaryErrorCode": firstFailure.map { String($0.code) } ?? "",
-                    "localVisionBackend": "app_process_vision_cpu_only"
-                ], elements: [])
-            }
-            // A request revision/device can still reject the chosen language/model combination.
-            // Retry once without an explicit language list before declaring local perception dead.
             fallbackUsed = true
             request = makeRequest(level: .fast, languages: nil)
+
+            let fallbackImage: CGImage
+            if Self.coreVideoAllocationFailure(in: primaryFailure) != nil {
+                // -6662 is kCVReturnAllocationFailed. Retrying the same accurate pipeline is not
+                // useful, but Apple's Vision fast path uses a smaller recognition model. Combine
+                // that with an ImageIO thumbnail so the fallback materially reduces memory rather
+                // than merely changing language settings. Bounding boxes remain normalized, so the
+                // original screen-point dimensions still produce correct GUI coordinates.
+                let maxFallbackDimension = 640
+                let options: [CFString: Any] = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceThumbnailMaxPixelSize: maxFallbackDimension,
+                    kCGImageSourceCreateThumbnailWithTransform: true
+                ]
+                fallbackImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) ?? image
+                backend = "app_process_vision_fast_thumbnail_fallback"
+            } else {
+                fallbackImage = image
+                backend = "app_process_vision_fast_fallback"
+            }
+
             do {
                 // Use a fresh handler after a failed Vision request so fallback state is isolated.
-                let fallbackHandler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
+                let fallbackHandler = VNImageRequestHandler(cgImage: fallbackImage, orientation: .up, options: [:])
                 try fallbackHandler.perform([request])
             } catch {
                 let finalFailure = error as NSError
@@ -268,7 +275,7 @@ enum LocalVisionTextObservation {
                     "localVisionErrorCode": String(finalFailure.code),
                     "localVisionPrimaryErrorDomain": firstFailure?.domain ?? "",
                     "localVisionPrimaryErrorCode": firstFailure.map { String($0.code) } ?? "",
-                    "localVisionBackend": "app_process_vision_cpu_only"
+                    "localVisionBackend": backend
                 ], elements: [])
             }
         }
@@ -336,7 +343,7 @@ enum LocalVisionTextObservation {
             "localVisionLatencyMS": String(max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))),
             "localVisionRecognitionLevel": request.recognitionLevel == .fast ? "fast" : "accurate",
             "localVisionFallbackUsed": fallbackUsed ? "true" : "false",
-            "localVisionBackend": "app_process_vision_cpu_only"
+            "localVisionBackend": backend
         ]
         if let boundedRegion {
             payload["localVisionRegion"] = "\(boundedRegion.minX),\(boundedRegion.minY),\(boundedRegion.width),\(boundedRegion.height)"

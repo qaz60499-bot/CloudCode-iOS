@@ -472,7 +472,7 @@ enum EmbeddedRootHelper {
         // standalone client, fail quickly and let screenshot/OCR remain the deterministic path.
         // Full XCTest/XCAXClient behavior requires an automation session and cannot be manufactured
         // merely by adding root privileges to a TrollStore process.
-        let result = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 1.5)
+        let result = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)
         guard result.code == 0, !result.stdout.isEmpty else {
             let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
             return (nil, failureDetail(prefix: "GUI tree (mobile AX client)", code: result.code, diagnostic: diagnostic))

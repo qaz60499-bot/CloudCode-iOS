@@ -349,6 +349,7 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
 }
 
 public enum ProviderEvent: Sendable, Equatable {
+    case status(String)
     case token(String)
     case toolCall(id: String, name: String, argumentsJSON: String)
     case finished
@@ -1201,6 +1202,25 @@ private extension ProviderRequestBuilding {
                                 "bodyDataReceived": String(bodyDataReceived)
                             ]
                         )
+                        let delaySeconds = max(0.0, Double(retryDelay) / 1_000_000_000.0)
+                        let retryStatus: String
+                        if let providerError = effectiveError as? ProviderError {
+                            switch providerError {
+                            case .upstreamPending(let detail):
+                                retryStatus = "厂商正在等待上游 API：\(detail)；Cloud Code 保持当前已验证路由，将在 \(String(format: "%.1f", delaySeconds)) 秒后进行第 \(attempt + 1)/\(retryPolicy.maxAttempts) 次有界重试。"
+                            case .rateLimited:
+                                retryStatus = "厂商请求过多/触发限流；Cloud Code 不会把它误判为断开，将在 \(String(format: "%.1f", delaySeconds)) 秒后进行第 \(attempt + 1)/\(retryPolicy.maxAttempts) 次有界重试。"
+                            case .malformedEvent:
+                                retryStatus = "厂商 SSE 流格式暂时异常，但尚未产生模型输出；将在 \(String(format: "%.1f", delaySeconds)) 秒后安全重试（第 \(attempt + 1)/\(retryPolicy.maxAttempts) 次）。"
+                            case .invalidResponse(let code) where (500...599).contains(code):
+                                retryStatus = "厂商上游暂时不可用（HTTP \(code)）；将在 \(String(format: "%.1f", delaySeconds)) 秒后进行第 \(attempt + 1)/\(retryPolicy.maxAttempts) 次有界重试。"
+                            default:
+                                retryStatus = "厂商连接暂时异常，尚未产生模型输出；将在 \(String(format: "%.1f", delaySeconds)) 秒后进行第 \(attempt + 1)/\(retryPolicy.maxAttempts) 次安全重试。"
+                            }
+                        } else {
+                            retryStatus = "厂商网络暂时异常，尚未产生模型输出；将在 \(String(format: "%.1f", delaySeconds)) 秒后进行第 \(attempt + 1)/\(retryPolicy.maxAttempts) 次安全重试。"
+                        }
+                        continuation.yield(.status(retryStatus))
                         attempt += 1
                         do {
                             try await Task.sleep(nanoseconds: retryDelay)
@@ -2232,6 +2252,8 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                             for try await event in stream {
                                 try Task.checkCancellation()
                                 switch event {
+                                case .status:
+                                    break
                                 case .token:
                                     emittedOutput = true
                                     emittedToken = true

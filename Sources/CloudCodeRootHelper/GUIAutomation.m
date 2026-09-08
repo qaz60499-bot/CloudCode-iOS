@@ -1056,21 +1056,23 @@ static NSDictionary *CloudCodeFrameDictionary(CloudCodeAXRuntime runtime, id val
     return @{@"x": @(frame.origin.x), @"y": @(frame.origin.y), @"width": @(frame.size.width), @"height": @(frame.size.height)};
 }
 
-static NSDictionary *CloudCodeAXNode(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef element, NSUInteger depth, NSUInteger *nodeCount)
+static NSDictionary *CloudCodeAXNodeLimited(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef element, NSUInteger depth, NSUInteger maxDepth, NSUInteger *nodeCount)
 {
-    if (!element || depth > 20 || !nodeCount || *nodeCount >= CLOUDCODE_GUI_MAX_TREE_NODES) { return nil; }
+    if (!element || depth > maxDepth || !nodeCount || *nodeCount >= CLOUDCODE_GUI_MAX_TREE_NODES) { return nil; }
     (*nodeCount)++;
     NSMutableDictionary *node = [NSMutableDictionary dictionary];
-    NSArray<NSDictionary *> *attributes = @[
+    NSMutableArray<NSDictionary *> *attributes = [@[
         @{@"key": @"role", @"attribute": (__bridge id)(runtime.attributeElementType ?: CFSTR("AXRole"))},
         @{@"key": @"label", @"attribute": (__bridge id)(runtime.attributeLabel ?: CFSTR("AXLabel"))},
         @{@"key": @"value", @"attribute": (__bridge id)(runtime.attributeValue ?: CFSTR("AXValue"))},
         @{@"key": @"title", @"attribute": @"AXTitle"},
         @{@"key": @"identifier", @"attribute": (__bridge id)(runtime.attributeIdentifier ?: CFSTR("AXIdentifier"))},
         @{@"key": @"placeholder", @"attribute": (__bridge id)(runtime.attributePlaceholder ?: CFSTR("AXPlaceholderValue"))},
-        @{@"key": @"frame", @"attribute": (__bridge id)(runtime.attributeFrame ?: CFSTR("AXFrame"))},
-        @{@"key": @"children", @"attribute": (__bridge id)(runtime.attributeChildren ?: CFSTR("AXChildren"))}
-    ];
+        @{@"key": @"frame", @"attribute": (__bridge id)(runtime.attributeFrame ?: CFSTR("AXFrame"))}
+    ] mutableCopy];
+    if (depth < maxDepth) {
+        [attributes addObject:@{@"key": @"children", @"attribute": (__bridge id)(runtime.attributeChildren ?: CFSTR("AXChildren"))}];
+    }
 
     // Prefer one AX IPC for the attributes needed by a node. A detached client paying one
     // messaging timeout per role/label/value/frame/children call scales catastrophically when an
@@ -1104,20 +1106,27 @@ static NSDictionary *CloudCodeAXNode(CloudCodeAXRuntime runtime, CloudCodeAXUIEl
         id frameValue = CloudCodeAXCopy(runtime, element, runtime.attributeFrame ?: CFSTR("AXFrame"));
         NSDictionary *frame = CloudCodeFrameDictionary(runtime, frameValue);
         if (frame) { node[@"frame"] = frame; }
-        childrenValue = CloudCodeAXCopy(runtime, element, runtime.attributeChildren ?: CFSTR("AXChildren"));
+        if (depth < maxDepth) {
+            childrenValue = CloudCodeAXCopy(runtime, element, runtime.attributeChildren ?: CFSTR("AXChildren"));
+        }
     }
 
-    if ([childrenValue isKindOfClass:NSArray.class] && depth < 20) {
+    if ([childrenValue isKindOfClass:NSArray.class] && depth < maxDepth) {
         NSMutableArray *children = [NSMutableArray array];
         for (id child in (NSArray *)childrenValue) {
             if (*nodeCount >= CLOUDCODE_GUI_MAX_TREE_NODES) { break; }
             CloudCodeAXUIElementRef childElement = (CloudCodeAXUIElementRef)(__bridge CFTypeRef)child;
-            NSDictionary *childNode = CloudCodeAXNode(runtime, childElement, depth + 1, nodeCount);
+            NSDictionary *childNode = CloudCodeAXNodeLimited(runtime, childElement, depth + 1, maxDepth, nodeCount);
             if (childNode) { [children addObject:childNode]; }
         }
         if (children.count > 0) { node[@"children"] = children; }
     }
     return node;
+}
+
+static NSDictionary *CloudCodeAXNode(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef element, NSUInteger depth, NSUInteger *nodeCount)
+{
+    return CloudCodeAXNodeLimited(runtime, element, depth, 20, nodeCount);
 }
 
 static CloudCodeAXUIElementRef CloudCodeAXFindElementForPid(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef element, pid_t targetPid, NSUInteger depth, NSUInteger *visited)
@@ -1311,15 +1320,14 @@ static NSDictionary *CloudCodeAXHitTestTree(CloudCodeAXRuntime runtime, NSUInteg
     // system-wide AX hit-test respects z-order, so these points can still recover useful foreground
     // elements when detached helpers cannot obtain a full application root.
     const CGPoint points[] = {
+        // Keep the degraded probe inside the helper watchdog budget. The right rail receives
+        // multiple samples because social/video apps commonly expose like/comment/share controls
+        // there; the center sample preserves a generic fallback without recursively walking DOMs.
         {size.width * 0.50, size.height * 0.50},
-        {size.width * 0.88, size.height * 0.30},
-        {size.width * 0.88, size.height * 0.43},
-        {size.width * 0.88, size.height * 0.56},
-        {size.width * 0.88, size.height * 0.69},
-        {size.width * 0.88, size.height * 0.82},
-        {size.width * 0.50, size.height * 0.22},
-        {size.width * 0.50, size.height * 0.78},
-        {size.width * 0.12, size.height * 0.50}
+        {size.width * 0.88, size.height * 0.32},
+        {size.width * 0.88, size.height * 0.48},
+        {size.width * 0.88, size.height * 0.64},
+        {size.width * 0.88, size.height * 0.80}
     };
     NSMutableArray *hits = [NSMutableArray array];
     pid_t foregroundPID = 0;
@@ -1363,7 +1371,10 @@ static NSDictionary *CloudCodeAXHitTestTree(CloudCodeAXRuntime runtime, NSUInteg
             }
         }
 
-        NSDictionary *node = CloudCodeAXNode(runtime, candidate, 0, nodeCount);
+        // Sampled fallback is intentionally shallow. A detached mobile AX client can spend a full
+        // IPC timeout on every descendant attribute; recursively expanding nine hit-test roots was
+        // the main reason the 1.5 s helper watchdog killed otherwise useful topmost semantics.
+        NSDictionary *node = CloudCodeAXNodeLimited(runtime, candidate, 0, 0, nodeCount);
         CFRelease(candidate);
         if (!node) { continue; }
         NSMutableDictionary *annotated = [node mutableCopy];

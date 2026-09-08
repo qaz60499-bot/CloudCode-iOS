@@ -1023,7 +1023,24 @@ static int BackgroundAssertionWorker(pid_t targetPID, int handshakeFD)
     if (!valid) { return 75; }
 
     RedirectStandardIOToNull();
-    while (kill(targetPID, 0) == 0) { sleep(2); }
+    // A live worker PID is not proof that its RunningBoard/BKS assertion remains effective. The
+    // previous implementation could therefore keep reporting "background assertion alive" after
+    // the assertion itself had been invalidated and the target App was already suspendable. Keep
+    // the worker lifetime coupled to the assertion's `valid` state so the existing status command
+    // becomes meaningful: when validity is lost the worker exits and the App can fall back to its
+    // checkpoint/restart recovery path instead of trusting a zombie guardian process.
+    while (kill(targetPID, 0) == 0) {
+        BOOL assertionStillValid = YES;
+        if ([assertion respondsToSelector:validSelector]) {
+            BOOL (*sendBool0)(id, SEL) = (void *)objc_msgSend;
+            @try { assertionStillValid = sendBool0(assertion, validSelector); }
+            @catch (__unused NSException *exception) { assertionStillValid = NO; }
+        } else if (callbackCalled) {
+            assertionStillValid = acquired;
+        }
+        if (!assertionStillValid) { break; }
+        sleep(2);
+    }
     SEL invalidateSelector = NSSelectorFromString(@"invalidate");
     if ([assertion respondsToSelector:invalidateSelector]) {
         @try { ((void (*)(id, SEL))objc_msgSend)(assertion, invalidateSelector); } @catch (__unused NSException *exception) {}

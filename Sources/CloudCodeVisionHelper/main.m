@@ -90,6 +90,27 @@ static NSError *CloudCodePerformOCR(CGImageRef image, VNRecognizeTextRequest **r
     return error ?: [NSError errorWithDomain:@"CloudCodeVisionHelper" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Vision request failed without NSError"}];
 }
 
+static NSError *CloudCodePerformFastFallbackOCR(CGImageRef image, VNRecognizeTextRequest **requestOut, NSString **levelName)
+{
+    VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] init];
+    request.recognitionLevel = VNRequestTextRecognitionLevelFast;
+    request.usesLanguageCorrection = NO;
+    request.minimumTextHeight = 0.012f;
+    request.preferBackgroundProcessing = YES;
+    if (@available(iOS 16.0, *)) { request.automaticallyDetectsLanguage = YES; }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    request.usesCPUOnly = YES;
+#pragma clang diagnostic pop
+    if (levelName) { *levelName = @"fast"; }
+    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image options:@{}];
+    NSError *error = nil;
+    BOOL ok = [handler performRequests:@[request] error:&error];
+    if (requestOut) { *requestOut = request; }
+    if (ok && !error) { return nil; }
+    return error ?: [NSError errorWithDomain:@"CloudCodeVisionHelper" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Fast fallback Vision request failed without NSError"}];
+}
+
 static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements)
 {
     CFAbsoluteTime startedAt = CFAbsoluteTimeGetCurrent();
@@ -125,6 +146,28 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements)
     NSError *primaryError = CloudCodePerformOCR(image, &request, YES, &recognitionLevelName);
     BOOL cpuFallbackUsed = NO;
     NSError *finalError = primaryError;
+    NSString *backendName = @"vision_helper_public_api";
+
+    if (primaryError) {
+        // A fresh helper process is valuable only if it does materially less work after the same
+        // public Vision pipeline fails. Retry once with Apple's fast recognizer on an ImageIO
+        // thumbnail. This reduces both model and image memory pressure and specifically gives
+        // CoreVideo allocation failures (-6662) a cheaper path instead of repeating accurate OCR.
+        CGImageSourceRef fallbackSource = CGImageSourceCreateWithData((__bridge CFDataRef)jpeg, NULL);
+        NSDictionary *thumbnailOptions = @{
+            (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+            (id)kCGImageSourceThumbnailMaxPixelSize: @640,
+            (id)kCGImageSourceCreateThumbnailWithTransform: @YES
+        };
+        CGImageRef fallbackImage = fallbackSource ? CGImageSourceCreateThumbnailAtIndex(fallbackSource, 0, (__bridge CFDictionaryRef)thumbnailOptions) : NULL;
+        if (fallbackSource) { CFRelease(fallbackSource); }
+        if (fallbackImage) {
+            cpuFallbackUsed = YES;
+            backendName = @"vision_helper_public_api_fast_thumbnail_fallback";
+            finalError = CloudCodePerformFastFallbackOCR(fallbackImage, &request, &recognitionLevelName);
+            CGImageRelease(fallbackImage);
+        }
+    }
 
     if (finalError) {
         NSDictionary *failure = @{
@@ -133,7 +176,7 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements)
             @"screenPointHeight": @(pixelHeight),
             @"latencyMS": @((NSInteger)MAX(0.0, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000.0)),
             @"recognitionLevel": recognitionLevelName ?: @"unknown",
-            @"backend": @"vision_helper_public_api",
+            @"backend": backendName,
             @"cpuFallbackUsed": @(cpuFallbackUsed),
             @"errorDomain": finalError.domain ?: @"",
             @"errorCode": @(finalError.code),
@@ -201,7 +244,7 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements)
         @"screenPointHeight": @(pixelHeight),
         @"latencyMS": @((NSInteger)MAX(0.0, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000.0)),
         @"recognitionLevel": recognitionLevelName ?: @"unknown",
-        @"backend": @"vision_helper_public_api",
+        @"backend": backendName,
         @"cpuFallbackUsed": @(cpuFallbackUsed),
         @"visibleText": [textParts componentsJoinedByString:@" | "],
         @"elements": elements
