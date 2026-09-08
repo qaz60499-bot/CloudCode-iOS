@@ -1166,9 +1166,9 @@ static void CloudCodePrepareAXApplication(CloudCodeAXRuntime runtime, CloudCodeA
     if (runtime.setTimeout) {
         @try { runtime.setTimeout(root, CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {}
     }
-    if (runtime.setAttribute) {
-        @try { runtime.setAttribute(root, CFSTR("AXManualAccessibility"), kCFBooleanTrue); } @catch (__unused NSException *exception) {}
-    }
+    // Production AX observation must remain passive. AXManualAccessibility changes the target
+    // process' accessibility mode and is not required to read a native iOS App such as WeChat.
+    // Keep that mutation confined to the explicit diagnostic probe's attributes stage below.
 }
 
 static CloudCodeAXUIElementRef CloudCodeAXRootForPid(CloudCodeAXRuntime runtime, pid_t pid, NSString **backend)

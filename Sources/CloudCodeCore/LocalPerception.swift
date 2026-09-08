@@ -107,6 +107,33 @@ public enum LocalPerceptionTextMatcher {
             if containment.count == 1 { return .unique(containment[0]) }
             if containment.count > 1 { return .ambiguous(containment.count) }
         }
+
+        // Chinese UI labels may arrive with OCR-inserted whitespace/punctuation or as adjacent
+        // observations on one visual row. Only after normal matching fails, compact those benign
+        // separators and try a tightly bounded same-line merge. Multiple candidates still fail
+        // closed instead of guessing between rows.
+        let compactQuery = compactNormalized(rawQuery)
+        if compactQuery.count >= 2 {
+            let compactMatches = usable.filter { candidate in
+                let compactCandidate = compactNormalized(candidate.element.text)
+                switch mode {
+                case .exact: return compactCandidate == compactQuery
+                case .contains: return compactCandidate.contains(compactQuery)
+                }
+            }.map(\.element)
+            if compactMatches.count == 1 { return .unique(compactMatches[0]) }
+            if compactMatches.count > 1 { return .ambiguous(compactMatches.count) }
+
+            let mergedMatches = mergedSameLineCandidates(elements: usable.map(\.element)).filter { candidate in
+                let compactCandidate = compactNormalized(candidate.text)
+                switch mode {
+                case .exact: return compactCandidate == compactQuery
+                case .contains: return compactCandidate.contains(compactQuery)
+                }
+            }
+            if mergedMatches.count == 1 { return .unique(mergedMatches[0]) }
+            if mergedMatches.count > 1 { return .ambiguous(mergedMatches.count) }
+        }
         return .notFound
     }
 
@@ -114,6 +141,79 @@ public enum LocalPerceptionTextMatcher {
         value
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    private static func compactNormalized(_ value: String) -> String {
+        normalized(value).unicodeScalars.reduce(into: "") { result, scalar in
+            if CharacterSet.whitespacesAndNewlines.contains(scalar)
+                || CharacterSet.punctuationCharacters.contains(scalar)
+                || CharacterSet.symbols.contains(scalar) {
+                return
+            }
+            result.append(contentsOf: String(scalar))
+        }
+    }
+
+    private static func mergedSameLineCandidates(elements: [LocalPerceptionTextElement]) -> [LocalPerceptionTextElement] {
+        let sorted = elements.sorted { lhs, rhs in
+            if lhs.centerY == rhs.centerY { return lhs.x < rhs.x }
+            return lhs.centerY < rhs.centerY
+        }
+        var lines: [[LocalPerceptionTextElement]] = []
+        for element in sorted {
+            if let index = lines.firstIndex(where: { line in
+                guard let first = line.first else { return false }
+                let tolerance = max(8, min(first.height, element.height) * 0.65)
+                return abs(first.centerY - element.centerY) <= tolerance
+            }) {
+                lines[index].append(element)
+            } else {
+                lines.append([element])
+            }
+        }
+
+        var merged: [LocalPerceptionTextElement] = []
+        for rawLine in lines {
+            let line = rawLine.sorted { $0.x < $1.x }
+            guard line.count >= 2 else { continue }
+            for start in line.indices {
+                var minX = line[start].x
+                var minY = line[start].y
+                var maxX = line[start].x + line[start].width
+                var maxY = line[start].y + line[start].height
+                var text = line[start].text
+                var confidenceTotal = line[start].confidence
+                var count = 1
+                var previous = line[start]
+                let upperBound = min(line.count, start + 4)
+                guard start + 1 < upperBound else { continue }
+                for index in (start + 1)..<upperBound {
+                    let next = line[index]
+                    let gap = next.x - (previous.x + previous.width)
+                    let maxGap = max(28, max(previous.height, next.height) * 1.8)
+                    if gap > maxGap { break }
+                    if gap < -max(previous.width, next.width) * 0.35 { break }
+
+                    text += next.text
+                    confidenceTotal += next.confidence
+                    count += 1
+                    minX = min(minX, next.x)
+                    minY = min(minY, next.y)
+                    maxX = max(maxX, next.x + next.width)
+                    maxY = max(maxY, next.y + next.height)
+                    merged.append(LocalPerceptionTextElement(
+                        text: text,
+                        confidence: confidenceTotal / Double(count),
+                        x: minX,
+                        y: minY,
+                        width: maxX - minX,
+                        height: maxY - minY
+                    ))
+                    previous = next
+                }
+            }
+        }
+        return merged
     }
 }
 
