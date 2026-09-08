@@ -141,7 +141,7 @@ struct PerceptionProbeView: View {
                     } catch { return Self.json(["status": "fixture_write_failed"]) }
                     defer { try? FileManager.default.removeItem(at: url) }
                     body = Self.spawn(executable: EmbeddedVisionHelper.executablePath, arguments: ["probe-ocr-file", url.path,
-                        selectedInitializer, selectedLanguage, selectedCPU ? "1" : "0", String(screen.width), String(screen.height)], asRoot: false)
+                        selectedInitializer, selectedLanguage, selectedCPU ? "1" : "0", String(describing: screen.width), String(describing: screen.height)], asRoot: false)
                 } else {
                     body = CloudCodeVisionProbeJSON(jpeg, selectedInitializer, selectedLanguage, selectedCPU, screen.width, screen.height)
                 }
