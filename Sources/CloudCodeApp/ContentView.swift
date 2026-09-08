@@ -1494,7 +1494,9 @@ private struct SettingsView: View {
                 }
 
                 Section("诊断") {
+                    #if DEBUG
                     NavigationLink("感知专项探针") { PerceptionProbeView(model: model) }
+                    #endif
                     NavigationLink {
                         DiagnosticLogsView(model: model)
                     } label: {

@@ -258,9 +258,13 @@ enum EmbeddedRootHelper {
             return (nil, "\(executableName) 不可执行；跨 App 枚举保持不可用。")
         }
 
-        let isolated = run(["enumerate-json"], privilege: .isolatedUser, timeout: 5)
+        // enumerate-json is machine-readable stdout. RootHelperBridge also emits helper lifecycle
+        // evidence on stderr; using the combined-output bridge here makes two valid JSON documents
+        // look like one invalid document and collapses apps.list back to the caller-only fallback.
+        // Keep stdout/stderr separated exactly as app introspection already does.
+        let isolated = runSeparated(["enumerate-json"], privilege: .isolatedUser, timeout: 5)
         if isolated.code == 0,
-           let payload = decodeEnumerationPayload(isolated.diagnostic),
+           let payload = decodeEnumerationPayload(isolated.stdout),
            enumerationHasCrossAppEvidence(payload) {
             return (payload, "\(payload.backend) 已在 isolated helper 中完成跨 App 枚举。")
         }
@@ -271,25 +275,38 @@ enum EmbeddedRootHelper {
         // explicit cross-app read (apps.list/apps.inspect/container resolution) causes the resolver
         // to refresh. The command is strictly read-only and still returns only the bounded JSON
         // schema accepted below.
-        let privileged = run(["enumerate-json"], privilege: .root, timeout: 5)
+        let privileged = runSeparated(["enumerate-json"], privilege: .root, timeout: 5)
         if privileged.code == 0,
-           let payload = decodeEnumerationPayload(privileged.diagnostic),
+           let payload = decodeEnumerationPayload(privileged.stdout),
            enumerationHasCrossAppEvidence(payload) {
             let isolatedDetail: String
             if isolated.code == 0 {
                 isolatedDetail = "isolated helper 仅看到本 App 或没有跨 App 证据"
             } else {
-                isolatedDetail = failureDetail(prefix: "isolated helper 枚举", code: isolated.code, diagnostic: isolated.diagnostic)
+                let diagnostic = isolated.stderr.isEmpty ? isolated.stdout : isolated.stderr
+                isolatedDetail = failureDetail(prefix: "isolated helper 枚举", code: isolated.code, diagnostic: diagnostic)
             }
             return (payload, "\(payload.backend) 已通过 bounded read-only root helper 恢复跨 App 枚举；\(isolatedDetail)。")
         }
 
-        let isolatedDetail = isolated.code == 0
-            ? "isolated helper 枚举输出没有跨 App 证据"
-            : failureDetail(prefix: "isolated helper 枚举", code: isolated.code, diagnostic: isolated.diagnostic)
-        let privilegedDetail = privileged.code == 0
-            ? "root helper 枚举输出没有跨 App 证据或无法解析"
-            : failureDetail(prefix: "root helper 枚举", code: privileged.code, diagnostic: privileged.diagnostic)
+        let isolatedDetail: String
+        if isolated.code == 0 {
+            isolatedDetail = isolated.stdout.isEmpty
+                ? "isolated helper 枚举没有返回 machine-readable stdout"
+                : "isolated helper 枚举输出没有跨 App 证据"
+        } else {
+            let diagnostic = isolated.stderr.isEmpty ? isolated.stdout : isolated.stderr
+            isolatedDetail = failureDetail(prefix: "isolated helper 枚举", code: isolated.code, diagnostic: diagnostic)
+        }
+        let privilegedDetail: String
+        if privileged.code == 0 {
+            privilegedDetail = privileged.stdout.isEmpty
+                ? "root helper 枚举没有返回 machine-readable stdout"
+                : "root helper 枚举输出没有跨 App 证据或无法解析"
+        } else {
+            let diagnostic = privileged.stderr.isEmpty ? privileged.stdout : privileged.stderr
+            privilegedDetail = failureDetail(prefix: "root helper 枚举", code: privileged.code, diagnostic: diagnostic)
+        }
         return (nil, "跨 App 枚举失败：\(isolatedDetail)；\(privilegedDetail)。")
     }
 
