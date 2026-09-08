@@ -751,9 +751,18 @@ public enum DiagnosticProblemPackageBuilder {
         if record.level == .error { return true }
         let result = record.result.lowercased()
         let diagnostic = (record.diagnostic ?? "").lowercased()
+        let action = record.action.lowercased()
         let localVisionStatus = (record.metadata["localVisionOCR"] ?? "").lowercased()
-        let failureMarkers = ["failed", "failure", "exhausted", "timeout", "timed out", "interrupted", "insufficient", "unverified", "no_effect", "no effect", "premature"]
-        if failureMarkers.contains(where: { result.contains($0) || diagnostic.contains($0) }) { return true }
+        let hardResultMarkers = ["failed", "failure", "exhausted", "timeout", "timed out", "interrupted", "insufficient", "no_effect", "no effect", "premature"]
+        if hardResultMarkers.contains(where: { result.contains($0) }) { return true }
+        if record.level == .warning,
+           hardResultMarkers.contains(where: { diagnostic.contains($0) }) { return true }
+        // Low-level helper success diagnostics include bounded timeout evidence such as
+        // timeoutSeconds/parentTimeout:false and often say dispatched-unverified because semantic
+        // verification belongs to the enclosing tool. Neither is itself a failure capsule.
+        if result.contains("unverified"), !action.hasSuffix(".helper") { return true }
+        if record.metadata["foregroundVerified"] == "false",
+           (action.contains("openapp") || action.contains("launch")) { return true }
         // A screenshot/action can succeed while a required perception sub-stage fails. Preserve that
         // partial failure as a capsule candidate instead of letting the outer tool success hide it.
         if localVisionStatus.hasPrefix("unavailable") { return true }
@@ -1044,6 +1053,7 @@ public enum DiagnosticProblemPackageBuilder {
         }
 
         if record.result.lowercased().contains("route_failed") { return "route_selection_failed" }
+        if record.metadata["foregroundVerified"] == "false" { return "foreground_unverified" }
         if combined.contains("foreground") && (combined.contains("mismatch") || combined.contains("wrong app")) { return "foreground_target_mismatch" }
         if combined.contains("foreground") && combined.contains("verify") { return "foreground_unverified" }
         if combined.contains("no effect") || combined.contains("no_effect") { return "no_observed_effect" }

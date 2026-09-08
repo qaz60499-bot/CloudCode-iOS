@@ -605,6 +605,44 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(DiagnosticProblemPackageBuilder.replayClassification(livePackage.replayArtifacts[0]), .realDeviceRequired)
     }
 
+    func testDiagnosticProblemPackageIgnoresSuccessfulHelperLifecycleTimeoutMetadata() {
+        let context = DiagnosticProblemContext(build: "92", iOSVersion: "18", deviceClass: "phone")
+        let successfulHelper = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "gui",
+            action: "tap.helper",
+            result: "dispatched-unverified",
+            diagnostic: "helper completed normally",
+            metadata: [
+                "timeoutSeconds": "3.0",
+                "parentTimeout": "false",
+                "timeoutKillResult": "0",
+                "timeoutKillErrno": "0"
+            ]
+        )
+        let successfulSQLite = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "capability",
+            action: "native.sqlite",
+            result: "available",
+            diagnostic: "read-only query support with timeout bounds"
+        )
+        let successfulAssertion = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "app",
+            action: "background.assertion",
+            result: "acquired",
+            diagnostic: "worker active; parentTimeout=false"
+        )
+
+        let package = DiagnosticProblemPackageBuilder.build(
+            records: [successfulHelper, successfulSQLite, successfulAssertion],
+            executionMetrics: [],
+            context: context
+        )
+        XCTAssertTrue(package.capsules.isEmpty)
+    }
+
     func testDiagnosticRegressionManifestGroupsRepeatedFailureSignature() {
         let sessionID = UUID()
         let first = DiagnosticLogRecord(
@@ -3090,7 +3128,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(learning.requiredCapabilities.isEmpty)
         XCTAssertEqual(learning.risk, .readOnly)
         XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.typeObserve", arguments: ["text": "secret text"], sessionID: UUID())), "当前前台 App · 输入 11 个字符（内容已隐藏）")
-        XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.tapTextObserve", arguments: ["query": "文件传输助手"], sessionID: UUID())), "当前前台 App · local OCR text tap")
+        XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.tapTextObserve", arguments: ["query": "文件传输助手"], sessionID: UUID())), "当前前台 App · local AX/OCR text tap")
         XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.focusComposerObserve", arguments: [:], sessionID: UUID())), "当前前台 App · semantic chat composer focus")
     }
 
@@ -4021,7 +4059,7 @@ final class CloudCodeCoreTests: XCTestCase {
                     FixedPayloadExecutor(
                         route: .guiFallback,
                         names: ["gui.focusComposerObserve"],
-                        payload: ["keyboardLikely": "true"]
+                        payload: ["focusVerified": "true", "focusVerificationRoute": "ax_focused_text_input"]
                     ),
                     CountingExecutor(route: .guiFallback, names: ["gui.type"], counter: typeCounter)
                 ]

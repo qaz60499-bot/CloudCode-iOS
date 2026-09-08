@@ -2060,6 +2060,62 @@ int CloudCodeGUINavigateBack(NSString *strategy)
     }
 }
 
+int CloudCodeGUIFocusedTextInputJSON(void)
+{
+    @autoreleasepool {
+        CloudCodeAXRuntime ax = CloudCodeResolveAX();
+        BOOL runtimeAvailable = ax.copyAttribute != NULL;
+        BOOL focusedElementAvailable = NO;
+        BOOL focusedTextInput = NO;
+        pid_t focusedPID = 0;
+        NSString *focusedBackend = @"";
+        NSString *focusedRole = @"";
+
+        if (runtimeAvailable) {
+            CloudCodeAXUIElementRef focusedRoot = CloudCodeAXFocusedApplicationRoot(ax, &focusedPID, &focusedBackend);
+            if (focusedRoot) {
+                id focusedHolder = nil;
+                CloudCodeAXUIElementRef focusedElement = NULL;
+                for (NSString *attribute in @[@"AXFocusedUIElement", @"AXFocusedElement"]) {
+                    id candidate = CloudCodeAXCopy(ax, focusedRoot, (__bridge CFStringRef)attribute);
+                    if (candidate) {
+                        focusedHolder = candidate;
+                        focusedElement = (CloudCodeAXUIElementRef)(__bridge CFTypeRef)focusedHolder;
+                        break;
+                    }
+                }
+                CFRelease(focusedRoot);
+                if (focusedElement) {
+                    focusedElementAvailable = YES;
+                    id rawRole = CloudCodeAXCopy(ax, focusedElement, ax.attributeElementType ?: CFSTR("AXRole"));
+                    focusedRole = CloudCodeBoundedString(rawRole) ?: @"";
+                    focusedTextInput =
+                        [focusedRole rangeOfString:@"TextField" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                        [focusedRole rangeOfString:@"TextArea" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                        [focusedRole rangeOfString:@"TextView" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                        [focusedRole rangeOfString:@"SearchField" options:NSCaseInsensitiveSearch].location != NSNotFound;
+                    (void)focusedHolder;
+                }
+            }
+        }
+
+        NSDictionary *payload = @{
+            @"runtimeAvailable": @(runtimeAvailable),
+            @"focusedElementAvailable": @(focusedElementAvailable),
+            @"focusedTextInput": @(focusedTextInput),
+            @"role": focusedRole ?: @"",
+            @"backend": focusedBackend ?: @"",
+            @"pid": @(focusedPID)
+        };
+        NSError *error = nil;
+        NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
+        if (!data || error || data.length > 4096) { return 61; }
+        fwrite(data.bytes, 1, data.length, stdout);
+        fputc('\n', stdout);
+        return runtimeAvailable ? 0 : 62;
+    }
+}
+
 int CloudCodeGUITypeBase64(NSString *base64Text)
 {
     @autoreleasepool {

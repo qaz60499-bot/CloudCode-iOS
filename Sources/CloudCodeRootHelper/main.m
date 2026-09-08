@@ -131,7 +131,17 @@ static BOOL WaitForFrontmostApplication(NSString *bundleID, useconds_t timeoutMi
 static int VerifyFrontmostApplication(NSString *bundleID)
 {
     if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0 || bundleID.length > 255) { return 10; }
-    return WaitForFrontmostApplication(bundleID, 1200000) ? 0 : 80;
+    if (WaitForFrontmostApplication(bundleID, 1200000)) {
+        fprintf(stderr, "frontmost: expected=%s actual=%s verified=1\n",
+                bundleID.UTF8String ?: "",
+                bundleID.UTF8String ?: "");
+        return 0;
+    }
+    NSString *actual = FrontmostApplicationBundleID() ?: @"";
+    fprintf(stderr, "frontmost: expected=%s actual=%s verified=0\n",
+            bundleID.UTF8String ?: "",
+            actual.UTF8String ?: "");
+    return 80;
 }
 
 static void LoadBoardFramework(NSString *frameworkName)
@@ -1212,6 +1222,10 @@ int main(int argc, const char *argv[])
             NSString *inputPath = [NSString stringWithUTF8String:argv[2]];
             NSUInteger maximumElements = (NSUInteger)strtoul(argv[3], NULL, 10);
             return CloudCodeGUIOCRFile(inputPath, maximumElements);
+        }
+        if ([command isEqualToString:@"gui-focused-text-input-json"]) {
+            if (getuid() == 0 || geteuid() == 0) { return 11; }
+            return CloudCodeGUIFocusedTextInputJSON();
         }
         if ([command isEqualToString:@"gui-tap"]) {
             if (argc < 4) { return 10; }

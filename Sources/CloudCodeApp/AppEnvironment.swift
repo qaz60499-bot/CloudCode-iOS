@@ -394,6 +394,11 @@ public final class CloudCodeViewModel: ObservableObject {
                 ]
             )
 
+            // OCR follows the Cloud Code process lifecycle, but startup warming is deliberately
+            // invisible and read-only: initialize only public Vision recognition configuration.
+            // No screenshot, helper process, AX monitoring, or on-screen overlay is created here.
+            LocalVisionTextObservation.prepareRuntime()
+
             isRefreshingCapabilities = true
             capabilityRefreshMessage = "正在执行安全启动检测…"
             recordStartupBreadcrumb("bootstrap.safe.begin")

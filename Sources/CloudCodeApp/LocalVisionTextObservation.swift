@@ -2,6 +2,9 @@ import Foundation
 import Vision
 import ImageIO
 import CloudCodeCore
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Bounded, on-device text observation for GUI screenshots.
 ///
@@ -36,6 +39,12 @@ enum LocalVisionTextObservation {
         var elements: [LocalPerceptionTextElement]
     }
 
+    // Serialize OCR work across screenshot tools. Build 92 could overlap several Vision/helper
+    // attempts during cross-app automation, increasing CoreVideo/CoreML pressure and making the
+    // fallback helper more likely to be jetsam-killed. One local OCR pass at a time is sufficient
+    // because every observation is tied to a single current screenshot.
+    private static let recognitionSemaphore = DispatchSemaphore(value: 1)
+
     // Vision language support is fixed for the running OS/Vision revision. Probe it once per
     // process instead of paying the supported-language lookup on every screenshot.
     private static let primaryRecognitionConfiguration: RecognitionConfiguration = {
@@ -53,6 +62,15 @@ enum LocalVisionTextObservation {
         return RecognitionConfiguration(level: .accurate, languages: preferred.filter { accurate.contains($0) })
     }()
 
+    /// Warm only the public Vision text-recognition configuration after the Cloud Code UI is up.
+    /// This makes OCR ready with the App process without capturing a screen, starting a helper,
+    /// drawing any overlay, or performing recognition before it is actually requested.
+    static func prepareRuntime() {
+        Task.detached(priority: .utility) {
+            _ = primaryRecognitionConfiguration
+        }
+    }
+
     static func payload(for jpegData: Data, maximumElements: Int = 28, regionInScreenPoints: CGRect? = nil) async -> [String: String] {
         await observe(for: jpegData, maximumElements: maximumElements, regionInScreenPoints: regionInScreenPoints).payload
     }
@@ -64,19 +82,36 @@ enum LocalVisionTextObservation {
         requiresText: Bool = false
     ) async -> Observation {
         let boundedMaximum = min(max(maximumElements, 1), 48)
+        #if canImport(UIKit)
+        let hostAppActive = await MainActor.run { UIApplication.shared.applicationState == .active }
+        #else
+        let hostAppActive = true
+        #endif
         return await Task.detached(priority: .utility) {
+            recognitionSemaphore.wait()
+            defer { recognitionSemaphore.signal() }
+
             // Vision/Core ML is an App compute workload, not a privilege workload. Running OCR as
             // persona-99/root caused real-device failures in CoreVideo/CoreML even though capture
-            // itself succeeded. Prefer the host App process when it is viable. If the host is
-            // background-constrained, retry in the already-trusted RootHelper executable under the
-            // ordinary mobile persona (never root). Keep the standalone VisionHelper as a tertiary
-            // compatibility fallback while the mobile RootHelper route is validated on-device.
-            let inProcess = recognizeInProcess(
-                jpegData,
-                maximumElements: boundedMaximum,
-                regionInScreenPoints: regionInScreenPoints
-            )
-            if Self.isUsable(inProcess, requiresText: requiresText) { return inProcess }
+            // itself succeeded. When Cloud Code is backgrounded behind the target App, do not even
+            // attempt in-process Vision: build-92 diagnostics repeatedly showed CoreVideo -6662 in
+            // exactly that lifecycle state. Go directly to the ordinary-mobile helper instead.
+            let inProcess: Observation
+            if hostAppActive {
+                inProcess = recognizeInProcess(
+                    jpegData,
+                    maximumElements: boundedMaximum,
+                    regionInScreenPoints: regionInScreenPoints
+                )
+                if Self.isUsable(inProcess, requiresText: requiresText) { return inProcess }
+            } else {
+                inProcess = Observation(payload: [
+                    "localVisionOCR": "unavailable_host_background_skipped",
+                    "localVisionBackend": "vision_public_api",
+                    "localVisionHostState": "background",
+                    "localVisionFailureClass": "host_background_inprocess_ocr_skipped"
+                ], elements: [])
+            }
 
             let mobileHelperObservation = recognizeWithMobileRootHelper(
                 jpegData,
