@@ -229,26 +229,68 @@ enum EmbeddedRootHelper {
         return diagnostic.isEmpty ? "\(prefix)退出码 \(code)\(suffix)。" : "\(prefix)退出码 \(code)\(suffix)：\(diagnostic)"
     }
 
+    private static func decodeEnumerationPayload(_ diagnostic: String) -> EnumerationPayload? {
+        let decoder = JSONDecoder()
+        if let data = diagnostic.data(using: .utf8),
+           let payload = try? decoder.decode(EnumerationPayload.self, from: data) {
+            return payload
+        }
+        if let start = diagnostic.firstIndex(of: "{"), let end = diagnostic.lastIndex(of: "}") {
+            let json = String(diagnostic[start...end])
+            if let data = json.data(using: .utf8),
+               let payload = try? decoder.decode(EnumerationPayload.self, from: data) {
+                return payload
+            }
+        }
+        return nil
+    }
+
+    private static func enumerationHasCrossAppEvidence(_ payload: EnumerationPayload) -> Bool {
+        let ownBundleID = Bundle.main.bundleIdentifier
+        return payload.apps.contains { app in
+            !app.bundleID.isEmpty && app.bundleID != ownBundleID
+        }
+    }
+
     static func enumerateInstalledApps() -> (payload: EnumerationPayload?, detail: String) {
         let path = executablePath
         guard FileManager.default.fileExists(atPath: path), FileManager.default.isExecutableFile(atPath: path) else {
             return (nil, "\(executableName) 不可执行；跨 App 枚举保持不可用。")
         }
-        let result = run(["enumerate-json"], privilege: .isolatedUser, timeout: 5)
-        guard result.code == 0 else {
-            return (nil, failureDetail(prefix: "\(executableName) 隔离枚举", code: result.code, diagnostic: result.diagnostic))
+
+        let isolated = run(["enumerate-json"], privilege: .isolatedUser, timeout: 5)
+        if isolated.code == 0,
+           let payload = decodeEnumerationPayload(isolated.diagnostic),
+           enumerationHasCrossAppEvidence(payload) {
+            return (payload, "\(payload.backend) 已在 isolated helper 中完成跨 App 枚举。")
         }
-        let decoder = JSONDecoder()
-        if let data = result.diagnostic.data(using: .utf8), let payload = try? decoder.decode(EnumerationPayload.self, from: data) {
-            return (payload, "\(payload.backend) 已在 helper 子进程内完成枚举。")
-        }
-        if let start = result.diagnostic.firstIndex(of: "{"), let end = result.diagnostic.lastIndex(of: "}") {
-            let json = String(result.diagnostic[start...end])
-            if let data = json.data(using: .utf8), let payload = try? decoder.decode(EnumerationPayload.self, from: data) {
-                return (payload, "\(payload.backend) 已在 helper 子进程内完成枚举。")
+
+        // On some TrollStore/iOS combinations an ordinary mobile-persona LaunchServices query can
+        // see only the caller itself even though the same bounded helper can enumerate correctly
+        // under persona 99. Do not make startup privileged again: this fallback runs only when an
+        // explicit cross-app read (apps.list/apps.inspect/container resolution) causes the resolver
+        // to refresh. The command is strictly read-only and still returns only the bounded JSON
+        // schema accepted below.
+        let privileged = run(["enumerate-json"], privilege: .root, timeout: 5)
+        if privileged.code == 0,
+           let payload = decodeEnumerationPayload(privileged.diagnostic),
+           enumerationHasCrossAppEvidence(payload) {
+            let isolatedDetail: String
+            if isolated.code == 0 {
+                isolatedDetail = "isolated helper 仅看到本 App 或没有跨 App 证据"
+            } else {
+                isolatedDetail = failureDetail(prefix: "isolated helper 枚举", code: isolated.code, diagnostic: isolated.diagnostic)
             }
+            return (payload, "\(payload.backend) 已通过 bounded read-only root helper 恢复跨 App 枚举；\(isolatedDetail)。")
         }
-        return (nil, "\(executableName) 枚举输出无法解析；已按 fail-closed 处理。")
+
+        let isolatedDetail = isolated.code == 0
+            ? "isolated helper 枚举输出没有跨 App 证据"
+            : failureDetail(prefix: "isolated helper 枚举", code: isolated.code, diagnostic: isolated.diagnostic)
+        let privilegedDetail = privileged.code == 0
+            ? "root helper 枚举输出没有跨 App 证据或无法解析"
+            : failureDetail(prefix: "root helper 枚举", code: privileged.code, diagnostic: privileged.diagnostic)
+        return (nil, "跨 App 枚举失败：\(isolatedDetail)；\(privilegedDetail)。")
     }
 
     static func appIntrospection(bundleID: String) -> (payload: AppIntrospectionPayload?, detail: String) {
