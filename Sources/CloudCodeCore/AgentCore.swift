@@ -138,12 +138,19 @@ public actor SessionStore {
         // Recovery fallback: compact the largest remaining tool observations until the session fits.
         // State-changing truth remains available in the execution ledger/audit log; the transcript
         // retains the tool identity and instructs the Agent to re-read final state before another write.
-        let candidates = compacted.messages.indices
-            .filter { compacted.messages[$0].role == .tool && compacted.messages[$0].providerMetadata["storage_compacted"] != "true" }
-            .sorted { compacted.messages[$0].content.count > compacted.messages[$1].content.count }
-        for index in candidates {
-            guard compacted.messages[index].content.count > 8_192 else { continue }
-            compactToolMessage(&compacted.messages[index], reason: "size_recovery")
+        // String.count walks extended grapheme clusters. The UUID-matched build 88 CPU fatal
+        // stack spends its samples in this sort comparator, repeatedly walking large Unicode
+        // observations. Measure each candidate once; compare only integers during the sort.
+        let candidates = compacted.messages.indices.compactMap { index -> (index: Int, characters: Int)? in
+            let message = compacted.messages[index]
+            guard message.role == .tool, message.providerMetadata["storage_compacted"] != "true" else { return nil }
+            let characters = message.content.count
+            return characters > 8_192 ? (index, characters) : nil
+        }.sorted {
+            $0.characters == $1.characters ? $0.index < $1.index : $0.characters > $1.characters
+        }
+        for candidate in candidates {
+            compactToolMessage(&compacted.messages[candidate.index], reason: "size_recovery", originalCharacters: candidate.characters)
             data = try JSONEncoder.pretty.encode(compacted)
             if Int64(data.count) <= Self.maxSerializedBytes { return (compacted, data) }
         }
@@ -151,8 +158,8 @@ public actor SessionStore {
         throw SessionStoreError.oversizedSession(session.id)
     }
 
-    private func compactToolMessage(_ message: inout ChatMessage, reason: String) {
-        let originalCharacters = message.content.count
+    private func compactToolMessage(_ message: inout ChatMessage, reason: String, originalCharacters: Int? = nil) {
+        let originalCharacters = originalCharacters ?? message.content.count
         let toolName = message.providerMetadata["tool_name"] ?? "unknown"
         message.content = ToolOutputEnvelope(
             trust: .untrustedData,

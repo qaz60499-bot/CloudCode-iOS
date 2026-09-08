@@ -190,6 +190,10 @@ static NSInteger CloudCodeSpawnHelperInternal(
         if (spawnError != 0) {
             result = -3000 - spawnError;
         } else {
+            const BOOL tracePerception = [path.lastPathComponent hasPrefix:@"CloudCode"];
+            BOOL parentTimeout = NO;
+            int timeoutKillResult = 0;
+            int timeoutKillErrno = 0;
             if (captureStdout) {
                 close(stdoutPipe[1]);
                 stdoutPipe[1] = -1;
@@ -205,6 +209,7 @@ static NSInteger CloudCodeSpawnHelperInternal(
 
             const double start = CloudCodeMonotonicSeconds();
             int status = 0;
+            BOOL statusObserved = NO;
             BOOL finished = NO;
             while (!finished) {
                 if (captureStdout) { CloudCodeDrainPipe(stdoutPipe[0], capturedStdout, &stdoutTruncated); }
@@ -212,6 +217,7 @@ static NSInteger CloudCodeSpawnHelperInternal(
 
                 pid_t waited = waitpid(pid, &status, WNOHANG);
                 if (waited == pid) {
+                    statusObserved = YES;
                     finished = YES;
                     break;
                 }
@@ -224,7 +230,9 @@ static NSInteger CloudCodeSpawnHelperInternal(
 
                 double elapsed = CloudCodeMonotonicSeconds() - start;
                 if (elapsed >= timeout) {
-                    (void)kill(pid, SIGKILL);
+                    parentTimeout = YES;
+                    timeoutKillResult = kill(pid, SIGKILL);
+                    timeoutKillErrno = timeoutKillResult == 0 ? 0 : errno;
                     // A helper can be wedged inside private AX IPC. A blocking waitpid after SIGKILL
                     // made the nominal 3s AX deadline stretch past 15s on-device. Reap synchronously
                     // only for a short bounded grace period; if the kernel has not released the child
@@ -234,6 +242,7 @@ static NSInteger CloudCodeSpawnHelperInternal(
                     do {
                         waited = waitpid(pid, &status, WNOHANG);
                         if (waited == pid || (waited == -1 && errno == ECHILD)) {
+                            statusObserved = waited == pid;
                             reaped = YES;
                             break;
                         }
@@ -281,6 +290,26 @@ static NSInteger CloudCodeSpawnHelperInternal(
                     diagnosticSuffix = [NSString stringWithFormat:@"helper terminated by signal %d", WTERMSIG(status)];
                 } else {
                     result = -5001;
+                }
+            }
+            if (tracePerception) {
+                NSDictionary *exitEvidence = @{
+                    @"schemaVersion": @1, @"stage": @"helper-exit",
+                    @"helper": path.lastPathComponent, @"pid": @(pid), @"parentPID": @(getpid()),
+                    @"parentUID": @(getuid()), @"parentGID": @(getgid()), @"rootRequested": @(asRoot),
+                    @"elapsedMS": @((NSInteger)((CloudCodeMonotonicSeconds() - start) * 1000)),
+                    @"timeoutSeconds": @(timeout), @"parentTimeout": @(parentTimeout),
+                    @"timeoutKillResult": @(timeoutKillResult), @"timeoutKillErrno": @(timeoutKillErrno),
+                    @"result": @(result),
+                    @"waitStatusObserved": @(statusObserved),
+                    @"signal": statusObserved && WIFSIGNALED(status) ? @(WTERMSIG(status)) : NSNull.null,
+                    @"exitCode": statusObserved && WIFEXITED(status) ? @(WEXITSTATUS(status)) : NSNull.null,
+                    @"systemTerminationReason": @"requires_correlated_system_report"
+                };
+                NSData *json = [NSJSONSerialization dataWithJSONObject:exitEvidence options:0 error:nil];
+                NSString *record = json ? [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding] : @"";
+                if (record.length) {
+                    diagnosticSuffix = CloudCodeCombinedOutput(diagnosticSuffix, record);
                 }
             }
             if (stdoutTruncated || stderrTruncated) {

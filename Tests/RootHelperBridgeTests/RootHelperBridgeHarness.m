@@ -43,6 +43,21 @@ int main(void)
         Require(result < 0, @"helper timeout must fail closed");
         Require([standardError containsString:@"timed out"], @"helper timeout must be observable in stderr diagnostics");
 
+        NSString *testDirectory = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+        [[NSFileManager defaultManager] createDirectoryAtPath:testDirectory withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *child = [testDirectory stringByAppendingPathComponent:@"CloudCodeBridgeTestChild"];
+        Require([[NSFileManager defaultManager] createSymbolicLinkAtPath:child withDestinationPath:@"/bin/sh" error:nil], @"create isolated transport test child");
+        result = CloudCodeSpawnHelperWithSeparatedOutput(child, @[@"-c", @"kill -KILL $$"], NO, 2, &standardOutput, &standardError);
+        Require(result == -5009, @"external/self SIGKILL must retain signal result, not parent timeout");
+        NSData *recordData = [[standardError componentsSeparatedByString:@"\n"].lastObject dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *record = [NSJSONSerialization JSONObjectWithData:recordData options:0 error:nil];
+        Require([record[@"signal"] intValue] == 9 && ![record[@"parentTimeout"] boolValue], @"signal-only termination evidence must not claim parent timeout");
+        result = CloudCodeSpawnHelperWithSeparatedOutput(child, @[@"-c", @"sleep 2"], NO, 0.1, &standardOutput, &standardError);
+        recordData = [[standardError componentsSeparatedByString:@"\n"].lastObject dataUsingEncoding:NSUTF8StringEncoding];
+        record = [NSJSONSerialization JSONObjectWithData:recordData options:0 error:nil];
+        Require(result != -5009 && [record[@"parentTimeout"] boolValue], @"parent timeout kill must be distinguishable from unknown system SIGKILL");
+        [[NSFileManager defaultManager] removeItemAtPath:testDirectory error:nil];
+
         printf("PASS: helper output transport isolates stdout/stderr, preserves the 1 MiB boundary, detects truncation, and enforces timeout\n");
         return 0;
     }
