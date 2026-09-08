@@ -17,7 +17,11 @@ def now():
 
 def relevant(line):
     # Do not collect unrelated SpringBoard/backboardd motion traffic.
-    return bool(re.search(r"CloudCode|com\.cloudcode|VisionHelper|AXRuntime|CoreVideo|CoreML", line, re.I))
+    return bool(re.search(
+        r"CloudCode|com\.cloudcode|CloudCodeRootHelper|CloudCodeVisionHelper|Vision|AXRuntime|CoreVideo|CoreML|RunningBoard|launchd|amfid|jetsam|memorystatus",
+        line,
+        re.I,
+    ))
 
 
 async def capture(out, seconds):
