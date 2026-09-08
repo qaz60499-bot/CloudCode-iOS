@@ -2712,6 +2712,11 @@ public final class CloudCodeViewModel: ObservableObject {
         }
     }
 
+    public func recordPerceptionProbe(id: String, stage: String, json: String) async {
+        try? await diagnosticLogStore.log(level: .info, subsystem: "perception-probe", action: stage,
+            result: "recorded", diagnostic: json, metadata: ["probeID": id])
+    }
+
     public func exportDiagnosticBundle() async throws -> URL {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601

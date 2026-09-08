@@ -4,6 +4,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <math.h>
 #import <stdio.h>
+#import "../CloudCodeApp/PerceptionVisionProbe.h"
 
 static NSString * const CloudCodeVisionProtocolMarker = @"cloudcode-vision-helper-protocol=1";
 static const NSUInteger CloudCodeVisionMaxInputBytes = 8 * 1024 * 1024;
@@ -262,6 +263,20 @@ int main(int argc, char *argv[])
             return 64;
         }
         NSString *command = [NSString stringWithUTF8String:argv[1]];
+        if ([command isEqualToString:@"probe-ocr-file"]) {
+            if (argc != 8) { return 64; }
+            NSString *path = [NSString stringWithUTF8String:argv[2]];
+            if (!CloudCodeIsBoundedTempJPEG(path)) { return 71; }
+            // Flush process identity before the first Vision call so pre-/post-main deaths can
+            // be distinguished using parent and system timestamps even when no result survives.
+            NSData *entry = [NSJSONSerialization dataWithJSONObject:CCPerceptionProcessEvidence(@"vision_helper") options:0 error:nil];
+            if (entry) { fwrite(entry.bytes, 1, entry.length, stderr); fputc('\n', stderr); fflush(stderr); }
+            NSData *jpeg = [NSData dataWithContentsOfFile:path options:0 error:nil];
+            NSDictionary *result = CCPerceptionVisionProbe(jpeg, [NSString stringWithUTF8String:argv[3]],
+                [NSString stringWithUTF8String:argv[4]], atoi(argv[5]) != 0, atof(argv[6]), atof(argv[7]), @"vision_helper");
+            CloudCodePrintJSON(result);
+            return 0;
+        }
         if ([command isEqualToString:@"probe"]) {
             fprintf(stdout, "%s\n", CloudCodeVisionProtocolMarker.UTF8String);
             return 0;

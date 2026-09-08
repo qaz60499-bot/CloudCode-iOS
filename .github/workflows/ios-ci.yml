@@ -74,6 +74,13 @@ jobs:
           set -euo pipefail
           APP_PATH="build/SimulatorDerivedData/Build/Products/Release-iphonesimulator/CloudCode.app"
           test -d "$APP_PATH"
+          for fixture in perception-english.jpg perception-chinese.jpg; do
+            if [[ ! -f "$APP_PATH/$fixture" ]]; then
+              echo "FAIL: perception fixture missing from app bundle root: $fixture" >&2
+              find "$APP_PATH" -maxdepth 3 -name 'perception-*.jpg' -print >&2 || true
+              exit 1
+            fi
+          done
           UDID="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ { print $2; exit }')"
           test -n "$UDID"
           xcrun simctl boot "$UDID" >/dev/null 2>&1 || true

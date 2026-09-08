@@ -1,4 +1,5 @@
 #import "GUIAutomation.h"
+#import "../CloudCodeApp/PerceptionProcessEvidence.h"
 
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -1390,6 +1391,140 @@ static NSDictionary *CloudCodeAXHitTestTree(CloudCodeAXRuntime runtime, NSUInteg
         @"scope": foregroundPID > 0 ? @"sampled-foreground-pid" : @"sampled-topmost-pid-unavailable",
         @"children": hits
     };
+}
+
+static NSDictionary *CCAXSymbolEvidence(void *address) {
+    Dl_info info = {0};
+    BOOL resolved = address && dladdr(address, &info) != 0;
+    return @{@"present": @(address != NULL),
+             @"address": address ? [NSString stringWithFormat:@"%p", address] : NSNull.null,
+             @"sourceImage": resolved && info.dli_fname ? @(info.dli_fname) : NSNull.null};
+}
+
+int CloudCodeGUIAXProbeJSON(NSString *stage, NSString *seedKind, pid_t targetPID, NSString *preparation) {
+    if (![@[@"symbols", @"frontmost", @"root", @"attributes", @"hit-test", @"application-at-point", @"context-at-point"] containsObject:stage]
+        || ![@[@"systemWide", @"application", @"pid0", @"springboard"] containsObject:seedKind]
+        || ![@[@"baseline", @"requesting2", @"associated"] containsObject:preparation] || targetPID < 0) { return 64; }
+    CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
+    NSMutableDictionary *record = [@{@"schemaVersion": @1, @"kind": @"ax-probe", @"stage": stage,
+        @"seedKind": seedKind, @"preparation": preparation, @"requestedPID": @(targetPID),
+        @"process": CCPerceptionProcessEvidence(@"standalone_ax_helper")} mutableCopy];
+    NSData *entry = [NSJSONSerialization dataWithJSONObject:record options:0 error:nil];
+    if (entry) { fwrite(entry.bytes, 1, entry.length, stderr); fputc('\n', stderr); fflush(stderr); }
+    CloudCodeAXRuntime runtime = CloudCodeResolveAX();
+    NSMutableDictionary *symbols = [NSMutableDictionary dictionary];
+#define CC_AX_SYMBOL(field) symbols[@#field] = CCAXSymbolEvidence((void *)runtime.field)
+    CC_AX_SYMBOL(createApplication); CC_AX_SYMBOL(createAppElementWithPid); CC_AX_SYMBOL(createSystemWide);
+    CC_AX_SYMBOL(getPid); CC_AX_SYMBOL(copyAttribute); CC_AX_SYMBOL(copyMultipleAttributes);
+    CC_AX_SYMBOL(copyElementAtPosition); CC_AX_SYMBOL(copyApplicationAtPosition); CC_AX_SYMBOL(copyApplicationAndContextAtPosition);
+    CC_AX_SYMBOL(setTimeout); CC_AX_SYMBOL(setAttribute); CC_AX_SYMBOL(addAssociatedPid); CC_AX_SYMBOL(setRequestingClient);
+#undef CC_AX_SYMBOL
+    record[@"symbols"] = symbols;
+    record[@"frameworkHandlePresent"] = @(runtime.handle != NULL);
+    // Availability of alternate names is evidence only. Do not invoke an unverified signature.
+    NSMutableDictionary *clientSymbols = [NSMutableDictionary dictionary];
+    for (NSString *name in @[@"__AXSetRequestingClient", @"_AXSetRequestingClient", @"AXSetRequestingClient", @"_AXOverrideRequestingClientType"]) {
+        clientSymbols[name] = CCAXSymbolEvidence(dlsym(RTLD_DEFAULT, name.UTF8String));
+    }
+    record[@"requestingClientSymbols"] = clientSymbols;
+    NSString *bundle = CloudCodeFrontmostBundleID();
+    NSString *bundlePath = bundle.length ? CloudCodeBundlePathForIdentifier(bundle) : nil;
+    pid_t foregroundPID = bundlePath.length ? CloudCodePIDForBundlePath(bundlePath) : 0;
+    record[@"frontmostSource"] = @"SBSCopyFrontmostApplicationDisplayIdentifier -> LSApplicationProxy.bundleURL -> proc_pidpath";
+    record[@"frontmostBundleID"] = bundle ?: @"";
+    record[@"frontmostBundleResolved"] = @(bundle.length > 0);
+    record[@"frontmostPID"] = @(foregroundPID);
+    record[@"frontmostBundlePathResolved"] = @(bundlePath.length > 0);
+    record[@"frontmostPIDResolved"] = @(foregroundPID > 0);
+    record[@"frontmostFirstFailure"] = bundle.length == 0 ? @"bundle-id" : (bundlePath.length == 0 ? @"bundle-path" : (foregroundPID <= 0 ? @"pid" : @"none"));
+    pid_t selectedPID = targetPID > 0 ? targetPID : foregroundPID;
+    record[@"targetPID"] = @(selectedPID);
+    if ([preparation isEqualToString:@"requesting2"]) {
+        if (runtime.setRequestingClient) { runtime.setRequestingClient(2); }
+        record[@"requestingClientCall"] = runtime.setRequestingClient ? @"called_void_no_ack" : @"symbol_missing";
+    }
+    if ([preparation isEqualToString:@"associated"]) {
+        if (runtime.addAssociatedPid && selectedPID > 0) {
+            runtime.addAssociatedPid(getpid(), selectedPID, 0); runtime.addAssociatedPid(getpid(), selectedPID, 1);
+            runtime.addAssociatedPid(selectedPID, getpid(), 0); runtime.addAssociatedPid(selectedPID, getpid(), 1);
+            record[@"associatedPIDResult"] = @"called_void_no_ack";
+        } else { record[@"associatedPIDResult"] = @"not_called_missing_symbol_or_pid"; }
+    }
+    if (![stage isEqualToString:@"symbols"] && ![stage isEqualToString:@"frontmost"]) {
+        CloudCodeAXUIElementRef seed = NULL;
+        NSString *seedCreationAPI = @"none";
+        @try {
+            if ([seedKind isEqualToString:@"systemWide"] && runtime.createSystemWide) { seedCreationAPI = @"AXUIElementCreateSystemWide"; seed = runtime.createSystemWide(); }
+            else if ([seedKind isEqualToString:@"pid0"] && runtime.createAppElementWithPid) { seedCreationAPI = @"_AXUIElementCreateAppElementWithPid(0)"; seed = runtime.createAppElementWithPid(0); }
+            else if ([seedKind isEqualToString:@"application"] && selectedPID > 0 && runtime.createApplication) { seedCreationAPI = @"AXUIElementCreateApplication(targetPID)"; seed = runtime.createApplication(selectedPID); }
+            else if ([seedKind isEqualToString:@"springboard"] && runtime.createApplication) {
+                seedCreationAPI = @"AXUIElementCreateApplication(SpringBoardPID)";
+                NSString *path = CloudCodeBundlePathForIdentifier(@"com.apple.springboard");
+                pid_t springboardPID = path.length ? CloudCodePIDForBundlePath(path) : 0;
+                record[@"springboardPID"] = @(springboardPID);
+                if (springboardPID > 0) { seed = runtime.createApplication(springboardPID); }
+            }
+            record[@"seedCreationAPI"] = seedCreationAPI;
+            record[@"seedCreated"] = @(seed != NULL);
+            record[@"seedCreationFailure"] = seed ? @"none" : ([seedCreationAPI isEqualToString:@"none"] ? @"prerequisite_missing" : @"api_returned_null");
+            if (seed && runtime.setTimeout) { record[@"messagingTimeoutAXError"] = @(runtime.setTimeout(seed, CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS)); }
+            if (seed && runtime.getPid) {
+                pid_t seedPID = 0;
+                record[@"seedPIDAXError"] = @(runtime.getPid(seed, &seedPID)); record[@"seedPID"] = @(seedPID);
+            }
+            if (seed && [stage isEqualToString:@"attributes"]) {
+                if (runtime.setAttribute) { record[@"manualAccessibilityAXError"] = @(runtime.setAttribute(seed, CFSTR("AXManualAccessibility"), kCFBooleanTrue)); }
+                NSMutableArray *reads = [NSMutableArray array];
+                if (runtime.copyAttribute) {
+                    for (NSString *attribute in @[@"AXFocusedApplication", @"AXFocusedUIElement", @"AXChildren", @"AXLabel"]) {
+                        CFTypeRef value = NULL;
+                        CloudCodeAXError code = runtime.copyAttribute(seed, (__bridge CFStringRef)attribute, &value);
+                        [reads addObject:@{@"attribute": attribute, @"AXError": @(code), @"valuePresent": @(value != NULL)}];
+                        if (value) CFRelease(value);
+                    }
+                }
+                record[@"attributeReads"] = reads;
+                if (runtime.copyMultipleAttributes) {
+                    CFArrayRef values = NULL;
+                    NSArray *attributes = @[(__bridge id)runtime.attributeLabel, (__bridge id)runtime.attributeChildren];
+                    record[@"copyMultipleAXError"] = @(runtime.copyMultipleAttributes(seed, (__bridge CFArrayRef)attributes, 0, &values));
+                    record[@"copyMultipleValueCount"] = values ? @(CFArrayGetCount(values)) : @0;
+                    if (values) CFRelease(values);
+                }
+            }
+            CGSize size = CloudCodeScreenSize();
+            CGPoint point = CGPointMake(size.width * 0.5, size.height * 0.5);
+            record[@"screenPoints"] = @[@(size.width), @(size.height)];
+            record[@"point"] = @[@(point.x), @(point.y)];
+            CloudCodeAXUIElementRef hit = NULL;
+            CloudCodeAXError code = 0; BOOL called = NO; uint32_t contextID = 0;
+            if (seed && size.width > 1 && size.height > 1) {
+                if ([stage isEqualToString:@"hit-test"] && runtime.copyElementAtPosition) {
+                    called = YES; code = runtime.copyElementAtPosition(seed, point.x, point.y, &hit);
+                } else if ([stage isEqualToString:@"application-at-point"] && runtime.copyApplicationAtPosition) {
+                    called = YES; code = runtime.copyApplicationAtPosition(seed, &hit, point.x, point.y);
+                } else if ([stage isEqualToString:@"context-at-point"] && runtime.copyApplicationAndContextAtPosition) {
+                    called = YES; code = runtime.copyApplicationAndContextAtPosition(seed, &hit, &contextID, point.x, point.y);
+                }
+            }
+            record[@"positionAPICalled"] = @(called);
+            record[@"positionAXError"] = called ? @(code) : NSNull.null;
+            record[@"contextID"] = @(contextID);
+            record[@"positionElementCreated"] = @(hit != NULL);
+            if (hit) {
+                pid_t hitPID = 0;
+                if (runtime.getPid) { record[@"hitPIDAXError"] = @(runtime.getPid(hit, &hitPID)); record[@"hitPID"] = @(hitPID); }
+                if (code == 0) { NSUInteger count = 0; record[@"semanticNode"] = CloudCodeAXNodeLimited(runtime, hit, 0, 0, &count) ?: @{}; }
+                CFRelease(hit);
+            }
+        } @catch (NSException *exception) { record[@"exception"] = exception.name; }
+        if (seed) CFRelease(seed);
+    }
+    record[@"latencyMS"] = @((CFAbsoluteTimeGetCurrent() - started) * 1000);
+    NSData *json = [NSJSONSerialization dataWithJSONObject:record options:NSJSONWritingSortedKeys error:nil];
+    if (!json || json.length > 64 * 1024) { return 65; }
+    fwrite(json.bytes, 1, json.length, stdout); fputc('\n', stdout);
+    return 0;
 }
 
 static NSData *CloudCodeFrontmostTreeData(void)

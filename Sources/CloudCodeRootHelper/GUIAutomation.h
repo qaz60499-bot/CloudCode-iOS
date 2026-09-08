@@ -5,6 +5,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// Returns a bounded JSON readiness snapshot. Read-only probes only; no synthetic input is dispatched.
 int CloudCodeGUIProbeJSON(void);
 int CloudCodeGUITreeJSON(void);
+int CloudCodeGUIAXProbeJSON(NSString *stage, NSString *seedKind, pid_t targetPID, NSString *preparation);
 int CloudCodeGUIScreenshotBase64(void);
 int CloudCodeGUIScreenshotFile(NSString *path);
 int CloudCodeGUITap(double x, double y);

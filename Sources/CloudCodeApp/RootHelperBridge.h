@@ -2,6 +2,8 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+FOUNDATION_EXPORT NSString *CloudCodeVisionProbeJSON(NSData *jpeg, NSString *initializer, NSString *language, BOOL cpuOnly, double pointWidth, double pointHeight);
+
 FOUNDATION_EXPORT NSInteger CloudCodeSpawnRootHelper(NSString *path, NSArray<NSString *> *arguments);
 FOUNDATION_EXPORT NSInteger CloudCodeSpawnRootHelperWithOutput(NSString *path, NSArray<NSString *> *arguments, NSString * _Nullable * _Nullable diagnostic);
 FOUNDATION_EXPORT NSInteger CloudCodeSpawnHelperWithOutput(NSString *path, NSArray<NSString *> *arguments, BOOL asRoot, NSTimeInterval timeout, NSString * _Nullable * _Nullable diagnostic);
