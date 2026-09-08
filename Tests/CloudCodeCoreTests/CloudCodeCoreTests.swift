@@ -1026,6 +1026,78 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(HarnessContextManager.requestsLocalDataAccess(in: "读取微信数据库里的本地记录"))
     }
 
+    func testMessagingNavigationSearchTypingIsNarrowlySeparatedFromMessageBodyCompletion() {
+        XCTAssertTrue(HarnessContextManager.requiresNavigationSearch(in: "打开微信，找文件传输助手并发消息"))
+        XCTAssertFalse(HarnessContextManager.requiresNavigationSearch(in: "打开微信直接给文件传输助手发消息"))
+
+        XCTAssertTrue(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "navigation_search",
+            verifiedMessagingComposerFocus: false,
+            requiresNavigationSearch: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true
+        ))
+        XCTAssertFalse(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "navigation_search",
+            verifiedMessagingComposerFocus: false,
+            requiresNavigationSearch: true,
+            providerContextHasImages: false,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true
+        ))
+        XCTAssertFalse(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "navigation_search",
+            verifiedMessagingComposerFocus: false,
+            requiresNavigationSearch: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .textOnly,
+            hasForegroundTarget: true
+        ))
+
+        XCTAssertFalse(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "message_body",
+            verifiedMessagingComposerFocus: false,
+            requiresNavigationSearch: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true
+        ))
+        XCTAssertTrue(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "message_body",
+            verifiedMessagingComposerFocus: true,
+            requiresNavigationSearch: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true
+        ))
+        XCTAssertFalse(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "unexpected-purpose",
+            verifiedMessagingComposerFocus: true,
+            requiresNavigationSearch: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true
+        ))
+
+        XCTAssertFalse(AgentCore.shouldCountSuccessfulTextInputAsMessageBody(
+            requiresMessageSend: true,
+            purpose: "navigation_search"
+        ))
+        XCTAssertTrue(AgentCore.shouldCountSuccessfulTextInputAsMessageBody(
+            requiresMessageSend: true,
+            purpose: "message_body"
+        ))
+        XCTAssertTrue(AgentCore.isSemanticMessageCommitAction(
+            name: "gui.tapTextObserve",
+            arguments: ["query": "发送"]
+        ))
+        XCTAssertFalse(AgentCore.isSemanticMessageCommitAction(
+            name: "gui.tap",
+            arguments: ["x": "300", "y": "700"]
+        ))
+    }
+
     func testDiagnosticFailureExplanationClassifiesTextOnlyProviderLocalFallbackGap() throws {
         let record = DiagnosticLogRecord(
             level: .warning,

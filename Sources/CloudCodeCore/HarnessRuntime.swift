@@ -255,6 +255,12 @@ public enum HarnessContextManager {
         return markers.contains(where: normalized.contains)
     }
 
+    static func requiresNavigationSearch(in request: String) -> Bool {
+        let normalized = request.lowercased()
+        let markers = ["找", "找到", "查找", "搜索", "搜", "find", "search", "locate"]
+        return markers.contains(where: normalized.contains)
+    }
+
     static func requestsLocalDataAccess(in request: String) -> Bool {
         let normalized = request.lowercased()
         let markers = [
