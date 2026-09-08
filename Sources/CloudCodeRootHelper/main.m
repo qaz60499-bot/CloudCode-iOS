@@ -599,6 +599,18 @@ static id ApplicationProxy(NSString *bundleID)
     return sendObject(cls, selector, bundleID);
 }
 
+// Shared only with GUIAutomation.m in this executable. The OCR command uses this to bind its
+// temporary input to Cloud Code's currently registered data container instead of trusting an
+// arbitrary /var/mobile/Containers/Data/Application path supplied by a caller.
+NSString *CloudCodeRootHelperDataContainerPath(NSString *bundleID)
+{
+    if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0 || bundleID.length > 255) { return nil; }
+    id proxy = ApplicationProxy(bundleID);
+    NSURL *dataURL = SafeValue(proxy, @"dataContainerURL");
+    NSString *path = [dataURL isKindOfClass:NSURL.class] ? dataURL.path : nil;
+    return IsSafeDataPath(path) ? path.stringByStandardizingPath : nil;
+}
+
 static NSArray<NSString *> *PluginDataPaths(NSString *bundleID)
 {
     id proxy = ApplicationProxy(bundleID);
@@ -1194,6 +1206,12 @@ int main(int argc, const char *argv[])
             if (argc < 3) { return 10; }
             NSString *outputPath = [NSString stringWithUTF8String:argv[2]];
             return CloudCodeGUIScreenshotFile(outputPath);
+        }
+        if ([command isEqualToString:@"gui-ocr-file"]) {
+            if (argc < 4 || getuid() == 0 || geteuid() == 0) { return 11; }
+            NSString *inputPath = [NSString stringWithUTF8String:argv[2]];
+            NSUInteger maximumElements = (NSUInteger)strtoul(argv[3], NULL, 10);
+            return CloudCodeGUIOCRFile(inputPath, maximumElements);
         }
         if ([command isEqualToString:@"gui-tap"]) {
             if (argc < 4) { return 10; }

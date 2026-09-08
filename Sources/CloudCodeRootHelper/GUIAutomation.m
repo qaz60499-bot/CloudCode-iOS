@@ -3,8 +3,12 @@
 
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <ImageIO/ImageIO.h>
+#import <Vision/Vision.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
+#import <errno.h>
+#import <fcntl.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
 #import <math.h>
@@ -13,7 +17,10 @@
 #import <stdint.h>
 #import <stdio.h>
 #import <stdlib.h>
+#import <sys/stat.h>
 #import <unistd.h>
+
+extern NSString *CloudCodeRootHelperDataContainerPath(NSString *bundleID);
 
 #define CLOUDCODE_GUI_MAX_TREE_NODES 400
 #define CLOUDCODE_GUI_MAX_TREE_BYTES (256 * 1024)
@@ -1709,6 +1716,283 @@ int CloudCodeGUIScreenshotFile(NSString *path)
             fprintf(stderr, "gui-screenshot-file: write failed: %s\n", error.localizedDescription.UTF8String ?: "unknown");
             return 63;
         }
+        return 0;
+    }
+}
+
+static NSString *CloudCodeCanonicalMobilePath(NSString *path)
+{
+    NSString *normalized = [path isKindOfClass:NSString.class] ? path.stringByStandardizingPath : nil;
+    if ([normalized hasPrefix:@"/private/var/"]) {
+        return [normalized substringFromIndex:@"/private".length];
+    }
+    return normalized;
+}
+
+static BOOL CloudCodeIsBoundedOCRInputPath(NSString *path)
+{
+    NSString *normalized = CloudCodeCanonicalMobilePath(path);
+    NSString *dataContainer = CloudCodeCanonicalMobilePath(CloudCodeRootHelperDataContainerPath(@"com.cloudcode.ios"));
+    if (normalized.length == 0 || dataContainer.length == 0) { return NO; }
+    NSString *expectedTmp = [dataContainer stringByAppendingPathComponent:@"tmp"].stringByStandardizingPath;
+    NSString *parent = normalized.stringByDeletingLastPathComponent;
+    NSString *filename = normalized.lastPathComponent;
+    return [parent isEqualToString:expectedTmp]
+        && [filename hasPrefix:@"CloudCode-GUI-OCR-"]
+        && [[filename.pathExtension lowercaseString] isEqualToString:@"jpg"];
+}
+
+static NSArray<NSString *> *CloudCodeOCRPreferredLanguages(VNRequestTextRecognitionLevel level)
+{
+    VNRecognizeTextRequest *probe = [[VNRecognizeTextRequest alloc] init];
+    probe.recognitionLevel = level;
+    NSError *error = nil;
+    NSArray<NSString *> *supported = [probe supportedRecognitionLanguagesAndReturnError:&error] ?: @[];
+    if (error) { return @[]; }
+    NSMutableArray<NSString *> *preferred = [NSMutableArray array];
+    for (NSString *language in @[@"zh-Hans", @"en-US"]) {
+        if ([supported containsObject:language]) { [preferred addObject:language]; }
+    }
+    return preferred;
+}
+
+static VNRecognizeTextRequest *CloudCodeMakeMobileOCRRequest(BOOL forceFast, NSString **levelName)
+{
+    VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] init];
+    request.usesLanguageCorrection = NO;
+    request.minimumTextHeight = forceFast ? 0.012f : 0.009f;
+    request.preferBackgroundProcessing = YES;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    request.usesCPUOnly = YES;
+#pragma clang diagnostic pop
+
+    NSArray<NSString *> *fastLanguages = CloudCodeOCRPreferredLanguages(VNRequestTextRecognitionLevelFast);
+    if (forceFast || [fastLanguages containsObject:@"zh-Hans"]) {
+        request.recognitionLevel = VNRequestTextRecognitionLevelFast;
+        if (!forceFast && fastLanguages.count > 0) {
+            request.recognitionLanguages = fastLanguages;
+        } else if (@available(iOS 16.0, *)) {
+            request.automaticallyDetectsLanguage = YES;
+        }
+        if (levelName) { *levelName = @"fast"; }
+    } else {
+        request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+        NSArray<NSString *> *accurateLanguages = CloudCodeOCRPreferredLanguages(VNRequestTextRecognitionLevelAccurate);
+        if (accurateLanguages.count > 0) {
+            request.recognitionLanguages = accurateLanguages;
+        } else if (@available(iOS 16.0, *)) {
+            request.automaticallyDetectsLanguage = YES;
+        }
+        if (levelName) { *levelName = @"accurate"; }
+    }
+    return request;
+}
+
+static NSError *CloudCodePerformMobileOCR(CGImageRef image, BOOL forceFast, VNRecognizeTextRequest **requestOut, NSString **levelName)
+{
+    VNRecognizeTextRequest *request = CloudCodeMakeMobileOCRRequest(forceFast, levelName);
+    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image orientation:kCGImagePropertyOrientationUp options:@{}];
+    NSError *error = nil;
+    BOOL ok = [handler performRequests:@[request] error:&error];
+    if (requestOut) { *requestOut = request; }
+    if (ok && !error) { return nil; }
+    return error ?: [NSError errorWithDomain:@"CloudCodeRootHelperVision" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Vision request failed without NSError"}];
+}
+
+int CloudCodeGUIOCRFile(NSString *path, NSUInteger maximumElements)
+{
+    @autoreleasepool {
+        CFAbsoluteTime startedAt = CFAbsoluteTimeGetCurrent();
+        if (!CloudCodeIsBoundedOCRInputPath(path)) {
+            fprintf(stderr, "gui-ocr-file: rejected input path outside the app tmp boundary\n");
+            return 71;
+        }
+        // This production path is intentionally mobile-persona only. Root-persona Vision was
+        // already proven on-device to fail in CoreVideo/CoreML and must never be reintroduced.
+        if (getuid() == 0 || geteuid() == 0) {
+            fprintf(stderr, "gui-ocr-file: root persona rejected; use isolated mobile helper execution\n");
+            return 11;
+        }
+
+        NSString *normalized = path.stringByStandardizingPath;
+        const char *filePath = normalized.fileSystemRepresentation;
+        struct stat pathStat = {0};
+        if (!filePath || lstat(filePath, &pathStat) != 0 || !S_ISREG(pathStat.st_mode)
+            || pathStat.st_nlink != 1 || pathStat.st_uid != getuid()
+            || (pathStat.st_mode & 0777) != 0600 || pathStat.st_size <= 0
+            || pathStat.st_size > CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES) {
+            fprintf(stderr, "gui-ocr-file: input must be a single-link owner-only regular bounded JPEG\n");
+            return 71;
+        }
+        int inputFD = open(filePath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (inputFD < 0) {
+            fprintf(stderr, "gui-ocr-file: O_NOFOLLOW open failed\n");
+            return 71;
+        }
+        struct stat fdStat = {0};
+        if (fstat(inputFD, &fdStat) != 0 || fdStat.st_dev != pathStat.st_dev || fdStat.st_ino != pathStat.st_ino
+            || fdStat.st_size != pathStat.st_size || !S_ISREG(fdStat.st_mode) || fdStat.st_nlink != 1
+            || fdStat.st_uid != getuid() || (fdStat.st_mode & 0777) != 0600) {
+            close(inputFD);
+            fprintf(stderr, "gui-ocr-file: input identity changed between path validation and open\n");
+            return 71;
+        }
+        NSMutableData *jpegBuffer = [NSMutableData dataWithLength:(NSUInteger)fdStat.st_size];
+        uint8_t *destination = jpegBuffer.mutableBytes;
+        ssize_t totalRead = 0;
+        while (totalRead < fdStat.st_size) {
+            ssize_t count = read(inputFD, destination + totalRead, (size_t)(fdStat.st_size - totalRead));
+            if (count > 0) { totalRead += count; continue; }
+            if (count < 0 && errno == EINTR) { continue; }
+            break;
+        }
+        close(inputFD);
+        if (totalRead != fdStat.st_size) {
+            fprintf(stderr, "gui-ocr-file: bounded JPEG read was incomplete\n");
+            return 71;
+        }
+        NSData *jpeg = jpegBuffer.copy;
+
+        CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)jpeg, NULL);
+        if (!source) {
+            fprintf(stderr, "gui-ocr-file: JPEG image source creation failed\n");
+            return 71;
+        }
+        NSDictionary *properties = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(source, 0, NULL));
+        NSNumber *widthValue = [properties[(id)kCGImagePropertyPixelWidth] isKindOfClass:NSNumber.class] ? properties[(id)kCGImagePropertyPixelWidth] : nil;
+        NSNumber *heightValue = [properties[(id)kCGImagePropertyPixelHeight] isKindOfClass:NSNumber.class] ? properties[(id)kCGImagePropertyPixelHeight] : nil;
+        size_t pixelWidth = widthValue.unsignedLongValue;
+        size_t pixelHeight = heightValue.unsignedLongValue;
+        if (pixelWidth < 1 || pixelHeight < 1 || pixelWidth > 2048 || pixelHeight > 2048
+            || pixelWidth * pixelHeight > (4 * 1024 * 1024)) {
+            CFRelease(source);
+            fprintf(stderr, "gui-ocr-file: JPEG dimensions exceed bounded screenshot limits\n");
+            return 71;
+        }
+        NSUInteger boundedMaximum = MIN(MAX(maximumElements, (NSUInteger)1), (NSUInteger)48);
+
+        // The host process is usually backgrounded during cross-app automation. Run Vision in the
+        // already-trusted RootHelper binary but under the ordinary mobile persona, and decode only
+        // a bounded thumbnail. Vision boxes are normalized so coordinates still map to the original
+        // point-sized screenshot dimensions below.
+        NSDictionary *thumbnailOptions = @{
+            (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+            (id)kCGImageSourceThumbnailMaxPixelSize: @640,
+            (id)kCGImageSourceCreateThumbnailWithTransform: @YES
+        };
+        CGImageRef workingImage = CGImageSourceCreateThumbnailAtIndex(source, 0, (__bridge CFDictionaryRef)thumbnailOptions);
+        CFRelease(source);
+        if (!workingImage) {
+            fprintf(stderr, "gui-ocr-file: bounded thumbnail decode failed\n");
+            return 71;
+        }
+        fprintf(stderr,
+                "gui-ocr-file: stage=vision-begin uid=%u euid=%u input=%zux%zu working=%zux%zu bytes=%lu\n",
+                (unsigned)getuid(), (unsigned)geteuid(), pixelWidth, pixelHeight,
+                CGImageGetWidth(workingImage), CGImageGetHeight(workingImage), (unsigned long)jpeg.length);
+        fflush(stderr);
+
+        NSString *recognitionLevelName = nil;
+        VNRecognizeTextRequest *request = nil;
+        NSError *primaryError = CloudCodePerformMobileOCR(workingImage, NO, &request, &recognitionLevelName);
+        NSError *finalError = primaryError;
+        BOOL fallbackUsed = NO;
+        NSString *backend = @"root_helper_mobile_vision_thumbnail";
+        if (primaryError) {
+            fallbackUsed = YES;
+            backend = @"root_helper_mobile_vision_fast_thumbnail_fallback";
+            finalError = CloudCodePerformMobileOCR(workingImage, YES, &request, &recognitionLevelName);
+        }
+        CGImageRelease(workingImage);
+
+        if (finalError) {
+            NSDictionary *failure = @{
+                @"status": @"unavailable_request_failed",
+                @"screenPointWidth": @(pixelWidth),
+                @"screenPointHeight": @(pixelHeight),
+                @"latencyMS": @((NSInteger)MAX(0.0, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000.0)),
+                @"recognitionLevel": recognitionLevelName ?: @"unknown",
+                @"backend": backend,
+                @"cpuFallbackUsed": @(fallbackUsed),
+                @"errorDomain": finalError.domain ?: @"",
+                @"errorCode": @(finalError.code),
+                @"primaryErrorDomain": primaryError.domain ?: @"",
+                @"primaryErrorCode": @(primaryError.code),
+                @"uid": @(getuid()),
+                @"euid": @(geteuid()),
+                @"elements": @[]
+            };
+            NSData *failureData = [NSJSONSerialization dataWithJSONObject:failure options:0 error:nil];
+            if (!failureData || failureData.length > (64 * 1024)) { return 71; }
+            CloudCodePrintData(failureData);
+            return 0;
+        }
+
+        NSMutableArray<NSDictionary *> *elements = [NSMutableArray arrayWithCapacity:boundedMaximum];
+        NSMutableArray<NSString *> *textParts = [NSMutableArray array];
+        NSUInteger textCharacters = 0;
+        NSArray<VNRecognizedTextObservation *> *observations = request.results ?: @[];
+        observations = [observations sortedArrayUsingComparator:^NSComparisonResult(VNRecognizedTextObservation *lhs, VNRecognizedTextObservation *rhs) {
+            CGFloat lhsTop = 1.0 - CGRectGetMaxY(lhs.boundingBox);
+            CGFloat rhsTop = 1.0 - CGRectGetMaxY(rhs.boundingBox);
+            if (fabs(lhsTop - rhsTop) > 0.015) { return lhsTop < rhsTop ? NSOrderedAscending : NSOrderedDescending; }
+            if (lhs.boundingBox.origin.x == rhs.boundingBox.origin.x) { return NSOrderedSame; }
+            return lhs.boundingBox.origin.x < rhs.boundingBox.origin.x ? NSOrderedAscending : NSOrderedDescending;
+        }];
+        for (VNRecognizedTextObservation *observation in observations) {
+            if (elements.count >= boundedMaximum) { break; }
+            VNRecognizedText *candidate = [observation topCandidates:1].firstObject;
+            if (!candidate || candidate.confidence < 0.12f) { continue; }
+            NSString *cleaned = [[candidate.string stringByReplacingOccurrencesOfString:@"\n" withString:@" "] stringByReplacingOccurrencesOfString:@"\r" withString:@" "];
+            cleaned = [cleaned stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if (cleaned.length == 0) { continue; }
+            NSString *text = cleaned.length > 120 ? [cleaned substringToIndex:120] : cleaned;
+            CGRect box = observation.boundingBox;
+            double minX = MAX(0.0, MIN(1.0, box.origin.x));
+            double minY = MAX(0.0, MIN(1.0, box.origin.y));
+            double maxX = MAX(0.0, MIN(1.0, CGRectGetMaxX(box)));
+            double maxY = MAX(0.0, MIN(1.0, CGRectGetMaxY(box)));
+            if (maxX <= minX || maxY <= minY) { continue; }
+            double x = minX * (double)pixelWidth;
+            double y = (1.0 - maxY) * (double)pixelHeight;
+            double width = (maxX - minX) * (double)pixelWidth;
+            double height = (maxY - minY) * (double)pixelHeight;
+            [elements addObject:@{
+                @"text": text,
+                @"confidence": @(round((double)candidate.confidence * 1000.0) / 1000.0),
+                @"x": @(round(x * 10.0) / 10.0),
+                @"y": @(round(y * 10.0) / 10.0),
+                @"width": @(round(width * 10.0) / 10.0),
+                @"height": @(round(height * 10.0) / 10.0)
+            }];
+            if (textCharacters < 4096) {
+                NSUInteger remaining = 4096 - textCharacters;
+                NSString *part = text.length > remaining ? [text substringToIndex:remaining] : text;
+                [textParts addObject:part];
+                textCharacters += part.length + 3;
+            }
+        }
+
+        NSDictionary *payload = @{
+            @"status": elements.count > 0 ? @"recognized" : @"available_empty",
+            @"screenPointWidth": @(pixelWidth),
+            @"screenPointHeight": @(pixelHeight),
+            @"latencyMS": @((NSInteger)MAX(0.0, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000.0)),
+            @"recognitionLevel": recognitionLevelName ?: @"unknown",
+            @"backend": backend,
+            @"cpuFallbackUsed": @(fallbackUsed),
+            @"uid": @(getuid()),
+            @"euid": @(geteuid()),
+            @"visibleText": [textParts componentsJoinedByString:@" | "],
+            @"elements": elements
+        };
+        NSData *output = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+        if (!output || output.length > (64 * 1024)) {
+            fprintf(stderr, "gui-ocr-file: OCR JSON exceeded bounded output limit\n");
+            return 71;
+        }
+        CloudCodePrintData(output);
         return 0;
     }
 }

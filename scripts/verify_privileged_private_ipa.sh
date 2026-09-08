@@ -124,6 +124,10 @@ HELPER="$APP_PATH/CloudCodeRootHelper"
 VISION_HELPER="$APP_PATH/CloudCodeVisionHelper"
 test -f "$HELPER"
 test -f "$VISION_HELPER"
+if ! strings "$HELPER" | grep -Fq 'gui-ocr-file'; then
+  echo "FAIL: CloudCodeRootHelper mobile-persona OCR command missing" >&2
+  exit 12
+fi
 if ! lipo -info "$VISION_HELPER" | grep -q 'arm64'; then
   echo "FAIL: CloudCodeVisionHelper does not contain arm64" >&2
   exit 12

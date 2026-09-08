@@ -1141,6 +1141,7 @@ public actor ToolRouter {
                 "localVisionOCR", "localVisionElementCount", "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion", "localVisionBackend",
                 "localVisionFailureClass", "localVisionErrorDomain", "localVisionErrorCode", "localVisionPrimaryErrorDomain", "localVisionPrimaryErrorCode", "localVisionFallbackUsed",
                 "localVisionSecondaryBackend", "localVisionSecondaryStatus", "localVisionSecondaryErrorDomain", "localVisionSecondaryErrorCode",
+                "localVisionTertiaryBackend", "localVisionTertiaryStatus", "localVisionTertiaryErrorDomain", "localVisionTertiaryErrorCode",
                 "screenPointWidth", "screenPointHeight", "keyboardLikely", "focusStrategy", "textInputSafety",
                 "localMetric", "localMetricSelection", "localMetricExtraction", "localMetricSelectedSample",
                 "localMetricSelectedValue", "localMetricSelectedReturnVerified"

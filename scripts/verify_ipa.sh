@@ -10,7 +10,37 @@ fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-unzip -q "$IPA_PATH" -d "$TMP_DIR"
+# Validate the central directory before writing any archive member to disk. In particular, reject
+# symlinks/special files so a crafted IPA cannot redirect extraction outside this temporary tree.
+python3 - "$IPA_PATH" "$TMP_DIR" <<'PY'
+import stat
+import sys
+import zipfile
+from pathlib import PurePosixPath
+
+ipa_path, destination = sys.argv[1:3]
+with zipfile.ZipFile(ipa_path) as archive:
+    seen = set()
+    lowered = {}
+    for info in archive.infolist():
+        name = info.filename
+        path = PurePosixPath(name)
+        if not name or name.startswith("/") or "\\" in name or ".." in path.parts:
+            raise SystemExit(f"FAIL: unsafe IPA path before extraction: {name!r}")
+        if name in seen:
+            raise SystemExit(f"FAIL: IPA contains duplicate ZIP entry before extraction: {name}")
+        seen.add(name)
+        key = name.casefold()
+        if key in lowered and lowered[key] != name:
+            raise SystemExit(f"FAIL: case-colliding IPA entries before extraction: {lowered[key]} vs {name}")
+        lowered[key] = name
+        mode = (info.external_attr >> 16) & 0xFFFF
+        file_type = stat.S_IFMT(mode)
+        if file_type not in (0, stat.S_IFREG, stat.S_IFDIR):
+            raise SystemExit(f"FAIL: IPA contains symlink/special entry before extraction: {name}")
+    archive.extractall(destination)
+PY
+
 APP_COUNT="$(find "$TMP_DIR/Payload" -maxdepth 1 -type d -name '*.app' -print | wc -l | tr -d ' ')"
 if [[ "$APP_COUNT" != "1" ]]; then
   echo "FAIL: expected exactly one Payload/*.app, found $APP_COUNT" >&2
@@ -81,9 +111,13 @@ if ! lipo -info "$HELPER" | grep -q 'arm64'; then
   echo "FAIL: CloudCodeRootHelper does not contain arm64" >&2
   exit 17
 fi
-if ! strings "$HELPER" | grep -Fq 'cloudcode-root-helper-protocol=1'; then
+if ! grep -aFq 'cloudcode-root-helper-protocol=1' "$HELPER"; then
   echo "FAIL: embedded CloudCodeRootHelper protocol marker is missing or incompatible" >&2
   exit 18
+fi
+if ! grep -aFq 'gui-ocr-file' "$HELPER"; then
+  echo "FAIL: CloudCodeRootHelper is missing the mobile-persona local OCR command" >&2
+  exit 22
 fi
 VISION_HELPER="$APP_PATH/CloudCodeVisionHelper"
 if [[ ! -f "$VISION_HELPER" ]]; then
@@ -94,7 +128,7 @@ if ! lipo -info "$VISION_HELPER" | grep -q 'arm64'; then
   echo "FAIL: CloudCodeVisionHelper does not contain arm64" >&2
   exit 20
 fi
-if ! strings "$VISION_HELPER" | grep -Fq 'cloudcode-vision-helper-protocol=1'; then
+if ! grep -aFq 'cloudcode-vision-helper-protocol=1' "$VISION_HELPER"; then
   echo "FAIL: embedded CloudCodeVisionHelper protocol marker is missing or incompatible" >&2
   exit 21
 fi

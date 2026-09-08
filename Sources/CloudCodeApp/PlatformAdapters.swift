@@ -514,6 +514,37 @@ enum EmbeddedRootHelper {
         return (data, "全局截图已通过独立 tmp JPEG 通道返回。\(routeDetail)")
     }
 
+    static func guiOCRAsMobile(jpegData: Data, maximumElements: Int) -> (json: String?, detail: String) {
+        guard embeddedHelperMatchesExpectedProtocol,
+              FileManager.default.isExecutableFile(atPath: executablePath),
+              GUIAutomationPayloadPolicy.isValidScreenshotJPEG(jpegData) else {
+            return (nil, "mobile RootHelper OCR 当前不可用或输入不是有效 bounded JPEG。")
+        }
+        let boundedMaximum = min(max(maximumElements, 1), 48)
+        let inputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CloudCode-GUI-OCR-\(UUID().uuidString).jpg", isDirectory: false)
+        guard FileManager.default.createFile(atPath: inputURL.path, contents: jpegData) else {
+            return (nil, "无法为 mobile RootHelper OCR 创建受控 tmp JPEG。")
+        }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: inputURL.path)
+        defer { try? FileManager.default.removeItem(at: inputURL) }
+
+        // Important: the same TSRootBinary that owns GUI primitives is spawned without persona-99.
+        // Vision is a compute workload, and root-persona OCR already failed on-device. This path
+        // exists specifically to keep a trusted executable context while retaining mobile uid/euid.
+        let result = runSeparated(
+            ["gui-ocr-file", inputURL.path, String(boundedMaximum)],
+            privilege: .isolatedUser,
+            timeout: 4
+        )
+        guard result.code == 0, !result.stdout.isEmpty, result.stdout.utf8.count <= 64 * 1024 else {
+            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+            return (nil, failureDetail(prefix: "mobile RootHelper Vision OCR", code: result.code, diagnostic: diagnostic))
+        }
+        let suffix = result.stderr.isEmpty ? "" : " helper diagnostics: \(result.stderr)"
+        return (result.stdout, "OCR 已在 RootHelper 的 mobile persona 中执行；未使用 root Vision。\(suffix)")
+    }
+
     static func guiTap(x: Double, y: Double) -> (success: Bool, detail: String) {
         let result = run(["gui-tap", String(x), String(y)], privilege: .root, timeout: 3)
         return result.code == 0

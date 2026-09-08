@@ -67,29 +67,53 @@ enum LocalVisionTextObservation {
         return await Task.detached(priority: .utility) {
             // Vision/Core ML is an App compute workload, not a privilege workload. Running OCR as
             // persona-99/root caused real-device failures in CoreVideo/CoreML even though capture
-            // itself succeeded. Prefer the host App process with a CPU-only/background-friendly
-            // request, then use the embedded helper only as an isolated secondary execution context.
+            // itself succeeded. Prefer the host App process when it is viable. If the host is
+            // background-constrained, retry in the already-trusted RootHelper executable under the
+            // ordinary mobile persona (never root). Keep the standalone VisionHelper as a tertiary
+            // compatibility fallback while the mobile RootHelper route is validated on-device.
             let inProcess = recognizeInProcess(
                 jpegData,
                 maximumElements: boundedMaximum,
                 regionInScreenPoints: regionInScreenPoints
             )
             if Self.isUsable(inProcess, requiresText: requiresText) { return inProcess }
-            if let helperObservation = recognizeWithHelper(
+
+            let mobileHelperObservation = recognizeWithMobileRootHelper(
                 jpegData,
                 maximumElements: boundedMaximum,
                 regionInScreenPoints: regionInScreenPoints
-            ) {
-                if Self.isUsable(helperObservation, requiresText: requiresText) { return helperObservation }
-                var combined = inProcess
-                combined.payload["localVisionSecondaryBackend"] = helperObservation.payload["localVisionBackend"] ?? "vision_helper_public_api"
-                combined.payload["localVisionSecondaryStatus"] = helperObservation.payload["localVisionOCR"] ?? "unavailable"
-                combined.payload["localVisionSecondaryErrorDomain"] = helperObservation.payload["localVisionErrorDomain"] ?? ""
-                combined.payload["localVisionSecondaryErrorCode"] = helperObservation.payload["localVisionErrorCode"] ?? ""
-                combined.payload["localVisionSecondaryDiagnostic"] = helperObservation.payload["localVisionHelperDiagnostic"] ?? ""
-                return combined
+            )
+            if let mobileHelperObservation,
+               Self.isUsable(mobileHelperObservation, requiresText: requiresText) {
+                return mobileHelperObservation
             }
-            return inProcess
+
+            let standaloneHelperObservation = recognizeWithVisionHelper(
+                jpegData,
+                maximumElements: boundedMaximum,
+                regionInScreenPoints: regionInScreenPoints
+            )
+            if let standaloneHelperObservation,
+               Self.isUsable(standaloneHelperObservation, requiresText: requiresText) {
+                return standaloneHelperObservation
+            }
+
+            var combined = inProcess
+            if let mobileHelperObservation {
+                combined.payload["localVisionSecondaryBackend"] = mobileHelperObservation.payload["localVisionBackend"] ?? "root_helper_mobile_vision"
+                combined.payload["localVisionSecondaryStatus"] = mobileHelperObservation.payload["localVisionOCR"] ?? "unavailable"
+                combined.payload["localVisionSecondaryErrorDomain"] = mobileHelperObservation.payload["localVisionErrorDomain"] ?? ""
+                combined.payload["localVisionSecondaryErrorCode"] = mobileHelperObservation.payload["localVisionErrorCode"] ?? ""
+                combined.payload["localVisionSecondaryDiagnostic"] = mobileHelperObservation.payload["localVisionHelperDiagnostic"] ?? ""
+            }
+            if let standaloneHelperObservation {
+                combined.payload["localVisionTertiaryBackend"] = standaloneHelperObservation.payload["localVisionBackend"] ?? "vision_helper_public_api"
+                combined.payload["localVisionTertiaryStatus"] = standaloneHelperObservation.payload["localVisionOCR"] ?? "unavailable"
+                combined.payload["localVisionTertiaryErrorDomain"] = standaloneHelperObservation.payload["localVisionErrorDomain"] ?? ""
+                combined.payload["localVisionTertiaryErrorCode"] = standaloneHelperObservation.payload["localVisionErrorCode"] ?? ""
+                combined.payload["localVisionTertiaryDiagnostic"] = standaloneHelperObservation.payload["localVisionHelperDiagnostic"] ?? ""
+            }
+            return combined
         }.value
     }
 
@@ -99,19 +123,50 @@ enum LocalVisionTextObservation {
         return status == "available_empty" && !requiresText
     }
 
-    private static func recognizeWithHelper(
+    private static func recognizeWithMobileRootHelper(
+        _ jpegData: Data,
+        maximumElements: Int,
+        regionInScreenPoints: CGRect?
+    ) -> Observation? {
+        let helper = EmbeddedRootHelper.guiOCRAsMobile(jpegData: jpegData, maximumElements: maximumElements)
+        return decodeHelperObservation(
+            json: helper.json,
+            detail: helper.detail,
+            defaultBackend: "root_helper_mobile_vision",
+            maximumElements: maximumElements,
+            regionInScreenPoints: regionInScreenPoints
+        )
+    }
+
+    private static func recognizeWithVisionHelper(
         _ jpegData: Data,
         maximumElements: Int,
         regionInScreenPoints: CGRect?
     ) -> Observation? {
         let helper = EmbeddedVisionHelper.guiOCR(jpegData: jpegData, maximumElements: maximumElements)
-        guard let json = helper.json,
+        return decodeHelperObservation(
+            json: helper.json,
+            detail: helper.detail,
+            defaultBackend: "vision_helper_public_api",
+            maximumElements: maximumElements,
+            regionInScreenPoints: regionInScreenPoints
+        )
+    }
+
+    private static func decodeHelperObservation(
+        json: String?,
+        detail: String,
+        defaultBackend: String,
+        maximumElements: Int,
+        regionInScreenPoints: CGRect?
+    ) -> Observation {
+        guard let json,
               let data = json.data(using: .utf8),
               let response = try? JSONDecoder().decode(HelperResponse.self, from: data) else {
             return Observation(payload: [
                 "localVisionOCR": "unavailable_helper_failed",
-                "localVisionBackend": "vision_helper_public_api",
-                "localVisionHelperDiagnostic": String(helper.detail.prefix(512))
+                "localVisionBackend": defaultBackend,
+                "localVisionHelperDiagnostic": String(detail.prefix(512))
             ], elements: [])
         }
 
@@ -144,7 +199,7 @@ enum LocalVisionTextObservation {
             "localVisionLatencyMS": String(max(0, response.latencyMS)),
             "localVisionRecognitionLevel": response.recognitionLevel ?? "accurate",
             "localVisionFallbackUsed": response.cpuFallbackUsed == true ? "true" : "false",
-            "localVisionBackend": response.backend ?? "vision_helper_public_api",
+            "localVisionBackend": response.backend ?? defaultBackend,
             "localVisionRegion": boundedRegion.map { "\($0.minX),\($0.minY),\($0.width),\($0.height)" } ?? "full_screen"
         ]
         if let errorDomain = response.errorDomain, !errorDomain.isEmpty {

@@ -466,11 +466,16 @@ jobs:
           if not gui_helper.exists():
               raise SystemExit('FAIL: TrollStore GUI helper source is missing')
           gui_text = gui_helper.read_text(encoding='utf-8')
-          for forbidden_root_ocr in ('VNRecognizeTextRequest', 'CloudCodeGUIOCRFile', 'root_helper_vision'):
-              if forbidden_root_ocr in gui_text:
-                  raise SystemExit(f'FAIL: public Vision OCR regressed into privileged GUI helper: {forbidden_root_ocr}')
-          if 'gui-ocr-file' in helper_text:
-              raise SystemExit('FAIL: privileged root helper must not expose the retired OCR command')
+          # Vision may run in the already-trusted RootHelper executable only as the ordinary mobile
+          # persona. The previous persona-99/root OCR path is still forbidden. This keeps the helper
+          # launch context stable without turning Vision into a privileged operation.
+          for marker in ('VNRecognizeTextRequest', 'CloudCodeGUIOCRFile', 'root_helper_mobile_vision_thumbnail', 'O_NOFOLLOW', 'fstat(inputFD', 'CloudCodeRootHelperDataContainerPath(@"com.cloudcode.ios")', 'kCGImagePropertyPixelWidth', 'kCGImageSourceThumbnailMaxPixelSize'):
+              if marker not in gui_text:
+                  raise SystemExit(f'FAIL: mobile-persona RootHelper OCR lost bounded safety marker: {marker}')
+          if 'root_helper_vision' in gui_text:
+              raise SystemExit('FAIL: retired root-persona Vision backend marker reappeared in GUI helper')
+          if 'gui-ocr-file' not in helper_text or 'argc < 4 || getuid() == 0 || geteuid() == 0' not in helper_text:
+              raise SystemExit('FAIL: RootHelper OCR command must exist and fail closed when executed as root')
           if '#import <IOSurface/IOSurface.h>' in gui_text or '-framework IOSurface' in Path('project.yml').read_text(encoding='utf-8'):
               raise SystemExit('FAIL: GUI helper must resolve IOSurface at runtime because the iPhoneOS SDK does not expose IOSurface headers')
           for marker in ('CLOUDCODE_GUI_MAX_TREE_NODES', 'CLOUDCODE_GUI_MAX_TREE_BYTES', 'CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES', 'CLOUDCODE_GUI_PARENT_INDEX 0u', 'CLOUDCODE_GUI_PARENT_IDENTITY 0u', 'CLOUDCODE_GUI_FINGER_INDEX 2u', 'CLOUDCODE_GUI_FINGER_IDENTITY 2u', 'CLOUDCODE_GUI_SENDER_ID 0x8000000817319371ULL', 'CLOUDCODE_HID_DIGITIZER_ATTRIBUTE', 'CLOUDCODE_HID_FIELD_IS_BUILT_IN 0x4u', 'CLOUDCODE_HID_FIELD_DIGITIZER_DISPLAY_INTEGRATED 0xB0019u', 'eventMask = CLOUDCODE_HID_DIGITIZER_POSITION | CLOUDCODE_HID_DIGITIZER_ATTRIBUTE', 'eventMask = CLOUDCODE_HID_DIGITIZER_TOUCH | CLOUDCODE_HID_DIGITIZER_IDENTITY', 'uint64_t machTime = mach_absolute_time()', 'kCFAllocatorDefault, machTime, 3', 'kCFAllocatorDefault, machTime,', '90.0, range && touching', 'IOHIDEventSystemClientCreate', 'IOHIDEventSystemClientDispatchEvent', 'IOHIDEventSystemConnectionDispatchEvent', 'BKSHIDEventSetDigitizerInfo', '_eventRoutingClientConnectionManager', 'clientForBundleID:', 'clientForTaskPort:', 'contextIdAtPosition:', 'taskPortOfContextId:', 'profile=modern-trollstore route=system-client', 'profile=modern-trollstore route=backboard-bundle', 'profile=modern-trollstore route=backboard-context', 'result=dispatched-unverified', 'return CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route);', 'CloudCodeScreenshotLooksInformative', 'CloudCodeGUIScreenshotFile', 'CloudCode-GUI-', 'writeToFile:normalized options:0', 'rejected low-information frame', '_UICreateScreenUIImage', 'createScreenIOSurface', 'UICreateCGImageFromIOSurface', 'CARenderServerRenderDisplay', 'IOSurfaceCreate', 'IOSurfaceAlignProperty', 'alignProperty(CFSTR("IOSurfaceBytesPerRow"), rawBytesPerRow)', 'alignProperty(CFSTR("IOSurfaceAllocSize"), rawAllocationSize)', 'IOSurfaceAcceleratorCreate', 'IOSurfaceAcceleratorTransferSurface', 'transferSurface(accelerator, renderSurface, copiedSurface, NULL, NULL, NULL, NULL)', 'route=iosurface-accelerator transfer=success', 'IOSurfaceLock', 'IOSurfaceUnlock', 'IOSurfaceGetBaseAddress', 'IOSurfaceGetBytesPerRow', 'CloudCodeResolveAcrossFrameworks', 'ApplicationServices.framework/Frameworks/HIServices.framework/HIServices', 'RTLD_GLOBAL', 'AXUIElementCopyAttributeValue', 'AXUIElementSetAttributeValue', 'AXUIElementCreateSystemWide', '_AXUIElementCreateAppElementWithPid', 'AXUIElementCopyElementAtPosition', 'AXUIElementCopyApplicationAtPosition', 'AXUIElementCopyApplicationAndContextAtPosition', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'SBSCopyDisplayIdentifierForProcessID', 'AXFocusedApplication', 'AXFocusedUIElement', 'AXFocusedElement', 'route=ax-focused-value result=verified', 'route=ax-focused-value result=write-unverified', 'route=hid-unicode result=no-observed-change', 'gui-navigate-back: strategy=%s result=dispatched-semantic-unverified', '[strategy isEqualToString:@"edge"]', '[strategy isEqualToString:@"dismissDown"]', 'AXHitTestSnapshot', 'sampled-topmost-pid-unavailable', 'main-screen-width', 'stage=standalone-sampled-semantics', 'gui-screenshot/render-server:', 'gui-screenshot/uiwindow-iosurface:', 'Keep explicit capability refresh lightweight'):
@@ -481,9 +486,12 @@ jobs:
               raise SystemExit('FAIL: modern TrollStore GUI routing must prefer the global IOHID system client before BackBoard fallback')
           if '0x8000000817319375ULL' in gui_text or 'CLOUDCODE_GUI_FALLBACK_SENDER_ID' in gui_text:
               raise SystemExit('FAIL: build53 legacy IOHID sender/profile leaked into build54 GUI helper')
-          for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'run(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'CloudCodeSpawnHelperWithSeparatedOutput', 'runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)', 'runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)', 'result.stdout', 'result.stderr', 'run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)', 'EmbeddedVisionHelper', '["ocr-file", inputURL.path, String(boundedMaximum)]', '全局截图已通过独立 tmp JPEG 通道返回', 'run(["gui-navigate-back", strategy], privilege: .root, timeout: 4)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
+          for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'run(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'CloudCodeSpawnHelperWithSeparatedOutput', 'runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)', 'runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)', 'result.stdout', 'result.stderr', 'run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)', 'EmbeddedVisionHelper', '["ocr-file", inputURL.path, String(boundedMaximum)]', 'guiOCRAsMobile', '["gui-ocr-file", inputURL.path, String(boundedMaximum)]', '全局截图已通过独立 tmp JPEG 通道返回', 'run(["gui-navigate-back", strategy], privilege: .root, timeout: 4)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
               if marker not in adapters:
                   raise SystemExit(f'FAIL: GUI adapter lost bounded helper marker: {marker}')
+          mobile_ocr_adapter = adapters.split('static func guiOCRAsMobile', 1)[1].split('static func guiTap', 1)[0]
+          if 'privilege: .isolatedUser' not in mobile_ocr_adapter or 'privilege: .root' in mobile_ocr_adapter:
+              raise SystemExit('FAIL: RootHelper Vision OCR must execute only through the isolated mobile persona')
           gui_executor = adapters.split('public struct GUIFallbackExecutor', 1)[1]
           gui_routing = gui_executor.split('public func execute(', 1)[0]
           if 'DeferredCapabilitySelfValidatingToolExecutor' not in gui_executor or 'allowsDeferredCapabilityAttempt' not in gui_routing:
@@ -527,15 +535,20 @@ jobs:
               if marker not in vision_text:
                   raise SystemExit(f'FAIL: lightweight Vision helper lost public OCR isolation marker: {marker}')
           local_vision = Path('Sources/CloudCodeApp/LocalVisionTextObservation.swift').read_text(encoding='utf-8')
-          for marker in ('EmbeddedVisionHelper.guiOCR', 'request.usesCPUOnly = true', 'request.preferBackgroundProcessing = true', 'app_process_vision_cpu_only', 'app_process_vision_fast_thumbnail_fallback', 'kCGImageSourceThumbnailMaxPixelSize'):
+          for marker in ('EmbeddedVisionHelper.guiOCR', 'EmbeddedRootHelper.guiOCRAsMobile', 'request.usesCPUOnly = true', 'request.preferBackgroundProcessing = true', 'app_process_vision_cpu_only', 'app_process_vision_fast_thumbnail_fallback', 'kCGImageSourceThumbnailMaxPixelSize', 'localVisionTertiaryBackend'):
               if marker not in local_vision:
-                  raise SystemExit(f'FAIL: local OCR routing lost background-safe public Vision marker: {marker}')
-          if 'EmbeddedRootHelper.guiOCR' in local_vision:
-              raise SystemExit('FAIL: local OCR routing regressed back into the privileged/root GUI helper')
+                  raise SystemExit(f'FAIL: local OCR routing lost background-safe Vision fallback marker: {marker}')
+          observe_route = local_vision.split('static func observe(', 1)[1].split('private static func isUsable', 1)[0]
+          if not (observe_route.index('recognizeInProcess(') < observe_route.index('recognizeWithMobileRootHelper(') < observe_route.index('recognizeWithVisionHelper(')):
+              raise SystemExit('FAIL: local OCR fallback order must remain in-process -> mobile RootHelper -> standalone VisionHelper')
+          if 'EmbeddedRootHelper.guiOCR(' in local_vision:
+              raise SystemExit('FAIL: local OCR routing regressed to the retired root-persona OCR API')
           project_text = Path('project.yml').read_text(encoding='utf-8')
           for marker in ('CloudCodeVisionHelper', 'Sources/CloudCodeVisionHelper/main.m', '-framework ImageIO'):
               if marker not in project_text:
                   raise SystemExit(f'FAIL: lightweight Vision helper is not embedded in the iOS app build: {marker}')
+          if project_text.count('-framework Vision') < 2:
+              raise SystemExit('FAIL: build must link Vision into both the mobile RootHelper OCR path and standalone VisionHelper fallback')
           if 'TSRootBinaries:1 string CloudCodeVisionHelper' in project_text:
               raise SystemExit('FAIL: public Vision helper must never be declared as a TrollStore root binary')
           provider_client = Path('Sources/CloudCodeCore/ProviderClient.swift').read_text(encoding='utf-8')
