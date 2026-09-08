@@ -85,6 +85,34 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(guiCallCount, 1)
     }
 
+    func testStructuredPlanCapabilitiesRemainRoutableWhenAXTreeIsUnavailable() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let guiProvider = CountingGUIProvider(snapshot: GUIAutomationCapabilitySnapshot(
+            backendIdentifier: "ax-degraded-gui",
+            statuses: [
+                .openApp: .available,
+                .tree: .unavailable,
+                .screenshot: .available,
+                .touch: .available,
+                .textInput: .available,
+                .gestures: .available,
+                .verify: .unavailable
+            ]
+        ))
+        let probe = CapabilityProbe(appResolver: StaticAppResolver(), homeDirectory: root, guiCapabilityProvider: guiProvider)
+        let profile = await probe.probePrivileged()
+        let registry = ToolRegistry()
+        let descriptorValue = await registry.descriptor(named: "gui.runStructuredPlan")
+        let descriptor = try XCTUnwrap(descriptorValue)
+
+        XCTAssertEqual(profile.status(GUIAutomationFeature.tree.capabilityID), .unavailable)
+        XCTAssertFalse(descriptor.requiredCapabilities.contains(GUIAutomationFeature.tree.capabilityID))
+        for capability in descriptor.requiredCapabilities {
+            XCTAssertEqual(profile.status(capability), .available, "StructuredPlan local executor should remain routable without AX tree: \(capability)")
+        }
+    }
+
     func testExtendedCapabilityProbeRebuildsHomeOSAggregatesWithoutDuplicateStaleRecords() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
