@@ -1162,6 +1162,28 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(explanation.recommendedNextAction.contains("semantic_local_tool"))
     }
 
+    func testDiagnosticFailureExplanationClassifiesToolRouteDeepFallbackAsDiagnosticOnly() throws {
+        let record = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "tool-route",
+            action: "files.list",
+            result: "selected",
+            metadata: [
+                "route": AppExecutionRoute.guiFallback.rawValue,
+                "routeCandidates": "structuredTool,cli,privateFramework,urlScheme,guiFallback",
+                "fallbackReason": "structuredTool:no_executor;cli:no_executor;privateFramework:no_executor;urlScheme:no_executor",
+                "fallbackDepth": "4"
+            ]
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+        ))
+        XCTAssertEqual(explanation.failureLayer, .toolRouting)
+        XCTAssertTrue(explanation.failureSignature.contains("deep_route_fallback"))
+        XCTAssertFalse(explanation.automaticRecoveryAllowed)
+        XCTAssertEqual(explanation.recoveryReason, "diagnostic_only_route_degradation")
+    }
+
     func testDiagnosticFailureHistoryReportsChangedLayerAndRemainingFailureWithoutGuessing() throws {
         let sessionID = UUID()
         let previousCallID = UUID()

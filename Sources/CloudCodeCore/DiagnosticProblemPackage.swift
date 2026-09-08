@@ -820,7 +820,11 @@ public enum DiagnosticProblemPackageBuilder {
         if action.contains("type") { return .guiTextInput }
         if action.contains("swipe") || action.contains("scroll") || action.contains("feedsample") || action.contains("tap") { return .guiGesture }
         if action.contains("navigate") || action.contains("openapp") || action.contains("openurl") { return .guiNavigation }
-        if subsystem == "tool" && record.metadata["route"] != nil { return .toolRouting }
+        // Route-selection records use the dedicated `tool-route` subsystem, while execution
+        // completion records use `tool`. Both carry the same bounded route/fallback evidence and
+        // must classify identically; otherwise async log ordering can turn a successful deep
+        // fallback into an unknown/manual-resolution failure.
+        if (subsystem == "tool" || subsystem == "tool-route") && record.metadata["route"] != nil { return .toolRouting }
         if combined.contains("native") || combined.contains("cli") { return .nativeExecution }
         if subsystem.contains("agent") || combined.contains("planner") || combined.contains("planning") { return .agentPlanning }
         return .unknown
