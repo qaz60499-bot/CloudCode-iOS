@@ -2032,7 +2032,11 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 // immediately to one OCR pass from the already-captured current frame.
             }
 
-            let resolution = await resolveLocalVisionText(call, screenshot: baseline)
+            var resolution = await resolveLocalVisionText(call, screenshot: baseline)
+            if resolution.match == nil,
+               (resolution.failureReason == "ocr_target_not_recognized" || resolution.failureReason == "ocr_completed_no_text") {
+                resolution = await resolveLocalVisionText(call, screenshot: baseline, forcePrecise: true)
+            }
             guard let resolved = resolution.match else {
                 let attachment = try persistScreenshotAttachment(baseline, sessionID: call.sessionID)
                 var payload: [String: String] = [
@@ -2149,9 +2153,35 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 )
             }
 
-            let observation = await LocalVisionTextObservation.observe(for: data, maximumElements: 48, requiresText: true)
-            let screenHeight = Double(observation.payload["screenPointHeight"] ?? "") ?? Double(image.size.height)
-            let keyboardLikely = LocalKeyboardHeuristic.isLikelyVisible(elements: observation.elements, screenHeight: screenHeight)
+            // Keyboard/composer verification is bottom-screen semantics. Restrict the first local
+            // OCR pass to that region instead of paying for full-screen recognition. Vision ROI is
+            // expressed in normalized lower-left coordinates internally; LocalVisionTextObservation
+            // accepts top-left screen points and keeps all returned boxes in screen_points_top_left.
+            let keyboardRegion = CGRect(
+                x: 0,
+                y: image.size.height * 0.42,
+                width: image.size.width,
+                height: image.size.height * 0.58
+            )
+            var observation = await LocalVisionTextObservation.observe(
+                for: data,
+                maximumElements: 48,
+                regionInScreenPoints: keyboardRegion,
+                requiresText: true
+            )
+            var screenHeight = Double(observation.payload["screenPointHeight"] ?? "") ?? Double(image.size.height)
+            var keyboardLikely = LocalKeyboardHeuristic.isLikelyVisible(elements: observation.elements, screenHeight: screenHeight)
+            if !keyboardLikely {
+                observation = await LocalVisionTextObservation.observe(
+                    for: data,
+                    maximumElements: 48,
+                    regionInScreenPoints: keyboardRegion,
+                    requiresText: true,
+                    forcePrecise: true
+                )
+                screenHeight = Double(observation.payload["screenPointHeight"] ?? "") ?? Double(image.size.height)
+                keyboardLikely = LocalKeyboardHeuristic.isLikelyVisible(elements: observation.elements, screenHeight: screenHeight)
+            }
             var payload: [String: String] = [
                 "baselineSHA256": baselineSHA256,
                 "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
