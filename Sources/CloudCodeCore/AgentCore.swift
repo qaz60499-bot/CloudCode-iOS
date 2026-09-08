@@ -920,6 +920,13 @@ public actor AgentCore {
                         "gui.typeElementObserve", "gui.runStructuredPlan", "gui.verify"
                     ]
                     let freeCoordinateTapTools: Set<String> = ["gui.tap", "gui.tapObserve"]
+                    let foregroundMessagingDiscoveryDetours: Set<String> = [
+                        "apps.list", "apps.inspect", "container.resolve", "container.list", "container.search",
+                        "files.list", "files.search", "files.read", "files.stat", "files.metadata", "files.hash",
+                        "plist.read", "plist.query", "plist.metadata", "json.read", "json.query", "json.filter", "json.aggregate",
+                        "sqlite.discover", "sqlite.tables", "sqlite.schema", "sqlite.query", "sqlite.filter", "sqlite.aggregate", "sqlite.sample",
+                        "data.localQuery", "storage.analyze"
+                    ]
 
                     for round in 0..<maxToolRounds {
                         let cumulativeRound = checkpointStepBase + round + 1
@@ -1016,6 +1023,20 @@ public actor AgentCore {
                                 configuration: providerConfiguration,
                                 apiKey: key
                             )
+                        }
+                        if Self.shouldUseForegroundMessagingFastPath(
+                            requiresMessageSend: requiresMessageSend,
+                            providerContextHasImages: providerContextHasImages,
+                            providerVisionCapability: providerVisionAssessment.capability,
+                            hasForegroundTarget: currentGUIBundleID != nil || lastAcceptedUnverifiedLaunchBundleID != nil,
+                            requestsLocalDataAccess: HarnessContextManager.requestsLocalDataAccess(in: activeRequest)
+                        ) {
+                            roundDescriptors.removeAll { foregroundMessagingDiscoveryDetours.contains($0.name) }
+                            providerContextMessages.append(ChatMessage(
+                                role: .system,
+                                content: "Foreground messaging fast path is active: the target App already has a fresh screenshot and this Provider route can consume it. App enumeration and private container/database discovery are hidden for this round so planning stays on the current in-App search/chat surface. Use the visible GUI observation to locate the destination, focus the composer, type, send, and verify; do not leave the foreground flow merely to rediscover the contact through private data.",
+                                providerMetadata: ["context_layer": "foreground_messaging_fast_path"]
+                            ))
                         }
                         if providerVisionAssessment.capability != .supported {
                             roundDescriptors.removeAll { freeCoordinateTapTools.contains($0.name) }
@@ -1577,6 +1598,7 @@ public actor AgentCore {
                                     let rawContent = String(data: data, encoding: .utf8) ?? result.summary
                                     let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name)", content: rawContent).promptSafeRepresentation
                                     session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: ["tool_call_id": providerCallID, "tool_name": name, "provider_tool_name": providerToolName]))
+                                    let stateChangeWasNotDispatched = result.payload["effectVerification"] == "not_dispatched"
                                     let selectedExecutionRoute = result.payload["route"].flatMap(AppExecutionRoute.init(rawValue:))
                                     let reportedFallbackDepth = result.payload["fallbackDepth"].flatMap(Int.init) ?? 0
                                     let executorReportedRoute = AppExecutionRoute(rawValue: result.summary)
@@ -1789,7 +1811,7 @@ public actor AgentCore {
                                     ]
                                     if ["gui.tree", "gui.findElement", "gui.waitForElement"].contains(name), result.success {
                                         lastLocalVisionElementsJSON = nil
-                                    } else if screenshotBearingTools.contains(name), result.success {
+                                    } else if screenshotBearingTools.contains(name), result.success || stateChangeWasNotDispatched {
                                         // A post-action screenshot supersedes any pre-action structural coordinates.
                                         // Only current-frame local OCR boxes remain valid for a text-only provider.
                                         if result.payload["localVisionOCR"] == "recognized",
@@ -1853,7 +1875,9 @@ public actor AgentCore {
                                     )
                                     if let attachments = result.attachments, !attachments.isEmpty, remoteVisionSemanticallyNeeded {
                                         let observationSource: String
-                                        if name == "gui.swipeSequence" {
+                                        if stateChangeWasNotDispatched {
+                                            observationSource = "\(name).baselineScreenshot"
+                                        } else if name == "gui.swipeSequence" {
                                             observationSource = "gui.swipeSequence.finalScreenshot"
                                         } else if name == "gui.feedSample" {
                                             observationSource = "gui.feedSample.samples"
@@ -1924,7 +1948,8 @@ public actor AgentCore {
                                         }
                                     }
                                     var screenshotChangeAgainstBaseline: Bool?
-                                    if (name == "gui.screenshot" || name == "gui.swipeSequence" || name == "gui.feedSample" || name == "gui.navigateBack" || name == "gui.runStructuredPlan" || name.hasSuffix("Observe")), result.success,
+                                    if (name == "gui.screenshot" || name == "gui.swipeSequence" || name == "gui.feedSample" || name == "gui.navigateBack" || name == "gui.runStructuredPlan" || name.hasSuffix("Observe")),
+                                       (result.success || stateChangeWasNotDispatched),
                                        let currentHash = result.payload["sha256"], !currentHash.isEmpty {
                                         let comparisonBaseline = (name == "gui.swipeSequence" || name == "gui.feedSample" || name == "gui.navigateBack" || name.hasSuffix("Observe"))
                                             ? (result.payload["baselineSHA256"] ?? guiBeforeStateChangeSHA256)
@@ -1942,7 +1967,7 @@ public actor AgentCore {
                                         checkpoint.updatedAt = Date()
                                         try await checkpointStore.upsert(checkpoint)
                                     }
-                                    if let stateChangeSignature {
+                                    if let stateChangeSignature, Self.shouldRecordStateChange(for: result) {
                                         completedAppListSignatures.removeAll()
                                         checkpoint.payload.removeValue(forKey: "tool.completedAppListSignatures")
                                         lastStateChangeSignature = stateChangeSignature
@@ -2201,13 +2226,31 @@ public actor AgentCore {
             && !localPerceptionSufficient
     }
 
+    static func shouldUseForegroundMessagingFastPath(
+        requiresMessageSend: Bool,
+        providerContextHasImages: Bool,
+        providerVisionCapability: ProviderImageCapability,
+        hasForegroundTarget: Bool,
+        requestsLocalDataAccess: Bool
+    ) -> Bool {
+        requiresMessageSend
+            && providerContextHasImages
+            && providerVisionCapability == .supported
+            && hasForegroundTarget
+            && !requestsLocalDataAccess
+    }
+
+    static func shouldRecordStateChange(for result: ToolResult) -> Bool {
+        result.payload["effectVerification"] != "not_dispatched"
+    }
+
     static func shouldExplainFailure(
         toolName: String,
         result: ToolResult,
         providerVisionCapability: ProviderImageCapability = .unknown
     ) -> Bool {
         guard toolName != "diagnostics.explainFailure" else { return false }
-        if !result.success || result.verification?.passed == false { return true }
+        if result.verification?.passed == false { return true }
         if result.payload["effectVerification"] == "failed" || result.payload["effectVerification"] == "no_effect" { return true }
         if let fallbackDepth = result.payload["fallbackDepth"].flatMap(Int.init), fallbackDepth >= 2 { return true }
         let summary = result.summary.lowercased()
@@ -2215,19 +2258,19 @@ public actor AgentCore {
             return true
         }
 
-        // Local AX/OCR degradation is not a task failure when this successful tool already
-        // produced fresh image observations and the exact Provider route is proven image-capable.
-        // feedSample/openAppObserve/tapObserve intentionally use those screenshots as the normal
-        // semantic fallback. Counting the local OCR miss against the automatic recovery budget
-        // causes a completed feed comparison to be re-sampled and can abort the task after the
-        // user-visible action already succeeded.
+        // Local AX/OCR degradation is a normal perception fallback when a successful observation,
+        // or a semantic action that explicitly proves it was not dispatched, already carries a
+        // fresh screenshot and the exact Provider route is image-capable. The Provider can continue
+        // from that image without spending the diagnostic recovery budget or retrying the same OCR.
         let hasImageObservation = result.attachments?.contains { $0.mimeType.lowercased().hasPrefix("image/") } == true
         let remoteVisionFallbackReady = providerVisionCapability == .supported
             && result.payload["perceptionRemoteVisionRequired"] == "true"
             && hasImageObservation
-        if remoteVisionFallbackReady {
+        let safeNonDispatchFallback = result.success || result.payload["effectVerification"] == "not_dispatched"
+        if remoteVisionFallbackReady && safeNonDispatchFallback {
             return false
         }
+        if !result.success { return true }
 
         if result.payload["perceptionAXAttempted"] == "true" && result.payload["perceptionAXSucceeded"] == "false" { return true }
         if result.payload["perceptionOCRInvoked"] == "true" && result.payload["perceptionOCRSucceeded"] == "false" { return true }

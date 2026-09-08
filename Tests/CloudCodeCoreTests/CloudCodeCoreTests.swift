@@ -930,7 +930,7 @@ final class CloudCodeCoreTests: XCTestCase {
         ))
     }
 
-    func testSuccessfulFeedSampleOCRFailureUsesProvenRemoteVisionFallbackWithoutRecoveryDiagnosis() {
+    func testImageCapableRemoteVisionFallbackDoesNotSpendRecoveryBudgetForSuccessfulOrNonDispatchedLocalOCRFailure() {
         let screenshot = ChatAttachment(
             filename: "feed-sample.jpg",
             path: "/tmp/feed-sample.jpg",
@@ -963,6 +963,26 @@ final class CloudCodeCoreTests: XCTestCase {
             providerVisionCapability: .textOnly
         ))
 
+        var localTextLookupFallback = fallbackResult
+        localTextLookupFallback.success = false
+        localTextLookupFallback.summary = "Local OCR text lookup could not resolve a target."
+        localTextLookupFallback.payload["effectVerification"] = "not_dispatched"
+        XCTAssertFalse(AgentCore.shouldExplainFailure(
+            toolName: "gui.tapTextObserve",
+            result: localTextLookupFallback,
+            providerVisionCapability: .supported
+        ))
+        XCTAssertFalse(AgentCore.shouldRecordStateChange(for: localTextLookupFallback))
+
+        var failedWithoutNonDispatchProof = localTextLookupFallback
+        failedWithoutNonDispatchProof.payload.removeValue(forKey: "effectVerification")
+        XCTAssertTrue(AgentCore.shouldExplainFailure(
+            toolName: "gui.tapTextObserve",
+            result: failedWithoutNonDispatchProof,
+            providerVisionCapability: .supported
+        ))
+        XCTAssertTrue(AgentCore.shouldRecordStateChange(for: failedWithoutNonDispatchProof))
+
         var missingImage = fallbackResult
         missingImage.attachments = nil
         XCTAssertTrue(AgentCore.shouldExplainFailure(
@@ -978,6 +998,32 @@ final class CloudCodeCoreTests: XCTestCase {
             result: hardFailure,
             providerVisionCapability: .supported
         ))
+    }
+
+    func testForegroundMessagingFastPathRequiresFreshSupportedVisualContextAndNoLocalDataIntent() {
+        XCTAssertTrue(AgentCore.shouldUseForegroundMessagingFastPath(
+            requiresMessageSend: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true,
+            requestsLocalDataAccess: false
+        ))
+        XCTAssertFalse(AgentCore.shouldUseForegroundMessagingFastPath(
+            requiresMessageSend: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .textOnly,
+            hasForegroundTarget: true,
+            requestsLocalDataAccess: false
+        ))
+        XCTAssertFalse(AgentCore.shouldUseForegroundMessagingFastPath(
+            requiresMessageSend: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true,
+            requestsLocalDataAccess: true
+        ))
+        XCTAssertFalse(HarnessContextManager.requestsLocalDataAccess(in: "打开微信找到文件传输助手并发消息"))
+        XCTAssertTrue(HarnessContextManager.requestsLocalDataAccess(in: "读取微信数据库里的本地记录"))
     }
 
     func testDiagnosticFailureExplanationClassifiesTextOnlyProviderLocalFallbackGap() throws {
