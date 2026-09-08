@@ -930,6 +930,56 @@ final class CloudCodeCoreTests: XCTestCase {
         ))
     }
 
+    func testSuccessfulFeedSampleOCRFailureUsesProvenRemoteVisionFallbackWithoutRecoveryDiagnosis() {
+        let screenshot = ChatAttachment(
+            filename: "feed-sample.jpg",
+            path: "/tmp/feed-sample.jpg",
+            mimeType: "image/jpeg",
+            byteSize: 4_096
+        )
+        let fallbackResult = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "Feed samples captured for semantic review.",
+            payload: [
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "false",
+                "localVisionOCR": "unavailable_request_failed",
+                "localVisionFailureClass": "ocr_request_failed",
+                "localMetricExtraction": "incomplete_or_ambiguous",
+                "perceptionRemoteVisionRequired": "true"
+            ],
+            attachments: [screenshot]
+        )
+
+        XCTAssertFalse(AgentCore.shouldExplainFailure(
+            toolName: "gui.feedSample",
+            result: fallbackResult,
+            providerVisionCapability: .supported
+        ))
+        XCTAssertTrue(AgentCore.shouldExplainFailure(
+            toolName: "gui.feedSample",
+            result: fallbackResult,
+            providerVisionCapability: .textOnly
+        ))
+
+        var missingImage = fallbackResult
+        missingImage.attachments = nil
+        XCTAssertTrue(AgentCore.shouldExplainFailure(
+            toolName: "gui.feedSample",
+            result: missingImage,
+            providerVisionCapability: .supported
+        ))
+
+        var hardFailure = fallbackResult
+        hardFailure.payload["effectVerification"] = "no_effect"
+        XCTAssertTrue(AgentCore.shouldExplainFailure(
+            toolName: "gui.feedSample",
+            result: hardFailure,
+            providerVisionCapability: .supported
+        ))
+    }
+
     func testDiagnosticFailureExplanationClassifiesTextOnlyProviderLocalFallbackGap() throws {
         let record = DiagnosticLogRecord(
             level: .warning,

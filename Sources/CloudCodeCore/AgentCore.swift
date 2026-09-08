@@ -1585,7 +1585,11 @@ public actor AgentCore {
                                             || reportedFallbackDepth >= 2
                                             || executorReportedRoute.map { $0 != descriptor.preferredRoute } == true
                                     )
-                                    if Self.shouldExplainFailure(toolName: name, result: result) || successfulRouteDegradation {
+                                    if Self.shouldExplainFailure(
+                                        toolName: name,
+                                        result: result,
+                                        providerVisionCapability: providerVisionAssessment.capability
+                                    ) || successfulRouteDegradation {
                                         var resolvedExplanation = await toolRouter.explainFailure(
                                             sessionID: session.id,
                                             toolCallID: call.id,
@@ -2197,18 +2201,40 @@ public actor AgentCore {
             && !localPerceptionSufficient
     }
 
-    private static func shouldExplainFailure(toolName: String, result: ToolResult) -> Bool {
+    static func shouldExplainFailure(
+        toolName: String,
+        result: ToolResult,
+        providerVisionCapability: ProviderImageCapability = .unknown
+    ) -> Bool {
         guard toolName != "diagnostics.explainFailure" else { return false }
         if !result.success || result.verification?.passed == false { return true }
+        if result.payload["effectVerification"] == "failed" || result.payload["effectVerification"] == "no_effect" { return true }
+        if let fallbackDepth = result.payload["fallbackDepth"].flatMap(Int.init), fallbackDepth >= 2 { return true }
+        let summary = result.summary.lowercased()
+        if summary.contains("route exhausted") || summary.contains("route_failed") || summary.contains("premature") || summary.contains("no effect") {
+            return true
+        }
+
+        // Local AX/OCR degradation is not a task failure when this successful tool already
+        // produced fresh image observations and the exact Provider route is proven image-capable.
+        // feedSample/openAppObserve/tapObserve intentionally use those screenshots as the normal
+        // semantic fallback. Counting the local OCR miss against the automatic recovery budget
+        // causes a completed feed comparison to be re-sampled and can abort the task after the
+        // user-visible action already succeeded.
+        let hasImageObservation = result.attachments?.contains { $0.mimeType.lowercased().hasPrefix("image/") } == true
+        let remoteVisionFallbackReady = providerVisionCapability == .supported
+            && result.payload["perceptionRemoteVisionRequired"] == "true"
+            && hasImageObservation
+        if remoteVisionFallbackReady {
+            return false
+        }
+
         if result.payload["perceptionAXAttempted"] == "true" && result.payload["perceptionAXSucceeded"] == "false" { return true }
         if result.payload["perceptionOCRInvoked"] == "true" && result.payload["perceptionOCRSucceeded"] == "false" { return true }
         if (result.payload["localVisionOCR"] ?? "").hasPrefix("unavailable") { return true }
         if let localVisionFailureClass = result.payload["localVisionFailureClass"], !localVisionFailureClass.isEmpty { return true }
         if result.payload["localMetricExtraction"] == "incomplete_or_ambiguous" { return true }
-        if result.payload["effectVerification"] == "failed" || result.payload["effectVerification"] == "no_effect" { return true }
-        if let fallbackDepth = result.payload["fallbackDepth"].flatMap(Int.init), fallbackDepth >= 2 { return true }
-        let summary = result.summary.lowercased()
-        return summary.contains("route exhausted") || summary.contains("route_failed") || summary.contains("premature") || summary.contains("no effect")
+        return false
     }
 
     private static func diagnosticRecoveryBudgetKey(for failureSignature: String) -> String {
