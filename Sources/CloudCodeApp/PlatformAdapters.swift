@@ -123,6 +123,15 @@ enum EmbeddedRootHelper {
         var detail: String
     }
 
+    struct FocusedTextInputPayload: Decodable, Sendable {
+        var runtimeAvailable: Bool
+        var focusedElementAvailable: Bool
+        var focusedTextInput: Bool
+        var role: String
+        var backend: String
+        var pid: Int32
+    }
+
     static let executableName = "CloudCodeRootHelper"
     static let expectedProtocolMarker = "cloudcode-root-helper-protocol=1"
 
@@ -312,34 +321,27 @@ enum EmbeddedRootHelper {
             return LaunchOutcome(accepted: true, foregroundVerified: true, detail: "隔离 helper 已验证目标安装状态并完成 App 启动路径。\(route)")
         }
 
-        // Some third-party apps accept the LaunchServices request but the helper cannot read back
-        // a reliable foreground bundle identifier. Once LaunchServices explicitly reports that the
-        // write was accepted, do not immediately issue a second root/FrontBoard launch: that is a
-        // duplicate state-changing write and costs several seconds on real devices. Return the
-        // accepted-but-unverified state and let the caller obtain one fresh screenshot as the next
-        // independent observation. Only use the privileged fallback when the isolated route did not
-        // actually report an accepted launch.
+        // LaunchServices returning "accepted" is not evidence that the requested App became the
+        // foreground App. Build 92 repeatedly returned accepted-but-unverified and then continued
+        // target-specific GUI work against whichever App was still frontmost. A second activation
+        // through the privileged board-service route is safe and idempotent at this layer: it only
+        // asks iOS to foreground the same already-installed bundle, and success still requires an
+        // independent frontmost-bundle verification inside the helper. Therefore an unverified
+        // isolated launch must fall through to the bounded root activation path instead of being
+        // treated as good enough for screenshot-driven continuation.
         if isolated.code == 46 {
             let isolatedDetail = failureDetail(prefix: "隔离 helper 启动 App", code: isolated.code, diagnostic: isolated.diagnostic)
-            if acceptedButUnverified(isolated) {
-                return LaunchOutcome(
-                    accepted: true,
-                    foregroundVerified: false,
-                    detail: "系统已接受目标 App 启动请求，但 helper 无法可靠读取前台 Bundle ID；已跳过重复 root 启动并等待新鲜截图验证。\(isolatedDetail)"
-                )
-            }
-
             let privileged = run(["launch", bundleID], privilege: .root, timeout: 6)
             if privileged.code == 0 {
                 let route = privileged.diagnostic.isEmpty ? "" : " \(privileged.diagnostic)"
                 return LaunchOutcome(accepted: true, foregroundVerified: true, detail: "隔离 LaunchServices 路径未接受启动后，root helper 通过系统启动路由完成目标 App 前台切换。\(route)")
             }
             let privilegedDetail = failureDetail(prefix: "root helper 启动 App", code: privileged.code, diagnostic: privileged.diagnostic)
-            if acceptedButUnverified(privileged) {
+            if acceptedButUnverified(privileged) || acceptedButUnverified(isolated) {
                 return LaunchOutcome(
                     accepted: true,
                     foregroundVerified: false,
-                    detail: "root 系统启动请求已被接受，但前台 Bundle ID 仍无法可靠读取；等待截图验证。\(privilegedDetail)"
+                    detail: "隔离 LaunchServices 请求已接受但未建立可验证前台；已继续尝试一次 root/FrontBoard/BackBoard 激活，但目标前台仍未被证明。后续不得把截图默认解释为目标 App。\(isolatedDetail)；root fallback：\(privilegedDetail)"
                 )
             }
             return LaunchOutcome(accepted: false, foregroundVerified: false, detail: "\(isolatedDetail)；root fallback 同样失败：\(privilegedDetail)")
@@ -482,6 +484,17 @@ enum EmbeddedRootHelper {
         }
         let diagnosticSuffix = result.stderr.isEmpty ? "" : " helper diagnostics: \(result.stderr)"
         return (result.stdout, "AXRuntime tree 已由 mobile 身份 helper 返回。\(diagnosticSuffix)")
+    }
+
+    static func focusedTextInput() -> (payload: FocusedTextInputPayload?, detail: String) {
+        let result = runSeparated(["gui-focused-text-input-json"], privilege: .isolatedUser, timeout: 2.0)
+        guard result.code == 0,
+              let data = result.stdout.data(using: .utf8), data.count <= 4 * 1024,
+              let payload = try? JSONDecoder().decode(FocusedTextInputPayload.self, from: data) else {
+            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+            return (nil, failureDetail(prefix: "GUI focused text input (mobile AX client)", code: result.code, diagnostic: diagnostic))
+        }
+        return (payload, result.stderr.isEmpty ? "AX focused-text probe completed." : "AX focused-text probe completed. helper diagnostics: \(result.stderr)")
     }
 
     static func guiScreenshot() -> (data: Data?, detail: String) {
@@ -1614,6 +1627,14 @@ private struct LocalGUIPlanStep: Decodable {
     var timeoutMs: Int?
 }
 
+private struct LocalSemanticTarget: Sendable {
+    var centerX: Double
+    var centerY: Double
+    var searchableText: String
+    var source: String
+    var cacheHit: Bool
+}
+
 private actor GUIElementLookupCache {
     private struct Entry: Sendable {
         var match: GUIElementMatch
@@ -1855,7 +1876,25 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                     : "launch_accepted_foreground_unverified_screenshot_semantic_required",
                 "localObservation": "final_screenshot_attached"
             ]
-            await enrichWithLocalVision(&payload, screenshot: data)
+            if outcome.foregroundVerified {
+                await enrichWithLocalVision(&payload, screenshot: data)
+            } else {
+                // Do not spend local Vision/CoreML work on a frame that is not proven to belong to
+                // the requested target App. On build 92 this path both mis-grounded follow-up actions
+                // and triggered background CoreVideo allocation failures. Keep the fresh screenshot
+                // for semantic re-planning/remote vision when available, but defer local OCR until a
+                // verified foreground transition or a later explicit current-frame text lookup.
+                payload["perceptionAXAttempted"] = "false"
+                payload["perceptionAXSucceeded"] = "false"
+                payload["perceptionOCRInvoked"] = "false"
+                payload["perceptionOCRSucceeded"] = "false"
+                payload["localVisionOCR"] = "not_invoked_foreground_unverified"
+                payload["localVisionElementCount"] = "0"
+                payload["perceptionLocalSufficient"] = "false"
+                payload["perceptionRemoteVisionRequired"] = "true"
+                payload["perceptionFallbackReason"] = "foreground_unverified_local_ocr_skipped"
+                payload["providerVisualRoundTripAvoided"] = "0"
+            }
             return ToolResult(
                 toolCallID: call.id,
                 success: true,
@@ -1876,7 +1915,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 "perceptionAXSucceeded": "true",
                 "perceptionOCRInvoked": "false",
                 "perceptionOCRSucceeded": "false",
-                "axStage": "direct_root_then_sampled_hit_test",
+                "axStage": "direct_root_then_position_root_then_sampled_hit_test",
                 "axLatencyMS": String(axLatencyMS)
             ]
             if let data = tree.data(using: .utf8),
@@ -1949,6 +1988,50 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.tapTextObserve":
             let baseline = try await backend.screenshot()
             let baselineSHA256 = GUIAutomationPayloadPolicy.sha256Hex(baseline)
+
+            // Named visible text is exactly where AX and OCR should complement each other. Build 92
+            // went straight to Vision here, so a background CoreVideo/CoreML allocation failure left
+            // "文件传输助手" with no second local semantic path even when AX might expose it. Try one
+            // bounded current-tree lookup first; TrollStoreGUIBackend already suppresses repeated AX
+            // timeouts for the same foreground state. OCR remains the fallback and is not required for
+            // the descriptor/capability gate, so devices without a usable AX backend still work.
+            do {
+                let axResolved = try await resolveElement(call)
+                guard !Self.isProtectedElement(axResolved.match) else {
+                    throw ToolRouterError.noExecutionRoute("protected/system-confirmation AX text cannot be automated")
+                }
+                try await backend.tap(x: axResolved.match.frame.centerX, y: axResolved.match.frame.centerY)
+                try await Task.sleep(nanoseconds: 250_000_000)
+                try Task.checkCancellation()
+                let data = try await backend.screenshot()
+                let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
+                var payload = elementPayload(axResolved.match, treeHash: axResolved.treeHash, cacheHit: axResolved.cacheHit)
+                payload["baselineSHA256"] = baselineSHA256
+                payload["sha256"] = GUIAutomationPayloadPolicy.sha256Hex(data)
+                payload["effectVerification"] = "semantic_required"
+                payload["localObservation"] = "final_screenshot_attached"
+                payload["structuredPath"] = "ax_text_first"
+                payload["perceptionClass"] = "ax_text_action"
+                payload["perceptionAXAttempted"] = "true"
+                payload["perceptionAXSucceeded"] = "true"
+                payload["perceptionOCRInvoked"] = "false"
+                payload["perceptionOCRSucceeded"] = "false"
+                payload["perceptionLocalSufficient"] = "false"
+                payload["perceptionRemoteVisionRequired"] = "true"
+                payload["perceptionFallbackReason"] = "fresh_ax_unique_text_match_post_action_semantics_need_fresh_observation"
+                payload["providerVisualRoundTripAvoided"] = "0"
+                return ToolResult(
+                    toolCallID: call.id,
+                    success: true,
+                    summary: "Unique visible text was resolved through the current accessibility tree and tapped locally; final screenshot attached for semantic verification.",
+                    payload: payload,
+                    attachments: attachment.map { [$0] }
+                )
+            } catch {
+                // AX failure is expected on some third-party surfaces. Do not retry it here; continue
+                // immediately to one OCR pass from the already-captured current frame.
+            }
+
             let resolution = await resolveLocalVisionText(call, screenshot: baseline)
             guard let resolved = resolution.match else {
                 let attachment = try persistScreenshotAttachment(baseline, sessionID: call.sessionID)
@@ -1957,8 +2040,8 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                     "baselineSHA256": baselineSHA256,
                     "effectVerification": "not_dispatched",
                     "localObservation": "baseline_screenshot_attached",
-                    "perceptionClass": "local_ocr_text_lookup",
-                    "perceptionAXAttempted": "false",
+                    "perceptionClass": "ax_then_local_ocr_text_lookup",
+                    "perceptionAXAttempted": "true",
                     "perceptionAXSucceeded": "false",
                     "perceptionAnchorCacheHit": "false",
                     "perceptionLocalSufficient": "false",
@@ -1971,7 +2054,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 return ToolResult(
                     toolCallID: call.id,
                     success: false,
-                    summary: resolution.failureSummary ?? "Local OCR text lookup did not produce one unique current-frame target.",
+                    summary: resolution.failureSummary ?? "AX and local OCR did not produce one unique current-frame text target.",
                     payload: payload,
                     attachments: attachment.map { [$0] }
                 )
@@ -1997,17 +2080,17 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
                 "effectVerification": "semantic_required",
                 "localObservation": "final_screenshot_attached",
-                "perceptionClass": "local_ocr_text_action",
-                "perceptionAXAttempted": "false",
+                "perceptionClass": "ax_then_local_ocr_text_action",
+                "perceptionAXAttempted": "true",
                 "perceptionAXSucceeded": "false",
                 "perceptionAnchorCacheHit": "false",
-                "perceptionFallbackReason": "fresh_local_ocr_unique_text_match"
+                "perceptionFallbackReason": "ax_unavailable_fresh_local_ocr_unique_text_match"
             ]
             await enrichWithLocalVision(&payload, screenshot: data)
             return ToolResult(
                 toolCallID: call.id,
                 success: true,
-                summary: "Unique visible OCR text was resolved and tapped locally; final screenshot attached for semantic verification.",
+                summary: "AX did not resolve the text, but one unique visible OCR label was resolved and tapped locally; final screenshot attached for semantic verification.",
                 payload: payload,
                 attachments: attachment.map { [$0] }
             )
@@ -2027,6 +2110,45 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             try Task.checkCancellation()
             let data = try await backend.screenshot()
             let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
+
+            // Prefer a structural focus proof before invoking Vision. On the real build-92 device,
+            // Cloud Code is backgrounded while WeChat owns the keyboard; Vision frequently fails
+            // there with CoreVideo/CoreML allocation errors even though AX can still expose the
+            // focused text control. The probe intentionally returns no AXValue/text content.
+            let axFocus = EmbeddedRootHelper.focusedTextInput()
+            if let focused = axFocus.payload, focused.focusedTextInput {
+                let payload: [String: String] = [
+                    "baselineSHA256": baselineSHA256,
+                    "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
+                    "focusStrategy": "bounded_bottom_center_composer_candidate",
+                    "focusX": String(focusX),
+                    "focusY": String(focusY),
+                    "composerFocusVerified": "true",
+                    "keyboardLikely": "false",
+                    "focusVerification": "ax_focused_text_input",
+                    "focusedRole": String(focused.role.prefix(128)),
+                    "effectVerification": "ax_focused_text_input_verified",
+                    "localObservation": "final_screenshot_attached",
+                    "perceptionClass": "semantic_composer_focus",
+                    "perceptionAXAttempted": "true",
+                    "perceptionAXSucceeded": "true",
+                    "perceptionAnchorCacheHit": "false",
+                    "perceptionOCRInvoked": "false",
+                    "perceptionOCRSucceeded": "false",
+                    "perceptionLocalSufficient": "true",
+                    "perceptionRemoteVisionRequired": "false",
+                    "perceptionFallbackReason": "ax_focused_text_input_verified_composer_focus",
+                    "providerVisualRoundTripAvoided": "1"
+                ]
+                return ToolResult(
+                    toolCallID: call.id,
+                    success: true,
+                    summary: "Chat composer focus was locally verified by a focused accessibility text-input element; OCR was not required.",
+                    payload: payload,
+                    attachments: attachment.map { [$0] }
+                )
+            }
+
             let observation = await LocalVisionTextObservation.observe(for: data, maximumElements: 48, requiresText: true)
             let screenHeight = Double(observation.payload["screenPointHeight"] ?? "") ?? Double(image.size.height)
             let keyboardLikely = LocalKeyboardHeuristic.isLikelyVisible(elements: observation.elements, screenHeight: screenHeight)
@@ -2036,11 +2158,13 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 "focusStrategy": "bounded_bottom_center_composer_candidate",
                 "focusX": String(focusX),
                 "focusY": String(focusY),
+                "composerFocusVerified": keyboardLikely ? "true" : "false",
                 "keyboardLikely": keyboardLikely ? "true" : "false",
+                "focusVerification": keyboardLikely ? "ocr_keyboard_heuristic" : "unverified",
                 "effectVerification": keyboardLikely ? "local_keyboard_heuristic_passed" : "semantic_required",
                 "localObservation": "final_screenshot_attached",
                 "perceptionClass": "semantic_composer_focus",
-                "perceptionAXAttempted": "false",
+                "perceptionAXAttempted": "true",
                 "perceptionAXSucceeded": "false",
                 "perceptionAnchorCacheHit": "false"
             ]
@@ -2048,20 +2172,20 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             if keyboardLikely {
                 payload["perceptionLocalSufficient"] = "true"
                 payload["perceptionRemoteVisionRequired"] = "false"
-                payload["perceptionFallbackReason"] = "local_keyboard_heuristic_verified_composer_focus"
+                payload["perceptionFallbackReason"] = "ax_unavailable_local_keyboard_heuristic_verified_composer_focus"
                 payload["providerVisualRoundTripAvoided"] = "1"
             } else {
                 payload["perceptionLocalSufficient"] = "false"
                 payload["perceptionRemoteVisionRequired"] = "true"
-                payload["perceptionFallbackReason"] = "composer_focus_keyboard_not_locally_verified"
+                payload["perceptionFallbackReason"] = "composer_focus_not_locally_verified"
                 payload["providerVisualRoundTripAvoided"] = "0"
             }
             return ToolResult(
                 toolCallID: call.id,
                 success: keyboardLikely,
                 summary: keyboardLikely
-                    ? "Chat composer focus was locally verified by keyboard-like OCR evidence."
-                    : "Composer candidate was tapped, but local keyboard evidence was insufficient; raw typing remains blocked until focus is verified.",
+                    ? "AX did not prove text focus, but chat composer focus was locally verified by keyboard-like OCR evidence."
+                    : "Composer candidate was tapped, but neither AX focus nor local keyboard evidence verified the composer; raw typing remains blocked.",
                 payload: payload,
                 attachments: attachment.map { [$0] }
             )
@@ -2538,31 +2662,31 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                     stateChanges += 1
                 case "waitForElement":
                     let elementCall = Self.elementLookupCall(from: step, sessionID: call.sessionID, toolName: "gui.waitForElement")
-                    let resolved = try await waitForElement(elementCall, timeoutMS: timeoutMS)
+                    let resolved = try await waitForSemanticTarget(elementCall, timeoutMS: timeoutMS)
                     if resolved.cacheHit { elementCacheHits += 1 }
                 case "tapElement":
                     let elementCall = Self.elementLookupCall(from: step, sessionID: call.sessionID, toolName: "gui.findElement")
-                    let resolved = try await resolveElement(elementCall)
+                    let resolved = try await resolveSemanticTarget(elementCall)
                     if resolved.cacheHit { elementCacheHits += 1 }
-                    guard !Self.isProtectedElement(resolved.match) else {
+                    guard !Self.isProtectedLocalVisionText(resolved.searchableText) else {
                         throw ToolRouterError.noExecutionRoute("structured plan stopped at protected/system-confirmation element")
                     }
-                    guard !Self.isCommitElement(resolved.match) else {
+                    guard !Self.isCommitLocalVisionText(resolved.searchableText) else {
                         throw ToolRouterError.noExecutionRoute("structured plan stopped before a commit/irreversible element; execute that action as a separately verified tool step")
                     }
-                    try await backend.tap(x: resolved.match.frame.centerX, y: resolved.match.frame.centerY)
+                    try await backend.tap(x: resolved.centerX, y: resolved.centerY)
                     stateChanges += 1
                     if !isFinal || step.expectQuery != nil {
                         try await validateExpectation(step, timeoutMS: timeoutMS)
                     }
                 case "typeElement":
                     let elementCall = Self.elementLookupCall(from: step, sessionID: call.sessionID, toolName: "gui.findElement")
-                    let resolved = try await resolveElement(elementCall)
+                    let resolved = try await resolveSemanticTarget(elementCall)
                     if resolved.cacheHit { elementCacheHits += 1 }
-                    guard !Self.isProtectedElement(resolved.match) else {
+                    guard !Self.isProtectedLocalVisionText(resolved.searchableText) else {
                         throw ToolRouterError.noExecutionRoute("structured plan stopped at protected/secure input element")
                     }
-                    try await backend.tap(x: resolved.match.frame.centerX, y: resolved.match.frame.centerY)
+                    try await backend.tap(x: resolved.centerX, y: resolved.centerY)
                     try await Task.sleep(nanoseconds: 120_000_000)
                     try Task.checkCancellation()
                     try await backend.type(step.text ?? "")
@@ -2655,17 +2779,52 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         let mode = GUIElementMatchMode(rawValue: step.expectMatch ?? "exact") ?? .exact
         repeat {
             try Task.checkCancellation()
-            let tree = try await backend.tree()
-            let matches = GUIElementResolver.find(in: tree, query: query, role: step.expectRole, mode: mode, maximumMatches: 3)
-            if expectation == "present", matches.count == 1 { return }
-            if expectation == "absent", matches.isEmpty { return }
-            if expectation == "present", matches.count > 1 {
-                throw ToolRouterError.noExecutionRoute("structured plan expectation is ambiguous; refine expectQuery/expectRole")
+
+            var axResolved = false
+            do {
+                let tree = try await backend.tree()
+                let matches = GUIElementResolver.find(in: tree, query: query, role: step.expectRole, mode: mode, maximumMatches: 3)
+                if expectation == "present", matches.count == 1 { return }
+                if expectation == "absent", matches.isEmpty { return }
+                if matches.count > 1 {
+                    throw ToolRouterError.noExecutionRoute("structured plan expectation is ambiguous; refine expectQuery/expectRole")
+                }
+                axResolved = true
+            } catch let error as ToolRouterError {
+                if String(describing: error).contains("ambiguous") { throw error }
+            } catch {
+                // AX is best-effort on standalone TrollStore. Continue immediately to same-frame OCR.
             }
+
+            let screenshot = try await backend.screenshot()
+            let ocrCall = ToolCall(
+                name: "gui.findElement",
+                arguments: ["query": query, "match": mode.rawValue],
+                sessionID: UUID()
+            )
+            let first = await resolveLocalVisionText(ocrCall, screenshot: screenshot)
+            var ocrResolution = first
+            if first.match == nil,
+               (first.failureReason == "ocr_target_not_recognized" || first.failureReason == "ocr_completed_no_text") {
+                ocrResolution = await resolveLocalVisionText(ocrCall, screenshot: screenshot, forcePrecise: true)
+            }
+            if expectation == "present", ocrResolution.match != nil { return }
+            if ocrResolution.failureReason == "ocr_unique_match_ambiguous" {
+                throw ToolRouterError.noExecutionRoute("structured plan expectation is ambiguous in local OCR; refine expectQuery")
+            }
+            if expectation == "absent" {
+                let status = ocrResolution.observation.payload["localVisionOCR"] ?? ""
+                if ocrResolution.match == nil, (status == "recognized" || status == "available_empty") { return }
+            }
+
             if Date() >= deadline { break }
-            try await Task.sleep(nanoseconds: 180_000_000)
+            if axResolved {
+                try await Task.sleep(nanoseconds: 120_000_000)
+            } else {
+                try await Task.sleep(nanoseconds: 80_000_000)
+            }
         } while Date() < deadline
-        throw ToolRouterError.noExecutionRoute("structured plan local expectation did not become true before timeout")
+        throw ToolRouterError.noExecutionRoute("structured plan local semantic expectation did not become true before timeout")
     }
 
     private static func validateStructuredPlan(_ plan: LocalGUIPlan) throws {
@@ -2773,13 +2932,60 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         throw lastError ?? ToolRouterError.noExecutionRoute("structured element did not appear before timeout")
     }
 
+    private func resolveSemanticTarget(_ call: ToolCall) async throws -> LocalSemanticTarget {
+        do {
+            let resolved = try await resolveElement(call)
+            return LocalSemanticTarget(
+                centerX: resolved.match.frame.centerX,
+                centerY: resolved.match.frame.centerY,
+                searchableText: resolved.match.searchableText,
+                source: "ax",
+                cacheHit: resolved.cacheHit
+            )
+        } catch {
+            let screenshot = try await backend.screenshot()
+            var resolution = await resolveLocalVisionText(call, screenshot: screenshot)
+            if resolution.match == nil,
+               (resolution.failureReason == "ocr_target_not_recognized" || resolution.failureReason == "ocr_completed_no_text") {
+                resolution = await resolveLocalVisionText(call, screenshot: screenshot, forcePrecise: true)
+            }
+            guard let match = resolution.match else {
+                throw ToolRouterError.noExecutionRoute(resolution.failureSummary ?? "AX and local OCR could not resolve one unique semantic target")
+            }
+            return LocalSemanticTarget(
+                centerX: match.centerX,
+                centerY: match.centerY,
+                searchableText: match.text,
+                source: "ocr",
+                cacheHit: resolution.observation.payload["localVisionCacheHit"] == "true"
+            )
+        }
+    }
+
+    private func waitForSemanticTarget(_ call: ToolCall, timeoutMS: Int) async throws -> LocalSemanticTarget {
+        let deadline = Date().addingTimeInterval(Double(timeoutMS) / 1_000.0)
+        var lastError: Error?
+        repeat {
+            do {
+                return try await resolveSemanticTarget(call)
+            } catch {
+                lastError = error
+            }
+            try Task.checkCancellation()
+            if Date() >= deadline { break }
+            try await Task.sleep(nanoseconds: 120_000_000)
+        } while Date() < deadline
+        throw lastError ?? ToolRouterError.noExecutionRoute("local semantic target did not appear before timeout")
+    }
+
     private func resolveLocalVisionText(
         _ call: ToolCall,
-        screenshot: Data
+        screenshot: Data,
+        forcePrecise: Bool = false
     ) async -> (match: LocalPerceptionTextElement?, observation: LocalVisionTextObservation.Observation, failureReason: String?, failureSummary: String?) {
         let query = call.arguments["query"] ?? ""
         let mode = GUIElementMatchMode(rawValue: call.arguments["match"] ?? "exact") ?? .exact
-        let observation = await LocalVisionTextObservation.observe(for: screenshot, maximumElements: 48, requiresText: true)
+        let observation = await LocalVisionTextObservation.observe(for: screenshot, maximumElements: 48, requiresText: true, forcePrecise: forcePrecise)
         let status = observation.payload["localVisionOCR"] ?? "unavailable"
         guard status == "recognized" else {
             let reason = status == "available_empty" ? "ocr_completed_no_text" : "ocr_request_failed"
@@ -2849,7 +3055,11 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
     }
 
     private static func isCommitElement(_ match: GUIElementMatch) -> Bool {
-        let haystack = match.searchableText.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        isCommitLocalVisionText(match.searchableText)
+    }
+
+    private static func isCommitLocalVisionText(_ text: String) -> Bool {
+        let haystack = text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
         let commitMarkers = [
             "send", "submit", "publish", "post", "delete", "remove", "purchase", "buy", "pay", "checkout", "confirm order",
             "发送", "提交", "发布", "删除", "移除", "购买", "支付", "结算", "确认订单", "卸载"
@@ -2906,7 +3116,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.tapElementObserve": return [.tree, .touch, .screenshot]
         case "gui.tapTextObserve", "gui.focusComposerObserve": return [.screenshot, .touch]
         case "gui.typeElementObserve": return [.tree, .touch, .textInput, .screenshot]
-        case "gui.runStructuredPlan": return [.openApp, .tree, .screenshot, .touch, .textInput, .gestures]
+        case "gui.runStructuredPlan": return [.openApp, .screenshot, .touch, .textInput, .gestures]
         case "gui.screenshot": return [.screenshot]
         case "gui.tap": return [.touch]
         case "gui.type": return [.textInput]

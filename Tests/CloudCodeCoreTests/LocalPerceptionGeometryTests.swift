@@ -59,6 +59,38 @@ final class LocalPerceptionGeometryTests: XCTestCase {
         XCTAssertEqual(LocalPerceptionTextMatcher.resolve(query: "文件传输助手", mode: .exact, elements: duplicated), .ambiguous(2))
     }
 
+    func testVisibleTextMatcherToleratesOCRInsertedSpacingAndPunctuation() throws {
+        let elements = [
+            LocalPerceptionTextElement(text: "文件 传输·助手", confidence: 0.90, x: 42, y: 188, width: 148, height: 30),
+            LocalPerceptionTextElement(text: "订阅号", confidence: 0.92, x: 42, y: 244, width: 82, height: 28)
+        ]
+
+        let result = LocalPerceptionTextMatcher.resolve(query: "文件传输助手", mode: .exact, elements: elements)
+        guard case .unique(let match) = result else {
+            XCTFail("expected compact OCR normalization to recover the visible chat label")
+            return
+        }
+        XCTAssertEqual(match.text, "文件 传输·助手")
+    }
+
+    func testVisibleTextMatcherMergesAdjacentSameLineOCRFragmentsWithoutCrossRowGuessing() throws {
+        let elements = [
+            LocalPerceptionTextElement(text: "文件传输", confidence: 0.91, x: 42, y: 188, width: 88, height: 30),
+            LocalPerceptionTextElement(text: "助手", confidence: 0.89, x: 134, y: 189, width: 44, height: 29),
+            LocalPerceptionTextElement(text: "文件传输", confidence: 0.95, x: 42, y: 300, width: 88, height: 30),
+            LocalPerceptionTextElement(text: "记录", confidence: 0.94, x: 134, y: 301, width: 44, height: 29)
+        ]
+
+        let result = LocalPerceptionTextMatcher.resolve(query: "文件传输助手", mode: .exact, elements: elements)
+        guard case .unique(let match) = result else {
+            XCTFail("expected one bounded same-line merged OCR match")
+            return
+        }
+        XCTAssertEqual(match.text, "文件传输助手")
+        XCTAssertEqual(match.x, 42, accuracy: 0.0001)
+        XCTAssertEqual(match.width, 136, accuracy: 0.0001)
+    }
+
     func testVisionBoxIsClampedToScreenBoundsAndInvalidBoxesFailClosed() throws {
         let rect = try XCTUnwrap(LocalPerceptionGeometry.topLeftScreenRect(
             normalizedLowerLeftX: -0.05,

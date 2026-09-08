@@ -1212,6 +1212,9 @@ int main(int argc, const char *argv[])
             NSString *strategy = [NSString stringWithUTF8String:argv[2]];
             return CloudCodeGUINavigateBack(strategy);
         }
+        if ([command isEqualToString:@"gui-focused-text-input-json"]) {
+            return CloudCodeGUIFocusedTextInputJSON();
+        }
         if ([command isEqualToString:@"gui-type-base64"]) {
             if (argc < 3) { return 10; }
             NSString *encoded = [NSString stringWithUTF8String:argv[2]];

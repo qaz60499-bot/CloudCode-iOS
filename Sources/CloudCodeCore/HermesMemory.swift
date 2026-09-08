@@ -149,7 +149,7 @@ public actor HermesMemoryStore: HermesMemoryProviding {
     }
 
     @discardableResult
-    public func upsert(_ input: HermesMemoryRecord) throws -> HermesMemoryRecord {
+    public func upsert(_ input: HermesMemoryRecord, superseding additionalSupersededIDs: [UUID] = []) throws -> HermesMemoryRecord {
         try ensureDatabase()
         var record = input
         record.title = record.title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -158,14 +158,19 @@ public actor HermesMemoryStore: HermesMemoryProviding {
         record.updatedAt = Date()
 
         let previousID = try activeEquivalentID(kind: record.kind, title: record.title, project: record.project)
+        var supersededIDs: [UUID] = []
+        if let previousID, previousID != record.id { supersededIDs.append(previousID) }
+        for id in additionalSupersededIDs where id != record.id && !supersededIDs.contains(id) {
+            supersededIDs.append(id)
+        }
         let tagsJSON = String(data: try encoder.encode(record.tags), encoding: .utf8) ?? "[]"
         try execute("BEGIN IMMEDIATE")
         do {
-            if let previousID, previousID != record.id {
-                try execute("UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?", bindings: [
-                    .text(record.id.uuidString), .double(record.updatedAt.timeIntervalSince1970), .text(previousID.uuidString)
+            for supersededID in supersededIDs {
+                try execute("UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ? AND superseded_by IS NULL", bindings: [
+                    .text(record.id.uuidString), .double(record.updatedAt.timeIntervalSince1970), .text(supersededID.uuidString)
                 ])
-                try execute("DELETE FROM memories_fts WHERE id = ?", bindings: [.text(previousID.uuidString)])
+                try execute("DELETE FROM memories_fts WHERE id = ?", bindings: [.text(supersededID.uuidString)])
             }
 
             try execute(
@@ -198,8 +203,8 @@ public actor HermesMemoryStore: HermesMemoryProviding {
         // immediately refreshed, human-readable mirror. If filesystem replacement
         // fails after COMMIT, bootstrap reconciliation deterministically repairs it.
         try writeMarkdown(record)
-        if let previousID, previousID != record.id, let previous = try self.record(previousID) {
-            try writeMarkdown(previous)
+        for supersededID in supersededIDs {
+            if let previous = try self.record(supersededID) { try writeMarkdown(previous) }
         }
         return record
     }
@@ -226,13 +231,21 @@ public actor HermesMemoryStore: HermesMemoryProviding {
         return try queryRecords(sql: sql, bindings: bindings)
     }
 
-    public func pinned(limit: Int = 100) throws -> [HermesMemoryRecord] {
+    public func pinned(limit: Int = 100, project: String? = nil, explicitGlobalOnly: Bool = false) throws -> [HermesMemoryRecord] {
         try ensureDatabase()
         try purgeExpired()
-        return try queryRecords(
-            sql: activeSelectPrefix() + " AND pinned = 1 ORDER BY updated_at DESC LIMIT ?",
-            bindings: [.int(Int64(max(1, min(limit, 1000))))]
-        )
+        var sql = activeSelectPrefix() + " AND pinned = 1"
+        var bindings: [SQLiteBinding] = []
+        if let project = project?.trimmingCharacters(in: .whitespacesAndNewlines), !project.isEmpty {
+            sql += " AND project = ?"
+            bindings.append(.text(project))
+        } else if explicitGlobalOnly {
+            sql += " AND project IS NULL AND lower(tags) LIKE ?"
+            bindings.append(.text("%\"global\"%"))
+        }
+        sql += " ORDER BY updated_at DESC LIMIT ?"
+        bindings.append(.int(Int64(max(1, min(limit, 1000)))))
+        return try queryRecords(sql: sql, bindings: bindings)
     }
 
     public func search(_ query: String, project: String? = nil, tags: [String] = [], limit: Int = 100) throws -> [HermesMemoryRecord] {
@@ -262,12 +275,32 @@ public actor HermesMemoryStore: HermesMemoryProviding {
 
     public func context(query: String, project: String?, limit: Int = 8) async throws -> HermesContextSnapshot {
         let boundedLimit = max(1, min(limit, 16))
-        var records = try search(query, project: project, limit: boundedLimit)
-        let pinnedRecords = try pinned(limit: 8)
-        for pinned in pinnedRecords where !records.contains(where: { $0.id == pinned.id }) {
-            records.insert(pinned, at: 0)
+        let scopedProject = project?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        let relevantSource: [HermesMemoryRecord]
+        if let scopedProject {
+            relevantSource = try search(query, project: scopedProject, limit: min(100, boundedLimit * 4))
+        } else {
+            // Missing project scope must fail closed. Only records explicitly marked global
+            // may participate; nil must never mean "search every project".
+            relevantSource = try explicitGlobalSearch(query: query, limit: min(100, boundedLimit * 4))
         }
-        records = Array(records.prefix(boundedLimit))
+        let relevant = Array(relevantSource.filter(Self.isContextEligible).prefix(boundedLimit))
+
+        var pinnedCandidates: [HermesMemoryRecord] = []
+        if let scopedProject {
+            pinnedCandidates.append(contentsOf: try pinned(limit: 2, project: scopedProject).filter(Self.isContextEligible))
+        }
+        pinnedCandidates.append(contentsOf: try pinned(limit: 1, explicitGlobalOnly: true).filter(Self.isContextEligible))
+
+        var uniquePinned: [HermesMemoryRecord] = []
+        for record in pinnedCandidates where !uniquePinned.contains(where: { $0.id == record.id }) {
+            uniquePinned.append(record)
+        }
+        let pinnedBudget = relevant.isEmpty ? min(2, boundedLimit) : min(2, max(0, boundedLimit - 1))
+        var records = Array(uniquePinned.prefix(pinnedBudget))
+        for record in relevant where records.count < boundedLimit && !records.contains(where: { $0.id == record.id }) {
+            records.append(record)
+        }
         let rendered = Self.renderContext(records, maxCharacters: 10_000)
         return HermesContextSnapshot(records: records, renderedText: rendered)
     }
@@ -288,45 +321,82 @@ public actor HermesMemoryStore: HermesMemoryProviding {
             title: currentTitle,
             body: currentBody,
             project: project,
-            tags: ["auto", "session-state"]
+            tags: ["auto", "session-state"],
+            expiresAt: Date().addingTimeInterval(24 * 60 * 60)
         ))
 
         let lower = trimmedUser.lowercased()
-        let explicitMemory = lower.contains("记住") || lower.contains("remember") || lower.contains("以后") || lower.contains("偏好") || lower.contains("preference")
-        let ruleLike = lower.contains("必须") || lower.contains("不要") || lower.contains("规则") || lower.contains("always") || lower.contains("never") || lower.contains("rule")
+        let explicitMemory = lower.contains("记住") || lower.contains("remember")
+        let durableAnchor = lower.contains("以后默认") || lower.contains("从今以后") || lower.contains("以后始终")
+            || lower.contains("以后不要") || lower.contains("以后都") || lower.contains("长期") || lower.contains("永久")
+            || lower.contains("going forward") || lower.contains("from now on") || lower.contains("always remember")
+        let ruleLike = lower.contains("必须") || lower.contains("不要") || lower.contains("规则") || lower.contains("始终")
+            || lower.contains("always") || lower.contains("never") || lower.contains("rule")
         let decisionLike = lower.contains("决定") || lower.contains("确定采用") || lower.contains("decision") || lower.contains("we decided")
-        let temporaryLike = lower.contains("临时") || lower.contains("暂时") || lower.contains("这次") || lower.contains("temporary") || lower.contains("for now")
+        let temporaryLike = lower.contains("临时") || lower.contains("暂时") || lower.contains("这次") || lower.contains("本次")
+            || lower.contains("当前任务") || lower.contains("temporary") || lower.contains("for now") || lower.contains("this task")
+        let concreteRuntimeState = Self.looksLikeConcreteRuntimeState(lower)
+        let globalLike = lower.contains("全局") || lower.contains("所有项目") || lower.contains("所有任务")
+            || lower.contains("globally") || lower.contains("all projects") || lower.contains("every project")
+        let correctionLike = lower.contains("纠正") || lower.contains("改成") || lower.contains("改为") || lower.contains("不再")
+            || lower.contains("correction") || lower.contains("instead") || lower.contains("replace")
 
-        if explicitMemory || ruleLike || decisionLike || temporaryLike {
-            let kind: HermesMemoryKind
-            let expiresAt: Date?
-            if temporaryLike {
-                kind = .temporaryContext
-                expiresAt = Date().addingTimeInterval(24 * 60 * 60)
-            } else if ruleLike {
-                kind = .permanentRule
-                expiresAt = nil
-            } else if decisionLike {
-                kind = .decision
-                expiresAt = nil
-            } else {
-                kind = .userPreference
-                expiresAt = nil
-            }
-            let titlePrefix = String(trimmedUser.prefix(72)).trimmingCharacters(in: .whitespacesAndNewlines)
-            let title = titlePrefix.isEmpty ? "Explicit memory" : titlePrefix
-            let existingID = try activeEquivalentID(kind: kind, title: title, project: project) ?? UUID()
-            _ = try upsert(HermesMemoryRecord(
-                id: existingID,
-                kind: kind,
-                title: title,
-                body: Self.bounded(trimmedUser, limit: 5000),
-                project: project,
-                tags: ["auto", "explicit"],
-                pinned: kind == .permanentRule,
-                expiresAt: expiresAt
-            ))
+        let shouldPersistDurably = !concreteRuntimeState && !temporaryLike
+            && (explicitMemory || durableAnchor)
+        let shouldPersistTemporarily = explicitMemory && temporaryLike && !concreteRuntimeState
+        guard shouldPersistDurably || shouldPersistTemporarily else { return }
+
+        let kind: HermesMemoryKind
+        let expiresAt: Date?
+        if shouldPersistTemporarily {
+            kind = .temporaryContext
+            expiresAt = Date().addingTimeInterval(24 * 60 * 60)
+        } else if ruleLike && (explicitMemory || durableAnchor) {
+            kind = .permanentRule
+            expiresAt = nil
+        } else if decisionLike {
+            kind = .decision
+            expiresAt = nil
+        } else {
+            kind = .userPreference
+            expiresAt = nil
         }
+
+        let memoryProject = globalLike ? nil : project
+        let titlePrefix = String(trimmedUser.prefix(72)).trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = titlePrefix.isEmpty ? "Explicit memory" : titlePrefix
+        var existingID = try activeEquivalentID(kind: kind, title: title, project: memoryProject)
+        var correctionDuplicates: [UUID] = []
+        if correctionLike {
+            let skeleton = Self.durableFactSkeleton(trimmedUser)
+            let candidates = try activeAutoMemories(kind: kind, project: memoryProject, limit: 20).filter {
+                Self.durableFactSkeleton($0.body) == skeleton
+            }
+            if existingID == nil {
+                // A correction with no matching durable fact stays only in short-lived current
+                // state. Never append a new permanent rule merely because it says "correction".
+                guard let primary = candidates.first else { return }
+                existingID = primary.id
+            }
+            if let existingID {
+                correctionDuplicates = candidates.map(\.id).filter { $0 != existingID }
+            }
+        }
+        let id = existingID ?? UUID()
+        let createdAt = (try record(id))?.createdAt ?? Date()
+        var tags = ["auto", "explicit"]
+        if globalLike { tags.append("global") }
+        _ = try upsert(HermesMemoryRecord(
+            id: id,
+            kind: kind,
+            title: title,
+            body: Self.bounded(trimmedUser, limit: 5000),
+            project: memoryProject,
+            tags: tags,
+            pinned: kind == .permanentRule,
+            createdAt: createdAt,
+            expiresAt: expiresAt
+        ), superseding: correctionDuplicates)
     }
 
     public func setPinned(_ id: UUID, pinned: Bool) throws {
@@ -515,6 +585,48 @@ public actor HermesMemoryStore: HermesMemoryProviding {
         ).first
     }
 
+    private func explicitGlobalSearch(query: String, limit: Int) throws -> [HermesMemoryRecord] {
+        try ensureDatabase()
+        try purgeExpired()
+        let boundedLimit = max(1, min(limit, 1000))
+        let normalized = Self.ftsQuery(query)
+        if normalized.isEmpty {
+            return try queryRecords(
+                sql: activeSelectPrefix() + " AND project IS NULL AND lower(tags) LIKE ? ORDER BY pinned DESC, updated_at DESC LIMIT ?",
+                bindings: [.text("%\"global\"%"), .int(Int64(boundedLimit))]
+            )
+        }
+        return try queryRecords(
+            sql: """
+            SELECT m.id,m.kind,m.title,m.body,m.project,m.tags,m.pinned,m.created_at,m.updated_at,m.expires_at,m.superseded_by,m.source_path
+            FROM memories_fts f JOIN memories m ON m.id = f.id
+            WHERE memories_fts MATCH ? AND m.superseded_by IS NULL AND (m.expires_at IS NULL OR m.expires_at > ?)
+              AND m.project IS NULL AND lower(m.tags) LIKE ?
+            ORDER BY bm25(memories_fts), m.pinned DESC, m.updated_at DESC LIMIT ?
+            """,
+            bindings: [
+                .text(normalized), .double(Date().timeIntervalSince1970), .text("%\"global\"%"), .int(Int64(boundedLimit))
+            ]
+        )
+    }
+
+    private func activeAutoMemories(kind: HermesMemoryKind, project: String?, limit: Int = 20) throws -> [HermesMemoryRecord] {
+        try queryRecords(
+            sql: """
+            SELECT id,kind,title,body,project,tags,pinned,created_at,updated_at,expires_at,superseded_by,source_path
+            FROM memories
+            WHERE kind = ? AND COALESCE(project,'') = COALESCE(?, '')
+              AND superseded_by IS NULL AND (expires_at IS NULL OR expires_at > ?)
+              AND lower(tags) LIKE ? AND lower(tags) LIKE ?
+            ORDER BY updated_at DESC LIMIT ?
+            """,
+            bindings: [
+                .text(kind.rawValue), project.map(SQLiteBinding.text) ?? .null, .double(Date().timeIntervalSince1970),
+                .text("%\"auto\"%"), .text("%\"explicit\"%"), .int(Int64(max(1, min(limit, 100))))
+            ]
+        )
+    }
+
     private func activeEquivalentID(kind: HermesMemoryKind, title: String, project: String?) throws -> UUID? {
         let sql = """
         SELECT id FROM memories
@@ -552,6 +664,48 @@ public actor HermesMemoryStore: HermesMemoryProviding {
         \(record.body)
         """
         try Data(frontMatter.utf8).write(to: notesDirectory.appendingPathComponent("\(record.id.uuidString).md"), options: .atomic)
+    }
+
+    private static func durableFactSkeleton(_ value: String) -> String {
+        var normalized = value.lowercased()
+        for marker in [
+            "记住", "remember", "纠正", "correction", "改成", "改为", "replace", "instead",
+            "以后默认", "从今以后", "以后始终", "以后不要", "以后都", "长期", "永久",
+            "going forward", "from now on", "always remember"
+        ] {
+            normalized = normalized.replacingOccurrences(of: marker, with: " ")
+        }
+        normalized = normalized.replacingOccurrences(
+            of: #"\b[0-9a-f]{7,40}\b|\b\d+(?:\.\d+)*\b"#,
+            with: " value ",
+            options: [.regularExpression, .caseInsensitive]
+        )
+        normalized = normalized.replacingOccurrences(
+            of: #"[^\p{L}\p{N}]+"#,
+            with: "",
+            options: .regularExpression
+        )
+        return normalized
+    }
+
+    private static func isContextEligible(_ record: HermesMemoryRecord) -> Bool {
+        switch record.kind {
+        case .currentState, .temporaryContext:
+            return false
+        default:
+            return true
+        }
+    }
+
+    private static func looksLikeConcreteRuntimeState(_ value: String) -> Bool {
+        let patterns = [
+            #"\b(?:pid|process\s+id)\s*(?:is|=|:)?\s*\d{2,}\b"#,
+            #"\bcurrent\s+(?:git\s+)?head\s*(?:is|=|:)?\s*[0-9a-f]{7,40}\b"#,
+            #"当前\s*(?:git\s+)?head\s*(?:是|为|=|:)?\s*[0-9a-f]{7,40}"#,
+            #"\b(?:task\s+)?checkpoint\s*[:：]?\s*(?:step\s+)?\d+\s*(?:of|/)\s*\d+\b"#,
+            #"(?:本次|当前)\s*(?:任务\s*)?(?:checkpoint|检查点)\s*[:：]?.*(?:等待|重试|第\s*\d+\s*(?:步|/))"#
+        ]
+        return patterns.contains { value.range(of: $0, options: [.regularExpression, .caseInsensitive]) != nil }
     }
 
     private static func bounded(_ value: String, limit: Int) -> String {

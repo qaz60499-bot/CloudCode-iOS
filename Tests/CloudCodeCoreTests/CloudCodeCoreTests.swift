@@ -586,6 +586,46 @@ final class CloudCodeCoreTests: XCTestCase {
         let normalPackage = DiagnosticProblemPackageBuilder.build(records: [normal], executionMetrics: [], context: context)
         XCTAssertTrue(normalPackage.capsules.isEmpty)
 
+        let successfulHelperWithTimeoutEvidence = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "gui",
+            action: "tap.helper",
+            result: "dispatched-unverified",
+            diagnostic: #"IOHID tap dispatched {"parentTimeout":false,"timeoutSeconds":3,"timeoutKillResult":0}"#
+        )
+        let successfulCapabilityWithTimeoutProse = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "capability",
+            action: "native.sqlite",
+            result: "available",
+            diagnostic: "libsqlite3 support is available with bounded timeout enforcement"
+        )
+        let successfulAssertionWithTimeoutEvidence = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "app",
+            action: "background.assertion",
+            result: "acquired",
+            diagnostic: #"assertion acquired {"parentTimeout":false,"timeoutSeconds":4}"#
+        )
+        let helperNoisePackage = DiagnosticProblemPackageBuilder.build(
+            records: [successfulHelperWithTimeoutEvidence, successfulCapabilityWithTimeoutProse, successfulAssertionWithTimeoutEvidence],
+            executionMetrics: [],
+            context: context
+        )
+        XCTAssertTrue(helperNoisePackage.capsules.isEmpty)
+
+        let launchUnverified = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "tool",
+            action: "gui.openAppObserve",
+            result: "completed",
+            diagnostic: "launch accepted; semantic review pending",
+            metadata: ["foregroundVerified": "false"]
+        )
+        let launchPackage = DiagnosticProblemPackageBuilder.build(records: [launchUnverified], executionMetrics: [], context: context)
+        XCTAssertEqual(launchPackage.capsules.count, 1)
+        XCTAssertTrue(launchPackage.capsules[0].failureSignature.contains("foreground_unverified"))
+
         let slowButCompleted = DiagnosticLogRecord(
             level: .warning,
             subsystem: "tool",
@@ -930,6 +970,174 @@ final class CloudCodeCoreTests: XCTestCase {
         ))
     }
 
+    func testImageCapableRemoteVisionFallbackDoesNotSpendRecoveryBudgetForSuccessfulOrNonDispatchedLocalOCRFailure() {
+        let screenshot = ChatAttachment(
+            filename: "feed-sample.jpg",
+            path: "/tmp/feed-sample.jpg",
+            mimeType: "image/jpeg",
+            byteSize: 4_096
+        )
+        let fallbackResult = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "Feed samples captured for semantic review.",
+            payload: [
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "false",
+                "localVisionOCR": "unavailable_request_failed",
+                "localVisionFailureClass": "ocr_request_failed",
+                "localMetricExtraction": "incomplete_or_ambiguous",
+                "perceptionRemoteVisionRequired": "true"
+            ],
+            attachments: [screenshot]
+        )
+
+        XCTAssertFalse(AgentCore.shouldExplainFailure(
+            toolName: "gui.feedSample",
+            result: fallbackResult,
+            providerVisionCapability: .supported
+        ))
+        XCTAssertTrue(AgentCore.shouldExplainFailure(
+            toolName: "gui.feedSample",
+            result: fallbackResult,
+            providerVisionCapability: .textOnly
+        ))
+
+        var localTextLookupFallback = fallbackResult
+        localTextLookupFallback.success = false
+        localTextLookupFallback.summary = "Local OCR text lookup could not resolve a target."
+        localTextLookupFallback.payload["effectVerification"] = "not_dispatched"
+        XCTAssertFalse(AgentCore.shouldExplainFailure(
+            toolName: "gui.tapTextObserve",
+            result: localTextLookupFallback,
+            providerVisionCapability: .supported
+        ))
+        XCTAssertFalse(AgentCore.shouldRecordStateChange(for: localTextLookupFallback))
+
+        var failedWithoutNonDispatchProof = localTextLookupFallback
+        failedWithoutNonDispatchProof.payload.removeValue(forKey: "effectVerification")
+        XCTAssertTrue(AgentCore.shouldExplainFailure(
+            toolName: "gui.tapTextObserve",
+            result: failedWithoutNonDispatchProof,
+            providerVisionCapability: .supported
+        ))
+        XCTAssertTrue(AgentCore.shouldRecordStateChange(for: failedWithoutNonDispatchProof))
+
+        var missingImage = fallbackResult
+        missingImage.attachments = nil
+        XCTAssertTrue(AgentCore.shouldExplainFailure(
+            toolName: "gui.feedSample",
+            result: missingImage,
+            providerVisionCapability: .supported
+        ))
+
+        var hardFailure = fallbackResult
+        hardFailure.payload["effectVerification"] = "no_effect"
+        XCTAssertTrue(AgentCore.shouldExplainFailure(
+            toolName: "gui.feedSample",
+            result: hardFailure,
+            providerVisionCapability: .supported
+        ))
+    }
+
+    func testForegroundMessagingFastPathRequiresFreshSupportedVisualContextAndNoLocalDataIntent() {
+        XCTAssertTrue(AgentCore.shouldUseForegroundMessagingFastPath(
+            requiresMessageSend: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true,
+            requestsLocalDataAccess: false
+        ))
+        XCTAssertFalse(AgentCore.shouldUseForegroundMessagingFastPath(
+            requiresMessageSend: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .textOnly,
+            hasForegroundTarget: true,
+            requestsLocalDataAccess: false
+        ))
+        XCTAssertFalse(AgentCore.shouldUseForegroundMessagingFastPath(
+            requiresMessageSend: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true,
+            requestsLocalDataAccess: true
+        ))
+        XCTAssertFalse(HarnessContextManager.requestsLocalDataAccess(in: "打开微信找到文件传输助手并发消息"))
+        XCTAssertTrue(HarnessContextManager.requestsLocalDataAccess(in: "读取微信数据库里的本地记录"))
+    }
+
+    func testMessagingNavigationSearchTypingIsNarrowlySeparatedFromMessageBodyCompletion() {
+        XCTAssertTrue(HarnessContextManager.requiresNavigationSearch(in: "打开微信，找文件传输助手并发消息"))
+        XCTAssertFalse(HarnessContextManager.requiresNavigationSearch(in: "打开微信直接给文件传输助手发消息"))
+
+        XCTAssertTrue(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "navigation_search",
+            verifiedMessagingComposerFocus: false,
+            requiresNavigationSearch: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true
+        ))
+        XCTAssertFalse(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "navigation_search",
+            verifiedMessagingComposerFocus: false,
+            requiresNavigationSearch: true,
+            providerContextHasImages: false,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true
+        ))
+        XCTAssertFalse(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "navigation_search",
+            verifiedMessagingComposerFocus: false,
+            requiresNavigationSearch: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .textOnly,
+            hasForegroundTarget: true
+        ))
+
+        XCTAssertFalse(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "message_body",
+            verifiedMessagingComposerFocus: false,
+            requiresNavigationSearch: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true
+        ))
+        XCTAssertTrue(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "message_body",
+            verifiedMessagingComposerFocus: true,
+            requiresNavigationSearch: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true
+        ))
+        XCTAssertFalse(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "unexpected-purpose",
+            verifiedMessagingComposerFocus: true,
+            requiresNavigationSearch: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true
+        ))
+
+        XCTAssertFalse(AgentCore.shouldCountSuccessfulTextInputAsMessageBody(
+            requiresMessageSend: true,
+            purpose: "navigation_search"
+        ))
+        XCTAssertTrue(AgentCore.shouldCountSuccessfulTextInputAsMessageBody(
+            requiresMessageSend: true,
+            purpose: "message_body"
+        ))
+        XCTAssertTrue(AgentCore.isSemanticMessageCommitAction(
+            name: "gui.tapTextObserve",
+            arguments: ["query": "发送"]
+        ))
+        XCTAssertFalse(AgentCore.isSemanticMessageCommitAction(
+            name: "gui.tap",
+            arguments: ["x": "300", "y": "700"]
+        ))
+    }
+
     func testDiagnosticFailureExplanationClassifiesTextOnlyProviderLocalFallbackGap() throws {
         let record = DiagnosticLogRecord(
             level: .warning,
@@ -954,6 +1162,28 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(explanation.failureSignature.contains("provider_text_only_local_fallback_missing"))
         XCTAssertTrue(explanation.probableCauses.contains("provider_route_cannot_consume_image_observation"))
         XCTAssertTrue(explanation.recommendedNextAction.contains("semantic_local_tool"))
+    }
+
+    func testDiagnosticFailureExplanationClassifiesToolRouteDeepFallbackAsDiagnosticOnly() throws {
+        let record = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "tool-route",
+            action: "files.list",
+            result: "selected",
+            metadata: [
+                "route": AppExecutionRoute.guiFallback.rawValue,
+                "routeCandidates": "structuredTool,cli,privateFramework,urlScheme,guiFallback",
+                "fallbackReason": "structuredTool:no_executor;cli:no_executor;privateFramework:no_executor;urlScheme:no_executor",
+                "fallbackDepth": "4"
+            ]
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+        ))
+        XCTAssertEqual(explanation.failureLayer, .toolRouting)
+        XCTAssertTrue(explanation.failureSignature.contains("deep_route_fallback"))
+        XCTAssertFalse(explanation.automaticRecoveryAllowed)
+        XCTAssertEqual(explanation.recoveryReason, "diagnostic_only_route_degradation")
     }
 
     func testDiagnosticFailureHistoryReportsChangedLayerAndRemainingFailureWithoutGuessing() throws {
@@ -2922,11 +3152,11 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(learning.requiredCapabilities.isEmpty)
         XCTAssertEqual(learning.risk, .readOnly)
         XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.typeObserve", arguments: ["text": "secret text"], sessionID: UUID())), "当前前台 App · 输入 11 个字符（内容已隐藏）")
-        XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.tapTextObserve", arguments: ["query": "文件传输助手"], sessionID: UUID())), "当前前台 App · local OCR text tap")
+        XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.tapTextObserve", arguments: ["query": "文件传输助手"], sessionID: UUID())), "当前前台 App · local AX/OCR text tap")
         XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.focusComposerObserve", arguments: [:], sessionID: UUID())), "当前前台 App · semantic chat composer focus")
     }
 
-    func testStructuredGUIElementToolsPreferTreeAndBoundedLocalExecutionCapabilities() async throws {
+    func testStructuredGUIElementToolsKeepAXSpecificToolsButPlanDoesNotRequireTreeCapability() async throws {
         let registry = ToolRegistry()
         let findDescriptor = await registry.descriptor(named: "gui.findElement")
         let waitDescriptor = await registry.descriptor(named: "gui.waitForElement")
@@ -2945,7 +3175,8 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(wait.requiredCapabilities, [GUIAutomationFeature.tree.capabilityID])
         XCTAssertEqual(tap.requiredCapabilities, [GUIAutomationFeature.tree.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
         XCTAssertEqual(type.requiredCapabilities, [GUIAutomationFeature.tree.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
-        XCTAssertEqual(plan.requiredCapabilities, [GUIAutomationFeature.openApp.capabilityID, GUIAutomationFeature.tree.capabilityID, GUIAutomationFeature.screenshot.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.gestures.capabilityID])
+        XCTAssertEqual(plan.requiredCapabilities, [GUIAutomationFeature.openApp.capabilityID, GUIAutomationFeature.screenshot.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.gestures.capabilityID])
+        XCTAssertFalse(plan.requiredCapabilities.contains(GUIAutomationFeature.tree.capabilityID))
         XCTAssertEqual(openObserve.requiredCapabilities, [GUIAutomationFeature.openApp.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
         XCTAssertEqual(type.risk, .sensitiveWrite)
         XCTAssertEqual(plan.risk, .sensitiveWrite)
@@ -5217,6 +5448,10 @@ final class CloudCodeCoreTests: XCTestCase {
         let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
         let checkpoints = TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json"))
         let mailbox = AgentSteeringMailbox()
+        let memory = TrackingHermesMemoryProvider(responses: [
+            "initial": "Hermes current memory for initial",
+            "steer now": "Hermes current memory for steering"
+        ])
         let agent = AgentCore(
             provider: SteeringAwareProvider(),
             keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
@@ -5226,6 +5461,7 @@ final class CloudCodeCoreTests: XCTestCase {
             sessionStore: sessions,
             checkpointStore: checkpoints,
             steeringMailbox: mailbox,
+            memoryProvider: memory,
             maxToolRounds: 4
         )
         let session = AgentSession(permissionMode: .safe)
@@ -5248,6 +5484,100 @@ final class CloudCodeCoreTests: XCTestCase {
         let saved = try await sessions.load(session.id)
         XCTAssertTrue(saved.messages.contains { $0.role == .user && $0.content == "steer now" })
         XCTAssertTrue(saved.messages.contains { $0.role == .assistant && $0.content.contains("new") })
+        let memoryQueries = await memory.queries()
+        XCTAssertTrue(memoryQueries.contains { $0.query == "initial" })
+        XCTAssertTrue(memoryQueries.contains { $0.query == "steer now" })
+    }
+
+    func testAgentCoreResumeRefreshesHermesInsteadOfReusingCheckpointText() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = ToolRegistry(descriptors: [])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let recorder = MessageRecordingProvider()
+        let memory = TrackingHermesMemoryProvider(responses: [
+            "resume request": "FRESH_HERMES_CONTEXT"
+        ])
+        let session = AgentSession(title: "CloudCode", permissionMode: .safe)
+        let checkpoint = TaskCheckpoint(
+            sessionID: session.id,
+            taskName: "resume",
+            stepIndex: 2,
+            stepName: "interrupted",
+            totalSteps: 8,
+            state: "interrupted",
+            payload: [
+                "hermes.context": "STALE_HERMES_CONTEXT",
+                "hermes.memoryIDs": UUID().uuidString
+            ]
+        )
+        let agent = AgentCore(
+            provider: recorder,
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(registry: registry, executors: []),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            memoryProvider: memory,
+            maxToolRounds: 2
+        )
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        _ = try await collectAgentTokenText(await agent.send(
+            text: "resume request",
+            session: session,
+            providerConfiguration: config,
+            resumeCheckpoint: checkpoint
+        ))
+
+        let messages = await recorder.lastMessages()
+        XCTAssertTrue(messages.contains { $0.providerMetadata["context_layer"] == "hermes" && $0.content.contains("FRESH_HERMES_CONTEXT") })
+        XCTAssertFalse(messages.contains { $0.content.contains("STALE_HERMES_CONTEXT") })
+        let memoryQueries = await memory.queries()
+        XCTAssertTrue(memoryQueries.contains { $0.query == "resume request" && $0.project == "CloudCode" })
+    }
+
+    func testAgentCoreResumeDoesNotFallBackToCheckpointWhenHermesRefreshFails() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = ToolRegistry(descriptors: [])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let recorder = MessageRecordingProvider()
+        let session = AgentSession(title: "CloudCode", permissionMode: .safe)
+        let checkpoint = TaskCheckpoint(
+            sessionID: session.id,
+            taskName: "resume",
+            stepIndex: 2,
+            stepName: "interrupted",
+            totalSteps: 8,
+            state: "interrupted",
+            payload: [
+                "hermes.context": "STALE_HERMES_CONTEXT",
+                "hermes.memoryIDs": UUID().uuidString
+            ]
+        )
+        let agent = AgentCore(
+            provider: recorder,
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(registry: registry, executors: []),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            memoryProvider: FailingHermesMemoryProvider(),
+            maxToolRounds: 2
+        )
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        _ = try await collectAgentTokenText(await agent.send(
+            text: "resume request",
+            session: session,
+            providerConfiguration: config,
+            resumeCheckpoint: checkpoint
+        ))
+
+        let messages = await recorder.lastMessages()
+        XCTAssertFalse(messages.contains { $0.content.contains("STALE_HERMES_CONTEXT") })
+        XCTAssertFalse(messages.contains { $0.providerMetadata["context_layer"] == "hermes" })
     }
 
     func testHermesMemoryStoreSearchSupersedeExpiryAndMarkdownRoundTrip() async throws {
@@ -5320,6 +5650,138 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(recent.filter { $0.kind == .currentState }.count, 1)
         XCTAssertTrue(recent.contains { $0.kind == .permanentRule && $0.pinned })
         XCTAssertTrue(recent.first(where: { $0.kind == .currentState })?.body.contains("第二轮状态") == true)
+    }
+
+    func testHermesAutomaticTurnCurationRequiresDurableIntentAndExpiresSessionState() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = HermesMemoryStore(root: root.appendingPathComponent("Hermes", isDirectory: true))
+        try await store.bootstrap()
+        let sessionID = UUID()
+
+        try await store.recordCompletedTurn(
+            sessionID: sessionID,
+            sessionTitle: "CloudCode",
+            userText: "不要重启服务，检查 PID 12345 的任务",
+            assistantText: "当前任务已检查。"
+        )
+        var recent = try await store.recent(limit: 100, project: "CloudCode")
+        XCTAssertFalse(recent.contains { $0.kind == .permanentRule && $0.body.contains("PID 12345") })
+        let currentState = try XCTUnwrap(recent.first(where: { $0.kind == .currentState }))
+        XCTAssertNotNil(currentState.expiresAt)
+        XCTAssertLessThanOrEqual(currentState.expiresAt?.timeIntervalSinceNow ?? .infinity, 24 * 60 * 60 + 5)
+        let currentContext = try await store.context(query: "PID 12345", project: "CloudCode", limit: 8)
+        XCTAssertFalse(currentContext.records.contains { $0.kind == .currentState || $0.kind == .temporaryContext })
+        XCTAssertFalse(currentContext.renderedText.contains("PID 12345"))
+
+        try await store.recordCompletedTurn(
+            sessionID: sessionID,
+            sessionTitle: "CloudCode",
+            userText: "记住：以后默认 Provider 重试必须最多 3 次。",
+            assistantText: "已记录。"
+        )
+        try await store.recordCompletedTurn(
+            sessionID: sessionID,
+            sessionTitle: "CloudCode",
+            userText: "纠正：以后默认 Provider 重试必须最多 2 次。",
+            assistantText: "已纠正。"
+        )
+        recent = try await store.recent(limit: 100, project: "CloudCode")
+        let activeRules = recent.filter { $0.kind == .permanentRule }
+        XCTAssertEqual(activeRules.count, 1)
+        XCTAssertTrue(activeRules[0].body.contains("最多 2 次"))
+        XCTAssertTrue(activeRules[0].pinned)
+
+        try await store.recordCompletedTurn(
+            sessionID: sessionID,
+            sessionTitle: "CloudCode",
+            userText: "纠正：以后默认数据库必须使用 PostgreSQL。",
+            assistantText: "已收到纠正。"
+        )
+        recent = try await store.recent(limit: 100, project: "CloudCode")
+        XCTAssertEqual(recent.filter { $0.kind == .permanentRule }.count, 1)
+        XCTAssertTrue(recent.contains { $0.kind == .permanentRule && $0.body.contains("最多 2 次") })
+
+        _ = try await store.upsert(HermesMemoryRecord(
+            kind: .permanentRule,
+            title: "Legacy duplicate provider retry rule",
+            body: "记住：以后默认 Provider 重试必须最多 4 次。",
+            project: "CloudCode",
+            tags: ["auto", "explicit"],
+            pinned: true
+        ))
+        recent = try await store.recent(limit: 100, project: "CloudCode")
+        XCTAssertEqual(recent.filter { $0.kind == .permanentRule }.count, 2)
+
+        try await store.recordCompletedTurn(
+            sessionID: sessionID,
+            sessionTitle: "CloudCode",
+            userText: "纠正：以后默认 Provider 重试必须最多 1 次。",
+            assistantText: "已纠正。"
+        )
+        recent = try await store.recent(limit: 100, project: "CloudCode")
+        let reconciledRules = recent.filter { $0.kind == .permanentRule }
+        XCTAssertEqual(reconciledRules.count, 1)
+        XCTAssertTrue(reconciledRules[0].body.contains("最多 1 次"))
+    }
+
+    func testHermesContextKeepsRelevantProjectMemoryAndBoundsGlobalPinnedBudget() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = HermesMemoryStore(root: root.appendingPathComponent("Hermes", isDirectory: true))
+        try await store.bootstrap()
+
+        let relevant = try await store.upsert(HermesMemoryRecord(
+            kind: .projectMemory,
+            title: "Project A retry policy",
+            body: "Project A uses bounded provider retry semantics.",
+            project: "Project A"
+        ))
+        _ = try await store.upsert(HermesMemoryRecord(
+            kind: .permanentRule,
+            title: "Project A pinned",
+            body: "Project A pinned rule.",
+            project: "Project A",
+            pinned: true
+        ))
+        _ = try await store.upsert(HermesMemoryRecord(
+            kind: .permanentRule,
+            title: "Explicit global",
+            body: "Explicit global durable rule.",
+            tags: ["global"],
+            pinned: true
+        ))
+        _ = try await store.upsert(HermesMemoryRecord(
+            kind: .projectMemory,
+            title: "Untagged nil-project",
+            body: "Untagged global-looking text must not cross project scope."
+        ))
+        for index in 0..<8 {
+            _ = try await store.upsert(HermesMemoryRecord(
+                kind: .permanentRule,
+                title: "Project B pinned \(index)",
+                body: "Project B unrelated pinned rule \(index).",
+                project: "Project B",
+                pinned: true
+            ))
+        }
+
+        let snapshot = try await store.context(query: "bounded provider retry", project: "Project A", limit: 8)
+        XCTAssertTrue(snapshot.records.contains { $0.id == relevant.id })
+        XCTAssertTrue(snapshot.records.contains { $0.title == "Project A pinned" && $0.project == "Project A" })
+        XCTAssertFalse(snapshot.records.contains { $0.project == "Project B" })
+        XCTAssertLessThanOrEqual(snapshot.records.filter { $0.project == nil && $0.pinned }.count, 1)
+        XCTAssertLessThanOrEqual(snapshot.records.count, 8)
+
+        let limitOne = try await store.context(query: "bounded provider retry", project: "Project A", limit: 1)
+        XCTAssertEqual(limitOne.records.map(\.id), [relevant.id])
+
+        let missingScope = try await store.context(query: "bounded provider retry", project: nil, limit: 8)
+        XCTAssertFalse(missingScope.records.contains { $0.id == relevant.id })
+        XCTAssertTrue(missingScope.records.allSatisfy { $0.project == nil && $0.tags.contains(where: { $0.lowercased() == "global" }) })
+        let explicitGlobal = try await store.context(query: "global durable", project: nil, limit: 8)
+        XCTAssertTrue(explicitGlobal.records.contains { $0.title == "Explicit global" })
+        XCTAssertFalse(explicitGlobal.records.contains { $0.title == "Untagged nil-project" })
     }
 
     func testHermesContextCompressionIsBoundedAndMarkedUntrusted() async throws {
@@ -6605,6 +7067,35 @@ private struct FixedHermesMemoryProvider: HermesMemoryProviding, Sendable {
     func context(query: String, project: String?, limit: Int) async throws -> HermesContextSnapshot {
         HermesContextSnapshot(records: [], renderedText: text)
     }
+}
+
+private struct FailingHermesMemoryProvider: HermesMemoryProviding, Sendable {
+    enum Failure: Error { case unavailable }
+
+    func context(query: String, project: String?, limit: Int) async throws -> HermesContextSnapshot {
+        throw Failure.unavailable
+    }
+}
+
+private actor TrackingHermesMemoryProvider: HermesMemoryProviding {
+    struct Query: Sendable, Equatable {
+        let query: String
+        let project: String?
+    }
+
+    private let responses: [String: String]
+    private var observedQueries: [Query] = []
+
+    init(responses: [String: String]) {
+        self.responses = responses
+    }
+
+    func context(query: String, project: String?, limit: Int) async throws -> HermesContextSnapshot {
+        observedQueries.append(Query(query: query, project: project))
+        return HermesContextSnapshot(records: [], renderedText: responses[query] ?? "")
+    }
+
+    func queries() -> [Query] { observedQueries }
 }
 
 private actor MessageRecordingProvider: ProviderStreaming {

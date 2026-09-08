@@ -1,6 +1,8 @@
 import Foundation
 import Vision
 import ImageIO
+import UIKit
+import CryptoKit
 import CloudCodeCore
 
 /// Bounded, on-device text observation for GUI screenshots.
@@ -21,6 +23,53 @@ enum LocalVisionTextObservation {
         var languages: [String]
     }
 
+    private actor Coordinator {
+        private struct CacheEntry: Sendable {
+            var observation: Observation
+            var createdAt: Date
+        }
+
+        private var cache: [String: CacheEntry] = [:]
+        private var inFlight: [String: Task<Observation, Never>] = [:]
+        private var activeKey: String?
+        private let retention: TimeInterval = 3
+
+        func resolve(
+            key: String,
+            operation: @escaping @Sendable () async -> Observation
+        ) async -> Observation {
+            let now = Date()
+            cache = cache.filter { now.timeIntervalSince($0.value.createdAt) <= retention }
+            if var cached = cache[key]?.observation {
+                cached.payload["localVisionCacheHit"] = "true"
+                cached.payload["localVisionRequestCoalesced"] = "false"
+                return cached
+            }
+            if let task = inFlight[key] {
+                var shared = await task.value
+                shared.payload["localVisionCacheHit"] = "false"
+                shared.payload["localVisionRequestCoalesced"] = "true"
+                return shared
+            }
+            if let activeKey, let activeTask = inFlight[activeKey] {
+                _ = await activeTask.value
+                return await resolve(key: key, operation: operation)
+            }
+            let task = Task { await operation() }
+            activeKey = key
+            inFlight[key] = task
+            var value = await task.value
+            inFlight[key] = nil
+            if activeKey == key { activeKey = nil }
+            cache[key] = CacheEntry(observation: value, createdAt: Date())
+            value.payload["localVisionCacheHit"] = "false"
+            value.payload["localVisionRequestCoalesced"] = "false"
+            return value
+        }
+    }
+
+    private static let coordinator = Coordinator()
+
     private struct HelperResponse: Decodable {
         var status: String
         var screenPointWidth: Int
@@ -38,7 +87,7 @@ enum LocalVisionTextObservation {
 
     // Vision language support is fixed for the running OS/Vision revision. Probe it once per
     // process instead of paying the supported-language lookup on every screenshot.
-    private static let primaryRecognitionConfiguration: RecognitionConfiguration = {
+    private static let recognitionConfigurations: (primary: RecognitionConfiguration, accurate: RecognitionConfiguration) = {
         let preferred = ["zh-Hans", "en-US"]
         func supportedLanguages(_ level: VNRequestTextRecognitionLevel) -> [String] {
             let request = VNRecognizeTextRequest()
@@ -46,12 +95,35 @@ enum LocalVisionTextObservation {
             return (try? request.supportedRecognitionLanguages()) ?? []
         }
         let fast = supportedLanguages(.fast)
+        let accurateLanguages = supportedLanguages(.accurate)
+        let accurate = RecognitionConfiguration(
+            level: .accurate,
+            languages: preferred.filter { accurateLanguages.contains($0) }
+        )
+        let primary: RecognitionConfiguration
         if fast.contains("zh-Hans") {
-            return RecognitionConfiguration(level: .fast, languages: preferred.filter { fast.contains($0) })
+            primary = RecognitionConfiguration(level: .fast, languages: preferred.filter { fast.contains($0) })
+        } else {
+            primary = accurate
         }
-        let accurate = supportedLanguages(.accurate)
-        return RecognitionConfiguration(level: .accurate, languages: preferred.filter { accurate.contains($0) })
+        return (primary, accurate)
     }()
+
+    private static var primaryRecognitionConfiguration: RecognitionConfiguration {
+        recognitionConfigurations.primary
+    }
+
+    private static var accurateRecognitionConfiguration: RecognitionConfiguration {
+        recognitionConfigurations.accurate
+    }
+
+    /// Initializes the process-local OCR capability state without capturing a screen, allocating an
+    /// image tensor, or performing recognition. Cloud Code calls this once during normal bootstrap so
+    /// the supported-language/recognizer policy follows the App lifecycle while all real OCR remains
+    /// silent and on-demand. This function never creates an overlay or touches another App.
+    static func prepare() {
+        _ = primaryRecognitionConfiguration
+    }
 
     static func payload(for jpegData: Data, maximumElements: Int = 28, regionInScreenPoints: CGRect? = nil) async -> [String: String] {
         await observe(for: jpegData, maximumElements: maximumElements, regionInScreenPoints: regionInScreenPoints).payload
@@ -61,10 +133,23 @@ enum LocalVisionTextObservation {
         for jpegData: Data,
         maximumElements: Int = 28,
         regionInScreenPoints: CGRect? = nil,
-        requiresText: Bool = false
+        requiresText: Bool = false,
+        forcePrecise: Bool = false
     ) async -> Observation {
         let boundedMaximum = min(max(maximumElements, 1), 48)
-        return await Task.detached(priority: .utility) {
+        let digest = SHA256.hash(data: jpegData).map { String(format: "%02x", $0) }.joined()
+        let regionKey = regionInScreenPoints.map { "\($0.minX),\($0.minY),\($0.width),\($0.height)" } ?? "full"
+        let key = "\(digest)|\(regionKey)|\(boundedMaximum)|\(requiresText ? 1 : 0)|\(forcePrecise ? 1 : 0)"
+        // A live root background assertion keeps the Cloud Code host executable, but it does not
+        // make a newly spawned child Vision process a foreground application. Build 94 proved that
+        // the child helper can be killed immediately while the host is still alive. Record the host
+        // state before detaching: in-process CPU-only Vision remains allowed in background; the
+        // child helper is only a foreground/inactive fallback.
+        let helperSpawnAllowed = await MainActor.run {
+            UIApplication.shared.applicationState != .background
+        }
+        return await coordinator.resolve(key: key) {
+            await Task.detached(priority: .utility) {
             // Vision/Core ML is an App compute workload, not a privilege workload. Running OCR as
             // persona-99/root caused real-device failures in CoreVideo/CoreML even though capture
             // itself succeeded. Prefer the host App process with a CPU-only/background-friendly
@@ -72,9 +157,17 @@ enum LocalVisionTextObservation {
             let inProcess = recognizeInProcess(
                 jpegData,
                 maximumElements: boundedMaximum,
-                regionInScreenPoints: regionInScreenPoints
+                regionInScreenPoints: regionInScreenPoints,
+                forcePrecise: forcePrecise
             )
             if Self.isUsable(inProcess, requiresText: requiresText) { return inProcess }
+            guard helperSpawnAllowed else {
+                var backgroundResult = inProcess
+                backgroundResult.payload["localVisionSecondaryBackend"] = "vision_helper_public_api"
+                backgroundResult.payload["localVisionSecondaryStatus"] = "not_invoked_host_background"
+                backgroundResult.payload["localVisionSecondaryDiagnostic"] = "Child Vision helper intentionally skipped while Cloud Code is backgrounded; in-process CPU-only Vision is the authoritative local OCR route."
+                return backgroundResult
+            }
             if let helperObservation = recognizeWithHelper(
                 jpegData,
                 maximumElements: boundedMaximum,
@@ -90,7 +183,8 @@ enum LocalVisionTextObservation {
                 return combined
             }
             return inProcess
-        }.value
+            }.value
+        }
     }
 
     private static func isUsable(_ observation: Observation, requiresText: Bool) -> Bool {
@@ -174,7 +268,7 @@ enum LocalVisionTextObservation {
         return nil
     }
 
-    private static func recognizeInProcess(_ jpegData: Data, maximumElements: Int, regionInScreenPoints: CGRect?) -> Observation {
+    private static func recognizeInProcess(_ jpegData: Data, maximumElements: Int, regionInScreenPoints: CGRect?, forcePrecise: Bool) -> Observation {
         let startedAt = Date()
         guard !jpegData.isEmpty,
               let source = CGImageSourceCreateWithData(jpegData as CFData, nil),
@@ -195,11 +289,11 @@ enum LocalVisionTextObservation {
             }
         }
 
-        func makeRequest(level: VNRequestTextRecognitionLevel, languages: [String]?) -> VNRecognizeTextRequest {
+        func makeRequest(level: VNRequestTextRecognitionLevel, languages: [String]?, precise: Bool) -> VNRecognizeTextRequest {
             let request = VNRecognizeTextRequest()
             request.recognitionLevel = level
             request.usesLanguageCorrection = false
-            request.minimumTextHeight = 0.009
+            request.minimumTextHeight = precise ? 0.011 : (level == .fast ? 0.020 : 0.018)
             // Cross-app automation backgrounds this host on iOS 16. Keep Vision away from
             // GPU/ANE-backed paths that can fail in background with CoreVideo/CoreML errors.
             request.usesCPUOnly = true
@@ -227,7 +321,10 @@ enum LocalVisionTextObservation {
         // otherwise use accurate locally. Even the accurate local pass is far cheaper than a
         // provider round-trip or a multi-second AX timeout.
         let primary = Self.primaryRecognitionConfiguration
-        var request = makeRequest(level: primary.level, languages: primary.languages)
+        let precise = Self.accurateRecognitionConfiguration
+        let requestedLevel: VNRequestTextRecognitionLevel = forcePrecise ? precise.level : primary.level
+        let requestedLanguages: [String] = forcePrecise ? precise.languages : primary.languages
+        var request = makeRequest(level: requestedLevel, languages: requestedLanguages, precise: forcePrecise)
         let handler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
         var fallbackUsed = false
         var firstFailure: NSError?
@@ -238,7 +335,7 @@ enum LocalVisionTextObservation {
             let primaryFailure = error as NSError
             firstFailure = primaryFailure
             fallbackUsed = true
-            request = makeRequest(level: .fast, languages: nil)
+            request = makeRequest(level: .fast, languages: nil, precise: false)
 
             let fallbackImage: CGImage
             if Self.coreVideoAllocationFailure(in: primaryFailure) != nil {
@@ -342,6 +439,8 @@ enum LocalVisionTextObservation {
             "localVisionCoordinateSpace": "screen_points_top_left",
             "localVisionLatencyMS": String(max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))),
             "localVisionRecognitionLevel": request.recognitionLevel == .fast ? "fast" : "accurate",
+            "localVisionMinimumTextHeight": String(request.minimumTextHeight),
+            "localVisionPass": forcePrecise ? "precise" : "fast_or_supported_primary",
             "localVisionFallbackUsed": fallbackUsed ? "true" : "false",
             "localVisionBackend": backend
         ]

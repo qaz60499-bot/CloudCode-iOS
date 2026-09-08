@@ -128,10 +128,10 @@ public enum HarnessContextManager {
         if requiresMessageSend(in: request) {
             hints.append(ChatMessage(
                 role: .system,
-                content: "Harness execution hint: this is a messaging/contact task. Prefer deterministic local discovery before visual navigation when the target App exposes accessible container data: apps.inspect/container.resolve/container.search/data.localQuery/sqlite.* are read-only discovery aids for locating the contact/conversation and must never be used to forge a sent-message state by editing an App database. After the destination is resolved, use the cheapest verified App/private/deep-link/AX-text path and reserve screenshot GUI for the remaining state-dependent steps. A final send/commit is an external App action and still requires a real send control/private route plus fresh postcondition verification.",
+                content: "Harness execution hint: this is a messaging/contact task. Once the target App is foreground and a fresh screenshot is available, stay on the current in-App GUI/search path and act from that observation; do not detour through apps.list, container, filesystem, or SQLite discovery merely to locate a visible contact. Read-only native/container discovery is a fallback for an explicit local-data request or when no fresh GUI observation can resolve the destination and the exact container route is already verified. It must never be used to forge a sent-message state by editing an App database. A final send/commit is an external App action and still requires a real send control/private/GUI route plus fresh postcondition verification.",
                 providerMetadata: [
                     "context_layer": "harness_execution",
-                    "execution_mode": "native_messaging_discovery"
+                    "execution_mode": "foreground_messaging_fast_path"
                 ]
             ))
         }
@@ -255,6 +255,21 @@ public enum HarnessContextManager {
         return markers.contains(where: normalized.contains)
     }
 
+    static func requiresNavigationSearch(in request: String) -> Bool {
+        let normalized = request.lowercased()
+        let markers = ["找", "找到", "查找", "搜索", "搜", "find", "search", "locate"]
+        return markers.contains(where: normalized.contains)
+    }
+
+    static func requestsLocalDataAccess(in request: String) -> Bool {
+        let normalized = request.lowercased()
+        let markers = [
+            "读取文件", "删除文件", "复制文件", "移动文件", "搜索文件", "文件路径", "文件夹", "目录",
+            "json", "plist", "sqlite", "数据库", "container", "local data", "filesystem", "file path", "folder", "directory"
+        ]
+        return markers.contains(where: normalized.contains)
+    }
+
     static func scopedProviderToolNames(for request: String, availableNames: Set<String>) -> Set<String> {
         let normalized = request.lowercased()
         var prefixes = Set<String>()
@@ -282,10 +297,7 @@ public enum HarnessContextManager {
             && messagingMarkers.contains(where: normalized.contains)
             && messagingActions.contains(where: normalized.contains)
 
-        let dataMarkers = [
-            "读取文件", "删除文件", "复制文件", "移动文件", "搜索文件", "文件路径", "文件夹", "目录", "json", "plist", "sqlite", "数据库", "container"
-        ]
-        if dataMarkers.contains(where: normalized.contains) {
+        if requestsLocalDataAccess(in: request) {
             prefixes.formUnion(["files.", "container.", "data.", "json.", "plist.", "sqlite.", "storage.", "trash.", "capability."])
         }
         if normalized.contains("ipa") || normalized.contains("安装包") {

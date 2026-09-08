@@ -205,7 +205,7 @@ public struct DiagnosticReplayEvidence: Codable, Equatable, Sendable {
             "perceptionOCRInvoked", "perceptionOCRSucceeded", "perceptionOCRLatencyMS", "perceptionLocalSufficient",
             "perceptionRemoteVisionRequired", "perceptionFallbackReason", "providerVisualRoundTripAvoided",
             "sha256", "screenPointWidth", "screenPointHeight", "localVisionOCR", "localVisionElementCount",
-            "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion", "localVisionRecognitionLevel", "localVisionFallbackUsed", "localVisionBackend",
+            "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion", "localVisionRecognitionLevel", "localVisionMinimumTextHeight", "localVisionPass", "localVisionCacheHit", "localVisionRequestCoalesced", "localVisionFallbackUsed", "localVisionBackend",
             "localVisionFailureClass", "localVisionErrorDomain", "localVisionErrorCode", "localVisionPrimaryErrorDomain", "localVisionPrimaryErrorCode",
             "localVisionSecondaryBackend", "localVisionSecondaryStatus", "localVisionSecondaryErrorDomain", "localVisionSecondaryErrorCode", "treeHash",
             "coordinateSafety", "providerImageRoute", "keyboardLikely", "focusStrategy", "textInputSafety", "localMetric", "localMetricSelection", "localMetricExtraction", "cache", "idempotency",
@@ -750,9 +750,27 @@ public enum DiagnosticProblemPackageBuilder {
         if record.level == .error { return true }
         let result = record.result.lowercased()
         let diagnostic = (record.diagnostic ?? "").lowercased()
+        let action = record.action.lowercased()
         let localVisionStatus = (record.metadata["localVisionOCR"] ?? "").lowercased()
-        let failureMarkers = ["failed", "failure", "exhausted", "timeout", "timed out", "interrupted", "insufficient", "unverified", "no_effect", "no effect", "premature"]
-        if failureMarkers.contains(where: { result.contains($0) || diagnostic.contains($0) }) { return true }
+
+        // Helper success diagnostics intentionally include bounded-execution evidence such as
+        // `timeoutSeconds` and `parentTimeout:false`. Treating the mere word "timeout" in an info
+        // diagnostic as a failure created dozens of fake tap/swipe/background/SQLite capsules in
+        // build 92. Result state is authoritative for info records; diagnostic prose is only used
+        // as a generic failure signal on warning/error records.
+        let hardResultMarkers = ["failed", "failure", "exhausted", "timeout", "timed out", "interrupted", "insufficient", "no_effect", "no effect", "premature"]
+        if hardResultMarkers.contains(where: { result.contains($0) }) { return true }
+        if record.level == .warning,
+           hardResultMarkers.contains(where: { diagnostic.contains($0) }) { return true }
+
+        // "dispatched-unverified" is the normal low-level helper contract: the enclosing tool must
+        // observe the postcondition. Do not turn every successful primitive into a bug capsule.
+        // Foreground launch uncertainty is different because subsequent target-specific actions can
+        // otherwise run against the wrong App; preserve that explicit top-level state.
+        if result.contains("unverified"), !action.hasSuffix(".helper") { return true }
+        if record.metadata["foregroundVerified"] == "false",
+           (action.contains("openapp") || action.contains("launch")) { return true }
+
         // A screenshot/action can succeed while a required perception sub-stage fails. Preserve that
         // partial failure as a capsule candidate instead of letting the outer tool success hide it.
         if localVisionStatus.hasPrefix("unavailable") { return true }
@@ -810,7 +828,11 @@ public enum DiagnosticProblemPackageBuilder {
         if action.contains("type") { return .guiTextInput }
         if action.contains("swipe") || action.contains("scroll") || action.contains("feedsample") || action.contains("tap") { return .guiGesture }
         if action.contains("navigate") || action.contains("openapp") || action.contains("openurl") { return .guiNavigation }
-        if subsystem == "tool" && record.metadata["route"] != nil { return .toolRouting }
+        // Route-selection records use the dedicated `tool-route` subsystem, while execution
+        // completion records use `tool`. Both carry the same bounded route/fallback evidence and
+        // must classify identically; otherwise async log ordering can turn a successful deep
+        // fallback into an unknown/manual-resolution failure.
+        if (subsystem == "tool" || subsystem == "tool-route") && record.metadata["route"] != nil { return .toolRouting }
         if combined.contains("native") || combined.contains("cli") { return .nativeExecution }
         if subsystem.contains("agent") || combined.contains("planner") || combined.contains("planning") { return .agentPlanning }
         return .unknown
@@ -1043,6 +1065,7 @@ public enum DiagnosticProblemPackageBuilder {
         }
 
         if record.result.lowercased().contains("route_failed") { return "route_selection_failed" }
+        if record.metadata["foregroundVerified"] == "false" { return "foreground_unverified" }
         if combined.contains("foreground") && (combined.contains("mismatch") || combined.contains("wrong app")) { return "foreground_target_mismatch" }
         if combined.contains("foreground") && combined.contains("verify") { return "foreground_unverified" }
         if combined.contains("no effect") || combined.contains("no_effect") { return "no_observed_effect" }

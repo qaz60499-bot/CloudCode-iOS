@@ -113,7 +113,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
                 diagnostic: outcome.detail,
                 metadata: [
                     "axBackend": "standalone_trollstore_axruntime",
-                    "axStage": "direct_root_then_sampled_hit_test",
+                    "axStage": "direct_root_then_position_root_then_sampled_hit_test",
                     "axScope": "unavailable",
                     "axLatencyMS": String(latencyMS)
                 ]
@@ -138,7 +138,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             result: "observed",
             metadata: [
                 "axBackend": axBackend,
-                "axStage": "direct_root_then_sampled_hit_test",
+                "axStage": "direct_root_then_position_root_then_sampled_hit_test",
                 "axScope": axScope,
                 "axLatencyMS": String(latencyMS)
             ]

@@ -54,7 +54,7 @@ static VNRecognizeTextRequest *CloudCodeMakeRequest(BOOL cpuOnly, NSString **lev
 {
     VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] init];
     request.usesLanguageCorrection = NO;
-    request.minimumTextHeight = 0.009f;
+    request.minimumTextHeight = 0.020f;
     request.preferBackgroundProcessing = YES;
 
     NSArray<NSString *> *fastLanguages = CloudCodePreferredLanguages(VNRequestTextRecognitionLevelFast);

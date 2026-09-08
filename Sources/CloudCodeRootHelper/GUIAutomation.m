@@ -1159,9 +1159,11 @@ static void CloudCodePrepareAXApplication(CloudCodeAXRuntime runtime, CloudCodeA
     if (runtime.setTimeout) {
         @try { runtime.setTimeout(root, CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {}
     }
-    if (runtime.setAttribute) {
-        @try { runtime.setAttribute(root, CFSTR("AXManualAccessibility"), kCFBooleanTrue); } @catch (__unused NSException *exception) {}
-    }
+    // Normal Cloud Code observation must be passive. AXManualAccessibility is a target-process
+    // accessibility-mode switch, not a prerequisite for reading a native iOS App such as WeChat.
+    // Leaving it enabled can change the target App's accessibility behavior beyond this bounded
+    // request. Production and diagnostic tree/focus/text paths stay passive and only apply a short
+    // messaging timeout here.
 }
 
 static CloudCodeAXUIElementRef CloudCodeAXRootForPid(CloudCodeAXRuntime runtime, pid_t pid, NSString **backend)
@@ -1473,7 +1475,11 @@ int CloudCodeGUIAXProbeJSON(NSString *stage, NSString *seedKind, pid_t targetPID
                 record[@"seedPIDAXError"] = @(runtime.getPid(seed, &seedPID)); record[@"seedPID"] = @(seedPID);
             }
             if (seed && [stage isEqualToString:@"attributes"]) {
-                if (runtime.setAttribute) { record[@"manualAccessibilityAXError"] = @(runtime.setAttribute(seed, CFSTR("AXManualAccessibility"), kCFBooleanTrue)); }
+                // Keep even the explicit probe passive. AXManualAccessibility can visibly alter the
+                // target App (the green accessibility highlight reported on-device) and is not a
+                // prerequisite for the read-only AX queries below. Diagnostics must measure the same
+                // no-overlay execution mode used by production automation.
+                record[@"manualAccessibilityMutation"] = @"disabled_passive_probe";
                 NSMutableArray *reads = [NSMutableArray array];
                 if (runtime.copyAttribute) {
                     for (NSString *attribute in @[@"AXFocusedApplication", @"AXFocusedUIElement", @"AXChildren", @"AXLabel"]) {
@@ -1558,11 +1564,25 @@ static NSData *CloudCodeFrontmostTreeData(void)
         }
     }
 
-    // A standalone TrollStore helper is neither SpringBoard-injected nor attached to an XCTest /
-    // testmanagerd automation session. Once the direct foreground-PID application root fails, do
-    // not pay a serial chain of focused-app and application-at-position probes that depend on the
-    // same missing authority. Keep one bounded system-wide hit-test sample as the explicitly
-    // degraded semantic capability.
+    // A detached TrollStore helper can fail AXUIElementCreateApplication(pid) while the same AX
+    // runtime can still resolve the foreground application through its window/context at a screen
+    // point. Build 94 showed that falling directly to five shallow hit-test samples is cheap but too
+    // weak for named controls such as WeChat's 文件传输助手. Spend one bounded position-root attempt
+    // before degrading to sampled semantics. This stays passive: CloudCodePrepareAXApplication no
+    // longer enables AXManualAccessibility, so no visible accessibility highlight/green frame is
+    // required or created by this recovery path.
+    if (!root) {
+        pid_t positionPID = 0;
+        NSString *positionBackend = nil;
+        root = CloudCodeAXApplicationAtScreenPointRoot(runtime, &positionPID, &positionBackend);
+        if (root && positionPID > 0) {
+            pid = positionPID;
+            backend = positionBackend ?: @"AXRuntime.position.application";
+            NSString *positionBundleID = CloudCodeBundleIDForPID(positionPID);
+            if (positionBundleID.length > 0) { bundleID = positionBundleID; }
+        }
+    }
+
     NSUInteger nodeCount = 0;
     NSDictionary *rootNode = nil;
     if (!root) {
@@ -1773,6 +1793,62 @@ int CloudCodeGUINavigateBack(NSString *strategy)
         if (!dispatched) { return 66; }
         fprintf(stderr, "gui-navigate-back: strategy=%s result=dispatched-semantic-unverified\n", strategy.UTF8String ?: "unknown");
         return 0;
+    }
+}
+
+int CloudCodeGUIFocusedTextInputJSON(void)
+{
+    @autoreleasepool {
+        CloudCodeAXRuntime ax = CloudCodeResolveAX();
+        BOOL runtimeAvailable = ax.copyAttribute != NULL;
+        BOOL focusedElementAvailable = NO;
+        BOOL focusedTextInput = NO;
+        pid_t focusedPID = 0;
+        NSString *focusedBackend = @"";
+        NSString *focusedRole = @"";
+
+        if (runtimeAvailable) {
+            CloudCodeAXUIElementRef focusedRoot = CloudCodeAXFocusedApplicationRoot(ax, &focusedPID, &focusedBackend);
+            if (focusedRoot) {
+                id focusedHolder = nil;
+                CloudCodeAXUIElementRef focusedElement = NULL;
+                for (NSString *attribute in @[@"AXFocusedUIElement", @"AXFocusedElement"]) {
+                    id candidate = CloudCodeAXCopy(ax, focusedRoot, (__bridge CFStringRef)attribute);
+                    if (candidate) {
+                        focusedHolder = candidate;
+                        focusedElement = (CloudCodeAXUIElementRef)(__bridge CFTypeRef)focusedHolder;
+                        break;
+                    }
+                }
+                CFRelease(focusedRoot);
+                if (focusedElement) {
+                    focusedElementAvailable = YES;
+                    id rawRole = CloudCodeAXCopy(ax, focusedElement, ax.attributeElementType ?: CFSTR("AXRole"));
+                    focusedRole = CloudCodeBoundedString(rawRole) ?: @"";
+                    focusedTextInput =
+                        [focusedRole rangeOfString:@"TextField" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                        [focusedRole rangeOfString:@"TextArea" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                        [focusedRole rangeOfString:@"TextView" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                        [focusedRole rangeOfString:@"SearchField" options:NSCaseInsensitiveSearch].location != NSNotFound;
+                    (void)focusedHolder;
+                }
+            }
+        }
+
+        NSDictionary *payload = @{
+            @"runtimeAvailable": @(runtimeAvailable),
+            @"focusedElementAvailable": @(focusedElementAvailable),
+            @"focusedTextInput": @(focusedTextInput),
+            @"role": focusedRole ?: @"",
+            @"backend": focusedBackend ?: @"",
+            @"pid": @(focusedPID)
+        };
+        NSError *error = nil;
+        NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
+        if (!data || error || data.length > 4096) { return 61; }
+        fwrite(data.bytes, 1, data.length, stdout);
+        fputc('\n', stdout);
+        return runtimeAvailable ? 0 : 62;
     }
 }
 

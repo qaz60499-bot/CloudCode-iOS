@@ -403,6 +403,12 @@ public final class CloudCodeViewModel: ObservableObject {
             capabilityRefreshMessage = Self.capabilitySummary(capabilities) + " · 特权/私有 API 检测已延后"
             capabilityGraph = CapabilityGraphBuilder().build(profile: capabilities, tools: await toolRegistry.all())
             recordStartupBreadcrumb("bootstrap.safe.end")
+            // Bind OCR capability initialization to the Cloud Code process lifecycle without doing
+            // any screen capture/recognition at launch. The work is intentionally detached from the
+            // main actor and produces no visible AX/OCR overlay; actual recognition stays on-demand.
+            Task.detached(priority: .utility) {
+                LocalVisionTextObservation.prepare()
+            }
             await seedKnowledgeIfNeeded(apps)
             recordStartupBreadcrumb("bootstrap.local-state.begin")
             do {
