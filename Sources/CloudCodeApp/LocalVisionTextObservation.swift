@@ -309,6 +309,23 @@ enum LocalVisionTextObservation {
         let pixelHeight = max(1, image.height)
         let screenWidth = CGFloat(pixelWidth)
         let screenHeight = CGFloat(pixelHeight)
+        // Do not hand a 3MP full-screen capture to Vision just to learn normalized text boxes.
+        // Build 98 repeatedly hit kCVReturnAllocationFailed (-6662) before its fallback could help.
+        // ImageIO downsamples before Vision allocates its working buffers; normalized boxes are then
+        // mapped back through the original screen dimensions below, so GUI coordinates stay exact.
+        let primaryMaxDimension = forcePrecise ? 1_600 : 1_280
+        let primaryImage: CGImage
+        let primaryDownsampled = max(pixelWidth, pixelHeight) > primaryMaxDimension
+        if primaryDownsampled {
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: primaryMaxDimension,
+                kCGImageSourceCreateThumbnailWithTransform: true
+            ]
+            primaryImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) ?? image
+        } else {
+            primaryImage = image
+        }
         var boundedRegion: CGRect?
         if let requestedRegion = regionInScreenPoints {
             let screenBounds = CGRect(x: 0, y: 0, width: screenWidth, height: screenHeight)
@@ -354,10 +371,10 @@ enum LocalVisionTextObservation {
         let requestedLevel: VNRequestTextRecognitionLevel = forcePrecise ? precise.level : primary.level
         let requestedLanguages: [String] = forcePrecise ? precise.languages : primary.languages
         var request = makeRequest(level: requestedLevel, languages: requestedLanguages, precise: forcePrecise)
-        let handler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
+        let handler = VNImageRequestHandler(cgImage: primaryImage, orientation: .up, options: [:])
         var fallbackUsed = false
         var firstFailure: NSError?
-        var backend = "app_process_vision_cpu_only"
+        var backend = primaryDownsampled ? "app_process_vision_cpu_only_thumbnail" : "app_process_vision_cpu_only"
         do {
             try handler.perform([request])
         } catch {

@@ -135,6 +135,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private let resourceIndex: ProgressiveResourceIndex
     private let appKnowledge: AppKnowledgeRegistry
     private let customProviderFileURL: URL
+    private let liveProviderCatalogFileURL: URL
     private let startupBreadcrumbStore: StartupBreadcrumbStore
     private let startupRunID: UUID
     private let previousStartupRun: StartupBreadcrumbRunSummary?
@@ -309,8 +310,14 @@ public final class CloudCodeViewModel: ObservableObject {
         }
         let initialPermissionMode = PermissionMode(rawValue: defaults.string(forKey: "permission.mode") ?? "safe") ?? .safe
         let customProviderFileURL = support.appendingPathComponent("Provider/custom-providers.json")
+        let liveProviderCatalogFileURL = support.appendingPathComponent("Provider/live-model-catalogs.json")
         let customProfiles = Self.loadCustomProviders(from: customProviderFileURL)
-        let allProfiles = ProviderCatalog.desktopSnapshot + customProfiles
+        let manualOverridesAtLaunch = Set(defaults.stringArray(forKey: Self.manualProviderKeyOverridesDefaultsKey) ?? [])
+        let allProfiles = ProviderLiveModelCatalogCache.applyingCachedCatalogs(
+            to: ProviderCatalog.desktopSnapshot + customProfiles,
+            from: liveProviderCatalogFileURL,
+            excludingKeyReferences: manualOverridesAtLaunch
+        )
         let storedSelection = ProviderSelectionState(
             providerID: defaults.string(forKey: "provider.selected.id") ?? "",
             keySlotID: defaults.string(forKey: "provider.selected.keySlot") ?? "",
@@ -362,6 +369,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.resourceIndex = resourceIndex
         self.appKnowledge = appKnowledge
         self.customProviderFileURL = customProviderFileURL
+        self.liveProviderCatalogFileURL = liveProviderCatalogFileURL
         startupBreadcrumbStore.append(runID: resolvedStartupRunID, stage: "viewModel.init.end")
     }
 
@@ -841,6 +849,11 @@ public final class CloudCodeViewModel: ObservableObject {
             await rememberVerifiedProviderBaseURL(acceptedBaseURL, provider: provider, keySlotID: keySlotID, apiKey: apiKey)
             guard let providerIndex = providerProfiles.firstIndex(where: { $0.id == provider.id }) else { return false }
             providerProfiles[providerIndex].applyLiveModelCatalog(models, keySlotID: keySlotID, authoritative: true)
+            try? ProviderLiveModelCatalogCache.persist(
+                provider: providerProfiles[providerIndex],
+                keySlotID: keySlotID,
+                to: liveProviderCatalogFileURL
+            )
             let reconciled = ProviderSelectionResolver.reconcile(
                 ProviderSelectionState(providerID: selectedProviderID, keySlotID: selectedKeySlotID, model: selectedModel),
                 profiles: providerProfiles
@@ -3253,6 +3266,11 @@ public final class CloudCodeViewModel: ObservableObject {
             let shouldApplyDiscovery = discovery.readiness == .ready && !discovery.models.isEmpty
             if shouldApplyDiscovery {
                 providerProfiles[providerIndex].applyDiscovery(discovery, keySlotID: keySlotID)
+                try? ProviderLiveModelCatalogCache.persist(
+                    provider: providerProfiles[providerIndex],
+                    keySlotID: keySlotID,
+                    to: liveProviderCatalogFileURL
+                )
                 let reconciled = ProviderSelectionResolver.reconcile(
                     ProviderSelectionState(providerID: selectedProviderID, keySlotID: selectedKeySlotID, model: selectedModel),
                     profiles: providerProfiles

@@ -1182,17 +1182,25 @@ static CloudCodeAXUIElementRef CloudCodeAXFindElementForPid(CloudCodeAXRuntime r
     return NULL;
 }
 
+static void CloudCodeClearLegacyManualAccessibility(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef root)
+{
+    if (!root || !runtime.setAttribute) { return; }
+    // Builds before 95 could leave AXManualAccessibility enabled in the target process. Merely
+    // stopping that old write does not undo the already-mutated state, which is why a green AX
+    // highlight can survive an upgrade. This is a one-way compatibility cleanup: production never
+    // enables the flag, and every root we legitimately obtain is normalized back to passive mode.
+    @try { runtime.setAttribute(root, CFSTR("AXManualAccessibility"), kCFBooleanFalse); } @catch (__unused NSException *exception) {}
+}
+
 static void CloudCodePrepareAXApplication(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef root)
 {
     if (!root) { return; }
     if (runtime.setTimeout) {
         @try { runtime.setTimeout(root, CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {}
     }
-    // Normal Cloud Code observation must be passive. AXManualAccessibility is a target-process
-    // accessibility-mode switch, not a prerequisite for reading a native iOS App such as WeChat.
-    // Leaving it enabled can change the target App's accessibility behavior beyond this bounded
-    // request. Production and diagnostic tree/focus/text paths stay passive and only apply a short
-    // messaging timeout here.
+    CloudCodeClearLegacyManualAccessibility(runtime, root);
+    // Normal Cloud Code observation remains passive after the one-way legacy cleanup above.
+    // AXManualAccessibility is never enabled by production or diagnostic reads.
 }
 
 static CloudCodeAXUIElementRef CloudCodeAXRootForPid(CloudCodeAXRuntime runtime, pid_t pid, NSString **backend)
@@ -1596,7 +1604,8 @@ int CloudCodeGUIAXProbeJSON(NSString *stage, NSString *seedKind, pid_t targetPID
                 // target App (the green accessibility highlight reported on-device) and is not a
                 // prerequisite for the read-only AX queries below. Diagnostics must measure the same
                 // no-overlay execution mode used by production automation.
-                record[@"manualAccessibilityMutation"] = @"disabled_passive_probe";
+                CloudCodeClearLegacyManualAccessibility(runtime, seed);
+                record[@"manualAccessibilityMutation"] = @"legacy_cleanup_false_only";
                 NSMutableArray *reads = [NSMutableArray array];
                 if (runtime.copyAttribute) {
                     for (NSString *attribute in @[@"AXFocusedApplication", @"AXFocusedUIElement", @"AXChildren", @"AXLabel"]) {

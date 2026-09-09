@@ -275,6 +275,30 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.openAIChat, .anthropic])
     }
 
+    func testLiveModelCatalogCacheSurvivesRestartAndRespectsManualKeyOverride() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeLiveCatalog-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("live-model-catalogs.json")
+        var provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.agentRouterID }))
+        let liveModels = ["claude-opus-5", "gpt-5.6-sol", "new-live-model"]
+        provider.applyLiveModelCatalog(liveModels, keySlotID: "slot-1", authoritative: true)
+        try ProviderLiveModelCatalogCache.persist(provider: provider, keySlotID: "slot-1", to: url)
+
+        let restored = ProviderLiveModelCatalogCache.applyingCachedCatalogs(to: ProviderCatalog.desktopSnapshot, from: url)
+        let restoredProvider = try XCTUnwrap(restored.first(where: { $0.id == ProviderCatalog.agentRouterID }))
+        XCTAssertEqual(restoredProvider.selectableModels(for: "slot-1"), liveModels)
+
+        let reference = ProviderCatalog.keyReference(providerID: ProviderCatalog.agentRouterID, keySlotID: "slot-1")
+        let excluded = ProviderLiveModelCatalogCache.applyingCachedCatalogs(
+            to: ProviderCatalog.desktopSnapshot,
+            from: url,
+            excludingKeyReferences: [reference]
+        )
+        let excludedProvider = try XCTUnwrap(excluded.first(where: { $0.id == ProviderCatalog.agentRouterID }))
+        XCTAssertNotEqual(excludedProvider.selectableModels(for: "slot-1"), liveModels)
+        XCTAssertFalse(excludedProvider.selectableModels(for: "slot-1").contains("new-live-model"))
+    }
+
     func testPerKeyModelScopeOverridesProviderCatalog() throws {
         let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-sharellm-cn" }))
         let key1 = provider.models(for: "slot-1")

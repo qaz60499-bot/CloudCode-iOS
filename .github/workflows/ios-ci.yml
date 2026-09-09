@@ -529,8 +529,10 @@ jobs:
           if '_AXSSetAutomationEnabled' in gui_text or 'CloudCodeEnableAXAutomationForRequest' in gui_text:
               raise SystemExit('FAIL: detached AX helper must not mutate the global automation switch; SIGKILL timeout cannot guarantee restoration')
           import re
-          if re.search(r'CFSTR\(\s*"AXManualAccessibility"\s*\)', gui_text) or re.search(r'@"AXManualAccessibility"', gui_text):
-              raise SystemExit('FAIL: AX/OCR automation must remain passive; AXManualAccessibility is forbidden because it can create a visible green accessibility highlight on the user screen')
+          if 'AXManualAccessibility' not in gui_text or 'CloudCodeClearLegacyManualAccessibility' not in gui_text or 'kCFBooleanFalse' not in gui_text:
+              raise SystemExit('FAIL: legacy AXManualAccessibility cleanup is missing; upgraded devices can retain the old visible green highlight')
+          if re.search(r'AXManualAccessibility.{0,160}kCFBooleanTrue|kCFBooleanTrue.{0,160}AXManualAccessibility', gui_text, flags=re.S):
+              raise SystemExit('FAIL: AX/OCR automation must never enable AXManualAccessibility; only the false-only legacy cleanup is allowed')
           for visible_overlay_marker in ('CAShapeLayer', 'UIWindow(', 'strokeColor', 'borderColor', 'systemGreen', 'UIColor.green'):
               if visible_overlay_marker in gui_text:
                   raise SystemExit(f'FAIL: root GUI perception helper must not draw a visible scan/highlight overlay: {visible_overlay_marker}')
@@ -545,7 +547,7 @@ jobs:
               if marker not in vision_text:
                   raise SystemExit(f'FAIL: lightweight Vision helper lost public OCR isolation marker: {marker}')
           local_vision = Path('Sources/CloudCodeApp/LocalVisionTextObservation.swift').read_text(encoding='utf-8')
-          for marker in ('EmbeddedVisionHelper.guiOCR', 'request.usesCPUOnly = true', 'request.preferBackgroundProcessing = true', 'app_process_vision_cpu_only', 'app_process_vision_fast_thumbnail_fallback', 'kCGImageSourceThumbnailMaxPixelSize', 'UIApplication.shared.applicationState != .background', 'not_invoked_host_background', 'private actor Coordinator', 'localVisionCacheHit', 'localVisionRequestCoalesced', 'forcePrecise', 'precise ? 0.011', 'level == .fast ? 0.020 : 0.018'):
+          for marker in ('EmbeddedVisionHelper.guiOCR', 'request.usesCPUOnly = true', 'request.preferBackgroundProcessing = true', 'app_process_vision_cpu_only', 'app_process_vision_cpu_only_thumbnail', 'app_process_vision_fast_thumbnail_fallback', 'primaryMaxDimension', 'kCGImageSourceThumbnailMaxPixelSize', 'UIApplication.shared.applicationState != .background', 'not_invoked_host_background', 'private actor Coordinator', 'localVisionCacheHit', 'localVisionRequestCoalesced', 'forcePrecise', 'precise ? 0.011', 'level == .fast ? 0.020 : 0.018'):
               if marker not in local_vision:
                   raise SystemExit(f'FAIL: local OCR routing lost progressive/single-flight/background-safe Vision marker: {marker}')
           if 'request.minimumTextHeight = 0.009' in local_vision or 'request.minimumTextHeight = 0.009f' in vision_text:
@@ -556,6 +558,10 @@ jobs:
           for visible_overlay_marker in ('CAShapeLayer', 'UIWindow(', 'strokeColor', 'borderColor', 'systemGreen', 'UIColor.green'):
               if visible_overlay_marker in vision_overlay_surface:
                   raise SystemExit(f'FAIL: OCR must remain data-only/background-capable and must not render a visible scan box: {visible_overlay_marker}')
+          root_main = Path('Sources/CloudCodeRootHelper/main.m').read_text(encoding='utf-8')
+          for marker in ('CloudCodeRunOneShotCommand', 'objc_autoreleasePoolPush', 'fflush(NULL)', '_exit(result)'):
+              if marker not in root_main:
+                  raise SystemExit(f'FAIL: one-shot root helper can regress to post-result teardown/watchdog latency: {marker}')
           project_text = Path('project.yml').read_text(encoding='utf-8')
           for marker in ('CloudCodeVisionHelper', 'Sources/CloudCodeVisionHelper/main.m', '-framework ImageIO'):
               if marker not in project_text:

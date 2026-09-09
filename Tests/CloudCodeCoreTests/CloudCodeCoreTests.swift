@@ -5732,6 +5732,31 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(recent.first(where: { $0.kind == .currentState })?.body.contains("第二轮状态") == true)
     }
 
+    func testHermesExplicitPreferenceCrossesSessionTitlesWithoutLeakingCurrentState() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = HermesMemoryStore(root: root.appendingPathComponent("Hermes", isDirectory: true))
+        try await store.bootstrap()
+
+        try await store.recordCompletedTurn(
+            sessionID: UUID(),
+            sessionTitle: "旧会话标题",
+            userText: "记住：以后默认用中文简洁回答。",
+            assistantText: "已记录。"
+        )
+        try await store.recordCompletedTurn(
+            sessionID: UUID(),
+            sessionTitle: "另一个旧任务",
+            userText: "当前正在处理临时 PID 12345。",
+            assistantText: "临时状态。"
+        )
+
+        let snapshot = try await store.context(query: "继续处理这个任务", project: "全新会话标题", limit: 8)
+        XCTAssertTrue(snapshot.records.contains { $0.kind == .userPreference && $0.body.contains("中文简洁") })
+        XCTAssertFalse(snapshot.records.contains { $0.kind == .currentState || $0.kind == .temporaryContext })
+        XCTAssertFalse(snapshot.renderedText.contains("PID 12345"))
+    }
+
     func testHermesAutomaticTurnCurationRequiresDurableIntentAndExpiresSessionState() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

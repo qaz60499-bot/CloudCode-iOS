@@ -10,6 +10,7 @@
 #import <signal.h>
 #import <spawn.h>
 #import <stdlib.h>
+#import <string.h>
 #import "GUIAutomation.h"
 
 #define CLOUDCODE_PROC_PATH_MAX 4096
@@ -17,6 +18,7 @@
 typedef int (*CloudCodeProcListAllPidsFn)(void *, int);
 typedef int (*CloudCodeProcPidPathFn)(int, void *, uint32_t);
 extern char **environ;
+extern void *objc_autoreleasePoolPush(void);
 
 static NSString *NormalizePath(NSString *path)
 {
@@ -1145,9 +1147,8 @@ static int BackgroundAssertionWorkerStatus(pid_t workerPID)
     return kill(workerPID, 0) == 0 ? 0 : 77;
 }
 
-int main(int argc, const char *argv[])
+static int CloudCodeRunOneShotCommand(int argc, const char *argv[])
 {
-    @autoreleasepool {
         if (argc < 2) { return 10; }
         NSString *command = [NSString stringWithUTF8String:argv[1]];
         if ([command isEqualToString:@"probe"]) {
@@ -1278,5 +1279,25 @@ int main(int argc, const char *argv[])
             return TerminateApplication(bundlePath);
         }
         return 10;
+}
+
+int main(int argc, const char *argv[])
+{
+    // The background assertion worker is deliberately long-lived and is not observed by the
+    // one-shot parent bridge after its handshake. Preserve normal Objective-C cleanup for it.
+    if (argc > 1 && strcmp(argv[1], "background-assert-worker") == 0) {
+        @autoreleasepool {
+            return CloudCodeRunOneShotCommand(argc, argv);
+        }
     }
+
+    // Every other command is a one-shot helper. Some private iOS frameworks retain process-global
+    // objects whose autorelease teardown can block after the command has already emitted its final
+    // result. Build 98 therefore paid the full parent watchdog (5–6s) for successful work. Keep one
+    // process-lifetime pool, flush observable output, and terminate without teardown after dispatch.
+    // The kernel reclaims all helper memory immediately; no state is shared with the host process.
+    (void)objc_autoreleasePoolPush();
+    int result = CloudCodeRunOneShotCommand(argc, argv);
+    fflush(NULL);
+    _exit(result);
 }

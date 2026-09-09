@@ -292,12 +292,21 @@ public actor HermesMemoryStore: HermesMemoryProviding {
         }
         pinnedCandidates.append(contentsOf: try pinned(limit: 1, explicitGlobalOnly: true).filter(Self.isContextEligible))
 
+        // Session titles are conversation labels, not identity boundaries. Durable preferences and
+        // permanent rules explicitly learned from the user must remain available in later sessions,
+        // while project memories/decisions stay scoped. This also makes legacy auto memories that
+        // were stored under an older session title useful without a destructive migration.
+        let identityMemories = try activeIdentityAutoMemories(limit: min(4, boundedLimit))
+
         var uniquePinned: [HermesMemoryRecord] = []
         for record in pinnedCandidates where !uniquePinned.contains(where: { $0.id == record.id }) {
             uniquePinned.append(record)
         }
-        let pinnedBudget = relevant.isEmpty ? min(2, boundedLimit) : min(2, max(0, boundedLimit - 1))
+        let pinnedBudget = relevant.isEmpty && identityMemories.isEmpty ? min(2, boundedLimit) : min(2, max(0, boundedLimit - 1))
         var records = Array(uniquePinned.prefix(pinnedBudget))
+        for record in identityMemories where records.count < boundedLimit && !records.contains(where: { $0.id == record.id }) {
+            records.append(record)
+        }
         for record in relevant where records.count < boundedLimit && !records.contains(where: { $0.id == record.id }) {
             records.append(record)
         }
@@ -606,6 +615,24 @@ public actor HermesMemoryStore: HermesMemoryProviding {
             """,
             bindings: [
                 .text(normalized), .double(Date().timeIntervalSince1970), .text("%\"global\"%"), .int(Int64(boundedLimit))
+            ]
+        )
+    }
+
+    private func activeIdentityAutoMemories(limit: Int) throws -> [HermesMemoryRecord] {
+        try queryRecords(
+            sql: """
+            SELECT id,kind,title,body,project,tags,pinned,created_at,updated_at,expires_at,superseded_by,source_path
+            FROM memories
+            WHERE kind IN (?, ?)
+              AND superseded_by IS NULL AND (expires_at IS NULL OR expires_at > ?)
+              AND lower(tags) LIKE ? AND lower(tags) LIKE ?
+            ORDER BY pinned DESC, updated_at DESC LIMIT ?
+            """,
+            bindings: [
+                .text(HermesMemoryKind.permanentRule.rawValue), .text(HermesMemoryKind.userPreference.rawValue),
+                .double(Date().timeIntervalSince1970), .text("%\"auto\"%"), .text("%\"explicit\"%"),
+                .int(Int64(max(1, min(limit, 16))))
             ]
         )
     }
