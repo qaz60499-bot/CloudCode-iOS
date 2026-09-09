@@ -23,7 +23,7 @@ extern void *objc_autoreleasePoolPush(void);
 static __attribute__((noreturn)) void CloudCodeExitOneShot(int code)
 {
     // stdout/stderr are switched to unbuffered mode at process entry before any helper I/O occurs.
-    // Build 108 real-device evidence showed that even fflush(stdout/stderr) could wedge after a
+    // Build 108 real-device evidence showed that even an explicit stdout/stderr flush could wedge after a
     // private framework had already produced the final observable result, turning successful app
     // launch, screenshot and background-assert handshakes into false parent timeouts. Do not enter
     // stdio teardown/flush paths here: every write is already delivered synchronously to the bridge.
