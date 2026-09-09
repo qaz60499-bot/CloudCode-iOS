@@ -1365,30 +1365,37 @@ static CloudCodeAXUIElementRef CloudCodeAXParameterizedElementAtPoint(CloudCodeA
     }
     CloudCodePrepareAXApplication(runtime, application);
 
-    NSMutableDictionary *parameters = [@{
-        @"application": (__bridge id)application,
-        @"point": [NSValue valueWithCGPoint:point],
-        @"displayId": @1,
-        @"hitTestType": @0
-    } mutableCopy];
-    if (contextID > 0) { parameters[@"contextId"] = @(contextID); }
+    NSArray<NSNumber *> *displayIDs = @[@1, @0];
+    NSArray<NSNumber *> *hitTestTypes = @[@0, @2];
+    for (NSNumber *displayID in displayIDs) {
+        for (NSNumber *hitTestType in hitTestTypes) {
+            NSMutableDictionary *parameters = [@{
+                @"application": (__bridge id)application,
+                @"point": [NSValue valueWithCGPoint:point]
+            } mutableCopy];
+            if (displayID.unsignedIntValue > 0) { parameters[@"displayId"] = displayID; }
+            if (contextID > 0) { parameters[@"contextId"] = @(contextID); }
+            if (hitTestType.unsignedIntValue > 0) { parameters[@"hitTestType"] = hitTestType; }
 
-    CloudCodeAXUIElementRef candidate = NULL;
-    CloudCodeAXError code = -1;
-    @try {
-        code = runtime.copyElementWithParameters(&candidate, (__bridge CFDictionaryRef)parameters);
-    } @catch (__unused NSException *exception) {
-        code = -1;
-        candidate = NULL;
+            CloudCodeAXUIElementRef candidate = NULL;
+            CloudCodeAXError code = -1;
+            @try {
+                code = runtime.copyElementWithParameters(&candidate, (__bridge CFDictionaryRef)parameters);
+            } @catch (__unused NSException *exception) {
+                code = -1;
+                candidate = NULL;
+            }
+            if (code == 0 && candidate) {
+                CloudCodePrepareAXApplication(runtime, candidate);
+                CFRelease(application);
+                if (contextIDOut) { *contextIDOut = contextID; }
+                return candidate;
+            }
+            if (candidate) { CFRelease(candidate); }
+        }
     }
     CFRelease(application);
-    if (code != 0 || !candidate) {
-        if (candidate) { CFRelease(candidate); }
-        return NULL;
-    }
-    CloudCodePrepareAXApplication(runtime, candidate);
-    if (contextIDOut) { *contextIDOut = contextID; }
-    return candidate;
+    return NULL;
 }
 
 static NSDictionary *CloudCodeAXHitTestTree(CloudCodeAXRuntime runtime, NSUInteger *nodeCount, pid_t *pidOut, NSString **backend)
