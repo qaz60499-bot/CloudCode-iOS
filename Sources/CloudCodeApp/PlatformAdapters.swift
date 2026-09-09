@@ -457,19 +457,28 @@ enum EmbeddedRootHelper {
                     : failureDetail(prefix: "helper 高权限文件系统探测", code: result.code, diagnostic: diagnostic)
             )
         }
-        guard result.code == 0 || mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.stderr) else {
-            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+        if result.code == 0 {
+            return PrivilegedFilesystemCapabilitySnapshot(
+                sharedUserFilesAvailable: payload.sharedUserFiles,
+                unrestrictedAvailable: payload.unrestricted,
+                detail: payload.detail
+            )
+        }
+        if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.stderr) {
+            // The JSON is useful diagnostic evidence that the bounded canary finished, but this
+            // capability gates later filesystem writes/deletes. A parent exit timeout must not turn
+            // that evidence into destructive authority; keep both capabilities fail-closed.
             return PrivilegedFilesystemCapabilitySnapshot(
                 sharedUserFilesAvailable: false,
                 unrestrictedAvailable: false,
-                detail: failureDetail(prefix: "helper 高权限文件系统探测", code: result.code, diagnostic: diagnostic)
+                detail: payload.detail + "；helper 随后在退出阶段触发父进程超时。完整 JSON 仅保留为诊断证据，不授予共享文件或 unrestricted 写/删权限"
             )
         }
-        let timeoutSuffix = result.code == 0 ? "" : "；helper 随后仅在退出阶段触发父进程超时，但完整 JSON capability payload 已通过解码校验"
+        let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
         return PrivilegedFilesystemCapabilitySnapshot(
-            sharedUserFilesAvailable: payload.sharedUserFiles,
-            unrestrictedAvailable: payload.unrestricted,
-            detail: payload.detail + timeoutSuffix
+            sharedUserFilesAvailable: false,
+            unrestrictedAvailable: false,
+            detail: failureDetail(prefix: "helper 高权限文件系统探测", code: result.code, diagnostic: diagnostic)
         )
     }
 
