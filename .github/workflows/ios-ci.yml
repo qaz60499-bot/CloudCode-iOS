@@ -458,7 +458,7 @@ jobs:
           for marker in ('CloudCodeSpawnHelperWithOutput', 'CloudCodeSpawnHelperWithSeparatedOutput'):
               if marker not in bridge_header:
                   raise SystemExit(f'FAIL: bounded helper bridge API is missing: {marker}')
-          if 'run(["enumerate-json"], privilege: .isolatedUser' not in adapters or 'run(["probe-launch"], privilege: .isolatedUser' not in adapters or 'run(["launch", bundleID], privilege: .isolatedUser' not in adapters:
+          if 'runSeparated(["enumerate-json"], privilege: .isolatedUser' not in adapters or 'run(["probe-launch"], privilege: .isolatedUser' not in adapters or 'run(["launch", bundleID], privilege: .isolatedUser' not in adapters:
               raise SystemExit('FAIL: app discovery/launch must use the bounded non-root isolated helper path')
           if 'if isolated.code == 46' not in adapters or 'run(["launch", bundleID], privilege: .root' not in adapters:
               raise SystemExit('FAIL: exact app-launch rejection lost its bounded privileged board-service fallback')
