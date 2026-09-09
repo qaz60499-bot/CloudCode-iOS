@@ -288,8 +288,7 @@ static NSDictionary<NSString *, NSString *> *DataContainerPathsByBundleID(void)
 static int PrintInstalledApplicationsJSON(void)
 {
     id workspace = Workspace();
-    if (!workspace) { return 23; }
-    NSString *backend = @"LaunchServices";
+    NSString *backend = workspace ? @"LaunchServices" : @"BundleFilesystem(no-workspace)";
     NSArray *proxies = InstalledApplicationProxies(workspace, &backend);
     BOOL launchServicesEnumerationEmpty = proxies.count == 0;
 
