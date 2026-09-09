@@ -95,8 +95,8 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         records.append(record("data.keychain_scope", .data, .deviceValidationRequired,
                               "Keychain write/read/delete probing is deferred during automatic startup and runs only during explicit device validation."))
 
-        records.append(record("automation.url_scheme", .automation, .unavailable,
-                              "The current URL-scheme executor is a disabled placeholder and cannot execute app actions."))
+        records.append(record("automation.url_scheme", .automation, .deviceValidationRequired,
+                              "The app-layer URL-scheme executor is wired, but each exact URL and target App is validated at execution time; startup does not open another App."))
         records.append(record("automation.xctest_wda", .automation, .unavailable,
                               "No XCTest/WDA runtime backend is connected in this build."))
         let deferredGUIStatus: CapabilityStatus = guiCapabilityProvider == nil ? .unavailable : .deviceValidationRequired
@@ -364,8 +364,8 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         let keychainProbe = Self.probeOwnKeychain()
         records.append(record("data.keychain_scope", .data, keychainProbe.status, keychainProbe.detail))
 
-        records.append(record("automation.url_scheme", .automation, .unavailable,
-                              "The current URL-scheme executor is a disabled placeholder and cannot execute app actions."))
+        records.append(record("automation.url_scheme", .automation, .deviceValidationRequired,
+                              "The app-layer URL-scheme executor is wired and exact calls self-validate system acceptance plus target foreground state; no speculative deep-link probe is performed here."))
         records.append(record("automation.xctest_wda", .automation, .unavailable,
                               "No XCTest/WDA runtime backend is connected in this build."))
         try? await diagnosticLogger?.log(level: .info, subsystem: "capability", action: "probe.privileged.stage", result: "gui-lightweight")

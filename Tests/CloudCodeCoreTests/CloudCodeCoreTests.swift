@@ -3351,9 +3351,9 @@ final class CloudCodeCoreTests: XCTestCase {
 
         XCTAssertEqual(first.status("filesystem.own_container"), .available)
         XCTAssertEqual(first.status("apps.enumerate"), .unavailable)
-        XCTAssertEqual(first.status("automation.url_scheme"), .unavailable)
+        XCTAssertEqual(first.status("automation.url_scheme"), .deviceValidationRequired)
         XCTAssertEqual(first.status("ipa.inspect"), .available)
-        XCTAssertEqual(second.status("automation.url_scheme"), .unavailable)
+        XCTAssertEqual(second.status("automation.url_scheme"), .deviceValidationRequired)
         XCTAssertGreaterThanOrEqual(second.generatedAt, first.generatedAt)
     }
 

@@ -2033,7 +2033,9 @@ private func localizedCapabilityDetail(_ id: String, detail: String) -> String {
         if detail.contains("Verified on this runtime") { return "已在当前设备实际完成临时写入、读取和删除回验；Cloud Code 自身 Keychain 可用。" }
         return "正在按当前设备实际结果判断 Cloud Code 自身 Keychain，不再仅凭配置假定可用。"
     case "automation.url_scheme":
-        return detail.contains("disabled placeholder") ? "当前 URL Scheme 执行器只是禁用占位实现，因此现在不可用。" : "只有 URL 打开适配器真实接入并验证后才会启用。"
+        return detail.contains("self-validate") || detail.contains("validated at execution time")
+            ? "URL Scheme 执行器已接入；具体 URL 与目标 App 会在每次执行时验证系统接受结果和前台状态。"
+            : "URL Scheme 能力按具体调用自验证，不在启动阶段主动打开其他 App。"
     case "automation.xctest_wda":
         return detail.contains("No XCTest/WDA") ? "当前版本没有接入 XCTest / WDA 运行后端，因此不可用。" : "需要独立的 XCTest / WDA 运行后端。"
     case "automation.gui.open_app": return "由 bounded helper / LaunchServices 独立验证能否打开其他 App；不依赖完整 GUI backend。"
