@@ -1961,20 +1961,17 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             if outcome.foregroundVerified {
                 await enrichWithLocalVision(&payload, screenshot: data)
             } else {
-                // Do not spend local Vision/CoreML work on a frame that is not proven to belong to
-                // the requested target App. On build 92 this path both mis-grounded follow-up actions
-                // and triggered background CoreVideo allocation failures. Keep the fresh screenshot
-                // for semantic re-planning/remote vision when available, but defer local OCR until a
-                // verified foreground transition or a later explicit current-frame text lookup.
+                // Foreground identity is not strong enough to authorize a semantic action, but the
+                // freshly captured frame is still valuable as read-only local perception evidence.
+                // Run OCR without dispatching any action and keep the result explicitly untrusted for
+                // target identity. This avoids turning a flaky frontmost check into "OCR unavailable"
+                // while preserving the fail-closed action boundary.
+                await enrichWithLocalVision(&payload, screenshot: data)
                 payload["perceptionAXAttempted"] = "false"
                 payload["perceptionAXSucceeded"] = "false"
-                payload["perceptionOCRInvoked"] = "false"
-                payload["perceptionOCRSucceeded"] = "false"
-                payload["localVisionOCR"] = "not_invoked_foreground_unverified"
-                payload["localVisionElementCount"] = "0"
                 payload["perceptionLocalSufficient"] = "false"
                 payload["perceptionRemoteVisionRequired"] = "true"
-                payload["perceptionFallbackReason"] = "foreground_unverified_local_ocr_skipped"
+                payload["perceptionFallbackReason"] = "foreground_unverified_local_ocr_observation_only"
                 payload["providerVisualRoundTripAvoided"] = "0"
             }
             return ToolResult(
