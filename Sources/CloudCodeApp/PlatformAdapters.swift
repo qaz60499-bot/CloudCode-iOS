@@ -1912,22 +1912,34 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 "tree": ToolOutputEnvelope(trust: .untrustedData, source: "gui.tree", content: tree).promptSafeRepresentation,
                 "perceptionClass": "accessibility_tree",
                 "perceptionAXAttempted": "true",
-                "perceptionAXSucceeded": "true",
+                "perceptionAXSucceeded": "false",
                 "perceptionOCRInvoked": "false",
                 "perceptionOCRSucceeded": "false",
                 "axStage": "direct_root_then_position_root_then_sampled_hit_test",
                 "axLatencyMS": String(axLatencyMS)
             ]
+            var semanticTreeUsable = false
             if let data = tree.data(using: .utf8),
                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 let scope = object["scope"] as? String ?? "unknown"
+                let nodeCount = (object["nodeCount"] as? NSNumber)?.intValue ?? 0
+                let semanticNodeCount = (object["semanticNodeCount"] as? NSNumber)?.intValue ?? 0
+                let bundleID = (object["bundleId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                semanticTreeUsable = nodeCount > 0 && semanticNodeCount > 0
                 payload["axScope"] = scope
                 payload["axBackend"] = object["backend"] as? String ?? "unknown"
-                if let nodeCount = object["nodeCount"] as? NSNumber { payload["axNodeCount"] = nodeCount.stringValue }
-                let complete = scope == "full_application_tree_opportunistic"
+                payload["axNodeCount"] = String(nodeCount)
+                payload["axSemanticNodeCount"] = String(semanticNodeCount)
+                payload["axForegroundBundleID"] = bundleID
+                payload["perceptionAXSucceeded"] = semanticTreeUsable ? "true" : "false"
+                let complete = semanticTreeUsable && scope == "full_application_tree_opportunistic"
                 payload["perceptionLocalSufficient"] = complete ? "true" : "false"
                 payload["perceptionRemoteVisionRequired"] = complete ? "false" : "true"
-                payload["perceptionFallbackReason"] = complete ? "fresh_ax_application_tree" : "bounded_ax_sampled_semantics"
+                if !semanticTreeUsable {
+                    payload["perceptionFallbackReason"] = "ax_transport_returned_semantically_empty_tree"
+                } else {
+                    payload["perceptionFallbackReason"] = complete ? "fresh_ax_application_tree" : "bounded_ax_sampled_semantics"
+                }
                 payload["providerVisualRoundTripAvoided"] = complete ? "1" : "0"
             } else {
                 payload["axScope"] = "unknown"
@@ -1936,7 +1948,12 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 payload["perceptionFallbackReason"] = "ax_tree_scope_unparsed"
                 payload["providerVisualRoundTripAvoided"] = "0"
             }
-            return ToolResult(toolCallID: call.id, success: true, summary: "GUI tree read", payload: payload)
+            return ToolResult(
+                toolCallID: call.id,
+                success: semanticTreeUsable,
+                summary: semanticTreeUsable ? "GUI tree read" : "AX transport responded without usable foreground semantics",
+                payload: payload
+            )
         case "gui.findElement":
             let resolved = try await resolveElement(call)
             return ToolResult(

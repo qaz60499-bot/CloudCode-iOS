@@ -869,6 +869,10 @@ public actor AgentCore {
                     var successfulTextInputCount = Int(checkpoint.payload["tool.successfulTextInputCount"] ?? "0") ?? 0
                     var successfulTapActionCount = Int(checkpoint.payload["tool.successfulTapActionCount"] ?? "0") ?? 0
                     var successfulCommitAfterTextInput = checkpoint.payload["tool.successfulCommitAfterTextInput"] == "true"
+                    // A raw coordinate tap after message-body input may have attempted Send, but a
+                    // changing screenshot is not semantic proof of delivery. Persist this latch so
+                    // recovery/completion replans cannot click Send repeatedly after an uncertain attempt.
+                    var unverifiedMessageCommitAttempted = checkpoint.payload["tool.unverifiedMessageCommitAttempted"] == "true"
                     // Focus is intentionally process-local and never restored from a checkpoint: UI focus
                     // is transient and stale after suspension/restart. Raw messaging text input is allowed
                     // only after this run locally verifies a composer/keyboard focus state.
@@ -899,12 +903,13 @@ public actor AgentCore {
                             successfulTextInputCount = 0
                             successfulTapActionCount = 0
                             successfulCommitAfterTextInput = false
+                            unverifiedMessageCommitAttempted = false
                             verifiedMessagingComposerFocus = false
                             prematureCompletionReplanCount = 0
                             for key in [
                                 "tool.successfulPostLaunchGUIActionCount", "tool.completedRepeatedSwipeCount",
                                 "tool.successfulTextInputCount", "tool.successfulTapActionCount", "tool.successfulCommitAfterTextInput",
-                                "tool.prematureCompletionReplanCount"
+                                "tool.unverifiedMessageCommitAttempted", "tool.prematureCompletionReplanCount"
                             ] {
                                 checkpoint.payload.removeValue(forKey: key)
                             }
@@ -1214,6 +1219,8 @@ public actor AgentCore {
                                 completionBlockReason = "perception_insufficient: 当前 AX 已失败、本地 OCR 没有提供可用 grounding，且 Provider 图像能力为 \(providerVisionAssessment.capability.rawValue)。禁止猜测不可见坐标；需要可用的 AX/OCR/local anchor 或已证明支持图像的 Provider 路由。"
                             } else if requiresMessageSend, successfulTextInputCount == 0 {
                                 completionBlockReason = "用户要求发送消息，但当前还没有成功完成文本输入。必须从最新 GUI 状态继续定位输入框；AX 不可用时应改用最新截图路径。"
+                            } else if requiresMessageSend, unverifiedMessageCommitAttempted, !successfulCommitAfterTextInput {
+                                completionBlockReason = "message_commit_unverified_no_repeat: 文本输入后已经执行过一次无法语义确认的提交候选动作。截图像素变化不能证明消息已发送；为避免重复发送，禁止自动再次点击/输入，必须先获得语义化发送后状态或由用户重新明确发起。"
                             } else if requiresMessageSend, !successfulCommitAfterTextInput {
                                 completionBlockReason = "用户要求发送消息，文本输入后还没有确认执行提交/发送动作。不能把“已输入”当成“已发送”。"
                             } else if requiresMessageSend, !verificationSinceLastStateChange {
@@ -1280,7 +1287,11 @@ public actor AgentCore {
                                     ))
                                 }
 
-                                if prematureCompletionReplanCount < 2,
+                                let unsafeToAutoReplanMessageCommit = requiresMessageSend
+                                    && unverifiedMessageCommitAttempted
+                                    && !successfulCommitAfterTextInput
+                                if !unsafeToAutoReplanMessageCommit,
+                                   prematureCompletionReplanCount < 2,
                                    round + 1 < maxToolRounds {
                                     prematureCompletionReplanCount += 1
                                     checkpoint.payload["tool.prematureCompletionReplanCount"] = String(prematureCompletionReplanCount)
@@ -1430,6 +1441,66 @@ public actor AgentCore {
                                 ? Self.semanticToolSignature(name: name, arguments: arguments)
                                 : nil
 
+                            let normalizedTextPurpose = arguments["purpose"]?
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                                .lowercased() ?? ""
+                            if Self.shouldBlockRepeatedMessageBodyInput(
+                                requiresMessageSend: requiresMessageSend,
+                                toolName: name,
+                                purpose: normalizedTextPurpose,
+                                successfulTextInputCount: successfulTextInputCount
+                            ) {
+                                let failure = ToolResult(
+                                    toolCallID: call.id,
+                                    success: false,
+                                    summary: "已阻止同一消息任务再次输入正文；一次成功派发后必须先完成/验证提交，避免重复正文。",
+                                    payload: ["idempotency": "duplicate_message_body_blocked"]
+                                )
+                                continuation.yield(.toolFinished(failure))
+                                let data = try JSONEncoder.pretty.encode(failure)
+                                let rawContent = String(data: data, encoding: .utf8) ?? failure.summary
+                                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):message_body_duplicate", content: rawContent).promptSafeRepresentation
+                                session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: [
+                                    "tool_call_id": providerCallID,
+                                    "tool_name": name,
+                                    "provider_tool_name": providerToolName,
+                                    "idempotency": "duplicate_message_body_blocked"
+                                ]))
+                                session.updatedAt = Date()
+                                try await sessionStore.save(session)
+                                continue
+                            }
+                            let messageCommitCandidateTools: Set<String> = [
+                                "gui.tap", "gui.tapObserve", "gui.tapTextObserve", "gui.tapElementObserve", "gui.runStructuredPlan"
+                            ]
+                            if Self.shouldBlockUnverifiedMessageCommitRepeat(
+                                requiresMessageSend: requiresMessageSend,
+                                toolName: name,
+                                successfulTextInputCount: successfulTextInputCount,
+                                unverifiedMessageCommitAttempted: unverifiedMessageCommitAttempted,
+                                successfulCommitAfterTextInput: successfulCommitAfterTextInput,
+                                candidateTools: messageCommitCandidateTools
+                            ) {
+                                let failure = ToolResult(
+                                    toolCallID: call.id,
+                                    success: false,
+                                    summary: "已阻止重复提交候选动作；上一提交点击尚无语义化发送后证据。",
+                                    payload: ["idempotency": "unverified_message_commit_repeat_blocked"]
+                                )
+                                continuation.yield(.toolFinished(failure))
+                                let data = try JSONEncoder.pretty.encode(failure)
+                                let rawContent = String(data: data, encoding: .utf8) ?? failure.summary
+                                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):message_commit_repeat", content: rawContent).promptSafeRepresentation
+                                session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: [
+                                    "tool_call_id": providerCallID,
+                                    "tool_name": name,
+                                    "provider_tool_name": providerToolName,
+                                    "idempotency": "unverified_message_commit_repeat_blocked"
+                                ]))
+                                session.updatedAt = Date()
+                                try await sessionStore.save(session)
+                                continue
+                            }
                             if requiresMessageSend,
                                ["gui.type", "gui.typeObserve"].contains(name),
                                !Self.rawMessagingTextInputAllowed(
@@ -1788,22 +1859,39 @@ public actor AgentCore {
                                                 successfulTextInputCount += 1
                                             }
                                         } else if name == "gui.runStructuredPlan", let plan = arguments["plan"]?.lowercased() {
-                                            if plan.contains("type") {
+                                            let semanticCommit = Self.isSemanticMessageCommitAction(name: name, arguments: arguments)
+                                            // In a messaging task, a structured plan may type only a contact/search
+                                            // keyword. Do not count arbitrary `type` steps as message-body completion.
+                                            // A plan may satisfy the message path atomically only when it also contains
+                                            // a semantically named Send/Reply commit; otherwise use the purpose-aware
+                                            // individual typing tools for message-body accounting.
+                                            if plan.contains("type") && (!requiresMessageSend || semanticCommit) {
                                                 successfulTextInputCount += 1
                                             }
                                             if plan.contains("tap") {
                                                 successfulTapActionCount += 1
                                             }
-                                            if successfulTextInputCount > 0,
-                                               Self.isSemanticMessageCommitAction(name: name, arguments: arguments) {
+                                            if successfulTextInputCount > 0, semanticCommit {
                                                 successfulCommitAfterTextInput = true
+                                                unverifiedMessageCommitAttempted = false
+                                            } else if requiresMessageSend,
+                                                      successfulTextInputCount > 0,
+                                                      plan.contains("tap") {
+                                                unverifiedMessageCommitAttempted = true
                                             }
                                         }
                                         if ["gui.tap", "gui.tapObserve", "gui.tapTextObserve", "gui.tapElementObserve"].contains(name) {
                                             successfulTapActionCount += 1
-                                            if successfulTextInputCount > 0,
-                                               Self.isSemanticMessageCommitAction(name: name, arguments: arguments) {
-                                                successfulCommitAfterTextInput = true
+                                            if successfulTextInputCount > 0 {
+                                                if Self.isSemanticMessageCommitAction(name: name, arguments: arguments) {
+                                                    successfulCommitAfterTextInput = true
+                                                    unverifiedMessageCommitAttempted = false
+                                                } else if requiresMessageSend {
+                                                    // One raw/non-semantic post-body tap is allowed as a bounded commit
+                                                    // attempt. Do not let animation/screenshot hash changes authorize a
+                                                    // second tap; only a semantic Send target may promote commit success.
+                                                    unverifiedMessageCommitAttempted = true
+                                                }
                                             }
                                         }
                                         checkpoint.payload["tool.successfulPostLaunchGUIActionCount"] = String(successfulPostLaunchGUIActionCount)
@@ -1811,6 +1899,7 @@ public actor AgentCore {
                                         checkpoint.payload["tool.successfulTextInputCount"] = String(successfulTextInputCount)
                                         checkpoint.payload["tool.successfulTapActionCount"] = String(successfulTapActionCount)
                                         checkpoint.payload["tool.successfulCommitAfterTextInput"] = successfulCommitAfterTextInput ? "true" : "false"
+                                        checkpoint.payload["tool.unverifiedMessageCommitAttempted"] = unverifiedMessageCommitAttempted ? "true" : "false"
                                     }
                                     if result.success, (name == "gui.openApp" || name == "gui.openAppObserve" || name == "apps.launch" || name == "apps.openURL"),
                                        let bundleID = arguments["bundleId"], !bundleID.isEmpty,
@@ -2339,6 +2428,35 @@ public actor AgentCore {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() ?? ""
         return normalizedPurpose != "navigation_search"
+    }
+
+    static func shouldBlockRepeatedMessageBodyInput(
+        requiresMessageSend: Bool,
+        toolName: String,
+        purpose: String?,
+        successfulTextInputCount: Int
+    ) -> Bool {
+        guard requiresMessageSend, successfulTextInputCount > 0 else { return false }
+        guard ["gui.type", "gui.typeObserve", "gui.typeElementObserve"].contains(toolName) else { return false }
+        let normalizedPurpose = purpose?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        return normalizedPurpose != "navigation_search"
+    }
+
+    static func shouldBlockUnverifiedMessageCommitRepeat(
+        requiresMessageSend: Bool,
+        toolName: String,
+        successfulTextInputCount: Int,
+        unverifiedMessageCommitAttempted: Bool,
+        successfulCommitAfterTextInput: Bool,
+        candidateTools: Set<String> = ["gui.tap", "gui.tapObserve", "gui.tapTextObserve", "gui.tapElementObserve", "gui.runStructuredPlan"]
+    ) -> Bool {
+        requiresMessageSend
+            && successfulTextInputCount > 0
+            && unverifiedMessageCommitAttempted
+            && !successfulCommitAfterTextInput
+            && candidateTools.contains(toolName)
     }
 
     static func shouldRecordStateChange(for result: ToolResult) -> Bool {

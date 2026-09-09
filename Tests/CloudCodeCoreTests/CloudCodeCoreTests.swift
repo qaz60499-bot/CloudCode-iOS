@@ -814,6 +814,7 @@ final class CloudCodeCoreTests: XCTestCase {
             (DiagnosticLogRecord(level: .error, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "required AXRuntime creation/copy symbols are unavailable"), "ax_backend_unavailable"),
             (DiagnosticLogRecord(level: .error, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "AX request transport failed"), "ax_request_failed"),
             (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "no readable UI nodes; empty tree"), "ax_tree_empty"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "AX transport responded but no semantic/actionable foreground UI nodes were returned", metadata: ["perceptionFallbackReason": "ax_transport_returned_semantically_empty_tree"]), "ax_tree_empty"),
             (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.findElement", result: "failed", diagnostic: "structured element query returned no usable visible match"), "ax_target_absent"),
             (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.waitForElement", result: "failed", diagnostic: "structured plan local expectation did not become true before timeout"), "ax_target_absent"),
             (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "node budget output exceeded"), "ax_tree_budget_truncated"),
@@ -848,6 +849,29 @@ final class CloudCodeCoreTests: XCTestCase {
             XCTAssertEqual(explanation.failureLayer, .localVision)
             XCTAssertTrue(explanation.failureSignature.contains(expectedReason), "expected \(expectedReason), got \(explanation.failureSignature)")
         }
+    }
+
+    func testCoreVideoAllocationFailureSelfDiagnosisTripsCircuitInsteadOfBlindVisionRetry() throws {
+        let record = DiagnosticLogRecord(
+            level: .warning,
+            subsystem: "localVision",
+            action: "localVision.lookup",
+            result: "failed",
+            diagnostic: "Vision request failed",
+            metadata: [
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "false",
+                "localVisionOCR": "unavailable",
+                "localVisionErrorDomain": NSOSStatusErrorDomain,
+                "localVisionErrorCode": "-6662"
+            ]
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+        ))
+        XCTAssertTrue(explanation.failureSignature.contains("corevideo_allocation_failed"))
+        XCTAssertTrue(explanation.recommendedNextAction.contains("corevideo_circuit_breaker"))
+        XCTAssertTrue(explanation.recommendedNextAction.contains("avoid_same_context_vision_retry"))
     }
 
     func testDiagnosticFailureTaxonomyDoesNotMistakeScreenWidth400ForHTTP400() throws {
@@ -1163,6 +1187,33 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(AgentCore.isSemanticMessageCommitAction(
             name: "gui.tap",
             arguments: ["x": "300", "y": "700"]
+        ))
+
+        XCTAssertTrue(AgentCore.shouldBlockRepeatedMessageBodyInput(
+            requiresMessageSend: true,
+            toolName: "gui.typeObserve",
+            purpose: "message_body",
+            successfulTextInputCount: 1
+        ))
+        XCTAssertFalse(AgentCore.shouldBlockRepeatedMessageBodyInput(
+            requiresMessageSend: true,
+            toolName: "gui.typeObserve",
+            purpose: "navigation_search",
+            successfulTextInputCount: 1
+        ))
+        XCTAssertTrue(AgentCore.shouldBlockUnverifiedMessageCommitRepeat(
+            requiresMessageSend: true,
+            toolName: "gui.tapObserve",
+            successfulTextInputCount: 1,
+            unverifiedMessageCommitAttempted: true,
+            successfulCommitAfterTextInput: false
+        ))
+        XCTAssertFalse(AgentCore.shouldBlockUnverifiedMessageCommitRepeat(
+            requiresMessageSend: true,
+            toolName: "gui.tapTextObserve",
+            successfulTextInputCount: 1,
+            unverifiedMessageCommitAttempted: false,
+            successfulCommitAfterTextInput: false
         ))
     }
 

@@ -289,7 +289,7 @@ static int PrintInstalledApplicationsJSON(void)
     if (!workspace) { return 23; }
     NSString *backend = @"LaunchServices";
     NSArray *proxies = InstalledApplicationProxies(workspace, &backend);
-    if (proxies.count == 0) { return 40; }
+    BOOL launchServicesEnumerationEmpty = proxies.count == 0;
 
     NSMutableDictionary<NSString *, NSDictionary *> *byBundleID = [NSMutableDictionary dictionary];
     NSDictionary<NSString *, NSString *> *dataPathsByBundleID = DataContainerPathsByBundleID();
@@ -319,11 +319,14 @@ static int PrintInstalledApplicationsJSON(void)
         };
     }
 
-    // LaunchServices can lose registration before a failed uninstall has actually removed the
-    // bundle container. Merge only physically present, one-level user .app bundles that LS did
-    // not report so a later explicit apps.uninstall can reconcile that orphan instead of losing
-    // its path forever. This is read-only discovery and never deletes or registers anything.
-    NSUInteger orphanCount = 0;
+    // LaunchServices enumeration is not authoritative on every TrollStore execution context. A
+    // detached mobile helper can receive an empty/partial proxy list even while the installation
+    // database and Bundle containers still contain normal registered applications. Always merge
+    // the bounded one-level Bundle filesystem inventory, then ask applicationIsInstalled: for any
+    // bundle LS omitted. This keeps discovery/indexing resilient without treating physical presence
+    // as authority for launch/uninstall: exact operations still perform their own installation check.
+    NSUInteger filesystemOnlyCount = 0;
+    NSUInteger recoveredRegisteredCount = 0;
     NSString *bundleRoot = @"/var/containers/Bundle/Application";
     NSArray<NSString *> *containers = [NSFileManager.defaultManager contentsOfDirectoryAtPath:bundleRoot error:nil] ?: @[];
     for (NSString *containerName in containers) {
@@ -341,19 +344,34 @@ static int PrintInstalledApplicationsJSON(void)
             if (name.length == 0 && [info[@"CFBundleName"] isKindOfClass:NSString.class]) { name = info[@"CFBundleName"]; }
             if (name.length == 0) { name = bundleID; }
             NSString *version = [info[@"CFBundleShortVersionString"] isKindOfClass:NSString.class] ? info[@"CFBundleShortVersionString"] : @"";
+            BOOL known = NO;
+            BOOL installed = NO;
+            if (!launchServicesEnumerationEmpty) {
+                installed = ApplicationIsInstalled(workspace, bundleID, &known);
+            }
+            // When LS enumeration itself is empty, do not turn index recovery into hundreds of
+            // applicationIsInstalled: calls through the same degraded service. Physical presence is
+            // sufficient for read-only discovery and exact launch/uninstall still revalidates. When
+            // LS was merely partial, query omitted bundles so real uninstall orphans stay identifiable.
+            // Unknown registration state fails safe as registered for destructive routing.
+            BOOL registered = launchServicesEnumerationEmpty || !known || installed;
             byBundleID[bundleID] = @{
                 @"bundleID": bundleID,
                 @"name": name,
                 @"version": version ?: @"",
                 @"bundlePath": bundlePath,
                 @"dataContainerPath": dataPathsByBundleID[bundleID] ?: @"",
-                @"registered": @NO
+                @"registered": @(registered)
             };
-            orphanCount++;
+            filesystemOnlyCount++;
+            if (registered) { recoveredRegisteredCount++; }
         }
     }
     if (byBundleID.count == 0) { return 40; }
-    if (orphanCount > 0) { backend = [backend stringByAppendingString:@"+BundleFilesystemOrphans"]; }
+    if (filesystemOnlyCount > 0) {
+        backend = [backend stringByAppendingFormat:@"+BundleFilesystemOrphansOrRecovered(%lu,recoveredRegistered=%lu)",
+                   (unsigned long)filesystemOnlyCount, (unsigned long)recoveredRegisteredCount];
+    }
     NSArray *apps = [[byBundleID allValues] sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *lhs, NSDictionary *rhs) {
         return [lhs[@"name"] localizedCaseInsensitiveCompare:rhs[@"name"]];
     }];

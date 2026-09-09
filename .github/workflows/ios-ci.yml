@@ -515,9 +515,9 @@ jobs:
               raise SystemExit('FAIL: structured UI-tree must use the bounded mobile AX client path instead of persona-99/root')
           if '#define CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS 0.25f' not in gui_text:
               raise SystemExit('FAIL: AX per-request timeout budget must remain fail-fast for detached/mobile AX clients')
-          for marker in ('AXUIElementCopyMultipleAttributeValues', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic', 'CloudCodeAXApplicationAtScreenPointRoot', 'CloudCodeAXNodeLimited', 'CloudCodeAXNodeLimited(runtime, candidate, 0, 0, nodeCount)'):
+          for marker in ('AXUIElementCopyMultipleAttributeValues', 'AXUIElementCopyElementWithParameters', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic', 'CloudCodeAXApplicationAtScreenPointRoot', 'CloudCodeAXParameterizedElementAtPoint', 'CloudCodeAXNodeLimited', 'CloudCodeAXNodeLimited(runtime, candidate, 0, 0, &localNodeCount)', 'semanticNodeCount'):
               if marker not in gui_text:
-                  raise SystemExit(f'FAIL: AX runtime lost bounded standalone-capability marker: {marker}')
+                  raise SystemExit(f'FAIL: AX runtime lost bounded standalone/context-bound capability marker: {marker}')
           if '_AXSSetAutomationEnabled' in gui_text or 'CloudCodeEnableAXAutomationForRequest' in gui_text:
               raise SystemExit('FAIL: detached AX helper must not mutate the global automation switch; SIGKILL timeout cannot guarantee restoration')
           if 'runtime.setAttribute(seed, CFSTR("AXManualAccessibility"), kCFBooleanTrue)' in gui_text:

@@ -32,7 +32,9 @@ enum LocalVisionTextObservation {
         private var cache: [String: CacheEntry] = [:]
         private var inFlight: [String: Task<Observation, Never>] = [:]
         private var activeKey: String?
+        private var coreVideoCircuitOpenUntil: Date?
         private let retention: TimeInterval = 3
+        private let coreVideoCircuitDuration: TimeInterval = 12
 
         func resolve(
             key: String,
@@ -40,6 +42,19 @@ enum LocalVisionTextObservation {
         ) async -> Observation {
             let now = Date()
             cache = cache.filter { now.timeIntervalSince($0.value.createdAt) <= retention }
+            if let until = coreVideoCircuitOpenUntil, until > now {
+                return Observation(payload: [
+                    "localVisionOCR": "unavailable_corevideo_circuit_open",
+                    "localVisionBackend": "vision_circuit_breaker",
+                    "localVisionErrorDomain": NSOSStatusErrorDomain,
+                    "localVisionErrorCode": "-6662",
+                    "localVisionCircuitRemainingMS": String(max(0, Int(until.timeIntervalSince(now) * 1_000))),
+                    "localVisionElementCount": "0"
+                ], elements: [])
+            }
+            if let until = coreVideoCircuitOpenUntil, until <= now {
+                coreVideoCircuitOpenUntil = nil
+            }
             if var cached = cache[key]?.observation {
                 cached.payload["localVisionCacheHit"] = "true"
                 cached.payload["localVisionRequestCoalesced"] = "false"
@@ -61,10 +76,24 @@ enum LocalVisionTextObservation {
             var value = await task.value
             inFlight[key] = nil
             if activeKey == key { activeKey = nil }
+            if Self.hasCoreVideoAllocationFailure(value) {
+                coreVideoCircuitOpenUntil = Date().addingTimeInterval(coreVideoCircuitDuration)
+                value.payload["localVisionCircuitOpened"] = "true"
+                value.payload["localVisionCircuitDurationMS"] = String(Int(coreVideoCircuitDuration * 1_000))
+            }
             cache[key] = CacheEntry(observation: value, createdAt: Date())
             value.payload["localVisionCacheHit"] = "false"
             value.payload["localVisionRequestCoalesced"] = "false"
             return value
+        }
+
+        private static func hasCoreVideoAllocationFailure(_ observation: Observation) -> Bool {
+            let finalDomain = observation.payload["localVisionErrorDomain"] ?? ""
+            let finalCode = observation.payload["localVisionErrorCode"] ?? ""
+            let primaryDomain = observation.payload["localVisionPrimaryErrorDomain"] ?? ""
+            let primaryCode = observation.payload["localVisionPrimaryErrorCode"] ?? ""
+            return (finalDomain == NSOSStatusErrorDomain && finalCode == "-6662")
+                || (primaryDomain == NSOSStatusErrorDomain && primaryCode == "-6662")
         }
     }
 

@@ -64,6 +64,7 @@ typedef CloudCodeAXError (*CloudCodeAXSetAttributeFn)(CloudCodeAXUIElementRef, C
 typedef CloudCodeAXError (*CloudCodeAXCopyElementAtPositionFn)(CloudCodeAXUIElementRef, float, float, CloudCodeAXUIElementRef *);
 typedef CloudCodeAXError (*CloudCodeAXCopyApplicationAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, float, float);
 typedef CloudCodeAXError (*CloudCodeAXCopyApplicationAndContextAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, uint32_t *, float, float);
+typedef CloudCodeAXError (*CloudCodeAXCopyElementWithParametersFn)(CloudCodeAXUIElementRef *, CFDictionaryRef);
 typedef CloudCodeAXError (*CloudCodeAXSetTimeoutFn)(CloudCodeAXUIElementRef, float);
 typedef void (*CloudCodeAXAddAssociatedPidFn)(pid_t, pid_t, int);
 typedef void (*CloudCodeAXSetRequestingClientFn)(uint32_t);
@@ -129,6 +130,7 @@ typedef struct {
     CloudCodeAXCopyElementAtPositionFn copyElementAtPosition;
     CloudCodeAXCopyApplicationAtPositionFn copyApplicationAtPosition;
     CloudCodeAXCopyApplicationAndContextAtPositionFn copyApplicationAndContextAtPosition;
+    CloudCodeAXCopyElementWithParametersFn copyElementWithParameters;
     CloudCodeAXSetTimeoutFn setTimeout;
     CloudCodeAXAddAssociatedPidFn addAssociatedPid;
     CloudCodeAXSetRequestingClientFn setRequestingClient;
@@ -944,6 +946,7 @@ static CloudCodeAXRuntime CloudCodeResolveAX(void)
     runtime.copyElementAtPosition = (CloudCodeAXCopyElementAtPositionFn)CloudCodeResolveAcrossFrameworks(paths, "AXUIElementCopyElementAtPosition");
     runtime.copyApplicationAtPosition = (CloudCodeAXCopyApplicationAtPositionFn)CloudCodeResolveAcrossFrameworks(paths, "AXUIElementCopyApplicationAtPosition");
     runtime.copyApplicationAndContextAtPosition = (CloudCodeAXCopyApplicationAndContextAtPositionFn)CloudCodeResolveAcrossFrameworks(paths, "AXUIElementCopyApplicationAndContextAtPosition");
+    runtime.copyElementWithParameters = (CloudCodeAXCopyElementWithParametersFn)CloudCodeResolveAcrossFrameworks(paths, "AXUIElementCopyElementWithParameters");
     runtime.setTimeout = (CloudCodeAXSetTimeoutFn)CloudCodeResolveAcrossFrameworks(paths, "AXUIElementSetMessagingTimeout");
     runtime.addAssociatedPid = (CloudCodeAXAddAssociatedPidFn)CloudCodeResolveAcrossFrameworks(paths, "_AXAddAssociatedPid");
     if (!runtime.addAssociatedPid) {
@@ -966,7 +969,7 @@ static CloudCodeAXRuntime CloudCodeResolveAX(void)
 static void CloudCodePrintAXRuntimeDiagnostic(CloudCodeAXRuntime runtime, const char *stage)
 {
     fprintf(stderr,
-        "gui-tree-ax-runtime: stage=%s authority=standalone-trollstore-best-effort requesting_client=%d create_app=%d create_systemwide=%d copy_attribute=%d copy_multiple=%d element_at_position=%d app_at_position=%d app_context_at_position=%d\n",
+        "gui-tree-ax-runtime: stage=%s authority=standalone-trollstore-best-effort requesting_client=%d create_app=%d create_systemwide=%d copy_attribute=%d copy_multiple=%d element_at_position=%d app_at_position=%d app_context_at_position=%d element_with_parameters=%d\n",
         stage ?: "unknown",
         runtime.setRequestingClient ? 1 : 0,
         (runtime.createApplication || runtime.createAppElementWithPid) ? 1 : 0,
@@ -975,7 +978,8 @@ static void CloudCodePrintAXRuntimeDiagnostic(CloudCodeAXRuntime runtime, const 
         runtime.copyMultipleAttributes ? 1 : 0,
         runtime.copyElementAtPosition ? 1 : 0,
         runtime.copyApplicationAtPosition ? 1 : 0,
-        runtime.copyApplicationAndContextAtPosition ? 1 : 0);
+        runtime.copyApplicationAndContextAtPosition ? 1 : 0,
+        runtime.copyElementWithParameters ? 1 : 0);
 }
 
 static NSString *CloudCodeBoundedString(id value)
@@ -1128,6 +1132,31 @@ static NSDictionary *CloudCodeAXNodeLimited(CloudCodeAXRuntime runtime, CloudCod
 static NSDictionary *CloudCodeAXNode(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef element, NSUInteger depth, NSUInteger *nodeCount)
 {
     return CloudCodeAXNodeLimited(runtime, element, depth, 20, nodeCount);
+}
+
+static NSUInteger CloudCodeAXSemanticNodeCount(NSDictionary *node)
+{
+    if (![node isKindOfClass:NSDictionary.class]) { return 0; }
+    BOOL hasTextIdentity = NO;
+    for (NSString *key in @[@"label", @"value", @"title", @"identifier", @"placeholder"]) {
+        NSString *value = [node[key] isKindOfClass:NSString.class] ? node[key] : nil;
+        if (value.length > 0) { hasTextIdentity = YES; break; }
+    }
+    NSString *role = [node[@"role"] isKindOfClass:NSString.class] ? node[@"role"] : nil;
+    BOOL hasActionableRole = role.length > 0
+        && ![role isEqualToString:@"AXApplication"]
+        && ![role isEqualToString:@"Application"]
+        && ![role isEqualToString:@"AXWindow"]
+        && ![role isEqualToString:@"Window"]
+        && [node[@"frame"] isKindOfClass:NSDictionary.class];
+    NSUInteger count = (hasTextIdentity || hasActionableRole) ? 1 : 0;
+    NSArray *children = [node[@"children"] isKindOfClass:NSArray.class] ? node[@"children"] : @[];
+    for (id child in children) {
+        if ([child isKindOfClass:NSDictionary.class]) {
+            count += CloudCodeAXSemanticNodeCount((NSDictionary *)child);
+        }
+    }
+    return count;
 }
 
 static CloudCodeAXUIElementRef CloudCodeAXFindElementForPid(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef element, pid_t targetPid, NSUInteger depth, NSUInteger *visited)
@@ -1307,9 +1336,64 @@ static CloudCodeAXUIElementRef CloudCodeAXApplicationAtScreenPointRoot(CloudCode
     return NULL;
 }
 
+static CloudCodeAXUIElementRef CloudCodeAXParameterizedElementAtPoint(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef seed, CGPoint point, uint32_t *contextIDOut)
+{
+    if (!seed || !runtime.copyElementWithParameters) { return NULL; }
+    CloudCodeAXUIElementRef application = NULL;
+    uint32_t contextID = 0;
+    CloudCodeAXError appCode = -1;
+    if (runtime.copyApplicationAndContextAtPosition) {
+        @try {
+            appCode = runtime.copyApplicationAndContextAtPosition(seed, &application, &contextID, (float)point.x, (float)point.y);
+        } @catch (__unused NSException *exception) {
+            appCode = -1;
+            application = NULL;
+            contextID = 0;
+        }
+    }
+    if ((appCode != 0 || !application) && runtime.copyApplicationAtPosition) {
+        if (application) { CFRelease(application); application = NULL; }
+        @try {
+            appCode = runtime.copyApplicationAtPosition(seed, &application, (float)point.x, (float)point.y);
+        } @catch (__unused NSException *exception) {
+            appCode = -1;
+            application = NULL;
+        }
+    }
+    if (!application) {
+        application = (CloudCodeAXUIElementRef)CFRetain(seed);
+    }
+    CloudCodePrepareAXApplication(runtime, application);
+
+    NSMutableDictionary *parameters = [@{
+        @"application": (__bridge id)application,
+        @"point": [NSValue valueWithCGPoint:point],
+        @"displayId": @1,
+        @"hitTestType": @0
+    } mutableCopy];
+    if (contextID > 0) { parameters[@"contextId"] = @(contextID); }
+
+    CloudCodeAXUIElementRef candidate = NULL;
+    CloudCodeAXError code = -1;
+    @try {
+        code = runtime.copyElementWithParameters(&candidate, (__bridge CFDictionaryRef)parameters);
+    } @catch (__unused NSException *exception) {
+        code = -1;
+        candidate = NULL;
+    }
+    CFRelease(application);
+    if (code != 0 || !candidate) {
+        if (candidate) { CFRelease(candidate); }
+        return NULL;
+    }
+    CloudCodePrepareAXApplication(runtime, candidate);
+    if (contextIDOut) { *contextIDOut = contextID; }
+    return candidate;
+}
+
 static NSDictionary *CloudCodeAXHitTestTree(CloudCodeAXRuntime runtime, NSUInteger *nodeCount, pid_t *pidOut, NSString **backend)
 {
-    if (!runtime.createSystemWide || !runtime.copyElementAtPosition || !nodeCount) { return nil; }
+    if (!runtime.createSystemWide || (!runtime.copyElementAtPosition && !runtime.copyElementWithParameters) || !nodeCount) { return nil; }
     CGSize size = CloudCodeScreenSize();
     if (size.width <= 1 || size.height <= 1) { return nil; }
 
@@ -1338,11 +1422,23 @@ static NSDictionary *CloudCodeAXHitTestTree(CloudCodeAXRuntime runtime, NSUInteg
         if (*nodeCount >= CLOUDCODE_GUI_MAX_TREE_NODES) { break; }
         CloudCodeAXUIElementRef candidate = NULL;
         CloudCodeAXError code = -1;
-        @try {
-            code = runtime.copyElementAtPosition(systemWide, (float)points[index].x, (float)points[index].y, &candidate);
-        } @catch (__unused NSException *exception) {
-            code = -1;
-            candidate = NULL;
+        NSString *sampleRoute = @"elementAtPosition";
+        uint32_t contextID = 0;
+        if (runtime.copyElementAtPosition) {
+            @try {
+                code = runtime.copyElementAtPosition(systemWide, (float)points[index].x, (float)points[index].y, &candidate);
+            } @catch (__unused NSException *exception) {
+                code = -1;
+                candidate = NULL;
+            }
+        }
+        if (code != 0 || !candidate) {
+            if (candidate) { CFRelease(candidate); candidate = NULL; }
+            candidate = CloudCodeAXParameterizedElementAtPoint(runtime, systemWide, points[index], &contextID);
+            if (candidate) {
+                code = 0;
+                sampleRoute = @"elementWithParameters";
+            }
         }
         if (code != 0 || !candidate) { if (candidate) CFRelease(candidate); continue; }
 
@@ -1375,19 +1471,33 @@ static NSDictionary *CloudCodeAXHitTestTree(CloudCodeAXRuntime runtime, NSUInteg
         }
 
         // Sampled fallback is intentionally shallow. A detached mobile AX client can spend a full
-        // IPC timeout on every descendant attribute; recursively expanding nine hit-test roots was
-        // the main reason the 1.5 s helper watchdog killed otherwise useful topmost semantics.
-        NSDictionary *node = CloudCodeAXNodeLimited(runtime, candidate, 0, 0, nodeCount);
-        CFRelease(candidate);
-        if (!node) { continue; }
+        // IPC timeout on every descendant attribute. If the legacy point hit-test only returns an
+        // empty shell, retry that same point once through the context-bound parameterized API before
+        // accepting failure; this uses the contextID rather than discarding it after discovery.
+        NSUInteger localNodeCount = 0;
+        NSDictionary *node = CloudCodeAXNodeLimited(runtime, candidate, 0, 0, &localNodeCount);
+        NSUInteger localSemanticCount = CloudCodeAXSemanticNodeCount(node);
+        if (localSemanticCount == 0 && runtime.copyElementWithParameters && ![sampleRoute isEqualToString:@"elementWithParameters"]) {
+            CFRelease(candidate);
+            candidate = CloudCodeAXParameterizedElementAtPoint(runtime, systemWide, points[index], &contextID);
+            localNodeCount = 0;
+            node = candidate ? CloudCodeAXNodeLimited(runtime, candidate, 0, 0, &localNodeCount) : nil;
+            localSemanticCount = CloudCodeAXSemanticNodeCount(node);
+            if (candidate) { sampleRoute = @"elementWithParameters"; }
+        }
+        if (candidate) { CFRelease(candidate); }
+        if (!node || localSemanticCount == 0) { continue; }
+        *nodeCount += localNodeCount;
         NSMutableDictionary *annotated = [node mutableCopy];
         annotated[@"hitPoint"] = @{@"x": @(points[index].x), @"y": @(points[index].y)};
+        annotated[@"hitRoute"] = sampleRoute;
+        if (contextID > 0) { annotated[@"contextId"] = @(contextID); }
         [hits addObject:annotated];
     }
     CFRelease(systemWide);
     if (hits.count == 0) { return nil; }
     if (pidOut) { *pidOut = foregroundPID; }
-    if (backend) { *backend = foregroundPID > 0 ? @"AXRuntime.systemWide.elementAtPosition" : @"AXRuntime.systemWide.elementAtPosition.pid-unavailable"; }
+    if (backend) { *backend = foregroundPID > 0 ? @"AXRuntime.systemWide.boundedHitTest" : @"AXRuntime.systemWide.boundedHitTest.pid-unavailable"; }
     return @{
         @"role": @"AXHitTestSnapshot",
         @"scope": foregroundPID > 0 ? @"sampled-foreground-pid" : @"sampled-topmost-pid-unavailable",
@@ -1418,7 +1528,7 @@ int CloudCodeGUIAXProbeJSON(NSString *stage, NSString *seedKind, pid_t targetPID
 #define CC_AX_SYMBOL(field) symbols[@#field] = CCAXSymbolEvidence((void *)runtime.field)
     CC_AX_SYMBOL(createApplication); CC_AX_SYMBOL(createAppElementWithPid); CC_AX_SYMBOL(createSystemWide);
     CC_AX_SYMBOL(getPid); CC_AX_SYMBOL(copyAttribute); CC_AX_SYMBOL(copyMultipleAttributes);
-    CC_AX_SYMBOL(copyElementAtPosition); CC_AX_SYMBOL(copyApplicationAtPosition); CC_AX_SYMBOL(copyApplicationAndContextAtPosition);
+    CC_AX_SYMBOL(copyElementAtPosition); CC_AX_SYMBOL(copyApplicationAtPosition); CC_AX_SYMBOL(copyApplicationAndContextAtPosition); CC_AX_SYMBOL(copyElementWithParameters);
     CC_AX_SYMBOL(setTimeout); CC_AX_SYMBOL(setAttribute); CC_AX_SYMBOL(addAssociatedPid); CC_AX_SYMBOL(setRequestingClient);
 #undef CC_AX_SYMBOL
     record[@"symbols"] = symbols;
@@ -1602,10 +1712,36 @@ static NSData *CloudCodeFrontmostTreeData(void)
     if (root) {
         rootNode = CloudCodeAXNode(runtime, root, 0, &nodeCount);
         CFRelease(root);
+        root = NULL;
     }
-    if (!rootNode || nodeCount == 0) {
-        CloudCodePrintAXRuntimeDiagnostic(runtime, "empty-tree");
-        fprintf(stderr, "gui-tree: AX root existed but no readable UI nodes were returned\n");
+    NSUInteger semanticNodeCount = CloudCodeAXSemanticNodeCount(rootNode);
+    if (rootNode && semanticNodeCount == 0) {
+        // A callable AXRuntime API is not the same as a usable accessibility tree. On iOS 16.6
+        // the detached helper can receive one shell Application root with no foreground controls.
+        // Do not report that as a complete tree; spend the already-bounded sampled hit-test fallback.
+        fprintf(stderr, "gui-tree: direct AX root contained no semantic/actionable nodes; trying sampled foreground hit-test\n");
+        nodeCount = 0;
+        pid_t sampledPID = 0;
+        NSString *sampledBackend = nil;
+        NSDictionary *sampled = CloudCodeAXHitTestTree(runtime, &nodeCount, &sampledPID, &sampledBackend);
+        NSUInteger sampledSemanticCount = CloudCodeAXSemanticNodeCount(sampled);
+        if (sampled && sampledSemanticCount > 0) {
+            rootNode = sampled;
+            semanticNodeCount = sampledSemanticCount;
+            if (sampledPID > 0) {
+                pid = sampledPID;
+                NSString *sampledBundleID = CloudCodeBundleIDForPID(sampledPID);
+                if (sampledBundleID.length > 0) { bundleID = sampledBundleID; }
+            }
+            backend = sampledBackend ?: @"AXRuntime.systemWide.elementAtPosition";
+        } else {
+            rootNode = nil;
+            semanticNodeCount = 0;
+        }
+    }
+    if (!rootNode || nodeCount == 0 || semanticNodeCount == 0) {
+        CloudCodePrintAXRuntimeDiagnostic(runtime, "empty-semantic-tree");
+        fprintf(stderr, "gui-tree: AX transport responded but no semantic/actionable foreground UI nodes were returned\n");
         return nil;
     }
     NSString *scope = [rootNode[@"role"] isEqual:@"AXHitTestSnapshot"] ? @"sampled_semantics" : @"full_application_tree_opportunistic";
@@ -1615,6 +1751,7 @@ static NSData *CloudCodeFrontmostTreeData(void)
         @"bundleId": bundleID ?: @"",
         @"pid": @(pid),
         @"nodeCount": @(nodeCount),
+        @"semanticNodeCount": @(semanticNodeCount),
         @"tree": rootNode
     };
     NSError *error = nil;

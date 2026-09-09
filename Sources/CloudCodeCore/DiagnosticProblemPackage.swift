@@ -1022,7 +1022,13 @@ public enum DiagnosticProblemPackageBuilder {
                 || combined.contains("structured plan local expectation did not become true before timeout") {
                 return "ax_target_absent"
             }
-            if combined.contains("no readable ui nodes") || combined.contains("empty tree") { return "ax_tree_empty" }
+            if combined.contains("no readable ui nodes")
+                || combined.contains("empty tree")
+                || combined.contains("no semantic/actionable foreground ui nodes")
+                || combined.contains("semantically empty tree")
+                || record.metadata["perceptionFallbackReason"] == "ax_transport_returned_semantically_empty_tree" {
+                return "ax_tree_empty"
+            }
             if combined.contains("timeout") || combined.contains("timed out") { return "ax_request_timeout" }
             return "ax_request_failed"
         }
@@ -1131,7 +1137,9 @@ public enum DiagnosticProblemPackageBuilder {
         switch reason {
         case "ax_request_timeout", "ax_request_failed", "ax_tree_empty", "ax_target_absent", "ax_semantic_match_ambiguous":
             return "avoid_repeating_ax_for_same_foreground;use_fresh_screenshot_then_local_ocr_or_existing_visual_fallback"
-        case "corevideo_allocation_failed", "coreml_runtime_failed", "ocr_request_failed":
+        case "corevideo_allocation_failed":
+            return "open_local_ocr_corevideo_circuit_breaker;avoid_same_context_vision_retry;continue_with_ax_or_fresh_screenshot_visual_fallback"
+        case "coreml_runtime_failed", "ocr_request_failed":
             return "capture_one_fresh_screenshot;retry_local_ocr_once_in_non_privileged_cpu_only_context;then_escalate"
         case "ocr_not_invoked":
             return "invoke_existing_local_ocr_path_once_before_remote_vision"
