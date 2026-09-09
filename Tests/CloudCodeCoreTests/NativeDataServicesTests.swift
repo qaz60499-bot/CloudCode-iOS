@@ -445,6 +445,41 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertTrue(graph.nodes.contains(where: { $0.resolvedPath == jsonURL.path }))
     }
 
+    func testAppsListSeedsMinimalAppKnowledgeForMatchedTarget() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let app = ResourceNode(
+            id: ResourceID("app://com.tencent.xin"),
+            kind: .app,
+            displayName: "微信",
+            logicalLocation: "app://com.tencent.xin",
+            resolvedPath: "/var/containers/Bundle/Application/TEST/WeChat.app",
+            ownerBundleID: "com.tencent.xin",
+            metadata: ["version": "8.0.76"]
+        )
+        let resolver = StaticAppResolver(apps: [app], bundlePaths: ["com.tencent.xin": app.resolvedPath ?? ""])
+        let resourceIndex = ProgressiveResourceIndex(fileURL: root.appendingPathComponent("index/resource-graph.json"))
+        let knowledge = AppKnowledgeRegistry(fileURL: root.appendingPathComponent("index/app-knowledge.json"))
+        let executor = try makeStructuredExecutor(root: root, resolver: resolver, resourceIndex: resourceIndex, appKnowledgeRegistry: knowledge)
+        let descriptor = ToolDescriptor(name: "apps.list", summary: "", risk: .readOnly)
+        let call = ToolCall(name: "apps.list", arguments: ["query": "微信"], sessionID: UUID())
+
+        let result = try await executor.execute(
+            call,
+            descriptor: descriptor,
+            context: ToolExecutionContext(permissionMode: .safe, capabilityProfile: publicNativeProfile(), allowedRoot: root)
+        )
+
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.payload["matchedCount"], "1")
+        let seeded = await knowledge.knowledge(for: "com.tencent.xin")
+        XCTAssertEqual(seeded?.appName, "微信")
+        XCTAssertEqual(seeded?.appVersion, "8.0.76")
+        XCTAssertTrue(seeded?.preferredRoutes.contains(.privateFramework) == true)
+        XCTAssertTrue(seeded?.preferredRoutes.contains(.guiFallback) == true)
+    }
+
     func testToolRouterProviderSchemaEligibilityOmitsUnavailableCapabilities() async throws {
         let registry = ToolRegistry(descriptors: [
             ToolDescriptor(name: "test.routable", summary: "", risk: .readOnly),

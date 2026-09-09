@@ -243,21 +243,50 @@ enum EmbeddedRootHelper {
         guard FileManager.default.fileExists(atPath: path), FileManager.default.isExecutableFile(atPath: path) else {
             return (nil, "\(executableName) 不可执行；跨 App 枚举保持不可用。")
         }
-        let result = run(["enumerate-json"], privilege: .isolatedUser, timeout: 5)
-        guard result.code == 0 else {
-            return (nil, failureDetail(prefix: "\(executableName) 隔离枚举", code: result.code, diagnostic: result.diagnostic))
-        }
-        let decoder = JSONDecoder()
-        if let data = result.diagnostic.data(using: .utf8), let payload = try? decoder.decode(EnumerationPayload.self, from: data) {
-            return (payload, "\(payload.backend) 已在 helper 子进程内完成枚举。")
-        }
-        if let start = result.diagnostic.firstIndex(of: "{"), let end = result.diagnostic.lastIndex(of: "}") {
-            let json = String(result.diagnostic[start...end])
-            if let data = json.data(using: .utf8), let payload = try? decoder.decode(EnumerationPayload.self, from: data) {
-                return (payload, "\(payload.backend) 已在 helper 子进程内完成枚举。")
+
+        func decode(_ diagnostic: String) -> EnumerationPayload? {
+            let decoder = JSONDecoder()
+            if let data = diagnostic.data(using: .utf8), let payload = try? decoder.decode(EnumerationPayload.self, from: data) {
+                return payload
             }
+            if let start = diagnostic.firstIndex(of: "{"), let end = diagnostic.lastIndex(of: "}") {
+                let json = String(diagnostic[start...end])
+                if let data = json.data(using: .utf8), let payload = try? decoder.decode(EnumerationPayload.self, from: data) {
+                    return payload
+                }
+            }
+            return nil
         }
-        return (nil, "\(executableName) 枚举输出无法解析；已按 fail-closed 处理。")
+
+        func hasCrossAppEvidence(_ payload: EnumerationPayload) -> Bool {
+            let ownBundleID = Bundle.main.bundleIdentifier
+            return payload.apps.contains { !$0.bundleID.isEmpty && $0.bundleID != ownBundleID }
+        }
+
+        // Cross-App discovery is invoked only by an explicit apps.list/apps.inspect/container request,
+        // never by the startup-safe path. On TrollStore, a detached non-root helper can receive a
+        // partial LaunchServices view and then spend the full watchdog window walking hundreds of
+        // Bundle containers, which made Build 99 collapse the live index back to Cloud Code itself.
+        // Prefer the same embedded helper under the TrollStore root persona for this read-only,
+        // bounded inventory operation; exact launch/uninstall still revalidate their own authority.
+        let privileged = run(["enumerate-json"], privilege: .root, timeout: 7)
+        if privileged.code == 0, let payload = decode(privileged.diagnostic), hasCrossAppEvidence(payload) {
+            return (payload, "\(payload.backend) 已通过 bounded root helper 完成跨 App 枚举。")
+        }
+        let privilegedDetail = privileged.code == 0
+            ? "root helper 只返回 Cloud Code 自身或输出无法解析"
+            : failureDetail(prefix: "\(executableName) root 枚举", code: privileged.code, diagnostic: privileged.diagnostic)
+
+        // Keep the isolated path as a compatibility fallback for runtimes where persona/root spawn is
+        // unavailable but LaunchServices is still fully visible to the embedded helper.
+        let isolated = run(["enumerate-json"], privilege: .isolatedUser, timeout: 5)
+        if isolated.code == 0, let payload = decode(isolated.diagnostic), hasCrossAppEvidence(payload) {
+            return (payload, "\(payload.backend) 已在隔离 helper 子进程内完成跨 App 枚举；root 路径未采用：\(privilegedDetail)")
+        }
+        let isolatedDetail = isolated.code == 0
+            ? "隔离 helper 只返回 Cloud Code 自身或输出无法解析"
+            : failureDetail(prefix: "\(executableName) 隔离枚举", code: isolated.code, diagnostic: isolated.diagnostic)
+        return (nil, "跨 App 枚举未建立有效索引；root：\(privilegedDetail)；isolated：\(isolatedDetail)。")
     }
 
     static func appIntrospection(bundleID: String) -> (payload: AppIntrospectionPayload?, detail: String) {
@@ -1105,8 +1134,9 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
         let ownBundleID = Bundle.main.bundleIdentifier
         let crossAppCount = parsedApps.filter { $0.ownerBundleID != nil && $0.ownerBundleID != ownBundleID }.count
         guard crossAppCount > 0 else {
-            enumerationDetail = "\(payload.backend) helper 只返回 Cloud Code 自身或无法解析的记录；跨 App 枚举未通过。"
+            enumerationDetail = "\(payload.backend) helper 只返回 Cloud Code 自身或无法解析的记录；跨 App 枚举未通过。失败结果缓存 30 秒，避免同一任务反复触发慢枚举。"
             cachedApps = fallbackOwnApp()
+            failedIndexRetryAfter = Date().addingTimeInterval(30)
             return
         }
 

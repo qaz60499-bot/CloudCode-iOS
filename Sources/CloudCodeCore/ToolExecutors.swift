@@ -109,6 +109,41 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             let limit = min(50, max(1, Int(call.arguments["limit"] ?? "24") ?? 24))
             let boundedOffset = min(offset, filtered.count)
             let page = filtered.dropFirst(boundedOffset).prefix(limit)
+
+            // A successful installed-App lookup is already enough evidence to establish the target's
+            // stable identity. Persist a minimal AppKnowledge record for the returned page so a later
+            // GUI/native step does not fall back to Cloud Code-only knowledge simply because the model
+            // has not paid for apps.inspect yet. Static metadata/deep links remain lazy and are filled
+            // by apps.inspect; this seed never trusts or persists container UUID paths.
+            if let appKnowledgeRegistry {
+                for app in page {
+                    guard let bundleID = app.ownerBundleID, !bundleID.isEmpty else { continue }
+                    if var existing = await appKnowledgeRegistry.knowledge(for: bundleID) {
+                        var changed = false
+                        if existing.appName != app.displayName {
+                            existing.appName = app.displayName
+                            changed = true
+                        }
+                        let version = app.metadata["version"]
+                        if version?.isEmpty == false, existing.appVersion != version {
+                            existing.appVersion = version
+                            changed = true
+                        }
+                        if changed { try? await appKnowledgeRegistry.upsert(existing) }
+                    } else {
+                        let knowledge = AppKnowledge(
+                            appName: app.displayName,
+                            bundleID: bundleID,
+                            preferredRoutes: [.structuredTool, .privateFramework, .guiFallback],
+                            successRate: 0.5,
+                            estimatedCost: 0.5,
+                            appVersion: app.metadata["version"]
+                        )
+                        try? await appKnowledgeRegistry.upsert(knowledge)
+                    }
+                }
+            }
+
             // apps.list is a discovery/index tool, not a container dump. Return a bounded page and
             // keep bundle/data paths behind apps.inspect/container.resolve. This prevents a device
             // with hundreds of apps from repeatedly injecting the entire inventory into the Agent
