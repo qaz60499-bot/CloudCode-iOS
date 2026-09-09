@@ -204,6 +204,13 @@ enum EmbeddedRootHelper {
         )
     }
 
+    private static func mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: Int, stderr: String) -> Bool {
+        let parentTimeoutCode = -7000 - Int(ETIMEDOUT)
+        return code == parentTimeoutCode
+            && stderr.contains("helper timed out after")
+            && !stderr.contains("capture truncated")
+    }
+
     private static func failureDetail(prefix: String, code: Int, diagnostic: String) -> String {
         let meaning: String
         switch code {
@@ -284,38 +291,57 @@ enum EmbeddedRootHelper {
         // Bundle containers, which made Build 99 collapse the live index back to Cloud Code itself.
         // Prefer the same embedded helper under the TrollStore root persona for this read-only,
         // bounded inventory operation; exact launch/uninstall still revalidate their own authority.
-        let privileged = run(["enumerate-json"], privilege: .root, timeout: 7)
-        if privileged.code == 0, let payload = decode(privileged.diagnostic), hasCrossAppEvidence(payload) {
-            return (payload, "\(payload.backend) 已通过 bounded root helper 完成跨 App 枚举。")
+        let privileged = runSeparated(["enumerate-json"], privilege: .root, timeout: 7)
+        if let payload = decode(privileged.stdout), hasCrossAppEvidence(payload) {
+            if privileged.code == 0 {
+                return (payload, "\(payload.backend) 已通过 bounded root helper 完成跨 App 枚举。")
+            }
+            if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: privileged.code, stderr: privileged.stderr) {
+                return (payload, "\(payload.backend) 已返回可完整解码的跨 App 只读枚举；helper 随后在退出阶段触发父进程超时，因此保留已验证 payload，同时把退出超时留给诊断。")
+            }
         }
+        let privilegedDiagnostic = privileged.stderr.isEmpty ? privileged.stdout : privileged.stderr
         let privilegedDetail = privileged.code == 0
             ? "root helper 只返回 Cloud Code 自身或输出无法解析"
-            : failureDetail(prefix: "\(executableName) root 枚举", code: privileged.code, diagnostic: privileged.diagnostic)
+            : failureDetail(prefix: "\(executableName) root 枚举", code: privileged.code, diagnostic: privilegedDiagnostic)
 
         // Keep the isolated path as a compatibility fallback for runtimes where persona/root spawn is
         // unavailable but LaunchServices is still fully visible to the embedded helper.
-        let isolated = run(["enumerate-json"], privilege: .isolatedUser, timeout: 5)
-        if isolated.code == 0, let payload = decode(isolated.diagnostic), hasCrossAppEvidence(payload) {
-            return (payload, "\(payload.backend) 已在隔离 helper 子进程内完成跨 App 枚举；root 路径未采用：\(privilegedDetail)")
+        let isolated = runSeparated(["enumerate-json"], privilege: .isolatedUser, timeout: 5)
+        if let payload = decode(isolated.stdout), hasCrossAppEvidence(payload) {
+            if isolated.code == 0 {
+                return (payload, "\(payload.backend) 已在隔离 helper 子进程内完成跨 App 枚举；root 路径未采用：\(privilegedDetail)")
+            }
+            if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: isolated.code, stderr: isolated.stderr) {
+                return (payload, "\(payload.backend) 已返回可完整解码的隔离只读枚举；helper 随后在退出阶段触发父进程超时。root 路径未采用：\(privilegedDetail)")
+            }
         }
+        let isolatedDiagnostic = isolated.stderr.isEmpty ? isolated.stdout : isolated.stderr
         let isolatedDetail = isolated.code == 0
             ? "隔离 helper 只返回 Cloud Code 自身或输出无法解析"
-            : failureDetail(prefix: "\(executableName) 隔离枚举", code: isolated.code, diagnostic: isolated.diagnostic)
+            : failureDetail(prefix: "\(executableName) 隔离枚举", code: isolated.code, diagnostic: isolatedDiagnostic)
         return (nil, "跨 App 枚举未建立有效索引；root：\(privilegedDetail)；isolated：\(isolatedDetail)。")
     }
 
     static func appIntrospection(bundleID: String) -> (payload: AppIntrospectionPayload?, detail: String) {
         let result = runSeparated(["app-introspect-json", bundleID], privilege: .root, timeout: 5)
-        guard result.code == 0 else {
-            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
-            return (nil, failureDetail(prefix: "App introspection", code: result.code, diagnostic: diagnostic))
-        }
         guard let data = result.stdout.data(using: .utf8), data.count <= 256 * 1024,
               let payload = try? JSONDecoder().decode(AppIntrospectionPayload.self, from: data),
               payload.bundleID == bundleID else {
+            if result.code != 0 {
+                let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+                return (nil, failureDetail(prefix: "App introspection", code: result.code, diagnostic: diagnostic))
+            }
             return (nil, "App introspection 返回内容无法验证；已按 fail-closed 处理。")
         }
-        return (payload, "已通过 bounded root helper 读取当前 App 静态 metadata；结果仅作为 discovery/performance hint。")
+        if result.code == 0 {
+            return (payload, "已通过 bounded root helper 读取当前 App 静态 metadata；结果仅作为 discovery/performance hint。")
+        }
+        if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, stderr: result.stderr) {
+            return (payload, "App introspection 已返回 bundleID 匹配且可完整解码的只读 metadata；helper 随后在退出阶段触发父进程超时，因此保留已验证 payload。")
+        }
+        let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+        return (nil, failureDetail(prefix: "App introspection", code: result.code, diagnostic: diagnostic))
     }
 
     static func launchCapability() -> RootHelperCapabilitySnapshot {
@@ -654,6 +680,7 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
     private var negativeBundleIDs: Set<String> = []
     private var unregisteredBundleIDs: Set<String> = []
     private var enumerationProven = false
+    private var hasLastKnownGoodCrossAppIndex = false
     private var enumerationDetail = "尚未检测已安装 App 枚举能力。"
     private var uninstallDetail = "尚未检测 App 卸载后端。"
     private var pendingUninstallBundleID: String?
@@ -667,6 +694,7 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
 
     public func startupSafeApps() -> [ResourceNode] {
         enumerationProven = false
+        hasLastKnownGoodCrossAppIndex = false
         enumerationDetail = "自动启动阶段仅加载 Cloud Code 自身；跨 App 私有 API 探测已延后。"
         uninstallDetail = "卸载能力尚未进行显式设备验证。"
         cachedLaunchCapability = nil
@@ -802,12 +830,20 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
     }
 
     public func canEnumerateInstalledApps() async -> Bool {
-        if shouldRefreshIndex() { refresh() }
+        // Capability/status reads must not start a second broad scan. Callers such as apps.list
+        // first obtain installedApps(), which is the single place allowed to perform the necessary
+        // refresh for that read. This method only reports whether that completed refresh earned
+        // fresh cross-App authority.
         return enumerationProven
     }
 
+    public func canUseInstalledAppIndex() async -> Bool {
+        // Same one-refresh rule as above: report whether the current in-memory snapshot is usable
+        // for read-only discovery, including a retained last-known-good cross-App index.
+        return enumerationProven || hasLastKnownGoodCrossAppIndex
+    }
+
     public func installedAppEnumerationDetail() async -> String {
-        if shouldRefreshIndex() { refresh() }
         return enumerationDetail
     }
 
@@ -1131,18 +1167,52 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
     private func refresh() {
         defer { appIndexNeedsRefresh = false }
 
+        // A manual capability refresh is advisory discovery, not authority to erase a previously
+        // verified installed-App index. Build 107 cleared the last-known-good cache before running
+        // the helper; when the helper emitted a complete list but then hit its parent timeout, the
+        // resolver collapsed to Cloud Code-only and subsequently reported real apps such as WeChat
+        // as missing. Preserve the previous cross-app snapshot until a new snapshot is fully proven.
+        let previousApps = cachedApps
+        let previousBundlePaths = bundlePaths
+        let previousContainerPaths = containerPaths
+        let previousUnregisteredBundleIDs = unregisteredBundleIDs
+        let ownBundleID = Bundle.main.bundleIdentifier
+        let hadLastKnownGoodCrossAppIndex = hasLastKnownGoodCrossAppIndex && previousApps.contains {
+            $0.ownerBundleID != nil && $0.ownerBundleID != ownBundleID
+        }
+        // Every refresh must earn fresh authority again. A retained last-known-good index remains
+        // usable only for read-only discovery and exact routing hints.
         enumerationProven = false
-        enumerationDetail = "已安装 App 枚举尚未得到跨 App 可见性的有效证据。"
+
+        enumerationDetail = "正在根据本次 helper 隔离探测刷新已安装 App 索引。"
         uninstallDetail = "正在根据本次 helper 隔离探测重新判断卸载后端。"
-        bundlePaths = [:]
-        containerPaths = [:]
-        unregisteredBundleIDs.removeAll()
 
         let isolated = EmbeddedRootHelper.enumerateInstalledApps()
         guard let payload = isolated.payload, !payload.apps.isEmpty else {
-            enumerationDetail = isolated.detail + " 失败结果会缓存 30 秒，避免模型循环触发全量枚举。"
-            cachedApps = fallbackOwnApp()
             failedIndexRetryAfter = Date().addingTimeInterval(30)
+            if hadLastKnownGoodCrossAppIndex {
+                cachedApps = previousApps
+                bundlePaths = previousBundlePaths
+                containerPaths = previousContainerPaths
+                unregisteredBundleIDs = previousUnregisteredBundleIDs
+                hasLastKnownGoodCrossAppIndex = true
+                enumerationDetail = "本次重新检测失败；继续保留最近一次已验证的跨 App 内存索引，不把临时 helper 故障解释成 App 不存在。失败详情：\(isolated.detail.prefix(1200))。30 秒后才允许再次做全量枚举；当前枚举权威状态保持未验证，卸载/停止等状态改变操作不能使用这份旧索引作为授权依据。"
+                uninstallDetail = "本次索引刷新失败；保留最近一次只读 App 索引。任何卸载仍必须重新通过精确安装状态和卸载后端验证。"
+            } else {
+                enumerationProven = false
+                hasLastKnownGoodCrossAppIndex = false
+                enumerationDetail = isolated.detail + " 失败结果会缓存 30 秒，避免模型循环触发全量枚举。"
+                cachedApps = fallbackOwnApp()
+                bundlePaths = Dictionary(uniqueKeysWithValues: cachedApps.compactMap { node in
+                    guard let bundleID = node.ownerBundleID, let path = node.resolvedPath else { return nil }
+                    return (bundleID, path)
+                })
+                containerPaths = [:]
+                if let ownBundleID = Bundle.main.bundleIdentifier {
+                    containerPaths[ownBundleID] = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).path
+                }
+                unregisteredBundleIDs.removeAll()
+            }
             return
         }
 
@@ -1170,16 +1240,36 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
         }
 
         let parsedApps = appsByBundleID.values.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
-        let ownBundleID = Bundle.main.bundleIdentifier
         let crossAppCount = parsedApps.filter { $0.ownerBundleID != nil && $0.ownerBundleID != ownBundleID }.count
         guard crossAppCount > 0 else {
-            enumerationDetail = "\(payload.backend) helper 只返回 Cloud Code 自身或无法解析的记录；跨 App 枚举未通过。失败结果缓存 30 秒，避免同一任务反复触发慢枚举。"
-            cachedApps = fallbackOwnApp()
             failedIndexRetryAfter = Date().addingTimeInterval(30)
+            if hadLastKnownGoodCrossAppIndex {
+                cachedApps = previousApps
+                bundlePaths = previousBundlePaths
+                containerPaths = previousContainerPaths
+                unregisteredBundleIDs = previousUnregisteredBundleIDs
+                hasLastKnownGoodCrossAppIndex = true
+                enumerationDetail = "\(payload.backend) 本次只返回 Cloud Code 自身或无法解析的记录；未覆盖最近一次已验证的跨 App 只读索引。当前枚举权威状态保持未验证，30 秒后允许重试。"
+                uninstallDetail = "本次索引刷新未建立新的跨 App 权威快照；旧索引仅供只读发现，卸载仍要求新的设备验证。"
+            } else {
+                cachedApps = fallbackOwnApp()
+                bundlePaths = Dictionary(uniqueKeysWithValues: cachedApps.compactMap { node in
+                    guard let bundleID = node.ownerBundleID, let path = node.resolvedPath else { return nil }
+                    return (bundleID, path)
+                })
+                containerPaths = [:]
+                if let ownBundleID = Bundle.main.bundleIdentifier {
+                    containerPaths[ownBundleID] = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).path
+                }
+                unregisteredBundleIDs.removeAll()
+                hasLastKnownGoodCrossAppIndex = false
+                enumerationDetail = "\(payload.backend) helper 只返回 Cloud Code 自身或无法解析的记录；跨 App 枚举未通过。失败结果缓存 30 秒，避免同一任务反复触发慢枚举。"
+            }
             return
         }
 
         enumerationProven = true
+        hasLastKnownGoodCrossAppIndex = true
         failedIndexRetryAfter = nil
         negativeBundleIDs.removeAll()
         enumerationDetail = "\(payload.backend) 已在 helper 子进程内返回 \(parsedApps.count) 个有效应用，其中 \(crossAppCount) 个不是 Cloud Code 自身；后续沿用内存索引直到显式失效。"

@@ -52,11 +52,16 @@ public protocol AppIntrospectionProviding: Sendable {
 }
 
 public protocol AppEnumerationCapabilityProviding: Sendable {
+    /// Fresh capability proof for operations that require current cross-App authority.
     func canEnumerateInstalledApps() async -> Bool
+    /// Read-only discovery may continue from the most recent verified in-memory index after a
+    /// transient refresh failure. This must never be used as authority for destructive operations.
+    func canUseInstalledAppIndex() async -> Bool
     func installedAppEnumerationDetail() async -> String
 }
 
 public extension AppEnumerationCapabilityProviding {
+    func canUseInstalledAppIndex() async -> Bool { await canEnumerateInstalledApps() }
     func installedAppEnumerationDetail() async -> String { "Installed-app enumeration detail is unavailable." }
 }
 

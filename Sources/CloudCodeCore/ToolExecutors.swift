@@ -95,19 +95,24 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
 
         case "apps.list":
             let apps = await appResolver.installedApps()
-            if let enumerationProvider = appResolver as? any AppEnumerationCapabilityProviding,
-               !(await enumerationProvider.canEnumerateInstalledApps()) {
-                let detail = await enumerationProvider.installedAppEnumerationDetail()
-                return ToolResult(
-                    toolCallID: call.id,
-                    success: false,
-                    summary: "跨 App 应用索引当前不可用；未将 Cloud Code 自身视为完整安装列表。",
-                    payload: [
-                        "enumeration": "unavailable",
-                        "detail": String(detail.prefix(2_048)),
-                        "ownAppFallbackSuppressed": "true"
-                    ]
-                )
+            var enumerationFreshness = "fresh"
+            if let enumerationProvider = appResolver as? any AppEnumerationCapabilityProviding {
+                guard await enumerationProvider.canUseInstalledAppIndex() else {
+                    let detail = await enumerationProvider.installedAppEnumerationDetail()
+                    return ToolResult(
+                        toolCallID: call.id,
+                        success: false,
+                        summary: "跨 App 应用索引当前不可用；未将 Cloud Code 自身视为完整安装列表。",
+                        payload: [
+                            "enumeration": "unavailable",
+                            "detail": String(detail.prefix(2_048)),
+                            "ownAppFallbackSuppressed": "true"
+                        ]
+                    )
+                }
+                if !(await enumerationProvider.canEnumerateInstalledApps()) {
+                    enumerationFreshness = "stale_last_known_good"
+                }
             }
             let query = call.arguments["query"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let filtered: [ResourceNode]
@@ -184,16 +189,29 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
                     "matchedCount": String(filtered.count),
                     "offset": String(boundedOffset),
                     "limit": String(limit),
-                    "hasMore": String(hasMore)
+                    "hasMore": String(hasMore),
+                    "enumeration": enumerationFreshness
                 ]
             )
 
         case "apps.inspect":
             guard let bundleID = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
-            let node = try await resourceResolver.resolve(ResourceID("app://\(bundleID)"))
+            // Prefer the already-indexed identity before paying for another exact helper lookup.
+            // This is especially important after a transient refresh failure: a retained
+            // last-known-good entry still proves that the read-only target is known, even though
+            // fresh enumeration authority is unavailable for destructive operations.
+            let indexedApps = await appResolver.installedApps()
+            let indexedNode = indexedApps.first(where: { $0.ownerBundleID == bundleID })
+            let node: ResourceNode
+            if let indexedNode, indexedNode.resolvedPath != nil {
+                node = indexedNode
+            } else {
+                node = try await resourceResolver.resolve(ResourceID("app://\(bundleID)"))
+            }
             let dataContainer = await appResolver.dataContainerPath(for: bundleID)
             var payload = node.metadata
             payload["bundleId"] = bundleID
+            payload["displayName"] = node.displayName
             payload["bundlePath"] = node.resolvedPath ?? ""
             payload["dataContainer"] = dataContainer ?? ""
 
@@ -257,6 +275,11 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
                     }
                     if !localNodes.isEmpty { try? await resourceIndex.add(localNodes, source: "app_introspection") }
                 }
+            } else {
+                // Metadata enrichment is optional for read-only inspection. Do not translate an
+                // introspection helper timeout/unavailability into "App does not exist" when the
+                // installed-App index already supplied a valid identity/path/version baseline.
+                payload["introspection"] = "degraded_unavailable"
             }
             return try untrustedResult(call.id, summary: "已解析 \(bundleID) 并按需更新 AppKnowledge", key: "app", value: payload, source: "apps.inspect")
 

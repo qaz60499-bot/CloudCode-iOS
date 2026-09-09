@@ -510,6 +510,74 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertTrue(result.summary.contains("未将 Cloud Code 自身视为完整安装列表"))
     }
 
+    func testAppsListUsesLastKnownGoodIndexWhenFreshEnumerationTemporarilyFails() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let wechat = ResourceNode(
+            id: ResourceID("app://com.tencent.xin"),
+            kind: .app,
+            displayName: "微信",
+            logicalLocation: "app://com.tencent.xin",
+            resolvedPath: "/var/containers/Bundle/Application/TEST/WeChat.app",
+            ownerBundleID: "com.tencent.xin",
+            metadata: ["version": "8.0.76"]
+        )
+        let resolver = StaleEnumerationResolver(apps: [wechat])
+        let resourceIndex = ProgressiveResourceIndex(fileURL: root.appendingPathComponent("index/resource-graph.json"))
+        let executor = try makeStructuredExecutor(root: root, resolver: resolver, resourceIndex: resourceIndex)
+        let descriptor = ToolDescriptor(name: "apps.list", summary: "", risk: .readOnly)
+        let call = ToolCall(name: "apps.list", arguments: ["query": "微信"], sessionID: UUID())
+
+        let result = try await executor.execute(
+            call,
+            descriptor: descriptor,
+            context: ToolExecutionContext(permissionMode: .safe, capabilityProfile: publicNativeProfile(), allowedRoot: root)
+        )
+
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.payload["matchedCount"], "1")
+        XCTAssertEqual(result.payload["enumeration"], "stale_last_known_good")
+        XCTAssertTrue(result.payload["apps"]?.contains("com.tencent.xin") == true)
+        XCTAssertTrue(result.payload["apps"]?.contains("8.0.76") == true)
+    }
+
+    func testAppsInspectKeepsIndexedIdentityWhenIntrospectionIsUnavailable() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let wechat = ResourceNode(
+            id: ResourceID("app://com.tencent.xin"),
+            kind: .app,
+            displayName: "微信",
+            logicalLocation: "app://com.tencent.xin",
+            resolvedPath: "/var/containers/Bundle/Application/TEST/WeChat.app",
+            ownerBundleID: "com.tencent.xin",
+            metadata: ["version": "8.0.76"]
+        )
+        let resolver = DegradedIntrospectionResolver(
+            apps: [wechat],
+            bundlePaths: ["com.tencent.xin": wechat.resolvedPath ?? ""],
+            containerPaths: ["com.tencent.xin": "/var/mobile/Containers/Data/Application/TEST"]
+        )
+        let resourceIndex = ProgressiveResourceIndex(fileURL: root.appendingPathComponent("index/resource-graph.json"))
+        let executor = try makeStructuredExecutor(root: root, resolver: resolver, resourceIndex: resourceIndex)
+        let descriptor = ToolDescriptor(name: "apps.inspect", summary: "", risk: .readOnly)
+        let call = ToolCall(name: "apps.inspect", arguments: ["bundleId": "com.tencent.xin"], sessionID: UUID())
+
+        let result = try await executor.execute(
+            call,
+            descriptor: descriptor,
+            context: ToolExecutionContext(permissionMode: .safe, capabilityProfile: publicNativeProfile(), allowedRoot: root)
+        )
+
+        XCTAssertTrue(result.success)
+        XCTAssertTrue(result.payload["app"]?.contains("com.tencent.xin") == true)
+        XCTAssertTrue(result.payload["app"]?.contains("微信") == true)
+        XCTAssertTrue(result.payload["app"]?.contains("8.0.76") == true)
+        XCTAssertTrue(result.payload["app"]?.contains("degraded_unavailable") == true)
+    }
+
     func testToolRouterProviderSchemaEligibilityOmitsUnavailableCapabilities() async throws {
         let registry = ToolRegistry(descriptors: [
             ToolDescriptor(name: "test.routable", summary: "", risk: .readOnly),
@@ -600,7 +668,30 @@ private struct UnverifiedEnumerationResolver: AppContainerResolving, AppEnumerat
     func bundlePath(for bundleID: String) async -> String? { nil }
     func dataContainerPath(for bundleID: String) async -> String? { nil }
     func canEnumerateInstalledApps() async -> Bool { false }
+    func canUseInstalledAppIndex() async -> Bool { false }
     func installedAppEnumerationDetail() async -> String { "helper enumeration failed" }
+}
+
+private struct StaleEnumerationResolver: AppContainerResolving, AppEnumerationCapabilityProviding, Sendable {
+    let apps: [ResourceNode]
+
+    func installedApps() async -> [ResourceNode] { apps }
+    func bundlePath(for bundleID: String) async -> String? { apps.first(where: { $0.ownerBundleID == bundleID })?.resolvedPath }
+    func dataContainerPath(for bundleID: String) async -> String? { nil }
+    func canEnumerateInstalledApps() async -> Bool { false }
+    func canUseInstalledAppIndex() async -> Bool { true }
+    func installedAppEnumerationDetail() async -> String { "fresh helper failed; using last-known-good" }
+}
+
+private struct DegradedIntrospectionResolver: AppContainerResolving, AppIntrospectionProviding, Sendable {
+    let apps: [ResourceNode]
+    let bundlePaths: [String: String]
+    let containerPaths: [String: String]
+
+    func installedApps() async -> [ResourceNode] { apps }
+    func bundlePath(for bundleID: String) async -> String? { bundlePaths[bundleID] }
+    func dataContainerPath(for bundleID: String) async -> String? { containerPaths[bundleID] }
+    func appIntrospection(bundleID: String) async -> AppStaticIntrospection? { nil }
 }
 
 private struct TestCapabilityProbe: CapabilityProbing, Sendable {

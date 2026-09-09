@@ -22,7 +22,13 @@ extern void *objc_autoreleasePoolPush(void);
 
 static __attribute__((noreturn)) void CloudCodeExitOneShot(int code)
 {
-    fflush(NULL);
+    // Never call fflush(NULL) in the helper after private iOS frameworks have been loaded.
+    // Real-device build 107 evidence showed successful commands had already emitted their full
+    // stdout/stderr payload, then wedged while flushing unrelated process-global stdio streams and
+    // were killed by the 4–6s parent watchdog. Flush only the two observable pipes owned by the
+    // bridge, then hard-exit before private-framework teardown.
+    fflush(stdout);
+    fflush(stderr);
     _exit(code);
 }
 
@@ -1272,6 +1278,10 @@ int main(int argc, const char *argv[])
     // The kernel reclaims all helper memory immediately; no state is shared with the host process.
     (void)objc_autoreleasePoolPush();
     int result = CloudCodeRunOneShotCommand(argc, argv);
-    fflush(NULL);
+    // Same boundary as CloudCodeExitOneShot above: only the bridge-owned output streams are
+    // observable. Flushing every process-global FILE* can hang after LaunchServices/BackBoard/
+    // accessibility frameworks are loaded and turns already-completed work into a false timeout.
+    fflush(stdout);
+    fflush(stderr);
     _exit(result);
 }

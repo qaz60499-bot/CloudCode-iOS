@@ -40,7 +40,11 @@
 
 static __attribute__((noreturn)) void CloudCodeGUIExitOneShot(int code)
 {
-    fflush(NULL);
+    // Do not flush every process-global stdio stream after loading private GUI frameworks. On the
+    // real device that can wedge after a successful screenshot/AX command and make the parent
+    // watchdog report a false timeout. Only stdout/stderr are owned by the bridge and observable.
+    fflush(stdout);
+    fflush(stderr);
     _exit(code);
 }
 
