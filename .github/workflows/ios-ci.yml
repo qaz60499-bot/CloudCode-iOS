@@ -520,8 +520,12 @@ jobs:
                   raise SystemExit(f'FAIL: AX runtime lost bounded standalone/context-bound capability marker: {marker}')
           if '_AXSSetAutomationEnabled' in gui_text or 'CloudCodeEnableAXAutomationForRequest' in gui_text:
               raise SystemExit('FAIL: detached AX helper must not mutate the global automation switch; SIGKILL timeout cannot guarantee restoration')
-          if 'runtime.setAttribute(seed, CFSTR("AXManualAccessibility"), kCFBooleanTrue)' in gui_text:
-              raise SystemExit('FAIL: AX probe must remain passive and must not enable AXManualAccessibility/visible highlight mode')
+          import re
+          if re.search(r'CFSTR\(\s*"AXManualAccessibility"\s*\)', gui_text) or re.search(r'@"AXManualAccessibility"', gui_text):
+              raise SystemExit('FAIL: AX/OCR automation must remain passive; AXManualAccessibility is forbidden because it can create a visible green accessibility highlight on the user screen')
+          for visible_overlay_marker in ('CAShapeLayer', 'UIWindow(', 'strokeColor', 'borderColor', 'systemGreen', 'UIColor.green'):
+              if visible_overlay_marker in gui_text:
+                  raise SystemExit(f'FAIL: root GUI perception helper must not draw a visible scan/highlight overlay: {visible_overlay_marker}')
           for marker in ('CloudCodePointSizedScreenshot', 'CGImageGetWidth(backing)', 'CGImageGetHeight(backing)', 'normalize-backing-pixels', 'UIGraphicsBeginImageContextWithOptions(target, YES, 1.0)'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: screenshot backing pixels are no longer normalized into logical GUI point coordinates: {marker}')
@@ -540,6 +544,10 @@ jobs:
               raise SystemExit('FAIL: OCR regressed to unconditional full-screen tiny-text recognition')
           if 'EmbeddedRootHelper.guiOCR' in local_vision:
               raise SystemExit('FAIL: local OCR routing regressed back into the privileged/root GUI helper')
+          vision_overlay_surface = local_vision + '\n' + vision_text
+          for visible_overlay_marker in ('CAShapeLayer', 'UIWindow(', 'strokeColor', 'borderColor', 'systemGreen', 'UIColor.green'):
+              if visible_overlay_marker in vision_overlay_surface:
+                  raise SystemExit(f'FAIL: OCR must remain data-only/background-capable and must not render a visible scan box: {visible_overlay_marker}')
           project_text = Path('project.yml').read_text(encoding='utf-8')
           for marker in ('CloudCodeVisionHelper', 'Sources/CloudCodeVisionHelper/main.m', '-framework ImageIO'):
               if marker not in project_text:
