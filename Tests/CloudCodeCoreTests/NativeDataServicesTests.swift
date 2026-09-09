@@ -480,6 +480,36 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertTrue(seeded?.preferredRoutes.contains(.guiFallback) == true)
     }
 
+    func testAppsListFailsClosedWhenCrossAppEnumerationIsUnverified() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let ownApp = ResourceNode(
+            id: ResourceID("app://com.cloudcode.ios"),
+            kind: .app,
+            displayName: "Cloud Code",
+            logicalLocation: "app://com.cloudcode.ios",
+            resolvedPath: "/var/containers/Bundle/Application/TEST/CloudCode.app",
+            ownerBundleID: "com.cloudcode.ios"
+        )
+        let resolver = UnverifiedEnumerationResolver(apps: [ownApp])
+        let resourceIndex = ProgressiveResourceIndex(fileURL: root.appendingPathComponent("index/resource-graph.json"))
+        let executor = try makeStructuredExecutor(root: root, resolver: resolver, resourceIndex: resourceIndex)
+        let descriptor = ToolDescriptor(name: "apps.list", summary: "", risk: .readOnly)
+        let call = ToolCall(name: "apps.list", arguments: ["query": "微信"], sessionID: UUID())
+
+        let result = try await executor.execute(
+            call,
+            descriptor: descriptor,
+            context: ToolExecutionContext(permissionMode: .safe, capabilityProfile: publicNativeProfile(), allowedRoot: root)
+        )
+
+        XCTAssertFalse(result.success)
+        XCTAssertEqual(result.payload["enumeration"], "unavailable")
+        XCTAssertEqual(result.payload["ownAppFallbackSuppressed"], "true")
+        XCTAssertTrue(result.summary.contains("未将 Cloud Code 自身视为完整安装列表"))
+    }
+
     func testToolRouterProviderSchemaEligibilityOmitsUnavailableCapabilities() async throws {
         let registry = ToolRegistry(descriptors: [
             ToolDescriptor(name: "test.routable", summary: "", risk: .readOnly),
@@ -513,7 +543,7 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertEqual(metric.outcome, "completed")
     }
 
-    private func makeStructuredExecutor(root: URL, resolver: StaticAppResolver, resourceIndex: ProgressiveResourceIndex, appKnowledgeRegistry: AppKnowledgeRegistry? = nil) throws -> StructuredToolExecutor {
+    private func makeStructuredExecutor(root: URL, resolver: any AppContainerResolving, resourceIndex: ProgressiveResourceIndex, appKnowledgeRegistry: AppKnowledgeRegistry? = nil) throws -> StructuredToolExecutor {
         let policy = PolicyEngine()
         let audit = AuditLogStore(fileURL: root.appendingPathComponent("audit/audit.jsonl"))
         let journal = TransactionJournal(fileURL: root.appendingPathComponent("transactions/transactions.json"))
@@ -561,6 +591,16 @@ final class NativeDataServicesTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root
     }
+}
+
+private struct UnverifiedEnumerationResolver: AppContainerResolving, AppEnumerationCapabilityProviding, Sendable {
+    let apps: [ResourceNode]
+
+    func installedApps() async -> [ResourceNode] { apps }
+    func bundlePath(for bundleID: String) async -> String? { nil }
+    func dataContainerPath(for bundleID: String) async -> String? { nil }
+    func canEnumerateInstalledApps() async -> Bool { false }
+    func installedAppEnumerationDetail() async -> String { "helper enumeration failed" }
 }
 
 private struct TestCapabilityProbe: CapabilityProbing, Sendable {

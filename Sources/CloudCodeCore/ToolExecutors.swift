@@ -95,6 +95,20 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
 
         case "apps.list":
             let apps = await appResolver.installedApps()
+            if let enumerationProvider = appResolver as? any AppEnumerationCapabilityProviding,
+               !(await enumerationProvider.canEnumerateInstalledApps()) {
+                let detail = await enumerationProvider.installedAppEnumerationDetail()
+                return ToolResult(
+                    toolCallID: call.id,
+                    success: false,
+                    summary: "跨 App 应用索引当前不可用；未将 Cloud Code 自身视为完整安装列表。",
+                    payload: [
+                        "enumeration": "unavailable",
+                        "detail": String(detail.prefix(2_048)),
+                        "ownAppFallbackSuppressed": "true"
+                    ]
+                )
+            }
             let query = call.arguments["query"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let filtered: [ResourceNode]
             if query.isEmpty {
