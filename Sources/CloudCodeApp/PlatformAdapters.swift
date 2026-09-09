@@ -156,16 +156,31 @@ enum EmbeddedRootHelper {
         guard embeddedHelperMatchesExpectedProtocol else {
             return (69, "内嵌 CloudCodeRootHelper 与当前 App 协议不匹配；拒绝执行，避免误用旧 helper。")
         }
-        var diagnostic: NSString?
-        let code = CloudCodeSpawnHelperWithOutput(
+
+        // RootHelperBridge appends transport/process evidence to stderr for CloudCode helpers.
+        // Machine-readable helper payloads and exact probe markers live on stdout. Keeping the two
+        // streams merged made a successful `enumerate-json` look like two concatenated JSON objects
+        // and also made the exact protocol marker probe fail. Preserve stdout as the authoritative
+        // success payload; only fold stderr into the diagnostic on failure (or when success has no
+        // stdout payload at all).
+        var standardOutput: NSString?
+        var standardError: NSString?
+        let code = CloudCodeSpawnHelperWithSeparatedOutput(
             executablePath,
             arguments,
             privilege == .root,
             timeout,
-            &diagnostic
+            &standardOutput,
+            &standardError
         )
-        let text = (diagnostic as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return (code, text)
+        let stdout = (standardOutput as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let stderr = (standardError as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if code == 0 {
+            return (code, stdout)
+        }
+        if stdout.isEmpty { return (code, stderr) }
+        if stderr.isEmpty { return (code, stdout) }
+        return (code, stdout + "\n" + stderr)
     }
 
     private static func runSeparated(_ arguments: [String], privilege: PrivilegeMode, timeout: TimeInterval = 6) -> (code: Int, stdout: String, stderr: String) {
