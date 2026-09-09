@@ -254,23 +254,23 @@ final class CLIRuntimeTests: XCTestCase {
             context: context()
         )
         let requests = await runtime.recordedRequests()
-        let workspaceA = runtimeRoot
+        let sessionA = runtimeRoot
             .appendingPathComponent("Sessions", isDirectory: true)
             .appendingPathComponent(a.uuidString.lowercased(), isDirectory: true)
-            .appendingPathComponent("workspace", isDirectory: true)
             .standardizedFileURL
-        let workspaceB = runtimeRoot
+        let sessionB = runtimeRoot
             .appendingPathComponent("Sessions", isDirectory: true)
             .appendingPathComponent(b.uuidString.lowercased(), isDirectory: true)
-            .appendingPathComponent("workspace", isDirectory: true)
             .standardizedFileURL
+        let workspaceA = sessionA.appendingPathComponent("workspace", isDirectory: true).standardizedFileURL
+        let workspaceB = sessionB.appendingPathComponent("workspace", isDirectory: true).standardizedFileURL
         XCTAssertEqual(requests.count, 2)
         XCTAssertEqual(requests[0].sessionID, a)
         XCTAssertEqual(requests[1].sessionID, b)
         XCTAssertEqual(requests[0].timeoutMilliseconds, 10_000)
         XCTAssertEqual(requests[1].timeoutMilliseconds, 250)
-        XCTAssertEqual(requests[0].workspaceRoot.path, workspaceA.path)
-        XCTAssertEqual(requests[1].workspaceRoot.path, workspaceB.path)
+        XCTAssertEqual(requests[0].workspaceRoot.path, sessionA.path)
+        XCTAssertEqual(requests[1].workspaceRoot.path, sessionB.path)
         XCTAssertNotEqual(requests[0].workspaceRoot.path, requests[1].workspaceRoot.path)
         XCTAssertEqual(requests[0].workingDirectory.path, workspaceA.appendingPathComponent("nested", isDirectory: true).path)
         XCTAssertEqual(requests[1].workingDirectory.path, workspaceB.path)
@@ -300,7 +300,7 @@ final class CLIRuntimeTests: XCTestCase {
         let requests = await runtime.recordedRequests()
         XCTAssertEqual(requests.count, 2)
         XCTAssertEqual(requests[0].workingDirectory.lastPathComponent, "nested")
-        XCTAssertEqual(requests[1].workingDirectory.path, requests[1].workspaceRoot.path)
+        XCTAssertEqual(requests[1].workingDirectory.path, requests[1].workspaceRoot.appendingPathComponent("workspace", isDirectory: true).path)
         XCTAssertNotEqual(requests[0].workingDirectory.path, requests[1].workingDirectory.path)
     }
 
@@ -318,6 +318,140 @@ final class CLIRuntimeTests: XCTestCase {
         } catch let error as CLICommandValidationError {
             XCTAssertEqual(error, .cwdEscapesAllowedRoot)
         }
+    }
+
+    func testCLIPathArgumentsCannotEscapeSessionSandbox() async throws {
+        let runtime = FakeCLIRuntime()
+        let runtimeRoot = URL(fileURLWithPath: "/tmp/cloudcode-cli-paths", isDirectory: true)
+        let executor = IOSSystemExecutor(
+            policy: PolicyEngine(),
+            approval: FixedApprovalRequester(approved: true),
+            runtime: runtime,
+            runtimeRoot: runtimeRoot
+        )
+        let descriptor = ToolDescriptor(name: "cli.run", summary: "", risk: .readOnly, requiredCapabilities: ["cli.runtime"], preferredRoute: .cli)
+        for command in ["cat /etc/passwd", "cat ../../outside", "grep needle /private/var/mobile/file"] {
+            do {
+                _ = try await executor.execute(
+                    ToolCall(name: "cli.run", arguments: ["command": command], sessionID: UUID()),
+                    descriptor: descriptor,
+                    context: context()
+                )
+                XCTFail("Expected path confinement rejection for \(command)")
+            } catch let error as CLICommandValidationError {
+                guard case .pathArgumentEscapesSession = error else {
+                    return XCTFail("Unexpected path error for \(command): \(error)")
+                }
+            }
+        }
+        let recordedRequests = await runtime.recordedRequests()
+        XCTAssertTrue(recordedRequests.isEmpty)
+    }
+
+    func testAdvancedShellCannotUsePathFlagsOrOperandsToEscapeCatalogBoundary() async throws {
+        let runtime = FakeCLIRuntime()
+        let executor = IOSSystemExecutor(policy: PolicyEngine(), approval: FixedApprovalRequester(approved: true), runtime: runtime)
+        let descriptor = ToolDescriptor(name: "advanced.shell", summary: "", risk: .systemChange, requiredCapabilities: ["execution.ios_system"], preferredRoute: .cli)
+        let commands = [
+            "cp file /tmp/outside",
+            "find . -newer /tmp/outside",
+            "find . -exec cat file ;",
+            "find . -fprint output",
+            "sort -T /tmp input",
+            "ls -L .",
+            "cp -L source destination",
+            "tail -f file",
+            "grep -R needle ."
+        ]
+        for command in commands {
+            do {
+                _ = try await executor.execute(
+                    ToolCall(name: "advanced.shell", arguments: ["command": command], sessionID: UUID()),
+                    descriptor: descriptor,
+                    context: context()
+                )
+                XCTFail("Expected bounded advanced shell rejection for \(command)")
+            } catch is CLICommandValidationError {
+                continue
+            } catch is ToolRouterError {
+                continue
+            }
+        }
+        let recordedRequests = await runtime.recordedRequests()
+        XCTAssertTrue(recordedRequests.isEmpty)
+    }
+
+    func testReadOnlyUniqCannotUseSecondOperandAsOutputFile() async throws {
+        let runtime = FakeCLIRuntime()
+        let executor = IOSSystemExecutor(policy: PolicyEngine(), approval: FixedApprovalRequester(approved: true), runtime: runtime)
+        let descriptor = ToolDescriptor(name: "cli.run", summary: "", risk: .readOnly, requiredCapabilities: ["cli.runtime"], preferredRoute: .cli)
+        do {
+            _ = try await executor.execute(
+                ToolCall(name: "cli.run", arguments: ["command": "uniq input.txt output.txt"], sessionID: UUID()),
+                descriptor: descriptor,
+                context: context()
+            )
+            XCTFail("Expected uniq output-file mutation to fail closed")
+        } catch let error as CLICommandValidationError {
+            guard case .readOnlyMutationNotAllowed = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        let recordedRequests = await runtime.recordedRequests()
+        XCTAssertTrue(recordedRequests.isEmpty)
+    }
+
+    func testNonPathArgumentsRemainUsableInsideBoundedCLI() async throws {
+        let runtime = FakeCLIRuntime(results: [CLICommandExecutionResult(exitCode: 0), CLICommandExecutionResult(exitCode: 0)])
+        let executor = IOSSystemExecutor(policy: PolicyEngine(), approval: FixedApprovalRequester(approved: true), runtime: runtime)
+        let descriptor = ToolDescriptor(name: "cli.run", summary: "", risk: .readOnly, requiredCapabilities: ["cli.runtime"], preferredRoute: .cli)
+        let echo = try await executor.execute(
+            ToolCall(name: "cli.run", arguments: ["command": "echo /outside/is/text"], sessionID: UUID()),
+            descriptor: descriptor,
+            context: context()
+        )
+        let find = try await executor.execute(
+            ToolCall(name: "cli.run", arguments: ["command": "find . -name '*.json'"], sessionID: UUID()),
+            descriptor: descriptor,
+            context: context()
+        )
+        XCTAssertTrue(echo.success)
+        XCTAssertTrue(find.success)
+        let recordedRequests = await runtime.recordedRequests()
+        XCTAssertEqual(recordedRequests.count, 2)
+    }
+
+    func testSymlinkPathInsideWorkspaceCannotTunnelOutsideSession() async throws {
+        let fileManager = FileManager.default
+        let runtimeRoot = fileManager.temporaryDirectory.appendingPathComponent("cloudcode-cli-symlink-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fileManager.removeItem(at: runtimeRoot) }
+        let sessionID = UUID()
+        let workspace = runtimeRoot
+            .appendingPathComponent("Sessions", isDirectory: true)
+            .appendingPathComponent(sessionID.uuidString.lowercased(), isDirectory: true)
+            .appendingPathComponent("workspace", isDirectory: true)
+        try fileManager.createDirectory(at: workspace, withIntermediateDirectories: true)
+        let link = workspace.appendingPathComponent("escape")
+        try fileManager.createSymbolicLink(at: link, withDestinationURL: fileManager.temporaryDirectory)
+
+        let runtime = FakeCLIRuntime()
+        let executor = IOSSystemExecutor(
+            policy: PolicyEngine(),
+            approval: FixedApprovalRequester(approved: true),
+            runtime: runtime,
+            runtimeRoot: runtimeRoot
+        )
+        let descriptor = ToolDescriptor(name: "cli.run", summary: "", risk: .readOnly, requiredCapabilities: ["cli.runtime"], preferredRoute: .cli)
+        do {
+            _ = try await executor.execute(
+                ToolCall(name: "cli.run", arguments: ["command": "cat escape/anything"], sessionID: sessionID),
+                descriptor: descriptor,
+                context: context()
+            )
+            XCTFail("Expected symlink path to fail closed")
+        } catch let error as CLICommandValidationError {
+            guard case .pathArgumentUnsafe = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        let recordedRequests = await runtime.recordedRequests()
+        XCTAssertTrue(recordedRequests.isEmpty)
     }
 
     func testToolRegistryKeepsNativeStructuredRouteAheadOfCLIAndGUI() async throws {

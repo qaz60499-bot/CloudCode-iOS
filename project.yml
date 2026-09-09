@@ -23,7 +23,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.core
         PRODUCT_NAME: CloudCodeCore
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 97
+        CURRENT_PROJECT_VERSION: 98
         VERSIONING_SYSTEM: apple-generic
         DEFINES_MODULE: YES
         GENERATE_INFOPLIST_FILE: YES
@@ -44,25 +44,25 @@ targets:
       - package: ZIPFoundation
       - package: IOSSystemMinimal
         product: IOSSystemRuntime
-        embed: true
+        embed: false
       - package: IOSSystemMinimal
         product: IOSSystemFiles
         link: false
-        embed: true
+        embed: false
       - package: IOSSystemMinimal
         product: IOSSystemShell
         link: false
-        embed: true
+        embed: false
       - package: IOSSystemMinimal
         product: IOSSystemText
         link: false
-        embed: true
+        embed: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios
         PRODUCT_NAME: CloudCode
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 97
+        CURRENT_PROJECT_VERSION: 98
         VERSIONING_SYSTEM: apple-generic
         SWIFT_VERSION: 5.9
         SWIFT_OBJC_BRIDGING_HEADER: Sources/CloudCodeApp/RootHelperBridge.h
@@ -87,6 +87,22 @@ targets:
           SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" xcrun --sdk macosx swift scripts/materialize_app_icon.swift
         basedOnDependencyAnalysis: false
     postBuildScripts:
+      - name: Embed Bounded CLI Frameworks
+        script: |
+          set -euo pipefail
+          DESTINATION="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH"
+          mkdir -p "$DESTINATION"
+          for framework in ios_system files shell text; do
+            SOURCE="$BUILT_PRODUCTS_DIR/$framework.framework"
+            TARGET="$DESTINATION/$framework.framework"
+            if [ ! -d "$SOURCE" ]; then
+              echo "FAIL: processed ios_system framework missing: $SOURCE" >&2
+              exit 1
+            fi
+            rm -rf "$TARGET"
+            ditto "$SOURCE" "$TARGET"
+          done
+        basedOnDependencyAnalysis: false
       - name: Build Embedded Root Helper
         script: |
           set -euo pipefail

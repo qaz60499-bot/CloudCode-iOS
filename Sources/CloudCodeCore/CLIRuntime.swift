@@ -109,6 +109,8 @@ public enum CLICommandValidationError: Error, Equatable, CustomStringConvertible
     case readOnlyMutationNotAllowed(String)
     case cwdRequiresAllowedRoot
     case cwdEscapesAllowedRoot
+    case pathArgumentUnsafe(String)
+    case pathArgumentEscapesSession(String)
 
     public var description: String {
         switch self {
@@ -126,6 +128,8 @@ public enum CLICommandValidationError: Error, Equatable, CustomStringConvertible
         case .readOnlyMutationNotAllowed(let token): return "Read-only CLI surface rejected mutating syntax/flag: \(token)"
         case .cwdRequiresAllowedRoot: return "An explicit CLI cwd requires an allowed workspace root"
         case .cwdEscapesAllowedRoot: return "CLI cwd escapes the allowed workspace root"
+        case .pathArgumentUnsafe(let token): return "CLI path argument cannot be safely confined to the session workspace: \(token)"
+        case .pathArgumentEscapesSession(let token): return "CLI path argument escapes the session workspace: \(token)"
         }
     }
 }
@@ -259,10 +263,51 @@ public enum CLICommandAnalyzer {
         }
         if expectCommand { throw CLICommandValidationError.missingCommand }
 
+        try validateUniversalConstraints(tokens: tokens)
         if readOnly {
             try validateReadOnly(tokens: tokens, commands: commands)
         }
         return CLICommandAnalysis(commands: commands, separators: separators, tokens: tokens)
+    }
+
+    private static func validateUniversalConstraints(tokens: [String]) throws {
+        // Keep the first CLI generation on the audited short-option surface. Besides simplifying
+        // path confinement, this closes forms such as --output=/outside that otherwise bypass an
+        // exact-token guard written for the corresponding short option.
+        for token in tokens {
+            let plain = unquote(token)
+            if plain.hasPrefix("--"), plain != "--" {
+                throw CLICommandValidationError.unsupportedSyntax(plain)
+            }
+        }
+
+        // `find -exec/-ok` is itself an executable launcher and would bypass the packaged-command
+        // catalog. Its file-output predicates similarly hide writes inside a nominal find command.
+        // Symlink-following find modes are disabled because the generic CLI is session-confined.
+        let forbiddenFindFlags: Set<String> = [
+            "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls", "-H", "-L"
+        ]
+        // sort output/temp-file flags introduce hidden write paths; the bounded first generation
+        // returns sort output through captured stdout instead.
+        let forbiddenSortFlags: Set<String> = ["-o", "-T"]
+        var activeCommand: String?
+        for token in tokens {
+            if ["|", "||", "&&", ";"].contains(token) {
+                activeCommand = nil
+                continue
+            }
+            if activeCommand == nil {
+                activeCommand = unquote(token)
+                continue
+            }
+            let plain = unquote(token)
+            if activeCommand == "find", forbiddenFindFlags.contains(plain) {
+                throw CLICommandValidationError.unsupportedSyntax(plain)
+            }
+            if activeCommand == "sort", forbiddenSortFlags.contains(plain) {
+                throw CLICommandValidationError.unsupportedSyntax(plain)
+            }
+        }
     }
 
     private static func validateReadOnly(tokens: [String], commands: [String]) throws {
@@ -298,6 +343,356 @@ public enum CLICommandAnalyzer {
                 throw CLICommandValidationError.readOnlyMutationNotAllowed(plain)
             }
         }
+    }
+
+    private static func unquote(_ token: String) -> String {
+        guard token.count >= 2, let first = token.first, let last = token.last,
+              (first == "\"" || first == "'"), first == last else { return token }
+        return String(token.dropFirst().dropLast())
+    }
+}
+
+private enum CLIPathConfinement {
+    private static let separators: Set<String> = ["|", "||", "&&", ";"]
+
+    static func validate(
+        analysis: CLICommandAnalysis,
+        sessionRoot: URL,
+        workingDirectory: URL,
+        homeDirectory: URL,
+        temporaryDirectory: URL,
+        readOnly: Bool,
+        fileManager: FileManager = .default
+    ) throws {
+        let root = canonicalURL(sessionRoot, fileManager: fileManager)
+        let cwd = canonicalURL(workingDirectory, fileManager: fileManager)
+        guard isInside(cwd, root: root) else {
+            throw CLICommandValidationError.cwdEscapesAllowedRoot
+        }
+
+        for segment in commandSegments(analysis.tokens) {
+            guard let first = segment.first else { continue }
+            let command = unquote(first)
+            let operands = try pathOperands(command: command, arguments: Array(segment.dropFirst()))
+            if readOnly, command == "uniq", operands.count > 1 {
+                throw CLICommandValidationError.readOnlyMutationNotAllowed("uniq output file")
+            }
+            for operand in operands {
+                try validatePathOperand(
+                    operand,
+                    sessionRoot: root,
+                    workingDirectory: cwd,
+                    homeDirectory: canonicalURL(homeDirectory, fileManager: fileManager),
+                    temporaryDirectory: canonicalURL(temporaryDirectory, fileManager: fileManager),
+                    fileManager: fileManager
+                )
+            }
+        }
+    }
+
+    private static func commandSegments(_ tokens: [String]) -> [[String]] {
+        var result: [[String]] = []
+        var current: [String] = []
+        for token in tokens {
+            if separators.contains(token) {
+                if !current.isEmpty { result.append(current) }
+                current.removeAll(keepingCapacity: true)
+            } else {
+                current.append(token)
+            }
+        }
+        if !current.isEmpty { result.append(current) }
+        return result
+    }
+
+    private static func pathOperands(command: String, arguments: [String]) throws -> [String] {
+        switch command {
+        case "pwd", "echo":
+            return []
+        case "ls":
+            try rejectOptionCharacters(arguments, forbidden: ["H", "L"])
+            return try operandsSkippingShortOptions(arguments, valueOptions: [])
+        case "cp":
+            try rejectOptionCharacters(arguments, forbidden: ["H", "L"])
+            return try operandsSkippingShortOptions(arguments, valueOptions: [])
+        case "cat", "mv", "rm":
+            return try operandsSkippingShortOptions(arguments, valueOptions: [])
+        case "mkdir":
+            return try operandsSkippingShortOptions(arguments, valueOptions: ["m"])
+        case "stat":
+            return try operandsSkippingShortOptions(arguments, valueOptions: ["f", "t"])
+        case "head":
+            return try operandsSkippingShortOptions(arguments, valueOptions: ["n", "c"])
+        case "tail":
+            try rejectOptionCharacters(arguments, forbidden: ["F", "f"])
+            return try operandsSkippingShortOptions(arguments, valueOptions: ["b", "c", "n"])
+        case "wc":
+            return try operandsSkippingShortOptions(arguments, valueOptions: ["M", "N"])
+        case "sort":
+            return try operandsSkippingShortOptions(arguments, valueOptions: ["k", "t"])
+        case "uniq":
+            return try operandsSkippingShortOptions(arguments, valueOptions: ["f", "s"])
+        case "find":
+            return try findPathOperands(arguments)
+        case "grep":
+            return try grepPathOperands(arguments)
+        default:
+            // Capability validation should prevent this branch. Keep path policy fail-closed if
+            // the packaged catalog grows before this confinement model is updated.
+            throw CLICommandValidationError.pathArgumentUnsafe("unsupported command path model: \(command)")
+        }
+    }
+
+    private static func rejectOptionCharacters(_ arguments: [String], forbidden: Set<Character>) throws {
+        var endOptions = false
+        for token in arguments {
+            let plain = unquote(token)
+            if plain == "--" {
+                endOptions = true
+                continue
+            }
+            guard !endOptions, plain.hasPrefix("-"), plain != "-", !plain.hasPrefix("--") else { continue }
+            for option in plain.dropFirst() where forbidden.contains(option) {
+                throw CLICommandValidationError.unsupportedSyntax("-\(option)")
+            }
+        }
+    }
+
+    private static func operandsSkippingShortOptions(_ arguments: [String], valueOptions: Set<Character>) throws -> [String] {
+        var operands: [String] = []
+        var index = 0
+        var endOptions = false
+        while index < arguments.count {
+            let plain = unquote(arguments[index])
+            if !endOptions, plain == "--" {
+                endOptions = true
+                index += 1
+                continue
+            }
+            if !endOptions, plain.hasPrefix("-"), plain != "-" {
+                guard !plain.hasPrefix("--") else {
+                    throw CLICommandValidationError.unsupportedSyntax(plain)
+                }
+                let optionCharacters = Array(plain.dropFirst())
+                var consumesFollowingValue = false
+                for (offset, option) in optionCharacters.enumerated() where valueOptions.contains(option) {
+                    consumesFollowingValue = offset == optionCharacters.count - 1
+                    break
+                }
+                if consumesFollowingValue {
+                    guard index + 1 < arguments.count else {
+                        throw CLICommandValidationError.pathArgumentUnsafe("missing option value after \(plain)")
+                    }
+                    index += 2
+                } else {
+                    index += 1
+                }
+                continue
+            }
+            operands.append(plain)
+            index += 1
+        }
+        return operands
+    }
+
+    private static func findPathOperands(_ arguments: [String]) throws -> [String] {
+        var paths: [String] = []
+        var index = 0
+        var endOptions = false
+
+        // Parse the bounded path-prefix first. Once an expression begins, every accepted predicate
+        // is explicitly whitelisted below; predicates that take a filesystem path (for example
+        // -newer/-samefile) are intentionally unsupported in the first generation.
+        while index < arguments.count {
+            let plain = unquote(arguments[index])
+            if !endOptions, plain == "--" {
+                endOptions = true
+                index += 1
+                continue
+            }
+            if !endOptions, plain == "-f" {
+                guard index + 1 < arguments.count else {
+                    throw CLICommandValidationError.pathArgumentUnsafe("missing find -f path")
+                }
+                paths.append(unquote(arguments[index + 1]))
+                index += 2
+                continue
+            }
+            if plain == "!" || plain.hasPrefix("-") { break }
+            paths.append(plain)
+            index += 1
+        }
+
+        let noValuePredicates: Set<String> = [
+            "-a", "-and", "-o", "-or", "-not", "-empty", "-print", "-print0", "-xdev", "-depth", "-delete"
+        ]
+        let oneValuePredicates: Set<String> = [
+            "-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-type", "-size",
+            "-maxdepth", "-mindepth", "-perm", "-user", "-group", "-uid", "-gid", "-links", "-inum",
+            "-atime", "-ctime", "-mtime", "-amin", "-cmin", "-mmin"
+        ]
+        while index < arguments.count {
+            let predicate = unquote(arguments[index])
+            if predicate == "!" || noValuePredicates.contains(predicate) {
+                index += 1
+                continue
+            }
+            if oneValuePredicates.contains(predicate) {
+                guard index + 1 < arguments.count else {
+                    throw CLICommandValidationError.pathArgumentUnsafe("missing find predicate value after \(predicate)")
+                }
+                index += 2
+                continue
+            }
+            throw CLICommandValidationError.unsupportedSyntax(predicate)
+        }
+        return paths
+    }
+
+    private static func grepPathOperands(_ arguments: [String]) throws -> [String] {
+        try rejectOptionCharacters(arguments, forbidden: ["R"])
+        let valueOptions: Set<Character> = ["A", "B", "C", "D", "d", "e", "f", "m"]
+        var paths: [String] = []
+        var index = 0
+        var endOptions = false
+        var patternProvidedByOption = false
+        var positionalPatternSeen = false
+
+        while index < arguments.count {
+            let plain = unquote(arguments[index])
+            if !endOptions, plain == "--" {
+                endOptions = true
+                index += 1
+                continue
+            }
+            if !endOptions, plain.hasPrefix("-"), plain != "-" {
+                guard !plain.hasPrefix("--") else {
+                    throw CLICommandValidationError.unsupportedSyntax(plain)
+                }
+                let optionCharacters = Array(plain.dropFirst())
+                var consumedSeparateValue = false
+                for (offset, option) in optionCharacters.enumerated() where valueOptions.contains(option) {
+                    let hasAttachedValue = offset < optionCharacters.count - 1
+                    if option == "e" || option == "f" { patternProvidedByOption = true }
+                    if option == "f" {
+                        if hasAttachedValue {
+                            paths.append(String(optionCharacters[(offset + 1)...]))
+                        } else {
+                            guard index + 1 < arguments.count else {
+                                throw CLICommandValidationError.pathArgumentUnsafe("missing grep -f pattern file")
+                            }
+                            paths.append(unquote(arguments[index + 1]))
+                            consumedSeparateValue = true
+                        }
+                    } else if !hasAttachedValue {
+                        guard index + 1 < arguments.count else {
+                            throw CLICommandValidationError.pathArgumentUnsafe("missing option value after \(plain)")
+                        }
+                        consumedSeparateValue = true
+                    }
+                    break
+                }
+                index += consumedSeparateValue ? 2 : 1
+                continue
+            }
+
+            if !patternProvidedByOption, !positionalPatternSeen {
+                positionalPatternSeen = true
+            } else {
+                paths.append(plain)
+            }
+            index += 1
+        }
+        return paths
+    }
+
+    private static func validatePathOperand(
+        _ raw: String,
+        sessionRoot: URL,
+        workingDirectory: URL,
+        homeDirectory: URL,
+        temporaryDirectory: URL,
+        fileManager: FileManager
+    ) throws {
+        if raw == "-" || raw.isEmpty { return }
+        if raw.contains("\\") || raw.contains("*") || raw.contains("?") || raw.contains("[") || raw.contains("]") {
+            throw CLICommandValidationError.pathArgumentUnsafe(raw)
+        }
+
+        let expanded: String
+        if raw == "~" || raw.hasPrefix("~/") {
+            expanded = homeDirectory.path + String(raw.dropFirst())
+        } else if let value = expandKnownVariablePath(raw, name: "HOME", value: homeDirectory.path) {
+            expanded = value
+        } else if let value = expandKnownVariablePath(raw, name: "TMPDIR", value: temporaryDirectory.path) {
+            expanded = value
+        } else if let value = expandKnownVariablePath(raw, name: "PWD", value: workingDirectory.path) {
+            expanded = value
+        } else {
+            guard !raw.contains("$") else { throw CLICommandValidationError.pathArgumentUnsafe(raw) }
+            expanded = raw
+        }
+
+        let candidate = expanded.hasPrefix("/")
+            ? URL(fileURLWithPath: expanded)
+            : workingDirectory.appendingPathComponent(expanded)
+        let standardized = candidate.standardizedFileURL
+        guard isInside(standardized, root: sessionRoot) else {
+            throw CLICommandValidationError.pathArgumentEscapesSession(raw)
+        }
+
+        // Do not allow a path below the session root to tunnel through a symlink into broader
+        // TrollStore-visible storage. Rejecting symlinks is intentionally stricter than resolving
+        // and permitting same-root links; the bounded first generation prioritizes containment.
+        try rejectSymlinkComponents(standardized, root: sessionRoot, raw: raw, fileManager: fileManager)
+    }
+
+    private static func expandKnownVariablePath(_ raw: String, name: String, value: String) -> String? {
+        let marker = "$\(name)"
+        guard raw == marker || raw.hasPrefix(marker + "/") else { return nil }
+        return value + String(raw.dropFirst(marker.count))
+    }
+
+    private static func rejectSymlinkComponents(
+        _ candidate: URL,
+        root: URL,
+        raw: String,
+        fileManager: FileManager
+    ) throws {
+        let rootComponents = root.standardizedFileURL.pathComponents
+        let candidateComponents = candidate.standardizedFileURL.pathComponents
+        guard candidateComponents.count >= rootComponents.count,
+              Array(candidateComponents.prefix(rootComponents.count)) == rootComponents else {
+            throw CLICommandValidationError.pathArgumentEscapesSession(raw)
+        }
+        var cursor = root.standardizedFileURL
+        for component in candidateComponents.dropFirst(rootComponents.count) {
+            cursor.appendPathComponent(component)
+            guard let attributes = try? fileManager.attributesOfItem(atPath: cursor.path),
+                  let type = attributes[.type] as? FileAttributeType else {
+                // Missing destinations are valid for mkdir/cp/mv. Their existing parent chain has
+                // already been checked, and remaining lexical components stay below sessionRoot.
+                continue
+            }
+            if type == .typeSymbolicLink {
+                throw CLICommandValidationError.pathArgumentUnsafe(raw)
+            }
+        }
+    }
+
+    private static func canonicalURL(_ url: URL, fileManager: FileManager) -> URL {
+        let standardized = url.standardizedFileURL
+        if fileManager.fileExists(atPath: standardized.path) {
+            return standardized.resolvingSymlinksInPath().standardizedFileURL
+        }
+        return standardized
+    }
+
+    private static func isInside(_ candidate: URL, root: URL) -> Bool {
+        let candidatePath = candidate.standardizedFileURL.path
+        let rootPath = root.standardizedFileURL.path
+        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+        return candidatePath == rootPath || candidatePath.hasPrefix(prefix)
     }
 
     private static func unquote(_ token: String) -> String {
@@ -357,11 +752,22 @@ public struct IOSSystemExecutor: ToolExecuting, Sendable {
             throw ToolRouterError.noExecutionRoute(CLICommandValidationError.commandUnavailable(name).description)
         }
 
-        // Generic CLI always stays inside a per-Agent-session workspace, even when broader typed
-        // filesystem capabilities are available. Cross-container/root operations continue through
-        // their typed helpers instead of inheriting the TrollStore App's broader process authority.
-        let workspaceRoot = sessionWorkspaceRoot(for: call.sessionID)
-        let cwd = try validatedWorkingDirectory(call.arguments["cwd"], allowedRoot: workspaceRoot)
+        // Generic CLI always stays inside one per-Agent-session sandbox. `workspace` is the default
+        // cwd while HOME/TMP remain sibling directories under the same mini-root; no generic CLI
+        // operation inherits the TrollStore App's broader process-visible filesystem authority.
+        let sessionRoot = cliSessionRoot(for: call.sessionID)
+        let workspace = sessionRoot.appendingPathComponent("workspace", isDirectory: true).standardizedFileURL
+        let home = sessionRoot.appendingPathComponent("home", isDirectory: true).standardizedFileURL
+        let temporary = sessionRoot.appendingPathComponent("tmp", isDirectory: true).standardizedFileURL
+        let cwd = try validatedWorkingDirectory(call.arguments["cwd"], defaultDirectory: workspace, allowedRoot: sessionRoot)
+        try CLIPathConfinement.validate(
+            analysis: analysis,
+            sessionRoot: sessionRoot,
+            workingDirectory: cwd,
+            homeDirectory: home,
+            temporaryDirectory: temporary,
+            readOnly: readOnlySurface
+        )
         let timeoutMilliseconds = boundedTimeout(call.arguments["timeoutMs"], readOnly: readOnlySurface)
 
         let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: cwd.path)
@@ -384,7 +790,7 @@ public struct IOSSystemExecutor: ToolExecuting, Sendable {
         let request = CLICommandExecutionRequest(
             command: command,
             sessionID: call.sessionID,
-            workspaceRoot: workspaceRoot,
+            workspaceRoot: sessionRoot,
             workingDirectory: cwd,
             timeoutMilliseconds: timeoutMilliseconds
         )
@@ -432,22 +838,22 @@ public struct IOSSystemExecutor: ToolExecuting, Sendable {
         return min(max(parsed, 250), maximum)
     }
 
-    private func sessionWorkspaceRoot(for sessionID: UUID) -> URL {
+    private func cliSessionRoot(for sessionID: UUID) -> URL {
         runtimeRoot
             .appendingPathComponent("Sessions", isDirectory: true)
             .appendingPathComponent(sessionID.uuidString.lowercased(), isDirectory: true)
-            .appendingPathComponent("workspace", isDirectory: true)
             .standardizedFileURL
     }
 
-    private func validatedWorkingDirectory(_ raw: String?, allowedRoot: URL) throws -> URL {
+    private func validatedWorkingDirectory(_ raw: String?, defaultDirectory: URL, allowedRoot: URL) throws -> URL {
         let root = allowedRoot.standardizedFileURL.resolvingSymlinksInPath()
-        guard let raw, !raw.isEmpty else { return root }
+        let base = defaultDirectory.standardizedFileURL.resolvingSymlinksInPath()
+        guard let raw, !raw.isEmpty else { return base }
         let candidateURL: URL
         if raw.hasPrefix("/") {
             candidateURL = URL(fileURLWithPath: raw, isDirectory: true)
         } else {
-            candidateURL = root.appendingPathComponent(raw, isDirectory: true)
+            candidateURL = base.appendingPathComponent(raw, isDirectory: true)
         }
         let candidate = candidateURL.standardizedFileURL.resolvingSymlinksInPath()
         let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"

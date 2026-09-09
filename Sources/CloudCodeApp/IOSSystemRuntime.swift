@@ -92,13 +92,13 @@ public final class IOSSystemRuntime: CLICommandRuntime, @unchecked Sendable {
                         return
                     }
 
-                    let expectedWorkspace = workspace.standardizedFileURL.resolvingSymlinksInPath()
-                    let requestedWorkspace = request.workspaceRoot.standardizedFileURL.resolvingSymlinksInPath()
-                    guard requestedWorkspace.path == expectedWorkspace.path else {
+                    let expectedSessionRoot = sessionRoot.standardizedFileURL.resolvingSymlinksInPath()
+                    let requestedSessionRoot = request.workspaceRoot.standardizedFileURL.resolvingSymlinksInPath()
+                    guard requestedSessionRoot.path == expectedSessionRoot.path else {
                         cancellation.clear(invocationID)
                         continuation.resume(returning: CLICommandExecutionResult(
                             exitCode: -1,
-                            stderr: "CLI request workspace does not match the session workspace",
+                            stderr: "CLI request root does not match the session sandbox",
                             workingDirectory: request.workingDirectory.path
                         ))
                         return
@@ -116,12 +116,12 @@ public final class IOSSystemRuntime: CLICommandRuntime, @unchecked Sendable {
                         return
                     }
                     let resolvedWorkingDirectory = request.workingDirectory.standardizedFileURL.resolvingSymlinksInPath()
-                    let workspacePrefix = expectedWorkspace.path.hasSuffix("/") ? expectedWorkspace.path : expectedWorkspace.path + "/"
-                    guard resolvedWorkingDirectory.path == expectedWorkspace.path || resolvedWorkingDirectory.path.hasPrefix(workspacePrefix) else {
+                    let sessionPrefix = expectedSessionRoot.path.hasSuffix("/") ? expectedSessionRoot.path : expectedSessionRoot.path + "/"
+                    guard resolvedWorkingDirectory.path == expectedSessionRoot.path || resolvedWorkingDirectory.path.hasPrefix(sessionPrefix) else {
                         cancellation.clear(invocationID)
                         continuation.resume(returning: CLICommandExecutionResult(
                             exitCode: -1,
-                            stderr: "CLI working directory escaped the session workspace",
+                            stderr: "CLI working directory escaped the session sandbox",
                             workingDirectory: request.workingDirectory.path
                         ))
                         return
@@ -131,7 +131,7 @@ public final class IOSSystemRuntime: CLICommandRuntime, @unchecked Sendable {
                         request.command,
                         invocationID,
                         request.sessionID.uuidString,
-                        expectedWorkspace.path,
+                        expectedSessionRoot.path,
                         resolvedWorkingDirectory.path,
                         home.path,
                         temporary.path,

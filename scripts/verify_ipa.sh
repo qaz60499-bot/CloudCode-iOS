@@ -135,6 +135,12 @@ if ! otool -L "$APP_PATH/$EXECUTABLE" | grep -Fq '@rpath/ios_system.framework/io
   echo "FAIL: main executable is not linked against ios_system.framework" >&2
   exit 22
 fi
+for lazy_cli_framework in files shell text; do
+  if otool -L "$APP_PATH/$EXECUTABLE" | grep -Fq "@rpath/$lazy_cli_framework.framework/$lazy_cli_framework"; then
+    echo "FAIL: lazy CLI framework is linked at app launch instead of remaining dlopen-only: $lazy_cli_framework" >&2
+    exit 22
+  fi
+done
 for dictionary in commandDictionary.plist extraCommandsDictionary.plist; do
   if [[ ! -f "$APP_PATH/$dictionary" ]]; then
     echo "FAIL: ios_system command dictionary missing from IPA: $dictionary" >&2
