@@ -81,7 +81,7 @@ if ! lipo -info "$HELPER" | grep -q 'arm64'; then
   echo "FAIL: CloudCodeRootHelper does not contain arm64" >&2
   exit 17
 fi
-if ! strings "$HELPER" | grep -Fq 'cloudcode-root-helper-protocol=1'; then
+if ! LC_ALL=C grep -aFq 'cloudcode-root-helper-protocol=1' "$HELPER"; then
   echo "FAIL: embedded CloudCodeRootHelper protocol marker is missing or incompatible" >&2
   exit 18
 fi
@@ -94,7 +94,7 @@ if ! lipo -info "$VISION_HELPER" | grep -q 'arm64'; then
   echo "FAIL: CloudCodeVisionHelper does not contain arm64" >&2
   exit 20
 fi
-if ! strings "$VISION_HELPER" | grep -Fq 'cloudcode-vision-helper-protocol=1'; then
+if ! LC_ALL=C grep -aFq 'cloudcode-vision-helper-protocol=1' "$VISION_HELPER"; then
   echo "FAIL: embedded CloudCodeVisionHelper protocol marker is missing or incompatible" >&2
   exit 21
 fi
