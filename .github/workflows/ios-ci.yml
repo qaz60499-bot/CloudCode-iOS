@@ -642,7 +642,7 @@ jobs:
                   raise SystemExit(f'FAIL: Agent lost bounded GUI fast-path/batching/input/navigation policy: {marker}')
           if 'gui-screenshot-base64' in screenshot_adapter or 'Data(base64Encoded:' in screenshot_adapter:
               raise SystemExit('FAIL: screenshot adapter regressed to mixed stdout/stderr base64 transport')
-          approval = adapters.split('public final class ApprovalCenter', 1)[1].split('public struct IOSSystemExecutor', 1)[0]
+          approval = adapters.split('public final class ApprovalCenter', 1)[1].split('public struct IOSPrivateAppExecutor', 1)[0]
           for marker in ('withTaskCancellationHandler', 'continuationID', 'cancelPendingApproval(requestID:', 'finishPendingApproval(returning:'):
               if marker not in approval:
                   raise SystemExit(f'FAIL: approval cancellation-safety marker missing: {marker}')

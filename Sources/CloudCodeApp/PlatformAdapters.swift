@@ -1185,40 +1185,6 @@ public final class ApprovalCenter: ObservableObject, ApprovalRequesting, @unchec
     }
 }
 
-public struct IOSSystemExecutor: ToolExecuting, Sendable {
-    public let route: AppExecutionRoute = .cli
-    private let policy: PolicyEngine
-    private let approval: ApprovalRequesting
-
-    public init(policy: PolicyEngine, approval: ApprovalRequesting) {
-        self.policy = policy
-        self.approval = approval
-    }
-
-    public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
-        tool.name == "advanced.shell" && capabilities.isAvailable("execution.ios_system")
-    }
-
-    public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
-        guard let command = call.arguments["command"], !command.isEmpty else { throw ToolRouterError.noExecutionRoute("command missing") }
-        let decision = policy.decision(mode: context.permissionMode, tool: descriptor)
-        if decision == .deny { throw TransactionError.confirmationDenied }
-        if decision == .requireConfirmation {
-            let preview = ApprovalPreview(title: "Run advanced shell", target: command, originalSummary: nil, diff: nil, reason: "Generic shell bypasses typed-tool safety and is high risk", plan: ["Validate permission", "Execute ios_system", "Capture exit status"], risk: .systemChange)
-            guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
-        }
-        #if canImport(Darwin)
-        guard let handle = dlopen(nil, RTLD_NOW), let symbol = dlsym(handle, "ios_system") else { throw ToolRouterError.noExecutionRoute("ios_system symbol missing") }
-        typealias IOSSystemFunction = @convention(c) (UnsafePointer<CChar>) -> Int32
-        let function = unsafeBitCast(symbol, to: IOSSystemFunction.self)
-        let code = command.withCString { function($0) }
-        return ToolResult(toolCallID: call.id, success: code == 0, summary: "ios_system exited \(code)", payload: ["exitCode": String(code)])
-        #else
-        throw ToolRouterError.noExecutionRoute("ios_system unavailable")
-        #endif
-    }
-}
-
 public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecutor, Sendable {
     public let route: AppExecutionRoute = .privateFramework
     private let appResolver: IOSAppResolver
@@ -1226,19 +1192,22 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
     private let approval: ApprovalRequesting
     private let audit: AuditLogStore
     private let resourceIndex: ProgressiveResourceIndex?
+    private let appKnowledgeRegistry: AppKnowledgeRegistry?
 
     public init(
         appResolver: IOSAppResolver,
         policy: PolicyEngine,
         approval: ApprovalRequesting,
         audit: AuditLogStore,
-        resourceIndex: ProgressiveResourceIndex? = nil
+        resourceIndex: ProgressiveResourceIndex? = nil,
+        appKnowledgeRegistry: AppKnowledgeRegistry? = nil
     ) {
         self.appResolver = appResolver
         self.policy = policy
         self.approval = approval
         self.audit = audit
         self.resourceIndex = resourceIndex
+        self.appKnowledgeRegistry = appKnowledgeRegistry
     }
 
     public func allowsDeferredCapabilityAttempt(
@@ -1289,7 +1258,9 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
                 )
                 guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
             }
+            let launchStartedAt = Date()
             let outcome = await appResolver.launchApplication(bundleID: bundleID)
+            let launchLatencyMS = max(0, Int(Date().timeIntervalSince(launchStartedAt) * 1_000))
             try await audit.append(AuditEvent(
                 sessionID: call.sessionID,
                 toolCallID: call.id,
@@ -1300,6 +1271,24 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
                 detail: ["diagnostic": outcome.detail, "foregroundVerified": outcome.foregroundVerified ? "true" : "false"]
             ))
             let version = await appResolver.cachedVersion(for: bundleID) ?? ""
+            // Learn only from a semantically verified foreground transition, or from an outright
+            // rejected launch. "Accepted but foreground unverified" is deliberately not training
+            // evidence because dispatch acceptance is not proof that open_app succeeded.
+            if outcome.foregroundVerified || !outcome.accepted {
+                let environment = AppActionEnvironment(
+                    appVersion: version.isEmpty ? nil : version,
+                    iOSMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
+                    deviceClass: nil
+                )
+                try? await appKnowledgeRegistry?.recordActionOutcome(
+                    bundleID: bundleID,
+                    semanticAction: "open_app",
+                    route: .privateFramework,
+                    environment: environment,
+                    success: outcome.foregroundVerified,
+                    latencyMS: launchLatencyMS
+                )
+            }
             return ToolResult(
                 toolCallID: call.id,
                 success: outcome.accepted,
@@ -1674,18 +1663,21 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
     private let approval: ApprovalRequesting
     private let attachmentRoot: URL?
     private let elementCache: GUIElementLookupCache
+    private let appKnowledgeRegistry: AppKnowledgeRegistry?
 
     public init(
         backend: GUIAutomationBackend,
         policy: PolicyEngine,
         approval: ApprovalRequesting,
-        attachmentRoot: URL? = nil
+        attachmentRoot: URL? = nil,
+        appKnowledgeRegistry: AppKnowledgeRegistry? = nil
     ) {
         self.backend = backend
         self.policy = policy
         self.approval = approval
         self.attachmentRoot = attachmentRoot
         self.elementCache = GUIElementLookupCache()
+        self.appKnowledgeRegistry = appKnowledgeRegistry
     }
 
     public func allowsDeferredCapabilityAttempt(
@@ -1833,9 +1825,20 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         switch call.name {
         case "gui.openApp":
             guard let bundle = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
-            let outcome = call.arguments["_reuseVerifiedForeground"] == "true"
+            let reusedForeground = call.arguments["_reuseVerifiedForeground"] == "true"
+            let launchStartedAt = Date()
+            let outcome = reusedForeground
                 ? GUIOpenAppOutcome(accepted: true, foregroundVerified: true, detail: "current verified foreground reused")
                 : try await backend.openApp(bundleID: bundle)
+            let launchLatencyMS = max(0, Int(Date().timeIntervalSince(launchStartedAt) * 1_000))
+            if !reusedForeground, outcome.foregroundVerified || !outcome.accepted {
+                await recordActionOutcomeIfKnown(
+                    bundleID: bundle,
+                    semanticAction: "open_app",
+                    success: outcome.foregroundVerified,
+                    latencyMS: launchLatencyMS
+                )
+            }
             return ToolResult(
                 toolCallID: call.id,
                 success: true,
@@ -1853,12 +1856,22 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             let reusedForeground = call.arguments["_reuseVerifiedForeground"] == "true"
             let reusedAcceptedLaunch = call.arguments["_reuseAcceptedLaunch"] == "true"
             let outcome: GUIOpenAppOutcome
+            let launchStartedAt = Date()
             if reusedForeground {
                 outcome = GUIOpenAppOutcome(accepted: true, foregroundVerified: true, detail: "current verified foreground reused")
             } else if reusedAcceptedLaunch {
                 outcome = GUIOpenAppOutcome(accepted: true, foregroundVerified: false, detail: "prior accepted launch reused for fresh observation")
             } else {
                 outcome = try await backend.openApp(bundleID: bundle)
+            }
+            let launchLatencyMS = max(0, Int(Date().timeIntervalSince(launchStartedAt) * 1_000))
+            if !reusedForeground && !reusedAcceptedLaunch, outcome.foregroundVerified || !outcome.accepted {
+                await recordActionOutcomeIfKnown(
+                    bundleID: bundle,
+                    semanticAction: "open_app",
+                    success: outcome.foregroundVerified,
+                    latencyMS: launchLatencyMS
+                )
             }
             if !reusedForeground && !reusedAcceptedLaunch {
                 try await Task.sleep(nanoseconds: 200_000_000)
@@ -3135,6 +3148,29 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         if payload["perceptionRemoteVisionRequired"] == nil { payload["perceptionRemoteVisionRequired"] = "true" }
         if payload["perceptionFallbackReason"] == nil { payload["perceptionFallbackReason"] = "local_ocr_observation_requires_task_semantic_review" }
         if payload["providerVisualRoundTripAvoided"] == nil { payload["providerVisualRoundTripAvoided"] = "0" }
+    }
+
+    private func recordActionOutcomeIfKnown(
+        bundleID: String,
+        semanticAction: String,
+        success: Bool,
+        latencyMS: Int
+    ) async {
+        guard let appKnowledgeRegistry,
+              let knowledge = await appKnowledgeRegistry.knowledge(for: bundleID) else { return }
+        let environment = AppActionEnvironment(
+            appVersion: knowledge.appVersion,
+            iOSMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
+            deviceClass: nil
+        )
+        try? await appKnowledgeRegistry.recordActionOutcome(
+            bundleID: bundleID,
+            semanticAction: semanticAction,
+            route: .guiFallback,
+            environment: environment,
+            success: success,
+            latencyMS: latencyMS
+        )
     }
 
     private func persistScreenshotAttachment(_ data: Data, sessionID: UUID) throws -> ChatAttachment? {

@@ -25,19 +25,22 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
     private let homeDirectory: URL
     private let diagnosticLogger: DiagnosticLogStore?
     private let guiCapabilityProvider: (any GUIAutomationCapabilityProviding)?
+    private let cliCapabilityProvider: (any CLICommandCapabilityProviding)?
 
     public init(
         appResolver: AppContainerResolving,
         fileManager: FileManager = .default,
         homeDirectory: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true),
         diagnosticLogger: DiagnosticLogStore? = nil,
-        guiCapabilityProvider: (any GUIAutomationCapabilityProviding)? = nil
+        guiCapabilityProvider: (any GUIAutomationCapabilityProviding)? = nil,
+        cliCapabilityProvider: (any CLICommandCapabilityProviding)? = nil
     ) {
         self.appResolver = appResolver
         self.fileManager = fileManager
         self.homeDirectory = homeDirectory
         self.diagnosticLogger = diagnosticLogger
         self.guiCapabilityProvider = guiCapabilityProvider
+        self.cliCapabilityProvider = cliCapabilityProvider
     }
 
     public func probeStartupSafe() async -> CapabilityProfile {
@@ -62,8 +65,11 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         records.append(record("apps.resolve_data_container", .apps, .deviceValidationRequired,
                               "Cross-app data-container resolution is deferred during automatic startup."))
 
-        records.append(record("execution.ios_system", .execution, .deviceValidationRequired,
-                              "Dynamic execution symbols are not inspected during automatic startup."))
+        // Keep automatic startup strictly lightweight. The concrete CLI capability snapshot may
+        // inspect dictionaries and lazily load command frameworks to validate command symbols, so
+        // it belongs to explicit extended/privileged validation rather than app launch. Provider
+        // schemas therefore stay fail-closed until the packaged P0 catalog is explicitly proven.
+        appendDeferredCLIRecords(to: &records, providerConnected: cliCapabilityProvider != nil)
         records.append(record("execution.posix_spawn_symbol", .execution, .deviceValidationRequired,
                               "Spawn/persona symbols are not inspected during automatic startup."))
         records.append(record("execution.spawn_helper", .execution, .deviceValidationRequired,
@@ -145,8 +151,8 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         let sharedCandidate = URL(fileURLWithPath: "/var/mobile/Media", isDirectory: true)
         replacing(record("filesystem.shared_user_files", .filesystem, fileManager.isReadableFile(atPath: sharedCandidate.path) ? .available : .unavailable,
                          "Explicit extended read-only visibility check for the user media area."))
-        replacing(record("execution.ios_system", .execution, Self.hasDynamicSymbol("ios_system") ? .available : .unavailable,
-                         "Explicit extended dynamic-symbol presence check; no command is executed."))
+        let cliSnapshot = await cliCapabilityProvider?.cliCommandCapability()
+        replaceCLIRecords(in: &records, snapshot: cliSnapshot, mode: "extended")
         replacing(record("execution.posix_spawn_symbol", .execution, Self.hasDynamicSymbol("posix_spawn") ? .available : .unavailable,
                          "Explicit extended spawn-symbol presence check; no helper is spawned."))
 
@@ -294,8 +300,8 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
         records.append(record("apps.resolve_data_container", .apps, crossContainerStatus,
                               otherContainerResolved ? "Resolved at least one non-own installed-app data container; paths are resolved dynamically." : (enumerationProven ? "Cross-app data-container resolution is not proven on this runtime; container UUIDs are never cached as identity." : "Installed-app enumeration is unavailable, so cross-app data-container resolution is currently unavailable.")))
 
-        records.append(record("execution.ios_system", .execution, Self.hasDynamicSymbol("ios_system") ? .available : .unavailable,
-                              "Detected dynamically. Core tools do not require ios_system."))
+        let cliSnapshot = await cliCapabilityProvider?.cliCommandCapability()
+        appendCLIRecords(to: &records, snapshot: cliSnapshot, mode: "privileged")
         records.append(record("execution.posix_spawn_symbol", .execution, Self.hasDynamicSymbol("posix_spawn") ? .available : .unavailable,
                               "Only reports symbol presence; it does not prove sandbox escape or helper privilege."))
         try? await diagnosticLogger?.log(level: .info, subsystem: "capability", action: "probe.privileged.stage", result: "root-helper")
@@ -410,6 +416,63 @@ public struct CapabilityProbe: CapabilityProbing, @unchecked Sendable {
             metadata: ["count": String(records.count)]
         )
         return profile
+    }
+
+    private func appendDeferredCLIRecords(to records: inout [CapabilityRecord], providerConnected: Bool) {
+        let status: CapabilityStatus = providerConnected ? .deviceValidationRequired : .unavailable
+        let detail = providerConnected
+            ? "Bounded ios_system catalog validation is deferred during automatic startup; explicit device validation must verify runtime symbols, dictionaries, frameworks, and the complete P0 command catalog."
+            : "No bounded ios_system capability provider is connected in this build."
+        records.append(record("execution.ios_system", .execution, status, detail))
+        records.append(record("cli.runtime", .execution, status, detail))
+        for command in (CLICommandCatalog.packagedP0.union(CLICommandCatalog.desiredStructuredData)).sorted() {
+            records.append(record("cli.command.\(command)", .execution, status, detail))
+        }
+    }
+
+    private func replaceCLIRecords(in records: inout [CapabilityRecord], snapshot: CLICommandCapabilitySnapshot?, mode: String) {
+        let ids = Set(["execution.ios_system", "cli.runtime"] + (CLICommandCatalog.packagedP0.union(CLICommandCatalog.desiredStructuredData)).map { "cli.command.\($0)" })
+        records.removeAll { ids.contains($0.id) }
+        appendCLIRecords(to: &records, snapshot: snapshot, mode: mode)
+    }
+
+    private func appendCLIRecords(to records: inout [CapabilityRecord], snapshot: CLICommandCapabilitySnapshot?, mode: String) {
+        guard let snapshot else {
+            records.append(record("execution.ios_system", .execution, .unavailable, "No bounded ios_system capability provider is connected during \(mode) validation."))
+            records.append(record("cli.runtime", .execution, .unavailable, "No bounded CLI runtime is connected during \(mode) validation."))
+            for command in (CLICommandCatalog.packagedP0.union(CLICommandCatalog.desiredStructuredData)).sorted() {
+                records.append(record("cli.command.\(command)", .execution, .unavailable, "No CLI runtime is connected."))
+            }
+            return
+        }
+
+        let actual = Set(snapshot.commands)
+        let missingP0 = CLICommandCatalog.packagedP0.subtracting(actual).sorted()
+        let runtimeReady = snapshot.runtimeAvailable && missingP0.isEmpty
+        let runtimeStatus: CapabilityStatus = runtimeReady ? .available : .unavailable
+        let missingDetail = missingP0.isEmpty ? "" : " Missing required P0 commands: \(missingP0.joined(separator: ", "))."
+        let runtimeDetail = "\(snapshot.detail)\(missingDetail) Catalog validation mode=\(mode)."
+        records.append(record("execution.ios_system", .execution, runtimeStatus, runtimeDetail))
+        records.append(record("cli.runtime", .execution, runtimeStatus, runtimeDetail))
+
+        for command in CLICommandCatalog.packagedP0.sorted() {
+            let available = snapshot.runtimeAvailable && actual.contains(command)
+            records.append(record(
+                "cli.command.\(command)",
+                .execution,
+                available ? .available : .unavailable,
+                available ? "Verified in the packaged ios_system command dictionary/framework catalog." : "Command is absent or its packaged framework/symbol could not be validated."
+            ))
+        }
+        for command in CLICommandCatalog.desiredStructuredData.sorted() {
+            let available = snapshot.runtimeAvailable && actual.contains(command)
+            records.append(record(
+                "cli.command.\(command)",
+                .execution,
+                available ? .available : .unavailable,
+                available ? "Verified in the packaged ios_system command catalog." : "Structured-data CLI is not claimed until a pinned auditable iOS command framework is actually packaged; use native json.* tools meanwhile."
+            ))
+        }
     }
 
     private func record(_ id: String, _ domain: CapabilityDomain, _ status: CapabilityStatus, _ detail: String) -> CapabilityRecord {

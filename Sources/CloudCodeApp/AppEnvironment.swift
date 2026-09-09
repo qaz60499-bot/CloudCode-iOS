@@ -193,7 +193,14 @@ public final class CloudCodeViewModel: ObservableObject {
         let diagnosticLogStore = DiagnosticLogStore(directory: support.appendingPathComponent("Diagnostics/Runtime", isDirectory: true))
         let resolver = IOSAppResolver(diagnosticLogger: diagnosticLogStore)
         let guiBackend = TrollStoreGUIBackend(diagnosticLogger: diagnosticLogStore)
-        let probe = CapabilityProbe(appResolver: resolver, diagnosticLogger: diagnosticLogStore, guiCapabilityProvider: guiBackend)
+        let cliRuntimeRoot = support.appendingPathComponent("CLI", isDirectory: true)
+        let iosSystemRuntime = IOSSystemRuntime(runtimeRoot: cliRuntimeRoot)
+        let probe = CapabilityProbe(
+            appResolver: resolver,
+            diagnosticLogger: diagnosticLogStore,
+            guiCapabilityProvider: guiBackend,
+            cliCapabilityProvider: iosSystemRuntime
+        )
         let resourceResolver = ResourceResolver(appResolver: resolver)
         let fileService = FileService()
         let resourceIndex = ProgressiveResourceIndex(fileURL: support.appendingPathComponent("Index/resource-graph.json"))
@@ -223,10 +230,23 @@ public final class CloudCodeViewModel: ObservableObject {
             appKnowledgeRegistry: appKnowledge
         )
         let registry = ToolRegistry()
-        let cli = IOSSystemExecutor(policy: policy, approval: approval)
-        let privateApps = IOSPrivateAppExecutor(appResolver: resolver, policy: policy, approval: approval, audit: audit, resourceIndex: resourceIndex)
+        let cli = IOSSystemExecutor(policy: policy, approval: approval, runtime: iosSystemRuntime, runtimeRoot: cliRuntimeRoot)
+        let privateApps = IOSPrivateAppExecutor(
+            appResolver: resolver,
+            policy: policy,
+            approval: approval,
+            audit: audit,
+            resourceIndex: resourceIndex,
+            appKnowledgeRegistry: appKnowledge
+        )
         let attachmentRoot = support.appendingPathComponent("Attachments", isDirectory: true)
-        let gui = GUIFallbackExecutor(backend: guiBackend, policy: policy, approval: approval, attachmentRoot: attachmentRoot)
+        let gui = GUIFallbackExecutor(
+            backend: guiBackend,
+            policy: policy,
+            approval: approval,
+            attachmentRoot: attachmentRoot,
+            appKnowledgeRegistry: appKnowledge
+        )
         let interactionExperienceStore = IOSInteractionExperienceStore(
             fileURL: support.appendingPathComponent("Interaction/experience.json")
         )

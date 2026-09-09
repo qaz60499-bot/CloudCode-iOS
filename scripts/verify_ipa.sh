@@ -117,6 +117,38 @@ while IFS= read -r dependency; do
   esac
 done < <(otool -L "$APP_PATH/$EXECUTABLE" | tail -n +2 | awk '{print $1}')
 
+# The bounded CLI runtime is part of the install artifact, not a source-only capability claim.
+# Verify exactly the minimal upstream framework set and both runtime dictionaries. Generic CLI
+# frameworks remain ordinary app frameworks and must never appear in TSRootBinaries.
+for cli_framework in ios_system files shell text; do
+  cli_binary="$APP_PATH/Frameworks/$cli_framework.framework/$cli_framework"
+  if [[ ! -f "$cli_binary" ]]; then
+    echo "FAIL: bounded CLI framework missing from IPA: $cli_framework" >&2
+    exit 22
+  fi
+  if ! lipo -info "$cli_binary" | grep -q 'arm64'; then
+    echo "FAIL: bounded CLI framework is missing arm64: $cli_framework" >&2
+    exit 22
+  fi
+done
+if ! otool -L "$APP_PATH/$EXECUTABLE" | grep -Fq '@rpath/ios_system.framework/ios_system'; then
+  echo "FAIL: main executable is not linked against ios_system.framework" >&2
+  exit 22
+fi
+for dictionary in commandDictionary.plist extraCommandsDictionary.plist; do
+  if [[ ! -f "$APP_PATH/$dictionary" ]]; then
+    echo "FAIL: ios_system command dictionary missing from IPA: $dictionary" >&2
+    exit 22
+  fi
+  plutil -lint "$APP_PATH/$dictionary" >/dev/null
+done
+for forbidden_cli_framework in awk curl_ios ssh_cmd tar mandoc perl perlA perlB Python lua_ios network_ios; do
+  if [[ -e "$APP_PATH/Frameworks/$forbidden_cli_framework.framework" ]]; then
+    echo "FAIL: non-minimal CLI framework unexpectedly packaged: $forbidden_cli_framework" >&2
+    exit 22
+  fi
+done
+
 python3 - "$IPA_PATH" "$APP_PATH" <<'PY'
 import os
 import plistlib
@@ -140,6 +172,28 @@ with zipfile.ZipFile(ipa_path) as archive:
         if key in lowered and lowered[key] != name:
             raise SystemExit(f"FAIL: case-colliding IPA entries: {lowered[key]} vs {name}")
         lowered[key] = name
+
+expected_cli = {
+    "pwd", "echo", "ls", "cat", "cp", "mv", "mkdir", "rm", "stat", "find",
+    "grep", "head", "tail", "wc", "sort", "uniq",
+}
+with open(os.path.join(app_path, "commandDictionary.plist"), "rb") as handle:
+    command_dictionary = plistlib.load(handle)
+with open(os.path.join(app_path, "extraCommandsDictionary.plist"), "rb") as handle:
+    extra_dictionary = plistlib.load(handle)
+if set(command_dictionary) != expected_cli:
+    raise SystemExit(
+        f"FAIL: packaged CLI command catalog mismatch: expected={sorted(expected_cli)} actual={sorted(command_dictionary)}"
+    )
+if extra_dictionary != {}:
+    raise SystemExit("FAIL: extraCommandsDictionary must remain empty in the minimal CLI build")
+allowed_frameworks = {"files.framework/files", "shell.framework/shell", "text.framework/text"}
+for command, entry in command_dictionary.items():
+    if not isinstance(entry, list) or len(entry) != 4:
+        raise SystemExit(f"FAIL: invalid CLI dictionary entry for {command}")
+    if entry[0] not in allowed_frameworks:
+        raise SystemExit(f"FAIL: CLI command {command} references non-minimal framework {entry[0]}")
+print(f"PASS: minimal CLI catalog validated ({len(expected_cli)} commands; extra catalog empty)")
 
 for root, dirs, files in os.walk(app_path):
     if root.endswith(".framework") or root.endswith(".app"):

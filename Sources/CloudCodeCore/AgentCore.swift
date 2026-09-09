@@ -2919,8 +2919,8 @@ public actor AgentCore {
             return ToolArgumentSpec(properties: ["path": "string", "reason": "string", "logicalResourceId": "string", "sourceApp": "string"], required: ["path"])
         case "trash.restore", "trash.purge":
             return ToolArgumentSpec(properties: ["id": "string"], required: ["id"])
-        case "advanced.shell":
-            return ToolArgumentSpec(properties: ["command": "string"], required: ["command"])
+        case "cli.run", "advanced.shell":
+            return ToolArgumentSpec(properties: ["command": "string", "cwd": "string", "timeoutMs": "number"], required: ["command"])
         case "gui.tap", "gui.tapObserve":
             return ToolArgumentSpec(properties: ["x": "number", "y": "number"], required: ["x", "y"])
         case "gui.type", "gui.typeObserve":

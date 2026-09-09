@@ -141,8 +141,13 @@ public actor AppKnowledgeRegistry {
             lines.append("Known local-data aliases: \(aliases.joined(separator: ", ")). Stored paths are candidates only: resolve the current container and revalidate before any read or mutation.")
         }
         if let environment {
-            let candidates = (knowledge.actionMap ?? [])
-                .map { hint in AppActionCandidate(hint: hint, requiresRevalidation: !hint.environment.matches(environment)) }
+            // Consume the existing actionCandidates() API in the production planning hint instead
+            // of maintaining a second sorter here. Learning remains performance/discovery only:
+            // capability/policy eligibility is still enforced later by ToolRouter.
+            let semanticActions = Set((knowledge.actionMap ?? []).map { Self.normalizedAction($0.semanticAction) })
+                .filter { !$0.isEmpty }
+            let candidates = semanticActions
+                .flatMap { actionCandidates(for: bundleID, semanticAction: $0, environment: environment) }
                 .sorted { lhs, rhs in
                     if lhs.requiresRevalidation != rhs.requiresRevalidation { return !lhs.requiresRevalidation }
                     if lhs.hint.reliability != rhs.hint.reliability { return lhs.hint.reliability > rhs.hint.reliability }

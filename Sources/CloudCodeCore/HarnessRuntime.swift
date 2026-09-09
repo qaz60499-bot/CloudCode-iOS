@@ -304,7 +304,7 @@ public enum HarnessContextManager {
             prefixes.formUnion(["ipa.", "files.", "capability."])
         }
         if normalized.contains("shell") || normalized.contains("命令行") || normalized.contains("cli") {
-            prefixes.formUnion(["advanced.", "capability."])
+            prefixes.formUnion(["cli.", "advanced.", "capability."])
         }
 
         guard !prefixes.isEmpty else { return availableNames }

@@ -20,7 +20,8 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(profile.status("filesystem.shared_user_files"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("filesystem.unrestricted"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("apps.enumerate"), .deviceValidationRequired)
-        XCTAssertEqual(profile.status("execution.ios_system"), .deviceValidationRequired)
+        XCTAssertEqual(profile.status("execution.ios_system"), .unavailable)
+        XCTAssertEqual(profile.status("cli.runtime"), .unavailable)
         XCTAssertEqual(profile.status("execution.posix_spawn_symbol"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("execution.root_helper"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("apps.launch"), .deviceValidationRequired)
@@ -6324,6 +6325,8 @@ final class CloudCodeCoreTests: XCTestCase {
             CapabilityRecord(id: "filesystem.unrestricted", domain: .filesystem, status: .unavailable, detail: "no"),
             CapabilityRecord(id: "execution.root_helper", domain: .execution, status: .deviceValidationRequired, detail: "pending"),
             CapabilityRecord(id: "execution.ios_system", domain: .execution, status: .unavailable, detail: "no"),
+            CapabilityRecord(id: "cli.runtime", domain: .execution, status: .unavailable, detail: "no"),
+            CapabilityRecord(id: "cli.command.sh", domain: .execution, status: .unavailable, detail: "no interpreter"),
             CapabilityRecord(id: "ipa.inspect", domain: .ipa, status: .available, detail: "yes")
         ]
         let snapshots = HomeOSCapabilityLayer.snapshots(from: records)

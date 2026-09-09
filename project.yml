@@ -8,6 +8,8 @@ packages:
   ZIPFoundation:
     url: https://github.com/weichsel/ZIPFoundation.git
     revision: 22787ffb59de99e5dc1fbfe80b19c97a904ad48d
+  IOSSystemMinimal:
+    path: Vendor/IOSSystemMinimal
 targets:
   CloudCodeCore:
     type: library.static
@@ -21,7 +23,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.core
         PRODUCT_NAME: CloudCodeCore
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 96
+        CURRENT_PROJECT_VERSION: 97
         VERSIONING_SYSTEM: apple-generic
         DEFINES_MODULE: YES
         GENERATE_INFOPLIST_FILE: YES
@@ -32,16 +34,35 @@ targets:
     type: application
     platform: iOS
     sources:
-      - Sources/CloudCodeApp
+      - path: Sources/CloudCodeApp
+        excludes:
+          - Resources
+      - path: Sources/CloudCodeApp/Resources
+        buildPhase: resources
     dependencies:
       - target: CloudCodeCore
       - package: ZIPFoundation
+      - package: IOSSystemMinimal
+        product: IOSSystemRuntime
+        embed: true
+      - package: IOSSystemMinimal
+        product: IOSSystemFiles
+        link: false
+        embed: true
+      - package: IOSSystemMinimal
+        product: IOSSystemShell
+        link: false
+        embed: true
+      - package: IOSSystemMinimal
+        product: IOSSystemText
+        link: false
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios
         PRODUCT_NAME: CloudCode
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 96
+        CURRENT_PROJECT_VERSION: 97
         VERSIONING_SYSTEM: apple-generic
         SWIFT_VERSION: 5.9
         SWIFT_OBJC_BRIDGING_HEADER: Sources/CloudCodeApp/RootHelperBridge.h
