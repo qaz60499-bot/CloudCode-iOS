@@ -22,13 +22,11 @@ extern void *objc_autoreleasePoolPush(void);
 
 static __attribute__((noreturn)) void CloudCodeExitOneShot(int code)
 {
-    // Never call fflush(NULL) in the helper after private iOS frameworks have been loaded.
-    // Real-device build 107 evidence showed successful commands had already emitted their full
-    // stdout/stderr payload, then wedged while flushing unrelated process-global stdio streams and
-    // were killed by the 4–6s parent watchdog. Flush only the two observable pipes owned by the
-    // bridge, then hard-exit before private-framework teardown.
-    fflush(stdout);
-    fflush(stderr);
+    // stdout/stderr are switched to unbuffered mode at process entry before any helper I/O occurs.
+    // Build 108 real-device evidence showed that even fflush(stdout/stderr) could wedge after a
+    // private framework had already produced the final observable result, turning successful app
+    // launch, screenshot and background-assert handshakes into false parent timeouts. Do not enter
+    // stdio teardown/flush paths here: every write is already delivered synchronously to the bridge.
     _exit(code);
 }
 
@@ -1263,6 +1261,12 @@ static int CloudCodeRunOneShotCommand(int argc, const char *argv[])
 
 int main(int argc, const char *argv[])
 {
+    // Make bridge-owned stdout/stderr synchronous before any Foundation/private-framework work.
+    // This lets all one-shot commands hard-exit after their final write without calling fflush on
+    // process-global stdio state that can wedge on-device after LaunchServices/BackBoard/AX use.
+    (void)setvbuf(stdout, NULL, _IONBF, 0);
+    (void)setvbuf(stderr, NULL, _IONBF, 0);
+
     // The background assertion worker is deliberately long-lived and is not observed by the
     // one-shot parent bridge after its handshake. Preserve normal Objective-C cleanup for it.
     if (argc > 1 && strcmp(argv[1], "background-assert-worker") == 0) {
@@ -1278,10 +1282,7 @@ int main(int argc, const char *argv[])
     // The kernel reclaims all helper memory immediately; no state is shared with the host process.
     (void)objc_autoreleasePoolPush();
     int result = CloudCodeRunOneShotCommand(argc, argv);
-    // Same boundary as CloudCodeExitOneShot above: only the bridge-owned output streams are
-    // observable. Flushing every process-global FILE* can hang after LaunchServices/BackBoard/
-    // accessibility frameworks are loaded and turns already-completed work into a false timeout.
-    fflush(stdout);
-    fflush(stderr);
+    // Streams are unbuffered from process entry, so returning commands can hard-exit without any
+    // stdio flush/teardown. This is the same post-result boundary used by CloudCodeExitOneShot.
     _exit(result);
 }

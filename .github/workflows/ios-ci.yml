@@ -568,11 +568,11 @@ jobs:
               if visible_overlay_marker in vision_overlay_surface:
                   raise SystemExit(f'FAIL: OCR must remain data-only/background-capable and must not render a visible scan box: {visible_overlay_marker}')
           root_main = Path('Sources/CloudCodeRootHelper/main.m').read_text(encoding='utf-8')
-          for marker in ('CloudCodeRunOneShotCommand', 'objc_autoreleasePoolPush', 'fflush(stdout)', 'fflush(stderr)', '_exit(result)'):
+          for marker in ('CloudCodeRunOneShotCommand', 'objc_autoreleasePoolPush', 'setvbuf(stdout, NULL, _IONBF, 0)', 'setvbuf(stderr, NULL, _IONBF, 0)', '_exit(result)'):
               if marker not in root_main:
                   raise SystemExit(f'FAIL: one-shot root helper can regress to post-result teardown/watchdog latency: {marker}')
-          if re.search(r'fflush\s*\(\s*NULL\s*\)\s*;', root_main + '\n' + gui_text):
-              raise SystemExit('FAIL: helper must never flush every process-global FILE*; real-device build 107 showed this can hang after successful private-framework work')
+          if re.search(r'fflush\s*\(', root_main + '\n' + gui_text):
+              raise SystemExit('FAIL: one-shot helper must not enter stdio flush paths after private-framework work; build 108 showed even stdout/stderr flush can hang after the final result')
           project_text = Path('project.yml').read_text(encoding='utf-8')
           for marker in ('CloudCodeVisionHelper', 'Sources/CloudCodeVisionHelper/main.m', '-framework ImageIO'):
               if marker not in project_text:

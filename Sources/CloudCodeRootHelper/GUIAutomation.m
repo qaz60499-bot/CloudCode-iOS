@@ -40,11 +40,10 @@
 
 static __attribute__((noreturn)) void CloudCodeGUIExitOneShot(int code)
 {
-    // Do not flush every process-global stdio stream after loading private GUI frameworks. On the
-    // real device that can wedge after a successful screenshot/AX command and make the parent
-    // watchdog report a false timeout. Only stdout/stderr are owned by the bridge and observable.
-    fflush(stdout);
-    fflush(stderr);
+    // Root-helper process entry switches stdout/stderr to unbuffered mode before GUI work starts.
+    // Build 108 still showed post-result screenshot timeouts while flushing these streams after
+    // private framework use, so never enter stdio flush/teardown here. Observable writes have
+    // already reached the bridge synchronously.
     _exit(code);
 }
 
@@ -1698,7 +1697,7 @@ int CloudCodeGUIAXProbeJSON(NSString *stage, NSString *seedKind, pid_t targetPID
         @"seedKind": seedKind, @"preparation": preparation, @"requestedPID": @(targetPID),
         @"process": CCPerceptionProcessEvidence(@"standalone_ax_helper")} mutableCopy];
     NSData *entry = [NSJSONSerialization dataWithJSONObject:record options:0 error:nil];
-    if (entry) { fwrite(entry.bytes, 1, entry.length, stderr); fputc('\n', stderr); fflush(stderr); }
+    if (entry) { fwrite(entry.bytes, 1, entry.length, stderr); fputc('\n', stderr); }
     CloudCodeAXRuntime runtime = CloudCodeResolveAX();
     NSMutableDictionary *symbols = [NSMutableDictionary dictionary];
 #define CC_AX_SYMBOL(field) symbols[@#field] = CCAXSymbolEvidence((void *)runtime.field)
