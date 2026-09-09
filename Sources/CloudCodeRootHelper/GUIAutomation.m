@@ -1792,7 +1792,6 @@ static void CloudCodePrintData(NSData *data)
 
 int CloudCodeGUIProbeJSON(void)
 {
-    @autoreleasepool {
         // Keep explicit capability refresh lightweight. Do not touch UIScreen, global screenshots,
         // AXRuntime, or dispatch synthetic touch events here; each exact GUI operation validates
         // those private runtimes in its own bounded helper invocation when the user requests it.
@@ -1817,12 +1816,10 @@ int CloudCodeGUIProbeJSON(void)
         if (!data) { return 61; }
         CloudCodePrintData(data);
         return 0;
-    }
 }
 
 int CloudCodeGUITreeJSON(void)
 {
-    @autoreleasepool {
         // A detached TrollStore helper is not an XCTest/testmanagerd automation client. Do not
         // mutate the process-global AX automation switch here: timeout recovery uses SIGKILL, which
         // cannot run atexit cleanup and could otherwise leave that global state changed.
@@ -1830,12 +1827,10 @@ int CloudCodeGUITreeJSON(void)
         if (!data) { return 62; }
         CloudCodePrintData(data);
         return 0;
-    }
 }
 
 int CloudCodeGUIScreenshotBase64(void)
 {
-    @autoreleasepool {
         NSData *data = CloudCodeScreenshotJPEG();
         if (!data) {
             fprintf(stderr, "gui-screenshot: render-server IOSurface, _UICreateScreenUIImage, and UIWindow IOSurface backends all failed or could not produce a bounded JPEG\n");
@@ -1849,12 +1844,10 @@ int CloudCodeGUIScreenshotBase64(void)
         }
         CloudCodePrintData(output);
         return 0;
-    }
 }
 
 int CloudCodeGUIScreenshotFile(NSString *path)
 {
-    @autoreleasepool {
         NSString *normalized = [path isKindOfClass:NSString.class] ? path.stringByStandardizingPath : nil;
         NSString *parent = normalized.stringByDeletingLastPathComponent;
         NSString *filename = normalized.lastPathComponent;
@@ -1883,28 +1876,22 @@ int CloudCodeGUIScreenshotFile(NSString *path)
             return 63;
         }
         return 0;
-    }
 }
 
 int CloudCodeGUITap(double x, double y)
 {
-    @autoreleasepool {
         CGSize size = CloudCodeScreenSize();
         if (!CloudCodeValidPoint(x, y, size)) { return 64; }
         return CloudCodePerformTap(x, y) ? 0 : 65;
-    }
 }
 
 int CloudCodeGUISwipe(double fromX, double fromY, double toX, double toY, double durationSeconds)
 {
-    @autoreleasepool {
         return CloudCodePerformSwipe(fromX, fromY, toX, toY, durationSeconds) ? 0 : 66;
-    }
 }
 
 int CloudCodeGUIScroll(double deltaX, double deltaY)
 {
-    @autoreleasepool {
         if (!isfinite(deltaX) || !isfinite(deltaY) || (fabs(deltaX) < 0.5 && fabs(deltaY) < 0.5)) { return 64; }
         CGSize size = CloudCodeScreenSize();
         if (size.width <= 1 || size.height <= 1) { return 64; }
@@ -1913,12 +1900,10 @@ int CloudCodeGUIScroll(double deltaX, double deltaY)
         double toX = MIN(MAX(fromX - deltaX, size.width * 0.1), size.width * 0.9);
         double toY = MIN(MAX(fromY - deltaY, size.height * 0.1), size.height * 0.9);
         return CloudCodePerformSwipe(fromX, fromY, toX, toY, 0.30) ? 0 : 66;
-    }
 }
 
 int CloudCodeGUINavigateBack(NSString *strategy)
 {
-    @autoreleasepool {
         if (![strategy isKindOfClass:NSString.class]) { return 64; }
         CGSize size = CloudCodeScreenSize();
         if (size.width <= 1 || size.height <= 1) { return 64; }
@@ -1946,12 +1931,10 @@ int CloudCodeGUINavigateBack(NSString *strategy)
         if (!dispatched) { return 66; }
         fprintf(stderr, "gui-navigate-back: strategy=%s result=dispatched-semantic-unverified\n", strategy.UTF8String ?: "unknown");
         return 0;
-    }
 }
 
 int CloudCodeGUIFocusedTextInputJSON(void)
 {
-    @autoreleasepool {
         CloudCodeAXRuntime ax = CloudCodeResolveAX();
         BOOL runtimeAvailable = ax.copyAttribute != NULL;
         BOOL focusedElementAvailable = NO;
@@ -2002,12 +1985,10 @@ int CloudCodeGUIFocusedTextInputJSON(void)
         fwrite(data.bytes, 1, data.length, stdout);
         fputc('\n', stdout);
         return runtimeAvailable ? 0 : 62;
-    }
 }
 
 int CloudCodeGUITypeBase64(NSString *base64Text)
 {
-    @autoreleasepool {
         if (![base64Text isKindOfClass:NSString.class] || base64Text.length == 0 || base64Text.length > (CLOUDCODE_GUI_MAX_TEXT_UTF8_BYTES * 2)) { return 67; }
         NSData *utf8 = [[NSData alloc] initWithBase64EncodedString:base64Text options:0];
         if (!utf8 || utf8.length == 0 || utf8.length > CLOUDCODE_GUI_MAX_TEXT_UTF8_BYTES) { return 67; }
@@ -2125,5 +2106,4 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
         }
         fprintf(stderr, "gui-type: route=hid-unicode result=dispatched-unverified chars=%lu\n", (unsigned long)text.length);
         return 0;
-    }
 }

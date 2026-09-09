@@ -533,6 +533,8 @@ jobs:
               raise SystemExit('FAIL: legacy AXManualAccessibility cleanup is missing; upgraded devices can retain the old visible green highlight')
           if re.search(r'AXManualAccessibility.{0,160}kCFBooleanTrue|kCFBooleanTrue.{0,160}AXManualAccessibility', gui_text, flags=re.S):
               raise SystemExit('FAIL: AX/OCR automation must never enable AXManualAccessibility; only the false-only legacy cleanup is allowed')
+          if '@autoreleasepool' in gui_text:
+              raise SystemExit('FAIL: one-shot GUI command reintroduced an inner autorelease teardown before the hard-exit boundary')
           for visible_overlay_marker in ('CAShapeLayer', 'UIWindow(', 'strokeColor', 'borderColor', 'systemGreen', 'UIColor.green'):
               if visible_overlay_marker in gui_text:
                   raise SystemExit(f'FAIL: root GUI perception helper must not draw a visible scan/highlight overlay: {visible_overlay_marker}')
