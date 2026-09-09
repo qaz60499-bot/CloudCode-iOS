@@ -700,7 +700,10 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
 
     public func appIntrospection(bundleID: String) async -> AppStaticIntrospection? {
         let indexedVersion = cachedVersion(for: bundleID)
-        if let cached = cachedIntrospection[bundleID], indexedVersion == nil || cached.version == indexedVersion {
+        if let cached = cachedIntrospection[bundleID],
+           let indexedVersion,
+           cached.version == indexedVersion,
+           bundlePaths[bundleID] == cached.bundlePath {
             return cached
         }
         let result = EmbeddedRootHelper.appIntrospection(bundleID: bundleID)
@@ -747,6 +750,9 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
             localData: payload.localData
         )
         cachedIntrospection[bundleID] = introspection
+        if !introspection.bundlePath.isEmpty { bundlePaths[bundleID] = introspection.bundlePath }
+        if !introspection.dataContainerPath.isEmpty { containerPaths[bundleID] = introspection.dataContainerPath }
+        negativeBundleIDs.remove(bundleID)
         return introspection
     }
 
@@ -754,6 +760,16 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
         if bundleID == Bundle.main.bundleIdentifier { return bundlePaths[bundleID] ?? Bundle.main.bundleURL.path }
         if shouldRefreshIndex() { refresh() }
         if let value = bundlePaths[bundleID] { return value }
+
+        // A full installed-App inventory is useful for discovery, but it is not a prerequisite for
+        // an exact Bundle-ID lookup. Detached TrollStore helpers can occasionally lose the broad
+        // LaunchServices enumeration view while an exact LSApplicationProxy lookup still resolves
+        // the requested App correctly. Reuse the bounded single-App introspection path before
+        // concluding that a known target such as WeChat is absent.
+        if let exact = await appIntrospection(bundleID: bundleID), !exact.bundlePath.isEmpty {
+            return exact.bundlePath
+        }
+
         guard enumerationProven, !negativeBundleIDs.contains(bundleID) else { return nil }
         // A cache miss can mean a newly installed App. Permit one refresh for that bundle ID, then
         // remember a negative lookup so a stale/invalid ID cannot trigger a full 385-App scan forever.
@@ -770,6 +786,14 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
         // If the bundle itself is already in the index, an absent container path is a known value,
         // not evidence that the whole App index is stale.
         if bundlePaths[bundleID] != nil { return nil }
+
+        // Exact container resolution stays available even when broad installed-App enumeration is
+        // temporarily degraded. The single-App helper verifies the current Bundle ID and returns the
+        // current container UUID dynamically, so no historical UUID path is treated as identity.
+        if let exact = await appIntrospection(bundleID: bundleID), !exact.dataContainerPath.isEmpty {
+            return exact.dataContainerPath
+        }
+
         guard enumerationProven, !negativeBundleIDs.contains(bundleID) else { return nil }
         refresh()
         if let value = containerPaths[bundleID] { return value }
