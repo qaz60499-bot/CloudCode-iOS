@@ -3,6 +3,7 @@
 
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <ImageIO/ImageIO.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <mach/mach.h>
@@ -35,6 +36,13 @@
 #define CLOUDCODE_HID_DIGITIZER_ATTRIBUTE (1u << 6)
 #define CLOUDCODE_HID_FIELD_IS_BUILT_IN 0x4u
 #define CLOUDCODE_HID_FIELD_DIGITIZER_DISPLAY_INTEGRATED 0xB0019u
+#define CLOUDCODE_IOSURFACE_LOCK_READ_ONLY 0x1u
+
+static __attribute__((noreturn)) void CloudCodeGUIExitOneShot(int code)
+{
+    fflush(NULL);
+    _exit(code);
+}
 
 typedef const struct __CloudCodeIOHIDEvent *CloudCodeIOHIDEventRef;
 typedef const struct __CloudCodeIOHIDEventSystemClient *CloudCodeIOHIDEventSystemClientRef;
@@ -537,6 +545,163 @@ static CGSize CloudCodeScreenPixelSize(void)
         return CGSizeMake(width, height);
     }
     return CGSizeZero;
+}
+
+static __attribute__((noreturn)) void CloudCodeRenderServerScreenshotAndExit(NSString *outputPath, BOOL emitBase64)
+{
+    void *quartzCore = dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_LAZY | RTLD_LOCAL);
+    void *ioSurface = CloudCodeOpenFramework(@[
+        @"/System/Library/Frameworks/IOSurface.framework/IOSurface",
+        @"/rootfs/System/Library/Frameworks/IOSurface.framework/IOSurface"
+    ]);
+    void *ioSurfaceAccelerator = CloudCodeOpenFramework(@[
+        @"/System/Library/PrivateFrameworks/IOSurfaceAccelerator.framework/IOSurfaceAccelerator",
+        @"/rootfs/System/Library/PrivateFrameworks/IOSurfaceAccelerator.framework/IOSurfaceAccelerator"
+    ]);
+    CloudCodeRenderServerRenderDisplayFn render = (CloudCodeRenderServerRenderDisplayFn)CloudCodeResolve(quartzCore, "CARenderServerRenderDisplay");
+    CloudCodeIOSurfaceCreateFn createSurface = (CloudCodeIOSurfaceCreateFn)CloudCodeResolve(ioSurface, "IOSurfaceCreate");
+    CloudCodeIOSurfaceAlignPropertyFn alignProperty = (CloudCodeIOSurfaceAlignPropertyFn)CloudCodeResolve(ioSurface, "IOSurfaceAlignProperty");
+    CloudCodeIOSurfaceLockFn lockSurface = (CloudCodeIOSurfaceLockFn)CloudCodeResolve(ioSurface, "IOSurfaceLock");
+    CloudCodeIOSurfaceUnlockFn unlockSurface = (CloudCodeIOSurfaceUnlockFn)CloudCodeResolve(ioSurface, "IOSurfaceUnlock");
+    CloudCodeIOSurfaceGetBaseAddressFn getBaseAddress = (CloudCodeIOSurfaceGetBaseAddressFn)CloudCodeResolve(ioSurface, "IOSurfaceGetBaseAddress");
+    CloudCodeIOSurfaceGetBytesPerRowFn getBytesPerRow = (CloudCodeIOSurfaceGetBytesPerRowFn)CloudCodeResolve(ioSurface, "IOSurfaceGetBytesPerRow");
+    CloudCodeIOSurfaceAcceleratorCreateFn createAccelerator = (CloudCodeIOSurfaceAcceleratorCreateFn)CloudCodeResolve(ioSurfaceAccelerator, "IOSurfaceAcceleratorCreate");
+    CloudCodeIOSurfaceAcceleratorTransferFn transferSurface = (CloudCodeIOSurfaceAcceleratorTransferFn)CloudCodeResolve(ioSurfaceAccelerator, "IOSurfaceAcceleratorTransferSurface");
+    CGSize pixels = CloudCodeScreenPixelSize();
+    CGSize points = CloudCodeScreenSize();
+    if (!render || !createSurface || !alignProperty || !lockSurface || !unlockSurface || !getBaseAddress || !getBytesPerRow || !createAccelerator || !transferSurface || pixels.width <= 1 || pixels.height <= 1) {
+        fprintf(stderr, "gui-screenshot/direct: prerequisites unavailable render=%d create=%d align=%d lock=%d unlock=%d base=%d row=%d accelerator=%d transfer=%d pixels=%.0fx%.0f\n",
+                !!render, !!createSurface, !!alignProperty, !!lockSurface, !!unlockSurface, !!getBaseAddress, !!getBytesPerRow, !!createAccelerator, !!transferSurface, pixels.width, pixels.height);
+        CloudCodeGUIExitOneShot(63);
+    }
+
+    size_t width = (size_t)llround(pixels.width);
+    size_t height = (size_t)llround(pixels.height);
+    if (width == 0 || height == 0 || width > 8192 || height > 8192 || width > SIZE_MAX / 4) { CloudCodeGUIExitOneShot(63); }
+    size_t rawBytesPerRow = width * 4;
+    size_t bytesPerRow = alignProperty(CFSTR("IOSurfaceBytesPerRow"), rawBytesPerRow);
+    if (bytesPerRow < rawBytesPerRow || bytesPerRow == 0 || height > SIZE_MAX / bytesPerRow) { CloudCodeGUIExitOneShot(63); }
+    size_t rawAllocationSize = bytesPerRow * height;
+    size_t allocationSize = alignProperty(CFSTR("IOSurfaceAllocSize"), rawAllocationSize);
+    if (allocationSize < rawAllocationSize || allocationSize == 0 || allocationSize > 256 * 1024 * 1024) { CloudCodeGUIExitOneShot(63); }
+
+    NSDictionary *properties = @{
+        @"IOSurfaceWidth": @(width),
+        @"IOSurfaceHeight": @(height),
+        @"IOSurfaceBytesPerElement": @4,
+        @"IOSurfaceBytesPerRow": @(bytesPerRow),
+        @"IOSurfaceAllocSize": @(allocationSize),
+        @"IOSurfacePixelFormat": @(0x42475241),
+        @"IOSurfaceIsGlobal": @YES
+    };
+    CloudCodeIOSurfaceRef renderSurface = createSurface((__bridge CFDictionaryRef)properties);
+    CloudCodeIOSurfaceRef copiedSurface = createSurface((__bridge CFDictionaryRef)properties);
+    if (!renderSurface || !copiedSurface) {
+        fprintf(stderr, "gui-screenshot/direct: IOSurfaceCreate failed render=%d copy=%d\n", renderSurface != NULL, copiedSurface != NULL);
+        CloudCodeGUIExitOneShot(63);
+    }
+
+    int32_t renderLockCode = lockSurface(renderSurface, 0, NULL);
+    if (renderLockCode != 0) {
+        fprintf(stderr, "gui-screenshot/direct: render surface lock failed code=%d\n", renderLockCode);
+        CloudCodeGUIExitOneShot(63);
+    }
+    @try { render(0, CFSTR("LCD"), renderSurface, 0, 0); } @catch (__unused NSException *exception) {}
+    unlockSurface(renderSurface, 0, NULL);
+
+    CloudCodeIOSurfaceAcceleratorRef accelerator = NULL;
+    int32_t acceleratorCode = createAccelerator(kCFAllocatorDefault, NULL, &accelerator);
+    int32_t transferCode = (acceleratorCode == 0 && accelerator)
+        ? transferSurface(accelerator, renderSurface, copiedSurface, NULL, NULL, NULL, NULL)
+        : -1;
+    if (acceleratorCode != 0 || !accelerator || transferCode != 0) {
+        fprintf(stderr, "gui-screenshot/direct: accelerator copy failed create=%d transfer=%d\n", acceleratorCode, transferCode);
+        CloudCodeGUIExitOneShot(63);
+    }
+    fprintf(stderr, "gui-screenshot/direct: transfer=success size=%zux%zu\n", width, height);
+
+    fprintf(stderr, "gui-screenshot/direct: readable-lock begin\n");
+    int32_t readableLockCode = lockSurface(copiedSurface, CLOUDCODE_IOSURFACE_LOCK_READ_ONLY, NULL);
+    if (readableLockCode != 0) {
+        fprintf(stderr, "gui-screenshot/direct: readable-lock failed code=%d\n", readableLockCode);
+        CloudCodeGUIExitOneShot(63);
+    }
+    fprintf(stderr, "gui-screenshot/direct: readable-lock success\n");
+    void *baseAddress = getBaseAddress(copiedSurface);
+    size_t copiedBytesPerRow = getBytesPerRow(copiedSurface);
+    if (!baseAddress || copiedBytesPerRow < width * 4) {
+        fprintf(stderr, "gui-screenshot/direct: readable bytes unavailable base=%d row=%zu\n", baseAddress != NULL, copiedBytesPerRow);
+        CloudCodeGUIExitOneShot(63);
+    }
+
+    CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, baseAddress, copiedBytesPerRow * height, NULL);
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGImageRef sourceImage = provider && colorSpace ? CGImageCreate(
+        width, height, 8, 32, copiedBytesPerRow, colorSpace,
+        kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little,
+        provider, NULL, true, kCGRenderingIntentDefault
+    ) : NULL;
+    if (!sourceImage) {
+        fprintf(stderr, "gui-screenshot/direct: CGImage creation failed\n");
+        CloudCodeGUIExitOneShot(63);
+    }
+
+    size_t targetWidth = (size_t)llround(points.width > 1 ? points.width : pixels.width);
+    size_t targetHeight = (size_t)llround(points.height > 1 ? points.height : pixels.height);
+    if (targetWidth == 0 || targetHeight == 0 || targetWidth > 4096 || targetHeight > 4096 || targetWidth > SIZE_MAX / 4 || targetHeight > SIZE_MAX / (targetWidth * 4)) {
+        CloudCodeGUIExitOneShot(63);
+    }
+    size_t targetBytesPerRow = targetWidth * 4;
+    void *targetPixels = calloc(targetHeight, targetBytesPerRow);
+    if (!targetPixels) { CloudCodeGUIExitOneShot(63); }
+    CGContextRef bitmap = CGBitmapContextCreate(targetPixels, targetWidth, targetHeight, 8, targetBytesPerRow, colorSpace,
+                                                kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
+    if (!bitmap) { CloudCodeGUIExitOneShot(63); }
+    CGContextSetInterpolationQuality(bitmap, kCGInterpolationHigh);
+    CGContextTranslateCTM(bitmap, 0, (CGFloat)targetHeight);
+    CGContextScaleCTM(bitmap, 1, -1);
+    CGContextDrawImage(bitmap, CGRectMake(0, 0, targetWidth, targetHeight), sourceImage);
+    CGImageRef scaledImage = CGBitmapContextCreateImage(bitmap);
+    if (!scaledImage) { CloudCodeGUIExitOneShot(63); }
+
+    NSData *jpeg = nil;
+    const CGFloat qualities[] = {0.55, 0.45, 0.36, 0.28, 0.20};
+    for (NSUInteger index = 0; index < sizeof(qualities) / sizeof(qualities[0]); index++) {
+        NSMutableData *candidate = [NSMutableData data];
+        CGImageDestinationRef destination = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)candidate, CFSTR("public.jpeg"), 1, NULL);
+        if (!destination) { continue; }
+        NSDictionary *options = @{(__bridge NSString *)kCGImageDestinationLossyCompressionQuality: @(qualities[index])};
+        CGImageDestinationAddImage(destination, scaledImage, (__bridge CFDictionaryRef)options);
+        BOOL finalized = CGImageDestinationFinalize(destination);
+        if (finalized && candidate.length > 0 && candidate.length <= CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES) {
+            jpeg = candidate;
+            break;
+        }
+    }
+    if (!jpeg) {
+        fprintf(stderr, "gui-screenshot/direct: point-sized JPEG encoding failed or exceeded %d bytes\n", CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES);
+        CloudCodeGUIExitOneShot(63);
+    }
+
+    if (emitBase64) {
+        NSString *encoded = [jpeg base64EncodedStringWithOptions:0];
+        NSData *output = [encoded dataUsingEncoding:NSUTF8StringEncoding];
+        if (!output || output.length > (CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES * 2)) { CloudCodeGUIExitOneShot(63); }
+        fwrite(output.bytes, 1, output.length, stdout);
+        fputc('\n', stdout);
+    } else {
+        NSError *writeError = nil;
+        BOOL wrote = outputPath.length > 0 && [jpeg writeToFile:outputPath options:0 error:&writeError];
+        if (!wrote) {
+            fprintf(stderr, "gui-screenshot/direct: jpeg write failed %s\n", writeError.localizedDescription.UTF8String ?: "unknown");
+            CloudCodeGUIExitOneShot(63);
+        }
+    }
+    fprintf(stderr, "gui-screenshot/direct: completed points=%zux%zu jpeg=%lu\n", targetWidth, targetHeight, (unsigned long)jpeg.length);
+    // Intentionally do not unwind UIKit/IOSurface/private framework objects. This is a one-shot
+    // helper; the kernel reclaims every resource at process exit and avoids the real-device ARC/
+    // private-framework teardown stall observed after successful capture.
+    CloudCodeGUIExitOneShot(0);
 }
 
 static UIImage *CloudCodeScreenshotImageFromRenderServer(void)
@@ -1644,18 +1809,18 @@ int CloudCodeGUIAXProbeJSON(NSString *stage, NSString *seedKind, pid_t targetPID
     }
     record[@"latencyMS"] = @((CFAbsoluteTimeGetCurrent() - started) * 1000);
     NSData *json = [NSJSONSerialization dataWithJSONObject:record options:NSJSONWritingSortedKeys error:nil];
-    if (!json || json.length > 64 * 1024) { return 65; }
+    if (!json || json.length > 64 * 1024) { CloudCodeGUIExitOneShot(65); }
     fwrite(json.bytes, 1, json.length, stdout); fputc('\n', stdout);
-    return 0;
+    CloudCodeGUIExitOneShot(0);
 }
 
-static NSData *CloudCodeFrontmostTreeData(void)
+static __attribute__((noreturn)) void CloudCodeFrontmostTreeData(void)
 {
     CloudCodeAXRuntime runtime = CloudCodeResolveAX();
     if ((!runtime.createApplication && !runtime.createAppElementWithPid && !runtime.createSystemWide) || !runtime.copyAttribute) {
         CloudCodePrintAXRuntimeDiagnostic(runtime, "missing-symbols");
         fprintf(stderr, "gui-tree: required AXRuntime creation/copy symbols are unavailable\n");
-        return nil;
+        CloudCodeGUIExitOneShot(62);
     }
     if (runtime.setRequestingClient) { runtime.setRequestingClient(2); }
 
@@ -1712,7 +1877,7 @@ static NSData *CloudCodeFrontmostTreeData(void)
     if (!root && !rootNode) {
         CloudCodePrintAXRuntimeDiagnostic(runtime, "foreground-resolution-failed");
         fprintf(stderr, "gui-tree: stage=standalone-sampled-semantics result=unavailable direct-application-root-and-bounded-hit-test-produced-no-readable-ui\n");
-        return nil;
+        CloudCodeGUIExitOneShot(62);
     }
 
     if (root) {
@@ -1748,7 +1913,8 @@ static NSData *CloudCodeFrontmostTreeData(void)
     if (!rootNode || nodeCount == 0 || semanticNodeCount == 0) {
         CloudCodePrintAXRuntimeDiagnostic(runtime, "empty-semantic-tree");
         fprintf(stderr, "gui-tree: AX transport responded but no semantic/actionable foreground UI nodes were returned\n");
-        return nil;
+        // Result is final. Exit before ARC/private AX object teardown can stall the one-shot helper.
+        CloudCodeGUIExitOneShot(62);
     }
     NSString *scope = [rootNode[@"role"] isEqual:@"AXHitTestSnapshot"] ? @"sampled_semantics" : @"full_application_tree_opportunistic";
     NSDictionary *payload = @{
@@ -1764,13 +1930,15 @@ static NSData *CloudCodeFrontmostTreeData(void)
     NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
     if (!data || error || data.length == 0) {
         fprintf(stderr, "gui-tree: AX tree JSON serialization failed\n");
-        return nil;
+        CloudCodeGUIExitOneShot(62);
     }
     if (data.length > CLOUDCODE_GUI_MAX_TREE_BYTES) {
         fprintf(stderr, "gui-tree: AX tree output exceeded %d bytes\n", CLOUDCODE_GUI_MAX_TREE_BYTES);
-        return nil;
+        CloudCodeGUIExitOneShot(62);
     }
-    return data;
+    fwrite(data.bytes, 1, data.length, stdout);
+    fputc('\n', stdout);
+    CloudCodeGUIExitOneShot(0);
 }
 
 static void CloudCodePrintData(NSData *data)
@@ -1813,27 +1981,12 @@ int CloudCodeGUITreeJSON(void)
         // A detached TrollStore helper is not an XCTest/testmanagerd automation client. Do not
         // mutate the process-global AX automation switch here: timeout recovery uses SIGKILL, which
         // cannot run atexit cleanup and could otherwise leave that global state changed.
-        NSData *data = CloudCodeFrontmostTreeData();
-        if (!data) { return 62; }
-        CloudCodePrintData(data);
-        return 0;
+        CloudCodeFrontmostTreeData();
 }
 
 int CloudCodeGUIScreenshotBase64(void)
 {
-        NSData *data = CloudCodeScreenshotJPEG();
-        if (!data) {
-            fprintf(stderr, "gui-screenshot: render-server IOSurface, _UICreateScreenUIImage, and UIWindow IOSurface backends all failed or could not produce a bounded JPEG\n");
-            return 63;
-        }
-        NSString *encoded = [data base64EncodedStringWithOptions:0];
-        NSData *output = [encoded dataUsingEncoding:NSUTF8StringEncoding];
-        if (!output || output.length > (CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES * 2)) {
-            fprintf(stderr, "gui-screenshot: base64 output exceeded the app-layer capture bound\n");
-            return 63;
-        }
-        CloudCodePrintData(output);
-        return 0;
+        CloudCodeRenderServerScreenshotAndExit(nil, YES);
 }
 
 int CloudCodeGUIScreenshotFile(NSString *path)
@@ -1852,20 +2005,9 @@ int CloudCodeGUIScreenshotFile(NSString *path)
             return 63;
         }
 
-        NSData *data = CloudCodeScreenshotJPEG();
-        if (!data || data.length == 0 || data.length > CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES) {
-            fprintf(stderr, "gui-screenshot-file: no bounded JPEG available\n");
-            return 63;
-        }
-        // The app pre-creates this file as its own uid. Overwrite that inode in-place so a root
-        // helper does not replace it with a root-owned atomic-temp file that the sandboxed app
-        // cannot subsequently read.
-        NSError *error = nil;
-        if (![data writeToFile:normalized options:0 error:&error]) {
-            fprintf(stderr, "gui-screenshot-file: write failed: %s\n", error.localizedDescription.UTF8String ?: "unknown");
-            return 63;
-        }
-        return 0;
+        // The app pre-creates this inode as mobile. The direct capture path overwrites it in place,
+        // emits the final diagnostic, and exits the one-shot helper before private-framework teardown.
+        CloudCodeRenderServerScreenshotAndExit(normalized, NO);
 }
 
 int CloudCodeGUITap(double x, double y)
@@ -1971,10 +2113,10 @@ int CloudCodeGUIFocusedTextInputJSON(void)
         };
         NSError *error = nil;
         NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
-        if (!data || error || data.length > 4096) { return 61; }
+        if (!data || error || data.length > 4096) { CloudCodeGUIExitOneShot(61); }
         fwrite(data.bytes, 1, data.length, stdout);
         fputc('\n', stdout);
-        return runtimeAvailable ? 0 : 62;
+        CloudCodeGUIExitOneShot(runtimeAvailable ? 0 : 62);
 }
 
 int CloudCodeGUITypeBase64(NSString *base64Text)
@@ -2036,13 +2178,13 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
                                         (unsigned long)text.length,
                                         focusedBackend.UTF8String ?: "AXRuntime.focused",
                                         focusedRole.UTF8String ?: "unknown");
-                                return 0;
+                                CloudCodeGUIExitOneShot(0);
                             }
                             fprintf(stderr, "gui-type: route=ax-focused-value result=write-unverified chars=%lu backend=%s role=%s\n",
                                     (unsigned long)text.length,
                                     focusedBackend.UTF8String ?: "AXRuntime.focused",
                                     focusedRole.UTF8String ?: "unknown");
-                            return 70;
+                            CloudCodeGUIExitOneShot(70);
                         }
                     }
                 }
@@ -2050,17 +2192,17 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
         }
 
         NSData *unicode = [text dataUsingEncoding:NSUTF16LittleEndianStringEncoding];
-        if (!unicode || unicode.length == 0 || unicode.length > UINT32_MAX) { return 67; }
+        if (!unicode || unicode.length == 0 || unicode.length > UINT32_MAX) { CloudCodeGUIExitOneShot(67); }
         CloudCodeHIDRuntime runtime = CloudCodeResolveHID();
         CGSize size = CloudCodeScreenSize();
         CloudCodeHIDRoute route = {0};
         CGPoint routingPoint = CGPointMake(size.width > 1 ? size.width * 0.5 : 1, size.height > 1 ? size.height * 0.5 : 1);
         if (!CloudCodeHIDReady(runtime, routingPoint, &route) || !runtime.createUnicode) {
             CloudCodeReleaseHIDRoute(&route);
-            return 68;
+            CloudCodeGUIExitOneShot(68);
         }
         CloudCodeIOHIDEventRef event = runtime.createUnicode(kCFAllocatorDefault, mach_absolute_time(), unicode.bytes, (uint32_t)unicode.length, 1, 0);
-        if (!event) { CloudCodeReleaseHIDRoute(&route); return 68; }
+        if (!event) { CloudCodeReleaseHIDRoute(&route); CloudCodeGUIExitOneShot(68); }
         runtime.setInteger(event, 4, 1);
         if (route.usesBackBoardRoute && route.routedConnection && runtime.dispatchConnection) {
             runtime.dispatchConnection(route.routedConnection, event);
@@ -2070,7 +2212,7 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
         } else {
             CFRelease(event);
             CloudCodeReleaseHIDRoute(&route);
-            return 68;
+            CloudCodeGUIExitOneShot(68);
         }
         CFRelease(event);
         CloudCodeReleaseHIDRoute(&route);
@@ -2085,15 +2227,15 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
                 NSString *afterText = (NSString *)rawAfter;
                 if ([afterText isEqualToString:beforeText]) {
                     fprintf(stderr, "gui-type: route=hid-unicode result=no-observed-change chars=%lu\n", (unsigned long)text.length);
-                    return 70;
+                    CloudCodeGUIExitOneShot(70);
                 }
                 fprintf(stderr, "gui-type: route=hid-unicode result=ax-observed-change chars=%lu beforeChars=%lu afterChars=%lu\n",
                         (unsigned long)text.length,
                         (unsigned long)beforeText.length,
                         (unsigned long)afterText.length);
-                return 0;
+                CloudCodeGUIExitOneShot(0);
             }
         }
         fprintf(stderr, "gui-type: route=hid-unicode result=dispatched-unverified chars=%lu\n", (unsigned long)text.length);
-        return 0;
+        CloudCodeGUIExitOneShot(0);
 }
