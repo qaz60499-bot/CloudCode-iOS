@@ -432,6 +432,10 @@ enum EmbeddedRootHelper {
         if result.code == 0, result.diagnostic == expectedProtocolMarker {
             return RootHelperCapabilitySnapshot(available: true, detail: "\(executableName) 已通过 persona 99 / UID 0 / GID 0 及 helper 协议指纹探测。")
         }
+        if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.diagnostic),
+           String(result.diagnostic.split(separator: "\n", maxSplits: 1).first ?? "") == expectedProtocolMarker {
+            return RootHelperCapabilitySnapshot(available: true, detail: "\(executableName) 已返回精确 helper 协议指纹；随后仅在退出阶段触发父进程超时，因此保留已验证的只读 capability 结果。")
+        }
         if result.code == 0 {
             return RootHelperCapabilitySnapshot(available: false, detail: "\(executableName) root 探测返回了非预期协议指纹；拒绝使用可能过期的 helper。")
         }
@@ -439,36 +443,33 @@ enum EmbeddedRootHelper {
     }
 
     static func filesystemCapability() -> PrivilegedFilesystemCapabilitySnapshot {
-        let result = run(["probe-filesystem-json"], privilege: .root, timeout: 5)
-        guard result.code == 0 else {
-            return PrivilegedFilesystemCapabilitySnapshot(
-                sharedUserFilesAvailable: false,
-                unrestrictedAvailable: false,
-                detail: failureDetail(prefix: "helper 高权限文件系统探测", code: result.code, diagnostic: result.diagnostic)
-            )
-        }
-        let decoder = JSONDecoder()
-        var payload: FilesystemProbePayload?
-        if let data = result.diagnostic.data(using: .utf8) {
-            payload = try? decoder.decode(FilesystemProbePayload.self, from: data)
-        }
-        if payload == nil, let start = result.diagnostic.firstIndex(of: "{"), let end = result.diagnostic.lastIndex(of: "}") {
-            let json = String(result.diagnostic[start...end])
-            if let data = json.data(using: .utf8) {
-                payload = try? decoder.decode(FilesystemProbePayload.self, from: data)
-            }
-        }
+        // Keep the machine-readable capability payload separate from bridge timeout diagnostics so
+        // a fully completed bounded canary cannot be confused with the helper's later exit timeout.
+        let result = runSeparated(["probe-filesystem-json"], privilege: .root, timeout: 5)
+        let payload = result.stdout.data(using: .utf8).flatMap { try? JSONDecoder().decode(FilesystemProbePayload.self, from: $0) }
         guard let payload else {
+            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
             return PrivilegedFilesystemCapabilitySnapshot(
                 sharedUserFilesAvailable: false,
                 unrestrictedAvailable: false,
-                detail: "helper 高权限文件系统探测输出无法解析；已按 fail-closed 处理。"
+                detail: result.code == 0
+                    ? "helper 高权限文件系统探测输出无法解析；已按 fail-closed 处理。"
+                    : failureDetail(prefix: "helper 高权限文件系统探测", code: result.code, diagnostic: diagnostic)
             )
         }
+        guard result.code == 0 || mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.stderr) else {
+            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+            return PrivilegedFilesystemCapabilitySnapshot(
+                sharedUserFilesAvailable: false,
+                unrestrictedAvailable: false,
+                detail: failureDetail(prefix: "helper 高权限文件系统探测", code: result.code, diagnostic: diagnostic)
+            )
+        }
+        let timeoutSuffix = result.code == 0 ? "" : "；helper 随后仅在退出阶段触发父进程超时，但完整 JSON capability payload 已通过解码校验"
         return PrivilegedFilesystemCapabilitySnapshot(
             sharedUserFilesAvailable: payload.sharedUserFiles,
             unrestrictedAvailable: payload.unrestricted,
-            detail: payload.detail
+            detail: payload.detail + timeoutSuffix
         )
     }
 
@@ -529,12 +530,19 @@ enum EmbeddedRootHelper {
             return (nil, "\(executableName) 不可执行；GUI backend 保持不可用。")
         }
         let result = runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)
-        guard result.code == 0, let payload = decodeGUIProbe(result.stdout) else {
+        guard let payload = decodeGUIProbe(result.stdout) else {
             let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
             return (nil, failureDetail(prefix: "隔离 GUI readiness 探测", code: result.code, diagnostic: diagnostic))
         }
-        let diagnosticSuffix = result.stderr.isEmpty ? "" : " helper diagnostics: \(result.stderr)"
-        return (payload, "\(payload.backend) 已在受限 root helper 内完成只读 readiness handshake。\(diagnosticSuffix)")
+        if result.code == 0 {
+            let diagnosticSuffix = result.stderr.isEmpty ? "" : " helper diagnostics: \(result.stderr)"
+            return (payload, "\(payload.backend) 已在受限 root helper 内完成只读 readiness handshake。\(diagnosticSuffix)")
+        }
+        if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.stderr) {
+            return (payload, "\(payload.backend) 已返回完整可解码的只读 readiness payload；helper 随后仅在退出阶段触发父进程超时，因此保留已验证结果。")
+        }
+        let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+        return (nil, failureDetail(prefix: "隔离 GUI readiness 探测", code: result.code, diagnostic: diagnostic))
     }
 
     static func guiTree() -> (tree: String?, detail: String) {
