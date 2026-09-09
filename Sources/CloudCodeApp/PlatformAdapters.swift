@@ -204,11 +204,11 @@ enum EmbeddedRootHelper {
         )
     }
 
-    private static func mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: Int, stderr: String) -> Bool {
+    private static func mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: Int, diagnostic: String) -> Bool {
         let parentTimeoutCode = -7000 - Int(ETIMEDOUT)
         return code == parentTimeoutCode
-            && stderr.contains("helper timed out after")
-            && !stderr.contains("capture truncated")
+            && diagnostic.contains("helper timed out after")
+            && !diagnostic.contains("capture truncated")
     }
 
     private static func failureDetail(prefix: String, code: Int, diagnostic: String) -> String {
@@ -296,7 +296,7 @@ enum EmbeddedRootHelper {
             if privileged.code == 0 {
                 return (payload, "\(payload.backend) 已通过 bounded root helper 完成跨 App 枚举。")
             }
-            if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: privileged.code, stderr: privileged.stderr) {
+            if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: privileged.code, diagnostic: privileged.stderr) {
                 return (payload, "\(payload.backend) 已返回可完整解码的跨 App 只读枚举；helper 随后在退出阶段触发父进程超时，因此保留已验证 payload，同时把退出超时留给诊断。")
             }
         }
@@ -312,7 +312,7 @@ enum EmbeddedRootHelper {
             if isolated.code == 0 {
                 return (payload, "\(payload.backend) 已在隔离 helper 子进程内完成跨 App 枚举；root 路径未采用：\(privilegedDetail)")
             }
-            if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: isolated.code, stderr: isolated.stderr) {
+            if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: isolated.code, diagnostic: isolated.stderr) {
                 return (payload, "\(payload.backend) 已返回可完整解码的隔离只读枚举；helper 随后在退出阶段触发父进程超时。root 路径未采用：\(privilegedDetail)")
             }
         }
@@ -337,7 +337,7 @@ enum EmbeddedRootHelper {
         if result.code == 0 {
             return (payload, "已通过 bounded root helper 读取当前 App 静态 metadata；结果仅作为 discovery/performance hint。")
         }
-        if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, stderr: result.stderr) {
+        if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.stderr) {
             return (payload, "App introspection 已返回 bundleID 匹配且可完整解码的只读 metadata；helper 随后在退出阶段触发父进程超时，因此保留已验证 payload。")
         }
         let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
@@ -545,26 +545,41 @@ enum EmbeddedRootHelper {
         // Full XCTest/XCAXClient behavior requires an automation session and cannot be manufactured
         // merely by adding root privileges to a TrollStore process.
         let result = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)
-        guard result.code == 0, !result.stdout.isEmpty else {
+        guard !result.stdout.isEmpty, result.stdout.utf8.count <= 256 * 1024,
+              let treeData = result.stdout.data(using: .utf8),
+              (try? JSONSerialization.jsonObject(with: treeData)) != nil else {
+            if result.stdout.utf8.count > 256 * 1024 {
+                return (nil, "GUI tree 输出超过 256 KiB 限制，已 fail closed。")
+            }
             let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
             return (nil, failureDetail(prefix: "GUI tree (mobile AX client)", code: result.code, diagnostic: diagnostic))
         }
-        guard result.stdout.utf8.count <= 256 * 1024 else {
-            return (nil, "GUI tree 输出超过 256 KiB 限制，已 fail closed。")
+        if result.code == 0 {
+            let diagnosticSuffix = result.stderr.isEmpty ? "" : " helper diagnostics: \(result.stderr)"
+            return (result.stdout, "AXRuntime tree 已由 mobile 身份 helper 返回。\(diagnosticSuffix)")
         }
-        let diagnosticSuffix = result.stderr.isEmpty ? "" : " helper diagnostics: \(result.stderr)"
-        return (result.stdout, "AXRuntime tree 已由 mobile 身份 helper 返回。\(diagnosticSuffix)")
+        if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.stderr) {
+            return (result.stdout, "AXRuntime tree 已返回完整可解析 JSON；helper 随后仅在退出阶段触发父进程超时，因此保留这份只读 tree。")
+        }
+        let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+        return (nil, failureDetail(prefix: "GUI tree (mobile AX client)", code: result.code, diagnostic: diagnostic))
     }
 
     static func focusedTextInput() -> (payload: FocusedTextInputPayload?, detail: String) {
         let result = runSeparated(["gui-focused-text-input-json"], privilege: .isolatedUser, timeout: 2.0)
-        guard result.code == 0,
-              let data = result.stdout.data(using: .utf8), data.count <= 4 * 1024,
+        guard let data = result.stdout.data(using: .utf8), data.count <= 4 * 1024,
               let payload = try? JSONDecoder().decode(FocusedTextInputPayload.self, from: data) else {
             let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
             return (nil, failureDetail(prefix: "GUI focused text input (mobile AX client)", code: result.code, diagnostic: diagnostic))
         }
-        return (payload, result.stderr.isEmpty ? "AX focused-text probe completed." : "AX focused-text probe completed. helper diagnostics: \(result.stderr)")
+        if result.code == 0 {
+            return (payload, result.stderr.isEmpty ? "AX focused-text probe completed." : "AX focused-text probe completed. helper diagnostics: \(result.stderr)")
+        }
+        if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.stderr) {
+            return (payload, "AX focused-text probe 已返回完整可解码 payload；helper 随后仅在退出阶段触发父进程超时，因此保留这份只读结果。")
+        }
+        let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+        return (nil, failureDetail(prefix: "GUI focused text input (mobile AX client)", code: result.code, diagnostic: diagnostic))
     }
 
     static func guiScreenshot() -> (data: Data?, detail: String) {
@@ -586,15 +601,21 @@ enum EmbeddedRootHelper {
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: outputURL.path)
         defer { try? FileManager.default.removeItem(at: outputURL) }
         let result = run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)
-        guard result.code == 0 else {
-            return (nil, failureDetail(prefix: "GUI screenshot", code: result.code, diagnostic: result.diagnostic))
-        }
         guard let data = try? Data(contentsOf: outputURL, options: [.mappedIfSafe]),
               GUIAutomationPayloadPolicy.isValidScreenshotJPEG(data) else {
+            if result.code != 0 {
+                return (nil, failureDetail(prefix: "GUI screenshot", code: result.code, diagnostic: result.diagnostic))
+            }
             return (nil, "GUI screenshot helper 返回成功，但 tmp 文件不是有效的 bounded JPEG；已按 fail-closed 处理。")
         }
-        let routeDetail = result.diagnostic.isEmpty ? "" : " helper diagnostics: \(result.diagnostic)"
-        return (data, "全局截图已通过独立 tmp JPEG 通道返回。\(routeDetail)")
+        if result.code == 0 {
+            let routeDetail = result.diagnostic.isEmpty ? "" : " helper diagnostics: \(result.diagnostic)"
+            return (data, "全局截图已通过独立 tmp JPEG 通道返回。\(routeDetail)")
+        }
+        if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.diagnostic) {
+            return (data, "全局截图 JPEG 已完整写入并通过格式/大小校验；helper 随后仅在退出阶段触发父进程超时，因此保留已验证的只读截图。")
+        }
+        return (nil, failureDetail(prefix: "GUI screenshot", code: result.code, diagnostic: result.diagnostic))
     }
 
     static func guiTap(x: Double, y: Double) -> (success: Bool, detail: String) {

@@ -466,6 +466,10 @@ jobs:
               raise SystemExit('FAIL: app launch capability lost process-local success caching and may re-probe on every route check')
           if 'shouldRefreshIndex()' not in resolver or 'failedIndexRetryAfter' not in resolver or 'negativeBundleIDs' not in resolver:
               raise SystemExit('FAIL: installed-app discovery lost cached-index/bounded-refresh guards')
+          for status_signature in ('public func canEnumerateInstalledApps() async -> Bool {', 'public func canUseInstalledAppIndex() async -> Bool {', 'public func installedAppEnumerationDetail() async -> String {'):
+              status_body = resolver.split(status_signature, 1)[1].split('\n    }', 1)[0]
+              if 'refresh()' in status_body:
+                  raise SystemExit(f'FAIL: installed-app capability/status read can trigger a second broad refresh: {status_signature}')
           if 'timeIntervalSince(lastRefresh)' in resolver:
               raise SystemExit('FAIL: installed-app discovery reintroduced the old 30-second full-rescan TTL')
           if 'run(["probe-uninstall", bundleID], privilege: .root' not in adapters or 'run(["terminate", bundlePath], privilege: .root' not in adapters:
@@ -492,6 +496,9 @@ jobs:
           for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'run(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'CloudCodeSpawnHelperWithSeparatedOutput', 'runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)', 'runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)', 'result.stdout', 'result.stderr', 'run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)', 'EmbeddedVisionHelper', '["ocr-file", inputURL.path, String(boundedMaximum)]', '全局截图已通过独立 tmp JPEG 通道返回', 'run(["gui-navigate-back", strategy], privilege: .root, timeout: 4)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
               if marker not in adapters:
                   raise SystemExit(f'FAIL: GUI adapter lost bounded helper marker: {marker}')
+          for marker in ('mayAcceptValidatedReadOnlyPayloadAfterParentTimeout', 'AXRuntime tree 已返回完整可解析 JSON', 'AX focused-text probe 已返回完整可解码 payload', '全局截图 JPEG 已完整写入并通过格式/大小校验'):
+              if marker not in adapters:
+                  raise SystemExit(f'FAIL: validated read-only helper payload can regress to false failure after parent exit timeout: {marker}')
           gui_executor = adapters.split('public struct GUIFallbackExecutor', 1)[1]
           gui_routing = gui_executor.split('public func execute(', 1)[0]
           if 'DeferredCapabilitySelfValidatingToolExecutor' not in gui_executor or 'allowsDeferredCapabilityAttempt' not in gui_routing:
