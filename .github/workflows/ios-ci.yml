@@ -667,9 +667,9 @@ jobs:
           trollstore_gui = Path('Sources/CloudCodeApp/TrollStoreGUIBackend.swift').read_text(encoding='utf-8')
           if trollstore_gui.count('dispatched-unverified') < 3:
               raise SystemExit('FAIL: TrollStore GUI backend diagnostics reverted to claiming submitted actions as verified success')
-          for marker in ('treeRetryAfter', 'treeFailureCooldown', 'AX tree recently timed out'):
+          for marker in ('treeRetryAfter', 'treeFailureCooldown', 'unknownClientCooldown', 'lastTreeFailureClass', 'if let treeRetryAfter, treeRetryAfter > Date()', 'failureClass == .unknownClient ? unknownClientCooldown : treeFailureCooldown', 'if outcome.foregroundVerified {'):
               if marker not in trollstore_gui:
-                  raise SystemExit(f'FAIL: repeated AX timeout suppression missing: {marker}')
+                  raise SystemExit(f'FAIL: repeated AX failure cooldown/foreground-reset guard missing: {marker}')
           screenshot_adapter = adapters.split('static func guiScreenshot()', 1)[1].split('static func guiTap(', 1)[0]
           for marker in ('gui-screenshot-file', 'FileManager.default.temporaryDirectory', 'CloudCode-GUI-', 'FileManager.default.createFile(atPath: outputURL.path, contents: Data())', 'GUIAutomationPayloadPolicy.isValidScreenshotJPEG(data)'):
               if marker not in screenshot_adapter:
