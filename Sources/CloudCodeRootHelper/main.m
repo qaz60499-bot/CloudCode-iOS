@@ -1348,7 +1348,7 @@ static int CloudCodeRunOneShotCommand(int argc, const char *argv[])
             return CloudCodeGUITreeJSON();
         }
         if ([command isEqualToString:@"gui-ax-probe-json"]) {
-            if (argc != 6) { return 10; }
+            if (argc < 6) { return 10; }
             return CloudCodeGUIAXProbeJSON([NSString stringWithUTF8String:argv[2]], [NSString stringWithUTF8String:argv[3]],
                 (pid_t)strtol(argv[4], NULL, 10), [NSString stringWithUTF8String:argv[5]]);
         }
