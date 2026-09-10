@@ -73,8 +73,8 @@ if [[ "$(/usr/libexec/PlistBuddy -c 'Print :TSRootBinaries:0' "$INFO" 2>/dev/nul
   echo "FAIL: TSRootBinaries does not declare CloudCodeRootHelper" >&2
   exit 16
 fi
-if [[ "$(/usr/libexec/PlistBuddy -c 'Print :TSRootBinaries:1' "$INFO" 2>/dev/null || true)" != "CloudCodeVisionHelper" ]]; then
-  echo "FAIL: TSRootBinaries must preserve CloudCodeVisionHelper as an executable TrollStore child" >&2
+if /usr/libexec/PlistBuddy -c 'Print :TSRootBinaries:1' "$INFO" >/dev/null 2>&1; then
+  echo "FAIL: TSRootBinaries must contain only CloudCodeRootHelper; CloudCodeVisionHelper is a mobile-user child" >&2
   exit 16
 fi
 if ! lipo -info "$HELPER" | grep -q 'arm64'; then

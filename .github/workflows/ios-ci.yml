@@ -596,10 +596,12 @@ jobs:
           for marker in ('CloudCodeVisionHelper', 'Sources/CloudCodeVisionHelper/main.m', '-framework ImageIO'):
               if marker not in project_text:
                   raise SystemExit(f'FAIL: lightweight Vision helper is not embedded in the iOS app build: {marker}')
-          if 'TSRootBinaries:1 string CloudCodeVisionHelper' not in project_text:
-              raise SystemExit('FAIL: standalone Vision helper must be preserved as a TrollStore executable child')
+          if 'TSRootBinaries:1 string CloudCodeVisionHelper' in project_text:
+              raise SystemExit('FAIL: CloudCodeVisionHelper must not be declared as a TrollStore root binary; it runs as the ordinary mobile user')
+          if "Add :TSRootBinaries:0 string CloudCodeRootHelper" not in project_text:
+              raise SystemExit('FAIL: CloudCodeRootHelper must remain the sole declared TrollStore root binary')
           if 'root execution is forbidden' not in vision_text:
-              raise SystemExit('FAIL: Vision helper declared in TSRootBinaries must still fail closed under uid/euid 0')
+              raise SystemExit('FAIL: Vision helper must continue to fail closed under uid/euid 0')
           bridge_text = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
           if 'asRoot && [path.lastPathComponent isEqualToString:@"CloudCodeVisionHelper"]' not in bridge_text or 'return -1911;' not in bridge_text:
               raise SystemExit('FAIL: host bridge must reject root-persona Vision helper spawning')

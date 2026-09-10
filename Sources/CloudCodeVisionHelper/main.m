@@ -273,9 +273,9 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements, BOOL for
 
 static int CloudCodeRunOneShotVisionCommand(int argc, char *argv[])
 {
-    // TrollStore keeps this binary in TSRootBinaries only so it remains executable after import.
-    // OCR must still run as the ordinary mobile user; root/persona-99 Vision was proven unstable on
-    // iOS 16.6. Fail closed if any caller ever attempts to elevate this helper.
+    // OCR must run as the ordinary mobile user. Do not declare this binary in TSRootBinaries:
+    // that list is reserved for helpers that need TrollStore's special root-helper permissions.
+    // Root/persona-99 Vision was proven unstable on iOS 16.6, so fail closed on elevation.
     if (getuid() == 0 || geteuid() == 0) {
         fprintf(stderr, "vision-helper: root execution is forbidden\n");
         return 77;
