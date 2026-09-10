@@ -38,6 +38,11 @@ public enum DiagnosticRegressionStatus: String, Codable, Sendable {
 public struct DiagnosticPerformanceSnapshot: Codable, Equatable, Sendable {
     public var totalTaskLatencyMS: Int?
     public var providerRoundTrips: Int
+    public var providerTTFTMS: Int?
+    public var providerTotalMS: Int?
+    public var localTaskExecutionMS: Int?
+    public var axTotalMS: Int?
+    public var ocrTotalMS: Int?
     public var remoteVisionRoundTrips: Int
     public var screenshotCount: Int
     public var axObservationCount: Int
@@ -49,6 +54,11 @@ public struct DiagnosticPerformanceSnapshot: Codable, Equatable, Sendable {
     public init(
         totalTaskLatencyMS: Int? = nil,
         providerRoundTrips: Int = 0,
+        providerTTFTMS: Int? = nil,
+        providerTotalMS: Int? = nil,
+        localTaskExecutionMS: Int? = nil,
+        axTotalMS: Int? = nil,
+        ocrTotalMS: Int? = nil,
         remoteVisionRoundTrips: Int = 0,
         screenshotCount: Int = 0,
         axObservationCount: Int = 0,
@@ -59,6 +69,11 @@ public struct DiagnosticPerformanceSnapshot: Codable, Equatable, Sendable {
     ) {
         self.totalTaskLatencyMS = totalTaskLatencyMS
         self.providerRoundTrips = max(0, providerRoundTrips)
+        self.providerTTFTMS = providerTTFTMS.map { max(0, $0) }
+        self.providerTotalMS = providerTotalMS.map { max(0, $0) }
+        self.localTaskExecutionMS = localTaskExecutionMS.map { max(0, $0) }
+        self.axTotalMS = axTotalMS.map { max(0, $0) }
+        self.ocrTotalMS = ocrTotalMS.map { max(0, $0) }
         self.remoteVisionRoundTrips = max(0, remoteVisionRoundTrips)
         self.screenshotCount = max(0, screenshotCount)
         self.axObservationCount = max(0, axObservationCount)
@@ -198,6 +213,7 @@ public struct DiagnosticReplayEvidence: Codable, Equatable, Sendable {
     private static func replaySafeMetadata(_ metadata: [String: String]) -> [String: String] {
         let allowed = Set([
             "provider", "providerID", "providerId", "model", "modelID", "modelId", "protocol", "protocolClass",
+            "providerRoundTrips", "providerTTFTMS", "providerTotalMS", "providerRoundTripAvoided", "localTaskExecutionMS",
             "statusCode", "httpStatus", "errorClass", "retryReason", "fallbackReason", "fallbackDepth", "route", "routeCandidates",
             "authMode", "host", "endpointPath", "transportState", "responseStarted", "streamEstablished", "bodyDataReceived",
             "foregroundBundleID", "bundleID", "bundleId", "appVersion", "verification", "effectVerification",
@@ -205,11 +221,11 @@ public struct DiagnosticReplayEvidence: Codable, Equatable, Sendable {
             "perceptionOCRInvoked", "perceptionOCRSucceeded", "perceptionOCRLatencyMS", "perceptionLocalSufficient",
             "perceptionRemoteVisionRequired", "perceptionFallbackReason", "providerVisualRoundTripAvoided",
             "sha256", "screenPointWidth", "screenPointHeight", "localVisionOCR", "localVisionElementCount",
-            "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion", "localVisionRecognitionLevel", "localVisionMinimumTextHeight", "localVisionPass", "localVisionCacheHit", "localVisionRequestCoalesced", "localVisionFallbackUsed", "localVisionBackend",
+            "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion", "localVisionRegionExecution", "localVisionHelperInputWidth", "localVisionHelperInputHeight", "localVisionRecognitionLevel", "localVisionMinimumTextHeight", "localVisionPass", "localVisionAttemptSequence", "localVisionPrecisionRecommended", "localVisionPrecisionReason", "localVisionCacheHit", "localVisionRequestCoalesced", "localVisionFallbackUsed", "localVisionBackend",
             "localVisionFailureClass", "localVisionErrorDomain", "localVisionErrorCode", "localVisionPrimaryErrorDomain", "localVisionPrimaryErrorCode",
             "localVisionSecondaryBackend", "localVisionSecondaryStatus", "localVisionSecondaryErrorDomain", "localVisionSecondaryErrorCode", "treeHash",
             "coordinateSafety", "providerImageRoute", "keyboardLikely", "focusStrategy", "textInputSafety", "localMetric", "localMetricSelection", "localMetricExtraction", "cache", "idempotency",
-            "axBackend", "axStage", "axScope", "axNodeCount", "axErrorDomain", "axErrorCode", "axLatencyMS",
+            "axBackend", "axStage", "axScope", "axNodeCount", "axSemanticNodeCount", "axFailureClass", "axErrorDomain", "axErrorCode", "axLatencyMS",
             "providerVisionCapability", "providerVisionCapabilitySource", "selectedPerceptionRoute",
             "routeSelectionLatencyMS", "executionLatencyMS", "totalLatencyMS"
         ])
@@ -950,6 +966,15 @@ public enum DiagnosticProblemPackageBuilder {
         var totalLatency = 0
         var foundLatency = false
         var providerRoundTrips = 0
+        var providerTTFTTotalMS = 0
+        var providerTTFTObserved = false
+        var providerTotalMS = 0
+        var providerTotalObserved = false
+        var localTaskExecutionMS: Int?
+        var axTotalMS = 0
+        var axLatencyObserved = false
+        var ocrTotalMS = 0
+        var ocrLatencyObserved = false
         var remoteVisionRoundTrips = 0
         var screenshotCount = 0
         var axCount = 0
@@ -962,7 +987,36 @@ public enum DiagnosticProblemPackageBuilder {
                 totalLatency += max(0, latency)
                 foundLatency = true
             }
-            if record.subsystem.lowercased().contains("provider") && record.action.lowercased().contains("request") { providerRoundTrips += 1 }
+            if record.subsystem.lowercased().contains("provider") {
+                let action = record.action.lowercased()
+                let result = record.result.lowercased()
+                if action.contains("request") || (action == "stream" && result == "started") {
+                    providerRoundTrips += 1
+                }
+                if let value = record.metadata["providerTTFTMS"].flatMap(Int.init), value >= 0 {
+                    providerTTFTTotalMS += value
+                    providerTTFTObserved = true
+                }
+                if let value = record.metadata["providerTotalMS"].flatMap(Int.init), value >= 0 {
+                    providerTotalMS += value
+                    providerTotalObserved = true
+                }
+            }
+            if let value = record.metadata["localTaskExecutionMS"].flatMap(Int.init), value >= 0 {
+                localTaskExecutionMS = max(localTaskExecutionMS ?? 0, value)
+            }
+            if let value = record.metadata["axLatencyMS"].flatMap(Int.init), value >= 0 {
+                axTotalMS += value
+                axLatencyObserved = true
+            }
+            let ocrLatency = [record.metadata["perceptionOCRLatencyMS"], record.metadata["localVisionLatencyMS"]]
+                .compactMap { $0.flatMap(Int.init) }
+                .filter { $0 >= 0 }
+                .max()
+            if let ocrLatency {
+                ocrTotalMS += ocrLatency
+                ocrLatencyObserved = true
+            }
             if record.metadata["perceptionRemoteVisionRequired"] == "true" { remoteVisionRoundTrips += 1 }
             if record.action.lowercased().contains("screenshot") || record.metadata["sha256"] != nil { screenshotCount += 1 }
             if record.metadata["perceptionAXAttempted"] == "true" { axCount += 1 }
@@ -974,6 +1028,11 @@ public enum DiagnosticProblemPackageBuilder {
         return DiagnosticPerformanceSnapshot(
             totalTaskLatencyMS: foundLatency ? totalLatency : nil,
             providerRoundTrips: providerRoundTrips,
+            providerTTFTMS: providerTTFTObserved ? providerTTFTTotalMS : nil,
+            providerTotalMS: providerTotalObserved ? providerTotalMS : nil,
+            localTaskExecutionMS: localTaskExecutionMS,
+            axTotalMS: axLatencyObserved ? axTotalMS : nil,
+            ocrTotalMS: ocrLatencyObserved ? ocrTotalMS : nil,
             remoteVisionRoundTrips: remoteVisionRoundTrips,
             screenshotCount: screenshotCount,
             axObservationCount: axCount,

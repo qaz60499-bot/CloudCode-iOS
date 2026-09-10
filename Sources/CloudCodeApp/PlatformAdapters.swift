@@ -29,7 +29,7 @@ enum EmbeddedVisionHelper {
         return helperData.range(of: markerData) != nil
     }()
 
-    static func guiOCR(jpegData: Data, maximumElements: Int) -> (json: String?, detail: String) {
+    static func guiOCR(jpegData: Data, maximumElements: Int, forcePrecise: Bool = false) -> (json: String?, detail: String) {
         guard embeddedHelperMatchesExpectedProtocol,
               FileManager.default.isExecutableFile(atPath: executablePath),
               GUIAutomationPayloadPolicy.isValidScreenshotJPEG(jpegData) else {
@@ -50,7 +50,7 @@ enum EmbeddedVisionHelper {
         var standardError: NSString?
         let code = CloudCodeSpawnHelperWithSeparatedOutput(
             executablePath,
-            ["ocr-file", inputURL.path, String(boundedMaximum)],
+            ["ocr-file", inputURL.path, String(boundedMaximum), forcePrecise ? "accurate" : "fast"],
             false,
             4,
             &standardOutput,
@@ -2393,7 +2393,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
 
             var resolution = await resolveLocalVisionText(call, screenshot: baseline)
             if resolution.match == nil,
-               (resolution.failureReason == "ocr_target_not_recognized" || resolution.failureReason == "ocr_completed_no_text") {
+               resolution.observation.payload["localVisionPrecisionRecommended"] == "true" {
                 resolution = await resolveLocalVisionText(call, screenshot: baseline, forcePrecise: true)
             }
             guard let resolved = resolution.match else {
@@ -3194,7 +3194,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             let first = await resolveLocalVisionText(ocrCall, screenshot: screenshot)
             var ocrResolution = first
             if first.match == nil,
-               (first.failureReason == "ocr_target_not_recognized" || first.failureReason == "ocr_completed_no_text") {
+               first.observation.payload["localVisionPrecisionRecommended"] == "true" {
                 ocrResolution = await resolveLocalVisionText(ocrCall, screenshot: screenshot, forcePrecise: true)
             }
             if expectation == "present", ocrResolution.match != nil { return }
@@ -3335,7 +3335,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             let screenshot = try await backend.screenshot()
             var resolution = await resolveLocalVisionText(call, screenshot: screenshot)
             if resolution.match == nil,
-               (resolution.failureReason == "ocr_target_not_recognized" || resolution.failureReason == "ocr_completed_no_text") {
+               resolution.observation.payload["localVisionPrecisionRecommended"] == "true" {
                 resolution = await resolveLocalVisionText(call, screenshot: screenshot, forcePrecise: true)
             }
             guard let match = resolution.match else {
@@ -3374,30 +3374,110 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
     ) async -> (match: LocalPerceptionTextElement?, observation: LocalVisionTextObservation.Observation, failureReason: String?, failureSummary: String?) {
         let query = call.arguments["query"] ?? ""
         let mode = GUIElementMatchMode(rawValue: call.arguments["match"] ?? "exact") ?? .exact
-        let observation = await LocalVisionTextObservation.observe(for: screenshot, maximumElements: 48, requiresText: true, forcePrecise: forcePrecise)
-        let status = observation.payload["localVisionOCR"] ?? "unavailable"
-        guard status == "recognized" else {
-            let reason = status == "available_empty" ? "ocr_completed_no_text" : "ocr_request_failed"
-            return (nil, observation, reason, "Local OCR text lookup could not resolve a target: \(status).")
-        }
-        switch LocalPerceptionTextMatcher.resolve(query: query, mode: mode, elements: observation.elements) {
-        case .unique(let match):
-            return (match, observation, nil, nil)
-        case .ambiguous(let count):
-            return (
-                nil,
-                observation,
-                "ocr_unique_match_ambiguous",
-                "Local OCR text query is ambiguous (\(count) matches); refine the query instead of guessing coordinates."
+        let regions: [CGRect?] = forcePrecise ? [nil] : Self.semanticOCRRegions(query: query, screenshot: screenshot)
+        var attemptLabels: [String] = []
+        var lastObservation = LocalVisionTextObservation.Observation(
+            payload: ["localVisionOCR": "unavailable_not_attempted"],
+            elements: []
+        )
+        var lastFailureReason = "ocr_request_failed"
+        var lastFailureSummary = "Local OCR text lookup did not run."
+
+        for (index, region) in regions.enumerated() {
+            var observation = await LocalVisionTextObservation.observe(
+                for: screenshot,
+                maximumElements: 48,
+                regionInScreenPoints: region,
+                requiresText: true,
+                forcePrecise: forcePrecise
             )
-        case .notFound:
-            return (
-                nil,
-                observation,
-                "ocr_target_not_recognized",
-                "Local OCR completed, but the requested visible text did not produce one unique current-frame match."
-            )
+            let regionLabel = observation.payload["localVisionRegion"] ?? (region == nil ? "full_screen" : "roi")
+            let passLabel = forcePrecise ? "precise" : "fast"
+            attemptLabels.append("\(index + 1):\(passLabel):\(regionLabel)")
+            observation.payload["localVisionAttemptSequence"] = attemptLabels.joined(separator: " -> ")
+            lastObservation = observation
+
+            let status = observation.payload["localVisionOCR"] ?? "unavailable"
+            guard status == "recognized" else {
+                lastFailureReason = status == "available_empty" ? "ocr_completed_no_text" : "ocr_request_failed"
+                lastFailureSummary = "Local OCR text lookup could not resolve a target: \(status)."
+                continue
+            }
+
+            switch LocalPerceptionTextMatcher.resolve(query: query, mode: mode, elements: observation.elements) {
+            case .unique(let match):
+                observation.payload["localVisionPrecisionRecommended"] = "false"
+                observation.payload["localVisionAttemptSequence"] = attemptLabels.joined(separator: " -> ")
+                return (match, observation, nil, nil)
+            case .ambiguous(let count):
+                observation.payload["localVisionPrecisionRecommended"] = "false"
+                observation.payload["localVisionAttemptSequence"] = attemptLabels.joined(separator: " -> ")
+                return (
+                    nil,
+                    observation,
+                    "ocr_unique_match_ambiguous",
+                    "Local OCR text query is ambiguous (\(count) matches); refine the query instead of guessing coordinates."
+                )
+            case .notFound:
+                lastObservation = observation
+                lastFailureReason = "ocr_target_not_recognized"
+                lastFailureSummary = "Local OCR completed, but the requested visible text did not produce one unique current-frame match."
+            }
         }
+
+        if !forcePrecise {
+            let shortSemanticTarget = query.trimmingCharacters(in: .whitespacesAndNewlines).count <= 6
+            let sparseFastResult = lastObservation.elements.count < 12
+            let noText = lastObservation.payload["localVisionOCR"] == "available_empty"
+            let preciseRecommended = noText || (shortSemanticTarget && sparseFastResult)
+            lastObservation.payload["localVisionPrecisionRecommended"] = preciseRecommended ? "true" : "false"
+            lastObservation.payload["localVisionPrecisionReason"] = preciseRecommended
+                ? (noText ? "fast_completed_no_text" : "short_target_sparse_fast_result")
+                : "fast_elements_sufficient_do_not_repeat_same_frame_precise"
+        } else {
+            lastObservation.payload["localVisionPrecisionRecommended"] = "false"
+            lastObservation.payload["localVisionPrecisionReason"] = "precise_already_attempted"
+        }
+        lastObservation.payload["localVisionAttemptSequence"] = attemptLabels.joined(separator: " -> ")
+        return (nil, lastObservation, lastFailureReason, lastFailureSummary)
+    }
+
+    private static func semanticOCRRegions(query: String, screenshot: Data) -> [CGRect?] {
+        guard let image = UIImage(data: screenshot), image.size.width >= 100, image.size.height >= 200 else {
+            return [nil]
+        }
+        let width = image.size.width
+        let height = image.size.height
+        let normalized = query.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        let searchMarkers = ["搜索", "搜", "查找", "search", "find"]
+        let commitMarkers = ["发送", "回复", "send", "reply"]
+        let conversationMarkers = ["文件传输助手", "联系人", "群聊", "conversation", "contact", "chat"]
+
+        if searchMarkers.contains(where: normalized.contains) {
+            return [
+                CGRect(x: 0, y: 0, width: width, height: height * 0.34),
+                CGRect(x: 0, y: 0, width: width, height: height * 0.56),
+                nil
+            ]
+        }
+        if commitMarkers.contains(where: normalized.contains) {
+            return [
+                CGRect(x: 0, y: height * 0.62, width: width, height: height * 0.38),
+                CGRect(x: 0, y: height * 0.44, width: width, height: height * 0.56),
+                nil
+            ]
+        }
+        if conversationMarkers.contains(where: normalized.contains) {
+            return [
+                CGRect(x: 0, y: height * 0.10, width: width, height: height * 0.68),
+                CGRect(x: 0, y: height * 0.04, width: width, height: height * 0.86),
+                nil
+            ]
+        }
+        return [nil]
     }
 
     private func elementPayload(_ match: GUIElementMatch, treeHash: String, cacheHit: Bool) -> [String: String] {

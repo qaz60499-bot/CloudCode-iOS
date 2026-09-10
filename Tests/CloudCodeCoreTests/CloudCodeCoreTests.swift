@@ -5952,6 +5952,317 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(compressed.contains { $0.content == "old screenshot" })
     }
 
+    func testTaskContractCompilesDouyinGoldenTaskWithHardFiniteInvariant() {
+        let contract = TaskContractCompiler.compileKnownRequest("打开抖音，刷严格 5 条视频，比较点赞量，给点赞最高的一条点赞，然后停止")
+        XCTAssertEqual(contract?.intent, .finiteFeed)
+        XCTAssertEqual(contract?.limits.exactFeedItemCount, 5)
+        XCTAssertEqual(contract?.limits.exactLikeCount, 1)
+        XCTAssertEqual(contract?.feed?.metric, .likeCount)
+        XCTAssertEqual(contract?.feed?.selectionRule, .maximum)
+        XCTAssertEqual(contract?.feed?.requiresLikeAction, true)
+        XCTAssertTrue(contract?.limits.forbidFeedOverrun == true)
+    }
+
+    func testTaskContractCompilesWeChatGoldenTaskWithExactlyOneSend() {
+        let contract = TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1")
+        XCTAssertEqual(contract?.intent, .messaging)
+        XCTAssertEqual(contract?.targetBundleID, "com.tencent.xin")
+        XCTAssertEqual(contract?.message?.destinationEntity, "文件传输助手")
+        XCTAssertEqual(contract?.message?.messageBody, "1")
+        XCTAssertEqual(contract?.limits.exactSendCount, 1)
+        XCTAssertTrue(contract?.limits.reconcileUncertainSendBeforeRetry == true)
+    }
+
+    func testTaskRuntimeHardInvariantsBlockFeedOverrunAndUncertainSendRetry() throws {
+        let feedContract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开抖音刷 5 条然后点赞"))
+        var feedState = TaskRuntimeState(contract: feedContract)
+        feedState.finiteFeedCompleted = 3
+        XCTAssertTrue(feedState.canDispatchFiniteFeed(units: 2, contract: feedContract))
+        XCTAssertFalse(feedState.canDispatchFiniteFeed(units: 3, contract: feedContract))
+        feedState.finiteFeedCompleted = 5
+        XCTAssertFalse(feedState.canDispatchFiniteFeed(units: 1, contract: feedContract))
+
+        let messageContract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信找到文件传输助手发送 1"))
+        var messageState = TaskRuntimeState(contract: messageContract)
+        XCTAssertTrue(messageState.canDispatchMessageCommit(contract: messageContract))
+        messageState.messageCommitState = .uncertain
+        XCTAssertFalse(messageState.canDispatchMessageCommit(contract: messageContract))
+        messageState.messageCommitState = .verified
+        XCTAssertFalse(messageState.canDispatchMessageCommit(contract: messageContract))
+    }
+
+    func testTaskSemanticCheckpointMigratesLegacyPayloadAndDualWritesCompatibility() throws {
+        let request = "打开抖音刷 5 条然后点赞"
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest(request))
+        var payload: [String: String] = [
+            "tool.completedRepeatedSwipeCount": "3",
+            "tool.successfulLikeActionCount": "0",
+            "tool.currentGUIBundleID": "com.ss.iphone.ugc.aweme",
+            "tool.verificationSinceLastStateChange": "true"
+        ]
+        var runtime = TaskSemanticCheckpointCodec.restoreRuntime(contract: contract, payload: payload)
+        XCTAssertEqual(runtime.finiteFeedCompleted, 3)
+        XCTAssertEqual(runtime.currentBundleID, "com.ss.iphone.ugc.aweme")
+        XCTAssertTrue(runtime.verificationSinceLastStateChange)
+
+        runtime.finiteFeedCompleted = 5
+        runtime.likeActionsCompleted = 1
+        runtime.reconcileObligationProgress(contract: contract)
+        TaskSemanticCheckpointCodec.persist(contract: contract, runtime: runtime, payload: &payload)
+        XCTAssertEqual(payload["tool.completedRepeatedSwipeCount"], "5")
+        XCTAssertEqual(payload["tool.successfulLikeActionCount"], "1")
+        XCTAssertNotNil(payload[TaskSemanticCheckpointCodec.contractKey])
+        XCTAssertNotNil(payload[TaskSemanticCheckpointCodec.runtimeKey])
+        let restored = TaskSemanticCheckpointCodec.restoreRuntime(contract: contract, payload: payload)
+        XCTAssertEqual(restored, runtime)
+        XCTAssertEqual(payload["tool.semanticReconcileObservationCount"], "0")
+    }
+
+    func testTypedRuntimeDecodesCheckpointWrittenBeforeReconcileCounterField() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信找到文件传输助手发送 1"))
+        let runtime = TaskRuntimeState(contract: contract)
+        let encoded = try JSONEncoder().encode(runtime)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "reconcileObservationCount")
+        let legacyTypedData = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        let legacyTypedJSON = try XCTUnwrap(String(data: legacyTypedData, encoding: .utf8))
+        let restored = TaskSemanticCheckpointCodec.restoreRuntime(
+            contract: contract,
+            payload: [TaskSemanticCheckpointCodec.runtimeKey: legacyTypedJSON]
+        )
+        XCTAssertEqual(restored.requestFingerprint, runtime.requestFingerprint)
+        XCTAssertEqual(restored.boundedReconcileObservationCount, 0)
+    }
+
+    func testTaskContractCompilerDoesNotForceUnknownTaskIntoSemanticRuntime() {
+        XCTAssertNil(TaskContractCompiler.compileKnownRequest("帮我看看这个页面"))
+    }
+
+    func testTypedFiniteFeedFinalRemainderNeverRoundsOneUpToAnotherBatch() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开抖音，刷严格 5 条视频然后点赞"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.finiteFeedCompleted = 4
+        let operation = try XCTUnwrap(TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil))
+        XCTAssertEqual(operation.toolName, "gui.scrollObserve")
+        XCTAssertEqual(operation.arguments["dy"], "600")
+        XCTAssertNil(operation.arguments["count"])
+        XCTAssertTrue(runtime.canDispatchFiniteFeed(units: 1, contract: contract))
+        XCTAssertFalse(runtime.canDispatchFiniteFeed(units: 2, contract: contract))
+    }
+
+    func testTypedMessagingDestinationNeedsChangedPostActionSemanticEvidence() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        let destination = try XCTUnwrap(contract.message?.destinationEntity)
+        let element = LocalPerceptionTextElement(text: destination, confidence: 0.95, x: 90, y: 50, width: 180, height: 24)
+        let encoded = try XCTUnwrap(String(data: JSONEncoder().encode([element]), encoding: .utf8))
+
+        let unchanged = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "tap returned same frame",
+            payload: [
+                "baselineSHA256": "same",
+                "sha256": "same",
+                "localVisionOCR": "recognized",
+                "localVisionElements": encoded,
+                "localVisionElementCount": "1"
+            ]
+        )
+        let unchangedFrame = PerceptionBrokerFacade.frame(from: unchanged, foregroundBundleID: contract.targetBundleID)
+        runtime.applyToolEvidence(
+            toolName: "gui.tapTextObserve",
+            arguments: ["query": destination],
+            result: unchanged,
+            observation: unchangedFrame,
+            contract: contract
+        )
+        XCTAssertTrue(runtime.pendingObligations.contains("destination"))
+
+        let changed = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "conversation opened",
+            payload: [
+                "baselineSHA256": "before",
+                "sha256": "after",
+                "localVisionOCR": "recognized",
+                "localVisionElements": encoded,
+                "localVisionElementCount": "1"
+            ]
+        )
+        let changedFrame = PerceptionBrokerFacade.frame(from: changed, foregroundBundleID: contract.targetBundleID)
+        runtime.applyToolEvidence(
+            toolName: "gui.tapTextObserve",
+            arguments: ["query": destination],
+            result: changed,
+            observation: changedFrame,
+            contract: contract
+        )
+        XCTAssertTrue(runtime.completedObligations.contains("destination"))
+        XCTAssertEqual(runtime.semanticSurface, "wechat.conversation")
+    }
+
+    func testTypedMessagingUncertainSendStaysPendingAndOnlyReconcilesOnceLocally() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.markObligationCompleted("destination")
+        runtime.composerFocusVerified = true
+        runtime.textInputActionsCompleted = 1
+        runtime.messageCommitState = .uncertain
+        runtime.reconcileObligationProgress(contract: contract)
+
+        XCTAssertTrue(runtime.pendingObligations.contains("send"))
+        XCTAssertFalse(runtime.completedObligations.contains("send"))
+        XCTAssertFalse(runtime.canDispatchMessageCommit(contract: contract))
+        XCTAssertEqual(
+            TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil)?.toolName,
+            "gui.screenshot"
+        )
+
+        runtime.reconcileObservationCount = 1
+        XCTAssertNil(TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil))
+    }
+
+    func testTypedMessagingRequiresExactPostSendSemanticBodyBeforeVerified() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.textInputActionsCompleted = 1
+        runtime.messageCommitState = .uncertain
+        let bodyElement = LocalPerceptionTextElement(text: "1", confidence: 0.92, x: 220, y: 510, width: 18, height: 22)
+        let encoded = try XCTUnwrap(String(data: JSONEncoder().encode([bodyElement]), encoding: .utf8))
+        let result = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "post-send screenshot",
+            payload: [
+                "sha256": "post-send-frame",
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "recognized",
+                "localVisionElements": encoded,
+                "localVisionElementCount": "1"
+            ]
+        )
+        let frame = PerceptionBrokerFacade.frame(from: result, foregroundBundleID: contract.targetBundleID)
+        runtime.applyToolEvidence(
+            toolName: "gui.screenshot",
+            arguments: [:],
+            result: result,
+            observation: frame,
+            contract: contract
+        )
+
+        XCTAssertEqual(runtime.messageCommitState, .verified)
+        XCTAssertTrue(runtime.postconditionVerified)
+        XCTAssertTrue(runtime.completedObligations.contains("send"))
+        XCTAssertTrue(runtime.completedObligations.contains("verify"))
+    }
+
+    func testTypedLikeAttemptDoesNotCompleteLikeUntilSemanticPostcondition() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开抖音，刷严格 5 条视频然后点赞"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.finiteFeedCompleted = 5
+        runtime.likeActionsCompleted = 1
+        runtime.reconcileObligationProgress(contract: contract)
+
+        XCTAssertFalse(runtime.completedObligations.contains("like"))
+        XCTAssertEqual(
+            TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil)?.toolName,
+            "gui.screenshot"
+        )
+
+        runtime.reconcileObservationCount = 1
+        XCTAssertNil(TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil))
+    }
+
+    func testTypedLikeExactlyOnceGuardBlocksProviderOrLocalSecondLike() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开抖音，刷严格 5 条视频然后点赞"))
+        XCTAssertFalse(AgentCore.shouldBlockTypedLikeRepeat(
+            contract: contract,
+            successfulLikeActionCount: 0,
+            toolName: "gui.tapTextObserve",
+            arguments: ["query": "点赞"]
+        ))
+        XCTAssertTrue(AgentCore.shouldBlockTypedLikeRepeat(
+            contract: contract,
+            successfulLikeActionCount: 1,
+            toolName: "gui.tapTextObserve",
+            arguments: ["query": "点赞"]
+        ))
+        XCTAssertTrue(AgentCore.shouldBlockTypedLikeRepeat(
+            contract: contract,
+            successfulLikeActionCount: 1,
+            toolName: "gui.tapObserve",
+            arguments: ["semanticTarget": "like"]
+        ))
+        XCTAssertFalse(AgentCore.shouldBlockTypedLikeRepeat(
+            contract: contract,
+            successfulLikeActionCount: 1,
+            toolName: "gui.tapTextObserve",
+            arguments: ["query": "评论"]
+        ))
+    }
+
+    func testObservationFrameNormalizesExistingOCRAndScreenshotEvidenceWithoutNewPerceptionWork() throws {
+        let elements = [
+            LocalPerceptionTextElement(text: "文件传输助手", confidence: 0.96, x: 18, y: 120, width: 160, height: 28)
+        ]
+        let encoded = try XCTUnwrap(String(data: JSONEncoder().encode(elements), encoding: .utf8))
+        let result = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "local observation",
+            payload: [
+                "sha256": "frame-1",
+                "perceptionAXAttempted": "true",
+                "perceptionAXSucceeded": "false",
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "recognized",
+                "localVisionElements": encoded,
+                "localVisionElementCount": "1",
+                "localVisionRegion": "0,80,390,500",
+                "localVisionRecognitionLevel": "fast",
+                "localVisionLatencyMS": "210",
+                "localVisionCacheHit": "true",
+                "perceptionLocalSufficient": "true",
+                "perceptionFallbackReason": "ax_transport_returned_semantically_empty_tree"
+            ]
+        )
+        let frame = PerceptionBrokerFacade.frame(from: result, foregroundBundleID: "com.tencent.xin")
+        XCTAssertEqual(frame.foregroundBundleID, "com.tencent.xin")
+        XCTAssertEqual(frame.screenRevision, "frame-1")
+        XCTAssertEqual(frame.ocr.status, .recognized)
+        XCTAssertEqual(frame.ocr.elementCount, 1)
+        XCTAssertEqual(frame.semanticElements.first?.text, "文件传输助手")
+        XCTAssertEqual(frame.ax.failureClass, .semanticEmpty)
+        XCTAssertTrue(frame.canReuseOCR(screenRevision: "frame-1", region: "0,80,390,500", recognitionLevel: "fast"))
+        XCTAssertFalse(frame.canReuseOCR(screenRevision: "frame-2", region: "0,80,390,500", recognitionLevel: "fast"))
+        XCTAssertFalse(frame.canReuseOCR(screenRevision: "frame-1", region: "0,80,390,500", recognitionLevel: "accurate"))
+        XCTAssertFalse(frame.canReuseOCR(screenRevision: "frame-1", region: "0,0,390,844", recognitionLevel: "fast"))
+    }
+
+    func testObservationFrameClassifiesAXUnknownClientSeparatelyFromTimeoutAndSemanticEmpty() {
+        XCTAssertEqual(
+            PerceptionBrokerFacade.classifyAXFailure(attempted: true, succeeded: false, text: "AXRuntime: Unknown client: CloudCodeRootHelper"),
+            .unknownClient
+        )
+        XCTAssertEqual(
+            PerceptionBrokerFacade.classifyAXFailure(attempted: true, succeeded: false, text: "helper timed out"),
+            .transportTimeout
+        )
+        XCTAssertEqual(
+            PerceptionBrokerFacade.classifyAXFailure(attempted: true, succeeded: false, text: "no semantic/actionable foreground UI nodes", semanticNodeCount: 0),
+            .semanticEmpty
+        )
+    }
+
     func testHarnessExecutionHintRecognizesExplicitBoundedRepeatedSwipe() {
         let messages = [
             ChatMessage(role: .system, content: "safety"),
@@ -6081,6 +6392,11 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(partial?.providerMetadata["repeat_count"], "2")
         XCTAssertTrue(partial?.content.contains("count=2") == true)
         XCTAssertFalse(partial?.content.contains("count=5") == true)
+
+        let finalSingle = HarnessContextManager.executionHint(from: messages, finiteRepeatCompletedCount: 4)
+        XCTAssertEqual(finalSingle?.providerMetadata["repeat_remaining"], "1")
+        XCTAssertTrue(finalSingle?.content.contains("gui.scrollObserve") == true)
+        XCTAssertFalse(finalSingle?.content.contains("gui.feedSample with direction=forward and count=1") == true)
 
         let complete = HarnessContextManager.executionHint(from: messages, finiteRepeatCompletedCount: 5)
         XCTAssertEqual(complete?.providerMetadata["execution_mode"], "finite_repeat_complete")

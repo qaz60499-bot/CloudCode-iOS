@@ -860,21 +860,33 @@ public actor AgentCore {
                     // Once steering arrives in this process, that newer user instruction becomes the
                     // active request and recompiles the provider-visible tool domain immediately.
                     var activeRequest = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    var requiredRepeatedSwipeCount = HarnessContextManager.boundedRepeatedSwipeCount(in: activeRequest)
+                    var taskContract = TaskSemanticCheckpointCodec.restoreContract(request: activeRequest, payload: checkpoint.payload)
+                    var taskRuntimeState = taskContract.map { TaskSemanticCheckpointCodec.restoreRuntime(contract: $0, payload: checkpoint.payload) }
+                    var requiredRepeatedSwipeCount = taskContract?.limits.exactFeedItemCount
+                        ?? HarnessContextManager.boundedRepeatedSwipeCount(in: activeRequest)
                     var requiresPostLaunchGUIAction = HarnessContextManager.requiresPostLaunchGUIAction(in: activeRequest)
-                    var requiresMessageSend = HarnessContextManager.requiresMessageSend(in: activeRequest)
+                    var requiresMessageSend = taskContract?.intent == .messaging
+                        || HarnessContextManager.requiresMessageSend(in: activeRequest)
                     var requiresExplicitTapAction = HarnessContextManager.requiresExplicitTapAction(in: activeRequest)
-                    var requiresLikeAction = HarnessContextManager.requiresLikeAction(in: activeRequest)
-                    var successfulPostLaunchGUIActionCount = Int(checkpoint.payload["tool.successfulPostLaunchGUIActionCount"] ?? "0") ?? 0
-                    var completedRepeatedSwipeCount = Int(checkpoint.payload["tool.completedRepeatedSwipeCount"] ?? "0") ?? 0
-                    var successfulTextInputCount = Int(checkpoint.payload["tool.successfulTextInputCount"] ?? "0") ?? 0
-                    var successfulTapActionCount = Int(checkpoint.payload["tool.successfulTapActionCount"] ?? "0") ?? 0
-                    var successfulLikeActionCount = Int(checkpoint.payload["tool.successfulLikeActionCount"] ?? "0") ?? 0
-                    var successfulCommitAfterTextInput = checkpoint.payload["tool.successfulCommitAfterTextInput"] == "true"
+                    var requiresLikeAction = taskContract?.feed?.requiresLikeAction
+                        ?? HarnessContextManager.requiresLikeAction(in: activeRequest)
+                    var successfulPostLaunchGUIActionCount = taskRuntimeState?.postLaunchGUIActionsCompleted
+                        ?? (Int(checkpoint.payload["tool.successfulPostLaunchGUIActionCount"] ?? "0") ?? 0)
+                    var completedRepeatedSwipeCount = taskRuntimeState?.finiteFeedCompleted
+                        ?? (Int(checkpoint.payload["tool.completedRepeatedSwipeCount"] ?? "0") ?? 0)
+                    var successfulTextInputCount = taskRuntimeState?.textInputActionsCompleted
+                        ?? (Int(checkpoint.payload["tool.successfulTextInputCount"] ?? "0") ?? 0)
+                    var successfulTapActionCount = taskRuntimeState?.tapActionsCompleted
+                        ?? (Int(checkpoint.payload["tool.successfulTapActionCount"] ?? "0") ?? 0)
+                    var successfulLikeActionCount = taskRuntimeState?.likeActionsCompleted
+                        ?? (Int(checkpoint.payload["tool.successfulLikeActionCount"] ?? "0") ?? 0)
+                    var successfulCommitAfterTextInput = taskRuntimeState?.successfulCommitAfterTextInput
+                        ?? (checkpoint.payload["tool.successfulCommitAfterTextInput"] == "true")
                     // A raw coordinate tap after message-body input may have attempted Send, but a
                     // changing screenshot is not semantic proof of delivery. Persist this latch so
                     // recovery/completion replans cannot click Send repeatedly after an uncertain attempt.
-                    var unverifiedMessageCommitAttempted = checkpoint.payload["tool.unverifiedMessageCommitAttempted"] == "true"
+                    var unverifiedMessageCommitAttempted = taskRuntimeState?.unverifiedMessageCommitAttempted
+                        ?? (checkpoint.payload["tool.unverifiedMessageCommitAttempted"] == "true")
                     // Focus is intentionally process-local and never restored from a checkpoint: UI focus
                     // is transient and stale after suspension/restart. Raw messaging text input is allowed
                     // only after this run locally verifies a composer/keyboard focus state.
@@ -896,11 +908,16 @@ public actor AgentCore {
                            latest != activeRequest {
                             activeRequest = latest
                             requestChanged = true
-                            requiredRepeatedSwipeCount = HarnessContextManager.boundedRepeatedSwipeCount(in: activeRequest)
+                            taskContract = TaskSemanticCheckpointCodec.restoreContract(request: activeRequest, payload: checkpoint.payload)
+                            taskRuntimeState = taskContract.map { TaskRuntimeState(contract: $0) }
+                            requiredRepeatedSwipeCount = taskContract?.limits.exactFeedItemCount
+                                ?? HarnessContextManager.boundedRepeatedSwipeCount(in: activeRequest)
                             requiresPostLaunchGUIAction = HarnessContextManager.requiresPostLaunchGUIAction(in: activeRequest)
-                            requiresMessageSend = HarnessContextManager.requiresMessageSend(in: activeRequest)
+                            requiresMessageSend = taskContract?.intent == .messaging
+                                || HarnessContextManager.requiresMessageSend(in: activeRequest)
                             requiresExplicitTapAction = HarnessContextManager.requiresExplicitTapAction(in: activeRequest)
-                            requiresLikeAction = HarnessContextManager.requiresLikeAction(in: activeRequest)
+                            requiresLikeAction = taskContract?.feed?.requiresLikeAction
+                                ?? HarnessContextManager.requiresLikeAction(in: activeRequest)
                             successfulPostLaunchGUIActionCount = 0
                             completedRepeatedSwipeCount = 0
                             successfulTextInputCount = 0
@@ -944,11 +961,15 @@ public actor AgentCore {
                         ?? Self.lastCompletedStateChangeSignature(in: session, descriptorsByName: descriptorsByName)
                     var lastStateChangeScope = checkpoint.payload["tool.lastStateChangeScope"]
                         ?? Self.lastCompletedStateChangeScope(in: session, descriptorsByName: descriptorsByName)
-                    var verificationSinceLastStateChange = checkpoint.payload["tool.verificationSinceLastStateChange"] == "true"
-                    var lastGUIScreenshotSHA256 = checkpoint.payload["tool.lastGUIScreenshotSHA256"]
+                    var verificationSinceLastStateChange = taskRuntimeState?.verificationSinceLastStateChange
+                        ?? (checkpoint.payload["tool.verificationSinceLastStateChange"] == "true")
+                    var lastGUIScreenshotSHA256 = taskRuntimeState?.lastVerifiedState?.screenshotSHA256
+                        ?? checkpoint.payload["tool.lastGUIScreenshotSHA256"]
                     var guiBeforeStateChangeSHA256 = checkpoint.payload["tool.guiBeforeStateChangeSHA256"]
-                    var currentGUIBundleID = checkpoint.payload["tool.currentGUIBundleID"]
-                    var currentGUIAppVersion = checkpoint.payload["tool.currentGUIAppVersion"]
+                    var currentGUIBundleID = taskRuntimeState?.currentBundleID
+                        ?? checkpoint.payload["tool.currentGUIBundleID"]
+                    var currentGUIAppVersion = taskRuntimeState?.currentAppVersion
+                        ?? checkpoint.payload["tool.currentGUIAppVersion"]
                     var lastAcceptedUnverifiedLaunchBundleID: String?
                     var completedAppListSignatures = Set(
                         (checkpoint.payload["tool.completedAppListSignatures"] ?? "")
@@ -960,6 +981,7 @@ public actor AgentCore {
                     var repeatedToolPlanCount = 0
                     var guiTreeFailedForCurrentForegroundState = false
                     var lastLocalVisionElementsJSON: String?
+                    var lastObservationFrame: ObservationFrame?
                     // Keep only bounded perception status across Agent rounds. Raw OCR text/elements
                     // remain in the current tool result/session context and are never checkpointed here.
                     var lastPerceptionAXAttempted = checkpoint.payload["tool.lastPerceptionAXAttempted"]
@@ -970,6 +992,68 @@ public actor AgentCore {
                     var lastLocalVisionElementCount = checkpoint.payload["tool.lastLocalVisionElementCount"]
                     var lastPerceptionLocalSufficient = checkpoint.payload["tool.lastPerceptionLocalSufficient"]
                     var lastPerceptionFallbackReason = checkpoint.payload["tool.lastPerceptionFallbackReason"]
+
+                    func synchronizeTaskRuntimeToCheckpoint() {
+                        guard let contract = taskContract else { return }
+                        var runtime = taskRuntimeState ?? TaskRuntimeState(contract: contract)
+                        runtime.currentBundleID = currentGUIBundleID
+                        runtime.currentAppVersion = currentGUIAppVersion
+                        runtime.finiteFeedCompleted = max(0, completedRepeatedSwipeCount)
+                        runtime.postLaunchGUIActionsCompleted = max(0, successfulPostLaunchGUIActionCount)
+                        runtime.textInputActionsCompleted = max(0, successfulTextInputCount)
+                        runtime.tapActionsCompleted = max(0, successfulTapActionCount)
+                        runtime.likeActionsCompleted = max(0, successfulLikeActionCount)
+                        runtime.composerFocusVerified = verifiedMessagingComposerFocus
+                        runtime.verificationSinceLastStateChange = verificationSinceLastStateChange
+                        runtime.messageCommitState = successfulCommitAfterTextInput
+                            ? .verified
+                            : (unverifiedMessageCommitAttempted ? .uncertain : runtime.messageCommitState)
+                        if let lastStateChangeSignature {
+                            runtime.lastStateTransition = .init(
+                                toolName: "agent_tool",
+                                scope: lastStateChangeScope,
+                                signature: lastStateChangeSignature,
+                                at: Date()
+                            )
+                        }
+                        if let lastGUIScreenshotSHA256, !lastGUIScreenshotSHA256.isEmpty {
+                            runtime.lastVerifiedState = .init(
+                                screenshotSHA256: lastGUIScreenshotSHA256,
+                                genericSurface: runtime.genericSurface,
+                                semanticSurface: runtime.semanticSurface,
+                                at: Date()
+                            )
+                        }
+                        if lastPerceptionAXAttempted == "true" {
+                            runtime.perception.ax = lastPerceptionAXSucceeded == "true"
+                                ? .healthy
+                                : (guiTreeFailedForCurrentForegroundState ? .circuitOpen : .degraded)
+                        }
+                        if lastPerceptionOCRInvoked == "true" {
+                            runtime.perception.ocr = lastPerceptionOCRSucceeded == "true" ? .healthy : .degraded
+                        }
+                        if let frame = lastObservationFrame {
+                            runtime.perception.axFailureClass = frame.ax.failureClass == .none ? nil : frame.ax.failureClass.rawValue
+                            runtime.perception.ocrFailureClass = frame.ocr.status == .failed ? frame.degradation.fallbackReason : nil
+                            if frame.screenshot.available, let revision = frame.screenshot.sha256 {
+                                runtime.lastVerifiedState = .init(
+                                    screenshotSHA256: revision,
+                                    genericSurface: frame.genericSurface,
+                                    semanticSurface: frame.semanticSurface,
+                                    at: frame.capturedAt
+                                )
+                            }
+                        }
+                        runtime.reconcileObligationProgress(contract: contract)
+                        taskRuntimeState = runtime
+                        TaskSemanticCheckpointCodec.persist(contract: contract, runtime: runtime, payload: &checkpoint.payload)
+                    }
+
+                    synchronizeTaskRuntimeToCheckpoint()
+                    var providerRoundTrips = max(0, Int(checkpoint.payload["metric.providerRoundTrips"] ?? "0") ?? 0)
+                    var providerLastTTFTMS = checkpoint.payload["metric.providerTTFTMS"].flatMap(Int.init)
+                    var providerLastTotalMS = checkpoint.payload["metric.providerTotalMS"].flatMap(Int.init)
+                    var localTaskExecutionMS = max(0, Int(checkpoint.payload["metric.localTaskExecutionMS"] ?? "0") ?? 0)
                     let axDependentGUITools: Set<String> = [
                         "gui.tree", "gui.findElement", "gui.waitForElement", "gui.tapElementObserve",
                         "gui.typeElementObserve", "gui.runStructuredPlan", "gui.verify"
@@ -992,6 +1076,7 @@ public actor AgentCore {
                         checkpoint.stepName = resumeCheckpoint == nil
                             ? "agent round \(round + 1)"
                             : "resumed agent round \(cumulativeRound)"
+                        synchronizeTaskRuntimeToCheckpoint()
                         checkpoint.updatedAt = Date()
                         try await checkpointStore.upsert(checkpoint)
                         try? await diagnosticLogger?.log(
@@ -1079,9 +1164,38 @@ public actor AgentCore {
                                 ]
                             ))
                         }
+                        let deterministicTaskOperation: TaskDeterministicOperation? = {
+                            guard let contract = taskContract,
+                                  var runtime = taskRuntimeState else { return nil }
+                            runtime.currentBundleID = currentGUIBundleID
+                            runtime.currentAppVersion = currentGUIAppVersion
+                            runtime.finiteFeedCompleted = max(0, completedRepeatedSwipeCount)
+                            runtime.textInputActionsCompleted = max(0, successfulTextInputCount)
+                            runtime.likeActionsCompleted = max(0, successfulLikeActionCount)
+                            runtime.composerFocusVerified = verifiedMessagingComposerFocus
+                            runtime.messageCommitState = successfulCommitAfterTextInput
+                                ? .verified
+                                : (unverifiedMessageCommitAttempted ? .uncertain : runtime.messageCommitState)
+                            runtime.verificationSinceLastStateChange = verificationSinceLastStateChange
+                            runtime.reconcileObligationProgress(contract: contract)
+                            guard let operation = TaskTransitionPolicy.nextOperation(
+                                contract: contract,
+                                runtime: runtime,
+                                observation: lastObservationFrame
+                            ), roundDescriptors.contains(where: { $0.name == operation.toolName }) else {
+                                return nil
+                            }
+                            taskRuntimeState = runtime
+                            return operation
+                        }()
                         let providerContextHasImages = providerContextMessages.contains { !$0.attachments.isEmpty }
                         let providerVisionAssessment: ProviderImageCapabilityAssessment
-                        if providerContextHasImages {
+                        if deterministicTaskOperation != nil {
+                            providerVisionAssessment = ProviderImageCapabilityAssessment(
+                                capability: .unknown,
+                                source: "semantic_runtime_local_dispatch"
+                            )
+                        } else if providerContextHasImages {
                             // Resolve before schemas and before the first real screenshot-bearing Provider request.
                             // Production clients use trusted /models input-modality metadata first, then one fixed
                             // non-private 1px probe when metadata is absent. Unknown never means vision-supported.
@@ -1145,59 +1259,115 @@ public actor AgentCore {
                             currentRequest: activeRequest,
                             finiteRepeatCompletedCount: completedRepeatedSwipeCount
                         )
-                        runtimeBreadcrumb?("runtime.agent.provider.begin")
-                        try? await diagnosticLogger?.log(
-                            level: .debug,
-                            subsystem: "provider",
-                            action: "stream",
-                            result: "started",
-                            sessionID: session.id,
-                            metadata: ["round": String(round + 1)]
-                        )
-                        let stream = DiagnosticContext.$sessionID.withValue(session.id) {
-                            provider.stream(
-                                configuration: providerConfiguration,
-                                apiKey: key,
-                                messages: providerMessages,
-                                tools: roundSchemas
+                        if let deterministicTaskOperation {
+                            guard let providerToolName = toolNameMap.providerName(forInternalName: deterministicTaskOperation.toolName) else {
+                                throw ToolArgumentValidationError.unknownProviderTool(deterministicTaskOperation.toolName)
+                            }
+                            let argumentsData = try JSONSerialization.data(
+                                withJSONObject: deterministicTaskOperation.arguments,
+                                options: [.sortedKeys]
+                            )
+                            guard let argumentsJSON = String(data: argumentsData, encoding: .utf8) else {
+                                throw ToolArgumentValidationError.malformedJSON
+                            }
+                            let localCallID = "semantic-local-\(round + 1)-\(deterministicTaskOperation.toolName)"
+                            providerToolCallIDs.insert(localCallID)
+                            providerToolCalls.append((localCallID, providerToolName, argumentsJSON))
+                            runtimeBreadcrumb?("runtime.agent.semantic.localDispatch")
+                            continuation.yield(.status("Semantic Runtime 已确定下一本地步骤，跳过本轮 Provider。"))
+                            try? await diagnosticLogger?.log(
+                                level: .info,
+                                subsystem: "semantic_runtime",
+                                action: "local-transition",
+                                result: "dispatched_to_existing_tool_pipeline",
+                                sessionID: session.id,
+                                metadata: [
+                                    "round": String(round + 1),
+                                    "tool": deterministicTaskOperation.toolName,
+                                    "reason": deterministicTaskOperation.reason,
+                                    "providerRoundTripAvoided": "1"
+                                ]
+                            )
+                        } else {
+                            let providerStartedAt = Date()
+                            providerRoundTrips += 1
+                            checkpoint.payload["metric.providerRoundTrips"] = String(providerRoundTrips)
+                            checkpoint.updatedAt = Date()
+                            try? await checkpointStore.upsert(checkpoint)
+                            runtimeBreadcrumb?("runtime.agent.provider.begin")
+                            try? await diagnosticLogger?.log(
+                                level: .debug,
+                                subsystem: "provider",
+                                action: "stream",
+                                result: "started",
+                                sessionID: session.id,
+                                metadata: [
+                                    "round": String(round + 1),
+                                    "providerRoundTrips": String(providerRoundTrips)
+                                ]
+                            )
+                            let stream = DiagnosticContext.$sessionID.withValue(session.id) {
+                                provider.stream(
+                                    configuration: providerConfiguration,
+                                    apiKey: key,
+                                    messages: providerMessages,
+                                    tools: roundSchemas
+                                )
+                            }
+
+                            var sawProviderEvent = false
+                            var currentProviderTTFTMS: Int?
+                            for try await event in stream {
+                                try Task.checkCancellation()
+                                if !sawProviderEvent {
+                                    sawProviderEvent = true
+                                    currentProviderTTFTMS = max(0, Int(Date().timeIntervalSince(providerStartedAt) * 1_000))
+                                    providerLastTTFTMS = currentProviderTTFTMS
+                                    if let currentProviderTTFTMS {
+                                        checkpoint.payload["metric.providerTTFTMS"] = String(currentProviderTTFTMS)
+                                    }
+                                    runtimeBreadcrumb?("runtime.agent.provider.firstEvent")
+                                }
+                                switch event {
+                                case .status(let value):
+                                    continuation.yield(.status(value))
+                                case .token(let token):
+                                    assistantText += token
+                                    continuation.yield(.token(token))
+                                case .toolCall(let id, let name, let argumentsJSON):
+                                    guard !id.isEmpty, providerToolCallIDs.insert(id).inserted else {
+                                        throw ToolArgumentValidationError.duplicateToolCallID(id)
+                                    }
+                                    providerToolCalls.append((id, name, argumentsJSON))
+                                case .finished:
+                                    break
+                                }
+                                if await steeringMailbox.hasPending(sessionID: session.id) {
+                                    steeringInterruptedProviderStream = true
+                                    break
+                                }
+                            }
+                            let currentProviderTotalMS = max(0, Int(Date().timeIntervalSince(providerStartedAt) * 1_000))
+                            providerLastTotalMS = currentProviderTotalMS
+                            checkpoint.payload["metric.providerTotalMS"] = String(currentProviderTotalMS)
+                            checkpoint.updatedAt = Date()
+                            try? await checkpointStore.upsert(checkpoint)
+                            runtimeBreadcrumb?("runtime.agent.provider.end")
+                            try? await diagnosticLogger?.log(
+                                level: .debug,
+                                subsystem: "provider",
+                                action: "stream",
+                                result: "completed",
+                                sessionID: session.id,
+                                metadata: [
+                                    "round": String(round + 1),
+                                    "receivedEvent": sawProviderEvent ? "true" : "false",
+                                    "providerRoundTrips": String(providerRoundTrips),
+                                    "providerTTFTMS": currentProviderTTFTMS.map { String($0) } ?? "unknown",
+                                    "providerTotalMS": String(currentProviderTotalMS)
+                                ]
                             )
                         }
-
-                        var sawProviderEvent = false
-                        for try await event in stream {
-                            try Task.checkCancellation()
-                            if !sawProviderEvent {
-                                sawProviderEvent = true
-                                runtimeBreadcrumb?("runtime.agent.provider.firstEvent")
-                            }
-                            switch event {
-                            case .status(let value):
-                                continuation.yield(.status(value))
-                            case .token(let token):
-                                assistantText += token
-                                continuation.yield(.token(token))
-                            case .toolCall(let id, let name, let argumentsJSON):
-                                guard !id.isEmpty, providerToolCallIDs.insert(id).inserted else {
-                                    throw ToolArgumentValidationError.duplicateToolCallID(id)
-                                }
-                                providerToolCalls.append((id, name, argumentsJSON))
-                            case .finished:
-                                break
-                            }
-                            if await steeringMailbox.hasPending(sessionID: session.id) {
-                                steeringInterruptedProviderStream = true
-                                break
-                            }
-                        }
-                        runtimeBreadcrumb?("runtime.agent.provider.end")
-                        try? await diagnosticLogger?.log(
-                            level: .debug,
-                            subsystem: "provider",
-                            action: "stream",
-                            result: "completed",
-                            sessionID: session.id,
-                            metadata: ["round": String(round + 1), "receivedEvent": sawProviderEvent ? "true" : "false"]
-                        )
 
                         try Task.checkCancellation()
 
@@ -1227,6 +1397,34 @@ public actor AgentCore {
                                 continue
                             }
                             let completionBlockReason: String?
+                            let typedCompletionBlockReason: String? = {
+                                guard let contract = taskContract, let runtime = taskRuntimeState else { return nil }
+                                switch contract.intent {
+                                case .messaging:
+                                    if runtime.messageCommitState == .uncertain {
+                                        return "message_commit_unverified_no_repeat: typed runtime 已记录一次 Send 提交候选，但尚无消息正文出现在发送后语义观察中的证据。禁止再次发送；必须 reconcile/verify。"
+                                    }
+                                    if runtime.messageCommitState != .verified {
+                                        return "typed messaging 尚未达到 send=verified，不能把点击 Send 或截图变化当作发送完成。"
+                                    }
+                                    if !runtime.postconditionVerified {
+                                        return "typed messaging 的发送后 postcondition 尚未通过语义验证。"
+                                    }
+                                case .finiteFeed:
+                                    if let exact = contract.limits.exactFeedItemCount, runtime.finiteFeedCompleted < exact {
+                                        return "typed finite feed 尚未完成严格计数：\(runtime.finiteFeedCompleted)/\(exact)。"
+                                    }
+                                    if contract.feed?.requiresLikeAction == true {
+                                        if runtime.likeActionsCompleted == 0 {
+                                            return "typed finite feed 尚未执行一次语义化 Like 动作。"
+                                        }
+                                        if !runtime.postconditionVerified {
+                                            return "typed Like 已派发但 postcondition 尚未语义确认；禁止用 screenshot changed 冒充点赞成功，也禁止自动第二次点赞。"
+                                        }
+                                    }
+                                }
+                                return nil
+                            }()
                             let perceptionInsufficient = Self.completionRequiresPerceptionRecovery(
                                 requiresMessageSend: requiresMessageSend,
                                 successfulCommitAfterTextInput: successfulCommitAfterTextInput,
@@ -1236,7 +1434,9 @@ public actor AgentCore {
                                 axFailedForCurrentForegroundState: guiTreeFailedForCurrentForegroundState,
                                 localPerceptionSufficient: lastPerceptionLocalSufficient == "true"
                             )
-                            if let requiredRepeatedSwipeCount, completedRepeatedSwipeCount < requiredRepeatedSwipeCount {
+                            if let typedCompletionBlockReason {
+                                completionBlockReason = typedCompletionBlockReason
+                            } else if let requiredRepeatedSwipeCount, completedRepeatedSwipeCount < requiredRepeatedSwipeCount {
                                 completionBlockReason = "用户明确要求执行 \(requiredRepeatedSwipeCount) 次/条有限 GUI 浏览动作，但当前只确认执行了 \(completedRepeatedSwipeCount)。不能只打开 App 或口头说明完成。"
                             } else if perceptionInsufficient, requiresMessageSend || requiresExplicitTapAction {
                                 completionBlockReason = "perception_insufficient: 当前 AX 已失败、本地 OCR 没有提供可用 grounding，且 Provider 图像能力为 \(providerVisionAssessment.capability.rawValue)。禁止猜测不可见坐标；需要可用的 AX/OCR/local anchor 或已证明支持图像的 Provider 路由。"
@@ -1417,7 +1617,48 @@ public actor AgentCore {
                                 try await sessionStore.save(session)
                                 continue
                             }
-                            if Self.shouldBlockFiniteRepeatedGUIAction(
+                            let typedFiniteInvariantBlocked: Bool = {
+                                guard let contract = taskContract,
+                                      var runtime = taskRuntimeState,
+                                      let units = Self.finiteRepeatedGUIActionUnits(toolName: name, arguments: arguments) else {
+                                    return false
+                                }
+                                runtime.finiteFeedCompleted = max(0, completedRepeatedSwipeCount)
+                                return !runtime.canDispatchFiniteFeed(units: units, contract: contract)
+                            }()
+                            let typedLikeInvariantBlocked = Self.shouldBlockTypedLikeRepeat(
+                                contract: taskContract,
+                                successfulLikeActionCount: successfulLikeActionCount,
+                                toolName: name,
+                                arguments: arguments
+                            )
+                            if typedLikeInvariantBlocked {
+                                let failure = ToolResult(
+                                    toolCallID: callID,
+                                    success: false,
+                                    summary: "已阻止重复 Like/点赞动作；typed task 已派发所需点赞次数，后续只能核验或恢复，不能再次点击以免取消点赞。",
+                                    payload: [
+                                        "idempotency": "like_exactly_once_blocked",
+                                        "likeCompleted": String(successfulLikeActionCount),
+                                        "likeRequired": String(taskContract?.limits.exactLikeCount ?? 0),
+                                        "effectVerification": "not_dispatched"
+                                    ]
+                                )
+                                continuation.yield(.toolFinished(failure))
+                                let data = try JSONEncoder.pretty.encode(failure)
+                                let rawContent = String(data: data, encoding: .utf8) ?? failure.summary
+                                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):like_exactly_once", content: rawContent).promptSafeRepresentation
+                                session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: [
+                                    "tool_call_id": providerCallID,
+                                    "tool_name": name,
+                                    "provider_tool_name": providerToolName,
+                                    "idempotency": "like_exactly_once_blocked"
+                                ]))
+                                session.updatedAt = Date()
+                                try await sessionStore.save(session)
+                                continue
+                            }
+                            if typedFiniteInvariantBlocked || Self.shouldBlockFiniteRepeatedGUIAction(
                                 requiredCount: requiredRepeatedSwipeCount,
                                 completedCount: completedRepeatedSwipeCount,
                                 toolName: name,
@@ -1550,7 +1791,17 @@ public actor AgentCore {
                             let messageCommitCandidateTools: Set<String> = [
                                 "gui.tap", "gui.tapObserve", "gui.tapTextObserve", "gui.tapElementObserve", "gui.runStructuredPlan"
                             ]
-                            if Self.shouldBlockUnverifiedMessageCommitRepeat(
+                            let typedMessageCommitInvariantBlocked: Bool = {
+                                guard messageCommitCandidateTools.contains(name),
+                                      successfulTextInputCount > 0,
+                                      let contract = taskContract,
+                                      var runtime = taskRuntimeState else { return false }
+                                runtime.messageCommitState = successfulCommitAfterTextInput
+                                    ? .verified
+                                    : (unverifiedMessageCommitAttempted ? .uncertain : .notAttempted)
+                                return !runtime.canDispatchMessageCommit(contract: contract)
+                            }()
+                            if typedMessageCommitInvariantBlocked || Self.shouldBlockUnverifiedMessageCommitRepeat(
                                 requiresMessageSend: requiresMessageSend,
                                 toolName: name,
                                 successfulTextInputCount: successfulTextInputCount,
@@ -1799,12 +2050,46 @@ public actor AgentCore {
                                 do {
                                     let result = try await toolRouter.execute(call, context: context)
                                     let toolLatencyMS = max(0, Int(Date().timeIntervalSince(toolExecutionStartedAt) * 1_000))
+                                    if providerCallID.hasPrefix("semantic-local-") {
+                                        localTaskExecutionMS += toolLatencyMS
+                                        checkpoint.payload["metric.localTaskExecutionMS"] = String(localTaskExecutionMS)
+                                        try? await diagnosticLogger?.log(
+                                            level: .info,
+                                            subsystem: "semantic_runtime",
+                                            action: "local-execution",
+                                            result: "completed",
+                                            sessionID: session.id,
+                                            metadata: [
+                                                "tool": name,
+                                                "executionLatencyMS": String(toolLatencyMS),
+                                                "localTaskExecutionMS": String(localTaskExecutionMS),
+                                                "providerRoundTrips": String(providerRoundTrips),
+                                                "providerTTFTMS": providerLastTTFTMS.map { String($0) } ?? "unknown",
+                                                "providerTotalMS": providerLastTotalMS.map { String($0) } ?? "unknown"
+                                            ]
+                                        )
+                                    }
                                     runtimeBreadcrumb?("runtime.agent.tool.\(name).end")
                                     continuation.yield(.toolFinished(result))
                                     let data = try JSONEncoder.pretty.encode(result)
                                     let rawContent = String(data: data, encoding: .utf8) ?? result.summary
                                     let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name)", content: rawContent).promptSafeRepresentation
                                     session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: ["tool_call_id": providerCallID, "tool_name": name, "provider_tool_name": providerToolName]))
+                                    let carriesPerceptionEvidence = result.payload["perceptionAXAttempted"] != nil
+                                        || result.payload["perceptionOCRInvoked"] != nil
+                                        || result.payload["sha256"] != nil
+                                        || result.payload["treeSHA256"] != nil
+                                        || result.attachments?.contains(where: { $0.mimeType.lowercased().hasPrefix("image/") }) == true
+                                    if carriesPerceptionEvidence {
+                                        lastObservationFrame = PerceptionBrokerFacade.frame(
+                                            from: result,
+                                            foregroundBundleID: currentGUIBundleID ?? lastAcceptedUnverifiedLaunchBundleID,
+                                            genericSurface: taskRuntimeState?.genericSurface ?? .unknown,
+                                            semanticSurface: taskRuntimeState?.semanticSurface,
+                                            axCircuitOpen: guiTreeFailedForCurrentForegroundState,
+                                            ocrCircuitOpen: taskRuntimeState?.perception.ocr == .circuitOpen
+                                        )
+                                    }
                                     let stateChangeWasNotDispatched = result.payload["effectVerification"] == "not_dispatched"
                                     let selectedExecutionRoute = result.payload["route"].flatMap(AppExecutionRoute.init(rawValue:))
                                     let reportedFallbackDepth = result.payload["fallbackDepth"].flatMap(Int.init) ?? 0
@@ -1952,8 +2237,17 @@ public actor AgentCore {
                                                 successfulLikeActionCount += 1
                                             }
                                             if successfulTextInputCount > 0, semanticCommit {
-                                                successfulCommitAfterTextInput = true
-                                                unverifiedMessageCommitAttempted = false
+                                                if taskContract?.intent == .messaging {
+                                                    // A semantically identified Send control proves what was tapped,
+                                                    // not that the server-authority message is now visible in history.
+                                                    // Typed messaging therefore enters uncertain until post-action
+                                                    // semantic evidence confirms the expected message body.
+                                                    successfulCommitAfterTextInput = false
+                                                    unverifiedMessageCommitAttempted = true
+                                                } else {
+                                                    successfulCommitAfterTextInput = true
+                                                    unverifiedMessageCommitAttempted = false
+                                                }
                                             } else if requiresMessageSend,
                                                       successfulTextInputCount > 0,
                                                       plan.contains("tap") {
@@ -1967,8 +2261,13 @@ public actor AgentCore {
                                             }
                                             if successfulTextInputCount > 0 {
                                                 if Self.isSemanticMessageCommitAction(name: name, arguments: arguments) {
-                                                    successfulCommitAfterTextInput = true
-                                                    unverifiedMessageCommitAttempted = false
+                                                    if taskContract?.intent == .messaging {
+                                                        successfulCommitAfterTextInput = false
+                                                        unverifiedMessageCommitAttempted = true
+                                                    } else {
+                                                        successfulCommitAfterTextInput = true
+                                                        unverifiedMessageCommitAttempted = false
+                                                    }
                                                 } else if requiresMessageSend {
                                                     // One raw/non-semantic post-body tap is allowed as a bounded commit
                                                     // attempt. Do not let animation/screenshot hash changes authorize a
@@ -2323,6 +2622,25 @@ public actor AgentCore {
                                         checkpoint.updatedAt = Date()
                                         try await checkpointStore.upsert(checkpoint)
                                     }
+                                    synchronizeTaskRuntimeToCheckpoint()
+                                    if let contract = taskContract, var runtime = taskRuntimeState {
+                                        runtime.applyToolEvidence(
+                                            toolName: name,
+                                            arguments: arguments,
+                                            result: result,
+                                            observation: lastObservationFrame,
+                                            contract: contract
+                                        )
+                                        taskRuntimeState = runtime
+                                        successfulCommitAfterTextInput = runtime.successfulCommitAfterTextInput
+                                        unverifiedMessageCommitAttempted = runtime.unverifiedMessageCommitAttempted
+                                        verificationSinceLastStateChange = runtime.verificationSinceLastStateChange
+                                        TaskSemanticCheckpointCodec.persist(
+                                            contract: contract,
+                                            runtime: runtime,
+                                            payload: &checkpoint.payload
+                                        )
+                                    }
                                 } catch {
                                     let toolLatencyMS = max(0, Int(Date().timeIntervalSince(toolExecutionStartedAt) * 1_000))
                                     runtimeBreadcrumb?("runtime.agent.tool.\(name).error")
@@ -2389,6 +2707,9 @@ public actor AgentCore {
                                         try? await checkpointStore.upsert(checkpoint)
                                     }
                                 }
+                                synchronizeTaskRuntimeToCheckpoint()
+                                checkpoint.updatedAt = Date()
+                                try? await checkpointStore.upsert(checkpoint)
                                 session.updatedAt = Date()
                                 try await sessionStore.save(session)
                                 if let exhaustedDiagnosticFailureSignature {
@@ -2574,6 +2895,18 @@ public actor AgentCore {
             && unverifiedMessageCommitAttempted
             && !successfulCommitAfterTextInput
             && candidateTools.contains(toolName)
+    }
+
+    static func shouldBlockTypedLikeRepeat(
+        contract: TaskContract?,
+        successfulLikeActionCount: Int,
+        toolName: String,
+        arguments: [String: String]
+    ) -> Bool {
+        guard let exactLikeCount = contract?.limits.exactLikeCount,
+              exactLikeCount > 0,
+              successfulLikeActionCount >= exactLikeCount else { return false }
+        return isSemanticLikeAction(name: toolName, arguments: arguments)
     }
 
     static func finiteRepeatedGUIActionUnits(toolName: String, arguments: [String: String]) -> Int? {

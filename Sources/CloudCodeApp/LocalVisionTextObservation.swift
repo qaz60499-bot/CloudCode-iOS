@@ -179,7 +179,8 @@ enum LocalVisionTextObservation {
             await Task.detached(priority: .utility) {
             let started = Date()
             let helper = recognizeWithHelper(jpegData, maximumElements: boundedMaximum,
-                                             regionInScreenPoints: regionInScreenPoints)
+                                             regionInScreenPoints: regionInScreenPoints,
+                                             forcePrecise: forcePrecise)
             if var value = helper, Self.isUsable(value, requiresText: requiresText) {
                 value.payload["localVisionHostState"] = hostActive ? "active" : "inactive_or_background"
                 value.payload["localVisionInvoked"] = "true"
@@ -215,30 +216,69 @@ enum LocalVisionTextObservation {
     private static func recognizeWithHelper(
         _ jpegData: Data,
         maximumElements: Int,
-        regionInScreenPoints: CGRect?
+        regionInScreenPoints: CGRect?,
+        forcePrecise: Bool
     ) -> Observation? {
-        let helper = EmbeddedVisionHelper.guiOCR(jpegData: jpegData, maximumElements: maximumElements)
+        guard let source = CGImageSourceCreateWithData(jpegData as CFData, nil),
+              let sourceImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            return Observation(payload: [
+                "localVisionOCR": "unavailable_invalid_image",
+                "localVisionBackend": "vision_helper_public_api"
+            ], elements: [])
+        }
+        let fullWidth = CGFloat(max(1, sourceImage.width))
+        let fullHeight = CGFloat(max(1, sourceImage.height))
+        let fullBounds = CGRect(x: 0, y: 0, width: fullWidth, height: fullHeight)
+        let boundedRegion: CGRect? = regionInScreenPoints.flatMap { requested in
+            let intersection = requested.standardized.intersection(fullBounds)
+            return (!intersection.isNull && intersection.width >= 1 && intersection.height >= 1) ? intersection.integral : nil
+        }
+
+        var helperInput = jpegData
+        var helperOrigin = CGPoint.zero
+        var regionExecution = "full_frame"
+        if let boundedRegion {
+            if let cropped = croppedJPEG(sourceImage, region: boundedRegion) {
+                helperInput = cropped
+                helperOrigin = boundedRegion.origin
+                regionExecution = "helper_input_crop"
+            } else {
+                // Preserve correctness if crop encoding fails: full-frame helper output is still filtered
+                // below, but diagnostics make the more expensive fallback explicit.
+                regionExecution = "post_filter_fallback"
+            }
+        }
+
+        let helper = EmbeddedVisionHelper.guiOCR(
+            jpegData: helperInput,
+            maximumElements: maximumElements,
+            forcePrecise: forcePrecise
+        )
         guard let json = helper.json,
               let data = json.data(using: .utf8),
               let response = try? JSONDecoder().decode(HelperResponse.self, from: data) else {
             return Observation(payload: [
                 "localVisionOCR": "unavailable_helper_failed",
                 "localVisionBackend": "vision_helper_public_api",
+                "localVisionRegionExecution": regionExecution,
                 "localVisionHelperDiagnostic": String(helper.detail.prefix(512))
             ], elements: [])
         }
 
-        let screenWidth = CGFloat(max(1, response.screenPointWidth))
-        let screenHeight = CGFloat(max(1, response.screenPointHeight))
-        let boundedRegion: CGRect? = regionInScreenPoints.flatMap { requested in
-            let intersection = requested.standardized.intersection(CGRect(x: 0, y: 0, width: screenWidth, height: screenHeight))
-            return (!intersection.isNull && intersection.width >= 1 && intersection.height >= 1) ? intersection : nil
-        }
-        let elements = response.elements.prefix(maximumElements).filter { element in
+        let mappedElements = response.elements.prefix(maximumElements).map { element in
+            LocalPerceptionTextElement(
+                text: element.text,
+                confidence: element.confidence,
+                x: element.x + Double(helperOrigin.x),
+                y: element.y + Double(helperOrigin.y),
+                width: element.width,
+                height: element.height
+            )
+        }.filter { element in
             guard let boundedRegion else { return true }
             return CGRect(x: element.x, y: element.y, width: element.width, height: element.height).intersects(boundedRegion)
         }
-        let boundedElements = Array(elements)
+        let boundedElements = Array(mappedElements)
         let encodedElements: String
         if let encoded = try? JSONEncoder().encode(boundedElements), encoded.count <= 16 * 1024 {
             encodedElements = String(data: encoded, encoding: .utf8) ?? "[]"
@@ -251,16 +291,21 @@ enum LocalVisionTextObservation {
             "localVisionElementCount": String(boundedElements.count),
             "localVisionText": String(visibleText.prefix(4_096)),
             "localVisionElements": encodedElements,
-            "screenPointWidth": String(response.screenPointWidth),
-            "screenPointHeight": String(response.screenPointHeight),
+            "screenPointWidth": String(Int(fullWidth)),
+            "screenPointHeight": String(Int(fullHeight)),
             "localVisionCoordinateSpace": "screen_points_top_left",
             "localVisionLatencyMS": String(max(0, response.latencyMS)),
             "localVisionRecognitionLevel": response.recognitionLevel ?? "accurate",
             "localVisionFallbackUsed": response.cpuFallbackUsed == true ? "true" : "false",
             "localVisionBackend": response.backend ?? "vision_helper_public_api",
             "localVisionHelperDiagnostic": String(helper.detail.suffix(4096)),
-            "localVisionRegion": boundedRegion.map { "\($0.minX),\($0.minY),\($0.width),\($0.height)" } ?? "full_screen"
+            "localVisionRegion": boundedRegion.map { "\($0.minX),\($0.minY),\($0.width),\($0.height)" } ?? "full_screen",
+            "localVisionRegionExecution": regionExecution
         ]
+        if regionExecution == "helper_input_crop", let boundedRegion {
+            payload["localVisionHelperInputWidth"] = String(Int(boundedRegion.width))
+            payload["localVisionHelperInputHeight"] = String(Int(boundedRegion.height))
+        }
         if let errorDomain = response.errorDomain, !errorDomain.isEmpty {
             payload["localVisionErrorDomain"] = errorDomain
         }
@@ -274,6 +319,18 @@ enum LocalVisionTextObservation {
             payload["localVisionPrimaryErrorCode"] = String(primaryErrorCode)
         }
         return Observation(payload: payload, elements: boundedElements)
+    }
+
+    private static func croppedJPEG(_ image: CGImage, region: CGRect) -> Data? {
+        guard let cropped = image.cropping(to: region),
+              let output = CFDataCreateMutable(nil, 0),
+              let destination = CGImageDestinationCreateWithData(output, "public.jpeg" as CFString, 1, nil) else {
+            return nil
+        }
+        CGImageDestinationAddImage(destination, cropped, [kCGImageDestinationLossyCompressionQuality: 0.82] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        let data = output as Data
+        return GUIAutomationPayloadPolicy.isValidScreenshotJPEG(data) ? data : nil
     }
 
     private static func coreVideoAllocationFailure(in error: NSError) -> NSError? {
