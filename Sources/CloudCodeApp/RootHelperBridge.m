@@ -20,6 +20,46 @@
 typedef int (*PersonaSetFn)(const posix_spawnattr_t * _Nonnull __restrict, uid_t, uint32_t);
 typedef int (*PersonaUIDFn)(const posix_spawnattr_t * _Nonnull __restrict, uid_t);
 typedef int (*PersonaGIDFn)(const posix_spawnattr_t * _Nonnull __restrict, gid_t);
+typedef pid_t (*CloudCodeWaitPidFn)(pid_t, int *, int);
+
+static CloudCodeWaitPidFn CloudCodeDarwinWaitPidFunction(void)
+{
+    static CloudCodeWaitPidFn function = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // IOSSystemRuntime deliberately embeds ios_system.framework, which exports its own waitpid
+        // implementation for virtual shell processes. RootHelperBridge manages real Darwin children
+        // created by posix_spawn, so binding that interposed symbol makes real-helper polling spin in
+        // ios_system instead of waiting on the kernel. Resolve the system implementation from an
+        // explicit Apple image and reject any accidental ios_system resolution.
+        static const char *candidates[] = {
+            "/usr/lib/libSystem.B.dylib",
+            "/usr/lib/system/libsystem_c.dylib",
+        };
+        for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); index++) {
+            void *handle = dlopen(candidates[index], RTLD_LAZY | RTLD_LOCAL);
+            if (!handle) { continue; }
+            void *symbol = dlsym(handle, "waitpid");
+            if (!symbol) { continue; }
+            Dl_info info = {0};
+            if (dladdr(symbol, &info) == 0 || !info.dli_fname) { continue; }
+            if (strstr(info.dli_fname, "ios_system.framework") != NULL) { continue; }
+            function = (CloudCodeWaitPidFn)symbol;
+            break;
+        }
+    });
+    return function;
+}
+
+static pid_t CloudCodeDarwinWaitPid(pid_t pid, int *status, int options)
+{
+    CloudCodeWaitPidFn function = CloudCodeDarwinWaitPidFunction();
+    if (!function) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return function(pid, status, options);
+}
 
 static double CloudCodeMonotonicSeconds(void)
 {
@@ -99,6 +139,9 @@ static NSInteger CloudCodeSpawnHelperInternal(
     if (standardError) { *standardError = nil; }
     if (path.length == 0) { return -1001; }
     if (timeout <= 0) { timeout = CLOUDCODE_HELPER_DEFAULT_TIMEOUT; }
+    // Fail before spawning a real child if we cannot prove that process observation/reaping will
+    // use Darwin's waitpid rather than ios_system's virtual-process implementation.
+    if (!CloudCodeDarwinWaitPidFunction()) { return -1950; }
 
     NSMutableArray<NSString *> *argvStrings = [NSMutableArray arrayWithObject:path];
     [argvStrings addObjectsFromArray:arguments ?: @[]];
@@ -215,7 +258,7 @@ static NSInteger CloudCodeSpawnHelperInternal(
                 if (captureStdout) { CloudCodeDrainPipe(stdoutPipe[0], capturedStdout, &stdoutTruncated); }
                 if (captureStderr) { CloudCodeDrainPipe(stderrPipe[0], capturedStderr, &stderrTruncated); }
 
-                pid_t waited = waitpid(pid, &status, WNOHANG);
+                pid_t waited = CloudCodeDarwinWaitPid(pid, &status, WNOHANG);
                 if (waited == pid) {
                     statusObserved = YES;
                     finished = YES;
@@ -240,7 +283,7 @@ static NSInteger CloudCodeSpawnHelperInternal(
                     BOOL reaped = NO;
                     double reapDeadline = CloudCodeMonotonicSeconds() + 0.25;
                     do {
-                        waited = waitpid(pid, &status, WNOHANG);
+                        waited = CloudCodeDarwinWaitPid(pid, &status, WNOHANG);
                         if (waited == pid || (waited == -1 && errno == ECHILD)) {
                             statusObserved = waited == pid;
                             reaped = YES;
@@ -255,7 +298,7 @@ static NSInteger CloudCodeSpawnHelperInternal(
                             int reaperStatus = 0;
                             pid_t reaperWaited = 0;
                             do {
-                                reaperWaited = waitpid(timedOutPID, &reaperStatus, 0);
+                                reaperWaited = CloudCodeDarwinWaitPid(timedOutPID, &reaperStatus, 0);
                             } while (reaperWaited == -1 && errno == EINTR);
                         });
                     }

@@ -364,7 +364,14 @@ jobs:
             exit 1
           fi
           grep -F 'probeOwnKeychain()' Sources/CloudCodeCore/CapabilityProbe.swift >/dev/null
+          APP_EXECUTABLE="build/DerivedData/Build/Products/Release-iphoneos/CloudCode.app/CloudCode"
+          test -f "$APP_EXECUTABLE"
+          if nm -u "$APP_EXECUTABLE" | grep -E '(^|[[:space:]])_waitpid$'; then
+            echo "FAIL: final CloudCode binary directly binds _waitpid; ios_system.framework can interpose that symbol and spin helper reaping" >&2
+            exit 1
+          fi
           python3 - <<'PY'
+          import re
           from pathlib import Path
 
           capability = Path('Sources/CloudCodeCore/CapabilityProbe.swift').read_text(encoding='utf-8')
@@ -451,9 +458,11 @@ jobs:
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: app launch lost bounded board-service fallback/foreground verification marker: {marker}')
           bridge = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
-          for marker in ('CLOUDCODE_HELPER_CAPTURE_LIMIT (1024 * 1024)', 'WIFSIGNALED(status)', 'WNOHANG', 'O_NONBLOCK', 'ETIMEDOUT', 'kill(pid, SIGKILL)', 'process reap deferred', 'dispatch_async', 'CloudCodeSpawnHelperInternal', 'stdoutPipe', 'stderrPipe', 'CloudCodeSpawnHelperWithSeparatedOutput', 'helper %@ capture truncated', 'EOVERFLOW'):
+          for marker in ('CLOUDCODE_HELPER_CAPTURE_LIMIT (1024 * 1024)', 'WIFSIGNALED(status)', 'WNOHANG', 'O_NONBLOCK', 'ETIMEDOUT', 'kill(pid, SIGKILL)', 'process reap deferred', 'dispatch_async', 'CloudCodeSpawnHelperInternal', 'stdoutPipe', 'stderrPipe', 'CloudCodeSpawnHelperWithSeparatedOutput', 'helper %@ capture truncated', 'EOVERFLOW', 'CloudCodeDarwinWaitPidFunction', '/usr/lib/libSystem.B.dylib', 'dlsym(handle, "waitpid")', 'dladdr(symbol, &info)', 'ios_system.framework', 'CloudCodeDarwinWaitPid(pid, &status, WNOHANG)', 'CloudCodeDarwinWaitPid(timedOutPID, &reaperStatus, 0)'):
               if marker not in bridge:
-                  raise SystemExit(f'FAIL: root helper bridge lost timeout/isolation marker: {marker}')
+                  raise SystemExit(f'FAIL: root helper bridge lost timeout/isolation/system-waitpid marker: {marker}')
+          if re.search(r'(?<![A-Za-z0-9_])waitpid\s*\(', bridge):
+              raise SystemExit('FAIL: RootHelperBridge must never bind a direct waitpid call because ios_system.framework exports an incompatible virtual-process waitpid')
           bridge_header = Path('Sources/CloudCodeApp/RootHelperBridge.h').read_text(encoding='utf-8')
           for marker in ('CloudCodeSpawnHelperWithOutput', 'CloudCodeSpawnHelperWithSeparatedOutput'):
               if marker not in bridge_header:
