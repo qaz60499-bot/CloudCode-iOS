@@ -556,7 +556,7 @@ jobs:
               if marker not in vision_text:
                   raise SystemExit(f'FAIL: lightweight Vision helper lost public OCR isolation marker: {marker}')
           local_vision = Path('Sources/CloudCodeApp/LocalVisionTextObservation.swift').read_text(encoding='utf-8')
-          for marker in ('EmbeddedVisionHelper.guiOCR', 'request.usesCPUOnly = true', 'request.preferBackgroundProcessing = true', 'app_process_vision_cpu_only', 'app_process_vision_cpu_only_thumbnail', 'app_process_vision_fast_thumbnail_fallback', 'primaryMaxDimension', 'kCGImageSourceThumbnailMaxPixelSize', 'UIApplication.shared.applicationState != .background', 'not_invoked_host_background', 'private actor Coordinator', 'localVisionCacheHit', 'localVisionRequestCoalesced', 'forcePrecise', 'precise ? 0.011', 'level == .fast ? 0.020 : 0.018'):
+          for marker in ('EmbeddedVisionHelper.guiOCR', 'request.usesCPUOnly = true', 'request.preferBackgroundProcessing = true', 'app_process_vision_cpu_only', 'app_process_vision_cpu_only_thumbnail', 'app_process_vision_fast_thumbnail_fallback', 'primaryMaxDimension', 'kCGImageSourceThumbnailMaxPixelSize', 'UIApplication.shared.applicationState == .active', 'not_invoked_host_not_active', 'bypassCoreVideoCircuit: helperSpawnAllowed', 'private actor Coordinator', 'localVisionCacheHit', 'localVisionRequestCoalesced', 'forcePrecise', 'precise ? 0.011', 'level == .fast ? 0.020 : 0.018'):
               if marker not in local_vision:
                   raise SystemExit(f'FAIL: local OCR routing lost progressive/single-flight/background-safe Vision marker: {marker}')
           if 'request.minimumTextHeight = 0.009' in local_vision or 'request.minimumTextHeight = 0.009f' in vision_text:

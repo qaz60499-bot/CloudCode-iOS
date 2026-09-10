@@ -38,11 +38,12 @@ enum LocalVisionTextObservation {
 
         func resolve(
             key: String,
+            bypassCoreVideoCircuit: Bool = false,
             operation: @escaping @Sendable () async -> Observation
         ) async -> Observation {
             let now = Date()
             cache = cache.filter { now.timeIntervalSince($0.value.createdAt) <= retention }
-            if let until = coreVideoCircuitOpenUntil, until > now {
+            if let until = coreVideoCircuitOpenUntil, until > now, !bypassCoreVideoCircuit {
                 return Observation(payload: [
                     "localVisionOCR": "unavailable_corevideo_circuit_open",
                     "localVisionBackend": "vision_circuit_breaker",
@@ -173,11 +174,13 @@ enum LocalVisionTextObservation {
         // make a newly spawned child Vision process a foreground application. Build 94 proved that
         // the child helper can be killed immediately while the host is still alive. Record the host
         // state before detaching: in-process CPU-only Vision remains allowed in background; the
-        // child helper is only a foreground/inactive fallback.
+        // child helper is only a fully-active foreground fallback. During the `.inactive`
+        // transition iOS can accept spawn and then jetsam the helper before Vision returns; Build
+        // 108 diagnostics captured that as helper signal 9 / bridge code -5009.
         let helperSpawnAllowed = await MainActor.run {
-            UIApplication.shared.applicationState != .background
+            UIApplication.shared.applicationState == .active
         }
-        return await coordinator.resolve(key: key) {
+        return await coordinator.resolve(key: key, bypassCoreVideoCircuit: helperSpawnAllowed) {
             await Task.detached(priority: .utility) {
             // Vision/Core ML is an App compute workload, not a privilege workload. Running OCR as
             // persona-99/root caused real-device failures in CoreVideo/CoreML even though capture
@@ -193,8 +196,8 @@ enum LocalVisionTextObservation {
             guard helperSpawnAllowed else {
                 var backgroundResult = inProcess
                 backgroundResult.payload["localVisionSecondaryBackend"] = "vision_helper_public_api"
-                backgroundResult.payload["localVisionSecondaryStatus"] = "not_invoked_host_background"
-                backgroundResult.payload["localVisionSecondaryDiagnostic"] = "Child Vision helper intentionally skipped while Cloud Code is backgrounded; in-process CPU-only Vision is the authoritative local OCR route."
+                backgroundResult.payload["localVisionSecondaryStatus"] = "not_invoked_host_not_active"
+                backgroundResult.payload["localVisionSecondaryDiagnostic"] = "Child Vision helper intentionally skipped unless Cloud Code is fully active; in-process CPU-only Vision remains the authoritative local OCR route while inactive/backgrounded."
                 return backgroundResult
             }
             if let helperObservation = recognizeWithHelper(
