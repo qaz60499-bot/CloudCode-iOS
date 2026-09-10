@@ -8,8 +8,10 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     private var cachedSnapshot: GUIAutomationCapabilitySnapshot?
     private var cachedSnapshotAt: Date?
     private var treeRetryAfter: Date?
+    private var lastTreeFailureClass: ObservationFrame.AXFailureClass?
     private let snapshotTTL: TimeInterval = 2
     private let treeFailureCooldown: TimeInterval = 30
+    private let unknownClientCooldown: TimeInterval = 120
     private let diagnosticLogger: DiagnosticLogStore?
 
     public init(diagnosticLogger: DiagnosticLogStore? = nil) {
@@ -89,6 +91,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
         // another expensive tree probe loop.
         if outcome.foregroundVerified {
             treeRetryAfter = nil
+            lastTreeFailureClass = nil
         }
         return GUIOpenAppOutcome(
             accepted: outcome.accepted,
@@ -100,13 +103,20 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     public func tree() async throws -> String {
         if let treeRetryAfter, treeRetryAfter > Date() {
             let seconds = max(1, Int(treeRetryAfter.timeIntervalSinceNow.rounded(.up)))
-            throw ToolRouterError.noExecutionRoute("AX tree recently timed out for the current device; retry is suppressed for \(seconds)s so screenshot-driven computer use can continue.")
+            let failureClass = lastTreeFailureClass?.rawValue ?? "temporary_failure"
+            throw ToolRouterError.noExecutionRoute("AX tree circuit is open after \(failureClass); retry is suppressed for \(seconds)s so local OCR/screenshot execution can continue until foreground state changes.")
         }
         let startedAt = Date()
         let outcome = EmbeddedRootHelper.guiTree()
         let latencyMS = max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))
         guard let tree = outcome.tree else {
-            treeRetryAfter = Date().addingTimeInterval(treeFailureCooldown)
+            let failureClass = PerceptionBrokerFacade.classifyAXFailure(
+                attempted: true,
+                succeeded: false,
+                text: outcome.detail
+            )
+            lastTreeFailureClass = failureClass
+            treeRetryAfter = Date().addingTimeInterval(failureClass == .unknownClient ? unknownClientCooldown : treeFailureCooldown)
             try? await diagnosticLogger?.log(
                 level: .warning,
                 subsystem: "gui",
@@ -117,12 +127,14 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
                     "axBackend": "standalone_trollstore_axruntime",
                     "axStage": "direct_root_then_position_root_then_sampled_hit_test",
                     "axScope": "unavailable",
-                    "axLatencyMS": String(latencyMS)
+                    "axLatencyMS": String(latencyMS),
+                    "axFailureClass": failureClass.rawValue
                 ]
             )
             throw ToolRouterError.noExecutionRoute(outcome.detail)
         }
         guard tree.utf8.count <= 256 * 1024 else {
+            lastTreeFailureClass = .temporaryFailure
             treeRetryAfter = Date().addingTimeInterval(treeFailureCooldown)
             throw ToolRouterError.noExecutionRoute("GUI tree exceeded the 256 KiB app-layer output limit")
         }
@@ -133,6 +145,8 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             axBackend = object["backend"] as? String ?? axBackend
             axScope = object["scope"] as? String ?? axScope
         }
+        treeRetryAfter = nil
+        lastTreeFailureClass = nil
         try? await diagnosticLogger?.log(
             level: .info,
             subsystem: "gui",

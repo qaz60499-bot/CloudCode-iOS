@@ -140,7 +140,9 @@ public enum HarnessContextManager {
                 hints.append(ChatMessage(
                     role: .system,
                     content: useFeedSample
-                        ? "Harness execution hint: the latest user request requires \(count) consecutive feed/video items; \(completed) are already accounted for and only \(remaining) remain. After the target feed is foreground, request at most one gui.feedSample with direction=forward and count=\(remaining). This coordinate-free local macro owns the physical gesture direction and must never restart the original full batch after progress has been recorded."
+                        ? (remaining == 1
+                            ? "Harness execution hint: the latest user request requires \(count) consecutive feed/video items; \(completed) are already accounted for and exactly 1 remains. gui.feedSample intentionally requires at least 2 samples, so do not round this up or restart a batch. Advance exactly one unit with one bounded gui.scrollObserve; after that, reconcile any still-pending metric/selection obligation from existing evidence or one bounded re-plan."
+                            : "Harness execution hint: the latest user request requires \(count) consecutive feed/video items; \(completed) are already accounted for and only \(remaining) remain. After the target feed is foreground, request at most one gui.feedSample with direction=forward and count=\(remaining). This coordinate-free local macro owns the physical gesture direction and must never restart the original full batch after progress has been recorded.")
                         : "Harness execution hint: the latest user request requires \(count) finite repeated swipes; \(completed) are already accounted for and only \(remaining) remain. After a fresh foreground observation, request at most one gui.swipeSequence with count=\(remaining) when the repeated motion is mechanically identical and no intermediate semantic decision is required. Swipe coordinates are screen-point coordinates and duration is seconds (0.05–5.0, typically about 0.3); do not emit millisecond duration values. Never restart the original full batch after progress has been recorded.",
                     providerMetadata: [
                         "context_layer": "harness_execution",
@@ -312,8 +314,14 @@ public enum HarnessContextManager {
 
     static func requiresLikeAction(in request: String) -> Bool {
         let normalized = request.lowercased()
-        // Reading/comparing a visible like count is not a request to change the like state.
+        // A count/comparison mention is read-only only when it is the sole Like occurrence. Golden
+        // tasks often say “比较点赞量，给最高的一条点赞”; the second explicit Like is a write
+        // obligation and must not be erased merely because the same sentence also names the metric.
         let countOnlyMarkers = ["点赞量", "点赞数", "点赞数量", "like count", "likes count"]
+        let chineseLikeOccurrences = normalized.components(separatedBy: "点赞").count - 1
+        let explicitChineseWrite = chineseLikeOccurrences >= 2
+            || ["点赞一下", "点个赞", "然后点赞", "并点赞", "去点赞"].contains(where: normalized.contains)
+        if explicitChineseWrite { return true }
         if countOnlyMarkers.contains(where: normalized.contains) { return false }
         if normalized.contains("点赞") { return true }
         return normalized.range(of: #"\blike\b"#, options: .regularExpression) != nil

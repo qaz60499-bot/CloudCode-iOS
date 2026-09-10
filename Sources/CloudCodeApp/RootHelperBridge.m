@@ -157,8 +157,8 @@ static NSInteger CloudCodeSpawnHelperInternal(
     if (standardError) { *standardError = nil; }
     if (path.length == 0) { return -1001; }
     if (asRoot && [path.lastPathComponent isEqualToString:@"CloudCodeVisionHelper"]) {
-        // TSRootBinaries preserves this helper's ability to exec under TrollStore, but Vision must
-        // never inherit persona-99/root. Prior iOS 16.6 device evidence showed root-persona Vision traps.
+        // CloudCodeVisionHelper is intentionally not a TSRootBinary. Vision must never inherit
+        // persona-99/root; prior iOS 16.6 device evidence showed root-persona Vision traps.
         return -1911;
     }
     if (timeout <= 0) { timeout = CLOUDCODE_HELPER_DEFAULT_TIMEOUT; }

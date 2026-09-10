@@ -4,6 +4,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <math.h>
 #import <stdio.h>
+#import <string.h>
 #import <unistd.h>
 #import "../CloudCodeApp/PerceptionVisionProbe.h"
 
@@ -61,7 +62,7 @@ static NSArray<NSString *> *CloudCodePreferredLanguages(VNRequestTextRecognition
     return preferred;
 }
 
-static VNRecognizeTextRequest *CloudCodeMakeRequest(BOOL cpuOnly, NSString **levelName)
+static VNRecognizeTextRequest *CloudCodeMakeRequest(BOOL cpuOnly, BOOL forceAccurate, NSString **levelName)
 {
     VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] init];
     request.usesLanguageCorrection = NO;
@@ -69,7 +70,7 @@ static VNRecognizeTextRequest *CloudCodeMakeRequest(BOOL cpuOnly, NSString **lev
     request.preferBackgroundProcessing = YES;
 
     NSArray<NSString *> *fastLanguages = CloudCodePreferredLanguages(VNRequestTextRecognitionLevelFast);
-    if ([fastLanguages containsObject:@"zh-Hans"]) {
+    if (!forceAccurate && [fastLanguages containsObject:@"zh-Hans"]) {
         request.recognitionLevel = VNRequestTextRecognitionLevelFast;
         request.recognitionLanguages = fastLanguages;
         if (levelName) { *levelName = @"fast"; }
@@ -91,9 +92,9 @@ static VNRecognizeTextRequest *CloudCodeMakeRequest(BOOL cpuOnly, NSString **lev
     return request;
 }
 
-static NSError *CloudCodePerformOCR(CGImageRef image, VNRecognizeTextRequest **requestOut, BOOL cpuOnly, NSString **levelName)
+static NSError *CloudCodePerformOCR(CGImageRef image, VNRecognizeTextRequest **requestOut, BOOL cpuOnly, BOOL forceAccurate, NSString **levelName)
 {
-    VNRecognizeTextRequest *request = CloudCodeMakeRequest(cpuOnly, levelName);
+    VNRecognizeTextRequest *request = CloudCodeMakeRequest(cpuOnly, forceAccurate, levelName);
     VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image options:@{}];
     NSError *error = nil;
     CloudCodeVisionStage("vision-request-start", nil);
@@ -127,7 +128,7 @@ static NSError *CloudCodePerformFastFallbackOCR(CGImageRef image, VNRecognizeTex
     return error ?: [NSError errorWithDomain:@"CloudCodeVisionHelper" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Fast fallback Vision request failed without NSError"}];
 }
 
-static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements)
+static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements, BOOL forceAccurate)
 {
     CFAbsoluteTime startedAt = CFAbsoluteTimeGetCurrent();
     if (!CloudCodeIsBoundedTempJPEG(path)) {
@@ -159,7 +160,7 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements)
     // This helper exists specifically to provide a normal, non-root Vision execution context when
     // the host App cannot finish OCR while backgrounded. Do not first enter GPU/ANE/CoreVideo paths
     // that already failed on-device with CoreVideo -6662 / CoreML code 0 and then repeat the work.
-    NSError *primaryError = CloudCodePerformOCR(image, &request, YES, &recognitionLevelName);
+    NSError *primaryError = CloudCodePerformOCR(image, &request, YES, forceAccurate, &recognitionLevelName);
     BOOL cpuFallbackUsed = NO;
     NSError *finalError = primaryError;
     NSString *backendName = @"vision_helper_public_api";
@@ -272,9 +273,9 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements)
 
 static int CloudCodeRunOneShotVisionCommand(int argc, char *argv[])
 {
-    // TrollStore keeps this binary in TSRootBinaries only so it remains executable after import.
-    // OCR must still run as the ordinary mobile user; root/persona-99 Vision was proven unstable on
-    // iOS 16.6. Fail closed if any caller ever attempts to elevate this helper.
+    // OCR must run as the ordinary mobile user. Do not declare this binary in TSRootBinaries:
+    // that list is reserved for helpers that need TrollStore's special root-helper permissions.
+    // Root/persona-99 Vision was proven unstable on iOS 16.6, so fail closed on elevation.
     if (getuid() == 0 || geteuid() == 0) {
         fprintf(stderr, "vision-helper: root execution is forbidden\n");
         return 77;
@@ -310,7 +311,8 @@ static int CloudCodeRunOneShotVisionCommand(int argc, char *argv[])
         NSString *path = [NSString stringWithUTF8String:argv[2]];
         NSInteger parsed = [[NSString stringWithUTF8String:argv[3]] integerValue];
         NSUInteger maximumElements = (NSUInteger)MIN(MAX(parsed, 1), 48);
-        return CloudCodeOCRFile(path, maximumElements);
+        BOOL forceAccurate = argc >= 5 && strcmp(argv[4], "accurate") == 0;
+        return CloudCodeOCRFile(path, maximumElements, forceAccurate);
     }
     fprintf(stderr, "vision-helper: unsupported command\n");
     return 64;
