@@ -9,7 +9,9 @@ extension CloudCodeViewModel {
     @MainActor func runExplicitPerceptionRegressionIfRequested() {
         guard ProcessInfo.processInfo.arguments.contains("--cloudcode-perception-regression") else { return }
         let runID = UUID().uuidString
-        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        // TrollStore registers this bundle as a System app, so house_arrest refuses its container.
+        // USB AFC can retrieve this explicit diagnostic export without changing pairing or data.
+        let directory = URL(fileURLWithPath: "/var/mobile/Media", isDirectory: true)
             .appendingPathComponent("PerceptionRegression-\(runID)", isDirectory: true)
         do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
         catch { return }
