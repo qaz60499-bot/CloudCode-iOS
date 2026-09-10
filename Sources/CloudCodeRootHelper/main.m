@@ -9,6 +9,7 @@
 #import <unistd.h>
 #import <signal.h>
 #import <spawn.h>
+#import <sys/wait.h>
 #import <stdlib.h>
 #import <string.h>
 #import "GUIAutomation.h"
@@ -300,6 +301,115 @@ static NSString *InstalledBundlePath(id workspace, NSString *bundleID)
         return IsSafeBundlePath(path) ? path : nil;
     }
     return nil;
+}
+
+static BOOL IsSafeIPAPath(NSString *path)
+{
+    NSString *normalized = NormalizePath(path);
+    NSString *extension = normalized.pathExtension.lowercaseString;
+    if (!normalized || (![extension isEqualToString:@"ipa"] && ![extension isEqualToString:@"tipa"])) { return NO; }
+    if (!HasAnyPrefix(normalized, @[
+        @"/var/mobile/",
+        @"/private/var/mobile/"
+    ])) { return NO; }
+    NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:normalized error:nil];
+    if (![attributes[NSFileType] isEqualToString:NSFileTypeRegular]) { return NO; }
+    unsigned long long size = [attributes[NSFileSize] unsignedLongLongValue];
+    return size > 0 && size <= (4ULL * 1024ULL * 1024ULL * 1024ULL);
+}
+
+static NSString *TrollStoreHelperPathFromFilesystem(void)
+{
+    NSString *bundleRoot = @"/var/containers/Bundle/Application";
+    NSArray<NSString *> *containers = [NSFileManager.defaultManager contentsOfDirectoryAtPath:bundleRoot error:nil] ?: @[];
+    for (NSString *containerName in containers) {
+        NSString *containerPath = [bundleRoot stringByAppendingPathComponent:containerName];
+        if (!IsSafeBundleContainerPath(containerPath)) { continue; }
+        NSArray<NSString *> *entries = [NSFileManager.defaultManager contentsOfDirectoryAtPath:containerPath error:nil] ?: @[];
+        for (NSString *entry in entries) {
+            if (![entry.pathExtension.lowercaseString isEqualToString:@"app"]) { continue; }
+            NSString *bundlePath = [containerPath stringByAppendingPathComponent:entry];
+            if (!IsSafeBundlePath(bundlePath)) { continue; }
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"Info.plist"]];
+            NSString *bundleID = [info[@"CFBundleIdentifier"] isKindOfClass:NSString.class] ? [info[@"CFBundleIdentifier"] lowercaseString] : @"";
+            // Current TrollStore uses com.opa334.TrollStore; stealth builds keep that namespace and
+            // append a randomized TS suffix. Never execute an arbitrary app-provided helper merely
+            // because it happens to be named trollstorehelper.
+            if (![bundleID hasPrefix:@"com.opa334.trollstore"]) { continue; }
+            NSString *helper = [bundlePath stringByAppendingPathComponent:@"trollstorehelper"];
+            if ([NSFileManager.defaultManager fileExistsAtPath:helper] && [NSFileManager.defaultManager isExecutableFileAtPath:helper]) {
+                return helper.stringByStandardizingPath;
+            }
+        }
+    }
+    return nil;
+}
+
+static int ProbeIPAInstallCapability(void)
+{
+    if (getuid() != 0 || geteuid() != 0) { CloudCodeExitOneShot(11); }
+    NSString *helper = TrollStoreHelperPathFromFilesystem();
+    if (helper.length == 0) { CloudCodeExitOneShot(83); }
+    fputs("trollstore-install-backend=available\n", stdout);
+    CloudCodeExitOneShot(0);
+}
+
+static int InstallIPAThroughTrollStore(NSString *ipaPath, NSString *expectedBundleID, NSString *expectedBuild)
+{
+    if (getuid() != 0 || geteuid() != 0) { CloudCodeExitOneShot(11); }
+    NSString *normalized = NormalizePath(ipaPath);
+    if (!IsSafeIPAPath(normalized) || expectedBundleID.length == 0 || expectedBundleID.length > 255 || expectedBuild.length > 128) {
+        CloudCodeExitOneShot(82);
+    }
+    NSString *helper = TrollStoreHelperPathFromFilesystem();
+    if (helper.length == 0) { CloudCodeExitOneShot(83); }
+
+    const char *helperPath = helper.fileSystemRepresentation;
+    const char *command = "install";
+    const char *mode = "custom";
+    const char *archive = normalized.fileSystemRepresentation;
+    char *const childArgv[] = {(char *)helperPath, (char *)command, (char *)mode, (char *)archive, NULL};
+    pid_t child = 0;
+    int spawnError = posix_spawn(&child, helperPath, NULL, NULL, childArgv, environ);
+    if (spawnError != 0 || child <= 1) {
+        fprintf(stderr, "trollstore-install: spawn failed error=%d\n", spawnError);
+        CloudCodeExitOneShot(84);
+    }
+
+    int status = 0;
+    BOOL reaped = NO;
+    for (int attempt = 0; attempt < 900; attempt++) {
+        pid_t waited = waitpid(child, &status, WNOHANG);
+        if (waited == child) { reaped = YES; break; }
+        if (waited == -1 && errno != EINTR) { break; }
+        usleep(100000);
+    }
+    if (!reaped) {
+        (void)kill(child, SIGKILL);
+        do { } while (waitpid(child, &status, 0) == -1 && errno == EINTR);
+        fprintf(stderr, "trollstore-install: timed out after 90 seconds\n");
+        CloudCodeExitOneShot(84);
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        fprintf(stderr, "trollstore-install: helper returned %d\n", code);
+        CloudCodeExitOneShot(84);
+    }
+
+    NSString *installedBundlePath = BundlePathForIdentifierFromFilesystem(expectedBundleID);
+    NSDictionary *installedInfo = installedBundlePath.length > 0
+        ? [NSDictionary dictionaryWithContentsOfFile:[installedBundlePath stringByAppendingPathComponent:@"Info.plist"]]
+        : nil;
+    NSString *installedBundleID = [installedInfo[@"CFBundleIdentifier"] isKindOfClass:NSString.class] ? installedInfo[@"CFBundleIdentifier"] : @"";
+    NSString *installedBuild = [installedInfo[@"CFBundleVersion"] isKindOfClass:NSString.class] ? installedInfo[@"CFBundleVersion"] : @"";
+    if (![installedBundleID isEqualToString:expectedBundleID] || (expectedBuild.length > 0 && ![installedBuild isEqualToString:expectedBuild])) {
+        fprintf(stderr, "trollstore-install: postcondition mismatch expectedBundle=%s expectedBuild=%s actualBundle=%s actualBuild=%s\n",
+                expectedBundleID.UTF8String ?: "", expectedBuild.UTF8String ?: "",
+                installedBundleID.UTF8String ?: "", installedBuild.UTF8String ?: "");
+        CloudCodeExitOneShot(85);
+    }
+    fprintf(stdout, "trollstore-install: verified bundle=%s build=%s\n", installedBundleID.UTF8String ?: "", installedBuild.UTF8String ?: "");
+    CloudCodeExitOneShot(0);
 }
 
 static NSDictionary<NSString *, NSString *> *DataContainerPathsByBundleID(void)
@@ -1102,12 +1212,15 @@ static int StartDetachedBackgroundAssertion(pid_t targetPID, const char *helperE
     close(handshake[0]);
     if (count == sizeof(acquired) && acquired == 1) {
         fprintf(stderr, "background-assert: acquired targetPID=%d workerPID=%d spawn=posix_spawn flags=1 reason=10004\n", targetPID, workerPID);
-        return 0;
+        // This command's only observable result is the detached worker PID written above. Build 110
+        // repeatedly reached this line and then still hit the parent watchdog. Cross the one-shot
+        // boundary here instead of unwinding through any process-global Foundation/private state.
+        CloudCodeExitOneShot(0);
     }
 
     (void)kill(workerPID, SIGKILL);
     fprintf(stderr, "background-assert: acquisition failed targetPID=%d workerPID=%d poll=%d errno=%d\n", targetPID, workerPID, pollResult, errno);
-    return 75;
+    CloudCodeExitOneShot(75);
 }
 
 static int StopDetachedBackgroundAssertion(pid_t workerPID)
@@ -1157,6 +1270,16 @@ static int CloudCodeRunOneShotCommand(int argc, const char *argv[])
             if (getuid() != 0 || geteuid() != 0 || argc < 3) { return 11; }
             NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
             return ProbeUninstallCapability(bundleID);
+        }
+        if ([command isEqualToString:@"probe-ipa-install"]) {
+            return ProbeIPAInstallCapability();
+        }
+        if ([command isEqualToString:@"install-ipa"]) {
+            if (argc < 5) { return 10; }
+            NSString *ipaPath = [NSString stringWithUTF8String:argv[2]];
+            NSString *bundleID = [NSString stringWithUTF8String:argv[3]];
+            NSString *build = [NSString stringWithUTF8String:argv[4]];
+            return InstallIPAThroughTrollStore(ipaPath, bundleID, build);
         }
         if ([command isEqualToString:@"is-installed"]) {
             if (getuid() != 0 || geteuid() != 0 || argc < 3) { return 11; }

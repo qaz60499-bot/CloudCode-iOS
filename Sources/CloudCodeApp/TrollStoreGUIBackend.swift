@@ -28,10 +28,12 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
            Date().timeIntervalSince(cachedSnapshotAt) <= snapshotTTL {
             return cachedSnapshot
         }
-        let launch = EmbeddedRootHelper.launchCapability()
+        // Build 110 showed that a no-target LaunchServices readiness query can consume the full
+        // helper watchdog. Opening an App already has an exact bundle-scoped route with its own
+        // acceptance + foreground verification, so keep this feature deferred instead of probing.
         let probe = EmbeddedRootHelper.guiProbe()
         var statuses: [GUIAutomationFeature: CapabilityStatus] = [
-            .openApp: launch.available ? .available : .deviceValidationRequired,
+            .openApp: .deviceValidationRequired,
             .tree: .deviceValidationRequired,
             .screenshot: .deviceValidationRequired,
             .touch: .deviceValidationRequired,
@@ -40,7 +42,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             .verify: .deviceValidationRequired
         ]
         var details: [GUIAutomationFeature: String] = [
-            .openApp: launch.detail,
+            .openApp: "App launch uses exact bundle-scoped self-validation; no-target LaunchServices probing is intentionally disabled on this TrollStore runtime.",
             .tree: probe.detail,
             .screenshot: probe.detail,
             .touch: probe.detail,

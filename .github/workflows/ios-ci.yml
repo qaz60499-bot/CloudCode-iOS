@@ -444,7 +444,7 @@ jobs:
           for marker in ('assertionStillValid', 'sendBool0(assertion, validSelector)', 'if (!assertionStillValid) { break; }'):
               if marker not in background_section:
                   raise SystemExit(f'FAIL: background assertion worker can outlive an invalid BKS assertion: {marker}')
-          for marker in ('enumerate-json', 'probe-filesystem-json', 'probe-launch', 'probe-uninstall', 'is-installed', 'launch', 'uninstall', 'cleanup-unregistered', 'MCMMetadataIdentifier', 'BundleFilesystem(read-only-discovery)', 'BundlePathForIdentifierFromFilesystem', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-screenshot-file', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-navigate-back', 'gui-type-base64', 'background-assert-worker', 'background-assert-start', 'background-assert-status', 'background-assert-stop', 'BKSProcessAssertion', 'CloudCode.BackgroundAgent'):
+          for marker in ('enumerate-json', 'probe-filesystem-json', 'probe-launch', 'probe-uninstall', 'probe-ipa-install', 'install-ipa', 'trollstorehelper', 'trollstore-install: verified', 'is-installed', 'launch', 'uninstall', 'cleanup-unregistered', 'MCMMetadataIdentifier', 'BundleFilesystem(read-only-discovery)', 'BundlePathForIdentifierFromFilesystem', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-screenshot-file', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-navigate-back', 'gui-type-base64', 'background-assert-worker', 'background-assert-start', 'background-assert-status', 'background-assert-stop', 'BKSProcessAssertion', 'CloudCode.BackgroundAgent'):
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: root helper command missing: {marker}')
           for marker in ('@"%@.framework/%@"', '@"FBSSystemService", @"FrontBoardServices"', '@"BKSSystemService", @"BackBoardServices"', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'geteuid() != 0', 'foreground verification passed', 'launchservices+frontboard+backboard'):
@@ -458,12 +458,14 @@ jobs:
           for marker in ('CloudCodeSpawnHelperWithOutput', 'CloudCodeSpawnHelperWithSeparatedOutput'):
               if marker not in bridge_header:
                   raise SystemExit(f'FAIL: bounded helper bridge API is missing: {marker}')
-          if 'runSeparated(["enumerate-json"], privilege: .isolatedUser' not in adapters or 'run(["probe-launch"], privilege: .isolatedUser' not in adapters or 'run(["launch", bundleID], privilege: .isolatedUser' not in adapters:
-              raise SystemExit('FAIL: app discovery/launch must use the bounded non-root isolated helper path')
+          if 'runSeparated(["enumerate-json"], privilege: .isolatedUser' not in adapters or 'run(["launch", bundleID], privilege: .isolatedUser' not in adapters:
+              raise SystemExit('FAIL: app discovery/exact launch must use bounded isolated helper paths')
+          if 'run(["probe-launch"], privilege:' in adapters:
+              raise SystemExit('FAIL: no-target LaunchServices capability probe was reintroduced; build 110 proved it can consume the full helper watchdog')
           if 'if isolated.code == 46' not in adapters or 'run(["launch", bundleID], privilege: .root' not in adapters:
               raise SystemExit('FAIL: exact app-launch rejection lost its bounded privileged board-service fallback')
-          if 'cachedLaunchCapability' not in resolver or 'if let cachedLaunchCapability, cachedLaunchCapability.available' not in resolver:
-              raise SystemExit('FAIL: app launch capability lost process-local success caching and may re-probe on every route check')
+          if 'case "apps.launch": return capabilityID == "apps.launch"' not in adapters or 'Launch capability uses exact-operation self-validation' not in resolver:
+              raise SystemExit('FAIL: app launch must stay device-validation-deferred until the exact bundle-scoped operation executes')
           if 'shouldRefreshIndex()' not in resolver or 'failedIndexRetryAfter' not in resolver or 'negativeBundleIDs' not in resolver:
               raise SystemExit('FAIL: installed-app discovery lost cached-index/bounded-refresh guards')
           for status_signature in ('public func canEnumerateInstalledApps() async -> Bool {', 'public func canUseInstalledAppIndex() async -> Bool {', 'public func installedAppEnumerationDetail() async -> String {'):
@@ -474,6 +476,9 @@ jobs:
               raise SystemExit('FAIL: installed-app discovery reintroduced the old 30-second full-rescan TTL')
           if 'run(["probe-uninstall", bundleID], privilege: .root' not in adapters or 'run(["terminate", bundlePath], privilege: .root' not in adapters:
               raise SystemExit('FAIL: destructive/root-required app operations lost root helper gating')
+          for marker in ('run(["probe-ipa-install"], privilege: .root', 'run(["install-ipa", path, bundleID, build], privilege: .root', 'case "ipa.install": return capabilityID == "ipa.install"', 'ipaService.inspect(target, allowedRoot: context.allowedRoot)', '安装后 Bundle ID 与 CFBundleVersion 和 IPA 完全匹配'):
+              if marker not in adapters:
+                  raise SystemExit(f'FAIL: TrollStore-backed IPA install/self-update route lost safety marker: {marker}')
           gui_helper = Path('Sources/CloudCodeRootHelper/GUIAutomation.m')
           if not gui_helper.exists():
               raise SystemExit('FAIL: TrollStore GUI helper source is missing')

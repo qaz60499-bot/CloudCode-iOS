@@ -254,6 +254,10 @@ enum EmbeddedRootHelper {
         case 79: meaning = "App introspection 输出无法安全序列化或超过上限"
         case 80: meaning = "URL 已被系统接受，但目标 App 前台状态无法验证"
         case 81: meaning = "URL 路由被系统拒绝"
+        case 82: meaning = "IPA 路径、文件类型或期望 Bundle/Build 元数据无效"
+        case 83: meaning = "未发现可信且可执行的 TrollStore trollstorehelper"
+        case 84: meaning = "TrollStore 签名/安装 helper 执行失败或超时"
+        case 85: meaning = "TrollStore 返回成功，但安装后的 Bundle/Build 最终状态不匹配"
         default: meaning = ""
         }
         let suffix = meaning.isEmpty ? "" : "（\(meaning)）"
@@ -344,20 +348,30 @@ enum EmbeddedRootHelper {
         return (nil, failureDetail(prefix: "App introspection", code: result.code, diagnostic: diagnostic))
     }
 
-    static func launchCapability() -> RootHelperCapabilitySnapshot {
-        let result = run(["probe-launch"], privilege: .isolatedUser, timeout: 4)
-        if result.code == 0 {
-            return RootHelperCapabilitySnapshot(available: true, detail: "LaunchServices 启动 selector 已在 helper 子进程内验证。")
-        }
-        return RootHelperCapabilitySnapshot(available: false, detail: failureDetail(prefix: "helper 启动能力探测", code: result.code, diagnostic: result.diagnostic))
-    }
-
     static func uninstallCapability(bundleID: String) -> RootHelperCapabilitySnapshot {
         let result = run(["probe-uninstall", bundleID], privilege: .root, timeout: 6)
         if result.code == 0 {
             return RootHelperCapabilitySnapshot(available: true, detail: "卸载后端、权威安装状态查询及必要的 Bundle 容器兜底访问已在 helper 子进程内验证。")
         }
         return RootHelperCapabilitySnapshot(available: false, detail: failureDetail(prefix: "helper 卸载能力探测", code: result.code, diagnostic: result.diagnostic))
+    }
+
+    static func ipaInstallCapability() -> RootHelperCapabilitySnapshot {
+        // Discovery is filesystem-only inside the root helper. It does not invoke TrollStore or
+        // install a canary, so privileged capability validation remains side-effect free.
+        let result = run(["probe-ipa-install"], privilege: .root, timeout: 5)
+        if result.code == 0 {
+            return RootHelperCapabilitySnapshot(available: true, detail: "已发现可信 TrollStore 安装包及其 trollstorehelper；实际 IPA 仍需 ToolRouter 系统变更审批。")
+        }
+        return RootHelperCapabilitySnapshot(available: false, detail: failureDetail(prefix: "TrollStore IPA 安装能力探测", code: result.code, diagnostic: result.diagnostic))
+    }
+
+    static func installIPA(path: String, bundleID: String, build: String) -> (success: Bool, detail: String) {
+        let result = run(["install-ipa", path, bundleID, build], privilege: .root, timeout: 100)
+        if result.code == 0 {
+            return (true, result.diagnostic.isEmpty ? "TrollStore helper 已完成签名/安装并核对 Bundle/Build。" : result.diagnostic)
+        }
+        return (false, failureDetail(prefix: "TrollStore IPA 安装", code: result.code, diagnostic: result.diagnostic))
     }
 
     static func installationState(bundleID: String) -> (installed: Bool?, detail: String) {
@@ -709,7 +723,7 @@ enum EmbeddedRootHelper {
     }
 }
 
-public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, RootHelperCapabilityProviding, PrivilegedFilesystemCapabilityProviding, AppLifecycleCapabilityProviding {
+public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, RootHelperCapabilityProviding, IPAInstallationCapabilityProviding, PrivilegedFilesystemCapabilityProviding, AppLifecycleCapabilityProviding {
     private var cachedApps: [ResourceNode] = []
     private var bundlePaths: [String: String] = [:]
     private var containerPaths: [String: String] = [:]
@@ -722,7 +736,6 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
     private var enumerationDetail = "尚未检测已安装 App 枚举能力。"
     private var uninstallDetail = "尚未检测 App 卸载后端。"
     private var pendingUninstallBundleID: String?
-    private var cachedLaunchCapability: AppLifecycleCapabilitySnapshot?
     private var cachedIntrospection: [String: AppStaticIntrospection] = [:]
     private let diagnosticLogger: DiagnosticLogStore?
 
@@ -735,7 +748,6 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
         hasLastKnownGoodCrossAppIndex = false
         enumerationDetail = "自动启动阶段仅加载 Cloud Code 自身；跨 App 私有 API 探测已延后。"
         uninstallDetail = "卸载能力尚未进行显式设备验证。"
-        cachedLaunchCapability = nil
         bundlePaths = [:]
         containerPaths = [:]
         cachedApps = fallbackOwnApp()
@@ -897,6 +909,39 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
         return snapshot
     }
 
+    public func ipaInstallationCapability() async -> RootHelperCapabilitySnapshot {
+        let snapshot = EmbeddedRootHelper.ipaInstallCapability()
+        try? await diagnosticLogger?.log(
+            level: snapshot.available ? .info : .warning,
+            subsystem: "root-helper",
+            action: "ipa-install-capability",
+            result: snapshot.available ? "available" : "device_validation_required",
+            diagnostic: snapshot.detail
+        )
+        return snapshot
+    }
+
+    public func installIPA(path: String, bundleID: String, build: String) async -> (success: Bool, detail: String) {
+        let outcome = EmbeddedRootHelper.installIPA(path: path, bundleID: bundleID, build: build)
+        try? await diagnosticLogger?.log(
+            level: outcome.success ? .info : .error,
+            subsystem: "root-helper",
+            action: "ipa-install",
+            result: outcome.success ? "installed_verified" : "failed",
+            diagnostic: outcome.detail,
+            metadata: ["bundleID": bundleID, "build": build]
+        )
+        if outcome.success {
+            // The app index is a rebuildable discovery cache. Force its next reader to observe the
+            // newly installed bundle rather than serving the pre-install path/version snapshot.
+            appIndexNeedsRefresh = true
+            failedIndexRetryAfter = nil
+            negativeBundleIDs.remove(bundleID)
+            cachedIntrospection.removeValue(forKey: bundleID)
+        }
+        return outcome
+    }
+
     public func privilegedFilesystemCapability() async -> PrivilegedFilesystemCapabilitySnapshot {
         let snapshot = EmbeddedRootHelper.filesystemCapability()
         try? await diagnosticLogger?.log(
@@ -914,20 +959,13 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
     }
 
     public func appLaunchCapability() async -> AppLifecycleCapabilitySnapshot {
-        if let cachedLaunchCapability, cachedLaunchCapability.available {
-            return cachedLaunchCapability
-        }
-        let snapshot = EmbeddedRootHelper.launchCapability()
-        let lifecycle = AppLifecycleCapabilitySnapshot(available: snapshot.available, detail: snapshot.detail)
-        if lifecycle.available { cachedLaunchCapability = lifecycle }
-        try? await diagnosticLogger?.log(
-            level: snapshot.available ? .info : .warning,
-            subsystem: "root-helper",
-            action: "launch-capability",
-            result: snapshot.available ? "available" : "unavailable",
-            diagnostic: snapshot.detail
+        // Build 110 proved that asking LaunchServices a no-target capability question can block for
+        // the entire helper watchdog even though exact app launches remain independently testable.
+        // Keep the capability deferred and let the exact bundle-scoped operation self-validate.
+        return AppLifecycleCapabilitySnapshot(
+            available: false,
+            detail: "Launch capability uses exact-operation self-validation; the no-target LaunchServices probe is intentionally disabled because it can block on this TrollStore runtime."
         )
-        return lifecycle
     }
 
     public func appTerminateCapability() async -> AppLifecycleCapabilitySnapshot {
@@ -953,10 +991,8 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
         guard !bundleID.isEmpty, bundleID != Bundle.main.bundleIdentifier else {
             return (false, false, "目标 Bundle ID 无效，或目标是 Cloud Code 自身。")
         }
-        let capability = await appLaunchCapability()
-        guard capability.available else {
-            return (false, false, "启动能力不可用：\(capability.detail)")
-        }
+        // Do not run the old no-target launch capability probe here. The exact helper call below
+        // validates installation state, dispatch acceptance and foreground state for this bundle.
         let helperOutcome = EmbeddedRootHelper.launch(bundleID: bundleID)
         let outcome = (accepted: helperOutcome.accepted, foregroundVerified: helperOutcome.foregroundVerified, detail: helperOutcome.detail)
         var metadata = ["bundleID": bundleID, "foregroundVerified": outcome.foregroundVerified ? "true" : "false"]
@@ -1390,6 +1426,7 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
     private let audit: AuditLogStore
     private let resourceIndex: ProgressiveResourceIndex?
     private let appKnowledgeRegistry: AppKnowledgeRegistry?
+    private let ipaService: IPAService
 
     public init(
         appResolver: IOSAppResolver,
@@ -1397,7 +1434,8 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
         approval: ApprovalRequesting,
         audit: AuditLogStore,
         resourceIndex: ProgressiveResourceIndex? = nil,
-        appKnowledgeRegistry: AppKnowledgeRegistry? = nil
+        appKnowledgeRegistry: AppKnowledgeRegistry? = nil,
+        ipaService: IPAService = IPAService()
     ) {
         self.appResolver = appResolver
         self.policy = policy
@@ -1405,6 +1443,7 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
         self.audit = audit
         self.resourceIndex = resourceIndex
         self.appKnowledgeRegistry = appKnowledgeRegistry
+        self.ipaService = ipaService
     }
 
     public func allowsDeferredCapabilityAttempt(
@@ -1415,8 +1454,10 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
         guard capabilityIDs.count == 1, let capabilityID = capabilityIDs.first,
               capabilities.status(capabilityID) == .deviceValidationRequired else { return false }
         switch tool.name {
+        case "apps.launch": return capabilityID == "apps.launch"
         case "apps.terminate": return capabilityID == "apps.terminate"
         case "apps.uninstall": return capabilityID == "apps.uninstall"
+        case "ipa.install": return capabilityID == "ipa.install"
         default: return false
         }
     }
@@ -1424,20 +1465,85 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
         switch tool.name {
         case "apps.launch":
-            if capabilities.isAvailable("apps.launch") { return true }
-            guard capabilities.status("apps.launch") != .unavailable else { return false }
-            return await appResolver.appLaunchCapability().available
+            let status = capabilities.status("apps.launch")
+            return status == .available || status == .deviceValidationRequired
         case "apps.terminate":
             let status = capabilities.status("apps.terminate")
             return status == .available || status == .deviceValidationRequired
         case "apps.uninstall":
             let status = capabilities.status("apps.uninstall")
             return status == .available || status == .deviceValidationRequired
+        case "ipa.install":
+            let status = capabilities.status("ipa.install")
+            return status == .available || status == .deviceValidationRequired
         default: return false
         }
     }
 
     public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
+        if call.name == "ipa.install" {
+            guard let rawPath = call.arguments["path"], !rawPath.isEmpty else {
+                throw ToolRouterError.noExecutionRoute("ipa.install requires path")
+            }
+            let target = URL(fileURLWithPath: rawPath).standardizedFileURL
+            let inspection = try ipaService.inspect(target, allowedRoot: context.allowedRoot)
+            guard let bundleID = inspection.bundleIdentifier, Self.isValidBundleIdentifier(bundleID) else {
+                throw ToolRouterError.noExecutionRoute("IPA does not contain a valid bundle identifier")
+            }
+            let build = inspection.build ?? ""
+            guard !build.isEmpty else {
+                throw ToolRouterError.noExecutionRoute("IPA does not contain CFBundleVersion; refusing an unverifiable self/update install")
+            }
+
+            let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: target.path)
+            if decision == .deny { throw TransactionError.confirmationDenied }
+            if decision == .requireConfirmation {
+                let preview = ApprovalPreview(
+                    title: bundleID == Bundle.main.bundleIdentifier ? "安装 Cloud Code 更新" : "安装 IPA",
+                    target: "\(bundleID) · build \(build)",
+                    reason: "TrollStore 将对该 IPA 执行 CoreTrust/ldid 签名处理并写入系统 App 安装状态。",
+                    plan: ["检查 IPA 的 Bundle/Build 和归档结构", "通过受限 root helper 调用已安装 TrollStore 的 trollstorehelper", "重新读取安装后的 Bundle ID 与 Build，只有完全匹配才判定成功"],
+                    risk: descriptor.risk
+                )
+                guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
+            }
+
+            let capability = await appResolver.ipaInstallationCapability()
+            guard capability.available else {
+                throw ToolRouterError.noExecutionRoute("ipa.install device validation failed: \(capability.detail)")
+            }
+            let outcome = await appResolver.installIPA(path: target.path, bundleID: bundleID, build: build)
+            try await audit.append(AuditEvent(
+                sessionID: call.sessionID,
+                toolCallID: call.id,
+                action: call.name,
+                target: target.path,
+                risk: descriptor.risk,
+                result: outcome.success ? "installed_verified" : "install_failed",
+                detail: ["bundleID": bundleID, "build": build, "diagnostic": outcome.detail]
+            ))
+            return ToolResult(
+                toolCallID: call.id,
+                success: outcome.success,
+                summary: outcome.success
+                    ? "已通过 TrollStore 安装并验证 \(bundleID) build \(build)"
+                    : "IPA 安装失败：\(outcome.detail)",
+                payload: [
+                    "path": target.path,
+                    "bundleId": bundleID,
+                    "version": inspection.version ?? "",
+                    "build": build,
+                    "selfUpdate": bundleID == Bundle.main.bundleIdentifier ? "true" : "false",
+                    "diagnostic": outcome.detail
+                ],
+                verification: VerificationResult(
+                    passed: outcome.success,
+                    checks: ["IPA 元数据和归档结构通过本地检查", "可信 TrollStore helper 完成签名/安装", "安装后 Bundle ID 与 CFBundleVersion 和 IPA 完全匹配"],
+                    failures: outcome.success ? [] : [outcome.detail]
+                )
+            )
+        }
+
         guard let bundleID = call.arguments["bundleId"], Self.isValidBundleIdentifier(bundleID) else {
             throw ToolRouterError.noExecutionRoute("bundleId missing or invalid")
         }

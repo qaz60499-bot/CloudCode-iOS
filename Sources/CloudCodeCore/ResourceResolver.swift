@@ -84,6 +84,13 @@ public protocol RootHelperCapabilityProviding: Sendable {
     func rootHelperCapability() async -> RootHelperCapabilitySnapshot
 }
 
+/// Runtime proof that the installed TrollStore environment exposes a trusted IPA installation
+/// backend. The actual install remains a system-changing ToolRouter operation with policy/audit
+/// gates; capability probing itself is read-only and must never install a canary IPA.
+public protocol IPAInstallationCapabilityProviding: Sendable {
+    func ipaInstallationCapability() async -> RootHelperCapabilitySnapshot
+}
+
 public struct PrivilegedFilesystemCapabilitySnapshot: Sendable, Equatable {
     public var sharedUserFilesAvailable: Bool
     public var unrestrictedAvailable: Bool
