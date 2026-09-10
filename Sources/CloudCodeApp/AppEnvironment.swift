@@ -394,6 +394,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 didBootstrap = true
                 recordStartupBreadcrumb("bootstrap.recovery.ready")
                 recordStartupBreadcrumb("bootstrap.completed")
+                runExplicitPerceptionRegressionIfRequested()
                 return
             }
 

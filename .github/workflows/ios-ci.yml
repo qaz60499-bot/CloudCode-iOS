@@ -572,11 +572,13 @@ jobs:
           if '@autoreleasepool' in vision_text or re.search(r'fflush\s*\(', vision_text):
               raise SystemExit('FAIL: one-shot Vision helper must not enter autorelease/stdout teardown after final OCR output')
           local_vision = Path('Sources/CloudCodeApp/LocalVisionTextObservation.swift').read_text(encoding='utf-8')
-          for marker in ('EmbeddedVisionHelper.guiOCR', 'request.usesCPUOnly = true', 'request.preferBackgroundProcessing = true', 'app_process_vision_cpu_only', 'app_process_vision_cpu_only_thumbnail', 'app_process_vision_fast_thumbnail_fallback', 'primaryMaxDimension', 'kCGImageSourceThumbnailMaxPixelSize', 'UIApplication.shared.applicationState == .active', 'not_invoked_host_not_active', 'bypassCoreVideoCircuit: helperSpawnAllowed', 'private actor Coordinator', 'localVisionCacheHit', 'localVisionRequestCoalesced', 'forcePrecise', 'precise ? 0.011', 'level == .fast ? 0.020 : 0.018'):
+          for marker in ('EmbeddedVisionHelper.guiOCR', 'request.usesCPUOnly = true', 'request.preferBackgroundProcessing = true', 'app_process_vision_cpu_only', 'app_process_vision_cpu_only_thumbnail', 'app_process_vision_fast_thumbnail_fallback', 'primaryMaxDimension', 'kCGImageSourceThumbnailMaxPixelSize', 'UIApplication.shared.applicationState == .active', 'localVisionHostState', 'localVisionInvoked', 'bypassCoreVideoCircuit: true', 'private actor Coordinator', 'localVisionCacheHit', 'localVisionRequestCoalesced', 'forcePrecise', 'precise ? 0.011', 'level == .fast ? 0.020 : 0.018'):
               if marker not in local_vision:
                   raise SystemExit(f'FAIL: local OCR routing lost progressive/single-flight/background-safe Vision marker: {marker}')
           if 'request.minimumTextHeight = 0.009' in local_vision or 'request.minimumTextHeight = 0.009f' in vision_text:
               raise SystemExit('FAIL: OCR regressed to unconditional full-screen tiny-text recognition')
+          if 'not_invoked_host_not_active' in local_vision:
+              raise SystemExit('FAIL: background OCR must attempt the independent mobile helper')
           if 'EmbeddedRootHelper.guiOCR' in local_vision:
               raise SystemExit('FAIL: local OCR routing regressed back into the privileged/root GUI helper')
           vision_overlay_surface = local_vision + '\n' + vision_text

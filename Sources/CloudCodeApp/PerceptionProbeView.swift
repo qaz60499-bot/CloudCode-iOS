@@ -3,6 +3,87 @@ import UIKit
 import CryptoKit
 import CloudCodeCore
 
+// USB launch-argument entry to the existing perception probes. This is an explicit, bounded
+// device test, never a persisted startup task or an Agent/provider execution path.
+extension CloudCodeViewModel {
+    @MainActor func runExplicitPerceptionRegressionIfRequested() {
+        guard ProcessInfo.processInfo.arguments.contains("--cloudcode-perception-regression") else { return }
+        let runID = UUID().uuidString
+        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("PerceptionRegression-\(runID)", isDirectory: true)
+        do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
+        catch { return }
+        let token = UIApplication.shared.beginBackgroundTask(withName: "ExplicitPerceptionRegression")
+        Task {
+            func record(_ stage: String, _ body: [String: Any]) async {
+                var value = body
+                value["stage"] = stage
+                value["timestamp"] = ISO8601DateFormatter().string(from: Date())
+                value["hostState"] = UIApplication.shared.applicationState.rawValue
+                guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+                      data.count <= 256 * 1024 else { return }
+                let file = directory.appendingPathComponent("\(stage).json")
+                try? data.write(to: file, options: .atomic)
+                await recordPerceptionProbe(id: runID, stage: stage, json: String(data: data, encoding: .utf8) ?? "{}")
+            }
+            await record("begin", ["build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "", "pid": getpid()])
+            let assertion = await Task.detached { EmbeddedRootHelper.startBackgroundAssertion(targetPID: getpid()) }.value
+            await record("assertion", ["workerPID": assertion.workerPID ?? 0, "detail": assertion.detail])
+            let launch = await Task.detached { EmbeddedRootHelper.launch(bundleID: "com.tencent.xin") }.value
+            await record("launch", ["accepted": launch.accepted, "foregroundVerified": launch.foregroundVerified, "detail": launch.detail])
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            for iteration in 0..<30 {
+                let stage = String(format: "request-%02d", iteration)
+                switch iteration % 5 {
+                case 0:
+                    let result = await Task.detached { EmbeddedRootHelper.guiProbe() }.value
+                    await record(stage, ["command": "gui-probe", "detail": String(describing: result)])
+                case 1, 2:
+                    let shot = await Task.detached { EmbeddedRootHelper.guiScreenshot() }.value
+                    var body: [String: Any] = ["command": "screenshot-ocr", "screenshotDetail": shot.detail, "jpegBytes": shot.data?.count ?? 0]
+                    if let data = shot.data {
+                        try? data.write(to: directory.appendingPathComponent("\(stage).jpg"), options: .atomic)
+                        let observation = await LocalVisionTextObservation.observe(for: data, maximumElements: 48, requiresText: true, forcePrecise: true)
+                        body["ocr"] = observation.payload
+                    }
+                    await record(stage, body)
+                case 3:
+                    let tree = await Task.detached { EmbeddedRootHelper.guiTree() }.value
+                    await record(stage, ["command": "gui-tree", "tree": tree.tree ?? "", "detail": tree.detail])
+                default:
+                    let focus = await Task.detached { EmbeddedRootHelper.focusedTextInput() }.value
+                    await record(stage, ["command": "focused-text-input", "detail": focus.detail, "focusedTextInput": focus.payload?.focusedTextInput ?? false])
+                }
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+            if ProcessInfo.processInfo.arguments.contains("--cloudcode-ax-matrix") {
+                var index = 0
+                for root in [false, true] {
+                    for seed in ["systemWide", "application", "pid0", "springboard"] {
+                        for preparation in ["baseline", "requesting2", "associated"] {
+                            let body = await Task.detached { () -> [String: String] in
+                                var stdout: NSString?
+                                var stderr: NSString?
+                                let code = CloudCodeSpawnHelperWithSeparatedOutput(EmbeddedRootHelper.executablePath,
+                                    ["gui-ax-probe-json", "attributes", seed, "0", preparation], root, 3, &stdout, &stderr)
+                                return ["code": String(code), "stdout": stdout as String? ?? "", "stderr": stderr as String? ?? ""]
+                            }.value
+                            await record(String(format: "ax-%02d", index), ["seed": seed, "preparation": preparation, "root": root, "result": body])
+                            index += 1
+                        }
+                    }
+                }
+            }
+            if let pid = assertion.workerPID {
+                let stopped = await Task.detached { EmbeddedRootHelper.stopBackgroundAssertion(workerPID: pid) }.value
+                await record("assertion-stop", ["success": stopped.success, "detail": stopped.detail])
+            }
+            await record("completed", ["requests": 30, "status": "results_recorded_not_implicitly_passed"])
+            if token != .invalid { UIApplication.shared.endBackgroundTask(token) }
+        }
+    }
+}
+
 /// Explicit one-operation diagnostics. Uses the existing helper bridge and diagnostic log.
 /// Nothing runs on view appearance and no provider or Agent task is started.
 struct PerceptionProbeView: View {

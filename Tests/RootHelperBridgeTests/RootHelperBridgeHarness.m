@@ -1,5 +1,8 @@
 #import <Foundation/Foundation.h>
 #import "RootHelperBridge.h"
+#import <time.h>
+#import <dispatch/dispatch.h>
+#import <unistd.h>
 
 static void Require(BOOL condition, NSString *message)
 {
@@ -43,10 +46,38 @@ int main(void)
         Require(result < 0, @"helper timeout must fail closed");
         Require([standardError containsString:@"timed out"], @"helper timeout must be observable in stderr diagnostics");
 
+        // A helper may close its output before it exits (private framework teardown/hang).
+        // Polling its persistent POLLHUP previously burned a core until the deadline.
+        clock_t cpuStart = clock();
+        NSDate *wallStart = [NSDate date];
+        result = Run(@[@"-c", @"exec 1>&- 2>&-; sleep 1"], 2, &standardOutput, &standardError);
+        double cpuSeconds = (double)(clock() - cpuStart) / CLOCKS_PER_SEC;
+        Require(result == 0 && -wallStart.timeIntervalSinceNow >= 0.8, @"closed output must still wait for process exit");
+        Require(cpuSeconds < 0.25, @"closed pipes must sleep, not busy-poll POLLHUP");
+
+        for (int iteration = 0; iteration < 30; iteration++) {
+            result = Run(@[@"-c", @"printf bounded"], 2, &standardOutput, &standardError);
+            Require(result == 0 && [standardOutput isEqualToString:@"bounded"], @"reaped one-shot must release admission slot for repeated requests");
+        }
+
         NSString *testDirectory = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
         [[NSFileManager defaultManager] createDirectoryAtPath:testDirectory withIntermediateDirectories:YES attributes:nil error:nil];
         NSString *child = [testDirectory stringByAppendingPathComponent:@"CloudCodeBridgeTestChild"];
         Require([[NSFileManager defaultManager] createSymbolicLinkAtPath:child withDestinationPath:@"/bin/sh" error:nil], @"create isolated transport test child");
+        NSString *ready = [testDirectory stringByAppendingPathComponent:@"ready"];
+        dispatch_group_t group = dispatch_group_create();
+        __block NSInteger concurrentResult = -1;
+        dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            concurrentResult = CloudCodeSpawnHelperWithSeparatedOutput(child,
+                @[@"-c", @"touch \"$1\"; sleep 0.5", @"test", ready], NO, 2, NULL, NULL);
+        });
+        NSDate *readyDeadline = [NSDate dateWithTimeIntervalSinceNow:1];
+        while (![[NSFileManager defaultManager] fileExistsAtPath:ready] && readyDeadline.timeIntervalSinceNow > 0) { usleep(10000); }
+        Require([[NSFileManager defaultManager] fileExistsAtPath:ready], @"concurrent fixture must actually start before admission assertion");
+        result = CloudCodeSpawnHelperWithSeparatedOutput(child, @[@"-c", @"exit 0"], NO, 2, &standardOutput, &standardError);
+        Require(result < 0 && [standardError containsString:@"runtime_degraded"], @"same-command overlap must fail closed without spawning another helper");
+        Require(dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)) == 0 && concurrentResult == 0,
+            @"original helper must finish and release its registry slot");
         result = CloudCodeSpawnHelperWithSeparatedOutput(child, @[@"-c", @"kill -KILL $$"], NO, 2, &standardOutput, &standardError);
         Require(result == -5009, @"external/self SIGKILL must retain signal result, not parent timeout");
         NSData *recordData = [[standardError componentsSeparatedByString:@"\n"].lastObject dataUsingEncoding:NSUTF8StringEncoding];

@@ -69,7 +69,7 @@ enum LocalVisionTextObservation {
             }
             if let activeKey, let activeTask = inFlight[activeKey] {
                 _ = await activeTask.value
-                return await resolve(key: key, operation: operation)
+                return await resolve(key: key, bypassCoreVideoCircuit: bypassCoreVideoCircuit, operation: operation)
             }
             let task = Task { await operation() }
             activeKey = key
@@ -170,51 +170,37 @@ enum LocalVisionTextObservation {
         let digest = SHA256.hash(data: jpegData).map { String(format: "%02x", $0) }.joined()
         let regionKey = regionInScreenPoints.map { "\($0.minX),\($0.minY),\($0.width),\($0.height)" } ?? "full"
         let key = "\(digest)|\(regionKey)|\(boundedMaximum)|\(requiresText ? 1 : 0)|\(forcePrecise ? 1 : 0)"
-        // A live root background assertion keeps the Cloud Code host executable, but it does not
-        // make a newly spawned child Vision process a foreground application. Build 94 proved that
-        // the child helper can be killed immediately while the host is still alive. Record the host
-        // state before detaching: in-process CPU-only Vision remains allowed in background; the
-        // child helper is only a fully-active foreground fallback. During the `.inactive`
-        // transition iOS can accept spawn and then jetsam the helper before Vision returns; Build
-        // 108 diagnostics captured that as helper signal 9 / bridge code -5009.
-        let helperSpawnAllowed = await MainActor.run {
+        let hostActive = await MainActor.run {
             UIApplication.shared.applicationState == .active
         }
-        return await coordinator.resolve(key: key, bypassCoreVideoCircuit: helperSpawnAllowed) {
+        // The circuit guards failed App-process allocations; it must not suppress the independent
+        // mobile helper. Same-image requests coalesce and the bridge bounds outstanding children.
+        return await coordinator.resolve(key: key, bypassCoreVideoCircuit: true) {
             await Task.detached(priority: .utility) {
-            // Vision/Core ML is an App compute workload, not a privilege workload. Running OCR as
-            // persona-99/root caused real-device failures in CoreVideo/CoreML even though capture
-            // itself succeeded. Prefer the host App process with a CPU-only/background-friendly
-            // request, then use the embedded helper only as an isolated secondary execution context.
-            let inProcess = recognizeInProcess(
+            let started = Date()
+            let helper = recognizeWithHelper(jpegData, maximumElements: boundedMaximum,
+                                             regionInScreenPoints: regionInScreenPoints)
+            if var value = helper, Self.isUsable(value, requiresText: requiresText) {
+                value.payload["localVisionHostState"] = hostActive ? "active" : "inactive_or_background"
+                value.payload["localVisionInvoked"] = "true"
+                return value
+            }
+            var inProcess = recognizeInProcess(
                 jpegData,
                 maximumElements: boundedMaximum,
                 regionInScreenPoints: regionInScreenPoints,
                 forcePrecise: forcePrecise,
-                lowMemoryMode: !helperSpawnAllowed
+                lowMemoryMode: !hostActive
             )
-            if Self.isUsable(inProcess, requiresText: requiresText) { return inProcess }
-            guard helperSpawnAllowed else {
-                var backgroundResult = inProcess
-                backgroundResult.payload["localVisionSecondaryBackend"] = "vision_helper_public_api"
-                backgroundResult.payload["localVisionSecondaryStatus"] = "not_invoked_host_not_active"
-                backgroundResult.payload["localVisionSecondaryDiagnostic"] = "Child Vision helper intentionally skipped unless Cloud Code is fully active; in-process CPU-only Vision remains the authoritative local OCR route while inactive/backgrounded."
-                return backgroundResult
-            }
-            if let helperObservation = recognizeWithHelper(
-                jpegData,
-                maximumElements: boundedMaximum,
-                regionInScreenPoints: regionInScreenPoints
-            ) {
-                if Self.isUsable(helperObservation, requiresText: requiresText) { return helperObservation }
-                var combined = inProcess
-                combined.payload["localVisionSecondaryBackend"] = helperObservation.payload["localVisionBackend"] ?? "vision_helper_public_api"
-                combined.payload["localVisionSecondaryStatus"] = helperObservation.payload["localVisionOCR"] ?? "unavailable"
-                combined.payload["localVisionSecondaryErrorDomain"] = helperObservation.payload["localVisionErrorDomain"] ?? ""
-                combined.payload["localVisionSecondaryErrorCode"] = helperObservation.payload["localVisionErrorCode"] ?? ""
-                combined.payload["localVisionSecondaryDiagnostic"] = helperObservation.payload["localVisionHelperDiagnostic"] ?? ""
-                return combined
-            }
+            inProcess.payload["localVisionHostState"] = hostActive ? "active" : "inactive_or_background"
+            inProcess.payload["localVisionInvoked"] = "true"
+            inProcess.payload["localVisionFallbackUsed"] = "true"
+            inProcess.payload["localVisionTotalLatencyMS"] = String(Int(Date().timeIntervalSince(started) * 1_000))
+            inProcess.payload["localVisionSecondaryBackend"] = helper?.payload["localVisionBackend"] ?? "vision_helper_public_api"
+            inProcess.payload["localVisionSecondaryStatus"] = helper?.payload["localVisionOCR"] ?? "unavailable"
+            inProcess.payload["localVisionSecondaryErrorDomain"] = helper?.payload["localVisionErrorDomain"] ?? ""
+            inProcess.payload["localVisionSecondaryErrorCode"] = helper?.payload["localVisionErrorCode"] ?? ""
+            inProcess.payload["localVisionSecondaryDiagnostic"] = helper?.payload["localVisionHelperDiagnostic"] ?? ""
             return inProcess
             }.value
         }
@@ -272,6 +258,7 @@ enum LocalVisionTextObservation {
             "localVisionRecognitionLevel": response.recognitionLevel ?? "accurate",
             "localVisionFallbackUsed": response.cpuFallbackUsed == true ? "true" : "false",
             "localVisionBackend": response.backend ?? "vision_helper_public_api",
+            "localVisionHelperDiagnostic": String(helper.detail.suffix(4096)),
             "localVisionRegion": boundedRegion.map { "\($0.minX),\($0.minY),\($0.width),\($0.height)" } ?? "full_screen"
         ]
         if let errorDomain = response.errorDomain, !errorDomain.isEmpty {

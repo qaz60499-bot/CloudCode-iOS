@@ -13,6 +13,13 @@ static NSString * const CloudCodeVisionProtocolMarker = @"cloudcode-vision-helpe
 static const NSUInteger CloudCodeVisionMaxInputBytes = 8 * 1024 * 1024;
 static const NSUInteger CloudCodeVisionMaxOutputBytes = 64 * 1024;
 
+static void CloudCodeVisionStage(const char *stage, NSError *error)
+{
+    fprintf(stderr, "vision-helper: stage=%s pid=%d ppid=%d uid=%d time=%.3f errorDomain=%s errorCode=%ld\n",
+        stage, getpid(), getppid(), getuid(), CFAbsoluteTimeGetCurrent(),
+        error.domain.UTF8String ?: "none", (long)error.code);
+}
+
 static void CloudCodePrintJSON(NSDictionary *payload)
 {
     NSError *error = nil;
@@ -23,6 +30,7 @@ static void CloudCodePrintJSON(NSDictionary *payload)
     }
     fwrite(data.bytes, 1, data.length, stdout);
     fputc('\n', stdout);
+    CloudCodeVisionStage("stdout-json-completed", nil);
 }
 
 static BOOL CloudCodeIsBoundedTempJPEG(NSString *path)
@@ -88,7 +96,9 @@ static NSError *CloudCodePerformOCR(CGImageRef image, VNRecognizeTextRequest **r
     VNRecognizeTextRequest *request = CloudCodeMakeRequest(cpuOnly, levelName);
     VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image options:@{}];
     NSError *error = nil;
+    CloudCodeVisionStage("vision-request-start", nil);
     BOOL ok = [handler performRequests:@[request] error:&error];
+    CloudCodeVisionStage("vision-request-completed", error);
     if (requestOut) { *requestOut = request; }
     if (ok && !error) { return nil; }
     return error ?: [NSError errorWithDomain:@"CloudCodeVisionHelper" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Vision request failed without NSError"}];
@@ -109,7 +119,9 @@ static NSError *CloudCodePerformFastFallbackOCR(CGImageRef image, VNRecognizeTex
     if (levelName) { *levelName = @"fast"; }
     VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image options:@{}];
     NSError *error = nil;
+    CloudCodeVisionStage("vision-fast-fallback-start", nil);
     BOOL ok = [handler performRequests:@[request] error:&error];
+    CloudCodeVisionStage("vision-fast-fallback-completed", error);
     if (requestOut) { *requestOut = request; }
     if (ok && !error) { return nil; }
     return error ?: [NSError errorWithDomain:@"CloudCodeVisionHelper" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Fast fallback Vision request failed without NSError"}];
@@ -306,6 +318,8 @@ int main(int argc, char *argv[])
     (void)setvbuf(stdout, NULL, _IONBF, 0);
     (void)setvbuf(stderr, NULL, _IONBF, 0);
     (void)objc_autoreleasePoolPush();
+    CloudCodeVisionStage("startup", nil);
     int result = CloudCodeRunOneShotVisionCommand(argc, argv);
+    CloudCodeVisionStage("exit", nil);
     _exit(result);
 }
