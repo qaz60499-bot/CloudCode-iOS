@@ -458,7 +458,7 @@ jobs:
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: app launch lost bounded board-service fallback/foreground verification marker: {marker}')
           bridge = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
-          for marker in ('CLOUDCODE_HELPER_CAPTURE_LIMIT (1024 * 1024)', 'WIFSIGNALED(status)', 'WNOHANG', 'O_NONBLOCK', 'ETIMEDOUT', 'kill(pid, SIGKILL)', 'process reap deferred', 'dispatch_async', 'CloudCodeSpawnHelperInternal', 'stdoutPipe', 'stderrPipe', 'CloudCodeSpawnHelperWithSeparatedOutput', 'helper %@ capture truncated', 'EOVERFLOW', 'CloudCodeDarwinWaitPidFunction', '/usr/lib/libSystem.B.dylib', 'dlsym(handle, "waitpid")', 'dladdr(symbol, &info)', 'ios_system.framework', 'CloudCodeDarwinWaitPid(pid, &status, WNOHANG)', 'CloudCodeDarwinWaitPid(timedOutPID, &reaperStatus, 0)'):
+          for marker in ('CLOUDCODE_HELPER_CAPTURE_LIMIT (1024 * 1024)', 'WIFSIGNALED(status)', 'WNOHANG', 'O_NONBLOCK', 'ETIMEDOUT', 'kill(pid, SIGKILL)', 'process reap deferred', 'dispatch_async', 'CloudCodeSpawnHelperInternal', 'stdoutPipe', 'stderrPipe', 'CloudCodeSpawnHelperWithSeparatedOutput', 'helper %@ capture truncated', 'EOVERFLOW', 'CloudCodeDarwinWaitPidFunction', '/usr/lib/libSystem.B.dylib', 'dlsym(handle, "waitpid")', 'dladdr(symbol, &info)', 'ios_system.framework', 'CloudCodeDarwinWaitPid(pid, &status, WNOHANG)', 'CloudCodeDarwinWaitPid(timedOutPID, &reaperStatus, 0)', '--cloudcode-watchdog-ms=', 'CloudCodeRootHelper'):
               if marker not in bridge:
                   raise SystemExit(f'FAIL: root helper bridge lost timeout/isolation/system-waitpid marker: {marker}')
           if re.search(r'(?<![A-Za-z0-9_])waitpid\s*\(', bridge):
@@ -507,7 +507,7 @@ jobs:
               raise SystemExit('FAIL: modern TrollStore GUI routing must prefer the global IOHID system client before BackBoard fallback')
           if '0x8000000817319375ULL' in gui_text or 'CLOUDCODE_GUI_FALLBACK_SENDER_ID' in gui_text:
               raise SystemExit('FAIL: build53 legacy IOHID sender/profile leaked into build54 GUI helper')
-          for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'run(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'CloudCodeSpawnHelperWithSeparatedOutput', 'runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)', 'runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)', 'result.stdout', 'result.stderr', 'run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)', 'EmbeddedVisionHelper', '["ocr-file", inputURL.path, String(boundedMaximum)]', '全局截图已通过独立 tmp JPEG 通道返回', 'run(["gui-navigate-back", strategy], privilege: .root, timeout: 4)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
+          for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'runSeparated(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'CloudCodeSpawnHelperWithSeparatedOutput', 'runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)', 'runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)', 'result.stdout', 'result.stderr', 'run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)', 'EmbeddedVisionHelper', '["ocr-file", inputURL.path, String(boundedMaximum)]', '全局截图已通过独立 tmp JPEG 通道返回', 'run(["gui-navigate-back", strategy], privilege: .root, timeout: 4)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
               if marker not in adapters:
                   raise SystemExit(f'FAIL: GUI adapter lost bounded helper marker: {marker}')
           for marker in ('mayAcceptValidatedReadOnlyPayloadAfterParentTimeout', '已返回精确 helper 协议指纹', 'runSeparated(["probe-filesystem-json"], privilege: .root, timeout: 5)', '不授予共享文件或 unrestricted 写/删权限', '已返回完整可解码的只读 readiness payload', 'AXRuntime tree 已返回完整可解析 JSON', 'AX focused-text probe 已返回完整可解码 payload', '全局截图 JPEG 已完整写入并通过格式/大小校验'):
@@ -540,8 +540,8 @@ jobs:
           structured_descriptor = tool_router_text.split('ToolDescriptor(name: "gui.runStructuredPlan"', 1)[1].split('ToolDescriptor(name: "gui.screenshot"', 1)[0]
           if 'GUIAutomationFeature.tree.capabilityID' in structured_descriptor:
               raise SystemExit('FAIL: gui.runStructuredPlan regressed to an AX-tree hard capability dependency')
-          if 'let result = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)' not in adapters:
-              raise SystemExit('FAIL: structured UI-tree must use the bounded mobile AX client path instead of persona-99/root')
+          if 'let isolated = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)' not in adapters or 'let privileged = runSeparated(["gui-tree-json"], privilege: .root, timeout: 1.6)' not in adapters:
+              raise SystemExit('FAIL: structured UI-tree must preserve the bounded mobile AX path plus one passive persona-99 fallback')
           if '#define CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS 0.25f' not in gui_text:
               raise SystemExit('FAIL: AX per-request timeout budget must remain fail-fast for detached/mobile AX clients')
           for marker in ('AXUIElementCopyMultipleAttributeValues', 'AXUIElementCopyElementWithParameters', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic', 'CloudCodeAXApplicationAtScreenPointRoot', 'CloudCodeAXParameterizedElementAtPoint', 'CloudCodeAXNodeLimited', 'CloudCodeAXNodeLimited(runtime, candidate, 0, 0, &localNodeCount)', 'semanticNodeCount'):
@@ -584,7 +584,7 @@ jobs:
               if visible_overlay_marker in vision_overlay_surface:
                   raise SystemExit(f'FAIL: OCR must remain data-only/background-capable and must not render a visible scan box: {visible_overlay_marker}')
           root_main = Path('Sources/CloudCodeRootHelper/main.m').read_text(encoding='utf-8')
-          for marker in ('CloudCodeRunOneShotCommand', 'objc_autoreleasePoolPush', 'setvbuf(stdout, NULL, _IONBF, 0)', 'setvbuf(stderr, NULL, _IONBF, 0)', '_exit(result)'):
+          for marker in ('CloudCodeRunOneShotCommand', 'objc_autoreleasePoolPush', 'setvbuf(stdout, NULL, _IONBF, 0)', 'setvbuf(stderr, NULL, _IONBF, 0)', '_exit(result)', 'CloudCodeArmOneShotWatchdog', 'self-watchdog deadline reached'):
               if marker not in root_main:
                   raise SystemExit(f'FAIL: one-shot root helper can regress to post-result teardown/watchdog latency: {marker}')
           if re.search(r'fflush\s*\(', root_main + '\n' + gui_text):

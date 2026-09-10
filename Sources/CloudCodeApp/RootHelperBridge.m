@@ -145,6 +145,16 @@ static NSInteger CloudCodeSpawnHelperInternal(
 
     NSMutableArray<NSString *> *argvStrings = [NSMutableArray arrayWithObject:path];
     [argvStrings addObjectsFromArray:arguments ?: @[]];
+    // A mobile parent cannot reliably SIGKILL a persona-99/UID-0 child after the child has changed
+    // credentials. Real-device Build 113 left many timed-out CloudCodeRootHelper processes alive,
+    // which then amplified AX latency and Vision/CoreVideo allocation pressure. Arm the privileged
+    // helper with its own bounded watchdog so it can hard-exit itself shortly before the parent
+    // deadline. The long-lived background-assert worker is spawned directly by the helper and does
+    // not inherit this one-shot argument.
+    if (asRoot && [path.lastPathComponent isEqualToString:@"CloudCodeRootHelper"]) {
+        NSInteger watchdogMS = MAX(250, (NSInteger)(timeout * 1000.0) - 150);
+        [argvStrings addObject:[NSString stringWithFormat:@"--cloudcode-watchdog-ms=%ld", (long)watchdogMS]];
+    }
 
     const NSUInteger count = argvStrings.count;
     char **argv = calloc(count + 1, sizeof(char *));

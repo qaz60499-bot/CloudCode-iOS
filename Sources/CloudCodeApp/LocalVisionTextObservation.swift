@@ -34,7 +34,7 @@ enum LocalVisionTextObservation {
         private var activeKey: String?
         private var coreVideoCircuitOpenUntil: Date?
         private let retention: TimeInterval = 3
-        private let coreVideoCircuitDuration: TimeInterval = 12
+        private let coreVideoCircuitDuration: TimeInterval = 3
 
         func resolve(
             key: String,
@@ -190,7 +190,8 @@ enum LocalVisionTextObservation {
                 jpegData,
                 maximumElements: boundedMaximum,
                 regionInScreenPoints: regionInScreenPoints,
-                forcePrecise: forcePrecise
+                forcePrecise: forcePrecise,
+                lowMemoryMode: !helperSpawnAllowed
             )
             if Self.isUsable(inProcess, requiresText: requiresText) { return inProcess }
             guard helperSpawnAllowed else {
@@ -300,7 +301,7 @@ enum LocalVisionTextObservation {
         return nil
     }
 
-    private static func recognizeInProcess(_ jpegData: Data, maximumElements: Int, regionInScreenPoints: CGRect?, forcePrecise: Bool) -> Observation {
+    private static func recognizeInProcess(_ jpegData: Data, maximumElements: Int, regionInScreenPoints: CGRect?, forcePrecise: Bool, lowMemoryMode: Bool) -> Observation {
         let startedAt = Date()
         guard !jpegData.isEmpty,
               let source = CGImageSourceCreateWithData(jpegData as CFData, nil),
@@ -316,7 +317,11 @@ enum LocalVisionTextObservation {
         // Build 98 repeatedly hit kCVReturnAllocationFailed (-6662) before its fallback could help.
         // ImageIO downsamples before Vision allocates its working buffers; normalized boxes are then
         // mapped back through the original screen dimensions below, so GUI coordinates stay exact.
-        let primaryMaxDimension = forcePrecise ? 1_600 : 1_280
+        // Cross-app OCR normally runs while Cloud Code itself is backgrounded. Build 113 showed
+        // repeated kCVReturnAllocationFailed(-6662) in that state, made worse by leaked root helpers.
+        // Keep the foreground quality path unchanged, but bound the background working image much
+        // more aggressively so Vision/CoreVideo does not need a full-screen intermediate surface.
+        let primaryMaxDimension = lowMemoryMode ? (forcePrecise ? 960 : 640) : (forcePrecise ? 1_600 : 1_280)
         let primaryImage: CGImage
         let primaryDownsampled = max(pixelWidth, pixelHeight) > primaryMaxDimension
         if primaryDownsampled {
@@ -393,7 +398,7 @@ enum LocalVisionTextObservation {
                 // that with an ImageIO thumbnail so the fallback materially reduces memory rather
                 // than merely changing language settings. Bounding boxes remain normalized, so the
                 // original screen-point dimensions still produce correct GUI coordinates.
-                let maxFallbackDimension = 640
+                let maxFallbackDimension = lowMemoryMode ? 384 : 640
                 let options: [CFString: Any] = [
                     kCGImageSourceCreateThumbnailFromImageAlways: true,
                     kCGImageSourceThumbnailMaxPixelSize: maxFallbackDimension,

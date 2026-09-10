@@ -569,48 +569,70 @@ enum EmbeddedRootHelper {
     }
 
     static func guiTree() -> (tree: String?, detail: String) {
-        // AX is an accessibility-client capability, not a UID-0 capability. The real-device build
-        // repeatedly timed out when the detached helper was spawned as persona-99/root. Execute the
-        // same entitlement-bearing helper as the ordinary mobile user instead; if iOS refuses this
-        // standalone client, fail quickly and let screenshot/OCR remain the deterministic path.
-        // Full XCTest/XCAXClient behavior requires an automation session and cannot be manufactured
-        // merely by adding root privileges to a TrollStore process.
-        let result = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)
-        guard !result.stdout.isEmpty, result.stdout.utf8.count <= 256 * 1024,
-              let treeData = result.stdout.data(using: .utf8),
-              (try? JSONSerialization.jsonObject(with: treeData)) != nil else {
-            if result.stdout.utf8.count > 256 * 1024 {
-                return (nil, "GUI tree 输出超过 256 KiB 限制，已 fail closed。")
+        func validatedTree(_ result: (code: Int, stdout: String, stderr: String)) -> String? {
+            guard !result.stdout.isEmpty, result.stdout.utf8.count <= 256 * 1024,
+                  let treeData = result.stdout.data(using: .utf8),
+                  (try? JSONSerialization.jsonObject(with: treeData)) != nil else { return nil }
+            if result.code == 0 { return result.stdout }
+            if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.stderr) { return result.stdout }
+            return nil
+        }
+
+        // AX authority on TrollStore is runtime-dependent. Prefer the ordinary mobile AX client to
+        // avoid coupling semantics to UID 0, but Build 113 proved that this path can connect to the
+        // transport and still return zero semantic nodes. A single bounded persona-99 retry is safe
+        // and read-only now that the root helper carries its own self-watchdog. Neither route mutates
+        // AXManualAccessibility, so this fallback cannot reintroduce the visible green scan frame.
+        let isolated = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)
+        if let tree = validatedTree(isolated) {
+            if isolated.code == 0 {
+                let suffix = isolated.stderr.isEmpty ? "" : " helper diagnostics: \(isolated.stderr)"
+                return (tree, "AXRuntime tree 已由 mobile 身份 helper 返回。\(suffix)")
             }
-            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
-            return (nil, failureDetail(prefix: "GUI tree (mobile AX client)", code: result.code, diagnostic: diagnostic))
+            return (tree, "AXRuntime tree 已返回完整可解析 JSON；mobile helper 随后仅在退出阶段触发父进程超时，因此保留这份只读 tree。")
         }
-        if result.code == 0 {
-            let diagnosticSuffix = result.stderr.isEmpty ? "" : " helper diagnostics: \(result.stderr)"
-            return (result.stdout, "AXRuntime tree 已由 mobile 身份 helper 返回。\(diagnosticSuffix)")
+        if isolated.stdout.utf8.count > 256 * 1024 {
+            return (nil, "GUI tree 输出超过 256 KiB 限制，已 fail closed。")
         }
-        if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.stderr) {
-            return (result.stdout, "AXRuntime tree 已返回完整可解析 JSON；helper 随后仅在退出阶段触发父进程超时，因此保留这份只读 tree。")
+
+        let privileged = runSeparated(["gui-tree-json"], privilege: .root, timeout: 1.6)
+        if let tree = validatedTree(privileged) {
+            let suffix = privileged.stderr.isEmpty ? "" : " helper diagnostics: \(privileged.stderr)"
+            return (tree, "mobile AX client 未返回可用语义树；persona-99 被动 AX fallback 返回了有效 tree。\(suffix)")
         }
-        let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
-        return (nil, failureDetail(prefix: "GUI tree (mobile AX client)", code: result.code, diagnostic: diagnostic))
+
+        let isolatedDiagnostic = isolated.stderr.isEmpty ? isolated.stdout : isolated.stderr
+        let privilegedDiagnostic = privileged.stderr.isEmpty ? privileged.stdout : privileged.stderr
+        let isolatedDetail = failureDetail(prefix: "GUI tree (mobile AX client)", code: isolated.code, diagnostic: isolatedDiagnostic)
+        let privilegedDetail = failureDetail(prefix: "GUI tree (persona-99 passive fallback)", code: privileged.code, diagnostic: privilegedDiagnostic)
+        return (nil, "\(isolatedDetail)；root fallback：\(privilegedDetail)")
     }
 
     static func focusedTextInput() -> (payload: FocusedTextInputPayload?, detail: String) {
-        let result = runSeparated(["gui-focused-text-input-json"], privilege: .isolatedUser, timeout: 2.0)
-        guard let data = result.stdout.data(using: .utf8), data.count <= 4 * 1024,
-              let payload = try? JSONDecoder().decode(FocusedTextInputPayload.self, from: data) else {
-            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
-            return (nil, failureDetail(prefix: "GUI focused text input (mobile AX client)", code: result.code, diagnostic: diagnostic))
+        func decode(_ result: (code: Int, stdout: String, stderr: String)) -> FocusedTextInputPayload? {
+            guard let data = result.stdout.data(using: .utf8), data.count <= 4 * 1024,
+                  let payload = try? JSONDecoder().decode(FocusedTextInputPayload.self, from: data) else { return nil }
+            if result.code == 0 { return payload }
+            if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.stderr) { return payload }
+            return nil
         }
-        if result.code == 0 {
-            return (payload, result.stderr.isEmpty ? "AX focused-text probe completed." : "AX focused-text probe completed. helper diagnostics: \(result.stderr)")
+
+        let isolated = runSeparated(["gui-focused-text-input-json"], privilege: .isolatedUser, timeout: 2.0)
+        if let payload = decode(isolated) {
+            if isolated.code == 0 {
+                return (payload, isolated.stderr.isEmpty ? "AX focused-text probe completed via mobile client." : "AX focused-text probe completed via mobile client. helper diagnostics: \(isolated.stderr)")
+            }
+            return (payload, "AX focused-text probe 已返回完整可解码 payload；mobile helper 随后仅在退出阶段触发父进程超时，因此保留这份只读结果。")
         }
-        if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.stderr) {
-            return (payload, "AX focused-text probe 已返回完整可解码 payload；helper 随后仅在退出阶段触发父进程超时，因此保留这份只读结果。")
+
+        let privileged = runSeparated(["gui-focused-text-input-json"], privilege: .root, timeout: 1.4)
+        if let payload = decode(privileged) {
+            return (payload, privileged.stderr.isEmpty ? "AX focused-text probe completed via persona-99 passive fallback." : "AX focused-text probe completed via persona-99 passive fallback. helper diagnostics: \(privileged.stderr)")
         }
-        let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
-        return (nil, failureDetail(prefix: "GUI focused text input (mobile AX client)", code: result.code, diagnostic: diagnostic))
+
+        let isolatedDiagnostic = isolated.stderr.isEmpty ? isolated.stdout : isolated.stderr
+        let privilegedDiagnostic = privileged.stderr.isEmpty ? privileged.stdout : privileged.stderr
+        return (nil, "\(failureDetail(prefix: "GUI focused text input (mobile AX client)", code: isolated.code, diagnostic: isolatedDiagnostic))；root fallback：\(failureDetail(prefix: "GUI focused text input (persona-99 passive fallback)", code: privileged.code, diagnostic: privilegedDiagnostic))")
     }
 
     static func guiScreenshot() -> (data: Data?, detail: String) {
@@ -693,20 +715,27 @@ enum EmbeddedRootHelper {
 
     static func startBackgroundAssertion(targetPID: Int32) -> (workerPID: Int32?, detail: String) {
         guard targetPID > 1 else { return (nil, "后台 assertion 目标 PID 无效。") }
-        let result = run(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)
+        // `background-assert-start` writes its authoritative workerPID handshake to stderr before
+        // hard-exiting. The generic run() intentionally discards stderr on code 0, which made Build
+        // 113 create a real detached worker but then report "no worker PID" to the App. Every later
+        // background transition therefore spawned another orphan worker. Preserve both streams for
+        // this command and parse the success handshake from stderr (stdout remains accepted for old
+        // helper compatibility).
+        let result = runSeparated(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)
+        let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
         guard result.code == 0 else {
-            return (nil, failureDetail(prefix: "后台 assertion worker", code: result.code, diagnostic: result.diagnostic))
+            return (nil, failureDetail(prefix: "后台 assertion worker", code: result.code, diagnostic: diagnostic))
         }
         let marker = "workerPID="
-        guard let range = result.diagnostic.range(of: marker) else {
+        guard let range = diagnostic.range(of: marker) else {
             return (nil, "后台 assertion worker 已返回成功，但没有提供 worker PID；按 fail-closed 处理。")
         }
-        let suffix = result.diagnostic[range.upperBound...]
+        let suffix = diagnostic[range.upperBound...]
         let digits = suffix.prefix { $0.isNumber }
         guard let workerPID = Int32(digits), workerPID > 1 else {
             return (nil, "后台 assertion worker PID 无法解析；按 fail-closed 处理。")
         }
-        return (workerPID, result.diagnostic)
+        return (workerPID, diagnostic)
     }
 
     static func backgroundAssertionIsAlive(workerPID: Int32) -> Bool {

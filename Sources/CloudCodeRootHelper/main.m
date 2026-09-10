@@ -3,6 +3,7 @@
 #import <errno.h>
 #import <fcntl.h>
 #import <poll.h>
+#import <pthread.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <stdio.h>
@@ -10,6 +11,7 @@
 #import <signal.h>
 #import <spawn.h>
 #import <sys/wait.h>
+#import <time.h>
 #import <stdlib.h>
 #import <string.h>
 #import "GUIAutomation.h"
@@ -20,6 +22,49 @@ typedef int (*CloudCodeProcListAllPidsFn)(void *, int);
 typedef int (*CloudCodeProcPidPathFn)(int, void *, uint32_t);
 extern char **environ;
 extern void *objc_autoreleasePoolPush(void);
+
+typedef struct {
+    uint64_t milliseconds;
+} CloudCodeOneShotWatchdogContext;
+
+static void *CloudCodeOneShotWatchdogMain(void *rawContext)
+{
+    CloudCodeOneShotWatchdogContext *context = (CloudCodeOneShotWatchdogContext *)rawContext;
+    uint64_t milliseconds = context ? context->milliseconds : 0;
+    if (context) { free(context); }
+    if (milliseconds == 0) { return NULL; }
+    struct timespec delay = {
+        .tv_sec = (time_t)(milliseconds / 1000),
+        .tv_nsec = (long)((milliseconds % 1000) * 1000000ULL)
+    };
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+    static const char marker[] = "cloudcode-root-helper: self-watchdog deadline reached; hard-exiting one-shot helper\n";
+    (void)write(STDERR_FILENO, marker, sizeof(marker) - 1);
+    _exit(124);
+}
+
+static void CloudCodeArmOneShotWatchdog(int argc, const char *argv[])
+{
+    static const char prefix[] = "--cloudcode-watchdog-ms=";
+    uint64_t milliseconds = 0;
+    for (int index = 2; index < argc; index++) {
+        const char *argument = argv[index];
+        if (!argument || strncmp(argument, prefix, sizeof(prefix) - 1) != 0) { continue; }
+        unsigned long long parsed = strtoull(argument + sizeof(prefix) - 1, NULL, 10);
+        if (parsed >= 100 && parsed <= 120000) { milliseconds = (uint64_t)parsed; }
+        break;
+    }
+    if (milliseconds == 0) { return; }
+    CloudCodeOneShotWatchdogContext *context = calloc(1, sizeof(*context));
+    if (!context) { return; }
+    context->milliseconds = milliseconds;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, CloudCodeOneShotWatchdogMain, context) == 0) {
+        (void)pthread_detach(thread);
+    } else {
+        free(context);
+    }
+}
 
 static __attribute__((noreturn)) void CloudCodeExitOneShot(int code)
 {
@@ -1398,7 +1443,13 @@ int main(int argc, const char *argv[])
         }
     }
 
-    // Every other command is a one-shot helper. Some private iOS frameworks retain process-global
+    // Every other command is a one-shot helper. Persona-99 children may no longer be signalable by
+    // the mobile parent after credential override, so arm an in-process watchdog before entering any
+    // private framework call. This prevents a wedged AX/LaunchServices helper from surviving the
+    // parent deadline and accumulating across requests.
+    CloudCodeArmOneShotWatchdog(argc, argv);
+
+    // Some private iOS frameworks retain process-global
     // objects whose autorelease teardown can block after the command has already emitted its final
     // result. Build 98 therefore paid the full parent watchdog (5–6s) for successful work. Keep one
     // process-lifetime pool, flush observable output, and terminate without teardown after dispatch.
