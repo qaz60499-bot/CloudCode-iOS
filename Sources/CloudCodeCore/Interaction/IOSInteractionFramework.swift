@@ -17,6 +17,7 @@ public enum IOSInteractionSurface: String, Codable, CaseIterable, Sendable {
 public enum IOSInteractionObservationBackend: String, Codable, CaseIterable, Sendable {
     case screenshot
     case accessibilityTree
+    case localOCR
 }
 
 public enum IOSInteractionNavigationStrategy: String, Codable, CaseIterable, Sendable {
@@ -286,14 +287,15 @@ public actor IOSInteractionExperienceStore {
         let extremeSingleFailure = record.attempts >= 1 && record.failures == record.attempts && averageLatencyMS >= 3_000
         guard repeatedSlowFailure || extremeSingleFailure else { return false }
 
-        let alternate: IOSInteractionObservationBackend = backend == .accessibilityTree ? .screenshot : .accessibilityTree
-        guard let alternateRecord = observations[Self.observationKey(environment: environment, backend: alternate)],
-              alternateRecord.successes >= 1,
-              alternateRecord.reliability >= 0.50,
-              now.timeIntervalSince(alternateRecord.lastValidatedAt) <= 6 * 60 * 60 else {
-            return false
-        }
-        return true
+        let hasWorkingAlternate = IOSInteractionObservationBackend.allCases
+            .filter { $0 != backend }
+            .compactMap { observations[Self.observationKey(environment: environment, backend: $0)] }
+            .contains { alternateRecord in
+                alternateRecord.successes >= 1
+                    && alternateRecord.reliability >= 0.50
+                    && now.timeIntervalSince(alternateRecord.lastValidatedAt) <= 6 * 60 * 60
+            }
+        return hasWorkingAlternate
     }
 
     public func observationSnapshot(now: Date = Date()) -> [IOSInteractionObservationExperience] {
@@ -505,7 +507,7 @@ public enum IOSInteractionFramework {
     public static let coreInstruction = """
     iOS Interaction Framework is the interaction domain of Cloud Code's existing HomeOS/Core/Harness runtime, not a separate authority. HomeOS capability evidence determines which primitives actually exist; Harness compiles task shape; ToolRouter/PolicyEngine/root helper execute bounded actions; the Interaction Framework models iOS surfaces, transitions, input state, return obligations, and verified experience.
 
-    Use the cheapest deterministic execution layer that can prove the requested transition: (1) native/system lifecycle or typed app tools, (2) an already-fresh local observation that makes the next action unambiguous, whether screenshot or accessibility, (3) validated App/version/iOS/device interaction experience and current-tree cache hints, and only then additional observation or remote Vision reasoning. Vision is a fallback, never an authority grant. Do not issue a fresh AX lookup merely because AX is normally more structured when gui.openAppObserve already returned a screenshot that visibly resolves the next bounded action; use tapObserve/typeObserve/scrollObserve/feedSample directly and inspect their returned observation. When AX is unavailable and the target is visible text, gui.tapTextObserve may resolve and tap one unique OCR label entirely on-device. A text-only provider must never infer an icon coordinate from an omitted screenshot. A UI tree failure must fail quickly and may fall back to screenshot, but a screenshot hash/pixel change is never semantic proof.
+    Use the cheapest deterministic execution layer that can prove the requested transition: (1) native/system lifecycle or typed app tools, (2) an already-fresh local observation that makes the next action unambiguous, whether screenshot, accessibility, or local OCR, (3) validated App/version/iOS/device interaction experience and current-tree cache hints, and only then additional observation or remote Vision reasoning. Local OCR is a first-class observation backend whose reliability/latency is learned separately from AX and screenshot; Vision is a fallback, never an authority grant. Do not issue a fresh AX lookup merely because AX is normally more structured when gui.openAppObserve already returned a screenshot that visibly resolves the next bounded action; use tapObserve/typeObserve/scrollObserve/feedSample directly and inspect their returned observation. When AX is unavailable and the target is visible text, gui.tapTextObserve may resolve and tap one unique OCR label entirely on-device. A text-only provider must never infer an icon coordinate from an omitted screenshot. A UI tree failure must fail quickly and may fall back to screenshot, but a screenshot hash/pixel change is never semantic proof.
 
     For a named target App, prefer the typed native lifecycle tool apps.launch whenever it is routable, then obtain a fresh gui.screenshot/structured observation. This keeps lifecycle work on the native/private route instead of paying the GUI helper just to launch. If launch is accepted but detached-helper foreground identity cannot be proven, do not keep relaunching the same App; transition to a fresh screenshot/observation and resolve foreground semantics from current evidence. gui.openAppObserve/gui.openApp are fallbacks when the typed lifecycle launch is unavailable or exact-operation validation fails. When the current screenshot is ambiguous and accessibility can add certainty, prefer gui.findElement/gui.waitForElement and gui.tapElementObserve/gui.typeElementObserve instead of guessing coordinates. Element ambiguity, missing frames, stale/current-tree mismatch, or protected confirmation surfaces must fail closed.
 

@@ -38,8 +38,9 @@ static void *CloudCodeOneShotWatchdogMain(void *rawContext)
         .tv_nsec = (long)((milliseconds % 1000) * 1000000ULL)
     };
     while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
-    static const char marker[] = "cloudcode-root-helper: self-watchdog deadline reached; hard-exiting one-shot helper\n";
+    static const char marker[] = "cloudcode-root-helper: self-watchdog deadline reached; restoring AX automation lease and hard-exiting one-shot helper\n";
     (void)write(STDERR_FILENO, marker, sizeof(marker) - 1);
+    CloudCodeGUIRestoreAXAutomationForProcessExit();
     _exit(124);
 }
 
@@ -68,6 +69,7 @@ static void CloudCodeArmOneShotWatchdog(int argc, const char *argv[])
 
 static __attribute__((noreturn)) void CloudCodeExitOneShot(int code)
 {
+    CloudCodeGUIRestoreAXAutomationForProcessExit();
     // stdout/stderr are switched to unbuffered mode at process entry before any helper I/O occurs.
     // Build 108 real-device evidence showed that even an explicit stdout/stderr flush could wedge after a
     // private framework had already produced the final observable result, turning successful app
@@ -1458,5 +1460,6 @@ int main(int argc, const char *argv[])
     int result = CloudCodeRunOneShotCommand(argc, argv);
     // Streams are unbuffered from process entry, so returning commands can hard-exit without any
     // stdio flush/teardown. This is the same post-result boundary used by CloudCodeExitOneShot.
+    CloudCodeGUIRestoreAXAutomationForProcessExit();
     _exit(result);
 }

@@ -38,12 +38,16 @@
 #define CLOUDCODE_HID_FIELD_DIGITIZER_DISPLAY_INTEGRATED 0xB0019u
 #define CLOUDCODE_IOSURFACE_LOCK_READ_ONLY 0x1u
 
+void CloudCodeGUIRestoreAXAutomationForProcessExit(void);
+
 static __attribute__((noreturn)) void CloudCodeGUIExitOneShot(int code)
 {
     // Root-helper process entry switches stdout/stderr to unbuffered mode before GUI work starts.
     // Build 108 still showed post-result screenshot timeouts while flushing these streams after
     // private framework use, so never enter stdio flush/teardown here. Observable writes have
-    // already reached the bridge synchronously.
+    // already reached the bridge synchronously. Restore only the system Automation bit this helper
+    // changed; target-app AXManualAccessibility is never mutated.
+    CloudCodeGUIRestoreAXAutomationForProcessExit();
     _exit(code);
 }
 
@@ -79,6 +83,8 @@ typedef CloudCodeAXError (*CloudCodeAXCopyElementWithParametersFn)(CloudCodeAXUI
 typedef CloudCodeAXError (*CloudCodeAXSetTimeoutFn)(CloudCodeAXUIElementRef, float);
 typedef void (*CloudCodeAXAddAssociatedPidFn)(pid_t, pid_t, int);
 typedef void (*CloudCodeAXSetRequestingClientFn)(uint32_t);
+typedef int (*CloudCodeAXAutomationEnabledFn)(void);
+typedef void (*CloudCodeAXSetAutomationEnabledFn)(int);
 typedef int (*CloudCodeProcListAllPidsFn)(void *, int);
 typedef int (*CloudCodeProcPidPathFn)(int, void *, uint32_t);
 
@@ -145,6 +151,9 @@ typedef struct {
     CloudCodeAXSetTimeoutFn setTimeout;
     CloudCodeAXAddAssociatedPidFn addAssociatedPid;
     CloudCodeAXSetRequestingClientFn setRequestingClient;
+    CloudCodeAXAutomationEnabledFn automationEnabled;
+    CloudCodeAXSetAutomationEnabledFn setAutomationEnabled;
+    BOOL automationLeaseActive;
     CloudCodeAXValueGetTypeIDFn valueGetTypeID;
     CloudCodeAXValueGetTypeFn valueGetType;
     CloudCodeAXValueGetValueFn valueGetValue;
@@ -156,6 +165,19 @@ typedef struct {
     CFStringRef attributePlaceholder;
     CFStringRef attributeElementType;
 } CloudCodeAXRuntime;
+
+static CloudCodeAXSetAutomationEnabledFn CloudCodeAXAutomationRestoreSetter = NULL;
+static int CloudCodeAXAutomationOriginalState = -1;
+static BOOL CloudCodeAXAutomationStateChanged = NO;
+
+void CloudCodeGUIRestoreAXAutomationForProcessExit(void)
+{
+    if (!CloudCodeAXAutomationStateChanged || !CloudCodeAXAutomationRestoreSetter || CloudCodeAXAutomationOriginalState < 0) { return; }
+    @try {
+        CloudCodeAXAutomationRestoreSetter(CloudCodeAXAutomationOriginalState);
+    } @catch (__unused NSException *exception) {}
+    CloudCodeAXAutomationStateChanged = NO;
+}
 
 static void *CloudCodeOpenFramework(NSArray<NSString *> *paths)
 {
@@ -1121,6 +1143,26 @@ static CloudCodeAXRuntime CloudCodeResolveAX(void)
         runtime.addAssociatedPid = (CloudCodeAXAddAssociatedPidFn)CloudCodeResolveAcrossFrameworks(paths, "AXAddAssociatedPid");
     }
     runtime.setRequestingClient = (CloudCodeAXSetRequestingClientFn)CloudCodeResolveAcrossFrameworks(paths, "__AXSetRequestingClient");
+    runtime.automationEnabled = (CloudCodeAXAutomationEnabledFn)CloudCodeResolveAcrossFrameworks(paths, "_AXSAutomationEnabled");
+    runtime.setAutomationEnabled = (CloudCodeAXSetAutomationEnabledFn)CloudCodeResolveAcrossFrameworks(paths, "_AXSSetAutomationEnabled");
+    if (runtime.automationEnabled && runtime.setAutomationEnabled) {
+        int before = -1;
+        @try { before = runtime.automationEnabled(); } @catch (__unused NSException *exception) { before = -1; }
+        if (CloudCodeAXAutomationOriginalState < 0 && before >= 0) {
+            CloudCodeAXAutomationOriginalState = before ? 1 : 0;
+            CloudCodeAXAutomationRestoreSetter = runtime.setAutomationEnabled;
+        }
+        if (before == 0) {
+            @try { runtime.setAutomationEnabled(1); } @catch (__unused NSException *exception) {}
+            usleep(20000);
+            int after = 0;
+            @try { after = runtime.automationEnabled(); } @catch (__unused NSException *exception) { after = 0; }
+            runtime.automationLeaseActive = after != 0;
+            CloudCodeAXAutomationStateChanged = runtime.automationLeaseActive;
+        } else {
+            runtime.automationLeaseActive = before > 0;
+        }
+    }
     runtime.valueGetTypeID = (CloudCodeAXValueGetTypeIDFn)CloudCodeResolveAcrossFrameworks(paths, "AXValueGetTypeID");
     runtime.valueGetType = (CloudCodeAXValueGetTypeFn)CloudCodeResolveAcrossFrameworks(paths, "AXValueGetType");
     runtime.valueGetValue = (CloudCodeAXValueGetValueFn)CloudCodeResolveAcrossFrameworks(paths, "AXValueGetValue");
@@ -1137,8 +1179,11 @@ static CloudCodeAXRuntime CloudCodeResolveAX(void)
 static void CloudCodePrintAXRuntimeDiagnostic(CloudCodeAXRuntime runtime, const char *stage)
 {
     fprintf(stderr,
-        "gui-tree-ax-runtime: stage=%s authority=standalone-trollstore-best-effort requesting_client=%d create_app=%d create_systemwide=%d copy_attribute=%d copy_multiple=%d element_at_position=%d app_at_position=%d app_context_at_position=%d element_with_parameters=%d\n",
+        "gui-tree-ax-runtime: stage=%s authority=standalone-trollstore-best-effort automation_getter=%d automation_setter=%d automation_lease=%d requesting_client=%d create_app=%d create_systemwide=%d copy_attribute=%d copy_multiple=%d element_at_position=%d app_at_position=%d app_context_at_position=%d element_with_parameters=%d\n",
         stage ?: "unknown",
+        runtime.automationEnabled ? 1 : 0,
+        runtime.setAutomationEnabled ? 1 : 0,
+        runtime.automationLeaseActive ? 1 : 0,
         runtime.setRequestingClient ? 1 : 0,
         (runtime.createApplication || runtime.createAppElementWithPid) ? 1 : 0,
         runtime.createSystemWide ? 1 : 0,
@@ -1582,14 +1627,15 @@ static NSDictionary *CloudCodeAXHitTestTree(CloudCodeAXRuntime runtime, NSUInteg
     // system-wide AX hit-test respects z-order, so these points can still recover useful foreground
     // elements when detached helpers cannot obtain a full application root.
     const CGPoint points[] = {
-        // Keep the degraded probe inside the helper watchdog budget. The right rail receives
-        // multiple samples because social/video apps commonly expose like/comment/share controls
-        // there; the center sample preserves a generic fallback without recursively walking DOMs.
+        // Keep the degraded probe inside the helper watchdog budget. One top-center sample is
+        // reserved for navigation/search bars; Build 115's center/right-only grid could never
+        // discover a top SearchField after full-tree acquisition failed. Three right-rail samples
+        // still cover common like/comment/share controls and the center preserves a generic route.
+        {size.width * 0.50, size.height * 0.12},
         {size.width * 0.50, size.height * 0.50},
-        {size.width * 0.88, size.height * 0.32},
-        {size.width * 0.88, size.height * 0.48},
-        {size.width * 0.88, size.height * 0.64},
-        {size.width * 0.88, size.height * 0.80}
+        {size.width * 0.88, size.height * 0.38},
+        {size.width * 0.88, size.height * 0.58},
+        {size.width * 0.88, size.height * 0.78}
     };
     NSMutableArray *hits = [NSMutableArray array];
     pid_t foregroundPID = 0;
@@ -1925,6 +1971,7 @@ static __attribute__((noreturn)) void CloudCodeFrontmostTreeData(void)
         @"scope": scope,
         @"bundleId": bundleID ?: @"",
         @"pid": @(pid),
+        @"automationLeaseActive": @(runtime.automationLeaseActive),
         @"nodeCount": @(nodeCount),
         @"semanticNodeCount": @(semanticNodeCount),
         @"tree": rootNode
@@ -1981,9 +2028,10 @@ int CloudCodeGUIProbeJSON(void)
 
 int CloudCodeGUITreeJSON(void)
 {
-        // A detached TrollStore helper is not an XCTest/testmanagerd automation client. Do not
-        // mutate the process-global AX automation switch here: timeout recovery uses SIGKILL, which
-        // cannot run atexit cleanup and could otherwise leave that global state changed.
+        // ResolveAX acquires one process-scoped system Automation lease before reading the tree and
+        // CloudCodeGUIExitOneShot restores the prior bit before hard exit. Target-app
+        // AXManualAccessibility remains untouched, so this does not reintroduce the old green scan
+        // overlay path.
         CloudCodeFrontmostTreeData();
 }
 
@@ -2068,6 +2116,57 @@ int CloudCodeGUINavigateBack(NSString *strategy)
         return 0;
 }
 
+static CloudCodeAXUIElementRef CloudCodeAXCopyFocusedElement(CloudCodeAXRuntime runtime, pid_t *pidOut, NSString **backend)
+{
+        if (!runtime.copyAttribute) { return NULL; }
+
+        // Detached mobile helpers can expose AXFocusedUIElement directly on the system-wide root
+        // even when resolving a separate focused-application root fails or times out. Try that
+        // shortest route first; it is read-only and returns only the focused element reference.
+        if (runtime.createSystemWide) {
+            CloudCodeAXUIElementRef systemWide = NULL;
+            @try { systemWide = runtime.createSystemWide(); } @catch (__unused NSException *exception) { systemWide = NULL; }
+            if (systemWide) {
+                if (runtime.setTimeout) {
+                    @try { runtime.setTimeout(systemWide, CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS); }
+                    @catch (__unused NSException *exception) {}
+                }
+                for (NSString *attribute in @[@"AXFocusedUIElement", @"AXFocusedElement"]) {
+                    id candidate = CloudCodeAXCopy(runtime, systemWide, (__bridge CFStringRef)attribute);
+                    if (!candidate) { continue; }
+                    CloudCodeAXUIElementRef element = (CloudCodeAXUIElementRef)(__bridge CFTypeRef)candidate;
+                    CFRetain(element);
+                    if (runtime.getPid && pidOut) {
+                        pid_t pid = 0;
+                        @try { if (runtime.getPid(element, &pid) == 0) { *pidOut = pid; } }
+                        @catch (__unused NSException *exception) {}
+                    }
+                    if (backend) { *backend = [@"AXRuntime.systemWide." stringByAppendingString:attribute]; }
+                    CFRelease(systemWide);
+                    return element;
+                }
+                CFRelease(systemWide);
+            }
+        }
+
+        pid_t focusedPID = 0;
+        NSString *focusedBackend = nil;
+        CloudCodeAXUIElementRef focusedRoot = CloudCodeAXFocusedApplicationRoot(runtime, &focusedPID, &focusedBackend);
+        if (!focusedRoot) { return NULL; }
+        CloudCodeAXUIElementRef focusedElement = NULL;
+        for (NSString *attribute in @[@"AXFocusedUIElement", @"AXFocusedElement"]) {
+            id candidate = CloudCodeAXCopy(runtime, focusedRoot, (__bridge CFStringRef)attribute);
+            if (!candidate) { continue; }
+            focusedElement = (CloudCodeAXUIElementRef)(__bridge CFTypeRef)candidate;
+            CFRetain(focusedElement);
+            if (backend) { *backend = [focusedBackend stringByAppendingFormat:@".%@", attribute]; }
+            break;
+        }
+        CFRelease(focusedRoot);
+        if (focusedElement && pidOut) { *pidOut = focusedPID; }
+        return focusedElement;
+}
+
 int CloudCodeGUIFocusedTextInputJSON(void)
 {
         CloudCodeAXRuntime ax = CloudCodeResolveAX();
@@ -2079,30 +2178,17 @@ int CloudCodeGUIFocusedTextInputJSON(void)
         NSString *focusedRole = @"";
 
         if (runtimeAvailable) {
-            CloudCodeAXUIElementRef focusedRoot = CloudCodeAXFocusedApplicationRoot(ax, &focusedPID, &focusedBackend);
-            if (focusedRoot) {
-                id focusedHolder = nil;
-                CloudCodeAXUIElementRef focusedElement = NULL;
-                for (NSString *attribute in @[@"AXFocusedUIElement", @"AXFocusedElement"]) {
-                    id candidate = CloudCodeAXCopy(ax, focusedRoot, (__bridge CFStringRef)attribute);
-                    if (candidate) {
-                        focusedHolder = candidate;
-                        focusedElement = (CloudCodeAXUIElementRef)(__bridge CFTypeRef)focusedHolder;
-                        break;
-                    }
-                }
-                CFRelease(focusedRoot);
-                if (focusedElement) {
-                    focusedElementAvailable = YES;
-                    id rawRole = CloudCodeAXCopy(ax, focusedElement, ax.attributeElementType ?: CFSTR("AXRole"));
-                    focusedRole = CloudCodeBoundedString(rawRole) ?: @"";
-                    focusedTextInput =
-                        [focusedRole rangeOfString:@"TextField" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                        [focusedRole rangeOfString:@"TextArea" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                        [focusedRole rangeOfString:@"TextView" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                        [focusedRole rangeOfString:@"SearchField" options:NSCaseInsensitiveSearch].location != NSNotFound;
-                    (void)focusedHolder;
-                }
+            CloudCodeAXUIElementRef focusedElement = CloudCodeAXCopyFocusedElement(ax, &focusedPID, &focusedBackend);
+            if (focusedElement) {
+                focusedElementAvailable = YES;
+                id rawRole = CloudCodeAXCopy(ax, focusedElement, ax.attributeElementType ?: CFSTR("AXRole"));
+                focusedRole = CloudCodeBoundedString(rawRole) ?: @"";
+                focusedTextInput =
+                    [focusedRole rangeOfString:@"TextField" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [focusedRole rangeOfString:@"TextArea" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [focusedRole rangeOfString:@"TextView" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [focusedRole rangeOfString:@"SearchField" options:NSCaseInsensitiveSearch].location != NSNotFound;
+                CFRelease(focusedElement);
             }
         }
 
@@ -2110,6 +2196,7 @@ int CloudCodeGUIFocusedTextInputJSON(void)
             @"runtimeAvailable": @(runtimeAvailable),
             @"focusedElementAvailable": @(focusedElementAvailable),
             @"focusedTextInput": @(focusedTextInput),
+            @"automationLeaseActive": @(ax.automationLeaseActive),
             @"role": focusedRole ?: @"",
             @"backend": focusedBackend ?: @"",
             @"pid": @(focusedPID)
@@ -2135,25 +2222,13 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
         // responder. Never overwrite a non-empty field through AX: in that case preserve normal
         // caret/append semantics and fall back to HID below.
         CloudCodeAXRuntime ax = CloudCodeResolveAX();
-        id focusedHolder = nil;
         CloudCodeAXUIElementRef focusedElement = NULL;
         NSString *focusedBackend = nil;
         NSString *focusedRole = nil;
         NSString *beforeText = nil;
         if (ax.copyAttribute && ax.setAttribute) {
             pid_t focusedPID = 0;
-            CloudCodeAXUIElementRef focusedRoot = CloudCodeAXFocusedApplicationRoot(ax, &focusedPID, &focusedBackend);
-            if (focusedRoot) {
-                for (NSString *attribute in @[@"AXFocusedUIElement", @"AXFocusedElement"]) {
-                    id candidate = CloudCodeAXCopy(ax, focusedRoot, (__bridge CFStringRef)attribute);
-                    if (candidate) {
-                        focusedHolder = candidate;
-                        focusedElement = (CloudCodeAXUIElementRef)(__bridge CFTypeRef)focusedHolder;
-                        break;
-                    }
-                }
-                CFRelease(focusedRoot);
-            }
+            focusedElement = CloudCodeAXCopyFocusedElement(ax, &focusedPID, &focusedBackend);
             if (focusedElement) {
                 id rawRole = CloudCodeAXCopy(ax, focusedElement, ax.attributeElementType ?: CFSTR("AXRole"));
                 focusedRole = CloudCodeBoundedString(rawRole);

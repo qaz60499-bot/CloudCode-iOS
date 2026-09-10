@@ -272,6 +272,13 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements)
 
 static int CloudCodeRunOneShotVisionCommand(int argc, char *argv[])
 {
+    // TrollStore keeps this binary in TSRootBinaries only so it remains executable after import.
+    // OCR must still run as the ordinary mobile user; root/persona-99 Vision was proven unstable on
+    // iOS 16.6. Fail closed if any caller ever attempts to elevate this helper.
+    if (getuid() == 0 || geteuid() == 0) {
+        fprintf(stderr, "vision-helper: root execution is forbidden\n");
+        return 77;
+    }
     if (argc < 2) {
         fprintf(stderr, "vision-helper: missing command\n");
         return 64;

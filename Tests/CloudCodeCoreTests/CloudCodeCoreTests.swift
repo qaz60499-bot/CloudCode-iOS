@@ -6013,8 +6013,36 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(sendCorrection.contains("sqlite.query"))
         XCTAssertFalse(sendCorrection.contains("advanced.shell"))
 
+        let native = HarnessContextManager.scopedProviderToolNames(for: "修改这个 App 容器里的 plist 配置文件", availableNames: available)
+        XCTAssertTrue(native.contains("apps.launch"))
+        XCTAssertTrue(native.contains("files.read"))
+        XCTAssertTrue(native.contains("sqlite.query"))
+        XCTAssertFalse(native.contains("gui.feedSample"))
+        XCTAssertFalse(native.contains("advanced.shell"))
+
+        let ipa = HarnessContextManager.scopedProviderToolNames(for: "检查并修改这个 IPA 然后重新安装", availableNames: available)
+        XCTAssertTrue(ipa.contains("ipa.inspect"))
+        XCTAssertTrue(ipa.contains("files.read"))
+        XCTAssertTrue(ipa.contains("apps.launch"))
+        XCTAssertFalse(ipa.contains("gui.feedSample"))
+
         let unknown = HarnessContextManager.scopedProviderToolNames(for: "帮我处理一下", availableNames: available)
         XCTAssertEqual(unknown, available)
+    }
+
+    func testHarnessProvidesNativeDeviceAndIPAPipelineHints() {
+        let native = HarnessContextManager.executionHint(from: [
+            ChatMessage(role: .user, content: "修改这个应用容器里的配置文件")
+        ])
+        XCTAssertEqual(native?.providerMetadata["execution_mode"], "device_native_first")
+        XCTAssertTrue(native?.content.contains("apps/container/files/data/plist/json/sqlite") == true)
+
+        let ipa = HarnessContextManager.executionHint(from: [
+            ChatMessage(role: .user, content: "把这个 IPA 解包修改后重新打包安装")
+        ])
+        XCTAssertEqual(ipa?.providerMetadata["execution_mode"], "ipa_native_pipeline")
+        XCTAssertTrue(ipa?.content.contains("ipa.inspect") == true)
+        XCTAssertTrue(ipa?.content.contains("ipa.install") == true)
     }
 
     func testHarnessPrunesOlderObservationImagesButKeepsNewestMultiImageObservation() {
@@ -6043,6 +6071,23 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(hint?.providerMetadata["repeat_count"], "5")
     }
 
+    func testHarnessFiniteRepeatHintUsesRemainingProgressInsteadOfRestartingFullBatch() {
+        let messages = [ChatMessage(role: .user, content: "打开抖音刷 5 条然后点赞")]
+        let partial = HarnessContextManager.executionHint(from: messages, finiteRepeatCompletedCount: 3)
+        XCTAssertEqual(partial?.providerMetadata["execution_mode"], "bounded_feed_sample")
+        XCTAssertEqual(partial?.providerMetadata["repeat_required"], "5")
+        XCTAssertEqual(partial?.providerMetadata["repeat_completed"], "3")
+        XCTAssertEqual(partial?.providerMetadata["repeat_remaining"], "2")
+        XCTAssertEqual(partial?.providerMetadata["repeat_count"], "2")
+        XCTAssertTrue(partial?.content.contains("count=2") == true)
+        XCTAssertFalse(partial?.content.contains("count=5") == true)
+
+        let complete = HarnessContextManager.executionHint(from: messages, finiteRepeatCompletedCount: 5)
+        XCTAssertEqual(complete?.providerMetadata["execution_mode"], "finite_repeat_complete")
+        XCTAssertEqual(complete?.providerMetadata["repeat_remaining"], "0")
+        XCTAssertTrue(complete?.content.contains("Do not request gui.feedSample") == true)
+    }
+
     func testHarnessExecutionHintDoesNotInventUnboundedSwipeCount() {
         XCTAssertNil(HarnessContextManager.boundedRepeatedSwipeCount(in: "打开抖音一直刷视频，直到我叫停"))
         XCTAssertNil(HarnessContextManager.boundedRepeatedSwipeCount(in: "打开热门页面看看"))
@@ -6057,6 +6102,9 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(HarnessContextManager.requiresMessageSend(in: "发微信告诉他我到了"))
         XCTAssertTrue(HarnessContextManager.requiresMessageSend(in: "打开微信给文件传输助手发一个一"))
         XCTAssertTrue(HarnessContextManager.requiresExplicitTapAction(in: "刷三条抖音然后点赞"))
+        XCTAssertTrue(HarnessContextManager.requiresLikeAction(in: "刷三条抖音然后点赞"))
+        XCTAssertTrue(HarnessContextManager.requiresLikeAction(in: "like this video"))
+        XCTAssertFalse(HarnessContextManager.requiresLikeAction(in: "比较五条视频的点赞量"))
         XCTAssertFalse(HarnessContextManager.requiresExplicitTapAction(in: "打开微信看看"))
         XCTAssertFalse(HarnessContextManager.requiresMessageSend(in: "打开微信看看"))
     }
@@ -6079,6 +6127,57 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(hint?.content.contains("coordinate-free") == true)
         XCTAssertEqual(hint?.providerMetadata["execution_mode"], "bounded_feed_sample")
         XCTAssertEqual(hint?.providerMetadata["repeat_count"], "5")
+    }
+
+    func testAgentFiniteRepeatGuardBlocksAnotherFullFeedBatchAfterFiveAreComplete() {
+        XCTAssertTrue(AgentCore.shouldBlockFiniteRepeatedGUIAction(
+            requiredCount: 5,
+            completedCount: 5,
+            toolName: "gui.feedSample",
+            arguments: ["count": "5", "direction": "forward"]
+        ))
+        XCTAssertTrue(AgentCore.shouldBlockFiniteRepeatedGUIAction(
+            requiredCount: 5,
+            completedCount: 5,
+            toolName: "gui.swipeObserve",
+            arguments: [:]
+        ))
+    }
+
+    func testAgentFiniteRepeatGuardRejectsOverBudgetBatchButAllowsExactRemainingUnits() {
+        XCTAssertTrue(AgentCore.shouldBlockFiniteRepeatedGUIAction(
+            requiredCount: 5,
+            completedCount: 3,
+            toolName: "gui.swipeSequence",
+            arguments: ["count": "5"]
+        ))
+        XCTAssertFalse(AgentCore.shouldBlockFiniteRepeatedGUIAction(
+            requiredCount: 5,
+            completedCount: 3,
+            toolName: "gui.swipeSequence",
+            arguments: ["count": "2"]
+        ))
+        XCTAssertEqual(AgentCore.finiteRepeatedGUIActionUnits(toolName: "gui.feedSample", arguments: ["count": "5"]), 5)
+        XCTAssertNil(AgentCore.finiteRepeatedGUIActionUnits(toolName: "gui.tapObserve", arguments: ["x": "350", "y": "400"]))
+    }
+
+    func testAgentLikeAccountingRejectsNavigationTapAndAcceptsExplicitSemanticTarget() {
+        XCTAssertFalse(AgentCore.isSemanticLikeAction(
+            name: "gui.tapObserve",
+            arguments: ["x": "350", "y": "150"]
+        ))
+        XCTAssertFalse(AgentCore.isSemanticLikeAction(
+            name: "gui.tapTextObserve",
+            arguments: ["query": "搜索"]
+        ))
+        XCTAssertTrue(AgentCore.isSemanticLikeAction(
+            name: "gui.tapObserve",
+            arguments: ["x": "350", "y": "420", "semanticTarget": "like"]
+        ))
+        XCTAssertTrue(AgentCore.isSemanticLikeAction(
+            name: "gui.tapElementObserve",
+            arguments: ["query": "点赞"]
+        ))
     }
 
     func testHarnessExecutionHintTracksTransientVideoReturnBeforeTyping() {
@@ -6128,6 +6227,23 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(snapshot.count, 2)
         XCTAssertEqual(snapshot.first(where: { $0.backend == .screenshot })?.successes, 4)
         XCTAssertEqual(snapshot.first(where: { $0.backend == .accessibilityTree })?.failures, 3)
+    }
+
+    func testIOSInteractionExperienceLearnsLocalOCRAsIndependentObservationBackend() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = IOSInteractionExperienceStore(fileURL: root.appendingPathComponent("experience.json"))
+        let bundleID = "com.example.search"
+
+        for latency in [120, 130, 125] {
+            await store.recordObservation(bundleID: bundleID, backend: .localOCR, success: true, latencyMS: latency)
+        }
+        await store.recordObservation(bundleID: bundleID, backend: .accessibilityTree, success: false, latencyMS: 3_200)
+
+        let hint = await store.providerHint(bundleID: bundleID)
+        XCTAssertTrue(hint?.contains("prefer localOCR") == true)
+        let avoidAX = await store.shouldTemporarilyAvoidObservation(bundleID: bundleID, backend: .accessibilityTree)
+        XCTAssertTrue(avoidAX, "a proven local OCR route may serve as the working alternate to a failing AX backend")
     }
 
     func testIOSInteractionExperienceTemporarilySuppressesRepeatedSlowAXWhenScreenshotWorks() async throws {

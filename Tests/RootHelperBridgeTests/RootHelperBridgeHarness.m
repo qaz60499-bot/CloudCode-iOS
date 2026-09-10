@@ -78,6 +78,30 @@ int main(void)
         Require(result < 0 && [standardError containsString:@"runtime_degraded"], @"same-command overlap must fail closed without spawning another helper");
         Require(dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)) == 0 && concurrentResult == 0,
             @"original helper must finish and release its registry slot");
+
+        NSString *axHelper = [testDirectory stringByAppendingPathComponent:@"CloudCodeRootHelper"];
+        NSString *axReady = [testDirectory stringByAppendingPathComponent:@"ax-ready"];
+        NSString *axScript = @"#!/bin/sh\nif [ -n \"$2\" ]; then touch \"$2\"; fi\nsleep 0.5\n";
+        Require([axScript writeToFile:axHelper atomically:YES encoding:NSUTF8StringEncoding error:nil], @"create AX admission test helper");
+        Require([[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0755} ofItemAtPath:axHelper error:nil], @"make AX admission test helper executable");
+        __block NSInteger axConcurrentResult = -1;
+        dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            axConcurrentResult = CloudCodeSpawnHelperWithSeparatedOutput(axHelper,
+                @[@"gui-tree-json", axReady], NO, 2, NULL, NULL);
+        });
+        readyDeadline = [NSDate dateWithTimeIntervalSinceNow:1];
+        while (![[NSFileManager defaultManager] fileExistsAtPath:axReady] && readyDeadline.timeIntervalSinceNow > 0) { usleep(10000); }
+        Require([[NSFileManager defaultManager] fileExistsAtPath:axReady], @"AX lease fixture must actually start before overlap assertion");
+        standardOutput = nil;
+        standardError = nil;
+        result = CloudCodeSpawnHelperWithSeparatedOutput(axHelper, @[@"gui-focused-text-json"], NO, 2, &standardOutput, &standardError);
+        Require(result < 0 && [standardError containsString:@"serialized AX lease"],
+            @"different AX commands must share one admission key and never overlap the system Automation lease");
+        Require(dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)) == 0 && axConcurrentResult == 0,
+            @"first AX lease helper must finish and release the shared admission key");
+        result = CloudCodeSpawnHelperWithSeparatedOutput(axHelper, @[@"gui-focused-text-json"], NO, 2, &standardOutput, &standardError);
+        Require(result == 0, @"serialized AX admission key must be reusable after the prior helper exits");
+
         result = CloudCodeSpawnHelperWithSeparatedOutput(child, @[@"-c", @"kill -KILL $$"], NO, 2, &standardOutput, &standardError);
         Require(result == -5009, @"external/self SIGKILL must retain signal result, not parent timeout");
         NSData *recordData = [[standardError componentsSeparatedByString:@"\n"].lastObject dataUsingEncoding:NSUTF8StringEncoding];

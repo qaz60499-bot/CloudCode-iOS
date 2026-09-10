@@ -547,8 +547,9 @@ jobs:
           for marker in ('AXUIElementCopyMultipleAttributeValues', 'AXUIElementCopyElementWithParameters', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic', 'CloudCodeAXApplicationAtScreenPointRoot', 'CloudCodeAXParameterizedElementAtPoint', 'CloudCodeAXNodeLimited', 'CloudCodeAXNodeLimited(runtime, candidate, 0, 0, &localNodeCount)', 'semanticNodeCount'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: AX runtime lost bounded standalone/context-bound capability marker: {marker}')
-          if '_AXSSetAutomationEnabled' in gui_text or 'CloudCodeEnableAXAutomationForRequest' in gui_text:
-              raise SystemExit('FAIL: detached AX helper must not mutate the global automation switch; SIGKILL timeout cannot guarantee restoration')
+          for marker in ('_AXSAutomationEnabled', '_AXSSetAutomationEnabled', 'CloudCodeGUIRestoreAXAutomationForProcessExit();', 'automation_lease=%d'):
+              if marker not in gui_text:
+                  raise SystemExit(f'FAIL: AX system-automation lease/restore path missing required marker: {marker}')
           import re
           if 'AXManualAccessibility' not in gui_text or 'none_passive_read_only' not in gui_text:
               raise SystemExit('FAIL: passive AX policy marker is missing')
@@ -595,8 +596,13 @@ jobs:
           for marker in ('CloudCodeVisionHelper', 'Sources/CloudCodeVisionHelper/main.m', '-framework ImageIO'):
               if marker not in project_text:
                   raise SystemExit(f'FAIL: lightweight Vision helper is not embedded in the iOS app build: {marker}')
-          if 'TSRootBinaries:1 string CloudCodeVisionHelper' in project_text:
-              raise SystemExit('FAIL: public Vision helper must never be declared as a TrollStore root binary')
+          if 'TSRootBinaries:1 string CloudCodeVisionHelper' not in project_text:
+              raise SystemExit('FAIL: standalone Vision helper must be preserved as a TrollStore executable child')
+          if 'root execution is forbidden' not in vision_text:
+              raise SystemExit('FAIL: Vision helper declared in TSRootBinaries must still fail closed under uid/euid 0')
+          bridge_text = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
+          if 'asRoot && [path.lastPathComponent isEqualToString:@"CloudCodeVisionHelper"]' not in bridge_text or 'return -1911;' not in bridge_text:
+              raise SystemExit('FAIL: host bridge must reject root-persona Vision helper spawning')
           provider_client = Path('Sources/CloudCodeCore/ProviderClient.swift').read_text(encoding='utf-8')
           for marker in ('ProviderImageCapability', 'case textOnly = "text_only"', 'providerTinyImageProbeBase64', 'internal_image_capability_probe', 'models_metadata', 'tiny_image_probe', 'providerMessagesWithoutImages', 'providerToolsWithoutFreeCoordinates', 'image_omitted_before_provider_request', 'preferredCapabilityRoute', 'router_preferred_exact_route', 'case status(String)', '厂商正在等待上游 API', '厂商请求过多/触发限流'):
               if marker not in provider_client:
@@ -679,10 +685,10 @@ jobs:
           agent_core = Path('Sources/CloudCodeCore/AgentCore.swift').read_text(encoding='utf-8')
           harness_runtime = Path('Sources/CloudCodeCore/HarnessRuntime.swift').read_text(encoding='utf-8')
           interaction_framework = Path('Sources/CloudCodeCore/Interaction/IOSInteractionFramework.swift').read_text(encoding='utf-8')
-          for marker in ('harness_execution', 'bounded_repeated_swipe', 'gui.swipeSequence', 'boundedRepeatedSwipeCount', 'Never turn this hint into an unbounded loop', 'transient_navigation_return', 'return obligation', 'gui.navigateBack', 'strategy=dismissDown', 'Never treat ordinary video-frame changes as proof that navigation succeeded', 'before locating a text field or typing'):
+          for marker in ('harness_execution', 'bounded_repeated_swipe', 'gui.swipeSequence', 'boundedRepeatedSwipeCount', 'finiteRepeatCompletedCount', 'finite_repeat_complete', 'repeat_remaining', 'must never restart the original full batch', 'device_native_first', 'ipa_native_pipeline', 'apps/container/files/data/plist/json/sqlite', 'ipa.inspect → ipa.extract', 'transient_navigation_return', 'return obligation', 'gui.navigateBack', 'strategy=dismissDown', 'Never treat ordinary video-frame changes as proof that navigation succeeded', 'before locating a text field or typing'):
               if marker not in harness_runtime:
-                  raise SystemExit(f'FAIL: Harness lost bounded GUI execution/navigation compilation marker: {marker}')
-          for marker in ('IOSInteractionFramework', 'IOSInteractionExperienceStore', 'return obligation', 'tabs as peer roots', 'performance hint only', 'Never learn or persist passwords', 'permanent screen coordinates', 'HID constants', 'retentionInterval: TimeInterval = 30 * 24 * 60 * 60', 'attempts >= 3', 'native/system lifecycle', 'accessibility can add certainty', 'remote Vision reasoning', 'gui.runStructuredPlan', 'local semantic expectation', 'extremeSingleFailure'):
+                  raise SystemExit(f'FAIL: Harness lost bounded GUI/device-native execution compilation marker: {marker}')
+          for marker in ('IOSInteractionFramework', 'IOSInteractionExperienceStore', 'return obligation', 'tabs as peer roots', 'performance hint only', 'Never learn or persist passwords', 'permanent screen coordinates', 'HID constants', 'retentionInterval: TimeInterval = 30 * 24 * 60 * 60', 'attempts >= 3', 'native/system lifecycle', 'localOCR', 'Local OCR is a first-class observation backend', 'accessibility can add certainty', 'remote Vision reasoning', 'gui.runStructuredPlan', 'local semantic expectation', 'extremeSingleFailure'):
               if marker not in interaction_framework:
                   raise SystemExit(f'FAIL: embedded iOS Interaction Framework lost core semantics/learning boundary: {marker}')
           for marker in ('tool.lastGUIScreenshotSHA256', 'tool.guiBeforeStateChangeSHA256', 'tool.lastGUIEffectBeforeSHA256', 'tool.lastGUIEffectAfterSHA256', 'tool.lastGUIEffectScreenChanged', 'guiScreenshotChanged', 'byte-identical to the pre-action screenshot'):

@@ -156,6 +156,11 @@ static NSInteger CloudCodeSpawnHelperInternal(
     if (standardOutput) { *standardOutput = nil; }
     if (standardError) { *standardError = nil; }
     if (path.length == 0) { return -1001; }
+    if (asRoot && [path.lastPathComponent isEqualToString:@"CloudCodeVisionHelper"]) {
+        // TSRootBinaries preserves this helper's ability to exec under TrollStore, but Vision must
+        // never inherit persona-99/root. Prior iOS 16.6 device evidence showed root-persona Vision traps.
+        return -1911;
+    }
     if (timeout <= 0) { timeout = CLOUDCODE_HELPER_DEFAULT_TIMEOUT; }
     // Fail before spawning a real child if we cannot prove that process observation/reaping will
     // use Darwin's waitpid rather than ios_system's virtual-process implementation.
@@ -256,7 +261,18 @@ static NSInteger CloudCodeSpawnHelperInternal(
     } else if (personaError != 0) {
         result = -2000 - personaError;
     } else {
-        NSString *registryKey = [NSString stringWithFormat:@"%@|%@", path, arguments.firstObject ?: @""];
+        NSString *command = arguments.firstObject ?: @"";
+        NSSet<NSString *> *axLeaseCommands = [NSSet setWithArray:@[
+            @"gui-tree-json", @"gui-ax-probe-json", @"gui-focused-text-json", @"gui-type-base64"
+        ]];
+        BOOL usesAXAutomationLease = [path.lastPathComponent isEqualToString:@"CloudCodeRootHelper"]
+            && [axLeaseCommands containsObject:command];
+        // _AXSSetAutomationEnabled controls a system-wide bit. Different AX commands must therefore
+        // share one admission key instead of merely de-duplicating identical commands; otherwise one
+        // helper can restore the previous state while another helper is still reading the tree.
+        NSString *registryKey = usesAXAutomationLease
+            ? [NSString stringWithFormat:@"%@|ax-automation-lease", path]
+            : [NSString stringWithFormat:@"%@|%@", path, command];
         NSMutableSet *registry = CloudCodeHelperRegistry();
         BOOL admitted = NO;
         @synchronized (registry) {
@@ -269,7 +285,7 @@ static NSInteger CloudCodeSpawnHelperInternal(
         int spawnError = admitted ? posix_spawn(&pid, path.fileSystemRepresentation, captureOutput ? &actions : NULL, &attributes, argv, NULL) : EBUSY;
         if (spawnError != 0) {
             if (admitted) { CloudCodeReleaseHelper(registryKey); }
-            if (!admitted) { diagnosticSuffix = @"runtime_degraded: helper admission limit or same command still active/unreaped"; }
+            if (!admitted) { diagnosticSuffix = @"runtime_degraded: helper admission limit, same command, or serialized AX lease still active/unreaped"; }
             result = -3000 - spawnError;
         } else {
             const BOOL tracePerception = [path.lastPathComponent hasPrefix:@"CloudCode"];
