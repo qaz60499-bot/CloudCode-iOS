@@ -557,9 +557,11 @@ jobs:
           if not vision_helper.exists():
               raise SystemExit('FAIL: lightweight public Vision OCR helper source is missing')
           vision_text = vision_helper.read_text(encoding='utf-8')
-          for marker in ('cloudcode-vision-helper-protocol=1', 'VNRecognizeTextRequest', 'VNImageRequestHandler', 'usesCPUOnly = cpuOnly', 'preferBackgroundProcessing = YES', 'CloudCodePerformOCR(image, &request, YES', 'vision_helper_public_api', 'CloudCodePerformFastFallbackOCR', 'kCGImageSourceThumbnailMaxPixelSize', 'vision_helper_public_api_fast_thumbnail_fallback', 'ocr-file'):
+          for marker in ('cloudcode-vision-helper-protocol=1', 'VNRecognizeTextRequest', 'VNImageRequestHandler', 'usesCPUOnly = cpuOnly', 'preferBackgroundProcessing = YES', 'CloudCodePerformOCR(image, &request, YES', 'vision_helper_public_api', 'CloudCodePerformFastFallbackOCR', 'kCGImageSourceThumbnailMaxPixelSize', 'vision_helper_public_api_fast_thumbnail_fallback', 'ocr-file', 'CloudCodeRunOneShotVisionCommand', 'objc_autoreleasePoolPush', 'setvbuf(stdout, NULL, _IONBF, 0)', 'setvbuf(stderr, NULL, _IONBF, 0)', '_exit(result)'):
               if marker not in vision_text:
-                  raise SystemExit(f'FAIL: lightweight Vision helper lost public OCR isolation marker: {marker}')
+                  raise SystemExit(f'FAIL: lightweight Vision helper lost public OCR isolation/one-shot marker: {marker}')
+          if '@autoreleasepool' in vision_text or re.search(r'fflush\s*\(', vision_text):
+              raise SystemExit('FAIL: one-shot Vision helper must not enter autorelease/stdout teardown after final OCR output')
           local_vision = Path('Sources/CloudCodeApp/LocalVisionTextObservation.swift').read_text(encoding='utf-8')
           for marker in ('EmbeddedVisionHelper.guiOCR', 'request.usesCPUOnly = true', 'request.preferBackgroundProcessing = true', 'app_process_vision_cpu_only', 'app_process_vision_cpu_only_thumbnail', 'app_process_vision_fast_thumbnail_fallback', 'primaryMaxDimension', 'kCGImageSourceThumbnailMaxPixelSize', 'UIApplication.shared.applicationState == .active', 'not_invoked_host_not_active', 'bypassCoreVideoCircuit: helperSpawnAllowed', 'private actor Coordinator', 'localVisionCacheHit', 'localVisionRequestCoalesced', 'forcePrecise', 'precise ? 0.011', 'level == .fast ? 0.020 : 0.018'):
               if marker not in local_vision:

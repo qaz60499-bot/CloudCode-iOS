@@ -4,7 +4,10 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <math.h>
 #import <stdio.h>
+#import <unistd.h>
 #import "../CloudCodeApp/PerceptionVisionProbe.h"
+
+extern void *objc_autoreleasePoolPush(void);
 
 static NSString * const CloudCodeVisionProtocolMarker = @"cloudcode-vision-helper-protocol=1";
 static const NSUInteger CloudCodeVisionMaxInputBytes = 8 * 1024 * 1024;
@@ -255,43 +258,54 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements)
     return 0;
 }
 
-int main(int argc, char *argv[])
+static int CloudCodeRunOneShotVisionCommand(int argc, char *argv[])
 {
-    @autoreleasepool {
-        if (argc < 2) {
-            fprintf(stderr, "vision-helper: missing command\n");
-            return 64;
-        }
-        NSString *command = [NSString stringWithUTF8String:argv[1]];
-        if ([command isEqualToString:@"probe-ocr-file"]) {
-            if (argc != 8) { return 64; }
-            NSString *path = [NSString stringWithUTF8String:argv[2]];
-            if (!CloudCodeIsBoundedTempJPEG(path)) { return 71; }
-            // Flush process identity before the first Vision call so pre-/post-main deaths can
-            // be distinguished using parent and system timestamps even when no result survives.
-            NSData *entry = [NSJSONSerialization dataWithJSONObject:CCPerceptionProcessEvidence(@"vision_helper") options:0 error:nil];
-            if (entry) { fwrite(entry.bytes, 1, entry.length, stderr); fputc('\n', stderr); fflush(stderr); }
-            NSData *jpeg = [NSData dataWithContentsOfFile:path options:0 error:nil];
-            NSDictionary *result = CCPerceptionVisionProbe(jpeg, [NSString stringWithUTF8String:argv[3]],
-                [NSString stringWithUTF8String:argv[4]], atoi(argv[5]) != 0, atof(argv[6]), atof(argv[7]), @"vision_helper");
-            CloudCodePrintJSON(result);
-            return 0;
-        }
-        if ([command isEqualToString:@"probe"]) {
-            fprintf(stdout, "%s\n", CloudCodeVisionProtocolMarker.UTF8String);
-            return 0;
-        }
-        if ([command isEqualToString:@"ocr-file"]) {
-            if (argc < 4) {
-                fprintf(stderr, "vision-helper: ocr-file requires path and maximumElements\n");
-                return 64;
-            }
-            NSString *path = [NSString stringWithUTF8String:argv[2]];
-            NSInteger parsed = [[NSString stringWithUTF8String:argv[3]] integerValue];
-            NSUInteger maximumElements = (NSUInteger)MIN(MAX(parsed, 1), 48);
-            return CloudCodeOCRFile(path, maximumElements);
-        }
-        fprintf(stderr, "vision-helper: unsupported command\n");
+    if (argc < 2) {
+        fprintf(stderr, "vision-helper: missing command\n");
         return 64;
     }
+    NSString *command = [NSString stringWithUTF8String:argv[1]];
+    if ([command isEqualToString:@"probe-ocr-file"]) {
+        if (argc != 8) { return 64; }
+        NSString *path = [NSString stringWithUTF8String:argv[2]];
+        if (!CloudCodeIsBoundedTempJPEG(path)) { return 71; }
+        // Process identity is written synchronously before the first Vision call so pre-/post-main
+        // deaths can be distinguished even when no OCR result survives.
+        NSData *entry = [NSJSONSerialization dataWithJSONObject:CCPerceptionProcessEvidence(@"vision_helper") options:0 error:nil];
+        if (entry) { fwrite(entry.bytes, 1, entry.length, stderr); fputc('\n', stderr); }
+        NSData *jpeg = [NSData dataWithContentsOfFile:path options:0 error:nil];
+        NSDictionary *result = CCPerceptionVisionProbe(jpeg, [NSString stringWithUTF8String:argv[3]],
+            [NSString stringWithUTF8String:argv[4]], atoi(argv[5]) != 0, atof(argv[6]), atof(argv[7]), @"vision_helper");
+        CloudCodePrintJSON(result);
+        return 0;
+    }
+    if ([command isEqualToString:@"probe"]) {
+        fprintf(stdout, "%s\n", CloudCodeVisionProtocolMarker.UTF8String);
+        return 0;
+    }
+    if ([command isEqualToString:@"ocr-file"]) {
+        if (argc < 4) {
+            fprintf(stderr, "vision-helper: ocr-file requires path and maximumElements\n");
+            return 64;
+        }
+        NSString *path = [NSString stringWithUTF8String:argv[2]];
+        NSInteger parsed = [[NSString stringWithUTF8String:argv[3]] integerValue];
+        NSUInteger maximumElements = (NSUInteger)MIN(MAX(parsed, 1), 48);
+        return CloudCodeOCRFile(path, maximumElements);
+    }
+    fprintf(stderr, "vision-helper: unsupported command\n");
+    return 64;
+}
+
+int main(int argc, char *argv[])
+{
+    // Vision/CoreML/CoreVideo may retain process-global objects whose autorelease teardown blocks
+    // after the final OCR JSON has already been produced on the TrollStore iOS 16.6 device. Match
+    // the root/GUI one-shot contract: make observable writes synchronous, keep one process-lifetime
+    // pool, and terminate without ARC/Foundation/Vision teardown after dispatch.
+    (void)setvbuf(stdout, NULL, _IONBF, 0);
+    (void)setvbuf(stderr, NULL, _IONBF, 0);
+    (void)objc_autoreleasePoolPush();
+    int result = CloudCodeRunOneShotVisionCommand(argc, argv);
+    _exit(result);
 }
