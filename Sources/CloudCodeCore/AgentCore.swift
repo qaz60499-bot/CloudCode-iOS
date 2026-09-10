@@ -1401,6 +1401,12 @@ public actor AgentCore {
                                 guard let contract = taskContract, let runtime = taskRuntimeState else { return nil }
                                 switch contract.intent {
                                 case .messaging:
+                                    if !runtime.composerFocusVerified {
+                                        return "typed messaging 尚未验证消息输入框焦点，不能执行或宣告正文输入/发送完成。"
+                                    }
+                                    if runtime.textInputActionsCompleted == 0 {
+                                        return "typed messaging 还没有成功完成文本输入，不能进入 Send/发送完成状态。"
+                                    }
                                     if runtime.messageCommitState == .uncertain {
                                         return "message_commit_unverified_no_repeat: typed runtime 已记录一次 Send 提交候选，但尚无消息正文出现在发送后语义观察中的证据。禁止再次发送；必须 reconcile/verify。"
                                     }
@@ -1412,7 +1418,7 @@ public actor AgentCore {
                                     }
                                 case .finiteFeed:
                                     if let exact = contract.limits.exactFeedItemCount, runtime.finiteFeedCompleted < exact {
-                                        return "typed finite feed 尚未完成严格计数：\(runtime.finiteFeedCompleted)/\(exact)。"
+                                        return "typed finite feed 尚未完成严格计数：\(runtime.finiteFeedCompleted)/\(exact)；用户明确要求执行 \(exact) 次/条有限 GUI 浏览动作，不能只打开 App 或口头说明完成。"
                                     }
                                     if contract.feed?.requiresLikeAction == true {
                                         if runtime.likeActionsCompleted == 0 {

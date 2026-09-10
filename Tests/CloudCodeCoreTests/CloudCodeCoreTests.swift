@@ -4053,7 +4053,11 @@ final class CloudCodeCoreTests: XCTestCase {
             keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
             toolRouter: ToolRouter(
                 registry: registry,
-                executors: [CountingExecutor(route: .privateFramework, names: ["apps.launch"], counter: InvocationCounter())],
+                executors: [FixedPayloadExecutor(
+                    route: .privateFramework,
+                    names: ["apps.launch"],
+                    payload: ["foregroundVerified": "true"]
+                )],
                 diagnosticLogger: logStore
             ),
             registry: registry,
@@ -4086,6 +4090,7 @@ final class CloudCodeCoreTests: XCTestCase {
         })
         let diagnoses = saved.messages.filter { $0.providerMetadata["context_layer"] == "automatic_completion_diagnosis" }
         XCTAssertEqual(diagnoses.count, 3)
+        guard diagnoses.count == 3 else { return }
         XCTAssertEqual(diagnoses[0].providerMetadata["automatic_recovery_allowed"], "true")
         XCTAssertEqual(diagnoses[0].providerMetadata["recovery_reason"], "bounded_replan_available")
         XCTAssertEqual(diagnoses[1].providerMetadata["automatic_recovery_allowed"], "true")
@@ -4093,7 +4098,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(diagnoses[2].providerMetadata["automatic_recovery_allowed"], "false")
         XCTAssertEqual(diagnoses[2].providerMetadata["recovery_reason"], "recovery_budget_exhausted")
         let providerStreamCalls = await provider.streamCallCount()
-        XCTAssertEqual(providerStreamCalls, 4, "one launch round plus three completion attempts must stop before any fourth completion re-plan")
+        XCTAssertEqual(providerStreamCalls, 3, "typed deterministic launch bypasses Provider; exactly three premature completion attempts must exhaust the bounded recovery budget")
     }
 
     func testMessagingRawTypeIsBlockedUntilComposerFocusIsLocallyVerified() async throws {
@@ -4142,7 +4147,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(saved.messages.contains {
             $0.role == .system
                 && $0.providerMetadata["context_layer"] == "gui_completion_guard"
-                && $0.content.contains("还没有成功完成文本输入")
+                && $0.content.contains("尚未验证消息输入框焦点")
         })
     }
 

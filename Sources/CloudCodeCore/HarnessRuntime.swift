@@ -314,8 +314,14 @@ public enum HarnessContextManager {
 
     static func requiresLikeAction(in request: String) -> Bool {
         let normalized = request.lowercased()
-        // Reading/comparing a visible like count is not a request to change the like state.
+        // A count/comparison mention is read-only only when it is the sole Like occurrence. Golden
+        // tasks often say “比较点赞量，给最高的一条点赞”; the second explicit Like is a write
+        // obligation and must not be erased merely because the same sentence also names the metric.
         let countOnlyMarkers = ["点赞量", "点赞数", "点赞数量", "like count", "likes count"]
+        let chineseLikeOccurrences = normalized.components(separatedBy: "点赞").count - 1
+        let explicitChineseWrite = chineseLikeOccurrences >= 2
+            || ["点赞一下", "点个赞", "然后点赞", "并点赞", "去点赞"].contains(where: normalized.contains)
+        if explicitChineseWrite { return true }
         if countOnlyMarkers.contains(where: normalized.contains) { return false }
         if normalized.contains("点赞") { return true }
         return normalized.range(of: #"\blike\b"#, options: .regularExpression) != nil
