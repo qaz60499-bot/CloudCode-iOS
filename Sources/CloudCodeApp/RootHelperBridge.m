@@ -185,16 +185,11 @@ static NSInteger CloudCodeSpawnHelperInternal(
                 if (standardError && hostDiagnostic.length > 0) { *standardError = hostDiagnostic; }
                 return 0;
             }
-            if ([command isEqualToString:@"gui-focused-text-input-json"]) {
-                if (standardError) {
-                    *standardError = hostDiagnostic.length > 0 ? hostDiagnostic : @"System-app host AX focused-text read unavailable";
-                }
-                return 62;
-            }
             // Build 123 adds a materially different standalone route: AccessibilityUI's AXAudit
             // broker (AXUIClient + AXElement.primaryApp/explorerElements). If the System-app host's
             // raw AXRuntime path is empty, allow the normal isolated helper spawn below to try that
-            // broker before PlatformAdapters proceeds to its single persona-99 fallback.
+            // broker for both semantic-tree and focused-text observation before PlatformAdapters
+            // proceeds to its single persona-99 fallback.
         }
     }
 
