@@ -478,6 +478,11 @@ static CloudCodeHostAXUIElementRef CloudCodeHostAXFocusedElement(CloudCodeHostAX
     return result;
 }
 
+static NSValue *CloudCodeHostAXPointValue(CGPoint point)
+{
+    return [[NSValue alloc] initWithBytes:&point objCType:@encode(CGPoint)];
+}
+
 static uint32_t CloudCodeHostAXContextIDAtPoint(CloudCodeHostAXRuntime runtime, CloudCodeHostAXUIElementRef seed, CGPoint point, pid_t expectedPID)
 {
     if (!seed || !runtime.copyParameterizedAttributeValue) { return 0; }
@@ -485,7 +490,7 @@ static uint32_t CloudCodeHostAXContextIDAtPoint(CloudCodeHostAXRuntime runtime, 
     if (runtime.valueCreate) {
         @try { axPoint = runtime.valueCreate(1, &point); } @catch (__unused NSException *exception) { axPoint = NULL; }
     }
-    id pointValue = axPoint ? (__bridge id)axPoint : [NSValue valueWithCGPoint:point];
+    id pointValue = axPoint ? (__bridge id)axPoint : CloudCodeHostAXPointValue(point);
     uint32_t contextID = 0;
     for (NSNumber *displayID in @[@1, @0]) {
         NSArray *parameter = @[pointValue, displayID];
@@ -597,7 +602,7 @@ static CloudCodeHostAXUIElementRef CloudCodeHostAXContextElementAtPoint(
     if (!candidate && runtime.copyElementWithParameters) {
         NSMutableDictionary *parameters = [@{
             @"application": (__bridge id)application,
-            @"point": [NSValue valueWithCGPoint:point],
+            @"point": CloudCodeHostAXPointValue(point),
             @"displayId": @1
         } mutableCopy];
         if (contextID > 0) { parameters[@"contextId"] = @(contextID); }
