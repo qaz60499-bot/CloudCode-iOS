@@ -81,6 +81,19 @@ extension CloudCodeViewModel {
                         }
                     }
                 }
+                // ios-mcp v1.2.4 exposes additional FrontBoard/FBS/numeric/snapshot/context APIs.
+                // Probe them in both mobile and privileged helper identities, but keep them strictly
+                // diagnostic until a physical iOS 16.6 run proves which invocation context works.
+                for root in [false, true] {
+                    let body = await Task.detached { () -> [String: String] in
+                        var stdout: NSString?
+                        var stderr: NSString?
+                        let code = CloudCodeSpawnHelperWithSeparatedOutput(EmbeddedRootHelper.executablePath,
+                            ["gui-ax-probe-json", "iosmcp-delta", "application", "0", "requesting2"], root, 5, &stdout, &stderr)
+                        return ["code": String(code), "stdout": stdout as String? ?? "", "stderr": stderr as String? ?? ""]
+                    }.value
+                    await record(String(format: "ax-iosmcp-%02d", root ? 1 : 0), ["seed": "application", "preparation": "requesting2", "root": root, "result": body])
+                }
             }
             if let pid = assertion.workerPID {
                 let stopped = await Task.detached { EmbeddedRootHelper.stopBackgroundAssertion(workerPID: pid) }.value
@@ -148,7 +161,7 @@ struct PerceptionProbeView: View {
             } else {
                 Section("AX 隔离变量") {
                     Picker("阶段", selection: $axStage) {
-                        ForEach(["symbols", "frontmost", "root", "attributes", "hit-test", "application-at-point", "context-at-point"], id: \.self) { Text($0).tag($0) }
+                        ForEach(["symbols", "frontmost", "root", "attributes", "hit-test", "application-at-point", "context-at-point", "iosmcp-delta"], id: \.self) { Text($0).tag($0) }
                     }
                     Picker("Seed", selection: $axSeed) {
                         ForEach(["systemWide", "application", "pid0", "springboard"], id: \.self) { Text($0).tag($0) }
