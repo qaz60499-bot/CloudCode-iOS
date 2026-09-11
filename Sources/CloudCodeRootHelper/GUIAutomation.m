@@ -1455,15 +1455,76 @@ static id CloudCodeAXAuditPrimaryElement(NSString **detailOut)
     }
 }
 
+#define CLOUDCODE_AX_TRAIT_BUTTON                 0x1ULL
+#define CLOUDCODE_AX_TRAIT_LINK                   0x2ULL
+#define CLOUDCODE_AX_TRAIT_IMAGE                  0x4ULL
+#define CLOUDCODE_AX_TRAIT_STATIC_TEXT            0x40ULL
+#define CLOUDCODE_AX_TRAIT_SEARCH_FIELD           0x400ULL
+#define CLOUDCODE_AX_TRAIT_TAB_BAR                0x8000ULL
+#define CLOUDCODE_AX_TRAIT_TEXT_ENTRY             0x40000ULL
+#define CLOUDCODE_AX_TRAIT_RADIO_BUTTON           0x100000ULL
+#define CLOUDCODE_AX_TRAIT_IS_EDITING             0x200000ULL
+#define CLOUDCODE_AX_TRAIT_SECURE_TEXT_FIELD      0x1000000ULL
+#define CLOUDCODE_AX_TRAIT_TAB_BUTTON             0x10000000ULL
+#define CLOUDCODE_AX_TRAIT_SWITCH                 0x20000000000000ULL
+#define CLOUDCODE_AX_TRAIT_TEXT_AREA              0x800000000000ULL
+
+static id CloudCodeAXAuditEditingTextElement(NSString **detailOut)
+{
+    if (detailOut) { *detailOut = nil; }
+    NSString *primaryDetail = nil;
+    id primary = CloudCodeAXAuditPrimaryElement(&primaryDetail);
+    if (!primary) {
+        if (detailOut) { *detailOut = primaryDetail ?: @"AXAudit primaryApp unavailable"; }
+        return nil;
+    }
+    id explorer = CloudCodeAXAuditSafeValue(primary, @"explorerElements");
+    if (![explorer isKindOfClass:NSArray.class]) {
+        if (detailOut) { *detailOut = @"AXAudit primaryApp explorerElements unavailable"; }
+        return nil;
+    }
+
+    id match = nil;
+    NSUInteger matches = 0;
+    NSUInteger limit = MIN((NSUInteger)[(NSArray *)explorer count], (NSUInteger)CLOUDCODE_GUI_MAX_TREE_NODES);
+    for (NSUInteger index = 0; index < limit; index++) {
+        id element = [(NSArray *)explorer objectAtIndex:index];
+        id traitsRaw = CloudCodeAXAuditSafeValue(element, @"traits");
+        if (![traitsRaw isKindOfClass:NSNumber.class]) { continue; }
+        uint64_t traits = [(NSNumber *)traitsRaw unsignedLongLongValue];
+        BOOL textLike = (traits & (CLOUDCODE_AX_TRAIT_SEARCH_FIELD | CLOUDCODE_AX_TRAIT_TEXT_ENTRY | CLOUDCODE_AX_TRAIT_TEXT_AREA)) != 0;
+        BOOL editing = (traits & CLOUDCODE_AX_TRAIT_IS_EDITING) != 0;
+        BOOL secure = (traits & CLOUDCODE_AX_TRAIT_SECURE_TEXT_FIELD) != 0;
+        if (!textLike || !editing || secure) { continue; }
+        match = element;
+        matches++;
+        if (matches > 1) {
+            if (detailOut) { *detailOut = @"AXAudit editing text focus is ambiguous"; }
+            return nil;
+        }
+    }
+    if (!match) {
+        if (detailOut) { *detailOut = @"AXAudit found no unique non-secure editing text element"; }
+        return nil;
+    }
+    if (detailOut) { *detailOut = @"AXAudit found one non-secure element with text-entry and is-editing traits"; }
+    return match;
+}
+
 static NSString *CloudCodeAXAuditRoleForTraits(uint64_t traits)
 {
-    if ((traits & 0x400ULL) != 0) { return @"AXSearchField"; }
-    if ((traits & 0x40000ULL) != 0) { return @"AXTextField"; }
-    if ((traits & 0x1ULL) != 0) { return @"AXButton"; }
-    if ((traits & 0x2ULL) != 0) { return @"AXLink"; }
-    if ((traits & 0x8000ULL) != 0) { return @"AXTab"; }
-    if ((traits & 0x4ULL) != 0) { return @"AXImage"; }
-    if ((traits & 0x40ULL) != 0) { return @"AXStaticText"; }
+    if ((traits & CLOUDCODE_AX_TRAIT_SEARCH_FIELD) != 0) { return @"AXSearchField"; }
+    if ((traits & CLOUDCODE_AX_TRAIT_SECURE_TEXT_FIELD) != 0) { return @"AXSecureTextField"; }
+    if ((traits & CLOUDCODE_AX_TRAIT_TEXT_AREA) != 0) { return @"AXTextArea"; }
+    if ((traits & CLOUDCODE_AX_TRAIT_TEXT_ENTRY) != 0) { return @"AXTextField"; }
+    if ((traits & CLOUDCODE_AX_TRAIT_BUTTON) != 0) { return @"AXButton"; }
+    if ((traits & CLOUDCODE_AX_TRAIT_LINK) != 0) { return @"AXLink"; }
+    if ((traits & CLOUDCODE_AX_TRAIT_TAB_BUTTON) != 0) { return @"AXTabButton"; }
+    if ((traits & CLOUDCODE_AX_TRAIT_TAB_BAR) != 0) { return @"AXTabBar"; }
+    if ((traits & CLOUDCODE_AX_TRAIT_SWITCH) != 0) { return @"AXSwitch"; }
+    if ((traits & CLOUDCODE_AX_TRAIT_RADIO_BUTTON) != 0) { return @"AXRadioButton"; }
+    if ((traits & CLOUDCODE_AX_TRAIT_IMAGE) != 0) { return @"AXImage"; }
+    if ((traits & CLOUDCODE_AX_TRAIT_STATIC_TEXT) != 0) { return @"AXStaticText"; }
     return @"AXElement";
 }
 
@@ -1503,6 +1564,20 @@ static NSDictionary *CloudCodeAXAuditElementNode(CloudCodeAXRuntime runtime, id 
     }
     if (frame) { node[@"frame"] = frame; }
     return node;
+}
+
+static NSString *CloudCodeAXAuditTextValue(CloudCodeAXRuntime runtime, id element)
+{
+    if (!element) { return nil; }
+    NSString *value = CloudCodeBoundedString(CloudCodeAXAuditSafeValue(element, @"value"));
+    if (value) { return value; }
+    id uiElement = CloudCodeAXAuditSafeValue(element, @"uiElement");
+    if (!uiElement) { return nil; }
+    return CloudCodeBoundedString(CloudCodeAXCopy(
+        runtime,
+        (CloudCodeAXUIElementRef)(__bridge CFTypeRef)uiElement,
+        runtime.attributeValue ?: CFSTR("AXValue")
+    ));
 }
 
 static NSDictionary *CloudCodeAXAuditBrokerTree(
@@ -1679,7 +1754,10 @@ static NSUInteger CloudCodeAXActionableNodeCount(NSDictionary *node)
         [role localizedCaseInsensitiveContainsString:@"SearchField"] ||
         [role localizedCaseInsensitiveContainsString:@"Link"] ||
         [role localizedCaseInsensitiveContainsString:@"Cell"] ||
-        [role localizedCaseInsensitiveContainsString:@"Tab"]
+        [role localizedCaseInsensitiveContainsString:@"Switch"] ||
+        [role localizedCaseInsensitiveContainsString:@"RadioButton"] ||
+        [role localizedCaseInsensitiveContainsString:@"TabButton"] ||
+        [role localizedCaseInsensitiveCompare:@"AXTab"] == NSOrderedSame
     );
     NSUInteger count = actionable ? 1 : 0;
     NSArray *children = [node[@"children"] isKindOfClass:NSArray.class] ? node[@"children"] : @[];
@@ -2672,6 +2750,8 @@ static __attribute__((noreturn)) void CloudCodeFrontmostTreeData(void)
     NSDictionary *auditTree = CloudCodeAXAuditBrokerTree(runtime, &auditNodeCount, &auditPID, &auditBundleID, &auditDetail);
     NSUInteger auditSemanticCount = CloudCodeAXSemanticNodeCount(auditTree);
     NSUInteger auditActionableCount = CloudCodeAXActionableNodeCount(auditTree);
+    // A semantic tree remains useful even on read-only/static screens with no actionable role.
+    // Keep actionableCount as evidence, not as a hard availability gate.
     if (auditTree && auditNodeCount > 1 && auditSemanticCount > 0) {
         NSDictionary *payload = @{
             @"backend": @"AccessibilityUI.AXAudit.AXElement",
@@ -3039,7 +3119,19 @@ int CloudCodeGUIFocusedTextInputJSON(void)
         NSString *focusedBackend = @"";
         NSString *focusedRole = @"";
 
-        if (runtimeAvailable) {
+        NSString *auditFocusDetail = nil;
+        id auditFocused = CloudCodeAXAuditEditingTextElement(&auditFocusDetail);
+        if (auditFocused) {
+            NSDictionary *auditNode = CloudCodeAXAuditElementNode(ax, auditFocused);
+            focusedRole = [auditNode[@"role"] isKindOfClass:NSString.class] ? auditNode[@"role"] : @"";
+            id auditPID = CloudCodeAXAuditSafeValue(auditFocused, @"pid");
+            if ([auditPID respondsToSelector:@selector(intValue)]) { focusedPID = (pid_t)[auditPID intValue]; }
+            focusedElementAvailable = YES;
+            focusedTextInput = YES;
+            focusedBackend = @"AccessibilityUI.AXAudit.uniqueEditingTextElement";
+        }
+
+        if (!focusedElementAvailable && runtimeAvailable) {
             CloudCodeAXUIElementRef focusedElement = CloudCodeAXCopyFocusedElement(ax, &focusedPID, &focusedBackend);
             if (focusedElement) {
                 focusedElementAvailable = YES;
@@ -3078,6 +3170,46 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
         if (!utf8 || utf8.length == 0 || utf8.length > CLOUDCODE_GUI_MAX_TEXT_UTF8_BYTES) { return 67; }
         NSString *text = [[NSString alloc] initWithData:utf8 encoding:NSUTF8StringEncoding];
         if (!text || text.length == 0) { return 67; }
+
+        // First try AccessibilityUI's AXElement route, but only when AXAudit exposes exactly one
+        // non-secure text element carrying the reversed kAXIsEditingTrait. Do not equate AXAudit's
+        // opaque-provider navigation attribute (95226) with keyboard focus. After insertText:, read
+        // the element value back before reporting success; an unverified submission fails closed so
+        // HID fallback cannot duplicate text that may already have been inserted.
+        NSString *auditTextDetail = nil;
+        id auditFocused = CloudCodeAXAuditEditingTextElement(&auditTextDetail);
+        SEL insertTextSelector = NSSelectorFromString(@"insertText:");
+        if (auditFocused && [auditFocused respondsToSelector:insertTextSelector]) {
+            CloudCodeAXRuntime auditRuntime = CloudCodeResolveAX();
+            NSDictionary *auditNode = CloudCodeAXAuditElementNode(auditRuntime, auditFocused);
+            NSString *auditRole = [auditNode[@"role"] isKindOfClass:NSString.class] ? auditNode[@"role"] : @"";
+            NSString *beforeAuditText = CloudCodeAXAuditTextValue(auditRuntime, auditFocused);
+            @try {
+                ((void (*)(id, SEL, id))objc_msgSend)(auditFocused, insertTextSelector, text);
+                NSString *afterAuditText = nil;
+                for (NSUInteger attempt = 0; attempt < 4; attempt++) {
+                    usleep(50000);
+                    afterAuditText = CloudCodeAXAuditTextValue(auditRuntime, auditFocused);
+                    if (afterAuditText && (!beforeAuditText || ![afterAuditText isEqualToString:beforeAuditText])) { break; }
+                }
+                if (afterAuditText && (!beforeAuditText || ![afterAuditText isEqualToString:beforeAuditText])) {
+                    fprintf(stderr, "gui-type: route=AccessibilityUI.AXAudit.editing.insertText result=verified chars=%lu role=%s\n",
+                            (unsigned long)text.length,
+                            auditRole.UTF8String ?: "unknown");
+                    CloudCodeGUIExitOneShot(0);
+                }
+                fprintf(stderr, "gui-type: route=AccessibilityUI.AXAudit.editing.insertText result=write-unverified chars=%lu role=%s\n",
+                        (unsigned long)text.length,
+                        auditRole.UTF8String ?: "unknown");
+                CloudCodeGUIExitOneShot(70);
+            } @catch (NSException *exception) {
+                fprintf(stderr, "gui-type: route=AccessibilityUI.AXAudit.editing.insertText result=exception name=%s\n",
+                        exception.name.UTF8String ?: "unknown");
+                CloudCodeGUIExitOneShot(70);
+            }
+        } else if (auditTextDetail.length > 0) {
+            fprintf(stderr, "gui-type: AXAudit editing insertText unavailable: %s\n", auditTextDetail.UTF8String);
+        }
 
         // Prefer the focused accessibility text element when the foreground app exposes one.
         // This is substantially more reliable than sending a Unicode HID packet into an unknown

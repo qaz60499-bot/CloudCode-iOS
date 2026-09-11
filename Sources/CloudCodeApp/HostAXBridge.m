@@ -461,7 +461,10 @@ static NSUInteger CloudCodeHostAXActionableCount(NSDictionary *node)
         [role localizedCaseInsensitiveContainsString:@"SearchField"] ||
         [role localizedCaseInsensitiveContainsString:@"Link"] ||
         [role localizedCaseInsensitiveContainsString:@"Cell"] ||
-        [role localizedCaseInsensitiveContainsString:@"Tab"]
+        [role localizedCaseInsensitiveContainsString:@"Switch"] ||
+        [role localizedCaseInsensitiveContainsString:@"RadioButton"] ||
+        [role localizedCaseInsensitiveContainsString:@"TabButton"] ||
+        [role localizedCaseInsensitiveCompare:@"AXTab"] == NSOrderedSame
     );
     NSUInteger total = actionable ? 1 : 0;
     for (id child in [node[@"children"] isKindOfClass:NSArray.class] ? node[@"children"] : @[]) {
