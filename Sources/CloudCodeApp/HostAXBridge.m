@@ -200,7 +200,10 @@ static NSDictionary *CloudCodeHostAXFrame(CloudCodeHostAXRuntime runtime, id val
     CGRect frame = CGRectZero;
     BOOL ok = NO;
     if ([value isKindOfClass:NSValue.class]) {
-        @try { frame = [value CGRectValue]; ok = YES; } @catch (__unused NSException *exception) { ok = NO; }
+        @try {
+            [(NSValue *)value getValue:&frame size:sizeof(frame)];
+            ok = YES;
+        } @catch (__unused NSException *exception) { ok = NO; }
     }
     if (!ok && runtime.valueGetType && runtime.valueGetValue) {
         CFTypeRef ref = (__bridge CFTypeRef)value;
