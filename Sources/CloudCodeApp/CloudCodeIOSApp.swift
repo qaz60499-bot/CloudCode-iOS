@@ -44,10 +44,18 @@ struct CloudCodeIOSApp: App {
 private final class CloudCodeAppLauncher: ObservableObject {
     @Published private(set) var model: CloudCodeViewModel?
     private var didStart = false
+    private var pcControlBridge: PCControlBridge?
 
     func startIfNeeded() {
         guard !didStart else { return }
         didStart = true
+
+        // Ordinary launches expose no control listener. The Windows reference controller opts in
+        // explicitly with a fresh per-session token passed in the process arguments.
+        if let bridge = PCControlBridge.requestedByProcessArguments() {
+            pcControlBridge = bridge
+            bridge.start()
+        }
 
         // Render and commit a minimal SwiftUI shell before constructing the full runtime graph.
         // A single Task.yield() is not a first-frame guarantee: the main actor may resume before
