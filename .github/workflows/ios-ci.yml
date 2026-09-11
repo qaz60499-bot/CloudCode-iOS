@@ -255,6 +255,9 @@ jobs:
           grep -F 'simctl_bounded 90 launch' .github/workflows/ios-ci.yml >/dev/null
           grep -F 'revision: "22787ffb59de99e5dc1fbfe80b19c97a904ad48d"' Package.swift >/dev/null
           grep -F 'revision: 22787ffb59de99e5dc1fbfe80b19c97a904ad48d' project.yml >/dev/null
+          grep -F 'device_vision_teardown_crash_guard' Sources/CloudCodeApp/LocalVisionTextObservation.swift >/dev/null
+          grep -F 'CloudCodeDispatchSystemEventAsync' Sources/CloudCodeRootHelper/GUIAutomation.m >/dev/null
+          test "$(grep -c 'runExplicitPerceptionRegressionIfRequested()' Sources/CloudCodeApp/AppEnvironment.swift)" -ge 2
           grep -F 'case interaction = "homeos.interaction"' Sources/CloudCodeCore/HomeOSCapability.swift >/dev/null
           grep -F 'ToolDescriptor(name: "gui.tapObserve"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
           grep -F 'ToolDescriptor(name: "gui.typeObserve"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null

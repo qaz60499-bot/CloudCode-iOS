@@ -214,6 +214,7 @@ enum LocalVisionTextObservation {
                 value.payload["localVisionTotalLatencyMS"] = String(Int(Date().timeIntervalSince(started) * 1_000))
                 return value
             }
+#if targetEnvironment(simulator)
             var inProcess = recognizeInProcess(
                 jpegData,
                 maximumElements: boundedMaximum,
@@ -231,6 +232,24 @@ enum LocalVisionTextObservation {
             inProcess.payload["localVisionSecondaryErrorCode"] = helper?.payload["localVisionErrorCode"] ?? ""
             inProcess.payload["localVisionSecondaryDiagnostic"] = helper?.payload["localVisionHelperDiagnostic"] ?? ""
             return inProcess
+#else
+            // Build 119 produced a device crash in this fallback on iOS 16.6 while Vision/ANE was
+            // tearing down: libdispatch trapped because an internal Vision semaphore was deallocated
+            // while still in use. The isolated CloudCodeVisionHelper is the only supported device OCR
+            // process boundary. If it fails, preserve its exact evidence and fall back to screenshot /
+            // remote vision instead of running the same Vision stack inside the long-lived host App.
+            var value = helper ?? Observation(payload: [
+                "localVisionOCR": "unavailable_helper_failed",
+                "localVisionBackend": "vision_helper_public_api",
+                "localVisionElementCount": "0"
+            ], elements: [])
+            value.payload["localVisionHostState"] = hostActive ? "active" : "inactive_or_background"
+            value.payload["localVisionInvoked"] = "true"
+            value.payload["localVisionInProcessSuppressed"] = "device_vision_teardown_crash_guard"
+            value.payload["localVisionFallbackUsed"] = "false"
+            value.payload["localVisionTotalLatencyMS"] = String(Int(Date().timeIntervalSince(started) * 1_000))
+            return value
+#endif
             }.value
         }
     }

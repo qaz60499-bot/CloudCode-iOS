@@ -512,6 +512,10 @@ public final class CloudCodeViewModel: ObservableObject {
                 await refreshDiagnosticLogs()
                 resumeMostRecentInterruptedTaskIfRequested()
                 recordStartupBreadcrumb("bootstrap.completed")
+                // Explicit USB/CI perception regression launch arguments must work after an ordinary
+                // clean bootstrap too. Build 119 only invoked this hook from crash-recovery startup,
+                // so a healthy installed build silently ignored --cloudcode-perception-regression.
+                runExplicitPerceptionRegressionIfRequested()
             } catch {
                 recordStartupBreadcrumb("bootstrap.local-state.failed")
                 try? await diagnosticLogStore.log(level: .error, subsystem: "app", action: "bootstrap", result: "failed", error: error)

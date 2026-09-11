@@ -6,6 +6,7 @@
 #import <ImageIO/ImageIO.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
+#import <dispatch/dispatch.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
 #import <math.h>
@@ -375,6 +376,31 @@ static void CloudCodeReleaseHIDRoute(CloudCodeHIDRoute *route)
     *route = (CloudCodeHIDRoute){0};
 }
 
+static dispatch_queue_t CloudCodeHIDDispatchQueue(void)
+{
+    static dispatch_queue_t queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create("com.cloudcode.ios.roothelper.hid-dispatch", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
+static BOOL CloudCodeDispatchSystemEventAsync(CloudCodeHIDRuntime runtime, CloudCodeIOHIDEventSystemClientRef client, CloudCodeIOHIDEventRef event)
+{
+    if (!runtime.dispatch || !client || !event) { return NO; }
+    if (runtime.setSender) { runtime.setSender(event, CLOUDCODE_GUI_SENDER_ID); }
+    CloudCodeIOHIDEventSystemClientRef retainedClient = (CloudCodeIOHIDEventSystemClientRef)CFRetain(client);
+    CloudCodeIOHIDEventRef retainedEvent = (CloudCodeIOHIDEventRef)CFRetain(event);
+    CloudCodeHIDDispatchFn dispatchFn = runtime.dispatch;
+    dispatch_async(CloudCodeHIDDispatchQueue(), ^{
+        dispatchFn(retainedClient, retainedEvent);
+        CFRelease(retainedEvent);
+        CFRelease(retainedClient);
+    });
+    return YES;
+}
+
 static CGSize CloudCodeScreenSize(void)
 {
     @try {
@@ -484,8 +510,15 @@ static BOOL CloudCodeDispatchTouch(CloudCodeHIDRuntime runtime, CloudCodeHIDRout
     if (route.usesBackBoardRoute && route.routedConnection && runtime.dispatchConnection) {
         runtime.dispatchConnection(route.routedConnection, event);
     } else if (route.systemClient && runtime.dispatch) {
-        if (runtime.setSender) { runtime.setSender(event, CLOUDCODE_GUI_SENDER_ID); }
-        runtime.dispatch(route.systemClient, event);
+        // Current TrollVNC dispatches through a persistent IOHID system client asynchronously.
+        // Build 119 called IOHIDEventSystemClientDispatchEvent synchronously from the one-shot root
+        // helper; on the iOS 16.6 device that call could block for >45s and leave no UI effect.
+        // Retain the event/client across a short serial async dispatch so the helper remains bounded
+        // while the kernel/BackBoard delivery occurs independently of the command thread.
+        if (!CloudCodeDispatchSystemEventAsync(runtime, route.systemClient, event)) {
+            CFRelease(event);
+            return NO;
+        }
     } else {
         CFRelease(event);
         return NO;
@@ -2339,8 +2372,11 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
         if (route.usesBackBoardRoute && route.routedConnection && runtime.dispatchConnection) {
             runtime.dispatchConnection(route.routedConnection, event);
         } else if (route.systemClient && runtime.dispatch) {
-            if (runtime.setSender) { runtime.setSender(event, CLOUDCODE_GUI_SENDER_ID); }
-            runtime.dispatch(route.systemClient, event);
+            if (!CloudCodeDispatchSystemEventAsync(runtime, route.systemClient, event)) {
+                CFRelease(event);
+                CloudCodeReleaseHIDRoute(&route);
+                CloudCodeGUIExitOneShot(68);
+            }
         } else {
             CFRelease(event);
             CloudCodeReleaseHIDRoute(&route);
