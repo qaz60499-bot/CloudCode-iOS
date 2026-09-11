@@ -121,7 +121,7 @@ jobs:
           # Vision OCR remains a separate mobile-user child, outside the root GUI/HID profile. Fresh
           # Build 120 device evidence showed the helper was SIGKILLed before main() when restricted
           # IOKit entitlements lacked a launchable System-app identity, so its dedicated profile now
-          # carries that mobile System identity plus only the three required graphics/decode clients.
+          # carries that mobile System identity plus only the graphics/decode/ANE clients proven necessary by device syslog.
           ldid -SEntitlements/CloudCodeVisionHelper.entitlements "$VISION_HELPER"
           codesign --force --sign - --entitlements Entitlements/CloudCodeVisionHelper.entitlements "$VISION_HELPER"
           # Procursus ldid 2.1.5 can emit an entitlement blob that macOS codesign/Security.framework
@@ -153,6 +153,15 @@ jobs:
             /usr/libexec/PlistBuddy -c "Print :$required_vision_entitlement" "$VISION_ENTITLEMENTS" | grep -F 'true'
           done
           /usr/libexec/PlistBuddy -c 'Print :com.apple.private.security.container-required' "$VISION_ENTITLEMENTS" | grep -F 'false'
+          for required_vision_iokit_class in \
+            IOSurfaceAcceleratorClient \
+            H11ANEInDirectPathClient; do
+            for iokit_entitlement in \
+              com.apple.security.iokit-user-client-class \
+              com.apple.security.exception.iokit-user-client-class; do
+              /usr/libexec/PlistBuddy -c "Print :$iokit_entitlement" "$VISION_ENTITLEMENTS" | grep -F "$required_vision_iokit_class"
+            done
+          done
           rm -f "$VISION_ENTITLEMENTS"
           HELPER_ENTITLEMENTS="$RUNNER_TEMP/cloudcode-root-helper-entitlements.plist"
           ldid -e "$ROOT_HELPER" > "$HELPER_ENTITLEMENTS"

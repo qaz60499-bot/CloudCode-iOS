@@ -1143,22 +1143,32 @@ static NSString *CloudCodeBundlePathForIdentifier(NSString *bundleID)
     return [bundleURL isKindOfClass:NSURL.class] ? bundleURL.path.stringByStandardizingPath : nil;
 }
 
+static NSString *CloudCodeCanonicalProcessPath(NSString *path)
+{
+    NSString *normalized = [path isKindOfClass:NSString.class] ? path.stringByStandardizingPath : nil;
+    if ([normalized hasPrefix:@"/private/var/"]) {
+        normalized = [normalized substringFromIndex:@"/private".length];
+    }
+    return normalized;
+}
+
 static pid_t CloudCodePIDForBundlePath(NSString *bundlePath)
 {
-    if (bundlePath.length == 0) { return 0; }
+    NSString *canonicalBundlePath = CloudCodeCanonicalProcessPath(bundlePath);
+    if (canonicalBundlePath.length == 0) { return 0; }
     CloudCodeProcListAllPidsFn listPids = (CloudCodeProcListAllPidsFn)dlsym(RTLD_DEFAULT, "proc_listallpids");
     CloudCodeProcPidPathFn pidPath = (CloudCodeProcPidPathFn)dlsym(RTLD_DEFAULT, "proc_pidpath");
     if (!listPids || !pidPath) { return 0; }
     pid_t pids[4096] = {0};
     int count = listPids(pids, sizeof(pids));
-    NSString *prefix = [bundlePath stringByAppendingString:@"/"];
+    NSString *prefix = [canonicalBundlePath stringByAppendingString:@"/"];
     for (int index = 0; index < count && index < 4096; index++) {
         pid_t pid = pids[index];
         if (pid <= 1 || pid == getpid()) { continue; }
         char buffer[4096] = {0};
         if (pidPath(pid, buffer, sizeof(buffer)) <= 0) { continue; }
-        NSString *path = [NSString stringWithUTF8String:buffer];
-        if ([path hasPrefix:prefix]) { return pid; }
+        NSString *path = CloudCodeCanonicalProcessPath([NSString stringWithUTF8String:buffer]);
+        if ([path isEqualToString:canonicalBundlePath] || [path hasPrefix:prefix]) { return pid; }
     }
     return 0;
 }

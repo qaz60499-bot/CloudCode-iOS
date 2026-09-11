@@ -299,6 +299,11 @@ jobs:
             grep -F "<string>$vision_iokit_class</string>" Entitlements/TrollStore.entitlements >/dev/null
             grep -F "<string>$vision_iokit_class</string>" Entitlements/CloudCodeVisionHelper.entitlements >/dev/null
           done
+          # Build 121 device syslog proved Vision enters main()/performRequests, then MACF denies these
+          # exact user clients before TextRecognition aborts inside AppleNeuralEngine teardown.
+          for vision_helper_runtime_iokit_class in IOSurfaceAcceleratorClient H11ANEInDirectPathClient; do
+            grep -F "<string>$vision_helper_runtime_iokit_class</string>" Entitlements/CloudCodeVisionHelper.entitlements >/dev/null
+          done
           for vision_system_identity in \
             '<key>application-identifier</key>' \
             '<string>TROLLTROLL.*</string>' \

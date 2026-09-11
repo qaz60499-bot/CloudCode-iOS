@@ -20,18 +20,22 @@
     <true/>
     <key>com.apple.private.security.storage.AppDataContainers</key>
     <true/>
-    <!-- These are the exact graphics/decode clients required by Vision/TextRecognition. -->
+    <!-- Exact graphics/decode/ANE clients observed in the Vision/TextRecognition device path. -->
     <key>com.apple.security.iokit-user-client-class</key>
     <array>
         <string>AppleJPEGDriverUserClient</string>
         <string>IOSurfaceRootUserClient</string>
+        <string>IOSurfaceAcceleratorClient</string>
         <string>AGXDeviceUserClient</string>
+        <string>H11ANEInDirectPathClient</string>
     </array>
     <key>com.apple.security.exception.iokit-user-client-class</key>
     <array>
         <string>AppleJPEGDriverUserClient</string>
         <string>IOSurfaceRootUserClient</string>
+        <string>IOSurfaceAcceleratorClient</string>
         <string>AGXDeviceUserClient</string>
+        <string>H11ANEInDirectPathClient</string>
     </array>
 </dict>
 </plist>
