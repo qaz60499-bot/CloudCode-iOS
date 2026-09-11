@@ -161,6 +161,37 @@ static NSInteger CloudCodeSpawnHelperInternal(
         // persona-99/root; prior iOS 16.6 device evidence showed root-persona Vision traps.
         return -1911;
     }
+
+    // Build 120 proved that an anonymous one-shot CloudCodeRootHelper can have working AXRuntime
+    // symbols/transport yet still receive an empty semantic tree on iOS 16.6. For the two passive
+    // semantic reads, preserve the existing helper API but execute the first (non-root) attempt in
+    // the real System-app host identity. If it cannot produce bounded semantic evidence, return the
+    // same AX-unavailable code so PlatformAdapters performs its existing single root-helper fallback.
+    if (!asRoot
+        && [NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.cloudcode.ios"]
+        && [path.lastPathComponent isEqualToString:@"CloudCodeRootHelper"]
+        && arguments.count > 0) {
+        NSString *command = arguments.firstObject;
+        NSString *hostDiagnostic = nil;
+        NSString *hostPayload = nil;
+        if ([command isEqualToString:@"gui-tree-json"]) {
+            hostPayload = CloudCodeHostAXTreeJSON(&hostDiagnostic);
+        } else if ([command isEqualToString:@"gui-focused-text-input-json"]) {
+            hostPayload = CloudCodeHostAXFocusedTextInputJSON(&hostDiagnostic);
+        }
+        if ([command isEqualToString:@"gui-tree-json"] || [command isEqualToString:@"gui-focused-text-input-json"]) {
+            if (hostPayload.length > 0) {
+                if (standardOutput) { *standardOutput = hostPayload; }
+                if (standardError && hostDiagnostic.length > 0) { *standardError = hostDiagnostic; }
+                return 0;
+            }
+            if (standardError) {
+                *standardError = hostDiagnostic.length > 0 ? hostDiagnostic : @"System-app host AX semantic read unavailable";
+            }
+            return 62;
+        }
+    }
+
     if (timeout <= 0) { timeout = CLOUDCODE_HELPER_DEFAULT_TIMEOUT; }
     // Fail before spawning a real child if we cannot prove that process observation/reaping will
     // use Darwin's waitpid rather than ios_system's virtual-process implementation.
@@ -263,7 +294,7 @@ static NSInteger CloudCodeSpawnHelperInternal(
     } else {
         NSString *command = arguments.firstObject ?: @"";
         NSSet<NSString *> *axLeaseCommands = [NSSet setWithArray:@[
-            @"gui-tree-json", @"gui-ax-probe-json", @"gui-focused-text-json", @"gui-type-base64"
+            @"gui-tree-json", @"gui-ax-probe-json", @"gui-focused-text-input-json", @"gui-type-base64"
         ]];
         BOOL usesAXAutomationLease = [path.lastPathComponent isEqualToString:@"CloudCodeRootHelper"]
             && [axLeaseCommands containsObject:command];

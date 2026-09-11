@@ -42,10 +42,16 @@ extension CloudCodeViewModel {
                     await record(stage, ["command": "gui-probe", "detail": String(describing: result)])
                 case 1, 2:
                     let shot = await Task.detached { EmbeddedRootHelper.guiScreenshot() }.value
-                    var body: [String: Any] = ["command": "screenshot-ocr", "screenshotDetail": shot.detail, "jpegBytes": shot.data?.count ?? 0]
+                    let forcePrecise = iteration % 5 == 2
+                    var body: [String: Any] = [
+                        "command": "screenshot-ocr",
+                        "ocrMode": forcePrecise ? "accurate" : "fast",
+                        "screenshotDetail": shot.detail,
+                        "jpegBytes": shot.data?.count ?? 0
+                    ]
                     if let data = shot.data {
                         try? data.write(to: directory.appendingPathComponent("\(stage).jpg"), options: .atomic)
-                        let observation = await LocalVisionTextObservation.observe(for: data, maximumElements: 48, requiresText: true, forcePrecise: true)
+                        let observation = await LocalVisionTextObservation.observe(for: data, maximumElements: 48, requiresText: true, forcePrecise: forcePrecise)
                         body["ocr"] = observation.payload
                     }
                     await record(stage, body)

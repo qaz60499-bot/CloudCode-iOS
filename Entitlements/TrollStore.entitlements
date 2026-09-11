@@ -26,6 +26,12 @@
     <true/>
     <key>com.apple.private.persona-mgmt</key>
     <true/>
+    <!-- Build 120 fresh device evidence proved the detached AX helper can reach AXRuntime but still
+         receives an empty semantic tree while the System-app host is a real RunningBoard client.
+         Keep only the AX read entitlement on the host; HID/global-capture privileges remain isolated
+         to CloudCodeRootHelper. -->
+    <key>com.apple.accessibility.api</key>
+    <true/>
     <!-- Build 117/118 device syslog proved that Vision/TextRecognition in the platform host is
          denied before recognition because the platform-app sandbox cannot open the three IOKit
          clients below. Keep this list deliberately narrow: these are the exact clients observed in
@@ -45,8 +51,8 @@
         <string>IOSurfaceRootUserClient</string>
         <string>AGXDeviceUserClient</string>
     </array>
-    <!-- GUI-only HID / AX / global-capture entitlements intentionally live on the embedded
-         crash-isolated root helper, not on the SwiftUI host. This keeps ordinary app launch on
-         the smaller entitlement profile while exact GUI operations self-validate in the helper. -->
+    <!-- HID / global-capture entitlements intentionally remain on the embedded crash-isolated root
+         helper. AX semantic reads are the one exception: Build 120 proved the anonymous helper
+         identity itself is the failing boundary, so the host now carries only accessibility.api. -->
 </dict>
 </plist>

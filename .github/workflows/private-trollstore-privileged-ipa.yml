@@ -118,9 +118,10 @@ jobs:
           test -f "$ROOT_HELPER"
           test -f "$VISION_HELPER"
           ldid -SEntitlements/CloudCodeRootHelper.entitlements "$ROOT_HELPER"
-          # Vision OCR intentionally runs outside the privileged GUI execution profile. iOS 16.6
-          # device logs proved that TextRecognition still needs three graphics/decode IOKit clients,
-          # so the ordinary mobile-user helper carries only that narrow entitlement profile.
+          # Vision OCR remains a separate mobile-user child, outside the root GUI/HID profile. Fresh
+          # Build 120 device evidence showed the helper was SIGKILLed before main() when restricted
+          # IOKit entitlements lacked a launchable System-app identity, so its dedicated profile now
+          # carries that mobile System identity plus only the three required graphics/decode clients.
           ldid -SEntitlements/CloudCodeVisionHelper.entitlements "$VISION_HELPER"
           codesign --force --sign - --entitlements Entitlements/CloudCodeVisionHelper.entitlements "$VISION_HELPER"
           # Procursus ldid 2.1.5 can emit an entitlement blob that macOS codesign/Security.framework
@@ -136,10 +137,23 @@ jobs:
             com.apple.private.security.no-sandbox \
             platform-application \
             com.apple.private.security.storage.AppDataContainers \
-            com.apple.private.persona-mgmt; do
+            com.apple.private.persona-mgmt \
+            com.apple.accessibility.api; do
             /usr/libexec/PlistBuddy -c "Print :$required_host_entitlement" "$ENTITLEMENTS" | grep -F 'true'
           done
           rm -f "$ENTITLEMENTS"
+          VISION_ENTITLEMENTS="$RUNNER_TEMP/cloudcode-vision-helper-entitlements.plist"
+          ldid -e "$VISION_HELPER" > "$VISION_ENTITLEMENTS"
+          plutil -lint "$VISION_ENTITLEMENTS" >/dev/null
+          for required_vision_entitlement in \
+            get-task-allow \
+            com.apple.private.security.no-sandbox \
+            platform-application \
+            com.apple.private.security.storage.AppDataContainers; do
+            /usr/libexec/PlistBuddy -c "Print :$required_vision_entitlement" "$VISION_ENTITLEMENTS" | grep -F 'true'
+          done
+          /usr/libexec/PlistBuddy -c 'Print :com.apple.private.security.container-required' "$VISION_ENTITLEMENTS" | grep -F 'false'
+          rm -f "$VISION_ENTITLEMENTS"
           HELPER_ENTITLEMENTS="$RUNNER_TEMP/cloudcode-root-helper-entitlements.plist"
           ldid -e "$ROOT_HELPER" > "$HELPER_ENTITLEMENTS"
           plutil -lint "$HELPER_ENTITLEMENTS" >/dev/null

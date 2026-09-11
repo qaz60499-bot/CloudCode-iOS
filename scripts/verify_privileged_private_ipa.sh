@@ -75,7 +75,8 @@ for key in \
   'com.apple.private.security.no-sandbox' \
   'platform-application' \
   'com.apple.private.security.storage.AppDataContainers' \
-  'com.apple.private.persona-mgmt'; do
+  'com.apple.private.persona-mgmt' \
+  'com.apple.accessibility.api'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$ENTITLEMENTS" 2>/dev/null || true)"
   if [[ "$value" != "true" ]]; then
     echo "FAIL: privileged entitlement missing or false: $key" >&2
@@ -103,7 +104,6 @@ for helper_only in \
   'com.apple.private.hid.client.event-monitor' \
   'com.apple.private.hid.client.service-protected' \
   'com.apple.private.hid.manager.client' \
-  'com.apple.accessibility.api' \
   'com.apple.QuartzCore.cache-asynchronous' \
   'com.apple.QuartzCore.displayable-context' \
   'com.apple.QuartzCore.global-capture' \
@@ -148,9 +148,27 @@ fi
 VISION_ENTITLEMENTS="$TMP_DIR/vision-helper-entitlements.plist"
 ldid -e "$VISION_HELPER" > "$VISION_ENTITLEMENTS"
 plutil -lint "$VISION_ENTITLEMENTS" >/dev/null
-for forbidden_vision_entitlement in 'platform-application' 'com.apple.private.persona-mgmt' 'com.apple.accessibility.api' 'com.apple.private.hid.client.event-dispatch'; do
+for required_vision_entitlement in \
+  'get-task-allow' \
+  'com.apple.private.security.no-sandbox' \
+  'platform-application' \
+  'com.apple.private.security.storage.AppDataContainers'; do
+  value="$(/usr/libexec/PlistBuddy -c "Print :$required_vision_entitlement" "$VISION_ENTITLEMENTS" 2>/dev/null || true)"
+  if [[ "$value" != "true" ]]; then
+    echo "FAIL: Vision helper System-app execution entitlement missing or false: $required_vision_entitlement" >&2
+    exit 12
+  fi
+done
+test "$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$VISION_ENTITLEMENTS")" = 'TROLLTROLL.*'
+test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$VISION_ENTITLEMENTS")" = 'TROLLTROLL'
+vision_container_required="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.private.security.container-required' "$VISION_ENTITLEMENTS" 2>/dev/null || true)"
+if [[ "$vision_container_required" != "false" ]]; then
+  echo "FAIL: Vision helper must remain a no-container mobile child" >&2
+  exit 12
+fi
+for forbidden_vision_entitlement in 'com.apple.private.persona-mgmt' 'com.apple.accessibility.api' 'com.apple.private.hid.client.event-dispatch'; do
   if /usr/libexec/PlistBuddy -c "Print :$forbidden_vision_entitlement" "$VISION_ENTITLEMENTS" >/dev/null 2>&1; then
-    echo "FAIL: lightweight Vision helper unexpectedly carries privileged entitlement: $forbidden_vision_entitlement" >&2
+    echo "FAIL: Vision helper unexpectedly carries root/AX/HID entitlement: $forbidden_vision_entitlement" >&2
     exit 12
   fi
 done
@@ -166,6 +184,13 @@ codesign --verify "$VISION_HELPER"
 VISION_CODESIGN_ENTITLEMENTS="$TMP_DIR/vision-helper-codesign-entitlements.plist"
 codesign -d --entitlements :- "$VISION_HELPER" > "$VISION_CODESIGN_ENTITLEMENTS" 2>/dev/null
 plutil -lint "$VISION_CODESIGN_ENTITLEMENTS" >/dev/null
+for required_vision_entitlement in 'get-task-allow' 'com.apple.private.security.no-sandbox' 'platform-application' 'com.apple.private.security.storage.AppDataContainers'; do
+  value="$(/usr/libexec/PlistBuddy -c "Print :$required_vision_entitlement" "$VISION_CODESIGN_ENTITLEMENTS" 2>/dev/null || true)"
+  if [[ "$value" != "true" ]]; then
+    echo "FAIL: final Vision helper code signature entitlement missing or false: $required_vision_entitlement" >&2
+    exit 12
+  fi
+done
 for vision_iokit_key in 'com.apple.security.iokit-user-client-class' 'com.apple.security.exception.iokit-user-client-class'; do
   for vision_iokit_class in 'AppleJPEGDriverUserClient' 'IOSurfaceRootUserClient' 'AGXDeviceUserClient'; do
     if ! /usr/libexec/PlistBuddy -c "Print :$vision_iokit_key" "$VISION_CODESIGN_ENTITLEMENTS" 2>/dev/null | grep -F "$vision_iokit_class" >/dev/null; then
@@ -180,8 +205,9 @@ plutil -lint "$HELPER_ENTITLEMENTS" >/dev/null
 HELPER_CODESIGN_ENTITLEMENTS="$TMP_DIR/root-helper-codesign-entitlements.plist"
 codesign -d --entitlements :- "$HELPER" > "$HELPER_CODESIGN_ENTITLEMENTS" 2>/dev/null
 plutil -lint "$HELPER_CODESIGN_ENTITLEMENTS" >/dev/null
-# The helper has a dedicated privilege profile: keep GUI-only accessibility/capture
-# entitlements off the SwiftUI host and verify them only on the crash-isolated root helper.
+# The helper keeps HID/capture privileges isolated. Build 121 intentionally shares only
+# com.apple.accessibility.api with the System-app host so semantic AX reads do not depend on an
+# anonymous one-shot helper identity.
 for key in \
   'com.apple.private.security.no-sandbox' \
   'platform-application' \

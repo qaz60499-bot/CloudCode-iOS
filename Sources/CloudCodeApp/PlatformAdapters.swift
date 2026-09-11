@@ -2266,15 +2266,18 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 let scope = object["scope"] as? String ?? "unknown"
                 let nodeCount = (object["nodeCount"] as? NSNumber)?.intValue ?? 0
                 let semanticNodeCount = (object["semanticNodeCount"] as? NSNumber)?.intValue ?? 0
+                let actionableNodeCount = (object["actionableNodeCount"] as? NSNumber)?.intValue ?? 0
                 let bundleID = (object["bundleId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                semanticTreeUsable = nodeCount > 0 && semanticNodeCount > 0
+                semanticTreeUsable = nodeCount > 0 && semanticNodeCount > 0 && actionableNodeCount > 0
                 payload["axScope"] = scope
                 payload["axBackend"] = object["backend"] as? String ?? "unknown"
                 payload["axNodeCount"] = String(nodeCount)
                 payload["axSemanticNodeCount"] = String(semanticNodeCount)
+                payload["axActionableNodeCount"] = String(actionableNodeCount)
                 payload["axForegroundBundleID"] = bundleID
                 payload["perceptionAXSucceeded"] = semanticTreeUsable ? "true" : "false"
-                let complete = semanticTreeUsable && scope == "full_application_tree_opportunistic"
+                let fullApplicationScopes: Set<String> = ["full_application_tree_opportunistic", "full_application_tree_bounded"]
+                let complete = semanticTreeUsable && fullApplicationScopes.contains(scope)
                 payload["perceptionLocalSufficient"] = complete ? "true" : "false"
                 payload["perceptionRemoteVisionRequired"] = complete ? "false" : "true"
                 if !semanticTreeUsable {

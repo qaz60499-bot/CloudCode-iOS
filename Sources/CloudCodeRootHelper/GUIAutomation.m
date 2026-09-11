@@ -1456,6 +1456,30 @@ static NSUInteger CloudCodeAXSemanticNodeCount(NSDictionary *node)
     return count;
 }
 
+static NSUInteger CloudCodeAXActionableNodeCount(NSDictionary *node)
+{
+    if (![node isKindOfClass:NSDictionary.class]) { return 0; }
+    NSString *role = [node[@"role"] isKindOfClass:NSString.class] ? node[@"role"] : @"";
+    BOOL actionable = [node[@"frame"] isKindOfClass:NSDictionary.class] && (
+        [role localizedCaseInsensitiveContainsString:@"Button"] ||
+        [role localizedCaseInsensitiveContainsString:@"TextField"] ||
+        [role localizedCaseInsensitiveContainsString:@"TextArea"] ||
+        [role localizedCaseInsensitiveContainsString:@"TextView"] ||
+        [role localizedCaseInsensitiveContainsString:@"SearchField"] ||
+        [role localizedCaseInsensitiveContainsString:@"Link"] ||
+        [role localizedCaseInsensitiveContainsString:@"Cell"] ||
+        [role localizedCaseInsensitiveContainsString:@"Tab"]
+    );
+    NSUInteger count = actionable ? 1 : 0;
+    NSArray *children = [node[@"children"] isKindOfClass:NSArray.class] ? node[@"children"] : @[];
+    for (id child in children) {
+        if ([child isKindOfClass:NSDictionary.class]) {
+            count += CloudCodeAXActionableNodeCount((NSDictionary *)child);
+        }
+    }
+    return count;
+}
+
 static CloudCodeAXUIElementRef CloudCodeAXFindElementForPid(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef element, pid_t targetPid, NSUInteger depth, NSUInteger *visited)
 {
     if (!element || targetPid <= 0 || !visited || depth > 8 || *visited >= CLOUDCODE_GUI_MAX_TREE_NODES) { return NULL; }
@@ -2020,7 +2044,8 @@ static __attribute__((noreturn)) void CloudCodeFrontmostTreeData(void)
         root = NULL;
     }
     NSUInteger semanticNodeCount = CloudCodeAXSemanticNodeCount(rootNode);
-    if (rootNode && semanticNodeCount == 0) {
+    NSUInteger actionableNodeCount = CloudCodeAXActionableNodeCount(rootNode);
+    if (rootNode && (semanticNodeCount == 0 || actionableNodeCount == 0)) {
         // A callable AXRuntime API is not the same as a usable accessibility tree. On iOS 16.6
         // the detached helper can receive one shell Application root with no foreground controls.
         // Do not report that as a complete tree; spend the already-bounded sampled hit-test fallback.
@@ -2030,9 +2055,11 @@ static __attribute__((noreturn)) void CloudCodeFrontmostTreeData(void)
         NSString *sampledBackend = nil;
         NSDictionary *sampled = CloudCodeAXHitTestTree(runtime, &nodeCount, &sampledPID, &sampledBackend);
         NSUInteger sampledSemanticCount = CloudCodeAXSemanticNodeCount(sampled);
-        if (sampled && sampledSemanticCount > 0) {
+        NSUInteger sampledActionableCount = CloudCodeAXActionableNodeCount(sampled);
+        if (sampled && sampledSemanticCount > 0 && sampledActionableCount > 0) {
             rootNode = sampled;
             semanticNodeCount = sampledSemanticCount;
+            actionableNodeCount = sampledActionableCount;
             if (sampledPID > 0) {
                 pid = sampledPID;
                 NSString *sampledBundleID = CloudCodeBundleIDForPID(sampledPID);
@@ -2042,9 +2069,10 @@ static __attribute__((noreturn)) void CloudCodeFrontmostTreeData(void)
         } else {
             rootNode = nil;
             semanticNodeCount = 0;
+            actionableNodeCount = 0;
         }
     }
-    if (!rootNode || nodeCount == 0 || semanticNodeCount == 0) {
+    if (!rootNode || nodeCount == 0 || semanticNodeCount == 0 || actionableNodeCount == 0) {
         CloudCodePrintAXRuntimeDiagnostic(runtime, "empty-semantic-tree");
         fprintf(stderr, "gui-tree: AX transport responded but no semantic/actionable foreground UI nodes were returned\n");
         // Result is final. Exit before ARC/private AX object teardown can stall the one-shot helper.
@@ -2059,6 +2087,7 @@ static __attribute__((noreturn)) void CloudCodeFrontmostTreeData(void)
         @"automationLeaseActive": @(runtime.automationLeaseActive),
         @"nodeCount": @(nodeCount),
         @"semanticNodeCount": @(semanticNodeCount),
+        @"actionableNodeCount": @(actionableNodeCount),
         @"tree": rootNode
     };
     NSError *error = nil;

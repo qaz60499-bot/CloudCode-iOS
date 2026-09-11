@@ -2,9 +2,25 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Minimal graphics/decode entitlement profile for the ordinary mobile-user Vision helper.
-         These are the exact IOKit clients denied by iOS 16.6 while Vision/TextRecognition was
-         initializing on the user's device. Do not add root/persona/AX/HID privileges here. -->
+    <!-- Build 120 fresh device evidence showed this helper is SIGKILLed before main() emits its
+         startup marker when it carries only restricted IOKit entitlements. Keep it a mobile-user
+         child (no root persona, AX, or HID), but give it the same TrollStore/System-app execution
+         identity needed to make those restricted entitlements launchable on iOS 16.6. -->
+    <key>application-identifier</key>
+    <string>TROLLTROLL.*</string>
+    <key>com.apple.developer.team-identifier</key>
+    <string>TROLLTROLL</string>
+    <key>get-task-allow</key>
+    <true/>
+    <key>com.apple.private.security.no-sandbox</key>
+    <true/>
+    <key>com.apple.private.security.container-required</key>
+    <false/>
+    <key>platform-application</key>
+    <true/>
+    <key>com.apple.private.security.storage.AppDataContainers</key>
+    <true/>
+    <!-- These are the exact graphics/decode clients required by Vision/TextRecognition. -->
     <key>com.apple.security.iokit-user-client-class</key>
     <array>
         <string>AppleJPEGDriverUserClient</string>

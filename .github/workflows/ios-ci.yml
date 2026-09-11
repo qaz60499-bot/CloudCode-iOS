@@ -47,9 +47,11 @@ jobs:
           xcrun clang \
             -fobjc-arc \
             -framework Foundation \
+            -framework CoreGraphics \
             -I Sources/CloudCodeApp \
             Tests/RootHelperBridgeTests/RootHelperBridgeHarness.m \
             Sources/CloudCodeApp/RootHelperBridge.m \
+            Sources/CloudCodeApp/HostAXBridge.m \
             -o "$TEST_BINARY"
           "$TEST_BINARY"
 
@@ -283,7 +285,8 @@ jobs:
             '<key>com.apple.private.security.no-sandbox</key>' \
             '<key>platform-application</key>' \
             '<key>com.apple.private.security.storage.AppDataContainers</key>' \
-            '<key>com.apple.private.persona-mgmt</key>'; do
+            '<key>com.apple.private.persona-mgmt</key>' \
+            '<key>com.apple.accessibility.api</key>'; do
             grep -F "$required_trollstore_host_entitlement" Entitlements/TrollStore.entitlements >/dev/null
           done
           for vision_iokit_key in \
@@ -296,6 +299,26 @@ jobs:
             grep -F "<string>$vision_iokit_class</string>" Entitlements/TrollStore.entitlements >/dev/null
             grep -F "<string>$vision_iokit_class</string>" Entitlements/CloudCodeVisionHelper.entitlements >/dev/null
           done
+          for vision_system_identity in \
+            '<key>application-identifier</key>' \
+            '<string>TROLLTROLL.*</string>' \
+            '<key>com.apple.developer.team-identifier</key>' \
+            '<key>get-task-allow</key>' \
+            '<key>com.apple.private.security.no-sandbox</key>' \
+            '<key>com.apple.private.security.container-required</key>' \
+            '<key>platform-application</key>' \
+            '<key>com.apple.private.security.storage.AppDataContainers</key>'; do
+            grep -F "$vision_system_identity" Entitlements/CloudCodeVisionHelper.entitlements >/dev/null
+          done
+          for vision_forbidden in \
+            '<key>com.apple.private.persona-mgmt</key>' \
+            '<key>com.apple.accessibility.api</key>' \
+            '<key>com.apple.private.hid.client.event-dispatch</key>'; do
+            if grep -F "$vision_forbidden" Entitlements/CloudCodeVisionHelper.entitlements >/dev/null; then
+              echo "FAIL: Vision helper unexpectedly carries root/AX/HID entitlement: $vision_forbidden" >&2
+              exit 1
+            fi
+          done
           grep -F 'ldid -SEntitlements/CloudCodeVisionHelper.entitlements "$VISION_HELPER"' .github/workflows/private-trollstore-privileged-ipa.yml >/dev/null
           grep -F 'codesign --force --sign - --entitlements Entitlements/CloudCodeVisionHelper.entitlements "$VISION_HELPER"' .github/workflows/private-trollstore-privileged-ipa.yml >/dev/null
           if grep -F '<key>com.apple.multitasking.unlimitedassertions</key>' Entitlements/TrollStore.entitlements >/dev/null; then
@@ -303,6 +326,7 @@ jobs:
             exit 1
           fi
           grep -F '<key>com.apple.multitasking.unlimitedassertions</key>' Entitlements/CloudCodeRootHelper.entitlements >/dev/null
+          grep -F '<key>com.apple.accessibility.api</key>' Entitlements/CloudCodeRootHelper.entitlements >/dev/null
           for gui_only_entitlement in \
             '<key>com.apple.hid.system.server-access</key>' \
             '<key>com.apple.hid.system.user-access-service</key>' \
@@ -311,7 +335,6 @@ jobs:
             '<key>com.apple.private.hid.client.event-monitor</key>' \
             '<key>com.apple.private.hid.client.service-protected</key>' \
             '<key>com.apple.private.hid.manager.client</key>' \
-            '<key>com.apple.accessibility.api</key>' \
             '<key>com.apple.QuartzCore.cache-asynchronous</key>' \
             '<key>com.apple.QuartzCore.displayable-context</key>' \
             '<key>com.apple.QuartzCore.global-capture</key>' \
@@ -561,7 +584,13 @@ jobs:
           if 'GUIAutomationFeature.tree.capabilityID' in structured_descriptor:
               raise SystemExit('FAIL: gui.runStructuredPlan regressed to an AX-tree hard capability dependency')
           if 'let isolated = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)' not in adapters or 'let privileged = runSeparated(["gui-tree-json"], privilege: .root, timeout: 1.6)' not in adapters:
-              raise SystemExit('FAIL: structured UI-tree must preserve the bounded mobile AX path plus one passive persona-99 fallback')
+              raise SystemExit('FAIL: structured UI-tree must preserve the bounded mobile AX call plus one passive persona-99 fallback')
+          if 'CloudCodeHostAXTreeJSON(&hostDiagnostic)' not in bridge or 'gui-focused-text-input-json' not in bridge or 'return 62;' not in bridge:
+              raise SystemExit('FAIL: non-root AX bridge must route passive semantic reads through the System-app host and preserve fail-closed fallback')
+          host_ax = Path('Sources/CloudCodeApp/HostAXBridge.m').read_text(encoding='utf-8')
+          for marker in ('AXRuntime.host-system-app', 'CLOUDCODE_HOST_AX_TIMEOUT_SECONDS 0.25f', 'CLOUDCODE_HOST_AX_TOTAL_BUDGET_SECONDS 1.20', 'CLOUDCODE_HOST_AX_MAX_NODES 220', 'semanticNodeCount', 'actionableNodeCount', 'AXUIElementCreateApplication', 'AXUIElementCreateSystemWide', '_AXSetRequestingClient', '_AXSAutomationEnabled', '_AXSSetAutomationEnabled', 'CloudCodeHostAXAcquireAutomationLease', 'CloudCodeHostAXSharedLock', 'tryLock', 'fail-fast to bounded fallback'):
+              if marker not in host_ax:
+                  raise SystemExit(f'FAIL: host AX semantic fast path lost required marker: {marker}')
           if '#define CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS 0.25f' not in gui_text:
               raise SystemExit('FAIL: AX per-request timeout budget must remain fail-fast for detached/mobile AX clients')
           for marker in ('AXUIElementCopyMultipleAttributeValues', 'AXUIElementCopyElementWithParameters', 'typedef CloudCodeAXError (*CloudCodeAXCopyElementAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, float, float);', 'runtime.copyElementAtPosition(systemWide, &candidate, (float)points[index].x, (float)points[index].y)', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic', 'CloudCodeAXApplicationAtScreenPointRoot', 'CloudCodeAXParameterizedElementAtPoint', 'CloudCodeAXNodeLimited', 'CloudCodeAXNodeLimited(runtime, candidate, 0, 0, &localNodeCount)', 'semanticNodeCount'):

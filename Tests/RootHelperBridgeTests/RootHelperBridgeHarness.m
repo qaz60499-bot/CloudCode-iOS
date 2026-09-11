@@ -94,12 +94,12 @@ int main(void)
         Require([[NSFileManager defaultManager] fileExistsAtPath:axReady], @"AX lease fixture must actually start before overlap assertion");
         standardOutput = nil;
         standardError = nil;
-        result = CloudCodeSpawnHelperWithSeparatedOutput(axHelper, @[@"gui-focused-text-json"], NO, 2, &standardOutput, &standardError);
+        result = CloudCodeSpawnHelperWithSeparatedOutput(axHelper, @[@"gui-focused-text-input-json"], NO, 2, &standardOutput, &standardError);
         Require(result < 0 && [standardError containsString:@"serialized AX lease"],
             @"different AX commands must share one admission key and never overlap the system Automation lease");
         Require(dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)) == 0 && axConcurrentResult == 0,
             @"first AX lease helper must finish and release the shared admission key");
-        result = CloudCodeSpawnHelperWithSeparatedOutput(axHelper, @[@"gui-focused-text-json"], NO, 2, &standardOutput, &standardError);
+        result = CloudCodeSpawnHelperWithSeparatedOutput(axHelper, @[@"gui-focused-text-input-json"], NO, 2, &standardOutput, &standardError);
         Require(result == 0, @"serialized AX admission key must be reusable after the prior helper exits");
 
         result = CloudCodeSpawnHelperWithSeparatedOutput(child, @[@"-c", @"kill -KILL $$"], NO, 2, &standardOutput, &standardError);

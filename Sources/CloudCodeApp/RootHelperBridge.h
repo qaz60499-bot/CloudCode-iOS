@@ -4,6 +4,8 @@
 NS_ASSUME_NONNULL_BEGIN
 
 FOUNDATION_EXPORT NSString *CloudCodeVisionProbeJSON(NSData *jpeg, NSString *initializer, NSString *language, BOOL cpuOnly, double pointWidth, double pointHeight);
+FOUNDATION_EXPORT NSString * _Nullable CloudCodeHostAXTreeJSON(NSString * _Nullable * _Nullable diagnostic);
+FOUNDATION_EXPORT NSString * _Nullable CloudCodeHostAXFocusedTextInputJSON(NSString * _Nullable * _Nullable diagnostic);
 
 FOUNDATION_EXPORT NSInteger CloudCodeSpawnRootHelper(NSString *path, NSArray<NSString *> *arguments);
 FOUNDATION_EXPORT NSInteger CloudCodeSpawnRootHelperWithOutput(NSString *path, NSArray<NSString *> *arguments, NSString * _Nullable * _Nullable diagnostic);
