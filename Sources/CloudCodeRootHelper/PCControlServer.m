@@ -27,6 +27,7 @@ extern char **environ;
 #define CLOUDCODE_PC_CONTROL_TOKEN_BYTES 32
 #define CLOUDCODE_PC_CONTROL_MAX_REQUEST_BYTES (64 * 1024)
 #define CLOUDCODE_PC_CONTROL_CHILD_TIMEOUT_MS 5000
+#define CLOUDCODE_PC_CONTROL_INSTALL_TIMEOUT_MS 110000
 
 static NSString * const CloudCodePCControlTokenPath = @"/var/mobile/Media/Downloads/CloudCode-PC-Control.json";
 
@@ -133,9 +134,9 @@ static NSData *CloudCodePCReadRequest(int fd, BOOL *tooLarge)
     return nil;
 }
 
-static int CloudCodePCRunOneShot(const char *executablePath, NSArray<NSString *> *arguments)
+static int CloudCodePCRunOneShotWithTimeout(const char *executablePath, NSArray<NSString *> *arguments, uint64_t timeoutMS)
 {
-    if (!executablePath || !*executablePath || arguments.count == 0) { return 10; }
+    if (!executablePath || !*executablePath || arguments.count == 0 || timeoutMS == 0 || timeoutMS > 120000) { return 10; }
     NSMutableArray<NSString *> *argvStrings = [NSMutableArray arrayWithObject:[NSString stringWithUTF8String:executablePath]];
     [argvStrings addObjectsFromArray:arguments];
     [argvStrings addObject:@"--cloudcode-watchdog-ms=4500"];
@@ -172,7 +173,7 @@ static int CloudCodePCRunOneShot(const char *executablePath, NSArray<NSString *>
     free(argv);
     if (spawnResult != 0 || pid <= 1) { return 71; }
 
-    const double deadline = CloudCodePCMonotonicSeconds() + ((double)CLOUDCODE_PC_CONTROL_CHILD_TIMEOUT_MS / 1000.0);
+    const double deadline = CloudCodePCMonotonicSeconds() + ((double)timeoutMS / 1000.0);
     int status = 0;
     for (;;) {
         pid_t waited = waitpid(pid, &status, WNOHANG);
@@ -189,6 +190,24 @@ static int CloudCodePCRunOneShot(const char *executablePath, NSArray<NSString *>
         }
         usleep(10000);
     }
+}
+
+static int CloudCodePCRunOneShot(const char *executablePath, NSArray<NSString *> *arguments)
+{
+    return CloudCodePCRunOneShotWithTimeout(executablePath, arguments, CLOUDCODE_PC_CONTROL_CHILD_TIMEOUT_MS);
+}
+
+static BOOL CloudCodePCIsSafeInstallRequest(NSString *path, NSString *bundleID, NSString *build)
+{
+    if (!path.length || !bundleID.length || !build.length) { return NO; }
+    if (path.length > 4096 || bundleID.length > 255 || build.length > 32) { return NO; }
+    if (![path hasPrefix:@"/var/mobile/Media/Downloads/"] || ![path.lowercaseString hasSuffix:@".ipa"]) { return NO; }
+    if ([path containsString:@".."] || [path containsString:@"\n"] || [path containsString:@"\r"]) { return NO; }
+    NSCharacterSet *bundleAllowed = [NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_"];
+    if ([[bundleID stringByTrimmingCharactersInSet:bundleAllowed] length] != 0) { return NO; }
+    NSCharacterSet *buildAllowed = NSCharacterSet.decimalDigitCharacterSet;
+    if ([[build stringByTrimmingCharactersInSet:buildAllowed] length] != 0) { return NO; }
+    return YES;
 }
 
 static NSDictionary *CloudCodePCActionResponse(const char *executablePath, NSDictionary *request, BOOL *shutdown)
@@ -260,11 +279,21 @@ static NSDictionary *CloudCodePCActionResponse(const char *executablePath, NSDic
         NSData *textData = [text dataUsingEncoding:NSUTF8StringEncoding];
         NSString *encoded = [textData base64EncodedStringWithOptions:0];
         arguments = @[@"gui-type-base64", encoded];
+    } else if ([operation isEqualToString:@"install-ipa"]) {
+        NSString *path = [request[@"path"] isKindOfClass:NSString.class] ? request[@"path"] : nil;
+        NSString *bundleID = [request[@"bundleID"] isKindOfClass:NSString.class] ? request[@"bundleID"] : nil;
+        NSString *build = [request[@"build"] isKindOfClass:NSString.class] ? request[@"build"] : nil;
+        if (!CloudCodePCIsSafeInstallRequest(path, bundleID, build)) {
+            return @{@"ok": @NO, @"op": operation, @"error": @"invalid-install-request"};
+        }
+        arguments = @[@"install-ipa", path, bundleID, build];
     } else {
         return @{@"ok": @NO, @"op": operation, @"error": @"unsupported-op"};
     }
 
-    int code = CloudCodePCRunOneShot(executablePath, arguments);
+    int code = [operation isEqualToString:@"install-ipa"]
+        ? CloudCodePCRunOneShotWithTimeout(executablePath, arguments, CLOUDCODE_PC_CONTROL_INSTALL_TIMEOUT_MS)
+        : CloudCodePCRunOneShot(executablePath, arguments);
     return @{
         @"ok": @(code == 0),
         @"op": operation,
