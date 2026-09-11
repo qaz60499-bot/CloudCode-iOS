@@ -3,18 +3,24 @@
 #import <errno.h>
 #import <mach/mach.h>
 #import <os/proc.h>
+#import <TargetConditionals.h>
 #import <unistd.h>
 
 // Small shared evidence helpers, used only by explicit probes. They neither grant privileges
 // nor change process class. Unknown OS state stays unknown rather than inferred from UID.
 static NSDictionary *CCPerceptionProcessEvidence(NSString *role) {
+#if TARGET_OS_OSX && !TARGET_OS_MACCATALYST
+    id availableProcessMemory = NSNull.null;
+#else
+    id availableProcessMemory = @(os_proc_available_memory());
+#endif
     NSMutableDictionary *record = [@{
         @"processName": NSProcessInfo.processInfo.processName,
         @"pid": @(getpid()), @"parentPID": @(getppid()),
         @"uid": @(getuid()), @"effectiveUID": @(geteuid()), @"gid": @(getgid()),
         @"processRole": role, @"osVersion": NSProcessInfo.processInfo.operatingSystemVersionString,
         @"runningBoardState": @"requires_correlated_syslog",
-        @"physicalFootprintBytes": NSNull.null, @"availableProcessMemoryBytes": @(os_proc_available_memory())
+        @"physicalFootprintBytes": NSNull.null, @"availableProcessMemoryBytes": availableProcessMemory
     } mutableCopy];
     task_vm_info_data_t vm = {0};
     mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
