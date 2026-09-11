@@ -33,7 +33,7 @@ enum PCControlBootstrap {
                 helperURL.path,
                 ["pc-control-server-start"],
                 true,
-                4.0,
+                7.0,
                 &standardOutput,
                 &standardError
             )

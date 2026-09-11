@@ -494,6 +494,11 @@ jobs:
           for marker in ('assertionStillValid', 'sendBool0(assertion, validSelector)', 'if (!assertionStillValid) { break; }'):
               if marker not in background_section:
                   raise SystemExit(f'FAIL: background assertion worker can outlive an invalid BKS assertion: {marker}')
+
+          pc_control = Path('Sources/CloudCodeRootHelper/PCControlServer.m').read_text(encoding='utf-8')
+          for marker in ('CloudCodePCStartBackgroundGuardian', 'background-assert-worker', 'CloudCodePCStartBackgroundGuardian(executablePath, getpid())', 'signal(SIGHUP, SIG_IGN)', 'setsid()', 'poll(&pollFD, 1, 5000)', 'CloudCodePCStopBackgroundGuardian(guardianPID)'):
+              if marker not in pc_control:
+                  raise SystemExit(f'FAIL: PC-control server lost detached background-survival guardrail: {marker}')
           for marker in ('enumerate-json', 'probe-filesystem-json', 'probe-launch', 'probe-uninstall', 'probe-ipa-install', 'install-ipa', 'trollstorehelper', 'trollstore-install: verified', 'is-installed', 'launch', 'uninstall', 'cleanup-unregistered', 'MCMMetadataIdentifier', 'BundleFilesystem(read-only-discovery)', 'BundlePathForIdentifierFromFilesystem', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-screenshot-file', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-navigate-back', 'gui-type-base64', 'background-assert-worker', 'background-assert-start', 'background-assert-status', 'background-assert-stop', 'BKSProcessAssertion', 'CloudCode.BackgroundAgent'):
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: root helper command missing: {marker}')

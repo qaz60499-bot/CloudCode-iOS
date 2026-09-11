@@ -343,6 +343,69 @@ static BOOL CloudCodePCPingExisting(NSString *token)
     return [response[@"ok"] boolValue] && [response[@"protocol"] integerValue] == CLOUDCODE_PC_CONTROL_PROTOCOL;
 }
 
+static pid_t CloudCodePCStartBackgroundGuardian(const char *executablePath, pid_t targetPID)
+{
+    if (!executablePath || !*executablePath || targetPID <= 1) { return -1; }
+
+    int handshake[2] = {-1, -1};
+    if (pipe(handshake) != 0) { return -1; }
+
+    char targetArg[32] = {0};
+    char handshakeArg[32] = {0};
+    snprintf(targetArg, sizeof(targetArg), "%d", targetPID);
+    snprintf(handshakeArg, sizeof(handshakeArg), "%d", handshake[1]);
+    const char *guardianArgv[] = {
+        executablePath,
+        "background-assert-worker",
+        targetArg,
+        handshakeArg,
+        NULL
+    };
+
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        close(handshake[0]); close(handshake[1]);
+        return -1;
+    }
+    (void)posix_spawn_file_actions_addclose(&actions, handshake[0]);
+
+    pid_t guardianPID = 0;
+    int spawnResult = posix_spawn(&guardianPID, executablePath, &actions, NULL, (char * const *)guardianArgv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(handshake[1]);
+    handshake[1] = -1;
+    if (spawnResult != 0 || guardianPID <= 1) {
+        close(handshake[0]);
+        return -1;
+    }
+
+    struct pollfd pollFD = {.fd = handshake[0], .events = POLLIN | POLLHUP, .revents = 0};
+    int pollResult = 0;
+    do {
+        pollResult = poll(&pollFD, 1, 2500);
+    } while (pollResult < 0 && errno == EINTR);
+    uint8_t acquired = 0;
+    ssize_t count = pollResult > 0 ? read(handshake[0], &acquired, sizeof(acquired)) : -1;
+    close(handshake[0]);
+    if (count == sizeof(acquired) && acquired == 1) { return guardianPID; }
+
+    (void)kill(guardianPID, SIGTERM);
+    return -1;
+}
+
+static void CloudCodePCStopBackgroundGuardian(pid_t guardianPID)
+{
+    if (guardianPID <= 1) { return; }
+    (void)kill(guardianPID, SIGTERM);
+    int status = 0;
+    for (int attempt = 0; attempt < 20; attempt++) {
+        pid_t waited = waitpid(guardianPID, &status, WNOHANG);
+        if (waited == guardianPID || (waited < 0 && errno == ECHILD)) { return; }
+        if (waited < 0 && errno != EINTR) { return; }
+        usleep(10000);
+    }
+}
+
 int CloudCodePCControlServerStart(const char *executablePath)
 {
     if (getuid() != 0 || geteuid() != 0 || !executablePath || !*executablePath) { return 11; }
@@ -390,7 +453,7 @@ int CloudCodePCControlServerStart(const char *executablePath)
     }
 
     struct pollfd pollFD = {.fd = handshake[0], .events = POLLIN | POLLHUP, .revents = 0};
-    int pollResult = poll(&pollFD, 1, 2500);
+    int pollResult = poll(&pollFD, 1, 5000);
     uint8_t ready = 0;
     ssize_t count = pollResult > 0 ? read(handshake[0], &ready, sizeof(ready)) : -1;
     close(handshake[0]);
@@ -419,6 +482,8 @@ int CloudCodePCControlServerWorker(const char *executablePath, NSString *token, 
     }
 
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGHUP, SIG_IGN);
+    (void)setsid();
     int serverFD = socket(AF_INET, SOCK_STREAM, 0);
     if (serverFD < 0) {
         const uint8_t failed = 0; (void)write(handshakeFD, &failed, 1); close(handshakeFD);
@@ -434,9 +499,21 @@ int CloudCodePCControlServerWorker(const char *executablePath, NSString *token, 
     address.sin_family = AF_INET;
     address.sin_port = htons(CLOUDCODE_PC_CONTROL_PORT);
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(serverFD, (struct sockaddr *)&address, sizeof(address)) != 0 || listen(serverFD, 4) != 0 || !CloudCodePCWriteTokenRecord(token)) {
+    if (bind(serverFD, (struct sockaddr *)&address, sizeof(address)) != 0 || listen(serverFD, 4) != 0) {
         const uint8_t failed = 0; (void)write(handshakeFD, &failed, 1); close(handshakeFD); close(serverFD);
         return 81;
+    }
+
+    // The PC-control worker must remain schedulable after Cloud Code leaves the foreground.
+    // Reuse the already-proven BKS/RunningBoard assertion worker and target this server PID itself.
+    // This keeps the authenticated loopback server independent of the SwiftUI app lifecycle while
+    // preserving a bounded cleanup path: the guardian exits when this worker exits, and we also
+    // stop it explicitly on normal shutdown.
+    pid_t guardianPID = CloudCodePCStartBackgroundGuardian(executablePath, getpid());
+    if (guardianPID <= 1 || !CloudCodePCWriteTokenRecord(token)) {
+        CloudCodePCStopBackgroundGuardian(guardianPID);
+        const uint8_t failed = 0; (void)write(handshakeFD, &failed, 1); close(handshakeFD); close(serverFD);
+        return 82;
     }
 
     const uint8_t ready = 1;
@@ -492,5 +569,6 @@ int CloudCodePCControlServerWorker(const char *executablePath, NSString *token, 
     if ([currentToken isEqualToString:token]) {
         (void)unlink(CloudCodePCControlTokenPath.fileSystemRepresentation);
     }
+    CloudCodePCStopBackgroundGuardian(guardianPID);
     return 0;
 }
