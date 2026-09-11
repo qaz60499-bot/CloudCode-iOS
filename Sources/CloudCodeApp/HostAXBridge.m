@@ -2,7 +2,6 @@
 
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
-#import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <math.h>
 #import <objc/message.h>
@@ -626,10 +625,26 @@ static CloudCodeHostAXUIElementRef CloudCodeHostAXContextElementAtPoint(
     return candidate;
 }
 
+static CGSize CloudCodeHostAXScreenSize(void)
+{
+    Class screenClass = NSClassFromString(@"UIScreen");
+    SEL mainScreenSelector = NSSelectorFromString(@"mainScreen");
+    SEL boundsSelector = NSSelectorFromString(@"bounds");
+    if (!screenClass || ![screenClass respondsToSelector:mainScreenSelector]) { return CGSizeZero; }
+    id (*sendObject)(id, SEL) = (void *)objc_msgSend;
+    id screen = nil;
+    @try { screen = sendObject(screenClass, mainScreenSelector); } @catch (__unused NSException *exception) { screen = nil; }
+    if (!screen || ![screen respondsToSelector:boundsSelector]) { return CGSizeZero; }
+    CGRect (*sendRect)(id, SEL) = (void *)objc_msgSend;
+    CGRect bounds = CGRectZero;
+    @try { bounds = sendRect(screen, boundsSelector); } @catch (__unused NSException *exception) { bounds = CGRectZero; }
+    return bounds.size;
+}
+
 static NSDictionary *CloudCodeHostAXSampledTree(CloudCodeHostAXRuntime runtime, pid_t expectedPID, CFAbsoluteTime deadline, NSUInteger *nodeCountOut, NSString **routeOut)
 {
     if (expectedPID <= 0 || !runtime.createSystemWide || (!runtime.copyElementAtPosition && !runtime.copyElementWithParameters && !runtime.copyElementUsingContextIdAtPosition)) { return nil; }
-    CGSize size = UIScreen.mainScreen.bounds.size;
+    CGSize size = CloudCodeHostAXScreenSize();
     if (size.width <= 1 || size.height <= 1) { return nil; }
     CloudCodeHostAXUIElementRef systemWide = NULL;
     @try { systemWide = runtime.createSystemWide(); } @catch (__unused NSException *exception) { systemWide = NULL; }
