@@ -538,11 +538,30 @@ static pid_t CloudCodeHostPIDForBundlePath(NSString *bundlePath)
     NSString *prefix = [canonicalBundlePath stringByAppendingString:@"/"];
     for (int index = 0; index < count && index < 4096; index++) {
         pid_t pid = pids[index];
-        if (pid <= 1 || pid == getpid()) { continue; }
+        // When CloudCode itself is frontmost, the System-app host is the process we want. Build
+        // 123 incorrectly filtered getpid() here and therefore reported a real foreground bundle
+        // with pid=0. Bundle-path matching below is already the identity guard.
+        if (pid <= 1) { continue; }
         char buffer[4096] = {0};
         if (pidPath(pid, buffer, sizeof(buffer)) <= 0) { continue; }
         NSString *path = CloudCodeHostCanonicalProcessPath([NSString stringWithUTF8String:buffer]);
         if ([path isEqualToString:canonicalBundlePath] || [path hasPrefix:prefix]) { return pid; }
+    }
+    return 0;
+}
+
+static pid_t CloudCodeHostPIDForBundleID(NSString *bundleID)
+{
+    if (bundleID.length == 0) { return 0; }
+    CloudCodeHostProcListAllPidsFn listPids = (CloudCodeHostProcListAllPidsFn)dlsym(RTLD_DEFAULT, "proc_listallpids");
+    if (!listPids) { return 0; }
+    pid_t pids[4096] = {0};
+    int count = listPids(pids, sizeof(pids));
+    for (int index = 0; index < count && index < 4096; index++) {
+        pid_t pid = pids[index];
+        if (pid <= 1) { continue; }
+        NSString *candidate = CloudCodeHostBundleIDForPID(pid);
+        if ([candidate isEqualToString:bundleID]) { return pid; }
     }
     return 0;
 }
@@ -789,6 +808,93 @@ static CGSize CloudCodeHostAXScreenSize(void)
     CGRect bounds = CGRectZero;
     @try { bounds = sendRect(screen, boundsSelector); } @catch (__unused NSException *exception) { bounds = CGRectZero; }
     return bounds.size;
+}
+
+// ios-mcp resolves the visible application through two parameterized AX queries rather than
+// trusting process-local FrontBoard state: point+display -> context id (0x16573), then
+// context id -> pid (0x16574). Keep this as a bounded identity fallback for the System-app host.
+// If SpringBoardServices already supplied a frontmost bundle id, require the resolved pid to map
+// back to the same bundle so a host/helper-local AX context cannot silently become the target.
+static pid_t CloudCodeHostAXPIDAtScreenContext(
+    CloudCodeHostAXRuntime runtime,
+    CloudCodeHostAXUIElementRef systemWide,
+    NSString *expectedBundleID,
+    uint32_t *contextIDOut
+) {
+    if (!systemWide || !runtime.copyParameterizedAttributeValue) { return 0; }
+    CGSize size = CloudCodeHostAXScreenSize();
+    if (size.width <= 1 || size.height <= 1) { return 0; }
+    const CGPoint points[] = {
+        {size.width * 0.50, size.height * 0.50},
+        {size.width * 0.50, size.height * 0.25},
+        {size.width * 0.50, size.height * 0.75}
+    };
+    for (NSUInteger pointIndex = 0; pointIndex < sizeof(points) / sizeof(points[0]); pointIndex++) {
+        CGPoint point = points[pointIndex];
+        CFTypeRef axPoint = NULL;
+        if (runtime.valueCreate) {
+            @try { axPoint = runtime.valueCreate(1, &point); } @catch (__unused NSException *exception) { axPoint = NULL; }
+        }
+        id pointValue = axPoint ? (__bridge id)axPoint : CloudCodeHostAXPointValue(point);
+        for (NSNumber *displayID in @[@1, @0]) {
+            NSArray *pointParameter = @[pointValue, displayID];
+            CFTypeRef contextValue = NULL;
+            CloudCodeHostAXError contextCode = -1;
+            @try {
+                contextCode = runtime.copyParameterizedAttributeValue(
+                    systemWide,
+                    (CFStringRef)(uintptr_t)0x16573,
+                    (__bridge CFTypeRef)pointParameter,
+                    &contextValue
+                );
+            } @catch (__unused NSException *exception) {
+                contextCode = -1;
+                contextValue = NULL;
+            }
+            uint32_t contextID = 0;
+            if (contextCode == 0 && contextValue) {
+                id bridged = (__bridge id)contextValue;
+                if ([bridged respondsToSelector:@selector(unsignedIntValue)]) {
+                    contextID = [bridged unsignedIntValue];
+                }
+            }
+            if (contextValue) { CFRelease(contextValue); }
+            if (contextID == 0) { continue; }
+
+            NSDictionary *pidParameter = @{@"contextId": @(contextID)};
+            CFTypeRef pidValue = NULL;
+            CloudCodeHostAXError pidCode = -1;
+            @try {
+                pidCode = runtime.copyParameterizedAttributeValue(
+                    systemWide,
+                    (CFStringRef)(uintptr_t)0x16574,
+                    (__bridge CFTypeRef)pidParameter,
+                    &pidValue
+                );
+            } @catch (__unused NSException *exception) {
+                pidCode = -1;
+                pidValue = NULL;
+            }
+            pid_t candidatePID = 0;
+            if (pidCode == 0 && pidValue) {
+                id bridged = (__bridge id)pidValue;
+                if ([bridged respondsToSelector:@selector(intValue)]) {
+                    candidatePID = (pid_t)[bridged intValue];
+                }
+            }
+            if (pidValue) { CFRelease(pidValue); }
+            if (candidatePID <= 1) { continue; }
+            if (expectedBundleID.length > 0) {
+                NSString *candidateBundle = CloudCodeHostBundleIDForPID(candidatePID);
+                if (![candidateBundle isEqualToString:expectedBundleID]) { continue; }
+            }
+            if (contextIDOut) { *contextIDOut = contextID; }
+            if (axPoint) { CFRelease(axPoint); }
+            return candidatePID;
+        }
+        if (axPoint) { CFRelease(axPoint); }
+    }
+    return 0;
 }
 
 static NSDictionary *CloudCodeHostAXSampledTree(CloudCodeHostAXRuntime runtime, pid_t expectedPID, CFAbsoluteTime deadline, NSUInteger *nodeCountOut, NSString **routeOut)
@@ -1220,25 +1326,35 @@ NSString *CloudCodeHostAXProbeJSON(NSString * _Nullable * _Nullable diagnostic)
 
     NSString *bundleID = CloudCodeHostFrontmostBundleID();
     NSString *bundlePath = CloudCodeHostBundlePath(bundleID);
-    pid_t foregroundPID = CloudCodeHostPIDForBundlePath(bundlePath);
+    pid_t foregroundPID = CloudCodeHostPIDForBundleID(bundleID);
+    NSString *pidResolver = @"SBSCopyDisplayIdentifierForProcessID scan";
+    if (foregroundPID <= 0) {
+        foregroundPID = CloudCodeHostPIDForBundlePath(bundlePath);
+        pidResolver = @"LSApplicationProxy.bundleURL -> proc_pidpath fallback";
+    }
+    CloudCodeHostAXUIElementRef systemWide = NULL;
+    if (runtime.createSystemWide && CFAbsoluteTimeGetCurrent() < deadline) {
+        @try { systemWide = runtime.createSystemWide(); } @catch (__unused NSException *exception) { systemWide = NULL; }
+        if (systemWide && runtime.setTimeout) { @try { runtime.setTimeout(systemWide, CLOUDCODE_HOST_AX_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {} }
+    }
+    uint32_t foregroundContextID = 0;
+    if (foregroundPID <= 0 && systemWide && CFAbsoluteTimeGetCurrent() < deadline) {
+        foregroundPID = CloudCodeHostAXPIDAtScreenContext(runtime, systemWide, bundleID, &foregroundContextID);
+        if (foregroundPID > 0) { pidResolver = @"AX parameterized point->context->pid fallback"; }
+    }
     result[@"foreground"] = @{
         @"bundleId": bundleID ?: @"",
         @"bundlePathResolved": @(bundlePath.length > 0),
         @"pid": @(foregroundPID),
-        @"resolver": @"SBSCopyFrontmostApplicationDisplayIdentifier -> LSApplicationProxy.bundleURL -> proc_pidpath",
+        @"resolver": pidResolver,
+        @"contextId": @(foregroundContextID),
         @"resolved": @(bundleID.length > 0 && foregroundPID > 0),
-        @"firstFailure": bundleID.length == 0 ? @"bundle-id" : (bundlePath.length == 0 ? @"bundle-path" : (foregroundPID <= 0 ? @"pid" : @"none"))
+        @"firstFailure": bundleID.length == 0 ? @"bundle-id" : (foregroundPID <= 0 ? @"pid" : @"none")
     };
 
     result[@"axFrontBoard"] = CloudCodeHostAXFrontBoardEvidence(deadline);
     if (CFAbsoluteTimeGetCurrent() < deadline) {
         result[@"fbsWorkspace"] = CloudCodeHostAXFBSWorkspaceEvidence(bundleID, foregroundPID, deadline);
-    }
-
-    CloudCodeHostAXUIElementRef systemWide = NULL;
-    if (runtime.createSystemWide && CFAbsoluteTimeGetCurrent() < deadline) {
-        @try { systemWide = runtime.createSystemWide(); } @catch (__unused NSException *exception) { systemWide = NULL; }
-        if (systemWide && runtime.setTimeout) { @try { runtime.setTimeout(systemWide, CLOUDCODE_HOST_AX_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {} }
     }
     NSMutableDictionary *systemWideEvidence = [NSMutableDictionary dictionary];
     systemWideEvidence[@"created"] = @(systemWide != NULL);
@@ -1367,11 +1483,30 @@ NSString *CloudCodeHostAXTreeJSON(NSString * _Nullable * _Nullable diagnostic)
     }
     CloudCodeHostAXAutomationLease automationLease __attribute__((cleanup(CloudCodeHostAXAutomationLeaseCleanup))) = CloudCodeHostAXAcquireAutomationLease(runtime);
 
+    CFAbsoluteTime deadline = started + CLOUDCODE_HOST_AX_TOTAL_BUDGET_SECONDS;
     NSString *bundleID = CloudCodeHostFrontmostBundleID();
     NSString *bundlePath = CloudCodeHostBundlePath(bundleID);
-    pid_t pid = CloudCodeHostPIDForBundlePath(bundlePath);
+    pid_t pid = CloudCodeHostPIDForBundleID(bundleID);
+    NSString *route = @"frontmost-bundle-id";
+    if (pid <= 0) {
+        pid = CloudCodeHostPIDForBundlePath(bundlePath);
+        route = @"frontmost-bundle-path";
+    }
+    if (pid <= 0 && runtime.createSystemWide && CFAbsoluteTimeGetCurrent() < deadline) {
+        CloudCodeHostAXUIElementRef identitySeed = NULL;
+        @try { identitySeed = runtime.createSystemWide(); } @catch (__unused NSException *exception) { identitySeed = NULL; }
+        if (identitySeed && runtime.setTimeout) {
+            @try { runtime.setTimeout(identitySeed, CLOUDCODE_HOST_AX_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {}
+        }
+        uint32_t contextID = 0;
+        pid_t contextPID = CloudCodeHostAXPIDAtScreenContext(runtime, identitySeed, bundleID, &contextID);
+        if (identitySeed) { CFRelease(identitySeed); }
+        if (contextPID > 0) {
+            pid = contextPID;
+            route = @"parameterized-screen-context-pid";
+        }
+    }
     CloudCodeHostAXUIElementRef root = NULL;
-    NSString *route = @"frontmost-bundle";
     if (pid > 0) {
         if (runtime.addAssociatedPid) {
             runtime.addAssociatedPid(getpid(), pid, 0);
@@ -1399,7 +1534,6 @@ NSString *CloudCodeHostAXTreeJSON(NSString * _Nullable * _Nullable diagnostic)
     }
 
     NSUInteger nodeCount = 0;
-    CFAbsoluteTime deadline = started + CLOUDCODE_HOST_AX_TOTAL_BUDGET_SECONDS;
     NSDictionary *tree = CloudCodeHostAXNode(runtime, root, 0, &nodeCount, deadline);
     CFRelease(root);
     NSUInteger semanticNodeCount = CloudCodeHostAXSemanticCount(tree);

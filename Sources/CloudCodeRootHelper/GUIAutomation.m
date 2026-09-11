@@ -1186,6 +1186,22 @@ static pid_t CloudCodePIDForBundlePath(NSString *bundlePath)
     return 0;
 }
 
+static pid_t CloudCodePIDForBundleIdentifier(NSString *bundleID)
+{
+    if (bundleID.length == 0) { return 0; }
+    CloudCodeProcListAllPidsFn listPids = (CloudCodeProcListAllPidsFn)dlsym(RTLD_DEFAULT, "proc_listallpids");
+    if (!listPids) { return 0; }
+    pid_t pids[4096] = {0};
+    int count = listPids(pids, sizeof(pids));
+    for (int index = 0; index < count && index < 4096; index++) {
+        pid_t pid = pids[index];
+        if (pid <= 1 || pid == getpid()) { continue; }
+        NSString *candidate = CloudCodeBundleIDForPID(pid);
+        if ([candidate isEqualToString:bundleID]) { return pid; }
+    }
+    return 0;
+}
+
 static BOOL CloudCodePIDIsLiveProcess(pid_t pid)
 {
     if (pid <= 1) { return NO; }
@@ -1388,6 +1404,169 @@ static NSDictionary *CloudCodeFrameDictionary(CloudCodeAXRuntime runtime, id val
     }
     if (!ok || !isfinite(frame.origin.x) || !isfinite(frame.origin.y) || !isfinite(frame.size.width) || !isfinite(frame.size.height)) { return nil; }
     return @{@"x": @(frame.origin.x), @"y": @(frame.origin.y), @"width": @(frame.size.width), @"height": @(frame.size.height)};
+}
+
+static id CloudCodeAXAuditClientLease = nil;
+
+static id CloudCodeAXAuditSafeValue(id object, NSString *key)
+{
+    if (!object || key.length == 0) { return nil; }
+    @try { return [object valueForKey:key]; }
+    @catch (__unused NSException *exception) { return nil; }
+}
+
+static id CloudCodeAXAuditPrimaryElement(NSString **detailOut)
+{
+    if (detailOut) { *detailOut = nil; }
+    void *accessibilityUI = CloudCodeOpenFramework(@[
+        @"/System/Library/PrivateFrameworks/AccessibilityUI.framework/AccessibilityUI",
+        @"/rootfs/System/Library/PrivateFrameworks/AccessibilityUI.framework/AccessibilityUI"
+    ]);
+    Class clientClass = NSClassFromString(@"AXUIClient");
+    Class elementClass = NSClassFromString(@"AXElement");
+    SEL initSelector = NSSelectorFromString(@"initWithIdentifier:serviceBundleName:");
+    SEL primarySelector = NSSelectorFromString(@"primaryApp");
+    if (!accessibilityUI || !clientClass || !elementClass
+        || ![clientClass instancesRespondToSelector:initSelector]
+        || ![elementClass respondsToSelector:primarySelector]) {
+        if (detailOut) { *detailOut = @"AccessibilityUI AXAudit broker classes/selectors unavailable"; }
+        return nil;
+    }
+    @try {
+        if (!CloudCodeAXAuditClientLease) {
+            id allocated = ((id (*)(id, SEL))objc_msgSend)(clientClass, sel_registerName("alloc"));
+            CloudCodeAXAuditClientLease = ((id (*)(id, SEL, id, id))objc_msgSend)(
+                allocated,
+                initSelector,
+                @"AXAuditAXUIClientIdentifier",
+                @"AXAuditAXUIService"
+            );
+        }
+        if (!CloudCodeAXAuditClientLease) {
+            if (detailOut) { *detailOut = @"AXAudit AXUIClient initialization returned nil"; }
+            return nil;
+        }
+        id primary = ((id (*)(id, SEL))objc_msgSend)(elementClass, primarySelector);
+        if (!primary && detailOut) { *detailOut = @"AXAudit AXElement.primaryApp returned nil"; }
+        return primary;
+    } @catch (NSException *exception) {
+        if (detailOut) { *detailOut = [NSString stringWithFormat:@"AXAudit broker exception=%@", exception.name]; }
+        return nil;
+    }
+}
+
+static NSString *CloudCodeAXAuditRoleForTraits(uint64_t traits)
+{
+    if ((traits & 0x400ULL) != 0) { return @"AXSearchField"; }
+    if ((traits & 0x40000ULL) != 0) { return @"AXTextField"; }
+    if ((traits & 0x1ULL) != 0) { return @"AXButton"; }
+    if ((traits & 0x2ULL) != 0) { return @"AXLink"; }
+    if ((traits & 0x8000ULL) != 0) { return @"AXTab"; }
+    if ((traits & 0x4ULL) != 0) { return @"AXImage"; }
+    if ((traits & 0x40ULL) != 0) { return @"AXStaticText"; }
+    return @"AXElement";
+}
+
+static NSDictionary *CloudCodeAXAuditElementNode(CloudCodeAXRuntime runtime, id element)
+{
+    if (!element) { return nil; }
+    NSMutableDictionary *node = [NSMutableDictionary dictionary];
+    id traitsRaw = CloudCodeAXAuditSafeValue(element, @"traits");
+    NSNumber *traitsNumber = [traitsRaw isKindOfClass:NSNumber.class] ? traitsRaw : nil;
+    uint64_t traits = traitsNumber.unsignedLongLongValue;
+    id uiElement = CloudCodeAXAuditSafeValue(element, @"uiElement");
+
+    NSString *role = nil;
+    if (uiElement) {
+        role = CloudCodeBoundedString(CloudCodeAXCopy(
+            runtime,
+            (CloudCodeAXUIElementRef)(__bridge CFTypeRef)uiElement,
+            runtime.attributeElementType ?: CFSTR("AXRole")
+        ));
+    }
+    node[@"role"] = role.length > 0 ? role : CloudCodeAXAuditRoleForTraits(traits);
+
+    for (NSString *key in @[@"label", @"value", @"identifier"]) {
+        NSString *text = CloudCodeBoundedString(CloudCodeAXAuditSafeValue(element, key));
+        if (text.length > 0) { node[key] = text; }
+    }
+    NSString *bundleID = CloudCodeBoundedString(CloudCodeAXAuditSafeValue(element, @"bundleId"));
+    if (bundleID.length > 0) { node[@"bundleId"] = bundleID; }
+    id pidValue = CloudCodeAXAuditSafeValue(element, @"pid");
+    if ([pidValue isKindOfClass:NSNumber.class]) { node[@"pid"] = pidValue; }
+    if (traitsNumber) { node[@"traits"] = traitsNumber; }
+
+    NSDictionary *frame = CloudCodeFrameDictionary(runtime, CloudCodeAXAuditSafeValue(element, @"frame"));
+    if (!frame && uiElement) {
+        id frameValue = CloudCodeAXCopy(runtime, (CloudCodeAXUIElementRef)(__bridge CFTypeRef)uiElement, runtime.attributeFrame ?: CFSTR("AXFrame"));
+        frame = CloudCodeFrameDictionary(runtime, frameValue);
+    }
+    if (frame) { node[@"frame"] = frame; }
+    return node;
+}
+
+static NSDictionary *CloudCodeAXAuditBrokerTree(
+    CloudCodeAXRuntime runtime,
+    NSUInteger *nodeCountOut,
+    pid_t *pidOut,
+    NSString **bundleIDOut,
+    NSString **detailOut
+)
+{
+    if (nodeCountOut) { *nodeCountOut = 0; }
+    if (pidOut) { *pidOut = 0; }
+    if (bundleIDOut) { *bundleIDOut = nil; }
+    if (detailOut) { *detailOut = nil; }
+
+    NSString *primaryDetail = nil;
+    id primary = CloudCodeAXAuditPrimaryElement(&primaryDetail);
+    if (!primary) {
+        if (detailOut) { *detailOut = primaryDetail ?: @"AXAudit broker primaryApp unavailable"; }
+        return nil;
+    }
+
+    NSString *bundleID = CloudCodeBoundedString(CloudCodeAXAuditSafeValue(primary, @"bundleId"));
+    NSNumber *primaryPIDNumber = [CloudCodeAXAuditSafeValue(primary, @"pid") isKindOfClass:NSNumber.class]
+        ? CloudCodeAXAuditSafeValue(primary, @"pid") : nil;
+    pid_t primaryPID = (pid_t)primaryPIDNumber.intValue;
+    if (bundleID.length == 0 && primaryPID > 0) { bundleID = CloudCodeBundleIDForPID(primaryPID); }
+
+    id explorer = CloudCodeAXAuditSafeValue(primary, @"explorerElements");
+    if (![explorer isKindOfClass:NSArray.class] || [(NSArray *)explorer count] == 0) {
+        if (detailOut) {
+            *detailOut = [NSString stringWithFormat:@"AXAudit primaryApp resolved but explorerElements empty; bundle=%@ pid=%d", bundleID ?: @"", primaryPID];
+        }
+        return nil;
+    }
+
+    NSMutableArray *children = [NSMutableArray array];
+    NSUInteger limit = MIN((NSUInteger)[(NSArray *)explorer count], (NSUInteger)(CLOUDCODE_GUI_MAX_TREE_NODES - 1));
+    for (NSUInteger index = 0; index < limit; index++) {
+        id element = [(NSArray *)explorer objectAtIndex:index];
+        NSDictionary *node = CloudCodeAXAuditElementNode(runtime, element);
+        if (node.count > 1) { [children addObject:node]; }
+    }
+    if (children.count == 0) {
+        if (detailOut) { *detailOut = @"AXAudit explorerElements returned no serializable semantic nodes"; }
+        return nil;
+    }
+
+    NSMutableDictionary *root = [NSMutableDictionary dictionaryWithDictionary:@{
+        @"role": @"AXApplication",
+        @"children": children
+    }];
+    if (bundleID.length > 0) { root[@"bundleId"] = bundleID; root[@"identifier"] = bundleID; }
+    if (primaryPID > 0) { root[@"pid"] = @(primaryPID); }
+    NSDictionary *rootFrame = CloudCodeFrameDictionary(runtime, CloudCodeAXAuditSafeValue(primary, @"frame"));
+    if (rootFrame) { root[@"frame"] = rootFrame; }
+
+    if (nodeCountOut) { *nodeCountOut = children.count + 1; }
+    if (pidOut) { *pidOut = primaryPID; }
+    if (bundleIDOut) { *bundleIDOut = bundleID; }
+    if (detailOut) {
+        *detailOut = [NSString stringWithFormat:@"AXAudit broker verified primaryApp/explorerElements; bundle=%@ pid=%d elements=%lu", bundleID ?: @"", primaryPID, (unsigned long)children.count];
+    }
+    return root;
 }
 
 static NSDictionary *CloudCodeAXNodeLimited(CloudCodeAXRuntime runtime, CloudCodeAXUIElementRef element, NSUInteger depth, NSUInteger maxDepth, NSUInteger *nodeCount)
@@ -2482,24 +2661,59 @@ static __attribute__((noreturn)) void CloudCodeFrontmostTreeData(void)
     }
     if (runtime.setRequestingClient) { runtime.setRequestingClient(2); }
 
+    // Prefer the same AccessibilityUI/AXAudit broker used by working standalone iOS automation
+    // clients: AXUIClient establishes the service-side client identity, while AXElement.primaryApp
+    // and explorerElements expose the foreground semantic objects without requiring this helper to
+    // impersonate SpringBoard's raw AXUIElement transport context.
+    NSUInteger auditNodeCount = 0;
+    pid_t auditPID = 0;
+    NSString *auditBundleID = nil;
+    NSString *auditDetail = nil;
+    NSDictionary *auditTree = CloudCodeAXAuditBrokerTree(runtime, &auditNodeCount, &auditPID, &auditBundleID, &auditDetail);
+    NSUInteger auditSemanticCount = CloudCodeAXSemanticNodeCount(auditTree);
+    NSUInteger auditActionableCount = CloudCodeAXActionableNodeCount(auditTree);
+    if (auditTree && auditNodeCount > 1 && auditSemanticCount > 0) {
+        NSDictionary *payload = @{
+            @"backend": @"AccessibilityUI.AXAudit.AXElement",
+            @"scope": @"foreground_explorer_elements",
+            @"bundleId": auditBundleID ?: @"",
+            @"pid": @(auditPID),
+            @"automationLeaseActive": @(runtime.automationLeaseActive),
+            @"nodeCount": @(auditNodeCount),
+            @"semanticNodeCount": @(auditSemanticCount),
+            @"actionableNodeCount": @(auditActionableCount),
+            @"tree": auditTree
+        };
+        NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+        if (data.length > 0 && data.length <= CLOUDCODE_GUI_MAX_TREE_BYTES) {
+            fprintf(stderr, "gui-tree: %s\n", auditDetail.UTF8String ?: "AXAudit broker returned semantic tree");
+            fwrite(data.bytes, 1, data.length, stdout);
+            fputc('\n', stdout);
+            CloudCodeGUIExitOneShot(0);
+        }
+    } else if (auditDetail.length > 0) {
+        fprintf(stderr, "gui-tree: AXAudit broker fallback unavailable: %s\n", auditDetail.UTF8String);
+    }
+
     NSString *bundleID = CloudCodeFrontmostBundleID();
     pid_t pid = 0;
     NSString *backend = nil;
     CloudCodeAXUIElementRef root = NULL;
 
     if (bundleID.length > 0) {
-        NSString *bundlePath = CloudCodeBundlePathForIdentifier(bundleID);
-        if (bundlePath.length > 0) {
-            pid = CloudCodePIDForBundlePath(bundlePath);
-            if (pid > 0) {
-                if (runtime.addAssociatedPid) {
-                    runtime.addAssociatedPid(getpid(), pid, 0);
-                    runtime.addAssociatedPid(getpid(), pid, 1);
-                    runtime.addAssociatedPid(pid, getpid(), 0);
-                    runtime.addAssociatedPid(pid, getpid(), 1);
-                }
-                root = CloudCodeAXRootForPid(runtime, pid, &backend);
+        pid = CloudCodePIDForBundleIdentifier(bundleID);
+        if (pid <= 0) {
+            NSString *bundlePath = CloudCodeBundlePathForIdentifier(bundleID);
+            if (bundlePath.length > 0) { pid = CloudCodePIDForBundlePath(bundlePath); }
+        }
+        if (pid > 0) {
+            if (runtime.addAssociatedPid) {
+                runtime.addAssociatedPid(getpid(), pid, 0);
+                runtime.addAssociatedPid(getpid(), pid, 1);
+                runtime.addAssociatedPid(pid, getpid(), 0);
+                runtime.addAssociatedPid(pid, getpid(), 1);
             }
+            root = CloudCodeAXRootForPid(runtime, pid, &backend);
         }
     }
 
@@ -2735,6 +2949,38 @@ int CloudCodeGUINavigateBack(NSString *strategy)
 static CloudCodeAXUIElementRef CloudCodeAXCopyFocusedElement(CloudCodeAXRuntime runtime, pid_t *pidOut, NSString **backend)
 {
         if (!runtime.copyAttribute) { return NULL; }
+
+        // First reuse the AXAudit broker identity used by the semantic tree path. Its primaryApp
+        // wrapper can carry the correct accessibility-service context even when a fresh raw
+        // AXUIElementCreateSystemWide/Application object sees only this detached helper.
+        NSString *auditDetail = nil;
+        id auditPrimary = CloudCodeAXAuditPrimaryElement(&auditDetail);
+        id auditAppUIElement = CloudCodeAXAuditSafeValue(auditPrimary, @"uiElement");
+        if (auditAppUIElement) {
+            CloudCodeAXUIElementRef appElement = (CloudCodeAXUIElementRef)(__bridge CFTypeRef)auditAppUIElement;
+            if (runtime.setTimeout) {
+                @try { runtime.setTimeout(appElement, CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS); }
+                @catch (__unused NSException *exception) {}
+            }
+            for (NSString *attribute in @[@"AXFocusedUIElement", @"AXFocusedElement"]) {
+                id candidate = CloudCodeAXCopy(runtime, appElement, (__bridge CFStringRef)attribute);
+                if (!candidate) { continue; }
+                CloudCodeAXUIElementRef element = (CloudCodeAXUIElementRef)(__bridge CFTypeRef)candidate;
+                CFRetain(element);
+                pid_t pid = 0;
+                if (runtime.getPid) {
+                    @try { (void)runtime.getPid(element, &pid); }
+                    @catch (__unused NSException *exception) { pid = 0; }
+                }
+                if (pid <= 0) {
+                    id primaryPID = CloudCodeAXAuditSafeValue(auditPrimary, @"pid");
+                    if ([primaryPID respondsToSelector:@selector(intValue)]) { pid = (pid_t)[primaryPID intValue]; }
+                }
+                if (pidOut && pid > 0) { *pidOut = pid; }
+                if (backend) { *backend = [@"AccessibilityUI.AXAudit.primaryApp." stringByAppendingString:attribute]; }
+                return element;
+            }
+        }
 
         // Detached mobile helpers can expose AXFocusedUIElement directly on the system-wide root
         // even when resolving a separate focused-application root fails or times out. Try that
