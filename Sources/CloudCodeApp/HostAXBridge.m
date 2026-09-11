@@ -5,6 +5,7 @@
 #import <dlfcn.h>
 #import <math.h>
 #import <objc/message.h>
+#import <os/lock.h>
 #import <stdint.h>
 #import <unistd.h>
 
@@ -133,21 +134,25 @@ static void CloudCodeHostAXAutomationLeaseCleanup(CloudCodeHostAXAutomationLease
     lease->changed = NO;
 }
 
-static NSLock *CloudCodeHostAXSharedLock(void)
+static os_unfair_lock CloudCodeHostAXProcessLock = OS_UNFAIR_LOCK_INIT;
+
+typedef struct {
+    BOOL held;
+} CloudCodeHostAXCallLease;
+
+static CloudCodeHostAXCallLease CloudCodeHostAXAcquireCallLease(void)
 {
-    static NSLock *lock = nil;
-    @synchronized(NSLock.class) {
-        if (!lock) {
-            lock = [[NSLock alloc] init];
-            lock.name = @"CloudCode.HostAX";
-        }
-    }
-    return lock;
+    CloudCodeHostAXCallLease lease = {0};
+    lease.held = os_unfair_lock_trylock(&CloudCodeHostAXProcessLock);
+    return lease;
 }
 
-static void CloudCodeHostAXLockCleanup(NSLock **lock)
+static void CloudCodeHostAXCallLeaseCleanup(CloudCodeHostAXCallLease *lease)
 {
-    if (lock && *lock) { [*lock unlock]; }
+    if (lease && lease->held) {
+        os_unfair_lock_unlock(&CloudCodeHostAXProcessLock);
+        lease->held = NO;
+    }
 }
 
 static id CloudCodeHostAXCopy(CloudCodeHostAXRuntime runtime, CloudCodeHostAXUIElementRef element, CFStringRef attribute)
@@ -221,6 +226,9 @@ static NSDictionary *CloudCodeHostAXFrame(CloudCodeHostAXRuntime runtime, id val
 static NSDictionary *CloudCodeHostAXNode(CloudCodeHostAXRuntime runtime, CloudCodeHostAXUIElementRef element, NSUInteger depth, NSUInteger *nodeCount, CFAbsoluteTime deadline)
 {
     if (!element || !nodeCount || depth > CLOUDCODE_HOST_AX_MAX_DEPTH || *nodeCount >= CLOUDCODE_HOST_AX_MAX_NODES || CFAbsoluteTimeGetCurrent() >= deadline) { return nil; }
+    if (runtime.setTimeout) {
+        @try { runtime.setTimeout(element, CLOUDCODE_HOST_AX_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {}
+    }
     (*nodeCount)++;
     NSArray *keys = @[@"role", @"label", @"value", @"title", @"identifier", @"placeholder", @"frame", @"children"];
     NSArray *attrs = @[@"AXRole", @"AXLabel", @"AXValue", @"AXTitle", @"AXIdentifier", @"AXPlaceholderValue", @"AXFrame", @"AXChildren"];
@@ -228,6 +236,7 @@ static NSDictionary *CloudCodeHostAXNode(CloudCodeHostAXRuntime runtime, CloudCo
     NSMutableDictionary *node = [NSMutableDictionary dictionary];
     id childrenValue = nil;
     for (NSUInteger index = 0; index < attrs.count; index++) {
+        if (!values && CFAbsoluteTimeGetCurrent() >= deadline) { break; }
         id raw = values ? values[index] : CloudCodeHostAXCopy(runtime, element, (__bridge CFStringRef)attrs[index]);
         if (raw == NSNull.null || CloudCodeHostAXValueRepresentsError(runtime, raw)) { raw = nil; }
         NSString *key = keys[index];
@@ -244,7 +253,7 @@ static NSDictionary *CloudCodeHostAXNode(CloudCodeHostAXRuntime runtime, CloudCo
     if ([childrenValue isKindOfClass:NSArray.class] && depth < CLOUDCODE_HOST_AX_MAX_DEPTH) {
         NSMutableArray *children = [NSMutableArray array];
         for (id child in (NSArray *)childrenValue) {
-            if (*nodeCount >= CLOUDCODE_HOST_AX_MAX_NODES) { break; }
+            if (*nodeCount >= CLOUDCODE_HOST_AX_MAX_NODES || CFAbsoluteTimeGetCurrent() >= deadline) { break; }
             CloudCodeHostAXUIElementRef childElement = (CloudCodeHostAXUIElementRef)(__bridge CFTypeRef)child;
             NSDictionary *childNode = CloudCodeHostAXNode(runtime, childElement, depth + 1, nodeCount, deadline);
             if (childNode) { [children addObject:childNode]; }
@@ -437,12 +446,11 @@ NSString *CloudCodeHostAXTreeJSON(NSString * _Nullable * _Nullable diagnostic)
 {
     if (diagnostic) { *diagnostic = nil; }
     CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
-    NSLock *sharedLock = CloudCodeHostAXSharedLock();
-    if (![sharedLock tryLock]) {
+    CloudCodeHostAXCallLease callLease __attribute__((cleanup(CloudCodeHostAXCallLeaseCleanup))) = CloudCodeHostAXAcquireCallLease();
+    if (!callLease.held) {
         if (diagnostic) { *diagnostic = @"host AX semantic read already active; fail-fast to bounded fallback"; }
         return nil;
     }
-    NSLock *heldLock __attribute__((cleanup(CloudCodeHostAXLockCleanup))) = sharedLock;
     CloudCodeHostAXRuntime runtime = CloudCodeHostAXResolve();
     if ((!runtime.createApplication && !runtime.createAppElementWithPid && !runtime.createSystemWide) || !runtime.copyAttribute) {
         if (diagnostic) { *diagnostic = @"host AXRuntime required symbols unavailable"; }
@@ -520,12 +528,11 @@ NSString *CloudCodeHostAXTreeJSON(NSString * _Nullable * _Nullable diagnostic)
 NSString *CloudCodeHostAXFocusedTextInputJSON(NSString * _Nullable * _Nullable diagnostic)
 {
     if (diagnostic) { *diagnostic = nil; }
-    NSLock *sharedLock = CloudCodeHostAXSharedLock();
-    if (![sharedLock tryLock]) {
+    CloudCodeHostAXCallLease callLease __attribute__((cleanup(CloudCodeHostAXCallLeaseCleanup))) = CloudCodeHostAXAcquireCallLease();
+    if (!callLease.held) {
         if (diagnostic) { *diagnostic = @"host AX focused-text read already active; fail-fast to bounded fallback"; }
         return nil;
     }
-    NSLock *heldLock __attribute__((cleanup(CloudCodeHostAXLockCleanup))) = sharedLock;
     CloudCodeHostAXRuntime runtime = CloudCodeHostAXResolve();
     BOOL runtimeAvailable = runtime.copyAttribute != NULL && runtime.createSystemWide != NULL;
     CloudCodeHostAXAutomationLease automationLease __attribute__((cleanup(CloudCodeHostAXAutomationLeaseCleanup))) = CloudCodeHostAXAcquireAutomationLease(runtime);

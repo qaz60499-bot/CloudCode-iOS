@@ -588,7 +588,7 @@ jobs:
           if 'CloudCodeHostAXTreeJSON(&hostDiagnostic)' not in bridge or 'gui-focused-text-input-json' not in bridge or 'return 62;' not in bridge:
               raise SystemExit('FAIL: non-root AX bridge must route passive semantic reads through the System-app host and preserve fail-closed fallback')
           host_ax = Path('Sources/CloudCodeApp/HostAXBridge.m').read_text(encoding='utf-8')
-          for marker in ('AXRuntime.host-system-app', 'CLOUDCODE_HOST_AX_TIMEOUT_SECONDS 0.25f', 'CLOUDCODE_HOST_AX_TOTAL_BUDGET_SECONDS 1.20', 'CLOUDCODE_HOST_AX_MAX_NODES 220', 'semanticNodeCount', 'actionableNodeCount', 'AXUIElementCreateApplication', 'AXUIElementCreateSystemWide', '_AXSetRequestingClient', '_AXSAutomationEnabled', '_AXSSetAutomationEnabled', 'CloudCodeHostAXAcquireAutomationLease', 'CloudCodeHostAXSharedLock', 'tryLock', 'fail-fast to bounded fallback'):
+          for marker in ('AXRuntime.host-system-app', 'CLOUDCODE_HOST_AX_TIMEOUT_SECONDS 0.25f', 'CLOUDCODE_HOST_AX_TOTAL_BUDGET_SECONDS 1.20', 'CLOUDCODE_HOST_AX_MAX_NODES 220', 'semanticNodeCount', 'actionableNodeCount', 'AXUIElementCreateApplication', 'AXUIElementCreateSystemWide', '_AXSetRequestingClient', '_AXSAutomationEnabled', '_AXSSetAutomationEnabled', 'CloudCodeHostAXAcquireAutomationLease', 'CloudCodeHostAXAcquireCallLease', 'os_unfair_lock_trylock', 'runtime.setTimeout(element, CLOUDCODE_HOST_AX_TIMEOUT_SECONDS)', 'fail-fast to bounded fallback'):
               if marker not in host_ax:
                   raise SystemExit(f'FAIL: host AX semantic fast path lost required marker: {marker}')
           if '#define CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS 0.25f' not in gui_text:

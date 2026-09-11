@@ -578,18 +578,18 @@ enum EmbeddedRootHelper {
             return nil
         }
 
-        // AX authority on TrollStore is runtime-dependent. Prefer the ordinary mobile AX client to
-        // avoid coupling semantics to UID 0, but Build 113 proved that this path can connect to the
-        // transport and still return zero semantic nodes. A single bounded persona-99 retry is safe
-        // and read-only now that the root helper carries its own self-watchdog. Neither route mutates
-        // AXManualAccessibility, so this fallback cannot reintroduce the visible green scan frame.
+        // AX authority on TrollStore is runtime-dependent. The non-root bridge call is intercepted
+        // inside the real System-app host first so semantic reads keep a registered RunningBoard/App
+        // identity instead of relying on an anonymous one-shot helper. A single bounded persona-99
+        // retry remains the fail-closed fallback. Neither route mutates AXManualAccessibility, so
+        // this fallback cannot reintroduce the visible green scan frame.
         let isolated = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)
         if let tree = validatedTree(isolated) {
             if isolated.code == 0 {
                 let suffix = isolated.stderr.isEmpty ? "" : " helper diagnostics: \(isolated.stderr)"
-                return (tree, "AXRuntime tree 已由 mobile 身份 helper 返回。\(suffix)")
+                return (tree, "AXRuntime tree 已由 System-app host AX fast path 返回。\(suffix)")
             }
-            return (tree, "AXRuntime tree 已返回完整可解析 JSON；mobile helper 随后仅在退出阶段触发父进程超时，因此保留这份只读 tree。")
+            return (tree, "AXRuntime tree 已由 non-root AX 路径返回完整可解析 JSON；退出阶段异常不影响这份已验证的只读 tree。")
         }
         if isolated.stdout.utf8.count > 256 * 1024 {
             return (nil, "GUI tree 输出超过 256 KiB 限制，已 fail closed。")
@@ -598,12 +598,12 @@ enum EmbeddedRootHelper {
         let privileged = runSeparated(["gui-tree-json"], privilege: .root, timeout: 1.6)
         if let tree = validatedTree(privileged) {
             let suffix = privileged.stderr.isEmpty ? "" : " helper diagnostics: \(privileged.stderr)"
-            return (tree, "mobile AX client 未返回可用语义树；persona-99 被动 AX fallback 返回了有效 tree。\(suffix)")
+            return (tree, "System-app host AX fast path 未返回可用语义树；persona-99 被动 AX fallback 返回了有效 tree。\(suffix)")
         }
 
         let isolatedDiagnostic = isolated.stderr.isEmpty ? isolated.stdout : isolated.stderr
         let privilegedDiagnostic = privileged.stderr.isEmpty ? privileged.stdout : privileged.stderr
-        let isolatedDetail = failureDetail(prefix: "GUI tree (mobile AX client)", code: isolated.code, diagnostic: isolatedDiagnostic)
+        let isolatedDetail = failureDetail(prefix: "GUI tree (System-app host AX fast path)", code: isolated.code, diagnostic: isolatedDiagnostic)
         let privilegedDetail = failureDetail(prefix: "GUI tree (persona-99 passive fallback)", code: privileged.code, diagnostic: privilegedDiagnostic)
         return (nil, "\(isolatedDetail)；root fallback：\(privilegedDetail)")
     }
@@ -620,9 +620,9 @@ enum EmbeddedRootHelper {
         let isolated = runSeparated(["gui-focused-text-input-json"], privilege: .isolatedUser, timeout: 2.0)
         if let payload = decode(isolated) {
             if isolated.code == 0 {
-                return (payload, isolated.stderr.isEmpty ? "AX focused-text probe completed via mobile client." : "AX focused-text probe completed via mobile client. helper diagnostics: \(isolated.stderr)")
+                return (payload, isolated.stderr.isEmpty ? "AX focused-text probe completed via System-app host AX fast path." : "AX focused-text probe completed via System-app host AX fast path. diagnostics: \(isolated.stderr)")
             }
-            return (payload, "AX focused-text probe 已返回完整可解码 payload；mobile helper 随后仅在退出阶段触发父进程超时，因此保留这份只读结果。")
+            return (payload, "AX focused-text probe 已由 non-root AX 路径返回完整可解码 payload；退出阶段异常不影响这份已验证的只读结果。")
         }
 
         let privileged = runSeparated(["gui-focused-text-input-json"], privilege: .root, timeout: 1.4)
@@ -632,7 +632,7 @@ enum EmbeddedRootHelper {
 
         let isolatedDiagnostic = isolated.stderr.isEmpty ? isolated.stdout : isolated.stderr
         let privilegedDiagnostic = privileged.stderr.isEmpty ? privileged.stdout : privileged.stderr
-        return (nil, "\(failureDetail(prefix: "GUI focused text input (mobile AX client)", code: isolated.code, diagnostic: isolatedDiagnostic))；root fallback：\(failureDetail(prefix: "GUI focused text input (persona-99 passive fallback)", code: privileged.code, diagnostic: privilegedDiagnostic))")
+        return (nil, "\(failureDetail(prefix: "GUI focused text input (System-app host AX fast path)", code: isolated.code, diagnostic: isolatedDiagnostic))；root fallback：\(failureDetail(prefix: "GUI focused text input (persona-99 passive fallback)", code: privileged.code, diagnostic: privilegedDiagnostic))")
     }
 
     static func guiScreenshot() -> (data: Data?, detail: String) {

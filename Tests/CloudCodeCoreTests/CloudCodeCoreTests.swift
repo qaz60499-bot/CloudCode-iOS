@@ -6466,6 +6466,10 @@ final class CloudCodeCoreTests: XCTestCase {
             .semanticEmpty
         )
         XCTAssertEqual(
+            PerceptionBrokerFacade.classifyAXFailure(attempted: true, succeeded: false, text: "host AX transport responded but semantic/actionable tree insufficient; nodes=1 semantic=0 actionable=0"),
+            .semanticEmpty
+        )
+        XCTAssertEqual(
             PerceptionBrokerFacade.classifyAXFailure(
                 attempted: true,
                 succeeded: false,

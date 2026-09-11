@@ -262,6 +262,7 @@ public enum PerceptionBrokerFacade {
             || normalized.contains("semantically empty")
             || normalized.contains("empty-semantic-tree")
             || normalized.contains("no semantic/actionable")
+            || normalized.contains("semantic/actionable tree insufficient")
             || normalized.contains("ax_transport_returned_semantically_empty_tree") {
             return .semanticEmpty
         }

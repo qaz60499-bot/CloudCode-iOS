@@ -124,8 +124,8 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
                 result: "unavailable",
                 diagnostic: outcome.detail,
                 metadata: [
-                    "axBackend": "standalone_trollstore_axruntime",
-                    "axStage": "direct_root_then_position_root_then_sampled_hit_test",
+                    "axBackend": "host_system_app_then_persona99_fallback",
+                    "axStage": "host_semantic_tree_then_bounded_persona99_fallback",
                     "axScope": "unavailable",
                     "axLatencyMS": String(latencyMS),
                     "axFailureClass": failureClass.rawValue
@@ -138,7 +138,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             treeRetryAfter = Date().addingTimeInterval(treeFailureCooldown)
             throw ToolRouterError.noExecutionRoute("GUI tree exceeded the 256 KiB app-layer output limit")
         }
-        var axBackend = "standalone_trollstore_axruntime"
+        var axBackend = "host_system_app_then_persona99_fallback"
         var axScope = "unknown"
         if let data = tree.data(using: .utf8),
            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -154,7 +154,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             result: "observed",
             metadata: [
                 "axBackend": axBackend,
-                "axStage": "direct_root_then_position_root_then_sampled_hit_test",
+                "axStage": "host_semantic_tree_then_bounded_persona99_fallback",
                 "axScope": axScope,
                 "axLatencyMS": String(latencyMS)
             ]
