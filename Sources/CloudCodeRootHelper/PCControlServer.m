@@ -139,7 +139,11 @@ static int CloudCodePCRunOneShotWithTimeout(const char *executablePath, NSArray<
     if (!executablePath || !*executablePath || arguments.count == 0 || timeoutMS == 0 || timeoutMS > 120000) { return 10; }
     NSMutableArray<NSString *> *argvStrings = [NSMutableArray arrayWithObject:[NSString stringWithUTF8String:executablePath]];
     [argvStrings addObjectsFromArray:arguments];
-    [argvStrings addObject:@"--cloudcode-watchdog-ms=4500"];
+    // Keep the child self-watchdog just inside the parent deadline. A fixed 4.5s watchdog is
+    // appropriate for ordinary GUI primitives but would kill the bounded TrollStore install
+    // child long before the dedicated 110s install window can complete.
+    uint64_t watchdogMS = timeoutMS > 150 ? timeoutMS - 150 : timeoutMS;
+    [argvStrings addObject:[NSString stringWithFormat:@"--cloudcode-watchdog-ms=%llu", (unsigned long long)watchdogMS]];
 
     NSUInteger count = argvStrings.count;
     char **argv = calloc(count + 1, sizeof(char *));

@@ -30,8 +30,8 @@ enum PCControlBootstrap {
             var standardOutput: NSString?
             var standardError: NSString?
             let code = CloudCodeSpawnHelperWithSeparatedOutput(
-                helperURL.path as NSString,
-                ["pc-control-server-start"] as NSArray,
+                helperURL.path,
+                ["pc-control-server-start"],
                 true,
                 4.0,
                 &standardOutput,
