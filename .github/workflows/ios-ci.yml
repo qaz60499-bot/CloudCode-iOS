@@ -595,8 +595,9 @@ jobs:
               raise SystemExit('FAIL: gui.runStructuredPlan regressed to an AX-tree hard capability dependency')
           if 'let isolated = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)' not in adapters or 'let privileged = runSeparated(["gui-tree-json"], privilege: .root, timeout: 1.6)' not in adapters:
               raise SystemExit('FAIL: structured UI-tree must preserve the bounded mobile AX call plus one passive persona-99 fallback')
-          if 'CloudCodeHostAXTreeJSON(&hostDiagnostic)' not in bridge or 'gui-focused-text-input-json' not in bridge or 'return 62;' not in bridge:
-              raise SystemExit('FAIL: non-root AX bridge must route passive semantic reads through the System-app host and preserve fail-closed fallback')
+          for marker in ('CloudCodeHostAXTreeJSON(&hostDiagnostic)', 'gui-focused-text-input-json', 'AccessibilityUI/AXAudit', 'isolated helper', 'persona-99 fallback'):
+              if marker not in bridge:
+                  raise SystemExit(f'FAIL: non-root AX bridge lost host -> AXAudit broker -> persona-99 fallback ordering marker: {marker}')
           host_ax = Path('Sources/CloudCodeApp/HostAXBridge.m').read_text(encoding='utf-8')
           for marker in ('AXRuntime.host-system-app', 'CLOUDCODE_HOST_AX_TIMEOUT_SECONDS 0.25f', 'CLOUDCODE_HOST_AX_TOTAL_BUDGET_SECONDS 1.20', 'CLOUDCODE_HOST_AX_MAX_NODES 220', 'semanticNodeCount', 'actionableNodeCount', 'AXUIElementCreateApplication', 'AXUIElementCreateSystemWide', '_AXSetRequestingClient', '_AXSAutomationEnabled', '_AXSSetAutomationEnabled', 'CloudCodeHostAXAcquireAutomationLease', 'CloudCodeHostAXAcquireCallLease', 'os_unfair_lock_trylock', 'runtime.setTimeout(element, CLOUDCODE_HOST_AX_TIMEOUT_SECONDS)', 'fail-fast to bounded fallback'):
               if marker not in host_ax:

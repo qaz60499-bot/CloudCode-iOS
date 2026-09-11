@@ -165,8 +165,9 @@ static NSInteger CloudCodeSpawnHelperInternal(
     // Build 120 proved that an anonymous one-shot CloudCodeRootHelper can have working AXRuntime
     // symbols/transport yet still receive an empty semantic tree on iOS 16.6. For the two passive
     // semantic reads, preserve the existing helper API but execute the first (non-root) attempt in
-    // the real System-app host identity. If it cannot produce bounded semantic evidence, return the
-    // same AX-unavailable code so PlatformAdapters performs its existing single root-helper fallback.
+    // the real System-app host identity. If that raw AXRuntime route is empty, continue into the
+    // isolated helper so AccessibilityUI/AXAudit gets one bounded attempt before PlatformAdapters
+    // performs its existing single persona-99 fallback.
     if (!asRoot
         && [NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.cloudcode.ios"]
         && [path.lastPathComponent isEqualToString:@"CloudCodeRootHelper"]
