@@ -15,6 +15,7 @@
 #import <stdlib.h>
 #import <string.h>
 #import "GUIAutomation.h"
+#import "PCControlServer.h"
 
 #define CLOUDCODE_PROC_PATH_MAX 4096
 #define CLOUDCODE_ROOT_HELPER_PROTOCOL_MARKER "cloudcode-root-helper-protocol=1"
@@ -1387,6 +1388,15 @@ static int CloudCodeRunOneShotCommand(int argc, const char *argv[])
             NSString *encoded = [NSString stringWithUTF8String:argv[2]];
             return CloudCodeGUITypeBase64(encoded);
         }
+        if ([command isEqualToString:@"pc-control-server-start"]) {
+            return CloudCodePCControlServerStart(argv[0]);
+        }
+        if ([command isEqualToString:@"pc-control-server-worker"]) {
+            if (argc < 4) { return 10; }
+            NSString *token = [NSString stringWithUTF8String:argv[2]];
+            int handshakeFD = (int)strtol(argv[3], NULL, 10);
+            return CloudCodePCControlServerWorker(argv[0], token, handshakeFD);
+        }
         if ([command isEqualToString:@"background-assert-worker"]) {
             if (argc < 4) { return 10; }
             return BackgroundAssertionWorker((pid_t)strtol(argv[2], NULL, 10), (int)strtol(argv[3], NULL, 10));
@@ -1437,9 +1447,10 @@ int main(int argc, const char *argv[])
     (void)setvbuf(stdout, NULL, _IONBF, 0);
     (void)setvbuf(stderr, NULL, _IONBF, 0);
 
-    // The background assertion worker is deliberately long-lived and is not observed by the
-    // one-shot parent bridge after its handshake. Preserve normal Objective-C cleanup for it.
-    if (argc > 1 && strcmp(argv[1], "background-assert-worker") == 0) {
+    // The background assertion worker and PC-control worker are deliberately long-lived and are
+    // not observed by the one-shot parent bridge after their handshakes. Preserve normal
+    // Objective-C cleanup for them instead of arming the one-shot watchdog.
+    if (argc > 1 && (strcmp(argv[1], "background-assert-worker") == 0 || strcmp(argv[1], "pc-control-server-worker") == 0)) {
         @autoreleasepool {
             return CloudCodeRunOneShotCommand(argc, argv);
         }

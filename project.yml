@@ -118,6 +118,7 @@ targets:
             -target arm64-apple-ios16.0 \
             "$SRCROOT/Sources/CloudCodeRootHelper/main.m" \
             "$SRCROOT/Sources/CloudCodeRootHelper/GUIAutomation.m" \
+            "$SRCROOT/Sources/CloudCodeRootHelper/PCControlServer.m" \
             -framework Foundation \
             -framework UIKit \
             -framework CoreGraphics \
