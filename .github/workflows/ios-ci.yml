@@ -596,6 +596,17 @@ jobs:
           for marker in ('AXRuntime.host-system-app', 'CLOUDCODE_HOST_AX_TIMEOUT_SECONDS 0.25f', 'CLOUDCODE_HOST_AX_TOTAL_BUDGET_SECONDS 1.20', 'CLOUDCODE_HOST_AX_MAX_NODES 220', 'semanticNodeCount', 'actionableNodeCount', 'AXUIElementCreateApplication', 'AXUIElementCreateSystemWide', '_AXSetRequestingClient', '_AXSAutomationEnabled', '_AXSSetAutomationEnabled', 'CloudCodeHostAXAcquireAutomationLease', 'CloudCodeHostAXAcquireCallLease', 'os_unfair_lock_trylock', 'runtime.setTimeout(element, CLOUDCODE_HOST_AX_TIMEOUT_SECONDS)', 'fail-fast to bounded fallback'):
               if marker not in host_ax:
                   raise SystemExit(f'FAIL: host AX semantic fast path lost required marker: {marker}')
+          for marker in ('CloudCodeHostAXProbeJSON', 'CCPerceptionProcessEvidence(@"cloudcode_system_app_host_ax_probe")', 'AXFrontBoardFocusedAppPID', 'abi_unverified_after_build122_physical_probe', 'FBSWorkspace', 'numericAttributes', 'userTestingSnapshot', 'contextPidMatchesForeground', 'remoteViewBridgeMarker', 'axRemoteElementMarker', 'axManualAccessibilityTouched'):
+              if marker not in host_ax:
+                  raise SystemExit(f'FAIL: Build123 host-context AX evidence probe lost required marker: {marker}')
+          perception_probe = Path('Sources/CloudCodeApp/PerceptionProbeView.swift').read_text(encoding='utf-8')
+          for marker in ('CloudCodeHostAXProbeJSON', 'ax-host', 'ax-detached-control', 'Do not mechanically rerun the 24 old'):
+              if marker not in perception_probe:
+                  raise SystemExit(f'FAIL: physical AX regression no longer prioritizes host-context evidence: {marker}')
+          if 'for seed in ["systemWide", "application", "pid0", "springboard"]' in perception_probe:
+              raise SystemExit('FAIL: physical AX regression reintroduced the already-exhausted 24-group detached matrix')
+          if 'case ocr' not in tool_router_text or 'local OCR must remain independently reportable when AX tree is unavailable' not in Path('Tests/CloudCodeCoreTests/CloudCodeCoreTests.swift').read_text(encoding='utf-8'):
+              raise SystemExit('FAIL: local Vision/OCR capability is no longer independently represented from AX tree')
           if '#define CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS 0.25f' not in gui_text:
               raise SystemExit('FAIL: AX per-request timeout budget must remain fail-fast for detached/mobile AX clients')
           for marker in ('AXUIElementCopyMultipleAttributeValues', 'AXUIElementCopyElementWithParameters', 'typedef CloudCodeAXError (*CloudCodeAXCopyElementAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, float, float);', 'runtime.copyElementAtPosition(systemWide, &candidate, (float)points[index].x, (float)points[index].y)', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic', 'CloudCodeAXApplicationAtScreenPointRoot', 'CloudCodeAXParameterizedElementAtPoint', 'CloudCodeAXNodeLimited', 'CloudCodeAXNodeLimited(runtime, candidate, 0, 0, &localNodeCount)', 'semanticNodeCount'):

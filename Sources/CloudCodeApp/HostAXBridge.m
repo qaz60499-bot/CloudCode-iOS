@@ -1,4 +1,5 @@
 #import "RootHelperBridge.h"
+#import "PerceptionProcessEvidence.h"
 
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -14,6 +15,7 @@
 #define CLOUDCODE_HOST_AX_MAX_BYTES (256 * 1024)
 #define CLOUDCODE_HOST_AX_TIMEOUT_SECONDS 0.25f
 #define CLOUDCODE_HOST_AX_TOTAL_BUDGET_SECONDS 1.20
+#define CLOUDCODE_HOST_AX_PROBE_BUDGET_SECONDS 2.50
 
 typedef const struct __CloudCodeHostAXUIElement *CloudCodeHostAXUIElementRef;
 typedef int32_t CloudCodeHostAXError;
@@ -66,6 +68,23 @@ typedef struct {
     CloudCodeHostAXValueGetTypeIDFn valueGetTypeID;
     CloudCodeHostAXValueGetTypeFn valueGetType;
     CloudCodeHostAXValueGetValueFn valueGetValue;
+    CFStringRef xcElementType;
+    CFStringRef xcElementBaseType;
+    CFStringRef xcLabel;
+    CFStringRef xcValue;
+    CFStringRef xcIdentifier;
+    CFStringRef xcPlaceholderValue;
+    CFStringRef xcFrame;
+    CFStringRef xcVisibleFrame;
+    CFStringRef xcChildren;
+    CFStringRef xcChildrenCount;
+    CFStringRef xcUserTestingElements;
+    CFStringRef xcUserTestingSnapshot;
+    CFStringRef xcWindowContextId;
+    CFStringRef xcWindowDisplayId;
+    CFStringRef xcIsRemoteElement;
+    CFStringRef xcIsVisible;
+    CFStringRef xcIsUserInteractionEnabled;
 } CloudCodeHostAXRuntime;
 
 static void *CloudCodeHostAXResolveAcrossFrameworks(const char *name)
@@ -85,6 +104,14 @@ static void *CloudCodeHostAXResolveAcrossFrameworks(const char *name)
         if (symbol) { return symbol; }
     }
     return NULL;
+}
+
+static CFStringRef CloudCodeHostAXResolveCFStringConstant(const char *name)
+{
+    void *symbol = CloudCodeHostAXResolveAcrossFrameworks(name);
+    if (!symbol) { return NULL; }
+    @try { return *(CFStringRef *)symbol; }
+    @catch (__unused NSException *exception) { return NULL; }
 }
 
 static CloudCodeHostAXRuntime CloudCodeHostAXResolve(void)
@@ -116,6 +143,23 @@ static CloudCodeHostAXRuntime CloudCodeHostAXResolve(void)
     runtime.valueGetTypeID = (CloudCodeHostAXValueGetTypeIDFn)CloudCodeHostAXResolveAcrossFrameworks("AXValueGetTypeID");
     runtime.valueGetType = (CloudCodeHostAXValueGetTypeFn)CloudCodeHostAXResolveAcrossFrameworks("AXValueGetType");
     runtime.valueGetValue = (CloudCodeHostAXValueGetValueFn)CloudCodeHostAXResolveAcrossFrameworks("AXValueGetValue");
+    runtime.xcElementType = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeElementType");
+    runtime.xcElementBaseType = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeElementBaseType");
+    runtime.xcLabel = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeLabel");
+    runtime.xcValue = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeValue");
+    runtime.xcIdentifier = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeIdentifier");
+    runtime.xcPlaceholderValue = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributePlaceholderValue");
+    runtime.xcFrame = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeFrame");
+    runtime.xcVisibleFrame = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeVisibleFrame");
+    runtime.xcChildren = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeChildren");
+    runtime.xcChildrenCount = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeChildrenCount");
+    runtime.xcUserTestingElements = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeUserTestingElements");
+    runtime.xcUserTestingSnapshot = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeUserTestingSnapshot");
+    runtime.xcWindowContextId = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeWindowContextId");
+    runtime.xcWindowDisplayId = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeWindowDisplayId");
+    runtime.xcIsRemoteElement = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeIsRemoteElement");
+    runtime.xcIsVisible = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeIsVisible");
+    runtime.xcIsUserInteractionEnabled = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeIsUserInteractionEnabled");
     if (runtime.setRequestingClient) {
         @try { runtime.setRequestingClient(2); } @catch (__unused NSException *exception) {}
     }
@@ -190,6 +234,28 @@ static id CloudCodeHostAXCopy(CloudCodeHostAXRuntime runtime, CloudCodeHostAXUIE
     return CFBridgingRelease(value);
 }
 
+static BOOL CloudCodeHostAXValueRepresentsError(CloudCodeHostAXRuntime runtime, id value);
+
+static id CloudCodeHostAXCopyFirst(CloudCodeHostAXRuntime runtime, CloudCodeHostAXUIElementRef element, const CFStringRef *attributes, NSUInteger count, NSString **sourceOut)
+{
+    if (!runtime.copyAttribute || !element || !attributes) { return nil; }
+    for (NSUInteger index = 0; index < count; index++) {
+        CFStringRef attribute = attributes[index];
+        if (!attribute) { continue; }
+        id value = CloudCodeHostAXCopy(runtime, element, attribute);
+        if (!value || CloudCodeHostAXValueRepresentsError(runtime, value)) { continue; }
+        if (sourceOut) {
+            if ((uintptr_t)attribute < 0x10000) {
+                *sourceOut = [NSString stringWithFormat:@"numeric:%lu", (unsigned long)(uintptr_t)attribute];
+            } else {
+                *sourceOut = @"xc";
+            }
+        }
+        return value;
+    }
+    return nil;
+}
+
 static NSArray *CloudCodeHostAXCopyMany(CloudCodeHostAXRuntime runtime, CloudCodeHostAXUIElementRef element, NSArray *attributes)
 {
     if (!runtime.copyMultipleAttributes || !element || attributes.count == 0) { return nil; }
@@ -247,6 +313,43 @@ static NSDictionary *CloudCodeHostAXFrame(CloudCodeHostAXRuntime runtime, id val
     return @{@"x": @(frame.origin.x), @"y": @(frame.origin.y), @"width": @(frame.size.width), @"height": @(frame.size.height)};
 }
 
+static void CloudCodeHostAXAppendCandidateChildren(CloudCodeHostAXRuntime runtime, NSMutableArray *children, NSMutableSet<NSString *> *seen, id value)
+{
+    if (![value isKindOfClass:NSArray.class]) { return; }
+    for (id child in (NSArray *)value) {
+        if (!child || child == NSNull.null || CloudCodeHostAXValueRepresentsError(runtime, child)) { continue; }
+        NSString *key = [NSString stringWithFormat:@"%p", (__bridge const void *)child];
+        if ([seen containsObject:key]) { continue; }
+        [seen addObject:key];
+        [children addObject:child];
+    }
+}
+
+static NSArray *CloudCodeHostAXFallbackChildren(CloudCodeHostAXRuntime runtime, CloudCodeHostAXUIElementRef element, NSString **sourceOut)
+{
+    NSMutableArray *children = [NSMutableArray array];
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    NSMutableArray<NSString *> *sources = [NSMutableArray array];
+    const struct { CFStringRef attribute; __unsafe_unretained NSString *name; } candidates[] = {
+        { runtime.xcChildren, @"xcChildren" },
+        { runtime.xcUserTestingElements, @"xcUserTestingElements" },
+        { (CFStringRef)(uintptr_t)3015, @"numeric3015VisibleElements" },
+        { (CFStringRef)(uintptr_t)3022, @"numeric3022ExplorerElements" },
+        { (CFStringRef)(uintptr_t)3025, @"numeric3025SemanticContext" },
+        { (CFStringRef)(uintptr_t)3029, @"numeric3029NativeFocusable" },
+        { (CFStringRef)(uintptr_t)5001, @"numeric5001PrivateChildren" }
+    };
+    for (NSUInteger index = 0; index < sizeof(candidates) / sizeof(candidates[0]); index++) {
+        if (!candidates[index].attribute) { continue; }
+        id value = CloudCodeHostAXCopy(runtime, element, candidates[index].attribute);
+        NSUInteger before = children.count;
+        CloudCodeHostAXAppendCandidateChildren(runtime, children, seen, value);
+        if (children.count > before) { [sources addObject:candidates[index].name]; }
+    }
+    if (sourceOut && sources.count > 0) { *sourceOut = [sources componentsJoinedByString:@"+"]; }
+    return children;
+}
+
 static NSDictionary *CloudCodeHostAXNode(CloudCodeHostAXRuntime runtime, CloudCodeHostAXUIElementRef element, NSUInteger depth, NSUInteger *nodeCount, CFAbsoluteTime deadline)
 {
     if (!element || !nodeCount || depth > CLOUDCODE_HOST_AX_MAX_DEPTH || *nodeCount >= CLOUDCODE_HOST_AX_MAX_NODES || CFAbsoluteTimeGetCurrent() >= deadline) { return nil; }
@@ -274,15 +377,57 @@ static NSDictionary *CloudCodeHostAXNode(CloudCodeHostAXRuntime runtime, CloudCo
             if (text) { node[key] = text; }
         }
     }
-    if ([childrenValue isKindOfClass:NSArray.class] && depth < CLOUDCODE_HOST_AX_MAX_DEPTH) {
+
+    if (!node[@"role"]) {
+        const CFStringRef fallbacks[] = { runtime.xcElementType, runtime.xcElementBaseType };
+        NSString *source = nil;
+        NSString *text = CloudCodeHostAXBoundedString(CloudCodeHostAXCopyFirst(runtime, element, fallbacks, 2, &source));
+        if (text) { node[@"role"] = text; node[@"roleSource"] = source ?: @"xc"; }
+    }
+    if (!node[@"label"] && runtime.xcLabel) {
+        NSString *text = CloudCodeHostAXBoundedString(CloudCodeHostAXCopy(runtime, element, runtime.xcLabel));
+        if (text) { node[@"label"] = text; node[@"labelSource"] = @"xc"; }
+    }
+    if (!node[@"value"] && runtime.xcValue) {
+        NSString *text = CloudCodeHostAXBoundedString(CloudCodeHostAXCopy(runtime, element, runtime.xcValue));
+        if (text) { node[@"value"] = text; node[@"valueSource"] = @"xc"; }
+    }
+    if (!node[@"identifier"] && runtime.xcIdentifier) {
+        NSString *text = CloudCodeHostAXBoundedString(CloudCodeHostAXCopy(runtime, element, runtime.xcIdentifier));
+        if (text) { node[@"identifier"] = text; node[@"identifierSource"] = @"xc"; }
+    }
+    if (!node[@"placeholder"] && runtime.xcPlaceholderValue) {
+        NSString *text = CloudCodeHostAXBoundedString(CloudCodeHostAXCopy(runtime, element, runtime.xcPlaceholderValue));
+        if (text) { node[@"placeholder"] = text; node[@"placeholderSource"] = @"xc"; }
+    }
+    if (!node[@"frame"]) {
+        const CFStringRef fallbacks[] = { runtime.xcVisibleFrame, runtime.xcFrame, (CFStringRef)(uintptr_t)2057 };
+        NSString *source = nil;
+        NSDictionary *frame = CloudCodeHostAXFrame(runtime, CloudCodeHostAXCopyFirst(runtime, element, fallbacks, 3, &source));
+        if (frame) { node[@"frame"] = frame; node[@"frameSource"] = source ?: @"xc"; }
+    }
+
+    NSArray *candidateChildren = [childrenValue isKindOfClass:NSArray.class] ? (NSArray *)childrenValue : nil;
+    NSString *childrenSource = candidateChildren.count > 0 ? @"AXChildren" : nil;
+    if (candidateChildren.count == 0 && depth < CLOUDCODE_HOST_AX_MAX_DEPTH && CFAbsoluteTimeGetCurrent() < deadline) {
+        candidateChildren = CloudCodeHostAXFallbackChildren(runtime, element, &childrenSource);
+    }
+    if (candidateChildren.count == 0 && depth <= 1 && runtime.xcUserTestingSnapshot && CFAbsoluteTimeGetCurrent() < deadline) {
+        NSString *summary = CloudCodeHostAXBoundedString(CloudCodeHostAXCopy(runtime, element, runtime.xcUserTestingSnapshot));
+        if (summary) { node[@"userTestingSnapshotSummary"] = summary; }
+    }
+    if (candidateChildren.count > 0 && depth < CLOUDCODE_HOST_AX_MAX_DEPTH) {
         NSMutableArray *children = [NSMutableArray array];
-        for (id child in (NSArray *)childrenValue) {
+        for (id child in candidateChildren) {
             if (*nodeCount >= CLOUDCODE_HOST_AX_MAX_NODES || CFAbsoluteTimeGetCurrent() >= deadline) { break; }
             CloudCodeHostAXUIElementRef childElement = (CloudCodeHostAXUIElementRef)(__bridge CFTypeRef)child;
             NSDictionary *childNode = CloudCodeHostAXNode(runtime, childElement, depth + 1, nodeCount, deadline);
             if (childNode) { [children addObject:childNode]; }
         }
-        if (children.count > 0) { node[@"children"] = children; }
+        if (children.count > 0) {
+            node[@"children"] = children;
+            node[@"childrenSource"] = childrenSource ?: @"fallback";
+        }
     }
     return node;
 }
@@ -721,6 +866,489 @@ static NSDictionary *CloudCodeHostAXSampledTree(CloudCodeHostAXRuntime runtime, 
         @"scope": @"sampled_foreground_context",
         @"children": hits
     };
+}
+
+static NSDictionary *CloudCodeHostAXSymbolEvidence(void *address)
+{
+    Dl_info info = {0};
+    BOOL resolved = address && dladdr(address, &info) != 0;
+    return @{
+        @"present": @(address != NULL),
+        @"sourceImage": resolved && info.dli_fname ? @(info.dli_fname) : NSNull.null
+    };
+}
+
+static NSDictionary *CloudCodeHostAXValueSummary(id value)
+{
+    if (!value || value == NSNull.null) { return @{@"present": @NO}; }
+    NSMutableDictionary *summary = [@{
+        @"present": @YES,
+        @"class": NSStringFromClass([value class]) ?: @"<unknown>"
+    } mutableCopy];
+    if ([value isKindOfClass:NSArray.class]) {
+        summary[@"count"] = @([(NSArray *)value count]);
+    } else if ([value isKindOfClass:NSDictionary.class]) {
+        summary[@"count"] = @([(NSDictionary *)value count]);
+    } else if ([value isKindOfClass:NSString.class]) {
+        summary[@"value"] = CloudCodeHostAXBoundedString(value) ?: @"";
+    } else if ([value isKindOfClass:NSNumber.class]) {
+        summary[@"value"] = value;
+    }
+    NSString *description = CloudCodeHostAXBoundedString(value);
+    if (description.length > 0) {
+        summary[@"description"] = description;
+        summary[@"remoteViewBridgeMarker"] = @([description containsString:@"RemoteViewBridge"]);
+        summary[@"axRemoteElementMarker"] = @([description containsString:@"AXRemoteElement"]);
+    }
+    return summary;
+}
+
+static NSDictionary *CloudCodeHostAXProbeAttribute(CloudCodeHostAXRuntime runtime, CloudCodeHostAXUIElementRef element, CFStringRef attribute)
+{
+    if (!runtime.copyAttribute || !element || !attribute) {
+        return @{@"attempted": @NO, @"reason": @"missing_runtime_element_or_attribute"};
+    }
+    CFTypeRef value = NULL;
+    CloudCodeHostAXError code = -1;
+    @try { code = runtime.copyAttribute(element, attribute, &value); }
+    @catch (__unused NSException *exception) { code = -1; value = NULL; }
+    NSMutableDictionary *result = [@{
+        @"attempted": @YES,
+        @"AXError": @(code),
+        @"valuePresent": @(value != NULL)
+    } mutableCopy];
+    if (value) {
+        result[@"summary"] = CloudCodeHostAXValueSummary((__bridge id)value);
+        CFRelease(value);
+    }
+    return result;
+}
+
+static id CloudCodeHostAXProbeObject0(id object, NSString *selectorName)
+{
+    if (!object || selectorName.length == 0) { return nil; }
+    SEL selector = NSSelectorFromString(selectorName);
+    if (![object respondsToSelector:selector]) { return nil; }
+    id (*sendObject0)(id, SEL) = (void *)objc_msgSend;
+    @try { return sendObject0(object, selector); }
+    @catch (__unused NSException *exception) { return nil; }
+}
+
+static NSNumber *CloudCodeHostAXProbeUnsigned0(id object, NSString *selectorName)
+{
+    if (!object || selectorName.length == 0) { return nil; }
+    SEL selector = NSSelectorFromString(selectorName);
+    if (![object respondsToSelector:selector]) { return nil; }
+    unsigned long long (*sendUnsigned0)(id, SEL) = (void *)objc_msgSend;
+    @try { return @(sendUnsigned0(object, selector)); }
+    @catch (__unused NSException *exception) { return nil; }
+}
+
+static NSArray *CloudCodeHostAXProbeArrayLike(id value)
+{
+    if ([value isKindOfClass:NSArray.class]) { return value; }
+    id objects = CloudCodeHostAXProbeObject0(value, @"allObjects");
+    return [objects isKindOfClass:NSArray.class] ? objects : nil;
+}
+
+static NSDictionary *CloudCodeHostAXFrontBoardEvidence(CFAbsoluteTime deadline)
+{
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    void *handle = dlopen("/System/Library/PrivateFrameworks/AXFrontBoardUtils.framework/AXFrontBoardUtils", RTLD_NOW | RTLD_GLOBAL);
+    result[@"frameworkLoaded"] = @(handle != NULL);
+    NSArray<NSString *> *names = @[
+        @"AXFrontBoardFocusedAppPID", @"AXFrontBoardFocusedAppPIDs", @"AXFrontBoardFocusedAppPIDsIgnoringSiri",
+        @"AXFrontBoardFocusedApps", @"AXFrontBoardFocusedAppProcess", @"AXFrontBoardFocusedAppProcesses",
+        @"AXFrontBoardVisibleAppProcesses", @"AXFrontBoardFBSceneManager"
+    ];
+    NSMutableDictionary *symbols = [NSMutableDictionary dictionary];
+    for (NSString *name in names) {
+        void *symbol = handle ? dlsym(handle, name.UTF8String) : NULL;
+        if (!symbol) { symbol = dlsym(RTLD_DEFAULT, name.UTF8String); }
+        symbols[name] = CloudCodeHostAXSymbolEvidence(symbol);
+    }
+    result[@"symbols"] = symbols;
+    result[@"AXFrontBoardFocusedAppPID"] = @{
+        @"invoked": @NO,
+        @"classification": @"abi_unverified_after_build122_physical_probe",
+        @"reason": @"pid_t(void) call returned non-PID values; symbol presence is evidence only"
+    };
+    NSMutableDictionary *objects = [NSMutableDictionary dictionary];
+    for (NSUInteger index = 1; index < names.count && CFAbsoluteTimeGetCurrent() < deadline; index++) {
+        NSString *name = names[index];
+        void *symbol = handle ? dlsym(handle, name.UTF8String) : NULL;
+        if (!symbol) { symbol = dlsym(RTLD_DEFAULT, name.UTF8String); }
+        if (!symbol) { continue; }
+        CFTypeRef (*function)(void) = (CFTypeRef (*)(void))symbol;
+        @try {
+            CFTypeRef value = function();
+            objects[name] = value ? CloudCodeHostAXValueSummary((__bridge id)value) : @{@"present": @NO};
+        } @catch (__unused NSException *exception) {
+            objects[name] = @{@"exception": @YES};
+        }
+    }
+    result[@"objectResults"] = objects;
+    result[@"invocationContext"] = @"CloudCode System-app host process";
+    result[@"adoption"] = @"probe_only_until_physical_foreground_identity_matches_target_app";
+    return result;
+}
+
+static NSDictionary *CloudCodeHostAXFBSWorkspaceEvidence(NSString *foregroundBundle, pid_t foregroundPID, CFAbsoluteTime deadline)
+{
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    void *framework = dlopen("/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices", RTLD_NOW | RTLD_GLOBAL);
+    result[@"frameworkLoaded"] = @(framework != NULL);
+    Class workspaceClass = NSClassFromString(@"FBSWorkspace");
+    result[@"classPresent"] = @(workspaceClass != Nil);
+    if (!workspaceClass) { return result; }
+    id workspace = CloudCodeHostAXProbeObject0(workspaceClass, @"_sharedWorkspaceIfExists");
+    NSString *selector = @"_sharedWorkspaceIfExists";
+    if (!workspace) {
+        workspace = CloudCodeHostAXProbeObject0(workspaceClass, @"sharedWorkspace");
+        selector = @"sharedWorkspace";
+    }
+    result[@"workspacePresent"] = @(workspace != nil);
+    result[@"workspaceSelector"] = workspace ? selector : @"none";
+    if (!workspace) { return result; }
+    NSArray *scenes = CloudCodeHostAXProbeArrayLike(CloudCodeHostAXProbeObject0(workspace, @"scenes"));
+    result[@"sceneCount"] = @(scenes.count);
+    NSMutableArray *summaries = [NSMutableArray array];
+    NSUInteger limit = MIN((NSUInteger)12, scenes.count);
+    for (NSUInteger index = 0; index < limit && CFAbsoluteTimeGetCurrent() < deadline; index++) {
+        id scene = scenes[index];
+        NSMutableDictionary *summary = [NSMutableDictionary dictionary];
+        summary[@"class"] = NSStringFromClass([scene class]) ?: @"<unknown>";
+        id identifierValue = CloudCodeHostAXProbeObject0(scene, @"identifier");
+        id bundleValue = CloudCodeHostAXProbeObject0(scene, @"crs_applicationBundleIdentifier");
+        NSString *identifier = [identifierValue isKindOfClass:NSString.class] ? identifierValue : nil;
+        NSString *bundle = [bundleValue isKindOfClass:NSString.class] ? bundleValue : nil;
+        if (identifier) { summary[@"identifier"] = identifier; }
+        if (bundle) { summary[@"bundleId"] = bundle; }
+        id clientProcess = CloudCodeHostAXProbeObject0(scene, @"clientProcess");
+        id hostProcess = CloudCodeHostAXProbeObject0(scene, @"hostProcess");
+        NSNumber *clientPID = CloudCodeHostAXProbeUnsigned0(clientProcess, @"pid");
+        NSNumber *hostPID = CloudCodeHostAXProbeUnsigned0(hostProcess, @"pid");
+        if (clientPID) { summary[@"clientPid"] = clientPID; }
+        if (hostPID) { summary[@"hostPid"] = hostPID; }
+        id display = CloudCodeHostAXProbeObject0(scene, @"display");
+        NSNumber *displayID = CloudCodeHostAXProbeUnsigned0(display, @"displayId") ?: CloudCodeHostAXProbeUnsigned0(scene, @"displayId");
+        if (displayID) { summary[@"displayId"] = displayID; }
+        NSArray *contexts = CloudCodeHostAXProbeArrayLike(CloudCodeHostAXProbeObject0(scene, @"contexts"));
+        NSMutableArray *contextIDs = [NSMutableArray array];
+        NSUInteger contextLimit = MIN((NSUInteger)8, contexts.count);
+        for (NSUInteger contextIndex = 0; contextIndex < contextLimit; contextIndex++) {
+            id context = contexts[contextIndex];
+            NSNumber *contextID = CloudCodeHostAXProbeUnsigned0(context, @"contextID")
+                ?: CloudCodeHostAXProbeUnsigned0(context, @"contextId")
+                ?: CloudCodeHostAXProbeUnsigned0(context, @"windowContextId");
+            if (contextID) { [contextIDs addObject:contextID]; }
+        }
+        if (contextIDs.count > 0) { summary[@"contextIds"] = contextIDs; }
+        BOOL bundleMatch = foregroundBundle.length > 0 && [bundle isEqualToString:foregroundBundle];
+        BOOL pidMatch = foregroundPID > 0 && (clientPID.intValue == foregroundPID || hostPID.intValue == foregroundPID);
+        summary[@"foregroundCandidate"] = @(bundleMatch || pidMatch);
+        [summaries addObject:summary];
+    }
+    result[@"scenes"] = summaries;
+    result[@"invocationContext"] = @"CloudCode System-app host process";
+    result[@"adoption"] = @"probe_only_until_scene_identity_is_correlated_on_physical_device";
+    return result;
+}
+
+static NSDictionary *CloudCodeHostAXContextEvidence(CloudCodeHostAXRuntime runtime, CloudCodeHostAXUIElementRef systemWide, CloudCodeHostAXUIElementRef root, pid_t expectedPID, CFAbsoluteTime deadline)
+{
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    CGSize size = CloudCodeHostAXScreenSize();
+    CGPoint point = CGPointMake(size.width * 0.5, size.height * 0.5);
+    result[@"screenPoints"] = @[@(size.width), @(size.height)];
+    result[@"point"] = @[@(point.x), @(point.y)];
+    if (!systemWide || size.width <= 1 || size.height <= 1 || CFAbsoluteTimeGetCurrent() >= deadline) {
+        result[@"attempted"] = @NO;
+        return result;
+    }
+    result[@"attempted"] = @YES;
+
+    CloudCodeHostAXUIElementRef application = NULL;
+    uint32_t contextID = 0;
+    CloudCodeHostAXError applicationCode = -1;
+    if (runtime.copyApplicationAndContextAtPosition) {
+        @try { applicationCode = runtime.copyApplicationAndContextAtPosition(systemWide, &application, &contextID, (float)point.x, (float)point.y); }
+        @catch (__unused NSException *exception) { applicationCode = -1; application = NULL; contextID = 0; }
+    }
+    result[@"applicationContextAXError"] = @(applicationCode);
+    result[@"applicationPresent"] = @(application != NULL);
+    result[@"applicationContextId"] = @(contextID);
+    if (application && runtime.getPid) {
+        pid_t appPID = 0;
+        CloudCodeHostAXError code = -1;
+        @try { code = runtime.getPid(application, &appPID); } @catch (__unused NSException *exception) { code = -1; }
+        result[@"applicationPidAXError"] = @(code);
+        result[@"applicationPid"] = @(appPID);
+        result[@"applicationPidMatchesForeground"] = @(expectedPID > 0 && appPID == expectedPID);
+    }
+
+    uint32_t parameterizedContextID = 0;
+    if (runtime.copyParameterizedAttributeValue && CFAbsoluteTimeGetCurrent() < deadline) {
+        CFTypeRef axPoint = NULL;
+        if (runtime.valueCreate) {
+            @try { axPoint = runtime.valueCreate(1, &point); } @catch (__unused NSException *exception) { axPoint = NULL; }
+        }
+        id pointValue = axPoint ? (__bridge id)axPoint : CloudCodeHostAXPointValue(point);
+        NSMutableArray *attempts = [NSMutableArray array];
+        for (NSNumber *displayID in @[@1, @0]) {
+            if (CFAbsoluteTimeGetCurrent() >= deadline) { break; }
+            NSArray *parameter = @[pointValue, displayID];
+            CFTypeRef value = NULL;
+            CloudCodeHostAXError code = -1;
+            @try { code = runtime.copyParameterizedAttributeValue(systemWide, (CFStringRef)(uintptr_t)0x16573, (__bridge CFTypeRef)parameter, &value); }
+            @catch (__unused NSException *exception) { code = -1; value = NULL; }
+            NSMutableDictionary *entry = [@{@"displayId": displayID, @"AXError": @(code), @"valuePresent": @(value != NULL)} mutableCopy];
+            if (value) {
+                id bridged = (__bridge id)value;
+                entry[@"summary"] = CloudCodeHostAXValueSummary(bridged);
+                if ([bridged respondsToSelector:@selector(unsignedIntValue)]) { parameterizedContextID = [bridged unsignedIntValue]; }
+                CFRelease(value);
+            }
+            [attempts addObject:entry];
+            if (parameterizedContextID > 0) { break; }
+        }
+        result[@"parameterizedContextAttempts"] = attempts;
+        if (axPoint) { CFRelease(axPoint); }
+    }
+    if (contextID == 0) { contextID = parameterizedContextID; }
+    result[@"contextId"] = @(contextID);
+
+    pid_t contextPID = 0;
+    if (contextID > 0 && runtime.copyParameterizedAttributeValue && CFAbsoluteTimeGetCurrent() < deadline) {
+        NSDictionary *parameter = @{@"contextId": @(contextID)};
+        CFTypeRef value = NULL;
+        CloudCodeHostAXError code = -1;
+        @try { code = runtime.copyParameterizedAttributeValue(systemWide, (CFStringRef)(uintptr_t)0x16574, (__bridge CFTypeRef)parameter, &value); }
+        @catch (__unused NSException *exception) { code = -1; value = NULL; }
+        result[@"contextPidAXError"] = @(code);
+        result[@"contextPidPresent"] = @(value != NULL);
+        if (value) {
+            id bridged = (__bridge id)value;
+            result[@"contextPidSummary"] = CloudCodeHostAXValueSummary(bridged);
+            if ([bridged respondsToSelector:@selector(intValue)]) { contextPID = (pid_t)[bridged intValue]; }
+            CFRelease(value);
+        }
+    }
+    result[@"contextPid"] = @(contextPID);
+    result[@"contextPidMatchesForeground"] = @(expectedPID > 0 && contextPID == expectedPID);
+
+    CloudCodeHostAXUIElementRef target = application;
+    if (!target && root) { target = (CloudCodeHostAXUIElementRef)CFRetain(root); }
+    uint32_t displayID = 0;
+    if (target && CFAbsoluteTimeGetCurrent() < deadline) {
+        NSDictionary *displayProbe = runtime.xcWindowDisplayId
+            ? CloudCodeHostAXProbeAttribute(runtime, target, runtime.xcWindowDisplayId)
+            : CloudCodeHostAXProbeAttribute(runtime, target, (CFStringRef)(uintptr_t)2123);
+        result[@"displayAttribute"] = displayProbe;
+        NSDictionary *summary = displayProbe[@"summary"];
+        NSNumber *value = [summary[@"value"] isKindOfClass:NSNumber.class] ? summary[@"value"] : nil;
+        if (value) { displayID = value.unsignedIntValue; }
+    }
+    result[@"displayId"] = @(displayID);
+
+    if (target && contextID > 0 && runtime.copyElementUsingContextIdAtPosition && CFAbsoluteTimeGetCurrent() < deadline) {
+        CloudCodeHostAXUIElementRef hit = NULL;
+        CloudCodeHostAXError code = -1;
+        @try { code = runtime.copyElementUsingContextIdAtPosition(target, contextID, &hit, 0, (float)point.x, (float)point.y); }
+        @catch (__unused NSException *exception) { code = -1; hit = NULL; }
+        NSMutableDictionary *entry = [@{@"AXError": @(code), @"present": @(hit != NULL)} mutableCopy];
+        if (hit && runtime.getPid) {
+            pid_t pid = 0;
+            CloudCodeHostAXError pidCode = runtime.getPid(hit, &pid);
+            entry[@"pidAXError"] = @(pidCode);
+            entry[@"pid"] = @(pid);
+            entry[@"pidMatchesForeground"] = @(expectedPID > 0 && pid == expectedPID);
+        }
+        if (hit) { CFRelease(hit); }
+        result[@"contextHit"] = entry;
+    }
+    if (target && displayID > 0 && runtime.copyElementUsingDisplayIdAtPosition && CFAbsoluteTimeGetCurrent() < deadline) {
+        CloudCodeHostAXUIElementRef hit = NULL;
+        CloudCodeHostAXError code = -1;
+        @try { code = runtime.copyElementUsingDisplayIdAtPosition(target, displayID, &hit, 0, (float)point.x, (float)point.y); }
+        @catch (__unused NSException *exception) { code = -1; hit = NULL; }
+        NSMutableDictionary *entry = [@{@"AXError": @(code), @"present": @(hit != NULL)} mutableCopy];
+        if (hit && runtime.getPid) {
+            pid_t pid = 0;
+            CloudCodeHostAXError pidCode = runtime.getPid(hit, &pid);
+            entry[@"pidAXError"] = @(pidCode);
+            entry[@"pid"] = @(pid);
+            entry[@"pidMatchesForeground"] = @(expectedPID > 0 && pid == expectedPID);
+        }
+        if (hit) { CFRelease(hit); }
+        result[@"displayHit"] = entry;
+    }
+    if (target) { CFRelease(target); }
+    return result;
+}
+
+NSString *CloudCodeHostAXProbeJSON(NSString * _Nullable * _Nullable diagnostic)
+{
+    if (diagnostic) { *diagnostic = nil; }
+    CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
+    CFAbsoluteTime deadline = started + CLOUDCODE_HOST_AX_PROBE_BUDGET_SECONDS;
+    CloudCodeHostAXCallLease callLease __attribute__((cleanup(CloudCodeHostAXCallLeaseCleanup))) = CloudCodeHostAXAcquireCallLease();
+    if (!callLease.held) {
+        if (diagnostic) { *diagnostic = @"host AX probe already active"; }
+        return nil;
+    }
+    CloudCodeHostAXRuntime runtime = CloudCodeHostAXResolve();
+    CloudCodeHostAXAutomationLease automationLease __attribute__((cleanup(CloudCodeHostAXAutomationLeaseCleanup))) = CloudCodeHostAXAcquireAutomationLease(runtime);
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    result[@"schemaVersion"] = @1;
+    result[@"kind"] = @"host-ax-probe";
+    result[@"process"] = CCPerceptionProcessEvidence(@"cloudcode_system_app_host_ax_probe");
+    result[@"automationLeaseActive"] = @(automationLease.active);
+    result[@"axManualAccessibilityTouched"] = @NO;
+    result[@"executionContext"] = @"CloudCode System-app host process; no detached helper for host sections";
+
+    NSMutableDictionary *symbols = [NSMutableDictionary dictionary];
+#define CC_HOST_AX_SYMBOL(field) symbols[@#field] = CloudCodeHostAXSymbolEvidence((void *)runtime.field)
+    CC_HOST_AX_SYMBOL(createApplication); CC_HOST_AX_SYMBOL(createAppElementWithPid); CC_HOST_AX_SYMBOL(createSystemWide);
+    CC_HOST_AX_SYMBOL(getPid); CC_HOST_AX_SYMBOL(copyAttribute); CC_HOST_AX_SYMBOL(copyMultipleAttributes);
+    CC_HOST_AX_SYMBOL(copyElementAtPosition); CC_HOST_AX_SYMBOL(copyApplicationAtPosition); CC_HOST_AX_SYMBOL(copyApplicationAndContextAtPosition);
+    CC_HOST_AX_SYMBOL(copyElementWithParameters); CC_HOST_AX_SYMBOL(copyParameterizedAttributeValue);
+    CC_HOST_AX_SYMBOL(copyElementUsingContextIdAtPosition); CC_HOST_AX_SYMBOL(copyElementUsingDisplayIdAtPosition);
+    CC_HOST_AX_SYMBOL(setRequestingClient); CC_HOST_AX_SYMBOL(addAssociatedPid); CC_HOST_AX_SYMBOL(automationEnabled); CC_HOST_AX_SYMBOL(setAutomationEnabled);
+#undef CC_HOST_AX_SYMBOL
+    result[@"symbols"] = symbols;
+
+    NSString *bundleID = CloudCodeHostFrontmostBundleID();
+    NSString *bundlePath = CloudCodeHostBundlePath(bundleID);
+    pid_t foregroundPID = CloudCodeHostPIDForBundlePath(bundlePath);
+    result[@"foreground"] = @{
+        @"bundleId": bundleID ?: @"",
+        @"bundlePathResolved": @(bundlePath.length > 0),
+        @"pid": @(foregroundPID),
+        @"resolver": @"SBSCopyFrontmostApplicationDisplayIdentifier -> LSApplicationProxy.bundleURL -> proc_pidpath",
+        @"resolved": @(bundleID.length > 0 && foregroundPID > 0),
+        @"firstFailure": bundleID.length == 0 ? @"bundle-id" : (bundlePath.length == 0 ? @"bundle-path" : (foregroundPID <= 0 ? @"pid" : @"none"))
+    };
+
+    result[@"axFrontBoard"] = CloudCodeHostAXFrontBoardEvidence(deadline);
+    if (CFAbsoluteTimeGetCurrent() < deadline) {
+        result[@"fbsWorkspace"] = CloudCodeHostAXFBSWorkspaceEvidence(bundleID, foregroundPID, deadline);
+    }
+
+    CloudCodeHostAXUIElementRef systemWide = NULL;
+    if (runtime.createSystemWide && CFAbsoluteTimeGetCurrent() < deadline) {
+        @try { systemWide = runtime.createSystemWide(); } @catch (__unused NSException *exception) { systemWide = NULL; }
+        if (systemWide && runtime.setTimeout) { @try { runtime.setTimeout(systemWide, CLOUDCODE_HOST_AX_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {} }
+    }
+    NSMutableDictionary *systemWideEvidence = [NSMutableDictionary dictionary];
+    systemWideEvidence[@"created"] = @(systemWide != NULL);
+    if (systemWide) {
+        for (NSString *attribute in @[@"AXFocusedApplication", @"AXFocusedUIElement", @"AXChildren", @"AXLabel"]) {
+            if (CFAbsoluteTimeGetCurrent() >= deadline) { break; }
+            systemWideEvidence[attribute] = CloudCodeHostAXProbeAttribute(runtime, systemWide, (__bridge CFStringRef)attribute);
+        }
+    }
+    result[@"systemWide"] = systemWideEvidence;
+
+    CloudCodeHostAXUIElementRef root = NULL;
+    if (foregroundPID > 0 && CFAbsoluteTimeGetCurrent() < deadline) {
+        if (runtime.addAssociatedPid) {
+            @try {
+                runtime.addAssociatedPid(getpid(), foregroundPID, 0);
+                runtime.addAssociatedPid(getpid(), foregroundPID, 1);
+                runtime.addAssociatedPid(foregroundPID, getpid(), 0);
+                runtime.addAssociatedPid(foregroundPID, getpid(), 1);
+            } @catch (__unused NSException *exception) {}
+        }
+        root = CloudCodeHostAXRootForPID(runtime, foregroundPID);
+    }
+    result[@"foregroundRoot"] = @{
+        @"created": @(root != NULL),
+        @"pid": @(foregroundPID),
+        @"createApplicationSymbol": @(runtime.createApplication != NULL),
+        @"createAppElementWithPidSymbol": @(runtime.createAppElementWithPid != NULL)
+    };
+
+    if (root && CFAbsoluteTimeGetCurrent() < deadline) {
+        const struct { uintptr_t attribute; __unsafe_unretained NSString *name; __unsafe_unretained NSString *group; } numeric[] = {
+            {3015, @"visibleElements", @"children_visible"}, {3022, @"explorerElements", @"children_visible"},
+            {3025, @"semanticContext", @"semantic"}, {3029, @"nativeFocusable", @"focus"},
+            {3031, @"focusCandidates", @"focus"}, {3032, @"focusState", @"focus"},
+            {2092, @"contextCandidate", @"context_display"}, {2123, @"windowDisplayId", @"context_display"},
+            {2057, @"frameCandidate", @"semantic"}, {2070, @"visibilityCandidate", @"children_visible"},
+            {2186, @"remoteCandidateA", @"remote_view"}, {2187, @"remoteCandidateB", @"remote_view"},
+            {5001, @"privateChildren", @"children_visible"}
+        };
+        NSMutableDictionary *numericEvidence = [NSMutableDictionary dictionary];
+        for (NSUInteger index = 0; index < sizeof(numeric) / sizeof(numeric[0]); index++) {
+            if (CFAbsoluteTimeGetCurrent() >= deadline) { break; }
+            NSMutableDictionary *entry = [CloudCodeHostAXProbeAttribute(runtime, root, (CFStringRef)numeric[index].attribute) mutableCopy];
+            entry[@"group"] = numeric[index].group;
+            entry[@"name"] = numeric[index].name;
+            numericEvidence[[NSString stringWithFormat:@"%lu", (unsigned long)numeric[index].attribute]] = entry;
+        }
+        result[@"numericAttributes"] = numericEvidence;
+
+        const struct { CFStringRef attribute; __unsafe_unretained NSString *name; } xc[] = {
+            {runtime.xcElementType, @"elementType"}, {runtime.xcElementBaseType, @"elementBaseType"},
+            {runtime.xcLabel, @"label"}, {runtime.xcValue, @"value"}, {runtime.xcIdentifier, @"identifier"},
+            {runtime.xcPlaceholderValue, @"placeholder"}, {runtime.xcFrame, @"frame"}, {runtime.xcVisibleFrame, @"visibleFrame"},
+            {runtime.xcChildren, @"children"}, {runtime.xcChildrenCount, @"childrenCount"},
+            {runtime.xcUserTestingElements, @"userTestingElements"}, {runtime.xcUserTestingSnapshot, @"userTestingSnapshot"},
+            {runtime.xcWindowContextId, @"windowContextId"}, {runtime.xcWindowDisplayId, @"windowDisplayId"},
+            {runtime.xcIsRemoteElement, @"isRemoteElement"}, {runtime.xcIsVisible, @"isVisible"},
+            {runtime.xcIsUserInteractionEnabled, @"isUserInteractionEnabled"}
+        };
+        NSMutableDictionary *xcEvidence = [NSMutableDictionary dictionary];
+        BOOL remoteViewBridgeMarker = NO;
+        BOOL axRemoteElementMarker = NO;
+        for (NSUInteger index = 0; index < sizeof(xc) / sizeof(xc[0]); index++) {
+            if (CFAbsoluteTimeGetCurrent() >= deadline) { break; }
+            NSDictionary *entry = CloudCodeHostAXProbeAttribute(runtime, root, xc[index].attribute);
+            xcEvidence[xc[index].name] = entry;
+            NSDictionary *summary = entry[@"summary"];
+            remoteViewBridgeMarker = remoteViewBridgeMarker || [summary[@"remoteViewBridgeMarker"] boolValue];
+            axRemoteElementMarker = axRemoteElementMarker || [summary[@"axRemoteElementMarker"] boolValue];
+        }
+        result[@"xcAttributes"] = xcEvidence;
+        result[@"remoteViewBridgeMarker"] = @(remoteViewBridgeMarker);
+        result[@"axRemoteElementMarker"] = @(axRemoteElementMarker);
+    }
+
+    if (systemWide && CFAbsoluteTimeGetCurrent() < deadline) {
+        result[@"contextDisplay"] = CloudCodeHostAXContextEvidence(runtime, systemWide, root, foregroundPID, deadline);
+    }
+
+    NSUInteger nodeCount = 0;
+    NSDictionary *tree = nil;
+    if (root && CFAbsoluteTimeGetCurrent() < deadline) {
+        CFAbsoluteTime treeDeadline = MIN(deadline, CFAbsoluteTimeGetCurrent() + 0.45);
+        tree = CloudCodeHostAXNode(runtime, root, 0, &nodeCount, treeDeadline);
+    }
+    NSUInteger semanticCount = CloudCodeHostAXSemanticCount(tree);
+    NSUInteger actionableCount = CloudCodeHostAXActionableCount(tree);
+    result[@"semanticSummary"] = @{
+        @"nodeCount": @(nodeCount),
+        @"semanticCount": @(semanticCount),
+        @"actionableCount": @(actionableCount),
+        @"targetPid": @(foregroundPID)
+    };
+    if (root) { CFRelease(root); }
+    if (systemWide) { CFRelease(systemWide); }
+    result[@"latencyMS"] = @((NSInteger)MAX(0.0, (CFAbsoluteTimeGetCurrent() - started) * 1000.0));
+    result[@"budgetMS"] = @((NSInteger)(CLOUDCODE_HOST_AX_PROBE_BUDGET_SECONDS * 1000.0));
+    result[@"budgetExhausted"] = @(CFAbsoluteTimeGetCurrent() >= deadline);
+    result[@"probeClassification"] = @"read_only_host_context_evidence; production_adoption_requires_physical_device_match";
+
+    NSData *json = [NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingSortedKeys error:nil];
+    if (!json || json.length == 0 || json.length > CLOUDCODE_HOST_AX_MAX_BYTES) {
+        if (diagnostic) { *diagnostic = @"host AX probe JSON unavailable or exceeded 256 KiB"; }
+        return nil;
+    }
+    if (diagnostic) {
+        *diagnostic = [NSString stringWithFormat:@"host AX probe completed; foreground=%@ pid=%d semantic=%lu actionable=%lu latencyMS=%ld", bundleID ?: @"", foregroundPID, (unsigned long)semanticCount, (unsigned long)actionableCount, (long)[result[@"latencyMS"] integerValue]];
+    }
+    return [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
 }
 
 NSString *CloudCodeHostAXTreeJSON(NSString * _Nullable * _Nullable diagnostic)

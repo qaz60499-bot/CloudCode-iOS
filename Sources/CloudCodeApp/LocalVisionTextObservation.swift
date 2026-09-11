@@ -18,6 +18,11 @@ enum LocalVisionTextObservation {
         var elements: [LocalPerceptionTextElement]
     }
 
+    struct CapabilityEvidence: Sendable {
+        var status: CapabilityStatus
+        var detail: String
+    }
+
     private struct RecognitionConfiguration {
         var level: VNRequestTextRecognitionLevel
         var languages: [String]
@@ -33,6 +38,7 @@ enum LocalVisionTextObservation {
         private var inFlight: [String: Task<Observation, Never>] = [:]
         private var activeKey: String?
         private var coreVideoCircuitOpenUntil: Date?
+        private var lastCapabilityEvidence: CapabilityEvidence?
         private let retention: TimeInterval = 3
         // Once the App-process Vision stack reports kCVReturnAllocationFailed, repeated retries on
         // every fresh screenshot only reproduce the same entitlement/resource failure. The
@@ -40,6 +46,32 @@ enum LocalVisionTextObservation {
         // in-process fallback long enough for the GUI task to continue through screenshot/remote
         // vision instead of spending two recovery rounds on the same hard failure.
         private let coreVideoCircuitDuration: TimeInterval = 15
+
+        func capabilityEvidence() -> CapabilityEvidence {
+            lastCapabilityEvidence ?? CapabilityEvidence(
+                status: .deviceValidationRequired,
+                detail: "Local Vision/OCR has not yet executed in this app process. It is independent of AX and will be promoted only by an exact screenshot + Vision-helper operation."
+            )
+        }
+
+        func noteCapability(_ observation: Observation) {
+            let ocrStatus = observation.payload["localVisionOCR"] ?? "unknown"
+            let backend = observation.payload["localVisionBackend"] ?? "unknown"
+            let latency = observation.payload["localVisionTotalLatencyMS"]
+                ?? observation.payload["localVisionLatencyMS"]
+                ?? "0"
+            if ocrStatus == "recognized" || ocrStatus == "available_empty" {
+                lastCapabilityEvidence = CapabilityEvidence(
+                    status: .available,
+                    detail: "Exact on-device Vision/OCR completed successfully (status=\(ocrStatus), backend=\(backend), latencyMS=\(latency)); this evidence is independent of AX tree availability."
+                )
+            } else {
+                lastCapabilityEvidence = CapabilityEvidence(
+                    status: .deviceValidationRequired,
+                    detail: "The latest exact local Vision/OCR attempt did not prove availability (status=\(ocrStatus), backend=\(backend), latencyMS=\(latency)). AX state is not used to classify OCR; a later exact OCR request may revalidate it."
+                )
+            }
+        }
 
         func coreVideoCircuitRemainingMS() -> Int? {
             let now = Date()
@@ -170,6 +202,10 @@ enum LocalVisionTextObservation {
         _ = primaryRecognitionConfiguration
     }
 
+    static func capabilityEvidence() async -> CapabilityEvidence {
+        await coordinator.capabilityEvidence()
+    }
+
     static func payload(for jpegData: Data, maximumElements: Int = 28, regionInScreenPoints: CGRect? = nil) async -> [String: String] {
         await observe(for: jpegData, maximumElements: maximumElements, regionInScreenPoints: regionInScreenPoints).payload
     }
@@ -190,7 +226,7 @@ enum LocalVisionTextObservation {
         }
         // The circuit guards failed App-process allocations; it must not suppress the independent
         // mobile helper. Same-image requests coalesce and the bridge bounds outstanding children.
-        return await coordinator.resolve(key: key, bypassCoreVideoCircuit: true) {
+        let observation = await coordinator.resolve(key: key, bypassCoreVideoCircuit: true) {
             await Task.detached(priority: .utility) {
             let started = Date()
             let helper = recognizeWithHelper(jpegData, maximumElements: boundedMaximum,
@@ -252,6 +288,8 @@ enum LocalVisionTextObservation {
 #endif
             }.value
         }
+        await coordinator.noteCapability(observation)
+        return observation
     }
 
     private static func isUsable(_ observation: Observation, requiresText: Bool) -> Bool {

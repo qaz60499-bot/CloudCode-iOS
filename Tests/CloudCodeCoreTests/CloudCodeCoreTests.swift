@@ -66,6 +66,7 @@ final class CloudCodeCoreTests: XCTestCase {
                 .openApp: .available,
                 .tree: .unavailable,
                 .screenshot: .available,
+                .ocr: .available,
                 .touch: .available,
                 .textInput: .available,
                 .gestures: .available,
@@ -78,12 +79,22 @@ final class CloudCodeCoreTests: XCTestCase {
 
         XCTAssertEqual(profile.status(GUIAutomationFeature.openApp.capabilityID), .available)
         XCTAssertEqual(profile.status(GUIAutomationFeature.screenshot.capabilityID), .available)
+        XCTAssertEqual(profile.status(GUIAutomationFeature.ocr.capabilityID), .available, "local OCR must remain independently reportable when AX tree is unavailable")
         XCTAssertEqual(profile.status(GUIAutomationFeature.touch.capabilityID), .available)
         XCTAssertEqual(profile.status(GUIAutomationFeature.tree.capabilityID), .unavailable)
         XCTAssertEqual(profile.status(GUIAutomationFeature.verify.capabilityID), .unavailable)
         XCTAssertEqual(profile.status("automation.gui"), .unavailable, "partial capability must never masquerade as complete GUI automation")
         let guiCallCount = await guiProvider.totalCalls()
         XCTAssertEqual(guiCallCount, 1)
+    }
+
+    func testGUICompositeDoesNotTreatIndependentOCRAsRequiredForCoreGUIReadiness() {
+        var statuses = Dictionary(uniqueKeysWithValues: GUIAutomationFeature.allCases.map { ($0, CapabilityStatus.available) })
+        statuses[.ocr] = .unavailable
+        let snapshot = GUIAutomationCapabilitySnapshot(backendIdentifier: "test-gui", statuses: statuses)
+
+        XCTAssertEqual(snapshot.status(.ocr), .unavailable)
+        XCTAssertEqual(snapshot.compositeStatus, .available, "automation.gui composite must not couple independent local OCR readiness to AX/HID/screenshot readiness")
     }
 
     func testStructuredPlanCapabilitiesRemainRoutableWhenAXTreeIsUnavailable() async throws {
@@ -95,6 +106,7 @@ final class CloudCodeCoreTests: XCTestCase {
                 .openApp: .available,
                 .tree: .unavailable,
                 .screenshot: .available,
+                .ocr: .available,
                 .touch: .available,
                 .textInput: .available,
                 .gestures: .available,

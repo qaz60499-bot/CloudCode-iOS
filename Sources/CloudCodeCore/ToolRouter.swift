@@ -75,6 +75,9 @@ public enum GUIAutomationFeature: String, CaseIterable, Sendable {
     case openApp = "open_app"
     case tree
     case screenshot
+    /// On-device Vision/OCR is an independent perception capability. It deliberately remains
+    /// outside the composite GUI requirement so AX degradation cannot incorrectly disable OCR.
+    case ocr
     case touch
     case textInput = "text_input"
     case gestures

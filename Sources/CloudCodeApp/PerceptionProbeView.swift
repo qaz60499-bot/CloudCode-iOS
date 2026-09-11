@@ -65,34 +65,43 @@ extension CloudCodeViewModel {
                 try? await Task.sleep(nanoseconds: 300_000_000)
             }
             if ProcessInfo.processInfo.arguments.contains("--cloudcode-ax-matrix") {
-                var index = 0
-                for root in [false, true] {
-                    for seed in ["systemWide", "application", "pid0", "springboard"] {
-                        for preparation in ["baseline", "requesting2", "associated"] {
-                            let body = await Task.detached { () -> [String: String] in
-                                var stdout: NSString?
-                                var stderr: NSString?
-                                let code = CloudCodeSpawnHelperWithSeparatedOutput(EmbeddedRootHelper.executablePath,
-                                    ["gui-ax-probe-json", "attributes", seed, "0", preparation], root, 3, &stdout, &stderr)
-                                return ["code": String(code), "stdout": stdout as String? ?? "", "stderr": stderr as String? ?? ""]
-                            }.value
-                            await record(String(format: "ax-%02d", index), ["seed": seed, "preparation": preparation, "root": root, "result": body])
-                            index += 1
-                        }
-                    }
-                }
-                // ios-mcp v1.2.4 exposes additional FrontBoard/FBS/numeric/snapshot/context APIs.
-                // Probe them in both mobile and privileged helper identities, but keep them strictly
-                // diagnostic until a physical iOS 16.6 run proves which invocation context works.
+                // Build 122 already exhausted the old 2 identities × 4 seeds × 3 preparations
+                // detached-helper matrix. Build 123 uses this switch for the new evidence that can
+                // change the decision: one bounded System-app host probe plus two detached ios-mcp
+                // controls for execution-context comparison. Do not mechanically rerun the 24 old
+                // combinations on every regression.
+                let hostBody = await Task.detached { () -> [String: String] in
+                    var diagnostic: NSString?
+                    let payload = CloudCodeHostAXProbeJSON(&diagnostic)
+                    return [
+                        "code": payload == nil ? "62" : "0",
+                        "stdout": payload ?? "",
+                        "stderr": diagnostic as String? ?? ""
+                    ]
+                }.value
+                await record("ax-host", [
+                    "executionContext": "system-app-host",
+                    "result": hostBody
+                ])
+
+                // Keep the detached helper only as a control. AXFrontBoard scalar ABI remains
+                // deliberately uninvoked there; these controls distinguish host-context progress
+                // from the already-proven helper-self identity failure.
                 for root in [false, true] {
                     let body = await Task.detached { () -> [String: String] in
                         var stdout: NSString?
                         var stderr: NSString?
-                        let code = CloudCodeSpawnHelperWithSeparatedOutput(EmbeddedRootHelper.executablePath,
-                            ["gui-ax-probe-json", "iosmcp-delta", "application", "0", "requesting2"], root, 15, &stdout, &stderr)
+                        let code = CloudCodeSpawnHelperWithSeparatedOutput(
+                            EmbeddedRootHelper.executablePath,
+                            ["gui-ax-probe-json", "iosmcp-delta", "application", "0", "requesting2"],
+                            root, 8, &stdout, &stderr
+                        )
                         return ["code": String(code), "stdout": stdout as String? ?? "", "stderr": stderr as String? ?? ""]
                     }.value
-                    await record(String(format: "ax-iosmcp-%02d", root ? 1 : 0), ["seed": "application", "preparation": "requesting2", "root": root, "result": body])
+                    await record(String(format: "ax-detached-control-%02d", root ? 1 : 0), [
+                        "executionContext": root ? "detached-persona99" : "detached-mobile",
+                        "result": body
+                    ])
                 }
             }
             if let pid = assertion.workerPID {

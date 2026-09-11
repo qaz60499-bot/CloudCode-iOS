@@ -7,6 +7,8 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     public nonisolated let identifier = "trollstore-root-helper"
     private var cachedSnapshot: GUIAutomationCapabilitySnapshot?
     private var cachedSnapshotAt: Date?
+    private var exactRuntimeStatuses: [GUIAutomationFeature: CapabilityStatus] = [:]
+    private var exactRuntimeDetails: [GUIAutomationFeature: String] = [:]
     private var treeRetryAfter: Date?
     private var lastTreeFailureClass: ObservationFrame.AXFailureClass?
     private let snapshotTTL: TimeInterval = 2
@@ -37,10 +39,12 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
         // helper watchdog. Opening an App already has an exact bundle-scoped route with its own
         // acceptance + foreground verification, so keep this feature deferred instead of probing.
         let probe = EmbeddedRootHelper.guiProbe()
+        let localVisionEvidence = await LocalVisionTextObservation.capabilityEvidence()
         var statuses: [GUIAutomationFeature: CapabilityStatus] = [
             .openApp: .deviceValidationRequired,
             .tree: .deviceValidationRequired,
             .screenshot: .deviceValidationRequired,
+            .ocr: localVisionEvidence.status,
             .touch: .deviceValidationRequired,
             .textInput: .deviceValidationRequired,
             .gestures: .deviceValidationRequired,
@@ -50,6 +54,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             .openApp: "App launch uses exact bundle-scoped self-validation; no-target LaunchServices probing is intentionally disabled on this TrollStore runtime.",
             .tree: probe.detail,
             .screenshot: probe.detail,
+            .ocr: localVisionEvidence.detail,
             .touch: probe.detail,
             .textInput: probe.detail,
             .gestures: probe.detail,
@@ -62,6 +67,9 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             // requested operation executes in its own bounded helper process.
             statuses[.tree] = .deviceValidationRequired
             statuses[.screenshot] = .deviceValidationRequired
+            // OCR is intentionally not derived from AX/tree or the root-helper handshake. Its
+            // independent Vision-helper evidence is retained above and promoted only by an exact
+            // OCR operation that actually completed on this runtime.
             statuses[.touch] = .deviceValidationRequired
             statuses[.textInput] = .deviceValidationRequired
             statuses[.gestures] = .deviceValidationRequired
@@ -76,6 +84,12 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             details[.verify] = "Verification is deferred with AX tree observation and runs only for an exact gui.verify request."
         }
 
+        for (feature, status) in exactRuntimeStatuses {
+            statuses[feature] = status
+        }
+        for (feature, detail) in exactRuntimeDetails {
+            details[feature] = detail
+        }
         let snapshot = GUIAutomationCapabilitySnapshot(
             backendIdentifier: identifier,
             statuses: statuses,
@@ -150,6 +164,9 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
         }
         treeRetryAfter = nil
         lastTreeFailureClass = nil
+        exactRuntimeStatuses[.tree] = .available
+        exactRuntimeDetails[.tree] = "Exact host-first AX tree operation returned a bounded semantic tree on this runtime."
+        cachedSnapshotAt = nil
         try? await diagnosticLogger?.log(
             level: .info,
             subsystem: "gui",
@@ -169,6 +186,9 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     public func screenshot() async throws -> Data {
         let outcome = EmbeddedRootHelper.guiScreenshot()
         guard let data = outcome.data else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
+        exactRuntimeStatuses[.screenshot] = .available
+        exactRuntimeDetails[.screenshot] = "Exact global screenshot capture returned a valid bounded JPEG on this runtime."
+        cachedSnapshotAt = nil
         // A working global screenshot is authoritative visual evidence for the current foreground
         // state. Keep any recent AX timeout cooldown in place; visually rich apps such as video
         // feeds do not become better automation targets by immediately retrying the same AX path.
