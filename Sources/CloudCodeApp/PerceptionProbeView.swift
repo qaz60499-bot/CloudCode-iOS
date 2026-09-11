@@ -89,7 +89,7 @@ extension CloudCodeViewModel {
                         var stdout: NSString?
                         var stderr: NSString?
                         let code = CloudCodeSpawnHelperWithSeparatedOutput(EmbeddedRootHelper.executablePath,
-                            ["gui-ax-probe-json", "iosmcp-delta", "application", "0", "requesting2"], root, 5, &stdout, &stderr)
+                            ["gui-ax-probe-json", "iosmcp-delta", "application", "0", "requesting2"], root, 15, &stdout, &stderr)
                         return ["code": String(code), "stdout": stdout as String? ?? "", "stderr": stderr as String? ?? ""]
                     }.value
                     await record(String(format: "ax-iosmcp-%02d", root ? 1 : 0), ["seed": "application", "preparation": "requesting2", "root": root, "result": body])

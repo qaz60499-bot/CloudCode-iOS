@@ -90,6 +90,7 @@ typedef CloudCodeAXError (*CloudCodeAXCopyParameterizedAttributeValueFn)(CloudCo
 typedef CloudCodeAXError (*CloudCodeAXCopyAttributeNamesFn)(CloudCodeAXUIElementRef, CFArrayRef *);
 typedef CloudCodeAXError (*CloudCodeAXCopyElementUsingContextIdAtPositionFn)(CloudCodeAXUIElementRef, uint32_t, CloudCodeAXUIElementRef *, int, float, float);
 typedef CloudCodeAXError (*CloudCodeAXCopyElementUsingDisplayIdAtPositionFn)(CloudCodeAXUIElementRef, uint32_t, CloudCodeAXUIElementRef *, int, float, float);
+typedef CFTypeRef (*CloudCodeAXValueCreateFn)(int, const void *);
 typedef BOOL (*CloudCodeAXIsPidAssociatedFn)(pid_t);
 typedef BOOL (*CloudCodeAXIsPidAssociatedWithDisplayTypeFn)(pid_t, int);
 typedef pid_t (*CloudCodeAXFrontBoardFocusedAppPIDFn)(void);
@@ -103,6 +104,7 @@ typedef void (*CloudCodeAXSetAutomationEnabledFn)(int);
 typedef int (*CloudCodeProcListAllPidsFn)(void *, int);
 typedef int (*CloudCodeProcPidPathFn)(int, void *, uint32_t);
 
+typedef CFTypeRef (*CloudCodeAXValueCreateFn)(int, const void *);
 typedef CFTypeID (*CloudCodeAXValueGetTypeIDFn)(void);
 typedef int (*CloudCodeAXValueGetTypeFn)(CFTypeRef);
 typedef Boolean (*CloudCodeAXValueGetValueFn)(CFTypeRef, int, void *);
@@ -1917,7 +1919,22 @@ static void *CCAXProbeSymbol(CloudCodeAXRuntime runtime, const char *name)
 {
     void *symbol = dlsym(RTLD_DEFAULT, name);
     if (!symbol && runtime.handle) { symbol = dlsym(runtime.handle, name); }
-    return symbol;
+    if (symbol) { return symbol; }
+    // Match the production AX resolver and ios-mcp's multi-framework discovery. Probing only the
+    // first successfully opened image can falsely classify an API as absent when it lives in a
+    // different AX/Accessibility image on iOS 16.6.
+    return CloudCodeResolveAcrossFrameworks(@[
+        @"/System/Library/Frameworks/ApplicationServices.framework/Frameworks/HIServices.framework/HIServices",
+        @"/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime",
+        @"/System/Library/Frameworks/Accessibility.framework/Accessibility",
+        @"/System/Library/PrivateFrameworks/Accessibility.framework/Accessibility",
+        @"/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices",
+        @"/System/Library/Frameworks/HIServices.framework/HIServices",
+        @"/usr/lib/libAccessibility.dylib",
+        @"/rootfs/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime",
+        @"/rootfs/System/Library/Frameworks/Accessibility.framework/Accessibility",
+        @"/rootfs/usr/lib/libAccessibility.dylib"
+    ], name);
 }
 
 static CFStringRef CCAXProbeCFStringSymbol(CloudCodeAXRuntime runtime, const char *name)
@@ -1930,6 +1947,14 @@ static CFStringRef CCAXProbeCFStringSymbol(CloudCodeAXRuntime runtime, const cha
 static NSDictionary *CCAXProbeFBSWorkspace(NSString *foregroundBundle, pid_t foregroundPID)
 {
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    // ios-mcp normally executes inside SpringBoard, where FrontBoardServices is already resident.
+    // A detached TrollStore helper cannot assume that invocation context, so explicitly load the
+    // framework before judging FBSWorkspace availability and record that distinction in evidence.
+    void *frontBoardServices = CloudCodeOpenFramework(@[
+        @"/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices",
+        @"/rootfs/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices"
+    ]);
+    result[@"frameworkLoaded"] = @(frontBoardServices != NULL);
     Class workspaceClass = objc_getClass("FBSWorkspace");
     result[@"classPresent"] = @(workspaceClass != Nil);
     if (!workspaceClass) { return result; }
@@ -1944,7 +1969,10 @@ static NSDictionary *CCAXProbeFBSWorkspace(NSString *foregroundBundle, pid_t for
     if (!workspace) { return result; }
     id scenesValue = CCAXProbeObject0(workspace, @"scenes");
     NSArray *scenes = [scenesValue isKindOfClass:NSArray.class] ? scenesValue : nil;
-    if (!scenes && [scenesValue isKindOfClass:NSSet.class]) { scenes = [(NSSet *)scenesValue allObjects]; }
+    if (!scenes && [scenesValue respondsToSelector:@selector(allObjects)]) {
+        id objects = CCAXProbeObject0(scenesValue, @"allObjects");
+        if ([objects isKindOfClass:NSArray.class]) { scenes = objects; }
+    }
     result[@"sceneCount"] = @(scenes.count);
     NSMutableArray *summaries = [NSMutableArray array];
     NSUInteger limit = MIN((NSUInteger)12, scenes.count);
@@ -1967,7 +1995,10 @@ static NSDictionary *CCAXProbeFBSWorkspace(NSString *foregroundBundle, pid_t for
         if (displayID) { summary[@"displayId"] = displayID; }
         id contextsValue = CCAXProbeObject0(scene, @"contexts");
         NSArray *contexts = [contextsValue isKindOfClass:NSArray.class] ? contextsValue : nil;
-        if (!contexts && [contextsValue isKindOfClass:NSSet.class]) { contexts = [(NSSet *)contextsValue allObjects]; }
+        if (!contexts && [contextsValue respondsToSelector:@selector(allObjects)]) {
+            id objects = CCAXProbeObject0(contextsValue, @"allObjects");
+            if ([objects isKindOfClass:NSArray.class]) { contexts = objects; }
+        }
         NSMutableArray *contextIDs = [NSMutableArray array];
         for (id context in [contexts subarrayWithRange:NSMakeRange(0, MIN((NSUInteger)8, contexts.count))]) {
             NSNumber *contextID = CCAXProbeUnsigned0(context, @"contextID") ?: CCAXProbeUnsigned0(context, @"contextId") ?: CCAXProbeUnsigned0(context, @"windowContextId");
@@ -1986,6 +2017,12 @@ static NSDictionary *CCAXProbeFBSWorkspace(NSString *foregroundBundle, pid_t for
 static NSDictionary *CCAXProbeIOSMCPDelta(CloudCodeAXRuntime runtime, NSString *foregroundBundle, pid_t foregroundPID)
 {
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    result[@"adoptionStatus"] = @"probe_only_not_production_proof";
+    result[@"executionContext"] = @{
+        @"pid": @(getpid()), @"euid": @(geteuid()),
+        @"springBoardResident": @NO,
+        @"note": @"detached CloudCodeRootHelper persona; presence/success does not prove SpringBoard-resident behavior"
+    };
     NSArray<NSString *> *symbolNames = @[
         @"AXUIElementCopyParameterizedAttributeValue", @"AXUIElementCopyAttributeNames",
         @"AXUIElementCopyElementAtPositionWithParams", @"AXUIElementCopyElementUsingContextIdAtPosition",
@@ -2070,7 +2107,7 @@ static NSDictionary *CCAXProbeIOSMCPDelta(CloudCodeAXRuntime runtime, NSString *
             @"kAXXCAttributePlaceholderValue", @"kAXXCAttributeTraits", @"kAXXCAttributeUserTestingElements",
             @"kAXXCAttributeUserTestingSnapshot", @"kAXXCAttributeValue", @"kAXXCAttributeVisibleFrame",
             @"kAXXCAttributeWindowContextId", @"kAXXCAttributeWindowDisplayId",
-            @"kAXXCParameterizedAttributeChildrenWithRange", @"kAXXCParameterizedAttributeUserTestingSnapshot"
+            @"kAXXCParameterizedAttributeChildrenWithRange", @"kAXXCParameterizedAttributeUserTestingSnapshotParameterized"
         ];
         NSMutableDictionary *xc = [NSMutableDictionary dictionary];
         for (NSString *name in xcNames) {
@@ -2111,15 +2148,77 @@ static NSDictionary *CCAXProbeIOSMCPDelta(CloudCodeAXRuntime runtime, NSString *
     NSMutableDictionary *contextHit = [NSMutableDictionary dictionary];
     CloudCodeAXCopyElementUsingContextIdAtPositionFn contextFn = (CloudCodeAXCopyElementUsingContextIdAtPositionFn)CCAXProbeSymbol(runtime, "AXUIElementCopyElementUsingContextIdAtPosition");
     CloudCodeAXCopyElementUsingDisplayIdAtPositionFn displayFn = (CloudCodeAXCopyElementUsingDisplayIdAtPositionFn)CCAXProbeSymbol(runtime, "AXUIElementCopyElementUsingDisplayIdAtPosition");
+    CloudCodeAXCopyParameterizedAttributeValueFn parameterizedFn = (CloudCodeAXCopyParameterizedAttributeValueFn)CCAXProbeSymbol(runtime, "AXUIElementCopyParameterizedAttributeValue");
+    CloudCodeAXValueCreateFn axValueCreate = (CloudCodeAXValueCreateFn)CCAXProbeSymbol(runtime, "AXValueCreate");
+    contextHit[@"axValueCreateSymbol"] = CCAXSymbolEvidence((void *)axValueCreate);
     CGSize size = CloudCodeScreenSize();
     CGPoint point = CGPointMake(size.width * 0.5, size.height * 0.5);
+    CFTypeRef axPoint = NULL;
+    if (axValueCreate) {
+        // AXValueType 1 is CGPoint in the iOS AX ABI. ios-mcp uses an AXValue here rather than
+        // Foundation NSValue; preserve the NSValue fallback only so the probe can distinguish an
+        // unavailable AXValueCreate symbol from a remote-context/permission failure.
+        @try { axPoint = axValueCreate(1, &point); } @catch (__unused NSException *exception) { axPoint = NULL; }
+    }
+    id pointParameter = axPoint ? (__bridge id)axPoint : [NSValue valueWithCGPoint:point];
+    contextHit[@"pointParameterEncoding"] = axPoint ? @"AXValueCreate(CGPoint)" : @"NSValue(CGPoint)-fallback";
     CloudCodeAXUIElementRef seed = runtime.createSystemWide ? runtime.createSystemWide() : NULL;
+    if (seed && runtime.setTimeout) {
+        @try { runtime.setTimeout(seed, CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {}
+    }
+    uint32_t parameterizedContextID = 0;
+    if (seed && parameterizedFn) {
+        NSMutableArray *pointContextResults = [NSMutableArray array];
+        for (NSNumber *displayCandidate in @[@1, @0]) {
+            NSArray *parameter = @[pointParameter, displayCandidate];
+            CFTypeRef value = NULL;
+            CloudCodeAXError code = -1;
+            @try {
+                code = parameterizedFn(seed, (CFStringRef)(uintptr_t)0x16573, (__bridge CFTypeRef)parameter, &value);
+            } @catch (__unused NSException *exception) {
+                code = -1;
+                value = NULL;
+            }
+            NSMutableDictionary *entry = [@{@"displayId": displayCandidate, @"AXError": @(code), @"valuePresent": @(value != NULL)} mutableCopy];
+            if (value) {
+                id bridged = (__bridge id)value;
+                entry[@"summary"] = CCAXProbeValueSummary(bridged);
+                if (parameterizedContextID == 0 && [bridged respondsToSelector:@selector(unsignedIntValue)]) {
+                    parameterizedContextID = [bridged unsignedIntValue];
+                }
+                CFRelease(value);
+            }
+            [pointContextResults addObject:entry];
+            if (parameterizedContextID > 0) { break; }
+        }
+        contextHit[@"parameterizedPointContext"] = pointContextResults;
+        contextHit[@"parameterizedContextId"] = @(parameterizedContextID);
+        if (parameterizedContextID > 0) {
+            NSDictionary *parameter = @{@"contextId": @(parameterizedContextID)};
+            CFTypeRef value = NULL;
+            CloudCodeAXError code = -1;
+            @try {
+                code = parameterizedFn(seed, (CFStringRef)(uintptr_t)0x16574, (__bridge CFTypeRef)parameter, &value);
+            } @catch (__unused NSException *exception) {
+                code = -1;
+                value = NULL;
+            }
+            contextHit[@"parameterizedContextPidAXError"] = @(code);
+            contextHit[@"parameterizedContextPidPresent"] = @(value != NULL);
+            if (value) {
+                contextHit[@"parameterizedContextPid"] = CCAXProbeValueSummary((__bridge id)value);
+                CFRelease(value);
+            }
+        }
+    }
     CloudCodeAXUIElementRef application = NULL;
     uint32_t contextID = 0;
     CloudCodeAXError appCode = -1;
     if (seed && runtime.copyApplicationAndContextAtPosition) {
         @try { appCode = runtime.copyApplicationAndContextAtPosition(seed, &application, &contextID, point.x, point.y); } @catch (__unused NSException *exception) { appCode = -1; application = NULL; contextID = 0; }
     }
+    if (contextID == 0) { contextID = parameterizedContextID; }
+    if (!application && root) { application = (CloudCodeAXUIElementRef)CFRetain(root); }
     contextHit[@"applicationContextAXError"] = @(appCode);
     contextHit[@"contextId"] = @(contextID);
     contextHit[@"applicationPresent"] = @(application != NULL);
@@ -2164,6 +2263,7 @@ static NSDictionary *CCAXProbeIOSMCPDelta(CloudCodeAXRuntime runtime, NSString *
     }
     if (application) { CFRelease(application); }
     if (seed) { CFRelease(seed); }
+    if (axPoint) { CFRelease(axPoint); }
     if (root) { CFRelease(root); }
     semantic[@"contextDisplayHit"] = contextHit;
     result[@"semanticProbe"] = semantic;
