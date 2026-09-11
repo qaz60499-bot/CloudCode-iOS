@@ -91,6 +91,7 @@ typedef CloudCodeAXError (*CloudCodeAXCopyAttributeNamesFn)(CloudCodeAXUIElement
 typedef CloudCodeAXError (*CloudCodeAXCopyElementUsingContextIdAtPositionFn)(CloudCodeAXUIElementRef, uint32_t, CloudCodeAXUIElementRef *, int, float, float);
 typedef CloudCodeAXError (*CloudCodeAXCopyElementUsingDisplayIdAtPositionFn)(CloudCodeAXUIElementRef, uint32_t, CloudCodeAXUIElementRef *, int, float, float);
 typedef CFTypeRef (*CloudCodeAXValueCreateFn)(int, const void *);
+typedef BOOL (*CloudCodeAXBool0Fn)(void);
 typedef BOOL (*CloudCodeAXIsPidAssociatedFn)(pid_t);
 typedef BOOL (*CloudCodeAXIsPidAssociatedWithDisplayTypeFn)(pid_t, int);
 typedef pid_t (*CloudCodeAXFrontBoardFocusedAppPIDFn)(void);
@@ -104,7 +105,6 @@ typedef void (*CloudCodeAXSetAutomationEnabledFn)(int);
 typedef int (*CloudCodeProcListAllPidsFn)(void *, int);
 typedef int (*CloudCodeProcPidPathFn)(int, void *, uint32_t);
 
-typedef CFTypeRef (*CloudCodeAXValueCreateFn)(int, const void *);
 typedef CFTypeID (*CloudCodeAXValueGetTypeIDFn)(void);
 typedef int (*CloudCodeAXValueGetTypeFn)(CFTypeRef);
 typedef Boolean (*CloudCodeAXValueGetValueFn)(CFTypeRef, int, void *);
@@ -2014,6 +2014,54 @@ static NSDictionary *CCAXProbeFBSWorkspace(NSString *foregroundBundle, pid_t for
     return result;
 }
 
+static NSDictionary *CCAXProbeAXUIClientReadOnly(CloudCodeAXRuntime runtime)
+{
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    void *accessibilityUI = CloudCodeOpenFramework(@[
+        @"/System/Library/PrivateFrameworks/AccessibilityUI.framework/AccessibilityUI",
+        @"/rootfs/System/Library/PrivateFrameworks/AccessibilityUI.framework/AccessibilityUI"
+    ]);
+    void *accessibilityUtilities = CloudCodeOpenFramework(@[
+        @"/System/Library/PrivateFrameworks/AccessibilityUtilities.framework/AccessibilityUtilities",
+        @"/rootfs/System/Library/PrivateFrameworks/AccessibilityUtilities.framework/AccessibilityUtilities"
+    ]);
+    result[@"accessibilityUIFrameworkLoaded"] = @(accessibilityUI != NULL);
+    result[@"accessibilityUtilitiesFrameworkLoaded"] = @(accessibilityUtilities != NULL);
+    result[@"axUIClientClassPresent"] = @(NSClassFromString(@"AXUIClient") != Nil);
+    result[@"axUIClientConnectionClassPresent"] = @(NSClassFromString(@"AXUIClientConnection") != Nil);
+
+    NSMutableDictionary *symbols = [NSMutableDictionary dictionary];
+    for (NSString *name in @[
+        @"_AXSApplicationAccessibilityEnabled", @"__AXSApplicationAccessibilityEnabled",
+        @"_AXSApplicationAccessibilitySetEnabled", @"__AXSApplicationAccessibilitySetEnabled",
+        @"_AXSVoiceOverTouchUsageConfirmed", @"__AXSVoiceOverTouchUsageConfirmed",
+        @"_AXSVoiceOverTouchSetUsageConfirmed", @"__AXSVoiceOverTouchSetUsageConfirmed"
+    ]) {
+        symbols[name] = CCAXSymbolEvidence(CCAXProbeSymbol(runtime, name.UTF8String));
+    }
+    void *primeDisplayManager = accessibilityUtilities ? dlsym(accessibilityUtilities, "_AXDevicePrimeDisplayManager") : NULL;
+    symbols[@"_AXDevicePrimeDisplayManager"] = CCAXSymbolEvidence(primeDisplayManager);
+    result[@"symbols"] = symbols;
+
+    CloudCodeAXBool0Fn appAccessibilityEnabled = (CloudCodeAXBool0Fn)CCAXProbeSymbol(runtime, "_AXSApplicationAccessibilityEnabled");
+    if (!appAccessibilityEnabled) { appAccessibilityEnabled = (CloudCodeAXBool0Fn)CCAXProbeSymbol(runtime, "__AXSApplicationAccessibilityEnabled"); }
+    CloudCodeAXBool0Fn voiceOverUsageConfirmed = (CloudCodeAXBool0Fn)CCAXProbeSymbol(runtime, "_AXSVoiceOverTouchUsageConfirmed");
+    if (!voiceOverUsageConfirmed) { voiceOverUsageConfirmed = (CloudCodeAXBool0Fn)CCAXProbeSymbol(runtime, "__AXSVoiceOverTouchUsageConfirmed"); }
+    if (appAccessibilityEnabled) {
+        @try { result[@"applicationAccessibilityEnabled"] = @(appAccessibilityEnabled()); }
+        @catch (__unused NSException *exception) { result[@"applicationAccessibilityEnabledException"] = @YES; }
+    }
+    if (voiceOverUsageConfirmed) {
+        @try { result[@"voiceOverTouchUsageConfirmed"] = @(voiceOverUsageConfirmed()); }
+        @catch (__unused NSException *exception) { result[@"voiceOverTouchUsageConfirmedException"] = @YES; }
+    }
+    result[@"stateMutationAttempted"] = @NO;
+    result[@"axUIClientInstantiationAttempted"] = @NO;
+    result[@"axManualAccessibilityTouched"] = @NO;
+    result[@"probeClassification"] = @"read_only_presence_and_state_only";
+    return result;
+}
+
 static NSDictionary *CCAXProbeIOSMCPDelta(CloudCodeAXRuntime runtime, NSString *foregroundBundle, pid_t foregroundPID)
 {
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
@@ -2032,6 +2080,7 @@ static NSDictionary *CCAXProbeIOSMCPDelta(CloudCodeAXRuntime runtime, NSString *
     NSMutableDictionary *symbolEvidence = [NSMutableDictionary dictionary];
     for (NSString *name in symbolNames) { symbolEvidence[name] = CCAXSymbolEvidence(CCAXProbeSymbol(runtime, name.UTF8String)); }
     result[@"symbols"] = symbolEvidence;
+    result[@"axUIClientReadOnly"] = CCAXProbeAXUIClientReadOnly(runtime);
 
     void *frontBoardHandle = dlopen("/System/Library/PrivateFrameworks/AXFrontBoardUtils.framework/AXFrontBoardUtils", RTLD_NOW | RTLD_GLOBAL);
     NSMutableDictionary *frontBoard = [NSMutableDictionary dictionary];
@@ -2047,9 +2096,20 @@ static NSDictionary *CCAXProbeIOSMCPDelta(CloudCodeAXRuntime runtime, NSString *
     }
     frontBoard[@"frameworkLoaded"] = @(frontBoardHandle != NULL);
     frontBoard[@"symbols"] = frontBoardSymbols;
+    pid_t probeTargetPID = foregroundPID;
+    NSString *probeTargetPIDSource = foregroundPID > 0 ? @"input_resolver" : @"unresolved";
     CloudCodeAXFrontBoardFocusedAppPIDFn focusedPIDFn = frontBoardHandle ? (CloudCodeAXFrontBoardFocusedAppPIDFn)dlsym(frontBoardHandle, "AXFrontBoardFocusedAppPID") : NULL;
     if (focusedPIDFn) {
-        @try { frontBoard[@"focusedPid"] = @(focusedPIDFn()); } @catch (__unused NSException *exception) { frontBoard[@"focusedPidException"] = @YES; }
+        @try {
+            pid_t focusedPID = focusedPIDFn();
+            frontBoard[@"focusedPid"] = @(focusedPID);
+            if (probeTargetPID <= 0 && focusedPID > 0) {
+                probeTargetPID = focusedPID;
+                probeTargetPIDSource = @"AXFrontBoardFocusedAppPID";
+            }
+        } @catch (__unused NSException *exception) {
+            frontBoard[@"focusedPidException"] = @YES;
+        }
     }
     for (NSString *name in [frontBoardNames subarrayWithRange:NSMakeRange(1, frontBoardNames.count - 1)]) {
         CloudCodeAXFrontBoardObjectFn function = frontBoardHandle ? (CloudCodeAXFrontBoardObjectFn)dlsym(frontBoardHandle, name.UTF8String) : NULL;
@@ -2063,12 +2123,15 @@ static NSDictionary *CCAXProbeIOSMCPDelta(CloudCodeAXRuntime runtime, NSString *
         }
     }
     result[@"axFrontBoard"] = frontBoard;
-    result[@"fbsWorkspace"] = CCAXProbeFBSWorkspace(foregroundBundle, foregroundPID);
+    result[@"resolvedProbeTargetPid"] = @(probeTargetPID);
+    result[@"resolvedProbeTargetPidSource"] = probeTargetPIDSource;
+    result[@"fbsWorkspace"] = CCAXProbeFBSWorkspace(foregroundBundle, probeTargetPID);
 
     NSString *backend = nil;
-    CloudCodeAXUIElementRef root = foregroundPID > 0 ? CloudCodeAXRootForPid(runtime, foregroundPID, &backend) : NULL;
+    CloudCodeAXUIElementRef root = probeTargetPID > 0 ? CloudCodeAXRootForPid(runtime, probeTargetPID, &backend) : NULL;
     NSMutableDictionary *semantic = [NSMutableDictionary dictionary];
-    semantic[@"targetPid"] = @(foregroundPID);
+    semantic[@"targetPid"] = @(probeTargetPID);
+    semantic[@"targetPidSource"] = probeTargetPIDSource;
     semantic[@"rootCreated"] = @(root != NULL);
     if (backend) { semantic[@"rootBackend"] = backend; }
     CloudCodeAXCopyAttributeNamesFn copyAttributeNames = (CloudCodeAXCopyAttributeNamesFn)CCAXProbeSymbol(runtime, "AXUIElementCopyAttributeNames");
@@ -2138,11 +2201,11 @@ static NSDictionary *CCAXProbeIOSMCPDelta(CloudCodeAXRuntime runtime, NSString *
 
     CloudCodeAXIsPidAssociatedFn isAssociated = (CloudCodeAXIsPidAssociatedFn)CCAXProbeSymbol(runtime, "_AXIsPidAssociated");
     CloudCodeAXIsPidAssociatedWithDisplayTypeFn isAssociatedDisplay = (CloudCodeAXIsPidAssociatedWithDisplayTypeFn)CCAXProbeSymbol(runtime, "_AXIsPidAssociatedWithDisplayType");
-    if (foregroundPID > 0 && isAssociated) {
-        @try { semantic[@"targetPidAssociated"] = @(isAssociated(foregroundPID)); } @catch (__unused NSException *exception) { semantic[@"targetPidAssociatedException"] = @YES; }
+    if (probeTargetPID > 0 && isAssociated) {
+        @try { semantic[@"targetPidAssociated"] = @(isAssociated(probeTargetPID)); } @catch (__unused NSException *exception) { semantic[@"targetPidAssociatedException"] = @YES; }
     }
-    if (foregroundPID > 0 && isAssociatedDisplay) {
-        @try { semantic[@"targetPidDisplay1Associated"] = @(isAssociatedDisplay(foregroundPID, 1)); } @catch (__unused NSException *exception) { semantic[@"targetPidDisplay1AssociatedException"] = @YES; }
+    if (probeTargetPID > 0 && isAssociatedDisplay) {
+        @try { semantic[@"targetPidDisplay1Associated"] = @(isAssociatedDisplay(probeTargetPID, 1)); } @catch (__unused NSException *exception) { semantic[@"targetPidDisplay1AssociatedException"] = @YES; }
     }
 
     NSMutableDictionary *contextHit = [NSMutableDictionary dictionary];
