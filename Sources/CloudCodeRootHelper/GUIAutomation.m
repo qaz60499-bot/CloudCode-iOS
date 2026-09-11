@@ -2107,29 +2107,16 @@ static NSDictionary *CCAXProbeIOSMCPDelta(CloudCodeAXRuntime runtime, NSString *
     frontBoard[@"symbols"] = frontBoardSymbols;
     pid_t probeTargetPID = foregroundPID;
     NSString *probeTargetPIDSource = foregroundPID > 0 ? @"input_resolver" : @"unresolved";
-    CloudCodeAXFrontBoardFocusedAppPIDFn focusedPIDFn = frontBoardHandle ? (CloudCodeAXFrontBoardFocusedAppPIDFn)dlsym(frontBoardHandle, "AXFrontBoardFocusedAppPID") : NULL;
-    if (focusedPIDFn) {
-        @try {
-            pid_t focusedPID = focusedPIDFn();
-            BOOL live = CloudCodePIDIsLiveProcess(focusedPID);
-            NSString *focusedBundleID = live ? CloudCodeBundleIDForPID(focusedPID) : nil;
-            BOOL matchesKnownForeground = foregroundBundle.length == 0 || [focusedBundleID isEqualToString:foregroundBundle];
-            BOOL usable = live && focusedPID != getpid() && matchesKnownForeground;
-            frontBoard[@"focusedPid"] = @(focusedPID);
-            frontBoard[@"focusedPidLive"] = @(live);
-            frontBoard[@"focusedPidBundleID"] = focusedBundleID ?: @"";
-            frontBoard[@"focusedPidUsable"] = @(usable);
-            if (!live) { frontBoard[@"focusedPidRejection"] = @"not_a_live_process_pid"; }
-            else if (focusedPID == getpid()) { frontBoard[@"focusedPidRejection"] = @"detached_helper_self_pid"; }
-            else if (!matchesKnownForeground) { frontBoard[@"focusedPidRejection"] = @"does_not_match_sbscopy_foreground_bundle"; }
-            if (probeTargetPID <= 0 && usable) {
-                probeTargetPID = focusedPID;
-                probeTargetPIDSource = @"AXFrontBoardFocusedAppPID.validated";
-            }
-        } @catch (__unused NSException *exception) {
-            frontBoard[@"focusedPidException"] = @YES;
-        }
-    }
+    // Build 122 physical-device probes proved that treating AXFrontBoardFocusedAppPID as
+    // `pid_t(void)` is not ABI-safe in this detached helper: it returned changing non-process
+    // integers while the object/array accessors consistently resolved the helper itself. Keep the
+    // symbol evidence, but do not invoke the scalar entry until its ABI is independently proven.
+    // The already-validated SpringBoard/LaunchServices foreground resolver remains authoritative.
+    frontBoard[@"focusedPidProbe"] = @{
+        @"invoked": @NO,
+        @"classification": @"abi_unverified_after_build122_runtime_probe",
+        @"reason": @"scalar_call_returned_non_pid_values_on_physical_ios_16_6"
+    };
     for (NSString *name in [frontBoardNames subarrayWithRange:NSMakeRange(1, frontBoardNames.count - 1)]) {
         CloudCodeAXFrontBoardObjectFn function = frontBoardHandle ? (CloudCodeAXFrontBoardObjectFn)dlsym(frontBoardHandle, name.UTF8String) : NULL;
         if (!function) { continue; }
