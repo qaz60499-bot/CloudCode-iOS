@@ -254,15 +254,24 @@ public enum PerceptionBrokerFacade {
         if normalized.contains("unknown client") || normalized.contains("unknown_client") {
             return .unknownClient
         }
-        if normalized.contains("timeout") || normalized.contains("timed out") {
-            return .transportTimeout
-        }
+        // A helper diagnostic may include configuration fields such as `timeoutSeconds` even when
+        // waitpid observed a prompt exit. Semantic-empty AX is therefore stronger evidence than the
+        // mere presence of the word "timeout" in structured transport diagnostics.
         if semanticNodeCount == 0
             || normalized.contains("semantic empty")
             || normalized.contains("semantically empty")
+            || normalized.contains("empty-semantic-tree")
             || normalized.contains("no semantic/actionable")
             || normalized.contains("ax_transport_returned_semantically_empty_tree") {
             return .semanticEmpty
+        }
+        if normalized.contains("timed out")
+            || normalized.contains("parenttimeout\":true")
+            || normalized.contains("parenttimeout=true")
+            || normalized.contains("helper timeout")
+            || normalized.contains("transport timeout")
+            || normalized.contains("transport_timeout") {
+            return .transportTimeout
         }
         if normalized.contains("unsupported")
             || normalized.contains("required axruntime")

@@ -76,13 +76,16 @@ typedef CloudCodeAXError (*CloudCodeAXGetPidFn)(CloudCodeAXUIElementRef, pid_t *
 typedef CloudCodeAXError (*CloudCodeAXCopyAttributeFn)(CloudCodeAXUIElementRef, CFStringRef, CFTypeRef *);
 typedef CloudCodeAXError (*CloudCodeAXCopyMultipleAttributesFn)(CloudCodeAXUIElementRef, CFArrayRef, CFOptionFlags, CFArrayRef *);
 typedef CloudCodeAXError (*CloudCodeAXSetAttributeFn)(CloudCodeAXUIElementRef, CFStringRef, CFTypeRef);
-typedef CloudCodeAXError (*CloudCodeAXCopyElementAtPositionFn)(CloudCodeAXUIElementRef, float, float, CloudCodeAXUIElementRef *);
+// AXRuntime iOS ABI matches XCTest: out-element is the second parameter, followed by x/y.
+// Keeping the macOS-looking (element, x, y, out) order here silently corrupts the call boundary.
+typedef CloudCodeAXError (*CloudCodeAXCopyElementAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, float, float);
 typedef CloudCodeAXError (*CloudCodeAXCopyApplicationAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, float, float);
 typedef CloudCodeAXError (*CloudCodeAXCopyApplicationAndContextAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, uint32_t *, float, float);
 typedef CloudCodeAXError (*CloudCodeAXCopyElementWithParametersFn)(CloudCodeAXUIElementRef *, CFDictionaryRef);
 typedef CloudCodeAXError (*CloudCodeAXSetTimeoutFn)(CloudCodeAXUIElementRef, float);
 typedef void (*CloudCodeAXAddAssociatedPidFn)(pid_t, pid_t, int);
 typedef void (*CloudCodeAXSetRequestingClientFn)(uint32_t);
+typedef uint64_t (*CloudCodeAXOverrideRequestingClientTypeFn)(uint64_t);
 typedef int (*CloudCodeAXAutomationEnabledFn)(void);
 typedef void (*CloudCodeAXSetAutomationEnabledFn)(int);
 typedef int (*CloudCodeProcListAllPidsFn)(void *, int);
@@ -151,6 +154,9 @@ typedef struct {
     CloudCodeAXSetTimeoutFn setTimeout;
     CloudCodeAXAddAssociatedPidFn addAssociatedPid;
     CloudCodeAXSetRequestingClientFn setRequestingClient;
+    CloudCodeAXOverrideRequestingClientTypeFn overrideRequestingClientType;
+    BOOL requestingClientPrepared;
+    int requestingClientRoute;
     CloudCodeAXAutomationEnabledFn automationEnabled;
     CloudCodeAXSetAutomationEnabledFn setAutomationEnabled;
     BOOL automationLeaseActive;
@@ -339,6 +345,23 @@ static BOOL CloudCodeHIDReady(CloudCodeHIDRuntime runtime, CGPoint point, CloudC
         route->systemClient = runtime.createClient(kCFAllocatorDefault);
         if (route->systemClient) {
             fprintf(stderr, "gui-hid-route: profile=modern-trollstore route=system-client\n");
+            return YES;
+        }
+    }
+    return CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route);
+}
+
+static BOOL CloudCodeHIDTextReady(CloudCodeHIDRuntime runtime, CGPoint point, CloudCodeHIDRoute *route)
+{
+    // Unicode input does not require the digitizer/finger/append/setFloat symbols used by touch.
+    // Build 118 incorrectly reused CloudCodeHIDReady here, so any missing gesture-only primitive
+    // disabled text input even when IOHIDEventCreateUnicodeEvent + SystemClient dispatch worked.
+    if (!route || !runtime.createUnicode || !runtime.setInteger) { return NO; }
+    *route = (CloudCodeHIDRoute){0};
+    if (runtime.createClient && runtime.dispatch) {
+        route->systemClient = runtime.createClient(kCFAllocatorDefault);
+        if (route->systemClient) {
+            fprintf(stderr, "gui-hid-route: profile=modern-trollstore route=system-client purpose=unicode-text\n");
             return YES;
         }
     }
@@ -1143,6 +1166,32 @@ static CloudCodeAXRuntime CloudCodeResolveAX(void)
         runtime.addAssociatedPid = (CloudCodeAXAddAssociatedPidFn)CloudCodeResolveAcrossFrameworks(paths, "AXAddAssociatedPid");
     }
     runtime.setRequestingClient = (CloudCodeAXSetRequestingClientFn)CloudCodeResolveAcrossFrameworks(paths, "__AXSetRequestingClient");
+    if (!runtime.setRequestingClient) {
+        // iOS 16.6 exports the single-underscore spelling from AXRuntime; device probe evidence
+        // showed __AXSetRequestingClient absent while _AXSetRequestingClient is present.
+        runtime.setRequestingClient = (CloudCodeAXSetRequestingClientFn)CloudCodeResolveAcrossFrameworks(paths, "_AXSetRequestingClient");
+    }
+    if (!runtime.setRequestingClient) {
+        runtime.setRequestingClient = (CloudCodeAXSetRequestingClientFn)CloudCodeResolveAcrossFrameworks(paths, "AXSetRequestingClient");
+    }
+    runtime.overrideRequestingClientType = (CloudCodeAXOverrideRequestingClientTypeFn)CloudCodeResolveAcrossFrameworks(paths, "_AXOverrideRequestingClientType");
+    // XCTest identifies AX requests as automation client type 2. A detached TrollStore helper is
+    // otherwise inferred as an unknown client on iOS 16.6 and can receive an empty semantic tree.
+    // This changes only the requesting identity of this one-shot helper process; it never mutates
+    // AXManualAccessibility on the target app and therefore does not reintroduce the green overlay.
+    if (runtime.setRequestingClient) {
+        @try {
+            runtime.setRequestingClient(2);
+            runtime.requestingClientPrepared = YES;
+            runtime.requestingClientRoute = 1;
+        } @catch (__unused NSException *exception) {}
+    } else if (runtime.overrideRequestingClientType) {
+        @try {
+            (void)runtime.overrideRequestingClientType(2);
+            runtime.requestingClientPrepared = YES;
+            runtime.requestingClientRoute = 2;
+        } @catch (__unused NSException *exception) {}
+    }
     runtime.automationEnabled = (CloudCodeAXAutomationEnabledFn)CloudCodeResolveAcrossFrameworks(paths, "_AXSAutomationEnabled");
     runtime.setAutomationEnabled = (CloudCodeAXSetAutomationEnabledFn)CloudCodeResolveAcrossFrameworks(paths, "_AXSSetAutomationEnabled");
     if (runtime.automationEnabled && runtime.setAutomationEnabled) {
@@ -1179,12 +1228,14 @@ static CloudCodeAXRuntime CloudCodeResolveAX(void)
 static void CloudCodePrintAXRuntimeDiagnostic(CloudCodeAXRuntime runtime, const char *stage)
 {
     fprintf(stderr,
-        "gui-tree-ax-runtime: stage=%s authority=standalone-trollstore-best-effort automation_getter=%d automation_setter=%d automation_lease=%d requesting_client=%d create_app=%d create_systemwide=%d copy_attribute=%d copy_multiple=%d element_at_position=%d app_at_position=%d app_context_at_position=%d element_with_parameters=%d\n",
+        "gui-tree-ax-runtime: stage=%s authority=standalone-trollstore-best-effort automation_getter=%d automation_setter=%d automation_lease=%d requesting_client=%d requesting_client_prepared=%d requesting_client_route=%d create_app=%d create_systemwide=%d copy_attribute=%d copy_multiple=%d element_at_position=%d app_at_position=%d app_context_at_position=%d element_with_parameters=%d\n",
         stage ?: "unknown",
         runtime.automationEnabled ? 1 : 0,
         runtime.setAutomationEnabled ? 1 : 0,
         runtime.automationLeaseActive ? 1 : 0,
-        runtime.setRequestingClient ? 1 : 0,
+        (runtime.setRequestingClient || runtime.overrideRequestingClientType) ? 1 : 0,
+        runtime.requestingClientPrepared ? 1 : 0,
+        runtime.requestingClientRoute,
         (runtime.createApplication || runtime.createAppElementWithPid) ? 1 : 0,
         runtime.createSystemWide ? 1 : 0,
         runtime.copyAttribute ? 1 : 0,
@@ -1647,7 +1698,7 @@ static NSDictionary *CloudCodeAXHitTestTree(CloudCodeAXRuntime runtime, NSUInteg
         uint32_t contextID = 0;
         if (runtime.copyElementAtPosition) {
             @try {
-                code = runtime.copyElementAtPosition(systemWide, (float)points[index].x, (float)points[index].y, &candidate);
+                code = runtime.copyElementAtPosition(systemWide, &candidate, (float)points[index].x, (float)points[index].y);
             } @catch (__unused NSException *exception) {
                 code = -1;
                 candidate = NULL;
@@ -1750,7 +1801,7 @@ int CloudCodeGUIAXProbeJSON(NSString *stage, NSString *seedKind, pid_t targetPID
     CC_AX_SYMBOL(createApplication); CC_AX_SYMBOL(createAppElementWithPid); CC_AX_SYMBOL(createSystemWide);
     CC_AX_SYMBOL(getPid); CC_AX_SYMBOL(copyAttribute); CC_AX_SYMBOL(copyMultipleAttributes);
     CC_AX_SYMBOL(copyElementAtPosition); CC_AX_SYMBOL(copyApplicationAtPosition); CC_AX_SYMBOL(copyApplicationAndContextAtPosition); CC_AX_SYMBOL(copyElementWithParameters);
-    CC_AX_SYMBOL(setTimeout); CC_AX_SYMBOL(setAttribute); CC_AX_SYMBOL(addAssociatedPid); CC_AX_SYMBOL(setRequestingClient);
+    CC_AX_SYMBOL(setTimeout); CC_AX_SYMBOL(setAttribute); CC_AX_SYMBOL(addAssociatedPid); CC_AX_SYMBOL(setRequestingClient); CC_AX_SYMBOL(overrideRequestingClientType);
 #undef CC_AX_SYMBOL
     record[@"symbols"] = symbols;
     record[@"frameworkHandlePresent"] = @(runtime.handle != NULL);
@@ -1773,8 +1824,9 @@ int CloudCodeGUIAXProbeJSON(NSString *stage, NSString *seedKind, pid_t targetPID
     pid_t selectedPID = targetPID > 0 ? targetPID : foregroundPID;
     record[@"targetPID"] = @(selectedPID);
     if ([preparation isEqualToString:@"requesting2"]) {
-        if (runtime.setRequestingClient) { runtime.setRequestingClient(2); }
-        record[@"requestingClientCall"] = runtime.setRequestingClient ? @"called_void_no_ack" : @"symbol_missing";
+        record[@"requestingClientCall"] = runtime.requestingClientPrepared
+            ? (runtime.requestingClientRoute == 1 ? @"set_requesting_client_2" : @"override_requesting_client_type_2")
+            : @"symbol_missing";
     }
     if ([preparation isEqualToString:@"associated"]) {
         if (runtime.addAssociatedPid && selectedPID > 0) {
@@ -1836,7 +1888,7 @@ int CloudCodeGUIAXProbeJSON(NSString *stage, NSString *seedKind, pid_t targetPID
             CloudCodeAXError code = 0; BOOL called = NO; uint32_t contextID = 0;
             if (seed && size.width > 1 && size.height > 1) {
                 if ([stage isEqualToString:@"hit-test"] && runtime.copyElementAtPosition) {
-                    called = YES; code = runtime.copyElementAtPosition(seed, point.x, point.y, &hit);
+                    called = YES; code = runtime.copyElementAtPosition(seed, &hit, point.x, point.y);
                 } else if ([stage isEqualToString:@"application-at-point"] && runtime.copyApplicationAtPosition) {
                     called = YES; code = runtime.copyApplicationAtPosition(seed, &hit, point.x, point.y);
                 } else if ([stage isEqualToString:@"context-at-point"] && runtime.copyApplicationAndContextAtPosition) {
@@ -2004,11 +2056,13 @@ int CloudCodeGUIProbeJSON(void)
         // AXRuntime, or dispatch synthetic touch events here; each exact GUI operation validates
         // those private runtimes in its own bounded helper invocation when the user requests it.
         CloudCodeHIDRuntime hid = CloudCodeResolveHID();
-        BOOL symbolsReady = hid.createClient && hid.dispatch && hid.createDigitizer && hid.createFinger && hid.append && hid.setSender && hid.setInteger && hid.setFloat;
-        CloudCodeIOHIDEventSystemClientRef client = symbolsReady ? hid.createClient(kCFAllocatorDefault) : NULL;
-        BOOL hidReady = client != NULL;
-        if (client) { CFRelease(client); }
-        BOOL text = hidReady && hid.createUnicode != NULL;
+        // Capability refresh does not dispatch a synthetic event. Text readiness only depends on
+        // the Unicode event/system-client route; touch/gesture primitives stay exact-operation
+        // deferred and must not gate whether text input is reported routable.
+        BOOL textSymbolsReady = hid.createClient && hid.dispatch && hid.createUnicode && hid.setInteger;
+        CloudCodeIOHIDEventSystemClientRef textClient = textSymbolsReady ? hid.createClient(kCFAllocatorDefault) : NULL;
+        BOOL text = textClient != NULL;
+        if (textClient) { CFRelease(textClient); }
         NSDictionary *payload = @{
             @"backend": @"trollstore-root-helper-lightweight",
             @"touch": @NO,
@@ -2275,7 +2329,7 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
         CGSize size = CloudCodeScreenSize();
         CloudCodeHIDRoute route = {0};
         CGPoint routingPoint = CGPointMake(size.width > 1 ? size.width * 0.5 : 1, size.height > 1 ? size.height * 0.5 : 1);
-        if (!CloudCodeHIDReady(runtime, routingPoint, &route) || !runtime.createUnicode) {
+        if (!CloudCodeHIDTextReady(runtime, routingPoint, &route)) {
             CloudCodeReleaseHIDRoute(&route);
             CloudCodeGUIExitOneShot(68);
         }

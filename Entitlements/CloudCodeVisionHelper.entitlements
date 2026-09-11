@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Minimal graphics/decode entitlement profile for the ordinary mobile-user Vision helper.
+         These are the exact IOKit clients denied by iOS 16.6 while Vision/TextRecognition was
+         initializing on the user's device. Do not add root/persona/AX/HID privileges here. -->
+    <key>com.apple.security.iokit-user-client-class</key>
+    <array>
+        <string>AppleJPEGDriverUserClient</string>
+        <string>IOSurfaceRootUserClient</string>
+        <string>AGXDeviceUserClient</string>
+    </array>
+    <key>com.apple.security.exception.iokit-user-client-class</key>
+    <array>
+        <string>AppleJPEGDriverUserClient</string>
+        <string>IOSurfaceRootUserClient</string>
+        <string>AGXDeviceUserClient</string>
+    </array>
+</dict>
+</plist>

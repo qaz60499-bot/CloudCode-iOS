@@ -82,6 +82,19 @@ for key in \
     exit 11
   fi
 done
+for vision_iokit_key in \
+  'com.apple.security.iokit-user-client-class' \
+  'com.apple.security.exception.iokit-user-client-class'; do
+  for vision_iokit_class in \
+    'AppleJPEGDriverUserClient' \
+    'IOSurfaceRootUserClient' \
+    'AGXDeviceUserClient'; do
+    if ! /usr/libexec/PlistBuddy -c "Print :$vision_iokit_key" "$ENTITLEMENTS" 2>/dev/null | grep -F "$vision_iokit_class" >/dev/null; then
+      echo "FAIL: privileged host is missing local-Vision IOKit entitlement $vision_iokit_key: $vision_iokit_class" >&2
+      exit 11
+    fi
+  done
+done
 for helper_only in \
   'com.apple.multitasking.unlimitedassertions' \
   'com.apple.hid.system.server-access' \
@@ -132,14 +145,35 @@ if ! strings "$VISION_HELPER" | grep -Fq 'cloudcode-vision-helper-protocol=1'; t
   echo "FAIL: CloudCodeVisionHelper protocol marker missing" >&2
   exit 12
 fi
-VISION_ENTITLEMENTS="$(ldid -e "$VISION_HELPER" 2>/dev/null || true)"
+VISION_ENTITLEMENTS="$TMP_DIR/vision-helper-entitlements.plist"
+ldid -e "$VISION_HELPER" > "$VISION_ENTITLEMENTS"
+plutil -lint "$VISION_ENTITLEMENTS" >/dev/null
 for forbidden_vision_entitlement in 'platform-application' 'com.apple.private.persona-mgmt' 'com.apple.accessibility.api' 'com.apple.private.hid.client.event-dispatch'; do
-  if grep -Fq "$forbidden_vision_entitlement" <<<"$VISION_ENTITLEMENTS"; then
+  if /usr/libexec/PlistBuddy -c "Print :$forbidden_vision_entitlement" "$VISION_ENTITLEMENTS" >/dev/null 2>&1; then
     echo "FAIL: lightweight Vision helper unexpectedly carries privileged entitlement: $forbidden_vision_entitlement" >&2
     exit 12
   fi
 done
+for vision_iokit_key in 'com.apple.security.iokit-user-client-class' 'com.apple.security.exception.iokit-user-client-class'; do
+  for vision_iokit_class in 'AppleJPEGDriverUserClient' 'IOSurfaceRootUserClient' 'AGXDeviceUserClient'; do
+    if ! /usr/libexec/PlistBuddy -c "Print :$vision_iokit_key" "$VISION_ENTITLEMENTS" 2>/dev/null | grep -F "$vision_iokit_class" >/dev/null; then
+      echo "FAIL: lightweight Vision helper is missing IOKit client $vision_iokit_key: $vision_iokit_class" >&2
+      exit 12
+    fi
+  done
+done
 codesign --verify "$VISION_HELPER"
+VISION_CODESIGN_ENTITLEMENTS="$TMP_DIR/vision-helper-codesign-entitlements.plist"
+codesign -d --entitlements :- "$VISION_HELPER" > "$VISION_CODESIGN_ENTITLEMENTS" 2>/dev/null
+plutil -lint "$VISION_CODESIGN_ENTITLEMENTS" >/dev/null
+for vision_iokit_key in 'com.apple.security.iokit-user-client-class' 'com.apple.security.exception.iokit-user-client-class'; do
+  for vision_iokit_class in 'AppleJPEGDriverUserClient' 'IOSurfaceRootUserClient' 'AGXDeviceUserClient'; do
+    if ! /usr/libexec/PlistBuddy -c "Print :$vision_iokit_key" "$VISION_CODESIGN_ENTITLEMENTS" 2>/dev/null | grep -F "$vision_iokit_class" >/dev/null; then
+      echo "FAIL: final Vision helper code signature is missing IOKit client $vision_iokit_key: $vision_iokit_class" >&2
+      exit 12
+    fi
+  done
+done
 HELPER_ENTITLEMENTS="$TMP_DIR/root-helper-entitlements.plist"
 ldid -e "$HELPER" > "$HELPER_ENTITLEMENTS"
 plutil -lint "$HELPER_ENTITLEMENTS" >/dev/null

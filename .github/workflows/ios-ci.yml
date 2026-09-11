@@ -283,6 +283,18 @@ jobs:
             '<key>com.apple.private.persona-mgmt</key>'; do
             grep -F "$required_trollstore_host_entitlement" Entitlements/TrollStore.entitlements >/dev/null
           done
+          for vision_iokit_key in \
+            '<key>com.apple.security.iokit-user-client-class</key>' \
+            '<key>com.apple.security.exception.iokit-user-client-class</key>'; do
+            grep -F "$vision_iokit_key" Entitlements/TrollStore.entitlements >/dev/null
+            grep -F "$vision_iokit_key" Entitlements/CloudCodeVisionHelper.entitlements >/dev/null
+          done
+          for vision_iokit_class in AppleJPEGDriverUserClient IOSurfaceRootUserClient AGXDeviceUserClient; do
+            grep -F "<string>$vision_iokit_class</string>" Entitlements/TrollStore.entitlements >/dev/null
+            grep -F "<string>$vision_iokit_class</string>" Entitlements/CloudCodeVisionHelper.entitlements >/dev/null
+          done
+          grep -F 'ldid -SEntitlements/CloudCodeVisionHelper.entitlements "$VISION_HELPER"' .github/workflows/private-trollstore-privileged-ipa.yml >/dev/null
+          grep -F 'codesign --force --sign - --entitlements Entitlements/CloudCodeVisionHelper.entitlements "$VISION_HELPER"' .github/workflows/private-trollstore-privileged-ipa.yml >/dev/null
           if grep -F '<key>com.apple.multitasking.unlimitedassertions</key>' Entitlements/TrollStore.entitlements >/dev/null; then
             echo "FAIL: unlimited background assertion entitlement must remain isolated to the root helper" >&2
             exit 1
@@ -502,9 +514,14 @@ jobs:
           for marker in ('CLOUDCODE_GUI_MAX_TREE_NODES', 'CLOUDCODE_GUI_MAX_TREE_BYTES', 'CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES', 'CLOUDCODE_GUI_PARENT_INDEX 0u', 'CLOUDCODE_GUI_PARENT_IDENTITY 0u', 'CLOUDCODE_GUI_FINGER_INDEX 2u', 'CLOUDCODE_GUI_FINGER_IDENTITY 2u', 'CLOUDCODE_GUI_SENDER_ID 0x8000000817319371ULL', 'CLOUDCODE_HID_DIGITIZER_ATTRIBUTE', 'CLOUDCODE_HID_FIELD_IS_BUILT_IN 0x4u', 'CLOUDCODE_HID_FIELD_DIGITIZER_DISPLAY_INTEGRATED 0xB0019u', 'eventMask = CLOUDCODE_HID_DIGITIZER_POSITION | CLOUDCODE_HID_DIGITIZER_ATTRIBUTE', 'eventMask = CLOUDCODE_HID_DIGITIZER_TOUCH | CLOUDCODE_HID_DIGITIZER_IDENTITY', 'uint64_t machTime = mach_absolute_time()', 'kCFAllocatorDefault, machTime, 3', 'kCFAllocatorDefault, machTime,', '90.0, range && touching', 'IOHIDEventSystemClientCreate', 'IOHIDEventSystemClientDispatchEvent', 'IOHIDEventSystemConnectionDispatchEvent', 'BKSHIDEventSetDigitizerInfo', '_eventRoutingClientConnectionManager', 'clientForBundleID:', 'clientForTaskPort:', 'contextIdAtPosition:', 'taskPortOfContextId:', 'profile=modern-trollstore route=system-client', 'profile=modern-trollstore route=backboard-bundle', 'profile=modern-trollstore route=backboard-context', 'result=dispatched-unverified', 'return CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route);', 'CloudCodeScreenshotLooksInformative', 'CloudCodeGUIScreenshotFile', 'CloudCode-GUI-', 'CloudCodeRenderServerScreenshotAndExit(normalized, NO)', 'CGImageDestinationCreateWithData', 'gui-screenshot/direct: readable-lock success', 'rejected low-information frame', '_UICreateScreenUIImage', 'createScreenIOSurface', 'UICreateCGImageFromIOSurface', 'CARenderServerRenderDisplay', 'IOSurfaceCreate', 'IOSurfaceAlignProperty', 'alignProperty(CFSTR("IOSurfaceBytesPerRow"), rawBytesPerRow)', 'alignProperty(CFSTR("IOSurfaceAllocSize"), rawAllocationSize)', 'IOSurfaceAcceleratorCreate', 'IOSurfaceAcceleratorTransferSurface', 'transferSurface(accelerator, renderSurface, copiedSurface, NULL, NULL, NULL, NULL)', 'route=iosurface-accelerator transfer=success', 'IOSurfaceLock', 'IOSurfaceUnlock', 'IOSurfaceGetBaseAddress', 'IOSurfaceGetBytesPerRow', 'CloudCodeResolveAcrossFrameworks', 'ApplicationServices.framework/Frameworks/HIServices.framework/HIServices', 'RTLD_GLOBAL', 'AXUIElementCopyAttributeValue', 'AXUIElementSetAttributeValue', 'AXUIElementCreateSystemWide', '_AXUIElementCreateAppElementWithPid', 'AXUIElementCopyElementAtPosition', 'AXUIElementCopyApplicationAtPosition', 'AXUIElementCopyApplicationAndContextAtPosition', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'SBSCopyDisplayIdentifierForProcessID', 'AXFocusedApplication', 'AXFocusedUIElement', 'AXFocusedElement', 'route=ax-focused-value result=verified', 'route=ax-focused-value result=write-unverified', 'route=hid-unicode result=no-observed-change', 'gui-navigate-back: strategy=%s result=dispatched-semantic-unverified', '[strategy isEqualToString:@"edge"]', '[strategy isEqualToString:@"dismissDown"]', 'AXHitTestSnapshot', 'sampled-topmost-pid-unavailable', 'main-screen-width', 'stage=standalone-sampled-semantics', 'gui-screenshot/render-server:', 'gui-screenshot/uiwindow-iosurface:', 'Keep explicit capability refresh lightweight'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: GUI helper lost bounded/runtime marker: {marker}')
-          hid_ready = gui_text.split('static BOOL CloudCodeHIDReady', 1)[1].split('static void CloudCodeReleaseHIDRoute', 1)[0]
+          hid_ready = gui_text.split('static BOOL CloudCodeHIDReady', 1)[1].split('static BOOL CloudCodeHIDTextReady', 1)[0]
           if hid_ready.index('runtime.createClient') > hid_ready.index('CloudCodeResolveBackBoardRouteAtPoint'):
               raise SystemExit('FAIL: modern TrollStore GUI routing must prefer the global IOHID system client before BackBoard fallback')
+          hid_text_ready = gui_text.split('static BOOL CloudCodeHIDTextReady', 1)[1].split('static void CloudCodeReleaseHIDRoute', 1)[0]
+          if 'if (!route || !runtime.createUnicode || !runtime.setInteger) { return NO; }' not in hid_text_ready:
+              raise SystemExit('FAIL: Unicode text HID readiness must be independent of digitizer-only primitives')
+          if 'CloudCodeHIDTextReady(runtime, routingPoint, &route)' not in gui_text or 'BOOL textSymbolsReady = hid.createClient && hid.dispatch && hid.createUnicode && hid.setInteger;' not in gui_text:
+              raise SystemExit('FAIL: gui.type/probe no longer use the text-specific IOHID readiness path')
           if '0x8000000817319375ULL' in gui_text or 'CLOUDCODE_GUI_FALLBACK_SENDER_ID' in gui_text:
               raise SystemExit('FAIL: build53 legacy IOHID sender/profile leaked into build54 GUI helper')
           for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'runSeparated(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'CloudCodeSpawnHelperWithSeparatedOutput', 'runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)', 'runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)', 'result.stdout', 'result.stderr', 'run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)', 'EmbeddedVisionHelper', '["ocr-file", inputURL.path, String(boundedMaximum), forcePrecise ? "accurate" : "fast"]', '全局截图已通过独立 tmp JPEG 通道返回', 'run(["gui-navigate-back", strategy], privilege: .root, timeout: 4)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
@@ -544,12 +561,15 @@ jobs:
               raise SystemExit('FAIL: structured UI-tree must preserve the bounded mobile AX path plus one passive persona-99 fallback')
           if '#define CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS 0.25f' not in gui_text:
               raise SystemExit('FAIL: AX per-request timeout budget must remain fail-fast for detached/mobile AX clients')
-          for marker in ('AXUIElementCopyMultipleAttributeValues', 'AXUIElementCopyElementWithParameters', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic', 'CloudCodeAXApplicationAtScreenPointRoot', 'CloudCodeAXParameterizedElementAtPoint', 'CloudCodeAXNodeLimited', 'CloudCodeAXNodeLimited(runtime, candidate, 0, 0, &localNodeCount)', 'semanticNodeCount'):
+          for marker in ('AXUIElementCopyMultipleAttributeValues', 'AXUIElementCopyElementWithParameters', 'typedef CloudCodeAXError (*CloudCodeAXCopyElementAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, float, float);', 'runtime.copyElementAtPosition(systemWide, &candidate, (float)points[index].x, (float)points[index].y)', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic', 'CloudCodeAXApplicationAtScreenPointRoot', 'CloudCodeAXParameterizedElementAtPoint', 'CloudCodeAXNodeLimited', 'CloudCodeAXNodeLimited(runtime, candidate, 0, 0, &localNodeCount)', 'semanticNodeCount'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: AX runtime lost bounded standalone/context-bound capability marker: {marker}')
           for marker in ('_AXSAutomationEnabled', '_AXSSetAutomationEnabled', 'CloudCodeGUIRestoreAXAutomationForProcessExit();', 'automation_lease=%d'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: AX system-automation lease/restore path missing required marker: {marker}')
+          for marker in ('CloudCodeResolveAcrossFrameworks(paths, "__AXSetRequestingClient")', 'CloudCodeResolveAcrossFrameworks(paths, "_AXSetRequestingClient")', 'CloudCodeResolveAcrossFrameworks(paths, "AXSetRequestingClient")', '_AXOverrideRequestingClientType', 'runtime.setRequestingClient(2)', 'runtime.overrideRequestingClientType(2)', 'requesting_client_prepared=%d'):
+              if marker not in gui_text:
+                  raise SystemExit(f'FAIL: AX XCTest requesting-client identity preparation missing required marker: {marker}')
           import re
           if 'AXManualAccessibility' not in gui_text or 'none_passive_read_only' not in gui_text:
               raise SystemExit('FAIL: passive AX policy marker is missing')
@@ -632,9 +652,13 @@ jobs:
               if marker not in local_perception:
                   raise SystemExit(f'FAIL: local semantic OCR text matcher lost bounded uniqueness marker: {marker}')
           diagnostic_problem = Path('Sources/CloudCodeCore/DiagnosticProblemPackage.swift').read_text(encoding='utf-8')
-          for marker in ('DiagnosticFailureExplanation', 'explainFailure(', 'provider_text_only_local_fallback_missing', 'previousFailureSignature', 'progressObserved', 'recovery_budget_exhausted'):
+          for marker in ('DiagnosticFailureExplanation', 'explainFailure(', 'provider_text_only_local_fallback_missing', 'previousFailureSignature', 'progressObserved', 'recovery_budget_exhausted', 'empty-semantic-tree', 'record.metadata["parentTimeout"] == "true"', 'primaryText.contains("screenshot") && primaryText.contains("failed")', 'corevideo_allocation_failed'):
               if marker not in diagnostic_problem:
                   raise SystemExit(f'FAIL: bounded Agent-facing failure diagnosis lost required marker: {marker}')
+          corevideo_exact = diagnostic_problem.index('record.metadata["localVisionErrorDomain"] == NSOSStatusErrorDomain')
+          generic_ocr_class = diagnostic_problem.index('record.metadata["localVisionFailureClass"]?.isEmpty == false', corevideo_exact)
+          if corevideo_exact > generic_ocr_class:
+              raise SystemExit('FAIL: exact CoreVideo -6662 evidence must outrank generic OCR failure labels')
           tool_router_text = Path('Sources/CloudCodeCore/ToolRouter.swift').read_text(encoding='utf-8')
           for marker in ('diagnostics.explainFailure', 'local_read_only_diagnostics', 'executeFailureExplanation', 'relevantCapabilitiesJSON', 'probableCausesJSON', 'evidenceSummaryJSON'):
               if marker not in tool_router_text:

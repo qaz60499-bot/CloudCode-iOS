@@ -34,7 +34,22 @@ enum LocalVisionTextObservation {
         private var activeKey: String?
         private var coreVideoCircuitOpenUntil: Date?
         private let retention: TimeInterval = 3
-        private let coreVideoCircuitDuration: TimeInterval = 3
+        // Once the App-process Vision stack reports kCVReturnAllocationFailed, repeated retries on
+        // every fresh screenshot only reproduce the same entitlement/resource failure. The
+        // independent helper is still allowed on every request; this circuit suppresses only the
+        // in-process fallback long enough for the GUI task to continue through screenshot/remote
+        // vision instead of spending two recovery rounds on the same hard failure.
+        private let coreVideoCircuitDuration: TimeInterval = 15
+
+        func coreVideoCircuitRemainingMS() -> Int? {
+            let now = Date()
+            guard let until = coreVideoCircuitOpenUntil else { return nil }
+            if until <= now {
+                coreVideoCircuitOpenUntil = nil
+                return nil
+            }
+            return max(1, Int(until.timeIntervalSince(now) * 1_000))
+        }
 
         func resolve(
             key: String,
@@ -184,6 +199,19 @@ enum LocalVisionTextObservation {
             if var value = helper, Self.isUsable(value, requiresText: requiresText) {
                 value.payload["localVisionHostState"] = hostActive ? "active" : "inactive_or_background"
                 value.payload["localVisionInvoked"] = "true"
+                return value
+            }
+            if let circuitRemainingMS = await coordinator.coreVideoCircuitRemainingMS() {
+                var value = helper ?? Observation(payload: [
+                    "localVisionOCR": "unavailable_corevideo_circuit_open",
+                    "localVisionBackend": "vision_circuit_breaker",
+                    "localVisionElementCount": "0"
+                ], elements: [])
+                value.payload["localVisionHostState"] = hostActive ? "active" : "inactive_or_background"
+                value.payload["localVisionInvoked"] = "true"
+                value.payload["localVisionInProcessSuppressed"] = "corevideo_circuit_open"
+                value.payload["localVisionCircuitRemainingMS"] = String(circuitRemainingMS)
+                value.payload["localVisionTotalLatencyMS"] = String(Int(Date().timeIntervalSince(started) * 1_000))
                 return value
             }
             var inProcess = recognizeInProcess(

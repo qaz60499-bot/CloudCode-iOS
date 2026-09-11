@@ -970,7 +970,12 @@ public actor AgentCore {
                         ?? checkpoint.payload["tool.currentGUIBundleID"]
                     var currentGUIAppVersion = taskRuntimeState?.currentAppVersion
                         ?? checkpoint.payload["tool.currentGUIAppVersion"]
-                    var lastAcceptedUnverifiedLaunchBundleID: String?
+                    // Restore accepted-but-unverified launch identity from the typed checkpoint as
+                    // well. Without this bridge, a resumed AgentCore run can forget the accepted
+                    // launch and dispatch apps.launch again even though the semantic runtime still
+                    // has foreground verification pending.
+                    var lastAcceptedUnverifiedLaunchBundleID: String? = taskRuntimeState?.pendingForegroundVerificationBundleID
+                        ?? checkpoint.payload["tool.pendingForegroundVerificationBundleID"]
                     var completedAppListSignatures = Set(
                         (checkpoint.payload["tool.completedAppListSignatures"] ?? "")
                             .split(separator: ",")
@@ -2679,6 +2684,25 @@ public actor AgentCore {
                                         try? await checkpointStore.upsert(checkpoint)
                                     }
                                     let failure = ToolResult(toolCallID: call.id, success: false, summary: String(describing: error), payload: ["error": String(describing: error)])
+                                    // Feed failed tool evidence through the typed runtime as well. The runtime
+                                    // remains fail-closed for ordinary failures, but a failed bounded foreground
+                                    // reconciliation screenshot must still consume its one local observation
+                                    // attempt; otherwise deterministic planning can spin on screenshot/relaunch.
+                                    if let contract = taskContract, var runtime = taskRuntimeState {
+                                        runtime.applyToolEvidence(
+                                            toolName: name,
+                                            arguments: arguments,
+                                            result: failure,
+                                            observation: nil,
+                                            contract: contract
+                                        )
+                                        taskRuntimeState = runtime
+                                        TaskSemanticCheckpointCodec.persist(
+                                            contract: contract,
+                                            runtime: runtime,
+                                            payload: &checkpoint.payload
+                                        )
+                                    }
                                     continuation.yield(.toolFinished(failure))
                                     let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):error", content: "工具执行失败：\(error)").promptSafeRepresentation
                                     session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: ["tool_call_id": providerCallID, "tool_name": name, "provider_tool_name": providerToolName]))

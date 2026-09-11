@@ -26,6 +26,25 @@
     <true/>
     <key>com.apple.private.persona-mgmt</key>
     <true/>
+    <!-- Build 117/118 device syslog proved that Vision/TextRecognition in the platform host is
+         denied before recognition because the platform-app sandbox cannot open the three IOKit
+         clients below. Keep this list deliberately narrow: these are the exact clients observed in
+         the device denials for local OCR, not the broader GUI/HID entitlement set. -->
+    <key>com.apple.security.iokit-user-client-class</key>
+    <array>
+        <string>AppleJPEGDriverUserClient</string>
+        <string>IOSurfaceRootUserClient</string>
+        <string>AGXDeviceUserClient</string>
+    </array>
+    <!-- platform-application tightens IOKit sandbox policy on TrollStore devices. Keep the
+         exception-extension form in lockstep with the direct entitlement above so iOS 16.6 can
+         authorize exactly the same three Vision/decode clients under either policy path. -->
+    <key>com.apple.security.exception.iokit-user-client-class</key>
+    <array>
+        <string>AppleJPEGDriverUserClient</string>
+        <string>IOSurfaceRootUserClient</string>
+        <string>AGXDeviceUserClient</string>
+    </array>
     <!-- GUI-only HID / AX / global-capture entitlements intentionally live on the embedded
          crash-isolated root helper, not on the SwiftUI host. This keeps ordinary app launch on
          the smaller entitlement profile while exact GUI operations self-validate in the helper. -->

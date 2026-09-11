@@ -813,6 +813,17 @@ public enum DiagnosticProblemPackageBuilder {
             if combined.contains("route") || action.contains("fallback") || action.contains("compatibility") || record.metadata["fallbackReason"] != nil { return .providerRoute }
             return .provider
         }
+        // An AX observation executed through the privileged/root helper is still fundamentally an
+        // AX failure when the helper returned semantic-empty/AX evidence. Classify the failing
+        // subsystem before the transport implementation so timeout fields in helper diagnostics do
+        // not turn an AX semantic failure into privileged_helper.*.timeout.
+        if action == "gui.tree"
+            || combined.contains("empty-semantic-tree")
+            || combined.contains("no semantic/actionable foreground ui nodes")
+            || record.metadata["perceptionFallbackReason"] == "ax_transport_returned_semantically_empty_tree"
+            || record.metadata["perceptionAXAttempted"] == "true" && record.metadata["perceptionAXSucceeded"] == "false" {
+            return .axObservation
+        }
         if combined.contains("privileged") || combined.contains("roothelper") || combined.contains("root helper") { return .privilegedHelper }
         if combined.contains("resolveapp") || combined.contains("app_resolution") || combined.contains("foreground") && action.contains("launch") { return .appResolution }
         // Completion-guard perception failures can carry both a prior AX failure and the current
@@ -869,7 +880,10 @@ public enum DiagnosticProblemPackageBuilder {
                 return "coordinate_normalization"
             }
             if failureClass.contains("region") || failureClass.contains("crop") { return "region_selection" }
-            if action.contains("screenshot") { return "screenshot_capture" }
+            let primaryText = [record.result, record.diagnostic ?? ""].joined(separator: " ").lowercased()
+            let screenshotFailed = action.contains("screenshot")
+                && (record.level == .error || (primaryText.contains("screenshot") && primaryText.contains("failed")))
+            if screenshotFailed { return "screenshot_capture" }
             if record.metadata["perceptionOCRInvoked"] == "false" { return "ocr_invocation" }
             let localStatus = (record.metadata["localVisionOCR"] ?? "").lowercased()
             if record.metadata["perceptionOCRSucceeded"] == "false"
@@ -877,6 +891,7 @@ public enum DiagnosticProblemPackageBuilder {
                 || localStatus.hasPrefix("unavailable") {
                 return "ocr_recognition"
             }
+            if action.contains("screenshot") { return "screenshot_capture" }
             if record.metadata["selectedPerceptionRoute"] == "local_only_provider_vision_unavailable" {
                 return "semantic_fallback"
             }
@@ -1083,28 +1098,45 @@ public enum DiagnosticProblemPackageBuilder {
             }
             if combined.contains("no readable ui nodes")
                 || combined.contains("empty tree")
+                || combined.contains("empty-semantic-tree")
                 || combined.contains("no semantic/actionable foreground ui nodes")
                 || combined.contains("semantically empty tree")
                 || record.metadata["perceptionFallbackReason"] == "ax_transport_returned_semantically_empty_tree" {
                 return "ax_tree_empty"
             }
-            if combined.contains("timeout") || combined.contains("timed out") { return "ax_request_timeout" }
+            let explicitAXTimeout = primaryText == "timeout"
+                || primaryText.contains("timed out")
+                || primaryText.contains("transport_timeout")
+                || primaryText.contains("transport timeout")
+                || primaryText.contains("helper timeout")
+                || combined.contains("\"parenttimeout\":true")
+                || combined.contains("parenttimeout=true")
+                || record.metadata["parentTimeout"] == "true"
+            if explicitAXTimeout { return "ax_request_timeout" }
             return "ax_request_failed"
         }
 
         if layer == .localVision || record.metadata["perceptionOCRInvoked"] != nil || record.metadata["localVisionOCR"] != nil {
             let ocrInvoked = boolMetadata(record, "perceptionOCRInvoked") ?? (record.metadata["localVisionOCR"] != nil)
             let localStatus = record.metadata["localVisionOCR"]?.lowercased() ?? ""
-            if record.action.lowercased().contains("screenshot") && (record.level == .error || combined.contains("screenshot") && combined.contains("failed")) {
+            // A successful gui.screenshot may still carry local OCR failure metadata. Only the
+            // screenshot operation's own result/diagnostic may classify capture failure; generic
+            // metadata such as localVisionSecondaryStatus=unavailable_helper_failed must not turn
+            // a valid JPEG into screenshot_capture_failed.
+            if record.action.lowercased().contains("screenshot")
+                && (record.level == .error || (primaryText.contains("screenshot") && primaryText.contains("failed"))) {
                 return "screenshot_capture_failed"
             }
             if !ocrInvoked { return "ocr_not_invoked" }
-            if record.metadata["localVisionFailureClass"]?.isEmpty == false {
-                return stableToken(record.metadata["localVisionFailureClass"] ?? "ocr_request_failed")
-            }
+            // Preserve the concrete CoreVideo status ahead of the generic tool-layer
+            // localVisionFailureClass=ocr_request_failed. This lets the recovery policy trip its
+            // non-retryable -6662 circuit breaker instead of spending recovery budget blindly.
             if record.metadata["localVisionErrorDomain"] == NSOSStatusErrorDomain,
                record.metadata["localVisionErrorCode"] == "-6662" {
                 return "corevideo_allocation_failed"
+            }
+            if record.metadata["localVisionFailureClass"]?.isEmpty == false {
+                return stableToken(record.metadata["localVisionFailureClass"] ?? "ocr_request_failed")
             }
             if (record.metadata["localVisionErrorDomain"] ?? "").localizedCaseInsensitiveContains("CoreML") {
                 return "coreml_runtime_failed"
@@ -1174,7 +1206,11 @@ public enum DiagnosticProblemPackageBuilder {
     }
 
     private static func isAutomaticRecoverySafe(reason: String, layer: DiagnosticFailureLayer) -> Bool {
-        if ["unauthorized", "bad_request", "foreground_target_mismatch", "ax_backend_unavailable", "ax_tree_budget_truncated", "ocr_coordinate_normalization_failed", "deep_route_fallback"].contains(reason) {
+        if ["unauthorized", "bad_request", "foreground_target_mismatch", "ax_backend_unavailable", "ax_tree_budget_truncated", "corevideo_allocation_failed", "ocr_coordinate_normalization_failed", "deep_route_fallback"].contains(reason) {
+            // CoreVideo/Vision allocation failures are circuit-breaker events, not immediate
+            // self-repair opportunities. Retrying the same runtime context can reproduce the same
+            // entitlement/resource failure and amplify watchdog pressure; continue through an
+            // already-available screenshot/AX route and require a later fresh context for OCR.
             return false
         }
         switch layer {
@@ -1188,6 +1224,9 @@ public enum DiagnosticProblemPackageBuilder {
     private static func recommendedNextAction(for reason: String, layer: DiagnosticFailureLayer, recoveryAllowed: Bool) -> String {
         if reason == "deep_route_fallback" {
             return "continue_with_successful_selected_route_and_record_degradation;do_not_replan_only_for_fallback_depth"
+        }
+        if reason == "corevideo_allocation_failed" {
+            return "open_local_ocr_corevideo_circuit_breaker;avoid_same_context_vision_retry;continue_with_ax_or_fresh_screenshot_visual_fallback;require_fresh_runtime_or_developer_fix_before_local_ocr_retry"
         }
         guard recoveryAllowed else {
             if reason == "recovery_budget_exhausted" { return "stop_automatic_retry_and_emit_developer_diagnosis" }

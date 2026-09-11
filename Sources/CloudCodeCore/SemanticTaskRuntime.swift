@@ -292,6 +292,13 @@ public struct TaskRuntimeState: Codable, Equatable, Sendable {
     public var requestFingerprint: String
     public var currentBundleID: String?
     public var currentAppVersion: String?
+    /// LaunchServices accepted the target launch, but exact foreground identity has not yet been
+    /// verified. Keep this distinct from currentBundleID so semantic obligations are never promoted
+    /// merely because dispatch was accepted.
+    public var pendingForegroundVerificationBundleID: String?
+    /// At most one deterministic screenshot is allowed for an accepted-but-unverified launch.
+    /// Further recovery returns to the Provider/current evidence instead of spinning apps.launch.
+    public var pendingForegroundVerificationObservationAttempted: Bool?
     public var genericSurface: IOSInteractionSurface
     public var semanticSurface: String?
     public var completedObligations: Set<String>
@@ -320,6 +327,8 @@ public struct TaskRuntimeState: Codable, Equatable, Sendable {
         self.requestFingerprint = contract.requestFingerprint
         self.currentBundleID = nil
         self.currentAppVersion = nil
+        self.pendingForegroundVerificationBundleID = nil
+        self.pendingForegroundVerificationObservationAttempted = false
         self.genericSurface = .unknown
         self.semanticSurface = nil
         self.completedObligations = []
@@ -397,13 +406,42 @@ public struct TaskRuntimeState: Codable, Equatable, Sendable {
         observation: ObservationFrame?,
         contract: TaskContract
     ) {
+        // A bounded foreground-reconciliation observation consumes its one local attempt even when
+        // screenshot capture fails. Otherwise a failed screenshot would leave the flag false and
+        // the deterministic runtime could spin on gui.screenshot every round.
+        if toolName == "gui.screenshot",
+           pendingForegroundVerificationBundleID != nil {
+            pendingForegroundVerificationObservationAttempted = true
+        }
+
         guard result.success else { return }
 
         if ["apps.launch", "gui.openApp", "gui.openAppObserve", "apps.openURL"].contains(toolName),
-           result.payload["foregroundVerified"] == "true",
            let bundleID = arguments["bundleId"] {
-            currentBundleID = bundleID
-            currentAppVersion = result.payload["version"].flatMap { $0.isEmpty ? nil : $0 }
+            if result.payload["foregroundVerified"] == "true" {
+                currentBundleID = bundleID
+                currentAppVersion = result.payload["version"].flatMap { $0.isEmpty ? nil : $0 }
+                pendingForegroundVerificationBundleID = nil
+                pendingForegroundVerificationObservationAttempted = false
+            } else {
+                // An accepted launch is useful evidence, but it is not foreground authority. Record
+                // it separately so the deterministic runtime can request one fresh screenshot and
+                // then stop relaunching the same App in a tight local loop.
+                if pendingForegroundVerificationBundleID != bundleID {
+                    pendingForegroundVerificationBundleID = bundleID
+                    pendingForegroundVerificationObservationAttempted = false
+                }
+            }
+        } else if ["apps.terminate", "apps.uninstall"].contains(toolName),
+                  let bundleID = arguments["bundleId"] {
+            if currentBundleID == bundleID {
+                currentBundleID = nil
+                currentAppVersion = nil
+            }
+            if pendingForegroundVerificationBundleID == bundleID {
+                pendingForegroundVerificationBundleID = nil
+                pendingForegroundVerificationObservationAttempted = false
+            }
         }
 
         switch contract.intent {
@@ -530,6 +568,18 @@ public enum TaskTransitionPolicy {
     ) -> TaskDeterministicOperation? {
         if let targetBundleID = contract.targetBundleID,
            runtime.currentBundleID != targetBundleID {
+            if runtime.pendingForegroundVerificationBundleID == targetBundleID {
+                guard runtime.pendingForegroundVerificationObservationAttempted != true else {
+                    // Launch was already accepted and one fresh visual observation was attempted.
+                    // Do not let the local state machine spin launch/screenshot indefinitely; return
+                    // control to the Provider/current evidence for semantic foreground resolution.
+                    return nil
+                }
+                return TaskDeterministicOperation(
+                    toolName: "gui.screenshot",
+                    reason: "typed_target_launch_accepted_pending_foreground_observation"
+                )
+            }
             return TaskDeterministicOperation(
                 toolName: "apps.launch",
                 arguments: ["bundleId": targetBundleID],
@@ -697,6 +747,8 @@ public enum TaskSemanticCheckpointCodec {
         }
         state.currentBundleID = payload["tool.currentGUIBundleID"]
         state.currentAppVersion = payload["tool.currentGUIAppVersion"]
+        state.pendingForegroundVerificationBundleID = payload["tool.pendingForegroundVerificationBundleID"]
+        state.pendingForegroundVerificationObservationAttempted = payload["tool.pendingForegroundVerificationObservationAttempted"] == "true"
         state.verificationSinceLastStateChange = payload["tool.verificationSinceLastStateChange"] == "true"
         state.reconcileObservationCount = max(0, Int(payload["tool.semanticReconcileObservationCount"] ?? "0") ?? 0)
         if let hash = payload["tool.lastGUIScreenshotSHA256"], !hash.isEmpty {
@@ -745,6 +797,13 @@ public enum TaskSemanticCheckpointCodec {
         else { payload.removeValue(forKey: "tool.currentGUIBundleID") }
         if let appVersion = runtime.currentAppVersion { payload["tool.currentGUIAppVersion"] = appVersion }
         else { payload.removeValue(forKey: "tool.currentGUIAppVersion") }
+        if let pendingBundleID = runtime.pendingForegroundVerificationBundleID {
+            payload["tool.pendingForegroundVerificationBundleID"] = pendingBundleID
+            payload["tool.pendingForegroundVerificationObservationAttempted"] = runtime.pendingForegroundVerificationObservationAttempted == true ? "true" : "false"
+        } else {
+            payload.removeValue(forKey: "tool.pendingForegroundVerificationBundleID")
+            payload.removeValue(forKey: "tool.pendingForegroundVerificationObservationAttempted")
+        }
         if let signature = runtime.lastStateTransition?.signature { payload["tool.lastStateChangeSignature"] = signature }
         if let scope = runtime.lastStateTransition?.scope { payload["tool.lastStateChangeScope"] = scope }
         if let hash = runtime.lastVerifiedState?.screenshotSHA256 { payload["tool.lastGUIScreenshotSHA256"] = hash }

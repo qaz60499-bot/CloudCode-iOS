@@ -816,6 +816,7 @@ final class CloudCodeCoreTests: XCTestCase {
             (DiagnosticLogRecord(level: .error, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "AX request transport failed"), "ax_request_failed"),
             (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "no readable UI nodes; empty tree"), "ax_tree_empty"),
             (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "AX transport responded but no semantic/actionable foreground UI nodes were returned", metadata: ["perceptionFallbackReason": "ax_transport_returned_semantically_empty_tree"]), "ax_tree_empty"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "privileged-helper", action: "gui.tree", result: "failed", diagnostic: "gui-tree-ax-runtime: stage=empty-semantic-tree; helper-exit {\"parentTimeout\":false,\"timeoutSeconds\":2}"), "ax_tree_empty"),
             (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.findElement", result: "failed", diagnostic: "structured element query returned no usable visible match"), "ax_target_absent"),
             (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.waitForElement", result: "failed", diagnostic: "structured plan local expectation did not become true before timeout"), "ax_target_absent"),
             (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "node budget output exceeded"), "ax_tree_budget_truncated"),
@@ -864,15 +865,46 @@ final class CloudCodeCoreTests: XCTestCase {
                 "perceptionOCRSucceeded": "false",
                 "localVisionOCR": "unavailable",
                 "localVisionErrorDomain": NSOSStatusErrorDomain,
-                "localVisionErrorCode": "-6662"
+                "localVisionErrorCode": "-6662",
+                "localVisionFailureClass": "ocr_request_failed"
             ]
         )
         let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
             records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
         ))
         XCTAssertTrue(explanation.failureSignature.contains("corevideo_allocation_failed"))
+        XCTAssertFalse(explanation.automaticRecoveryAllowed, "same-context -6662 must trip the circuit instead of spending another self-repair attempt")
+        XCTAssertEqual(explanation.recoveryReason, "failure_requires_developer_or_manual_resolution")
         XCTAssertTrue(explanation.recommendedNextAction.contains("corevideo_circuit_breaker"))
         XCTAssertTrue(explanation.recommendedNextAction.contains("avoid_same_context_vision_retry"))
+    }
+
+    func testSuccessfulScreenshotWithOCRFailureKeepsScreenshotSuccessAndDiagnosesCoreVideo() throws {
+        let record = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "tool",
+            action: "gui.screenshot",
+            result: "completed",
+            diagnostic: "Screenshot captured with bounded on-device text observation when available",
+            metadata: [
+                "sha256": "valid-screenshot",
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "false",
+                "localVisionOCR": "unavailable_request_failed",
+                "localVisionErrorDomain": NSOSStatusErrorDomain,
+                "localVisionErrorCode": "-6662",
+                "localVisionFailureClass": "ocr_request_failed",
+                "localVisionSecondaryStatus": "unavailable_helper_failed"
+            ]
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+        ))
+        XCTAssertEqual(explanation.failureLayer, .localVision)
+        XCTAssertEqual(explanation.failureStage, "ocr_recognition")
+        XCTAssertTrue(explanation.failureSignature.contains("corevideo_allocation_failed"))
+        XCTAssertFalse(explanation.failureSignature.contains("screenshot_capture_failed"))
+        XCTAssertFalse(explanation.automaticRecoveryAllowed)
     }
 
     func testDiagnosticFailureTaxonomyDoesNotMistakeScreenWidth400ForHTTP400() throws {
@@ -6029,6 +6061,8 @@ final class CloudCodeCoreTests: XCTestCase {
         let encoded = try JSONEncoder().encode(runtime)
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         object.removeValue(forKey: "reconcileObservationCount")
+        object.removeValue(forKey: "pendingForegroundVerificationBundleID")
+        object.removeValue(forKey: "pendingForegroundVerificationObservationAttempted")
         let legacyTypedData = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         let legacyTypedJSON = try XCTUnwrap(String(data: legacyTypedData, encoding: .utf8))
         let restored = TaskSemanticCheckpointCodec.restoreRuntime(
@@ -6037,10 +6071,148 @@ final class CloudCodeCoreTests: XCTestCase {
         )
         XCTAssertEqual(restored.requestFingerprint, runtime.requestFingerprint)
         XCTAssertEqual(restored.boundedReconcileObservationCount, 0)
+        XCTAssertNil(restored.pendingForegroundVerificationBundleID)
+        XCTAssertFalse(restored.pendingForegroundVerificationObservationAttempted == true)
     }
 
     func testTaskContractCompilerDoesNotForceUnknownTaskIntoSemanticRuntime() {
         XCTAssertNil(TaskContractCompiler.compileKnownRequest("帮我看看这个页面"))
+    }
+
+    func testTypedRuntimeAcceptedLaunchObservesOnceInsteadOfRelaunchSpinning() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        let bundleID = try XCTUnwrap(contract.targetBundleID)
+
+        let accepted = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "launch accepted; foreground pending",
+            payload: [
+                "bundleId": bundleID,
+                "foregroundVerified": "false",
+                "effectVerification": "screenshot_required"
+            ]
+        )
+        runtime.applyToolEvidence(
+            toolName: "apps.launch",
+            arguments: ["bundleId": bundleID],
+            result: accepted,
+            observation: nil,
+            contract: contract
+        )
+
+        XCTAssertNil(runtime.currentBundleID, "accepted launch must not be promoted to foreground authority")
+        XCTAssertEqual(runtime.pendingForegroundVerificationBundleID, bundleID)
+        XCTAssertEqual(
+            TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil)?.toolName,
+            "gui.screenshot"
+        )
+
+        let screenshot = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "fresh screenshot",
+            payload: ["sha256": "foreground-check"]
+        )
+        runtime.applyToolEvidence(
+            toolName: "gui.screenshot",
+            arguments: [:],
+            result: screenshot,
+            observation: nil,
+            contract: contract
+        )
+
+        XCTAssertTrue(runtime.pendingForegroundVerificationObservationAttempted == true)
+        XCTAssertNil(
+            TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil),
+            "after one fresh observation the local runtime must yield instead of relaunching/screenshot spinning"
+        )
+    }
+
+    func testTypedRuntimeFailedForegroundScreenshotStillConsumesBoundedAttempt() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        let bundleID = try XCTUnwrap(contract.targetBundleID)
+        runtime.pendingForegroundVerificationBundleID = bundleID
+        runtime.pendingForegroundVerificationObservationAttempted = false
+
+        let failedScreenshot = ToolResult(
+            toolCallID: UUID(),
+            success: false,
+            summary: "screenshot failed",
+            payload: ["error": "capture unavailable"]
+        )
+        runtime.applyToolEvidence(
+            toolName: "gui.screenshot",
+            arguments: [:],
+            result: failedScreenshot,
+            observation: nil,
+            contract: contract
+        )
+
+        XCTAssertTrue(runtime.pendingForegroundVerificationObservationAttempted == true)
+        XCTAssertNil(
+            TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil),
+            "a failed bounded screenshot must not trigger another deterministic screenshot/relaunch loop"
+        )
+    }
+
+    func testTypedRuntimeVerifiedLaunchClearsPendingForegroundVerification() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        let bundleID = try XCTUnwrap(contract.targetBundleID)
+        runtime.pendingForegroundVerificationBundleID = bundleID
+        runtime.pendingForegroundVerificationObservationAttempted = true
+
+        let verified = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "foreground verified",
+            payload: ["foregroundVerified": "true"]
+        )
+        runtime.applyToolEvidence(
+            toolName: "apps.launch",
+            arguments: ["bundleId": bundleID],
+            result: verified,
+            observation: nil,
+            contract: contract
+        )
+
+        XCTAssertEqual(runtime.currentBundleID, bundleID)
+        XCTAssertNil(runtime.pendingForegroundVerificationBundleID)
+        XCTAssertFalse(runtime.pendingForegroundVerificationObservationAttempted == true)
+    }
+
+    func testTypedRuntimeTerminateClearsPendingForegroundVerification() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        let bundleID = try XCTUnwrap(contract.targetBundleID)
+        runtime.pendingForegroundVerificationBundleID = bundleID
+        runtime.pendingForegroundVerificationObservationAttempted = true
+
+        let terminated = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "terminated",
+            payload: [:]
+        )
+        runtime.applyToolEvidence(
+            toolName: "apps.terminate",
+            arguments: ["bundleId": bundleID],
+            result: terminated,
+            observation: nil,
+            contract: contract
+        )
+
+        XCTAssertNil(runtime.currentBundleID)
+        XCTAssertNil(runtime.pendingForegroundVerificationBundleID)
+        XCTAssertFalse(runtime.pendingForegroundVerificationObservationAttempted == true)
+        XCTAssertEqual(
+            TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil)?.toolName,
+            "apps.launch",
+            "after an explicit terminate, the runtime must allow a fresh launch instead of treating stale pending verification as active"
+        )
     }
 
     func testTypedFiniteFeedFinalRemainderNeverRoundsOneUpToAnotherBatch() throws {
@@ -6265,6 +6437,16 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(
             PerceptionBrokerFacade.classifyAXFailure(attempted: true, succeeded: false, text: "no semantic/actionable foreground UI nodes", semanticNodeCount: 0),
             .semanticEmpty
+        )
+        XCTAssertEqual(
+            PerceptionBrokerFacade.classifyAXFailure(
+                attempted: true,
+                succeeded: false,
+                text: "gui-tree-ax-runtime: stage=empty-semantic-tree; helper-exit {\"parentTimeout\":false,\"timeoutSeconds\":2}",
+                semanticNodeCount: 0
+            ),
+            .semanticEmpty,
+            "a configured timeout field must not turn a prompt semantic-empty AX response into transport_timeout"
         )
     }
 
