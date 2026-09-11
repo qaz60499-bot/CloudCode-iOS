@@ -2,6 +2,7 @@
 
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <math.h>
 #import <objc/message.h>
@@ -22,6 +23,14 @@ typedef CloudCodeHostAXUIElementRef (*CloudCodeHostAXCreateSystemWideFn)(void);
 typedef CloudCodeHostAXError (*CloudCodeHostAXGetPidFn)(CloudCodeHostAXUIElementRef, pid_t *);
 typedef CloudCodeHostAXError (*CloudCodeHostAXCopyAttributeFn)(CloudCodeHostAXUIElementRef, CFStringRef, CFTypeRef *);
 typedef CloudCodeHostAXError (*CloudCodeHostAXCopyMultipleAttributesFn)(CloudCodeHostAXUIElementRef, CFArrayRef, CFOptionFlags, CFArrayRef *);
+typedef CloudCodeHostAXError (*CloudCodeHostAXCopyElementAtPositionFn)(CloudCodeHostAXUIElementRef, CloudCodeHostAXUIElementRef *, float, float);
+typedef CloudCodeHostAXError (*CloudCodeHostAXCopyApplicationAtPositionFn)(CloudCodeHostAXUIElementRef, CloudCodeHostAXUIElementRef *, float, float);
+typedef CloudCodeHostAXError (*CloudCodeHostAXCopyApplicationAndContextAtPositionFn)(CloudCodeHostAXUIElementRef, CloudCodeHostAXUIElementRef *, uint32_t *, float, float);
+typedef CloudCodeHostAXError (*CloudCodeHostAXCopyElementWithParametersFn)(CloudCodeHostAXUIElementRef *, CFDictionaryRef);
+typedef CloudCodeHostAXError (*CloudCodeHostAXCopyParameterizedAttributeValueFn)(CloudCodeHostAXUIElementRef, CFStringRef, CFTypeRef, CFTypeRef *);
+typedef CloudCodeHostAXError (*CloudCodeHostAXCopyElementUsingContextIdAtPositionFn)(CloudCodeHostAXUIElementRef, uint32_t, CloudCodeHostAXUIElementRef *, int, float, float);
+typedef CloudCodeHostAXError (*CloudCodeHostAXCopyElementUsingDisplayIdAtPositionFn)(CloudCodeHostAXUIElementRef, uint32_t, CloudCodeHostAXUIElementRef *, int, float, float);
+typedef CFTypeRef (*CloudCodeHostAXValueCreateFn)(int, const void *);
 typedef CloudCodeHostAXError (*CloudCodeHostAXSetTimeoutFn)(CloudCodeHostAXUIElementRef, float);
 typedef void (*CloudCodeHostAXSetRequestingClientFn)(uint32_t);
 typedef void (*CloudCodeHostAXAddAssociatedPidFn)(pid_t, pid_t, int);
@@ -42,6 +51,14 @@ typedef struct {
     CloudCodeHostAXGetPidFn getPid;
     CloudCodeHostAXCopyAttributeFn copyAttribute;
     CloudCodeHostAXCopyMultipleAttributesFn copyMultipleAttributes;
+    CloudCodeHostAXCopyElementAtPositionFn copyElementAtPosition;
+    CloudCodeHostAXCopyApplicationAtPositionFn copyApplicationAtPosition;
+    CloudCodeHostAXCopyApplicationAndContextAtPositionFn copyApplicationAndContextAtPosition;
+    CloudCodeHostAXCopyElementWithParametersFn copyElementWithParameters;
+    CloudCodeHostAXCopyParameterizedAttributeValueFn copyParameterizedAttributeValue;
+    CloudCodeHostAXCopyElementUsingContextIdAtPositionFn copyElementUsingContextIdAtPosition;
+    CloudCodeHostAXCopyElementUsingDisplayIdAtPositionFn copyElementUsingDisplayIdAtPosition;
+    CloudCodeHostAXValueCreateFn valueCreate;
     CloudCodeHostAXSetTimeoutFn setTimeout;
     CloudCodeHostAXSetRequestingClientFn setRequestingClient;
     CloudCodeHostAXAddAssociatedPidFn addAssociatedPid;
@@ -81,6 +98,14 @@ static CloudCodeHostAXRuntime CloudCodeHostAXResolve(void)
     if (!runtime.getPid) { runtime.getPid = (CloudCodeHostAXGetPidFn)CloudCodeHostAXResolveAcrossFrameworks("_AXUIElementGetPid"); }
     runtime.copyAttribute = (CloudCodeHostAXCopyAttributeFn)CloudCodeHostAXResolveAcrossFrameworks("AXUIElementCopyAttributeValue");
     runtime.copyMultipleAttributes = (CloudCodeHostAXCopyMultipleAttributesFn)CloudCodeHostAXResolveAcrossFrameworks("AXUIElementCopyMultipleAttributeValues");
+    runtime.copyElementAtPosition = (CloudCodeHostAXCopyElementAtPositionFn)CloudCodeHostAXResolveAcrossFrameworks("AXUIElementCopyElementAtPosition");
+    runtime.copyApplicationAtPosition = (CloudCodeHostAXCopyApplicationAtPositionFn)CloudCodeHostAXResolveAcrossFrameworks("AXUIElementCopyApplicationAtPosition");
+    runtime.copyApplicationAndContextAtPosition = (CloudCodeHostAXCopyApplicationAndContextAtPositionFn)CloudCodeHostAXResolveAcrossFrameworks("AXUIElementCopyApplicationAndContextAtPosition");
+    runtime.copyElementWithParameters = (CloudCodeHostAXCopyElementWithParametersFn)CloudCodeHostAXResolveAcrossFrameworks("AXUIElementCopyElementWithParameters");
+    runtime.copyParameterizedAttributeValue = (CloudCodeHostAXCopyParameterizedAttributeValueFn)CloudCodeHostAXResolveAcrossFrameworks("AXUIElementCopyParameterizedAttributeValue");
+    runtime.copyElementUsingContextIdAtPosition = (CloudCodeHostAXCopyElementUsingContextIdAtPositionFn)CloudCodeHostAXResolveAcrossFrameworks("AXUIElementCopyElementUsingContextIdAtPosition");
+    runtime.copyElementUsingDisplayIdAtPosition = (CloudCodeHostAXCopyElementUsingDisplayIdAtPositionFn)CloudCodeHostAXResolveAcrossFrameworks("AXUIElementCopyElementUsingDisplayIdAtPosition");
+    runtime.valueCreate = (CloudCodeHostAXValueCreateFn)CloudCodeHostAXResolveAcrossFrameworks("AXValueCreate");
     runtime.setTimeout = (CloudCodeHostAXSetTimeoutFn)CloudCodeHostAXResolveAcrossFrameworks("AXUIElementSetMessagingTimeout");
     runtime.setRequestingClient = (CloudCodeHostAXSetRequestingClientFn)CloudCodeHostAXResolveAcrossFrameworks("_AXSetRequestingClient");
     if (!runtime.setRequestingClient) { runtime.setRequestingClient = (CloudCodeHostAXSetRequestingClientFn)CloudCodeHostAXResolveAcrossFrameworks("__AXSetRequestingClient"); }
@@ -454,6 +479,230 @@ static CloudCodeHostAXUIElementRef CloudCodeHostAXFocusedElement(CloudCodeHostAX
     return result;
 }
 
+static uint32_t CloudCodeHostAXContextIDAtPoint(CloudCodeHostAXRuntime runtime, CloudCodeHostAXUIElementRef seed, CGPoint point, pid_t expectedPID)
+{
+    if (!seed || !runtime.copyParameterizedAttributeValue) { return 0; }
+    CFTypeRef axPoint = NULL;
+    if (runtime.valueCreate) {
+        @try { axPoint = runtime.valueCreate(1, &point); } @catch (__unused NSException *exception) { axPoint = NULL; }
+    }
+    id pointValue = axPoint ? (__bridge id)axPoint : [NSValue valueWithCGPoint:point];
+    uint32_t contextID = 0;
+    for (NSNumber *displayID in @[@1, @0]) {
+        NSArray *parameter = @[pointValue, displayID];
+        CFTypeRef value = NULL;
+        CloudCodeHostAXError code = -1;
+        @try {
+            code = runtime.copyParameterizedAttributeValue(seed, (CFStringRef)(uintptr_t)0x16573, (__bridge CFTypeRef)parameter, &value);
+        } @catch (__unused NSException *exception) {
+            code = -1;
+            value = NULL;
+        }
+        if (code == 0 && value) {
+            id bridged = (__bridge id)value;
+            if ([bridged respondsToSelector:@selector(unsignedIntValue)]) { contextID = [bridged unsignedIntValue]; }
+            CFRelease(value);
+        } else if (value) {
+            CFRelease(value);
+        }
+        if (contextID > 0) { break; }
+    }
+    if (axPoint) { CFRelease(axPoint); }
+    if (contextID == 0 || expectedPID <= 0) { return contextID; }
+
+    NSDictionary *parameter = @{@"contextId": @(contextID)};
+    CFTypeRef pidValue = NULL;
+    CloudCodeHostAXError pidCode = -1;
+    @try {
+        pidCode = runtime.copyParameterizedAttributeValue(seed, (CFStringRef)(uintptr_t)0x16574, (__bridge CFTypeRef)parameter, &pidValue);
+    } @catch (__unused NSException *exception) {
+        pidCode = -1;
+        pidValue = NULL;
+    }
+    pid_t contextPID = 0;
+    if (pidCode == 0 && pidValue) {
+        id bridged = (__bridge id)pidValue;
+        if ([bridged respondsToSelector:@selector(intValue)]) { contextPID = (pid_t)[bridged intValue]; }
+    }
+    if (pidValue) { CFRelease(pidValue); }
+    return contextPID > 0 && contextPID != expectedPID ? 0 : contextID;
+}
+
+static CloudCodeHostAXUIElementRef CloudCodeHostAXContextElementAtPoint(
+    CloudCodeHostAXRuntime runtime,
+    CloudCodeHostAXUIElementRef systemWide,
+    pid_t expectedPID,
+    CGPoint point,
+    uint32_t *contextIDOut,
+    NSString **routeOut
+) {
+    if (!systemWide || expectedPID <= 0) { return NULL; }
+    CloudCodeHostAXUIElementRef application = NULL;
+    uint32_t contextID = 0;
+    CloudCodeHostAXError applicationCode = -1;
+    if (runtime.copyApplicationAndContextAtPosition) {
+        @try {
+            applicationCode = runtime.copyApplicationAndContextAtPosition(systemWide, &application, &contextID, (float)point.x, (float)point.y);
+        } @catch (__unused NSException *exception) {
+            applicationCode = -1;
+            application = NULL;
+            contextID = 0;
+        }
+    }
+    if ((applicationCode != 0 || !application) && runtime.copyApplicationAtPosition) {
+        if (application) { CFRelease(application); application = NULL; }
+        @try {
+            applicationCode = runtime.copyApplicationAtPosition(systemWide, &application, (float)point.x, (float)point.y);
+        } @catch (__unused NSException *exception) {
+            applicationCode = -1;
+            application = NULL;
+        }
+    }
+    if (contextID == 0) { contextID = CloudCodeHostAXContextIDAtPoint(runtime, systemWide, point, expectedPID); }
+
+    if (application && runtime.getPid) {
+        pid_t applicationPID = 0;
+        CloudCodeHostAXError pidCode = -1;
+        @try { pidCode = runtime.getPid(application, &applicationPID); } @catch (__unused NSException *exception) { pidCode = -1; }
+        if (pidCode == 0 && applicationPID > 0 && applicationPID != expectedPID) {
+            CFRelease(application);
+            application = NULL;
+        }
+    }
+    if (!application) { application = CloudCodeHostAXRootForPID(runtime, expectedPID); }
+    if (!application) { return NULL; }
+
+    CloudCodeHostAXUIElementRef candidate = NULL;
+    if (contextID > 0 && runtime.copyElementUsingContextIdAtPosition) {
+        CloudCodeHostAXError code = -1;
+        @try {
+            code = runtime.copyElementUsingContextIdAtPosition(application, contextID, &candidate, 0, (float)point.x, (float)point.y);
+        } @catch (__unused NSException *exception) {
+            code = -1;
+            candidate = NULL;
+        }
+        if (code == 0 && candidate && routeOut) { *routeOut = @"contextIdAtPosition"; }
+        if (code != 0 && candidate) { CFRelease(candidate); candidate = NULL; }
+    }
+    if (!candidate && runtime.copyElementUsingDisplayIdAtPosition) {
+        CloudCodeHostAXError code = -1;
+        @try {
+            code = runtime.copyElementUsingDisplayIdAtPosition(application, 1, &candidate, 0, (float)point.x, (float)point.y);
+        } @catch (__unused NSException *exception) {
+            code = -1;
+            candidate = NULL;
+        }
+        if (code == 0 && candidate && routeOut) { *routeOut = @"displayIdAtPosition"; }
+        if (code != 0 && candidate) { CFRelease(candidate); candidate = NULL; }
+    }
+    if (!candidate && runtime.copyElementWithParameters) {
+        NSMutableDictionary *parameters = [@{
+            @"application": (__bridge id)application,
+            @"point": [NSValue valueWithCGPoint:point],
+            @"displayId": @1
+        } mutableCopy];
+        if (contextID > 0) { parameters[@"contextId"] = @(contextID); }
+        CloudCodeHostAXError code = -1;
+        @try { code = runtime.copyElementWithParameters(&candidate, (__bridge CFDictionaryRef)parameters); }
+        @catch (__unused NSException *exception) { code = -1; candidate = NULL; }
+        if (code == 0 && candidate && routeOut) { *routeOut = @"elementWithParameters"; }
+        if (code != 0 && candidate) { CFRelease(candidate); candidate = NULL; }
+    }
+    CFRelease(application);
+
+    if (candidate && runtime.getPid) {
+        pid_t candidatePID = 0;
+        CloudCodeHostAXError pidCode = -1;
+        @try { pidCode = runtime.getPid(candidate, &candidatePID); } @catch (__unused NSException *exception) { pidCode = -1; }
+        if (pidCode == 0 && candidatePID > 0 && candidatePID != expectedPID) {
+            CFRelease(candidate);
+            candidate = NULL;
+        }
+    }
+    if (candidate && runtime.setTimeout) {
+        @try { runtime.setTimeout(candidate, CLOUDCODE_HOST_AX_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {}
+    }
+    if (candidate && contextIDOut) { *contextIDOut = contextID; }
+    return candidate;
+}
+
+static NSDictionary *CloudCodeHostAXSampledTree(CloudCodeHostAXRuntime runtime, pid_t expectedPID, CFAbsoluteTime deadline, NSUInteger *nodeCountOut, NSString **routeOut)
+{
+    if (expectedPID <= 0 || !runtime.createSystemWide || (!runtime.copyElementAtPosition && !runtime.copyElementWithParameters && !runtime.copyElementUsingContextIdAtPosition)) { return nil; }
+    CGSize size = UIScreen.mainScreen.bounds.size;
+    if (size.width <= 1 || size.height <= 1) { return nil; }
+    CloudCodeHostAXUIElementRef systemWide = NULL;
+    @try { systemWide = runtime.createSystemWide(); } @catch (__unused NSException *exception) { systemWide = NULL; }
+    if (!systemWide) { return nil; }
+    if (runtime.setTimeout) {
+        @try { runtime.setTimeout(systemWide, CLOUDCODE_HOST_AX_TIMEOUT_SECONDS); } @catch (__unused NSException *exception) {}
+    }
+
+    const CGPoint points[] = {
+        {size.width * 0.50, size.height * 0.10},
+        {size.width * 0.50, size.height * 0.22},
+        {size.width * 0.50, size.height * 0.50},
+        {size.width * 0.50, size.height * 0.84},
+        {size.width * 0.88, size.height * 0.38},
+        {size.width * 0.88, size.height * 0.58},
+        {size.width * 0.88, size.height * 0.78}
+    };
+    NSMutableArray *hits = [NSMutableArray array];
+    NSMutableSet<NSString *> *dedupe = [NSMutableSet set];
+    NSUInteger totalNodes = 0;
+    for (NSUInteger index = 0; index < sizeof(points) / sizeof(points[0]); index++) {
+        if (CFAbsoluteTimeGetCurrent() >= deadline || totalNodes >= CLOUDCODE_HOST_AX_MAX_NODES) { break; }
+        CloudCodeHostAXUIElementRef candidate = NULL;
+        NSString *hitRoute = @"elementAtPosition";
+        uint32_t contextID = 0;
+        if (runtime.copyElementAtPosition) {
+            CloudCodeHostAXError code = -1;
+            @try { code = runtime.copyElementAtPosition(systemWide, &candidate, (float)points[index].x, (float)points[index].y); }
+            @catch (__unused NSException *exception) { code = -1; candidate = NULL; }
+            if (code != 0 && candidate) { CFRelease(candidate); candidate = NULL; }
+        }
+        if (candidate && runtime.getPid) {
+            pid_t candidatePID = 0;
+            CloudCodeHostAXError pidCode = -1;
+            @try { pidCode = runtime.getPid(candidate, &candidatePID); } @catch (__unused NSException *exception) { pidCode = -1; }
+            if (pidCode == 0 && candidatePID > 0 && candidatePID != expectedPID) {
+                CFRelease(candidate);
+                candidate = NULL;
+            }
+        }
+        NSUInteger localCount = 0;
+        CFAbsoluteTime sampleDeadline = MIN(deadline, CFAbsoluteTimeGetCurrent() + 0.14);
+        NSDictionary *node = candidate ? CloudCodeHostAXNode(runtime, candidate, 0, &localCount, sampleDeadline) : nil;
+        if (candidate) { CFRelease(candidate); candidate = NULL; }
+        if (!node || CloudCodeHostAXSemanticCount(node) == 0) {
+            candidate = CloudCodeHostAXContextElementAtPoint(runtime, systemWide, expectedPID, points[index], &contextID, &hitRoute);
+            localCount = 0;
+            sampleDeadline = MIN(deadline, CFAbsoluteTimeGetCurrent() + 0.14);
+            node = candidate ? CloudCodeHostAXNode(runtime, candidate, 0, &localCount, sampleDeadline) : nil;
+            if (candidate) { CFRelease(candidate); candidate = NULL; }
+        }
+        if (!node || CloudCodeHostAXSemanticCount(node) == 0) { continue; }
+        NSMutableDictionary *annotated = [node mutableCopy];
+        annotated[@"hitPoint"] = @{@"x": @(points[index].x), @"y": @(points[index].y)};
+        annotated[@"hitRoute"] = hitRoute;
+        if (contextID > 0) { annotated[@"contextId"] = @(contextID); }
+        NSString *dedupeKey = [NSString stringWithFormat:@"%@|%@|%@|%@", annotated[@"role"] ?: @"", annotated[@"label"] ?: @"", annotated[@"identifier"] ?: @"", annotated[@"frame"] ?: @""];
+        if ([dedupe containsObject:dedupeKey]) { continue; }
+        [dedupe addObject:dedupeKey];
+        totalNodes += MAX((NSUInteger)1, localCount);
+        [hits addObject:annotated];
+    }
+    CFRelease(systemWide);
+    if (hits.count == 0) { return nil; }
+    if (nodeCountOut) { *nodeCountOut = totalNodes; }
+    if (routeOut) { *routeOut = @"host-systemwide-context-hit-test"; }
+    return @{
+        @"role": @"AXHitTestSnapshot",
+        @"scope": @"sampled_foreground_context",
+        @"children": hits
+    };
+}
+
 NSString *CloudCodeHostAXTreeJSON(NSString * _Nullable * _Nullable diagnostic)
 {
     if (diagnostic) { *diagnostic = nil; }
@@ -507,15 +756,34 @@ NSString *CloudCodeHostAXTreeJSON(NSString * _Nullable * _Nullable diagnostic)
     CFRelease(root);
     NSUInteger semanticNodeCount = CloudCodeHostAXSemanticCount(tree);
     NSUInteger actionableNodeCount = CloudCodeHostAXActionableCount(tree);
+    NSUInteger directNodeCount = nodeCount;
+    NSUInteger directSemanticNodeCount = semanticNodeCount;
+    NSUInteger directActionableNodeCount = actionableNodeCount;
+    NSString *scope = @"full_application_tree_opportunistic";
+    if (!tree || nodeCount == 0 || semanticNodeCount == 0 || actionableNodeCount == 0) {
+        NSUInteger sampledNodeCount = 0;
+        NSString *sampledRoute = nil;
+        NSDictionary *sampledTree = CloudCodeHostAXSampledTree(runtime, pid, deadline, &sampledNodeCount, &sampledRoute);
+        NSUInteger sampledSemanticNodeCount = CloudCodeHostAXSemanticCount(sampledTree);
+        NSUInteger sampledActionableNodeCount = CloudCodeHostAXActionableCount(sampledTree);
+        if (sampledTree && sampledSemanticNodeCount > 0 && sampledActionableNodeCount > 0) {
+            tree = sampledTree;
+            nodeCount = sampledNodeCount;
+            semanticNodeCount = sampledSemanticNodeCount;
+            actionableNodeCount = sampledActionableNodeCount;
+            route = sampledRoute ?: @"host-systemwide-context-hit-test";
+            scope = @"sampled_foreground_context";
+        }
+    }
     if (!tree || nodeCount == 0 || semanticNodeCount == 0 || actionableNodeCount == 0) {
         if (diagnostic) {
-            *diagnostic = [NSString stringWithFormat:@"host AX transport responded but semantic/actionable tree insufficient; bundle=%@ pid=%d nodes=%lu semantic=%lu actionable=%lu latencyMS=%.1f", bundleID ?: @"", pid, (unsigned long)nodeCount, (unsigned long)semanticNodeCount, (unsigned long)actionableNodeCount, (CFAbsoluteTimeGetCurrent() - started) * 1000.0];
+            *diagnostic = [NSString stringWithFormat:@"host AX transport responded but semantic/actionable tree insufficient after context-aware fallback; bundle=%@ pid=%d directNodes=%lu directSemantic=%lu directActionable=%lu finalNodes=%lu finalSemantic=%lu finalActionable=%lu latencyMS=%.1f", bundleID ?: @"", pid, (unsigned long)directNodeCount, (unsigned long)directSemanticNodeCount, (unsigned long)directActionableNodeCount, (unsigned long)nodeCount, (unsigned long)semanticNodeCount, (unsigned long)actionableNodeCount, (CFAbsoluteTimeGetCurrent() - started) * 1000.0];
         }
         return nil;
     }
     NSDictionary *payload = @{
         @"backend": @"AXRuntime.host-system-app",
-        @"scope": @"full_application_tree_opportunistic",
+        @"scope": scope,
         @"route": route,
         @"bundleId": bundleID ?: @"",
         @"pid": @(pid),
@@ -532,7 +800,7 @@ NSString *CloudCodeHostAXTreeJSON(NSString * _Nullable * _Nullable diagnostic)
         return nil;
     }
     if (diagnostic) {
-        *diagnostic = [NSString stringWithFormat:@"host AX semantic tree verified; bundle=%@ pid=%d semantic=%lu actionable=%lu", bundleID ?: @"", pid, (unsigned long)semanticNodeCount, (unsigned long)actionableNodeCount];
+        *diagnostic = [NSString stringWithFormat:@"host AX semantic tree verified; bundle=%@ pid=%d route=%@ scope=%@ semantic=%lu actionable=%lu", bundleID ?: @"", pid, route, scope, (unsigned long)semanticNodeCount, (unsigned long)actionableNodeCount];
     }
     return [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
 }

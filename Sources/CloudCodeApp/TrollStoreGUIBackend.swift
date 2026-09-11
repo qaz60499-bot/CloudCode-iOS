@@ -20,9 +20,12 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
 
     public func isAvailable() async -> Bool {
         // Never initiate a root/persona readiness probe from a generic availability check.
-        // Explicit privileged capability validation populates this cache; before that, GUI
-        // remains unavailable for ordinary Agent routing.
-        cachedSnapshot?.compositeStatus == .available
+        // Once an explicit capability refresh populated the cache, deviceValidationRequired is
+        // routable: every concrete GUI operation owns a bounded exact-operation self-validation
+        // path. Treating that state as backend-unavailable prevents those validators from ever
+        // running and can report OCR/screenshot as unavailable even after a physical success.
+        guard let status = cachedSnapshot?.compositeStatus else { return false }
+        return status == .available || status == .deviceValidationRequired
     }
 
     public func guiCapabilitySnapshot() async -> GUIAutomationCapabilitySnapshot {

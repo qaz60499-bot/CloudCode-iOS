@@ -1186,6 +1186,15 @@ static pid_t CloudCodePIDForBundlePath(NSString *bundlePath)
     return 0;
 }
 
+static BOOL CloudCodePIDIsLiveProcess(pid_t pid)
+{
+    if (pid <= 1) { return NO; }
+    CloudCodeProcPidPathFn pidPath = (CloudCodeProcPidPathFn)dlsym(RTLD_DEFAULT, "proc_pidpath");
+    if (!pidPath) { return NO; }
+    char buffer[4096] = {0};
+    return pidPath(pid, buffer, sizeof(buffer)) > 0;
+}
+
 static CloudCodeAXRuntime CloudCodeResolveAX(void)
 {
     CloudCodeAXRuntime runtime = {0};
@@ -2102,10 +2111,20 @@ static NSDictionary *CCAXProbeIOSMCPDelta(CloudCodeAXRuntime runtime, NSString *
     if (focusedPIDFn) {
         @try {
             pid_t focusedPID = focusedPIDFn();
+            BOOL live = CloudCodePIDIsLiveProcess(focusedPID);
+            NSString *focusedBundleID = live ? CloudCodeBundleIDForPID(focusedPID) : nil;
+            BOOL matchesKnownForeground = foregroundBundle.length == 0 || [focusedBundleID isEqualToString:foregroundBundle];
+            BOOL usable = live && focusedPID != getpid() && matchesKnownForeground;
             frontBoard[@"focusedPid"] = @(focusedPID);
-            if (probeTargetPID <= 0 && focusedPID > 0) {
+            frontBoard[@"focusedPidLive"] = @(live);
+            frontBoard[@"focusedPidBundleID"] = focusedBundleID ?: @"";
+            frontBoard[@"focusedPidUsable"] = @(usable);
+            if (!live) { frontBoard[@"focusedPidRejection"] = @"not_a_live_process_pid"; }
+            else if (focusedPID == getpid()) { frontBoard[@"focusedPidRejection"] = @"detached_helper_self_pid"; }
+            else if (!matchesKnownForeground) { frontBoard[@"focusedPidRejection"] = @"does_not_match_sbscopy_foreground_bundle"; }
+            if (probeTargetPID <= 0 && usable) {
                 probeTargetPID = focusedPID;
-                probeTargetPIDSource = @"AXFrontBoardFocusedAppPID";
+                probeTargetPIDSource = @"AXFrontBoardFocusedAppPID.validated";
             }
         } @catch (__unused NSException *exception) {
             frontBoard[@"focusedPidException"] = @YES;
