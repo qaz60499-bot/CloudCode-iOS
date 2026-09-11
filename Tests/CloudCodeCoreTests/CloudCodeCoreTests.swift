@@ -879,6 +879,33 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(explanation.recommendedNextAction.contains("avoid_same_context_vision_retry"))
     }
 
+    func testTapTextObserveDiagnosesFailedOCRFallbackAheadOfEarlierAXFailure() throws {
+        let record = DiagnosticLogRecord(
+            level: .warning,
+            subsystem: "tool",
+            action: "gui.tapTextObserve",
+            result: "failed",
+            diagnostic: "Local OCR text lookup could not resolve a target: unavailable_request_failed.",
+            metadata: [
+                "perceptionAXAttempted": "true",
+                "perceptionAXSucceeded": "false",
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "false",
+                "localVisionOCR": "unavailable_request_failed",
+                "localVisionErrorDomain": NSOSStatusErrorDomain,
+                "localVisionErrorCode": "-6662",
+                "localVisionFailureClass": "ocr_request_failed"
+            ]
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+        ))
+        XCTAssertEqual(explanation.failureLayer, .localVision)
+        XCTAssertEqual(explanation.failureStage, "ocr_recognition")
+        XCTAssertTrue(explanation.failureSignature.contains("corevideo_allocation_failed"))
+        XCTAssertFalse(explanation.automaticRecoveryAllowed)
+    }
+
     func testSuccessfulScreenshotWithOCRFailureKeepsScreenshotSuccessAndDiagnosesCoreVideo() throws {
         let record = DiagnosticLogRecord(
             level: .info,

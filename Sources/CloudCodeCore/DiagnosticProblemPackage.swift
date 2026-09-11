@@ -813,6 +813,15 @@ public enum DiagnosticProblemPackageBuilder {
             if combined.contains("route") || action.contains("fallback") || action.contains("compatibility") || record.metadata["fallbackReason"] != nil { return .providerRoute }
             return .provider
         }
+        // Multi-stage semantic tools can fail AX first and then fail the OCR fallback. When the
+        // record carries explicit OCR failure evidence, diagnose the last failing perception stage
+        // rather than letting the earlier AX attempt mask a concrete Vision/CoreVideo root cause.
+        let explicitLocalVisionFailure = record.metadata["perceptionOCRInvoked"] == "true" && (
+            record.metadata["perceptionOCRSucceeded"] == "false"
+                || record.metadata["localVisionFailureClass"]?.isEmpty == false
+                || (record.metadata["localVisionOCR"] ?? "").lowercased().hasPrefix("unavailable")
+        )
+        if explicitLocalVisionFailure { return .localVision }
         // An AX observation executed through the privileged/root helper is still fundamentally an
         // AX failure when the helper returned semantic-empty/AX evidence. Classify the failing
         // subsystem before the transport implementation so timeout fields in helper diagnostics do
@@ -820,8 +829,7 @@ public enum DiagnosticProblemPackageBuilder {
         if action == "gui.tree"
             || combined.contains("empty-semantic-tree")
             || combined.contains("no semantic/actionable foreground ui nodes")
-            || record.metadata["perceptionFallbackReason"] == "ax_transport_returned_semantically_empty_tree"
-            || record.metadata["perceptionAXAttempted"] == "true" && record.metadata["perceptionAXSucceeded"] == "false" {
+            || record.metadata["perceptionFallbackReason"] == "ax_transport_returned_semantically_empty_tree" {
             return .axObservation
         }
         if combined.contains("privileged") || combined.contains("roothelper") || combined.contains("root helper") { return .privilegedHelper }
