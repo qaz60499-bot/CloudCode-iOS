@@ -435,7 +435,7 @@ jobs:
               'guiCapabilityProvider: guiBackend',
               'let gui = GUIFallbackExecutor(',
               'backend: guiBackend',
-              'executors: [structured, interactionLearning, cli, privateApps, urlScheme, gui]',
+              'executors: [structured, fileShare, interactionLearning, cli, privateApps, urlScheme, gui]',
               'diagnosticLogger: diagnosticLogStore',
           ):
               if marker not in app:
