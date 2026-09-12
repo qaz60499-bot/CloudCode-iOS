@@ -4308,7 +4308,7 @@ final class CloudCodeCoreTests: XCTestCase {
         )
         let session = AgentSession(permissionMode: .full)
         let stream = await agent.send(
-            text: "打开微信给文件传输助手发一个一",
+            text: "打开微信给联系人发一个一",
             session: session,
             providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key")
         )
@@ -4366,7 +4366,7 @@ final class CloudCodeCoreTests: XCTestCase {
         )
         let session = AgentSession(permissionMode: .full)
         let stream = await agent.send(
-            text: "打开微信给文件传输助手发一个一",
+            text: "打开微信给联系人发一个一",
             session: session,
             providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key")
         )
