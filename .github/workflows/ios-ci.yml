@@ -618,6 +618,10 @@ jobs:
           for marker in ('AXUIElementCopyMultipleAttributeValues', 'AXUIElementCopyElementWithParameters', 'typedef CloudCodeAXError (*CloudCodeAXCopyElementAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, float, float);', 'runtime.copyElementAtPosition(systemWide, &candidate, (float)points[index].x, (float)points[index].y)', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic', 'CloudCodeAXApplicationAtScreenPointRoot', 'CloudCodeAXParameterizedElementAtPoint', 'CloudCodeAXNodeLimited', 'CloudCodeAXNodeLimited(runtime, candidate, 0, 0, &localNodeCount)', 'semanticNodeCount', 'AccessibilityUI.AXAudit.AXElement', 'initWithIdentifier:serviceBundleName:', 'AXAuditAXUIClientIdentifier', 'AXAuditAXUIService', 'primaryApp', 'explorerElements', 'CloudCodeAXAuditEditingTextElement', 'CLOUDCODE_AX_TRAIT_IS_EDITING', 'CLOUDCODE_AX_TRAIT_SECURE_TEXT_FIELD', 'CFSTR("AXFocused")', 'focusSource=%@', 'Never treat a merely unique text-like element as focused', 'AccessibilityUI.AXAudit.editing.insertText', 'write-unverified', 'CloudCodePIDForBundleIdentifier'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: AX runtime lost bounded standalone/context-bound capability marker: {marker}')
+          unverified_type_marker = 'gui-type: route=hid-unicode result=dispatched-unverified'
+          unverified_type_index = gui_text.find(unverified_type_marker)
+          if unverified_type_index < 0 or 'CloudCodeGUIExitOneShot(70);' not in gui_text[unverified_type_index:unverified_type_index + 800]:
+              raise SystemExit('FAIL: unverified HID text dispatch must fail closed instead of reporting gui.type success')
           for marker in ('_AXSAutomationEnabled', '_AXSSetAutomationEnabled', 'CloudCodeGUIRestoreAXAutomationForProcessExit();', 'automation_lease=%d'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: AX system-automation lease/restore path missing required marker: {marker}')

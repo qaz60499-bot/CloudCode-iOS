@@ -3337,5 +3337,8 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
             }
         }
         fprintf(stderr, "gui-type: route=hid-unicode result=dispatched-unverified chars=%lu\n", (unsigned long)text.length);
-        CloudCodeGUIExitOneShot(0);
+        // Dispatch alone is not evidence that UIKit accepted text. Real-device Build124 showed this
+        // route returning success while the composer remained unchanged and Send stayed disabled.
+        // Fail closed unless AX/read-back above observed a real value change.
+        CloudCodeGUIExitOneShot(70);
 }
