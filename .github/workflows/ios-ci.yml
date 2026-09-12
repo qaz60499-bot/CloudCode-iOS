@@ -901,7 +901,7 @@ jobs:
           root_tabs = content.split('private struct MoreView', 1)[0]
           if root_tabs.count('.tabItem { Label(') != 5:
               raise SystemExit('FAIL: iPhone root TabView must contain exactly five tabs to avoid UIKit automatic More remapping')
-          for required in ('SettingsView(model: model)', 'MoreView(model: model)', '.tag(RootTab.settings)', '.tag(RootTab.more)'):
+          for required in ('SettingsView(model: model)', 'MoreView(model: model', '.tag(RootTab.settings)', '.tag(RootTab.more)'):
               if required not in root_tabs:
                   raise SystemExit(f'FAIL: stable root navigation marker missing: {required}')
           for forbidden in ('AppsView(model: model)', 'FilesView(model: model)', 'HermesVaultView(model: model)', 'ActivityView(model: model)', 'TrashView(model: model)'):
