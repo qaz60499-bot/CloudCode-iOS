@@ -91,14 +91,14 @@ int main(void)
         });
         readyDeadline = [NSDate dateWithTimeIntervalSinceNow:1];
         while (![[NSFileManager defaultManager] fileExistsAtPath:axReady] && readyDeadline.timeIntervalSinceNow > 0) { usleep(10000); }
-        Require([[NSFileManager defaultManager] fileExistsAtPath:axReady], @"AX lease fixture must actually start before overlap assertion");
+        Require([[NSFileManager defaultManager] fileExistsAtPath:axReady], @"serialized AX runtime fixture must actually start before overlap assertion");
         standardOutput = nil;
         standardError = nil;
         result = CloudCodeSpawnHelperWithSeparatedOutput(axHelper, @[@"gui-focused-text-input-json"], NO, 2, &standardOutput, &standardError);
-        Require(result < 0 && [standardError containsString:@"serialized AX lease"],
-            @"different AX commands must share one admission key and never overlap the system Automation lease");
+        Require(result < 0 && [standardError containsString:@"serialized AX runtime"],
+            @"different AX commands must share one admission key and never overlap the detached AX runtime context");
         Require(dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)) == 0 && axConcurrentResult == 0,
-            @"first AX lease helper must finish and release the shared admission key");
+            @"first serialized AX helper must finish and release the shared admission key");
         result = CloudCodeSpawnHelperWithSeparatedOutput(axHelper, @[@"gui-focused-text-input-json"], NO, 2, &standardOutput, &standardError);
         Require(result == 0, @"serialized AX admission key must be reusable after the prior helper exits");
 
