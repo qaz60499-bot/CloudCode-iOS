@@ -1464,6 +1464,10 @@ public actor AgentCore {
                                             return "typed Like 已派发但 postcondition 尚未语义确认；禁止用 screenshot changed 冒充点赞成功，也禁止自动第二次点赞。"
                                         }
                                     }
+                                case .genericGUI:
+                                    if !runtime.isComplete(contract: contract) {
+                                        return "typed generic GUI contract 尚有未完成的 obligation/milestone；不能在缺少验证证据时宣告完成。"
+                                    }
                                 }
                                 return nil
                             }()
