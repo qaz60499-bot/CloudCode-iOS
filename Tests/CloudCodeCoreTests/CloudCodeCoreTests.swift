@@ -6820,6 +6820,11 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(ipa.contains("apps.launch"))
         XCTAssertFalse(ipa.contains("gui.feedSample"))
 
+        let rawFallbackAvailable: Set<String> = ["gui.tree", "gui.screenshot", "gui.swipe", "gui.tap"]
+        let rawFallback = HarnessContextManager.scopedProviderToolNames(for: "打开抖音向上滑动一次", availableNames: rawFallbackAvailable)
+        XCTAssertTrue(rawFallback.contains("gui.swipe"), "raw swipe must remain available when no observation-producing swipe variant exists")
+        XCTAssertTrue(rawFallback.contains("gui.tap"), "raw tap must remain available when no observation-producing tap variant exists")
+
         let unknown = HarnessContextManager.scopedProviderToolNames(for: "帮我处理一下", availableNames: available)
         XCTAssertEqual(unknown, available)
     }

@@ -427,6 +427,20 @@ public enum HarnessContextManager {
             } else if ["滑", "滚动", "swipe", "scroll"].contains(where: normalized.contains) {
                 guiFastPath.formUnion(["gui.scrollObserve", "gui.swipeObserve", "gui.navigateBack"])
             }
+
+            // Prefer observation-producing actions, but do not erase the only executable semantic
+            // route when a reduced registry (tests, older device runtime, capability downgrade) has
+            // only the raw primitive. Raw actions remain hidden whenever the corresponding Observe
+            // variant is actually available, preserving the small Provider schema on normal builds.
+            if !availableNames.contains("gui.tapObserve"), availableNames.contains("gui.tap") {
+                guiFastPath.insert("gui.tap")
+            }
+            if !availableNames.contains("gui.swipeObserve"), availableNames.contains("gui.swipe") {
+                guiFastPath.insert("gui.swipe")
+            }
+            if !availableNames.contains("gui.scrollObserve"), availableNames.contains("gui.scroll") {
+                guiFastPath.insert("gui.scroll")
+            }
             scoped = scoped.intersection(guiFastPath)
         }
 
