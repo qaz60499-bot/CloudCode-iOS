@@ -752,9 +752,14 @@ static __attribute__((noreturn)) void CloudCodeRenderServerScreenshotAndExit(NSS
                                                 kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
     if (!bitmap) { CloudCodeGUIExitOneShot(63); }
     CGContextSetInterpolationQuality(bitmap, kCGInterpolationHigh);
-    CGContextTranslateCTM(bitmap, 0, (CGFloat)targetHeight);
-    CGContextScaleCTM(bitmap, 1, -1);
+    // CARenderServerRenderDisplay already writes the IOSurface in display scan-out order. Both the
+    // source CGImage and this destination CGBitmapContext use CoreGraphics image coordinates here;
+    // applying an additional UIKit-style Y flip turns the final JPEG upside down. Real-device OCR
+    // evidence exposed the status-bar time near y=814 on an 844-point portrait frame and produced
+    // low-confidence gibberish despite Vision completing normally. Scale only; do not add another
+    // vertical transform at this raw-image boundary.
     CGContextDrawImage(bitmap, CGRectMake(0, 0, targetWidth, targetHeight), sourceImage);
+    fprintf(stderr, "gui-screenshot/direct: pixel-orientation=display-upright-no-extra-flip\n");
     CGImageRef scaledImage = CGBitmapContextCreateImage(bitmap);
     if (!scaledImage) { CloudCodeGUIExitOneShot(63); }
 

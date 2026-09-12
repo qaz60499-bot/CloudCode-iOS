@@ -209,6 +209,9 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements, BOOL for
     NSMutableArray<NSDictionary *> *elements = [NSMutableArray arrayWithCapacity:boundedMaximum];
     NSMutableArray<NSString *> *textParts = [NSMutableArray array];
     NSUInteger textCharacters = 0;
+    double confidenceTotal = 0.0;
+    double confidenceMinimum = 1.0;
+    double confidenceMaximum = 0.0;
     NSArray<VNRecognizedTextObservation *> *observations = request.results ?: @[];
     observations = [observations sortedArrayUsingComparator:^NSComparisonResult(VNRecognizedTextObservation *lhs, VNRecognizedTextObservation *rhs) {
         CGFloat lhsTop = 1.0 - CGRectGetMaxY(lhs.boundingBox);
@@ -239,9 +242,13 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements, BOOL for
         double y = (1.0 - maxY) * (double)pixelHeight;
         double width = (maxX - minX) * (double)pixelWidth;
         double height = (maxY - minY) * (double)pixelHeight;
+        double confidence = (double)candidate.confidence;
+        confidenceTotal += confidence;
+        confidenceMinimum = MIN(confidenceMinimum, confidence);
+        confidenceMaximum = MAX(confidenceMaximum, confidence);
         [elements addObject:@{
             @"text": text,
-            @"confidence": @(round((double)candidate.confidence * 1000.0) / 1000.0),
+            @"confidence": @(round(confidence * 1000.0) / 1000.0),
             @"x": @(round(x * 10.0) / 10.0),
             @"y": @(round(y * 10.0) / 10.0),
             @"width": @(round(width * 10.0) / 10.0),
@@ -255,12 +262,18 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements, BOOL for
         }
     }
 
+    double averageConfidence = elements.count > 0 ? confidenceTotal / (double)elements.count : 0.0;
     NSDictionary *payload = @{
         @"status": elements.count > 0 ? @"recognized" : @"available_empty",
         @"screenPointWidth": @(pixelWidth),
         @"screenPointHeight": @(pixelHeight),
         @"latencyMS": @((NSInteger)MAX(0.0, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000.0)),
         @"recognitionLevel": recognitionLevelName ?: @"unknown",
+        @"inputOrientation": @"up",
+        @"averageConfidence": @(round(averageConfidence * 1000.0) / 1000.0),
+        @"averageConfidencePercent": @(round(averageConfidence * 10000.0) / 100.0),
+        @"minimumConfidence": @(elements.count > 0 ? round(confidenceMinimum * 1000.0) / 1000.0 : 0.0),
+        @"maximumConfidence": @(elements.count > 0 ? round(confidenceMaximum * 1000.0) / 1000.0 : 0.0),
         @"backend": backendName,
         @"cpuFallbackUsed": @(cpuFallbackUsed),
         @"visibleText": [textParts componentsJoinedByString:@" | "],

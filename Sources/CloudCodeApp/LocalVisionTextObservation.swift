@@ -153,6 +153,11 @@ enum LocalVisionTextObservation {
         var screenPointHeight: Int
         var latencyMS: Int
         var recognitionLevel: String?
+        var inputOrientation: String?
+        var averageConfidence: Double?
+        var averageConfidencePercent: Double?
+        var minimumConfidence: Double?
+        var maximumConfidence: Double?
         var backend: String?
         var cpuFallbackUsed: Bool?
         var errorDomain: String?
@@ -381,6 +386,11 @@ enum LocalVisionTextObservation {
             "localVisionCoordinateSpace": "screen_points_top_left",
             "localVisionLatencyMS": String(max(0, response.latencyMS)),
             "localVisionRecognitionLevel": response.recognitionLevel ?? "accurate",
+            "localVisionInputOrientation": response.inputOrientation ?? "unknown",
+            "localVisionAverageConfidence": response.averageConfidence.map(String.init) ?? "0",
+            "localVisionAverageConfidencePercent": response.averageConfidencePercent.map(String.init) ?? "0",
+            "localVisionMinimumConfidence": response.minimumConfidence.map(String.init) ?? "0",
+            "localVisionMaximumConfidence": response.maximumConfidence.map(String.init) ?? "0",
             "localVisionFallbackUsed": response.cpuFallbackUsed == true ? "true" : "false",
             "localVisionBackend": response.backend ?? "vision_helper_public_api",
             "localVisionHelperDiagnostic": String(helper.detail.suffix(4096)),

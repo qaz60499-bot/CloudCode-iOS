@@ -641,11 +641,17 @@ jobs:
           for marker in ('CloudCodePointSizedScreenshot', 'CGImageGetWidth(backing)', 'CGImageGetHeight(backing)', 'normalize-backing-pixels', 'UIGraphicsBeginImageContextWithOptions(target, YES, 1.0)'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: screenshot backing pixels are no longer normalized into logical GUI point coordinates: {marker}')
+          direct_screenshot = gui_text.split('static __attribute__((noreturn)) void CloudCodeRenderServerScreenshotAndExit', 1)[1].split('static UIImage *CloudCodeScreenshotImageFromRenderServer', 1)[0]
+          if 'pixel-orientation=display-upright-no-extra-flip' not in direct_screenshot:
+              raise SystemExit('FAIL: direct RenderServer screenshot lost its explicit display-upright orientation contract')
+          for forbidden_flip in ('CGContextTranslateCTM(bitmap', 'CGContextScaleCTM(bitmap, 1, -1)'):
+              if forbidden_flip in direct_screenshot:
+                  raise SystemExit(f'FAIL: direct RenderServer screenshot reintroduced an extra vertical flip: {forbidden_flip}')
           vision_helper = Path('Sources/CloudCodeVisionHelper/main.m')
           if not vision_helper.exists():
               raise SystemExit('FAIL: lightweight public Vision OCR helper source is missing')
           vision_text = vision_helper.read_text(encoding='utf-8')
-          for marker in ('cloudcode-vision-helper-protocol=1', 'VNRecognizeTextRequest', 'VNImageRequestHandler', 'usesCPUOnly = cpuOnly', 'preferBackgroundProcessing = YES', 'CloudCodePerformOCR(image, &request, YES', 'vision_helper_public_api', 'CloudCodePerformFastFallbackOCR', 'kCGImageSourceThumbnailMaxPixelSize', 'vision_helper_public_api_fast_thumbnail_fallback', 'ocr-file', 'CloudCodeRunOneShotVisionCommand', 'objc_autoreleasePoolPush', 'setvbuf(stdout, NULL, _IONBF, 0)', 'setvbuf(stderr, NULL, _IONBF, 0)', '_exit(result)'):
+          for marker in ('cloudcode-vision-helper-protocol=1', 'VNRecognizeTextRequest', 'VNImageRequestHandler', 'usesCPUOnly = cpuOnly', 'preferBackgroundProcessing = YES', 'CloudCodePerformOCR(image, &request, YES', 'vision_helper_public_api', 'CloudCodePerformFastFallbackOCR', 'kCGImageSourceThumbnailMaxPixelSize', 'vision_helper_public_api_fast_thumbnail_fallback', 'inputOrientation', 'averageConfidencePercent', 'minimumConfidence', 'maximumConfidence', 'ocr-file', 'CloudCodeRunOneShotVisionCommand', 'objc_autoreleasePoolPush', 'setvbuf(stdout, NULL, _IONBF, 0)', 'setvbuf(stderr, NULL, _IONBF, 0)', '_exit(result)'):
               if marker not in vision_text:
                   raise SystemExit(f'FAIL: lightweight Vision helper lost public OCR isolation/one-shot marker: {marker}')
           if '@autoreleasepool' in vision_text or re.search(r'fflush\s*\(', vision_text):
