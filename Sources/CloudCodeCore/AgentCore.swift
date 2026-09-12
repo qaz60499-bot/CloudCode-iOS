@@ -2038,6 +2038,48 @@ public actor AgentCore {
                                 try await sessionStore.save(session)
                                 continue
                             }
+                            if let typedMessagingViolation = Self.typedMessagingTextInputViolation(
+                                contract: taskContract,
+                                runtime: taskRuntimeState,
+                                toolName: name,
+                                arguments: arguments
+                            ) {
+                                let failure = ToolResult(
+                                    toolCallID: call.id,
+                                    success: false,
+                                    summary: "已阻止偏离锁定消息任务的文本输入；导航搜索只能输入锁定目标，正文只能在目标会话确认后输入锁定正文，且搜索/正文不得塞进同一 structured plan。",
+                                    payload: ["typedMessagingGuard": typedMessagingViolation]
+                                )
+                                continuation.yield(.toolFinished(failure))
+                                try? await diagnosticLogger?.log(
+                                    level: .warning,
+                                    subsystem: "agent",
+                                    action: "gui.typed-messaging-guard",
+                                    result: "blocked",
+                                    sessionID: session.id,
+                                    metadata: [
+                                        "typedMessagingGuard": typedMessagingViolation,
+                                        "tool": name
+                                    ]
+                                )
+                                let data = try JSONEncoder.pretty.encode(failure)
+                                let rawContent = String(data: data, encoding: .utf8) ?? failure.summary
+                                let content = ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):typed_messaging_guard", content: rawContent).promptSafeRepresentation
+                                session.messages.append(ChatMessage(role: .tool, content: content, providerMetadata: [
+                                    "tool_call_id": providerCallID,
+                                    "tool_name": name,
+                                    "provider_tool_name": providerToolName,
+                                    "typed_messaging_guard": typedMessagingViolation
+                                ]))
+                                session.messages.append(ChatMessage(
+                                    role: .system,
+                                    content: "Typed messaging guard blocked a phase violation. Keep the locked destination and locked message body separate: while destination is pending, navigation_search text must exactly equal the destination; only after the destination conversation is semantically verified may message_body input occur, and it must exactly equal the requested body. Use one state-changing text step followed by a fresh observation.",
+                                    providerMetadata: ["context_layer": "typed_messaging_guard"]
+                                ))
+                                session.updatedAt = Date()
+                                try await sessionStore.save(session)
+                                continue
+                            }
                             if requiresMessageSend,
                                ["gui.type", "gui.typeObserve"].contains(name),
                                !Self.rawMessagingTextInputAllowed(
@@ -3123,6 +3165,50 @@ public actor AgentCore {
             && providerVisionCapability == .supported
             && hasForegroundTarget
             && !requestsLocalDataAccess
+    }
+
+    static func typedMessagingTextInputViolation(
+        contract: TaskContract?,
+        runtime: TaskRuntimeState?,
+        toolName: String,
+        arguments: [String: String]
+    ) -> String? {
+        guard let contract,
+              contract.intent == .messaging,
+              let message = contract.message,
+              let runtime else { return nil }
+
+        if toolName == "gui.runStructuredPlan", structuredPlanTypeElementCount(arguments: arguments) > 0 {
+            return "structured_typing_requires_phase_separation"
+        }
+
+        guard ["gui.type", "gui.typeObserve", "gui.typeElementObserve"].contains(toolName) else { return nil }
+        let text = arguments["text"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let purpose = arguments["purpose"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+
+        if purpose == "navigation_search" {
+            guard runtime.pendingObligations.contains("destination") else {
+                return "navigation_search_after_destination_resolved"
+            }
+            guard text == message.destinationEntity else {
+                return "navigation_search_target_mismatch"
+            }
+            return nil
+        }
+
+        if purpose.isEmpty || purpose == "message_body" {
+            guard !runtime.pendingObligations.contains("destination") else {
+                return "message_body_before_destination_verified"
+            }
+            guard text == message.messageBody else {
+                return "message_body_target_mismatch"
+            }
+            return nil
+        }
+
+        return "unsupported_text_purpose"
     }
 
     static func rawMessagingTextInputAllowed(

@@ -1310,6 +1310,61 @@ final class CloudCodeCoreTests: XCTestCase {
         ))
     }
 
+    func testTypedMessagingGuardLocksDestinationAndMessageBodyAcrossPhases() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.reconcileObligationProgress(contract: contract)
+
+        XCTAssertNil(AgentCore.typedMessagingTextInputViolation(
+            contract: contract,
+            runtime: runtime,
+            toolName: "gui.typeObserve",
+            arguments: ["purpose": "navigation_search", "text": "文件传输助手"]
+        ))
+        XCTAssertEqual(AgentCore.typedMessagingTextInputViolation(
+            contract: contract,
+            runtime: runtime,
+            toolName: "gui.typeObserve",
+            arguments: ["purpose": "navigation_search", "text": "文件 助手 1"]
+        ), "navigation_search_target_mismatch")
+        XCTAssertEqual(AgentCore.typedMessagingTextInputViolation(
+            contract: contract,
+            runtime: runtime,
+            toolName: "gui.typeObserve",
+            arguments: ["purpose": "message_body", "text": "1"]
+        ), "message_body_before_destination_verified")
+
+        runtime.markObligationCompleted("destination")
+        runtime.reconcileObligationProgress(contract: contract)
+        XCTAssertNil(AgentCore.typedMessagingTextInputViolation(
+            contract: contract,
+            runtime: runtime,
+            toolName: "gui.typeObserve",
+            arguments: ["purpose": "message_body", "text": "1"]
+        ))
+        XCTAssertEqual(AgentCore.typedMessagingTextInputViolation(
+            contract: contract,
+            runtime: runtime,
+            toolName: "gui.typeObserve",
+            arguments: ["purpose": "message_body", "text": "文件传输助手"]
+        ), "message_body_target_mismatch")
+        XCTAssertEqual(AgentCore.typedMessagingTextInputViolation(
+            contract: contract,
+            runtime: runtime,
+            toolName: "gui.typeObserve",
+            arguments: ["purpose": "navigation_search", "text": "文件传输助手"]
+        ), "navigation_search_after_destination_resolved")
+
+        let mixedPlan = #"{"steps":[{"action":"typeElement","text":"文件传输助手"}]}"#
+        XCTAssertEqual(AgentCore.typedMessagingTextInputViolation(
+            contract: contract,
+            runtime: runtime,
+            toolName: "gui.runStructuredPlan",
+            arguments: ["plan": mixedPlan]
+        ), "structured_typing_requires_phase_separation")
+    }
+
     func testStructuredMessagingPlanRejectsMultipleTypingMilestonesAndRepeatBodyInput() {
         let twoTypePlan = #"{"steps":[{"action":"typeElement","text":"文件传输助手"},{"action":"typeElement","text":"1"}]}"#
         XCTAssertEqual(AgentCore.structuredPlanTypeElementCount(arguments: ["plan": twoTypePlan]), 2)

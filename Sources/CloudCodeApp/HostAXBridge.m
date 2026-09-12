@@ -157,9 +157,10 @@ static CloudCodeHostAXRuntime CloudCodeHostAXResolve(void)
     runtime.xcIsRemoteElement = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeIsRemoteElement");
     runtime.xcIsVisible = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeIsVisible");
     runtime.xcIsUserInteractionEnabled = CloudCodeHostAXResolveCFStringConstant("kAXXCAttributeIsUserInteractionEnabled");
-    if (runtime.setRequestingClient) {
-        @try { runtime.setRequestingClient(2); } @catch (__unused NSException *exception) {}
-    }
+    // Build131 physical-device evidence still showed the visible green accessibility frame during
+    // ordinary AX work even after system-wide Automation writes were removed. Keep host AX reads
+    // passive: resolve the requesting-client symbols for diagnostics only, but never promote the app
+    // into the private automation client role. Screenshot/local OCR remains the bounded fallback.
     return runtime;
 }
 

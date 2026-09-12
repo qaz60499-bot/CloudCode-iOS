@@ -650,9 +650,11 @@ jobs:
                   raise SystemExit(f'FAIL: passive AX automation-state observation path missing required marker: {marker}')
           if '_AXSSetAutomationEnabled' in gui_text or '_AXSSetAutomationEnabled' in host_ax or 'setAutomationEnabled(' in gui_text or 'setAutomationEnabled(' in host_ax:
               raise SystemExit('FAIL: foreground-visible system Accessibility Automation writes are forbidden; AX/OCR perception must remain background-only and read-only')
-          for marker in ('CloudCodeResolveAcrossFrameworks(paths, "__AXSetRequestingClient")', 'CloudCodeResolveAcrossFrameworks(paths, "_AXSetRequestingClient")', 'CloudCodeResolveAcrossFrameworks(paths, "AXSetRequestingClient")', '_AXOverrideRequestingClientType', 'runtime.setRequestingClient(2)', 'runtime.overrideRequestingClientType(2)', 'requesting_client_prepared=%d'):
+          for marker in ('CloudCodeResolveAcrossFrameworks(paths, "__AXSetRequestingClient")', 'CloudCodeResolveAcrossFrameworks(paths, "_AXSetRequestingClient")', 'CloudCodeResolveAcrossFrameworks(paths, "AXSetRequestingClient")', '_AXOverrideRequestingClientType', 'requesting_client_prepared=%d', 'requesting_client_write=disabled'):
               if marker not in gui_text:
-                  raise SystemExit(f'FAIL: AX XCTest requesting-client identity preparation missing required marker: {marker}')
+                  raise SystemExit(f'FAIL: passive AX requesting-client diagnostic path missing required marker: {marker}')
+          if 'runtime.setRequestingClient(2)' in gui_text or 'runtime.overrideRequestingClientType(2)' in gui_text or 'runtime.setRequestingClient(2)' in host_ax:
+              raise SystemExit('FAIL: production AX must not actively promote the requesting-client identity; use passive AX or screenshot/OCR fallback')
           import re
           if 'AXManualAccessibility' not in gui_text or 'none_passive_read_only' not in gui_text:
               raise SystemExit('FAIL: passive AX policy marker is missing')

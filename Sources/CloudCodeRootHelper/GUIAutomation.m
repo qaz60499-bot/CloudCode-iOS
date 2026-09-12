@@ -1257,22 +1257,14 @@ static CloudCodeAXRuntime CloudCodeResolveAX(void)
     }
     runtime.overrideRequestingClientType = (CloudCodeAXOverrideRequestingClientTypeFn)CloudCodeResolveAcrossFrameworks(paths, "_AXOverrideRequestingClientType");
     // XCTest identifies AX requests as automation client type 2. A detached TrollStore helper is
-    // otherwise inferred as an unknown client on iOS 16.6 and can receive an empty semantic tree.
-    // This changes only the requesting identity of this one-shot helper process; it never mutates
-    // AXManualAccessibility on the target app and therefore does not reintroduce the green overlay.
-    if (runtime.setRequestingClient) {
-        @try {
-            runtime.setRequestingClient(2);
-            runtime.requestingClientPrepared = YES;
-            runtime.requestingClientRoute = 1;
-        } @catch (__unused NSException *exception) {}
-    } else if (runtime.overrideRequestingClientType) {
-        @try {
-            (void)runtime.overrideRequestingClientType(2);
-            runtime.requestingClientPrepared = YES;
-            runtime.requestingClientRoute = 2;
-        } @catch (__unused NSException *exception) {}
-    }
+    // Keep requesting-client identity passive in production. Build131 device evidence showed that
+    // ordinary AX helper initialization still surfaced the visible green accessibility frame even
+    // after all system-wide Automation writes were removed. Resolving the private symbols remains
+    // useful for diagnostics, but production observation must not actively promote this helper to
+    // the automation/requesting-client role. If passive AX cannot read the foreground semantics,
+    // the app falls back to screenshot/local OCR rather than trading UX for private AX authority.
+    runtime.requestingClientPrepared = NO;
+    runtime.requestingClientRoute = 0;
     runtime.automationEnabled = (CloudCodeAXAutomationEnabledFn)CloudCodeResolveAcrossFrameworks(paths, "_AXSAutomationEnabled");
     if (runtime.automationEnabled) {
         int observed = -1;
@@ -1298,7 +1290,7 @@ static CloudCodeAXRuntime CloudCodeResolveAX(void)
 static void CloudCodePrintAXRuntimeDiagnostic(CloudCodeAXRuntime runtime, const char *stage)
 {
     fprintf(stderr,
-        "gui-tree-ax-runtime: stage=%s authority=standalone-trollstore-best-effort automation_getter=%d automation_lease=%d automation_write=disabled requesting_client=%d requesting_client_prepared=%d requesting_client_route=%d create_app=%d create_systemwide=%d copy_attribute=%d copy_multiple=%d element_at_position=%d app_at_position=%d app_context_at_position=%d element_with_parameters=%d\n",
+        "gui-tree-ax-runtime: stage=%s authority=standalone-trollstore-best-effort automation_getter=%d automation_lease=%d automation_write=disabled requesting_client=%d requesting_client_prepared=%d requesting_client_route=%d requesting_client_write=disabled create_app=%d create_systemwide=%d copy_attribute=%d copy_multiple=%d element_at_position=%d app_at_position=%d app_context_at_position=%d element_with_parameters=%d\n",
         stage ?: "unknown",
         runtime.automationEnabled ? 1 : 0,
         runtime.automationLeaseActive ? 1 : 0,
@@ -2749,7 +2741,8 @@ static __attribute__((noreturn)) void CloudCodeFrontmostTreeData(void)
         fprintf(stderr, "gui-tree: required AXRuntime creation/copy symbols are unavailable\n");
         CloudCodeGUIExitOneShot(62);
     }
-    if (runtime.setRequestingClient) { runtime.setRequestingClient(2); }
+    // Do not call setRequestingClient/overrideRequestingClientType here. Production AX reads are
+    // passive; screenshot/local OCR remains the fallback when the broker cannot expose semantics.
 
     // Prefer the same AccessibilityUI/AXAudit broker used by working standalone iOS automation
     // clients: AXUIClient establishes the service-side client identity, while AXElement.primaryApp
