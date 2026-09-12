@@ -1618,6 +1618,12 @@ NSString *CloudCodeHostAXFocusedTextInputJSON(NSString * _Nullable * _Nullable d
             CFRelease(element);
         }
     }
+    if (!focusedElementAvailable || pid <= 0) {
+        if (diagnostic) {
+            *diagnostic = [NSString stringWithFormat:@"host AX focused text unavailable runtime=%d element=%d pid=%d; fail-fast to AXAudit fallback", runtimeAvailable, focusedElementAvailable, pid];
+        }
+        return nil;
+    }
     NSDictionary *payload = @{
         @"runtimeAvailable": @(runtimeAvailable),
         @"focusedElementAvailable": @(focusedElementAvailable),
