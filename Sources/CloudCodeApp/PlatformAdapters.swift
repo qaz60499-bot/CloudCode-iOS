@@ -434,33 +434,26 @@ enum EmbeddedRootHelper {
             return LaunchOutcome(accepted: true, foregroundVerified: true, detail: "隔离 helper 已验证目标安装状态并完成 App 启动路径。\(route)")
         }
 
-        // LaunchServices returning "accepted" is still not proof that the requested App became the
-        // foreground App. However, Build 126 device diagnostics showed that immediately replaying
-        // the same accepted request through FrontBoard/BackBoard can add ~4-5 seconds while still
-        // ending as foreground-unverified. Preserve the fail-closed identity boundary, but return
-        // accepted-unverified immediately so AgentCore can take one fresh screenshot/AX/OCR
-        // observation instead of blocking on a redundant second activation. The privileged fallback
-        // remains available only when the isolated route did not actually accept the request.
+        // LaunchServices returning "accepted" is not evidence that the requested App became the
+        // foreground App. Build 129 physical-device evidence reproduced the failure mode directly:
+        // WeChat remained installed and discoverable while an accepted-but-unverified isolated launch
+        // left Cloud Code frontmost. Therefore an unverified isolated activation must always fall
+        // through to the bounded root/FrontBoard/BackBoard path. The root helper first rechecks the
+        // current frontmost bundle, so a late successful LaunchServices transition returns quickly;
+        // otherwise the board-service fallback performs one exact, idempotent activation attempt.
         if isolated.code == 46 {
             let isolatedDetail = failureDetail(prefix: "隔离 helper 启动 App", code: isolated.code, diagnostic: isolated.diagnostic)
-            if acceptedButUnverified(isolated) {
-                return LaunchOutcome(
-                    accepted: true,
-                    foregroundVerified: false,
-                    detail: "隔离 LaunchServices 请求已接受但前台身份暂未验证；为避免重复 FrontBoard/BackBoard 激活造成长阻塞，立即交给下一次 fresh screenshot/AX/OCR observation 验证。后续不得把截图默认解释为目标 App。\(isolatedDetail)"
-                )
-            }
             let privileged = run(["launch", bundleID], privilege: .root, timeout: 6)
             if privileged.code == 0 {
                 let route = privileged.diagnostic.isEmpty ? "" : " \(privileged.diagnostic)"
-                return LaunchOutcome(accepted: true, foregroundVerified: true, detail: "隔离 LaunchServices 路径未接受启动后，root helper 通过系统启动路由完成目标 App 前台切换。\(route)")
+                return LaunchOutcome(accepted: true, foregroundVerified: true, detail: "隔离 LaunchServices 未建立可验证前台后，root helper 通过 bounded 系统启动路由完成目标 App 前台切换。\(route)")
             }
             let privilegedDetail = failureDetail(prefix: "root helper 启动 App", code: privileged.code, diagnostic: privileged.diagnostic)
-            if acceptedButUnverified(privileged) {
+            if acceptedButUnverified(privileged) || acceptedButUnverified(isolated) {
                 return LaunchOutcome(
                     accepted: true,
                     foregroundVerified: false,
-                    detail: "隔离 LaunchServices 路径未接受启动；root/FrontBoard/BackBoard fallback 已接受请求但目标前台仍未被证明。后续必须依赖 fresh observation 继续验证。\(isolatedDetail)；root fallback：\(privilegedDetail)"
+                    detail: "启动请求曾被系统接受但目标前台仍未被证明；已继续尝试一次 root/FrontBoard/BackBoard 激活，后续必须依赖 fresh observation 验证且不得把截图默认解释为目标 App。\(isolatedDetail)；root fallback：\(privilegedDetail)"
                 )
             }
             return LaunchOutcome(accepted: false, foregroundVerified: false, detail: "\(isolatedDetail)；root fallback 同样失败：\(privilegedDetail)")

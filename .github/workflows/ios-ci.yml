@@ -475,6 +475,15 @@ jobs:
           launch = resolver.split('public func launchApplication(bundleID:', 1)[1].split('public func terminateApplication', 1)[0]
           if 'EmbeddedRootHelper.launch(bundleID: bundleID)' not in launch:
               raise SystemExit('FAIL: app launch must execute through the isolated root helper')
+          embedded_launch = adapters.split('static func launch(bundleID:', 1)[1].split('static func probe()', 1)[0]
+          root_launch_marker = 'let privileged = run(["launch", bundleID], privilege: .root, timeout: 6)'
+          accepted_unverified_marker = 'acceptedButUnverified(privileged) || acceptedButUnverified(isolated)'
+          if root_launch_marker not in embedded_launch or accepted_unverified_marker not in embedded_launch:
+              raise SystemExit('FAIL: accepted-but-unverified app launch lost its bounded root/FrontBoard/BackBoard fallback')
+          if embedded_launch.index(root_launch_marker) > embedded_launch.index(accepted_unverified_marker):
+              raise SystemExit('FAIL: app launch can report accepted-unverified before attempting the required root activation fallback')
+          if 'return accepted-unverified immediately' in embedded_launch or '立即交给下一次 fresh screenshot/AX/OCR observation' in embedded_launch:
+              raise SystemExit('FAIL: app launch regressed to the Build127 early-return path that can leave Cloud Code frontmost')
           uninstall = resolver.split('public func uninstallApplication(bundleID:', 1)[1].split('private enum UninstallReconciliation', 1)[0]
           if 'EmbeddedRootHelper.uninstall(bundleID: bundleID' not in uninstall or 'EmbeddedRootHelper.installationState(bundleID: bundleID)' not in uninstall:
               raise SystemExit('FAIL: app uninstall and registration verification must execute through the isolated root helper')
