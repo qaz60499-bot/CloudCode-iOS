@@ -6023,6 +6023,27 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertLessThan(compressed.count, messages.count)
     }
 
+    func testHarnessContextCompressionPreservesCurrentRunToolTailWhenSystemContextConsumesBudget() {
+        let messages = [
+            ChatMessage(role: .system, content: String(repeating: "system ", count: 2_000)),
+            ChatMessage(role: .user, content: "older request"),
+            ChatMessage(role: .assistant, content: "older answer"),
+            ChatMessage(role: .user, content: "current request"),
+            ChatMessage(role: .assistant, content: "", providerMetadata: ["tool_call_id": "current-call", "tool_name": "gui.screenshot"]),
+            ChatMessage(role: .tool, content: String(repeating: "observation ", count: 700), providerMetadata: ["tool_call_id": "current-call", "tool_name": "gui.screenshot"])
+        ]
+
+        let compressed = HarnessContextManager.providerMessages(
+            from: messages,
+            policy: HarnessContextPolicy(maxCharacters: 8_000, maxMessages: 12)
+        )
+
+        XCTAssertTrue(compressed.contains { $0.role == .user && $0.content == "current request" })
+        XCTAssertTrue(compressed.contains { $0.role == .assistant && $0.providerMetadata["tool_call_id"] == "current-call" })
+        XCTAssertTrue(compressed.contains { $0.role == .tool && $0.providerMetadata["tool_call_id"] == "current-call" })
+        XCTAssertFalse(compressed.contains { $0.role == .user && $0.content == "older request" })
+    }
+
     func testHarnessContextCompressionBudgetsScreenshotBytesAndPreservesLatestExternalUser() {
         let oldScreenshot = ChatAttachment(
             filename: "old.jpg",

@@ -31,6 +31,9 @@ public enum HarnessContextManager {
         var selectedIndexes = Set<Int>()
         var requiredToolCallIDs = Set<String>()
         var selectedCount = 0
+        let latestExternalUserIndex = normalizedMessages.indices.reversed().first(where: {
+            normalizedMessages[$0].role == .user && normalizedMessages[$0].providerMetadata["internal_observation"] == nil
+        })
 
         for pair in conversational.reversed() {
             let index = pair.offset
@@ -39,9 +42,16 @@ public enum HarnessContextManager {
             let toolCallID = message.providerMetadata["tool_call_id"]
             let isRequiredAssistant = message.role == .assistant && toolCallID.map(requiredToolCallIDs.contains) == true
             let mustKeepLatestUser = selectedIndexes.isEmpty && message.role == .user
-            let fits = selectedCount < policy.maxMessages && cost <= remainingBudget
+            let withinMessageLimit = selectedCount < policy.maxMessages
+            let isCurrentRunMessage = latestExternalUserIndex.map { index >= $0 } ?? false
+            let fits = withinMessageLimit && cost <= remainingBudget
 
-            if fits || isRequiredAssistant || mustKeepLatestUser {
+            // Historical context obeys the strict character budget, but the active request's own
+            // bounded execution tail must not disappear merely because fixed system instructions
+            // already consumed that budget. Losing a fresh tool call/result makes the Provider
+            // repeat a completed stage and can turn context compression into a tool-round loop.
+            // maxMessages still caps this protected current-run tail.
+            if fits || (isCurrentRunMessage && withinMessageLimit) || isRequiredAssistant || mustKeepLatestUser {
                 selectedIndexes.insert(index)
                 selectedCount += 1
                 remainingBudget = max(0, remainingBudget - cost)
