@@ -4331,7 +4331,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(saved.messages.contains {
             $0.role == .system
                 && $0.providerMetadata["context_layer"] == "gui_completion_guard"
-                && $0.content.contains("尚未验证消息输入框焦点")
+                && $0.content.contains("还没有成功完成文本输入")
         })
     }
 
