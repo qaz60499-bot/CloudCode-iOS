@@ -1289,6 +1289,31 @@ final class CloudCodeCoreTests: XCTestCase {
         ))
     }
 
+    func testStructuredMessagingPlanRejectsMultipleTypingMilestonesAndRepeatBodyInput() {
+        let twoTypePlan = #"{"steps":[{"action":"typeElement","text":"文件传输助手"},{"action":"typeElement","text":"1"}]}"#
+        XCTAssertEqual(AgentCore.structuredPlanTypeElementCount(arguments: ["plan": twoTypePlan]), 2)
+        XCTAssertTrue(AgentCore.shouldBlockStructuredMessagingTyping(
+            requiresMessageSend: true,
+            toolName: "gui.runStructuredPlan",
+            arguments: ["plan": twoTypePlan],
+            successfulTextInputCount: 0
+        ))
+
+        let singleTypePlan = #"{"steps":[{"action":"typeElement","text":"1"}]}"#
+        XCTAssertFalse(AgentCore.shouldBlockStructuredMessagingTyping(
+            requiresMessageSend: true,
+            toolName: "gui.runStructuredPlan",
+            arguments: ["plan": singleTypePlan],
+            successfulTextInputCount: 0
+        ))
+        XCTAssertTrue(AgentCore.shouldBlockStructuredMessagingTyping(
+            requiresMessageSend: true,
+            toolName: "gui.runStructuredPlan",
+            arguments: ["plan": singleTypePlan],
+            successfulTextInputCount: 1
+        ))
+    }
+
     func testDiagnosticFailureExplanationClassifiesTextOnlyProviderLocalFallbackGap() throws {
         let record = DiagnosticLogRecord(
             level: .warning,
@@ -6067,6 +6092,143 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(messageState.canDispatchMessageCommit(contract: messageContract))
     }
 
+    func testTypedMessagingCompletionHardStopRequiresVerifiedCommitAndPostcondition() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.markObligationCompleted("destination")
+        runtime.composerFocusVerified = true
+        runtime.textInputActionsCompleted = 1
+        runtime.messageCommitState = .verified
+        runtime.postconditionVerified = true
+        runtime.reconcileObligationProgress(contract: contract)
+
+        XCTAssertTrue(runtime.isComplete(contract: contract))
+        for descriptor in [
+            ToolDescriptor(name: "gui.typeObserve", summary: "", risk: .sensitiveWrite),
+            ToolDescriptor(name: "gui.tapTextObserve", summary: "", risk: .safeWrite),
+            ToolDescriptor(name: "gui.runStructuredPlan", summary: "", risk: .sensitiveWrite),
+            ToolDescriptor(name: "gui.scrollObserve", summary: "", risk: .safeWrite)
+        ] {
+            XCTAssertTrue(AgentCore.shouldBlockTypedTaskCompletedWrite(
+                contract: contract,
+                runtime: runtime,
+                descriptor: descriptor
+            ), "completed task must block \(descriptor.name)")
+        }
+        XCTAssertFalse(AgentCore.shouldBlockTypedTaskCompletedWrite(
+            contract: contract,
+            runtime: runtime,
+            descriptor: ToolDescriptor(name: "gui.screenshot", summary: "", risk: .readOnly)
+        ))
+
+        runtime.messageCommitState = .uncertain
+        runtime.completedObligations.remove("send")
+        runtime.completedObligations.remove("verify")
+        runtime.pendingObligations.insert("send")
+        runtime.pendingObligations.insert("verify")
+        runtime.postconditionVerified = false
+        runtime.reconcileObligationProgress(contract: contract)
+        XCTAssertFalse(runtime.isComplete(contract: contract))
+    }
+
+    func testFiniteFeedSelectionRequiresExactMetricEvidenceAndVerifiedReturn() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开抖音，刷严格 5 条视频，比较点赞量，给点赞最高的一条点赞，然后停止"))
+
+        func result(values: String, returnVerified: Bool) -> ToolResult {
+            ToolResult(
+                toolCallID: UUID(),
+                success: true,
+                summary: "local feed sample",
+                payload: [
+                    "localMetricExtraction": "complete",
+                    "localMetricSelectedSample": "3",
+                    "localMetricSelectedValue": "30",
+                    "localMetricValues": values,
+                    "localMetricSelectedReturnVerified": returnVerified ? "true" : "false",
+                    "sampledCount": "5"
+                ]
+            )
+        }
+
+        var incompleteValues = TaskRuntimeState(contract: contract)
+        incompleteValues.currentBundleID = contract.targetBundleID
+        incompleteValues.finiteFeedCompleted = 5
+        incompleteValues.applyToolEvidence(
+            toolName: "gui.feedSample",
+            arguments: ["count": "5"],
+            result: result(values: "10,20,30,40", returnVerified: true),
+            observation: nil,
+            contract: contract
+        )
+        XCTAssertNil(incompleteValues.selectedFeedSample)
+        XCTAssertTrue(incompleteValues.pendingObligations.contains("selection"))
+
+        var unverifiedReturn = TaskRuntimeState(contract: contract)
+        unverifiedReturn.currentBundleID = contract.targetBundleID
+        unverifiedReturn.finiteFeedCompleted = 5
+        unverifiedReturn.applyToolEvidence(
+            toolName: "gui.feedSample",
+            arguments: ["count": "5"],
+            result: result(values: "10,20,30,40,50", returnVerified: false),
+            observation: nil,
+            contract: contract
+        )
+        XCTAssertEqual(unverifiedReturn.selectedFeedSample, 3)
+        XCTAssertFalse(unverifiedReturn.selectedFeedReturnVerified)
+        XCTAssertTrue(unverifiedReturn.pendingObligations.contains("selection"))
+
+        var complete = TaskRuntimeState(contract: contract)
+        complete.currentBundleID = contract.targetBundleID
+        complete.finiteFeedCompleted = 5
+        complete.applyToolEvidence(
+            toolName: "gui.feedSample",
+            arguments: ["count": "5"],
+            result: result(values: "10,20,30,40,50", returnVerified: true),
+            observation: nil,
+            contract: contract
+        )
+        XCTAssertEqual(complete.selectedFeedSample, 3)
+        XCTAssertTrue(complete.selectedFeedReturnVerified)
+        XCTAssertTrue(complete.completedObligations.contains("selection"))
+        XCTAssertEqual(complete.semanticSurface, "feed.item.selected")
+    }
+
+    func testGenericMilestonesReuseObligationsAndExposeExactlyOnceMetadata() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        let milestones = contract.effectiveMilestones
+        XCTAssertEqual(milestones.map(\.id), contract.obligations.map(\.id))
+        XCTAssertEqual(milestones.first?.prerequisiteIDs, [])
+        XCTAssertEqual(milestones.dropFirst().first?.prerequisiteIDs, ["foreground"])
+
+        let send = try XCTUnwrap(milestones.first(where: { $0.id == "send" }))
+        XCTAssertTrue(send.exactlyOnce)
+        XCTAssertTrue(send.verificationRequired)
+        XCTAssertEqual(send.failurePolicy, .reconcileBeforeRetry)
+        XCTAssertEqual(send.completionObligationIDs, ["send"])
+
+        var runtime = TaskRuntimeState(contract: contract)
+        XCTAssertEqual(runtime.nextPendingMilestone(contract: contract)?.id, "foreground")
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.reconcileObligationProgress(contract: contract)
+        XCTAssertEqual(runtime.nextPendingMilestone(contract: contract)?.id, "destination")
+    }
+
+    func testExecutionTraceMetadataIsPrivacySafeAndOmitsMessageBody() throws {
+        let secretBody = "secret_body_927"
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 \(secretBody)"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.reconcileObligationProgress(contract: contract)
+        let metadata = runtime.traceMetadata(contract: contract)
+
+        XCTAssertFalse(metadata.keys.contains("messageBody"))
+        XCTAssertFalse(metadata.values.contains(where: { $0.contains(secretBody) }))
+        XCTAssertEqual(metadata["intent"], "messaging")
+        XCTAssertEqual(metadata["nextMilestone"], "destination")
+        XCTAssertEqual(metadata["taskFingerprint"]?.count, 16)
+    }
+
     func testTaskSemanticCheckpointMigratesLegacyPayloadAndDualWritesCompatibility() throws {
         let request = "打开抖音刷 5 条然后点赞"
         let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest(request))
@@ -6318,7 +6480,7 @@ final class CloudCodeCoreTests: XCTestCase {
             contract: contract
         )
         XCTAssertTrue(runtime.completedObligations.contains("destination"))
-        XCTAssertEqual(runtime.semanticSurface, "wechat.conversation")
+        XCTAssertEqual(runtime.semanticSurface, "chat.conversation")
     }
 
     func testTypedMessagingUncertainSendStaysPendingAndOnlyReconcilesOnceLocally() throws {
@@ -6462,6 +6624,94 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(frame.canReuseOCR(screenRevision: "frame-2", region: "0,80,390,500", recognitionLevel: "fast"))
         XCTAssertFalse(frame.canReuseOCR(screenRevision: "frame-1", region: "0,80,390,500", recognitionLevel: "accurate"))
         XCTAssertFalse(frame.canReuseOCR(screenRevision: "frame-1", region: "0,0,390,844", recognitionLevel: "fast"))
+    }
+
+    func testSemanticSurfaceSnapshotPreservesOCRAXAndAmbiguityEvidence() throws {
+        let elements = [LocalPerceptionTextElement(text: "发送", confidence: 0.91, x: 310, y: 710, width: 46, height: 28)]
+        let encoded = try XCTUnwrap(String(data: JSONEncoder().encode(elements), encoding: .utf8))
+
+        let ocrOnly = ToolResult(
+            toolCallID: UUID(), success: true, summary: "ocr only",
+            payload: [
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "recognized",
+                "localVisionElements": encoded,
+                "localVisionElementCount": "1",
+                "perceptionLocalSufficient": "true"
+            ]
+        )
+        let ocrFrame = PerceptionBrokerFacade.frame(
+            from: ocrOnly,
+            foregroundBundleID: "com.tencent.xin",
+            genericSurface: .chat,
+            semanticSurface: "chat.conversation"
+        )
+        XCTAssertEqual(ocrFrame.surfaceSnapshot?.identity, "chat.conversation")
+        XCTAssertEqual(ocrFrame.surfaceSnapshot?.evidenceSources, [.localOCR])
+        XCTAssertTrue(ocrFrame.surfaceSnapshot?.landmarks.contains("发送") == true)
+
+        let axOnly = ToolResult(
+            toolCallID: UUID(), success: true, summary: "ax only",
+            payload: [
+                "perceptionAXAttempted": "true",
+                "perceptionAXSucceeded": "true",
+                "axSemanticNodeCount": "4",
+                "perceptionLocalSufficient": "true"
+            ]
+        )
+        let axFrame = PerceptionBrokerFacade.frame(from: axOnly, foregroundBundleID: "com.tencent.xin", genericSurface: .chat)
+        XCTAssertEqual(axFrame.surfaceSnapshot?.evidenceSources, [.accessibility])
+
+        let combined = ToolResult(
+            toolCallID: UUID(), success: true, summary: "combined",
+            payload: [
+                "perceptionAXAttempted": "true",
+                "perceptionAXSucceeded": "true",
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "recognized",
+                "localVisionElements": encoded,
+                "perceptionLocalSufficient": "true",
+                "perceptionFallbackReason": "multiple_match_ambiguous"
+            ]
+        )
+        let combinedFrame = PerceptionBrokerFacade.frame(from: combined, foregroundBundleID: "com.tencent.xin", genericSurface: .chat)
+        XCTAssertEqual(Set(combinedFrame.surfaceSnapshot?.evidenceSources ?? []), Set([.accessibility, .localOCR]))
+        XCTAssertTrue(combinedFrame.surfaceSnapshot?.ambiguous == true)
+        XCTAssertLessThanOrEqual(combinedFrame.surfaceSnapshot?.confidence ?? 1, 0.45)
+    }
+
+    func testSemanticSurfaceSnapshotTracksComposerKeyboardStatesAndFreshness() {
+        let focused = ToolResult(
+            toolCallID: UUID(), success: true, summary: "composer focused",
+            payload: ["composerFocusVerified": "true", "keyboardLikely": "true", "sha256": "focused"]
+        )
+        let focusedFrame = PerceptionBrokerFacade.frame(
+            from: focused,
+            foregroundBundleID: "com.tencent.xin",
+            genericSurface: .composer,
+            semanticSurface: "chat.composer"
+        )
+        XCTAssertEqual(focusedFrame.surfaceSnapshot?.composerState, .focused)
+        XCTAssertEqual(focusedFrame.surfaceSnapshot?.keyboardState, .present)
+
+        let keyboardAbsent = ToolResult(
+            toolCallID: UUID(), success: true, summary: "composer visible",
+            payload: ["keyboardLikely": "false", "sha256": "visible"]
+        )
+        let visibleFrame = PerceptionBrokerFacade.frame(from: keyboardAbsent, foregroundBundleID: "com.tencent.xin", genericSurface: .composer)
+        XCTAssertEqual(visibleFrame.surfaceSnapshot?.composerState, .visible)
+        XCTAssertEqual(visibleFrame.surfaceSnapshot?.keyboardState, .absent)
+
+        let unknownKeyboard = ToolResult(toolCallID: UUID(), success: true, summary: "unknown", payload: [:])
+        let staleFrame = PerceptionBrokerFacade.frame(
+            from: unknownKeyboard,
+            foregroundBundleID: "com.tencent.xin",
+            capturedAt: Date(timeIntervalSinceNow: -10)
+        )
+        XCTAssertEqual(staleFrame.surfaceSnapshot?.keyboardState, .unknown)
+        XCTAssertFalse(staleFrame.isFresh)
     }
 
     func testObservationFrameClassifiesAXUnknownClientSeparatelyFromTimeoutAndSemanticEmpty() {

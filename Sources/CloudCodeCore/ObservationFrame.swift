@@ -3,7 +3,7 @@ import Foundation
 /// Typed normalization over the existing AX / LocalVision OCR / screenshot / AppKnowledge evidence.
 /// This is a facade only: it owns no second AX runtime, OCR runtime, screenshot backend, or authority.
 public struct ObservationFrame: Codable, Equatable, Sendable {
-    public enum ElementSource: String, Codable, Sendable {
+    public enum ElementSource: String, Codable, Hashable, Sendable {
         case accessibility
         case localOCR
         case appKnowledge
@@ -102,6 +102,35 @@ public struct ObservationFrame: Codable, Equatable, Sendable {
         public var fallbackReason: String?
     }
 
+    public enum SemanticPresence: String, Codable, Sendable {
+        case unknown
+        case absent
+        case present
+    }
+
+    public enum ComposerState: String, Codable, Sendable {
+        case unknown
+        case visible
+        case focused
+    }
+
+    /// A light semantic projection over the same evidence already present in ObservationFrame.
+    /// It is descriptive telemetry/state only and never grants permission to execute an action.
+    public struct SemanticSurfaceSnapshot: Codable, Equatable, Sendable {
+        public var identity: String?
+        public var type: IOSInteractionSurface
+        public var landmarks: [String]
+        public var controls: [String]
+        public var navigationState: String?
+        public var composerState: ComposerState
+        public var keyboardState: SemanticPresence
+        public var modalState: SemanticPresence
+        public var feedItemIdentity: String?
+        public var confidence: Double
+        public var evidenceSources: [ElementSource]
+        public var ambiguous: Bool
+    }
+
     public var foregroundBundleID: String?
     public var screenRevision: String?
     public var genericSurface: IOSInteractionSurface
@@ -114,6 +143,8 @@ public struct ObservationFrame: Codable, Equatable, Sendable {
     public var capturedAt: Date
     public var confidence: Double
     public var degradation: DegradationState
+    /// Optional for backward-compatible decoding of earlier ObservationFrame payloads.
+    public var surfaceSnapshot: SemanticSurfaceSnapshot?
 
     public var isFresh: Bool {
         Date().timeIntervalSince(capturedAt) <= 5
@@ -217,6 +248,15 @@ public enum PerceptionBrokerFacade {
             confidence = 0.2
         }
 
+        let snapshot = semanticSnapshot(
+            payload: payload,
+            genericSurface: genericSurface,
+            semanticSurface: semanticSurface,
+            elements: elements,
+            axSucceeded: axSucceeded,
+            confidence: confidence
+        )
+
         return ObservationFrame(
             foregroundBundleID: foregroundBundleID ?? nonEmpty(payload["axForegroundBundleID"]),
             screenRevision: screenRevision,
@@ -237,7 +277,8 @@ public enum PerceptionBrokerFacade {
                 axCircuitOpen: axCircuitOpen,
                 ocrCircuitOpen: ocrCircuitOpen,
                 fallbackReason: nonEmpty(payload["perceptionFallbackReason"])
-            )
+            ),
+            surfaceSnapshot: snapshot
         )
     }
 
@@ -281,6 +322,70 @@ public enum PerceptionBrokerFacade {
             return .unsupported
         }
         return .temporaryFailure
+    }
+
+    private static func semanticSnapshot(
+        payload: [String: String],
+        genericSurface: IOSInteractionSurface,
+        semanticSurface: String?,
+        elements: [ObservationFrame.SemanticElement],
+        axSucceeded: Bool,
+        confidence: Double
+    ) -> ObservationFrame.SemanticSurfaceSnapshot {
+        let keyboardState: ObservationFrame.SemanticPresence
+        if let keyboard = payload["keyboardLikely"] {
+            keyboardState = bool(keyboard) ? .present : .absent
+        } else {
+            keyboardState = .unknown
+        }
+        let composerState: ObservationFrame.ComposerState
+        if bool(payload["composerFocusVerified"]) {
+            composerState = .focused
+        } else if genericSurface == .composer {
+            composerState = .visible
+        } else {
+            composerState = .unknown
+        }
+        let modalState: ObservationFrame.SemanticPresence = (genericSurface == .sheet || genericSurface == .alert)
+            ? .present
+            : .unknown
+        var sources = Set(elements.map(\.source))
+        if axSucceeded { sources.insert(.accessibility) }
+        let landmarks = Array(Set(elements
+            .filter { $0.confidence >= 0.35 }
+            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty })).sorted().prefix(16)
+        let controls = Array(Set(elements.compactMap { element -> String? in
+            guard let role = element.role?.lowercased(),
+                  role.contains("button") || role.contains("field") || role.contains("control") else { return nil }
+            let text = element.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return text.isEmpty ? element.identifier : text
+        })).sorted().prefix(12)
+        let ambiguityText = [payload["perceptionFallbackReason"], payload["localVisionFailureClass"]]
+            .compactMap { $0 }
+            .joined(separator: " ")
+            .lowercased()
+        let ambiguous = ambiguityText.contains("ambiguous") || ambiguityText.contains("multiple_match")
+        let identity = nonEmpty(semanticSurface)
+            ?? nonEmpty(payload["semanticSurface"])
+            ?? (genericSurface == .unknown ? nil : genericSurface.rawValue)
+        let feedIdentity = nonEmpty(payload["semanticIdentity"])
+            ?? nonEmpty(payload["localMetricSelectedSample"]).map { "sample:\($0)" }
+
+        return ObservationFrame.SemanticSurfaceSnapshot(
+            identity: identity,
+            type: genericSurface,
+            landmarks: Array(landmarks),
+            controls: Array(controls),
+            navigationState: nonEmpty(payload["navigationState"]),
+            composerState: composerState,
+            keyboardState: keyboardState,
+            modalState: modalState,
+            feedItemIdentity: feedIdentity,
+            confidence: ambiguous ? min(confidence, 0.45) : confidence,
+            evidenceSources: sources.sorted { $0.rawValue < $1.rawValue },
+            ambiguous: ambiguous
+        )
     }
 
     private static func decodeLocalOCRElements(_ raw: String?) -> [ObservationFrame.SemanticElement] {

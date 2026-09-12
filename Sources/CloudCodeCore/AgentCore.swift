@@ -1169,6 +1169,37 @@ public actor AgentCore {
                                 ]
                             ))
                         }
+                        if let contract = taskContract, var runtime = taskRuntimeState {
+                            runtime.currentBundleID = currentGUIBundleID
+                            runtime.currentAppVersion = currentGUIAppVersion
+                            runtime.finiteFeedCompleted = max(0, completedRepeatedSwipeCount)
+                            runtime.textInputActionsCompleted = max(0, successfulTextInputCount)
+                            runtime.likeActionsCompleted = max(0, successfulLikeActionCount)
+                            runtime.composerFocusVerified = verifiedMessagingComposerFocus
+                            runtime.messageCommitState = successfulCommitAfterTextInput
+                                ? .verified
+                                : (unverifiedMessageCommitAttempted ? .uncertain : runtime.messageCommitState)
+                            runtime.reconcileObligationProgress(contract: contract)
+                            taskRuntimeState = runtime
+                            if runtime.isComplete(contract: contract) {
+                                roundDescriptors.removeAll {
+                                    Self.shouldBlockTypedTaskCompletedWrite(
+                                        contract: contract,
+                                        runtime: runtime,
+                                        descriptor: $0
+                                    )
+                                }
+                                providerContextMessages.append(ChatMessage(
+                                    role: .system,
+                                    content: "The typed task contract is fully verified complete. All state-changing tools are removed for this round. Do not type, tap, send, like, navigate, or repeat any external action; return the completed result to the user.",
+                                    providerMetadata: [
+                                        "context_layer": "typed_task_complete_hard_stop",
+                                        "task_fingerprint": String(contract.requestFingerprint.prefix(16)),
+                                        "completed_obligations": runtime.completedObligations.sorted().joined(separator: ",")
+                                    ]
+                                ))
+                            }
+                        }
                         let deterministicTaskOperation: TaskDeterministicOperation? = {
                             guard let contract = taskContract,
                                   var runtime = taskRuntimeState else { return nil }
@@ -1628,6 +1659,66 @@ public actor AgentCore {
                                 try await sessionStore.save(session)
                                 continue
                             }
+                            guard let descriptor = descriptorsByName[name] else {
+                                throw ToolArgumentValidationError.unknownTool(name)
+                            }
+                            let typedTaskAlreadyComplete: Bool = {
+                                guard descriptor.risk != .readOnly,
+                                      let contract = taskContract,
+                                      var runtime = taskRuntimeState else { return false }
+                                runtime.currentBundleID = currentGUIBundleID
+                                runtime.currentAppVersion = currentGUIAppVersion
+                                runtime.finiteFeedCompleted = max(0, completedRepeatedSwipeCount)
+                                runtime.textInputActionsCompleted = max(0, successfulTextInputCount)
+                                runtime.likeActionsCompleted = max(0, successfulLikeActionCount)
+                                runtime.composerFocusVerified = verifiedMessagingComposerFocus
+                                runtime.messageCommitState = successfulCommitAfterTextInput
+                                    ? .verified
+                                    : (unverifiedMessageCommitAttempted ? .uncertain : runtime.messageCommitState)
+                                runtime.reconcileObligationProgress(contract: contract)
+                                taskRuntimeState = runtime
+                                return Self.shouldBlockTypedTaskCompletedWrite(
+                                    contract: contract,
+                                    runtime: runtime,
+                                    descriptor: descriptor
+                                )
+                            }()
+                            if typedTaskAlreadyComplete {
+                                let failure = ToolResult(
+                                    toolCallID: callID,
+                                    success: false,
+                                    summary: "任务已完成并通过 typed postcondition 验证；已阻止完成后的额外状态修改。",
+                                    payload: [
+                                        "idempotency": "typed_task_already_complete",
+                                        "effectVerification": "not_dispatched"
+                                    ]
+                                )
+                                continuation.yield(.toolFinished(failure))
+                                try? await diagnosticLogger?.log(
+                                    level: .warning,
+                                    subsystem: "agent",
+                                    action: "typed-task-complete-guard",
+                                    result: "blocked",
+                                    sessionID: session.id,
+                                    toolCallID: callID,
+                                    metadata: ["tool": name, "idempotency": "typed_task_already_complete"]
+                                )
+                                let data = try JSONEncoder.pretty.encode(failure)
+                                let rawContent = String(data: data, encoding: .utf8) ?? failure.summary
+                                session.messages.append(ChatMessage(
+                                    role: .tool,
+                                    content: ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):typed_task_complete", content: rawContent).promptSafeRepresentation,
+                                    providerMetadata: [
+                                        "tool_call_id": providerCallID,
+                                        "tool_name": name,
+                                        "provider_tool_name": providerToolName,
+                                        "idempotency": "typed_task_already_complete"
+                                    ]
+                                ))
+                                session.updatedAt = Date()
+                                try await sessionStore.save(session)
+                                continue
+                            }
                             let typedFiniteInvariantBlocked: Bool = {
                                 guard let contract = taskContract,
                                       var runtime = taskRuntimeState,
@@ -1762,9 +1853,6 @@ public actor AgentCore {
                                 arguments: arguments,
                                 sessionID: session.id
                             )
-                            guard let descriptor = descriptorsByName[name] else {
-                                throw ToolArgumentValidationError.unknownTool(name)
-                            }
                             let stateChangeSignature = descriptor.risk == .readOnly ? nil : Self.semanticToolSignature(name: name, arguments: arguments)
                             let appListSignature = descriptor.risk == .readOnly && name == "apps.list"
                                 ? Self.semanticToolSignature(name: name, arguments: arguments)
@@ -1777,6 +1865,11 @@ public actor AgentCore {
                                 requiresMessageSend: requiresMessageSend,
                                 toolName: name,
                                 purpose: normalizedTextPurpose,
+                                successfulTextInputCount: successfulTextInputCount
+                            ) || Self.shouldBlockStructuredMessagingTyping(
+                                requiresMessageSend: requiresMessageSend,
+                                toolName: name,
+                                arguments: arguments,
                                 successfulTextInputCount: successfulTextInputCount
                             ) {
                                 let failure = ToolResult(
@@ -2651,6 +2744,28 @@ public actor AgentCore {
                                             runtime: runtime,
                                             payload: &checkpoint.payload
                                         )
+                                        var traceMetadata = runtime.traceMetadata(contract: contract)
+                                        traceMetadata["tool"] = name
+                                        traceMetadata["toolLatencyMS"] = String(toolLatencyMS)
+                                        traceMetadata["providerRoundTrips"] = String(providerRoundTrips)
+                                        traceMetadata["providerTotalMS"] = providerLastTotalMS.map { String($0) } ?? "unknown"
+                                        traceMetadata["executionRoute"] = result.payload["route"] ?? descriptor.preferredRoute.rawValue
+                                        if let frame = lastObservationFrame {
+                                            traceMetadata["axLatencyMS"] = frame.sourceLatency.axTotalMS.map { String($0) } ?? "unknown"
+                                            traceMetadata["ocrLatencyMS"] = frame.sourceLatency.ocrTotalMS.map { String($0) } ?? "unknown"
+                                            traceMetadata["screenshotLatencyMS"] = frame.sourceLatency.screenshotMS.map { String($0) } ?? "unknown"
+                                            traceMetadata["observationConfidence"] = String(format: "%.2f", frame.confidence)
+                                            traceMetadata["observationAmbiguous"] = frame.surfaceSnapshot?.ambiguous == true ? "true" : "false"
+                                        }
+                                        try? await diagnosticLogger?.log(
+                                            level: .info,
+                                            subsystem: "execution_trace",
+                                            action: "task-transition",
+                                            result: runtime.isComplete(contract: contract) ? "complete" : "progress",
+                                            sessionID: session.id,
+                                            toolCallID: call.id,
+                                            metadata: traceMetadata
+                                        )
                                     }
                                 } catch {
                                     let toolLatencyMS = max(0, Int(Date().timeIntervalSince(toolExecutionStartedAt) * 1_000))
@@ -2898,6 +3013,15 @@ public actor AgentCore {
         return normalizedPurpose != "navigation_search"
     }
 
+    static func shouldBlockTypedTaskCompletedWrite(
+        contract: TaskContract?,
+        runtime: TaskRuntimeState?,
+        descriptor: ToolDescriptor?
+    ) -> Bool {
+        guard let contract, let runtime, let descriptor, descriptor.risk != .readOnly else { return false }
+        return runtime.isComplete(contract: contract)
+    }
+
     static func shouldBlockRepeatedMessageBodyInput(
         requiresMessageSend: Bool,
         toolName: String,
@@ -2910,6 +3034,31 @@ public actor AgentCore {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() ?? ""
         return normalizedPurpose != "navigation_search"
+    }
+
+    static func structuredPlanTypeElementCount(arguments: [String: String]) -> Int {
+        guard let rawPlan = arguments["plan"],
+              let data = rawPlan.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let steps = root["steps"] as? [[String: Any]] else { return 0 }
+        return steps.reduce(into: 0) { count, step in
+            if (step["action"] as? String) == "typeElement" { count += 1 }
+        }
+    }
+
+    static func shouldBlockStructuredMessagingTyping(
+        requiresMessageSend: Bool,
+        toolName: String,
+        arguments: [String: String],
+        successfulTextInputCount: Int
+    ) -> Bool {
+        guard requiresMessageSend, toolName == "gui.runStructuredPlan" else { return false }
+        let typeCount = structuredPlanTypeElementCount(arguments: arguments)
+        guard typeCount > 0 else { return false }
+        // Search text and outgoing-body text are separate state-dependent milestones. Keep a fresh
+        // semantic observation between them, and never type the outgoing body again after success.
+        if typeCount > 1 { return true }
+        return successfulTextInputCount > 0
     }
 
     static func shouldBlockUnverifiedMessageCommitRepeat(

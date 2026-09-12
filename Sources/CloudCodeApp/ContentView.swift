@@ -149,6 +149,7 @@ private struct ChatView: View {
     @State private var pendingDocument: ImportedChatDocument?
     @State private var isImportingDocument = false
     @State private var isConversationAtBottom = true
+    @FocusState private var isComposerFocused: Bool
 
     private let conversationBottomID = "cloudcode-conversation-bottom"
 
@@ -250,6 +251,8 @@ private struct ChatView: View {
                     }
                     .padding()
                 }
+                .scrollDismissesKeyboard(.interactively)
+                .simultaneousGesture(TapGesture().onEnded { isComposerFocused = false })
                 .onAppear {
                     isConversationAtBottom = true
                     scrollConversationToBottom(proxy, animated: false)
@@ -389,6 +392,7 @@ private struct ChatView: View {
     private var inputRow: some View {
         HStack(alignment: .bottom, spacing: 8) {
             Button {
+                isComposerFocused = false
                 showDocumentImporter = true
             } label: {
                 Image(systemName: "doc.badge.plus")
@@ -401,6 +405,7 @@ private struct ChatView: View {
                 Image(systemName: "photo")
                     .frame(width: 30, height: 30)
             }
+            .simultaneousGesture(TapGesture().onEnded { isComposerFocused = false })
 
             Button(action: toggleVoiceInput) {
                 Image(systemName: voice.isRecording ? "stop.circle.fill" : "mic")
@@ -411,6 +416,7 @@ private struct ChatView: View {
             TextField("输入要让 Cloud Code 完成的任务…", text: $input, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...5)
+                .focused($isComposerFocused)
 
             Button(model.isCurrentSessionRunning ? "追加" : "发送", action: sendCurrentInput)
                 .buttonStyle(.borderedProminent)
@@ -427,12 +433,14 @@ private struct ChatView: View {
     private var chatToolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .topBarTrailing) {
             Button {
+                isComposerFocused = false
                 showDiagnostics = true
             } label: {
                 Label("日志", systemImage: "doc.text.magnifyingglass")
             }
 
             Button {
+                isComposerFocused = false
                 showSessionHistory = true
             } label: {
                 Label("历史", systemImage: "clock.arrow.circlepath")
@@ -441,6 +449,10 @@ private struct ChatView: View {
             Button(action: createNewConversation) {
                 Label("新建对话", systemImage: "square.and.pencil")
             }
+        }
+        ToolbarItemGroup(placement: .keyboard) {
+            Spacer()
+            Button("收起") { isComposerFocused = false }
         }
     }
 
@@ -457,6 +469,7 @@ private struct ChatView: View {
     }
 
     private func sendCurrentInput() {
+        isComposerFocused = false
         let value = input
         let image = pendingImageData
         let document = pendingDocument
@@ -472,6 +485,7 @@ private struct ChatView: View {
     }
 
     private func createNewConversation() {
+        isComposerFocused = false
         input = ""
         clearPendingImage()
         clearPendingDocument(removeStoredFile: true)

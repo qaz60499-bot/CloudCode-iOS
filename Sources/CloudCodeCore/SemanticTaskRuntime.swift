@@ -9,6 +9,10 @@ public struct TaskContract: Codable, Equatable, Sendable {
     public enum Intent: String, Codable, Sendable {
         case finiteFeed
         case messaging
+        /// Generic semantic GUI work. The current compiler intentionally does not manufacture
+        /// this contract from arbitrary natural language yet; AppKnowledge/Skill-backed callers
+        /// may opt in once they can provide grounded milestones and a verified target App.
+        case genericGUI
     }
 
     public enum FeedMetric: String, Codable, Sendable {
@@ -106,6 +110,49 @@ public struct TaskContract: Codable, Equatable, Sendable {
         }
     }
 
+    /// A semantic milestone is an execution-state description, not a second planner. It reuses
+    /// the existing obligation IDs as the single source of progress truth and never carries
+    /// coordinates, message bodies, credentials, or execution authority.
+    public struct Milestone: Codable, Equatable, Sendable, Identifiable {
+        public enum FailurePolicy: String, Codable, Sendable {
+            case replan
+            case reconcileBeforeRetry
+            case failClosed
+        }
+
+        public var id: String
+        public var semanticGoal: String
+        public var prerequisiteIDs: [String]
+        public var completionObligationIDs: [String]
+        public var retryBudget: Int
+        public var failurePolicy: FailurePolicy
+        public var exactlyOnce: Bool
+        public var verificationRequired: Bool
+        public var preferredSkill: String?
+
+        public init(
+            id: String,
+            semanticGoal: String,
+            prerequisiteIDs: [String] = [],
+            completionObligationIDs: [String],
+            retryBudget: Int = 1,
+            failurePolicy: FailurePolicy = .replan,
+            exactlyOnce: Bool = false,
+            verificationRequired: Bool = false,
+            preferredSkill: String? = nil
+        ) {
+            self.id = id
+            self.semanticGoal = semanticGoal
+            self.prerequisiteIDs = prerequisiteIDs
+            self.completionObligationIDs = completionObligationIDs
+            self.retryBudget = max(0, retryBudget)
+            self.failurePolicy = failurePolicy
+            self.exactlyOnce = exactlyOnce
+            self.verificationRequired = verificationRequired
+            self.preferredSkill = preferredSkill
+        }
+    }
+
     public var version: Int
     public var requestFingerprint: String
     public var intent: Intent
@@ -117,6 +164,9 @@ public struct TaskContract: Codable, Equatable, Sendable {
     public var retryBudgets: RetryBudgets
     public var feed: FeedSpec?
     public var message: MessageSpec?
+    /// Optional to preserve decoding of Build125 checkpoints. When absent, effectiveMilestones
+    /// deterministically projects the existing obligations into a generic milestone chain.
+    public var milestones: [Milestone]?
 
     public init(
         requestFingerprint: String,
@@ -128,7 +178,8 @@ public struct TaskContract: Codable, Equatable, Sendable {
         limits: Limits,
         retryBudgets: RetryBudgets = RetryBudgets(),
         feed: FeedSpec? = nil,
-        message: MessageSpec? = nil
+        message: MessageSpec? = nil,
+        milestones: [Milestone]? = nil
     ) {
         self.version = Self.schemaVersion
         self.requestFingerprint = requestFingerprint
@@ -141,6 +192,42 @@ public struct TaskContract: Codable, Equatable, Sendable {
         self.retryBudgets = retryBudgets
         self.feed = feed
         self.message = message
+        self.milestones = milestones
+    }
+
+    public var effectiveMilestones: [Milestone] {
+        if let milestones, !milestones.isEmpty { return milestones }
+        var previousID: String?
+        return obligations.map { obligation in
+            let goal: String
+            switch obligation.kind {
+            case .foregroundTargetApp: goal = "foreground_target_app"
+            case .observeFiniteFeed: goal = "collect_bounded_items"
+            case .selectFeedItem: goal = "select_item_from_collected_evidence"
+            case .likeSelectedFeedItem: goal = "commit_selected_item_like"
+            case .navigateToDestination: goal = "navigate_to_semantic_destination"
+            case .focusComposer: goal = "focus_text_composer"
+            case .enterMessageBody: goal = "enter_requested_text_once"
+            case .sendMessage: goal = "commit_message_once"
+            case .verifyPostcondition: goal = "verify_task_postcondition"
+            }
+            let milestone = Milestone(
+                id: obligation.id,
+                semanticGoal: goal,
+                prerequisiteIDs: previousID.map { [$0] } ?? [],
+                completionObligationIDs: [obligation.id],
+                retryBudget: obligation.kind == .verifyPostcondition ? retryBudgets.perceptionRecovery : retryBudgets.localRecovery,
+                failurePolicy: (obligation.kind == .sendMessage || obligation.kind == .likeSelectedFeedItem)
+                    ? .reconcileBeforeRetry
+                    : .replan,
+                exactlyOnce: obligation.kind == .sendMessage || obligation.kind == .likeSelectedFeedItem,
+                verificationRequired: obligation.kind == .sendMessage
+                    || obligation.kind == .likeSelectedFeedItem
+                    || obligation.kind == .verifyPostcondition
+            )
+            previousID = milestone.id
+            return milestone
+        }
     }
 
     public static func fingerprint(for request: String) -> String {
@@ -371,6 +458,53 @@ public struct TaskRuntimeState: Codable, Equatable, Sendable {
         return true
     }
 
+    /// Completion is determined only from the contract's required obligations. This is the common
+    /// hard stop used by AgentCore before any further state-changing tool can run; Provider prose
+    /// can neither declare completion early nor reopen a completed commit.
+    public func isComplete(contract: TaskContract) -> Bool {
+        let required = contract.obligations.filter { contract.completionConditions.contains($0.kind) }
+        let requiredIDs = Set((required.isEmpty ? contract.obligations : required).map(\.id))
+        return !requiredIDs.isEmpty && requiredIDs.isSubset(of: completedObligations)
+    }
+
+    public func nextPendingMilestone(contract: TaskContract) -> TaskContract.Milestone? {
+        contract.effectiveMilestones.first { milestone in
+            let completed = Set(milestone.completionObligationIDs).isSubset(of: completedObligations)
+            let prerequisitesSatisfied = Set(milestone.prerequisiteIDs).isSubset(of: completedObligations)
+            return !completed && prerequisitesSatisfied
+        }
+    }
+
+    /// Privacy-safe execution-trace fields. Request text, message body, screenshot contents and
+    /// credentials are intentionally absent; diagnostics receive only bounded state/latency keys.
+    public func traceMetadata(contract: TaskContract) -> [String: String] {
+        var metadata: [String: String] = [
+            "taskFingerprint": String(contract.requestFingerprint.prefix(16)),
+            "intent": contract.intent.rawValue,
+            "taskComplete": isComplete(contract: contract) ? "true" : "false",
+            "completedObligations": completedObligations.sorted().joined(separator: ","),
+            "pendingObligations": pendingObligations.sorted().joined(separator: ","),
+            "genericSurface": genericSurface.rawValue,
+            "messageCommitState": messageCommitState.rawValue,
+            "feedCompleted": String(finiteFeedCompleted),
+            "likeActions": String(likeActionsCompleted),
+            "textInputActions": String(textInputActionsCompleted),
+            "localRecoveryRemaining": String(retry.localRecoveryRemaining),
+            "perceptionRecoveryRemaining": String(retry.perceptionRecoveryRemaining),
+            "providerReplanRemaining": String(retry.providerReplanRemaining)
+        ]
+        if let currentBundleID { metadata["foregroundBundleID"] = currentBundleID }
+        if let semanticSurface { metadata["semanticSurface"] = semanticSurface }
+        if let milestone = nextPendingMilestone(contract: contract) {
+            metadata["nextMilestone"] = milestone.id
+            metadata["nextMilestoneGoal"] = milestone.semanticGoal
+            metadata["nextMilestoneExactlyOnce"] = milestone.exactlyOnce ? "true" : "false"
+        } else {
+            metadata["nextMilestone"] = isComplete(contract: contract) ? "complete" : "blocked_or_unresolved"
+        }
+        return metadata
+    }
+
     public mutating func markObligationCompleted(_ id: String) {
         completedObligations.insert(id)
         pendingObligations.remove(id)
@@ -452,12 +586,23 @@ public struct TaskRuntimeState: Codable, Equatable, Sendable {
             }
             if toolName == "gui.feedSample" {
                 if result.payload["localMetricExtraction"] == "complete",
-                   let selected = result.payload["localMetricSelectedSample"].flatMap(Int.init) {
-                    selectedFeedSample = selected
-                    selectedFeedReturnVerified = result.payload["localMetricSelectedReturnVerified"] == "true"
-                    if selectedFeedReturnVerified {
-                        genericSurface = .fullscreenMedia
-                        semanticSurface = "douyin.feedVideo"
+                   let selected = result.payload["localMetricSelectedSample"].flatMap(Int.init),
+                   let sampled = result.payload["sampledCount"].flatMap(Int.init),
+                   let expected = contract.feed?.exactItemCount,
+                   sampled == expected,
+                   selected >= 1, selected <= expected {
+                    let values = (result.payload["localMetricValues"] ?? "")
+                        .split(separator: ",", omittingEmptySubsequences: true)
+                    // Selection is a milestone only when the requested sample set has complete
+                    // metric evidence. A selected index without N/N values is not enough to justify
+                    // a later Like/commit on behalf of the user.
+                    if values.count == expected, values.allSatisfy({ Double($0) != nil }) {
+                        selectedFeedSample = selected
+                        selectedFeedReturnVerified = result.payload["localMetricSelectedReturnVerified"] == "true"
+                        if selectedFeedReturnVerified {
+                            genericSurface = .fullscreenMedia
+                            semanticSurface = "feed.item.selected"
+                        }
                     }
                 }
             }
@@ -490,13 +635,13 @@ public struct TaskRuntimeState: Codable, Equatable, Sendable {
                 // conversation title); screenshot change by itself is never sufficient.
                 markObligationCompleted("destination")
                 genericSurface = .chat
-                semanticSurface = "wechat.conversation"
+                semanticSurface = "chat.conversation"
             }
             if toolName == "gui.focusComposerObserve",
                result.payload["composerFocusVerified"] == "true" || result.payload["keyboardLikely"] == "true" {
                 composerFocusVerified = true
                 genericSurface = .composer
-                semanticSurface = "wechat.composer"
+                semanticSurface = "chat.composer"
             }
             if Self.isSendOperation(toolName: toolName, arguments: arguments), textInputActionsCompleted > 0 {
                 messageCommitState = .uncertain
@@ -509,10 +654,15 @@ public struct TaskRuntimeState: Codable, Equatable, Sendable {
                 messageCommitState = .verified
                 postconditionVerified = true
                 genericSurface = .chat
-                semanticSurface = "wechat.conversation"
+                semanticSurface = "chat.conversation"
             } else if messageCommitState == .uncertain, toolName == "gui.screenshot" {
                 reconcileObservationCount = boundedReconcileObservationCount + 1
             }
+
+        case .genericGUI:
+            // Generic contracts are progressed by grounded milestone/skill evidence. This runtime
+            // deliberately does not infer completion from an arbitrary successful GUI write.
+            break
         }
         reconcileObligationProgress(contract: contract)
     }
@@ -704,6 +854,12 @@ public enum TaskTransitionPolicy {
                     reason: "typed_message_post_send_observation_once"
                 )
             }
+            return nil
+
+        case .genericGUI:
+            // A generic milestone becomes deterministic only when a registered Skill or current
+            // semantic observation uniquely resolves its next operation. Until that registry is
+            // wired, yield to AgentCore instead of guessing a universal UI action.
             return nil
         }
     }
