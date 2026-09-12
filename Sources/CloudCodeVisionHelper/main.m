@@ -67,7 +67,7 @@ static VNRecognizeTextRequest *CloudCodeMakeRequest(BOOL cpuOnly, BOOL forceAccu
     VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] init];
     request.usesLanguageCorrection = NO;
     request.minimumTextHeight = 0.020f;
-    request.preferBackgroundProcessing = YES;
+    request.preferBackgroundProcessing = NO;
 
     NSArray<NSString *> *fastLanguages = CloudCodePreferredLanguages(VNRequestTextRecognitionLevelFast);
     if (!forceAccurate && [fastLanguages containsObject:@"zh-Hans"]) {
@@ -111,7 +111,7 @@ static NSError *CloudCodePerformFastFallbackOCR(CGImageRef image, VNRecognizeTex
     request.recognitionLevel = VNRequestTextRecognitionLevelFast;
     request.usesLanguageCorrection = NO;
     request.minimumTextHeight = 0.012f;
-    request.preferBackgroundProcessing = YES;
+    request.preferBackgroundProcessing = NO;
     if (@available(iOS 16.0, *)) { request.automaticallyDetectsLanguage = YES; }
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -157,13 +157,35 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements, BOOL for
 
     NSString *recognitionLevelName = nil;
     VNRecognizeTextRequest *request = nil;
+    // Interactive OCR normally needs coordinates/text anchors, not full-resolution typography.
+    // Build 126 device diagnostics showed the public CPU Vision pass spending ~0.7-2.3s on full
+    // iPhone screenshots. Keep accurate mode on the original image, but run the default fast pass
+    // on a 960px ImageIO thumbnail. Vision boxes are normalized, so coordinates are still projected
+    // back into the original screen size below without losing point-space semantics.
+    CGImageRef primaryImage = image;
+    CGImageRef primaryThumbnail = NULL;
+    NSString *backendName = @"vision_helper_public_api";
+    if (!forceAccurate) {
+        CGImageSourceRef fastSource = CGImageSourceCreateWithData((__bridge CFDataRef)jpeg, NULL);
+        NSDictionary *fastOptions = @{
+            (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+            (id)kCGImageSourceThumbnailMaxPixelSize: @960,
+            (id)kCGImageSourceCreateThumbnailWithTransform: @YES
+        };
+        primaryThumbnail = fastSource ? CGImageSourceCreateThumbnailAtIndex(fastSource, 0, (__bridge CFDictionaryRef)fastOptions) : NULL;
+        if (fastSource) { CFRelease(fastSource); }
+        if (primaryThumbnail) {
+            primaryImage = primaryThumbnail;
+            backendName = @"vision_helper_public_api_fast_thumbnail";
+        }
+    }
+
     // This helper exists specifically to provide a normal, non-root Vision execution context when
     // the host App cannot finish OCR while backgrounded. Do not first enter GPU/ANE/CoreVideo paths
     // that already failed on-device with CoreVideo -6662 / CoreML code 0 and then repeat the work.
-    NSError *primaryError = CloudCodePerformOCR(image, &request, YES, forceAccurate, &recognitionLevelName);
+    NSError *primaryError = CloudCodePerformOCR(primaryImage, &request, YES, forceAccurate, &recognitionLevelName);
     BOOL cpuFallbackUsed = NO;
     NSError *finalError = primaryError;
-    NSString *backendName = @"vision_helper_public_api";
 
     if (primaryError) {
         // A fresh helper process is valuable only if it does materially less work after the same
@@ -202,6 +224,7 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements, BOOL for
             @"elements": @[]
         };
         CloudCodePrintJSON(failure);
+        if (primaryThumbnail) { CGImageRelease(primaryThumbnail); }
         CGImageRelease(image);
         return 0;
     }
@@ -280,6 +303,7 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements, BOOL for
         @"elements": elements
     };
     CloudCodePrintJSON(payload);
+    if (primaryThumbnail) { CGImageRelease(primaryThumbnail); }
     CGImageRelease(image);
     return 0;
 }

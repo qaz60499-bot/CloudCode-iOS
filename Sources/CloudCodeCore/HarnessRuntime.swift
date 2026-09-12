@@ -219,7 +219,7 @@ public enum HarnessContextManager {
             // GUI execution is dominated by current foreground evidence. Retaining dozens of old
             // screenshot/tool turns makes gateway payloads slower and can trigger compatibility
             // failures without improving the next local action. Full history stays persisted locally.
-            return HarnessContextPolicy(maxCharacters: 48_000, maxMessages: 40)
+            return HarnessContextPolicy(maxCharacters: 32_000, maxMessages: 24)
         }
         return HarnessContextPolicy()
     }
@@ -401,18 +401,57 @@ public enum HarnessContextManager {
 
         guard !prefixes.isEmpty else { return availableNames }
         var scoped = Set(availableNames.filter { name in prefixes.contains(where: name.hasPrefix) })
+
+        if isGUIRequest {
+            // GUI rounds are latency-sensitive and dominated by the current foreground state. Do not
+            // serialize every apps.* and gui.* capability into each Provider request: the duplicate raw
+            // actions and unrelated destructive lifecycle tools materially increase schema size and TTFT.
+            // Keep one bounded tool for each semantic job, then add only task-specific fast paths.
+            var guiFastPath: Set<String> = [
+                "apps.launch", "apps.list", "apps.inspect",
+                "gui.openAppObserve", "gui.screenshot", "gui.tree", "gui.findElement",
+                "gui.tapElementObserve", "gui.tapTextObserve", "gui.tapObserve", "gui.verify",
+                "interaction.confirmTransition", "capability.probe"
+            ]
+            if requiresMessageSend(in: request) || messagingMarkers.contains(where: normalized.contains) {
+                guiFastPath.formUnion([
+                    "gui.waitForElement", "gui.focusComposerObserve", "gui.typeElementObserve",
+                    "gui.typeObserve", "gui.runStructuredPlan", "gui.navigateBack"
+                ])
+            }
+            if boundedRepeatedSwipeCount(in: request) != nil || requestsConsecutiveFeedItems(in: request) {
+                guiFastPath.formUnion([
+                    "gui.feedSample", "gui.swipeSequence", "gui.scrollObserve", "gui.swipeObserve",
+                    "gui.navigateBack"
+                ])
+            } else if ["滑", "滚动", "swipe", "scroll"].contains(where: normalized.contains) {
+                guiFastPath.formUnion(["gui.scrollObserve", "gui.swipeObserve", "gui.navigateBack"])
+            }
+            scoped = scoped.intersection(guiFastPath)
+        }
+
         // Failure explanation is a local read-only introspection tool and remains useful even when
         // the provider schema is domain-scoped. It never broadens execution authority.
         if availableNames.contains("diagnostics.explainFailure") { scoped.insert("diagnostics.explainFailure") }
         if shouldExposeNativeMessagingDiscovery {
-            let nativeReadOnlyDiscovery: Set<String> = [
-                "apps.inspect", "container.resolve", "container.list", "container.search",
-                "files.list", "files.search", "files.read", "files.inspectDocument", "files.stat", "files.metadata", "files.hash",
-                "plist.read", "plist.query", "plist.metadata",
-                "json.read", "json.query", "json.filter", "json.aggregate",
-                "sqlite.discover", "sqlite.tables", "sqlite.schema", "sqlite.query", "sqlite.filter", "sqlite.aggregate", "sqlite.sample",
-                "data.localQuery", "storage.analyze"
-            ]
+            // A generic messaging task should not pay for dozens of low-level filesystem/database
+            // schemas before the foreground GUI path has even been tried. data.localQuery already
+            // provides the bounded resolve→search→inspect→query macro when deterministic native
+            // discovery is needed. Expand to the lower-level read-only surface only when the user
+            // explicitly asked to inspect local files/data.
+            let nativeReadOnlyDiscovery: Set<String>
+            if requestsLocalDataAccess(in: request) {
+                nativeReadOnlyDiscovery = [
+                    "apps.inspect", "container.resolve", "container.list", "container.search",
+                    "files.list", "files.search", "files.read", "files.inspectDocument", "files.stat", "files.metadata", "files.hash",
+                    "plist.read", "plist.query", "plist.metadata",
+                    "json.read", "json.query", "json.filter", "json.aggregate",
+                    "sqlite.discover", "sqlite.tables", "sqlite.schema", "sqlite.query", "sqlite.filter", "sqlite.aggregate", "sqlite.sample",
+                    "data.localQuery", "storage.analyze"
+                ]
+            } else {
+                nativeReadOnlyDiscovery = ["apps.inspect", "container.resolve", "data.localQuery"]
+            }
             scoped.formUnion(availableNames.intersection(nativeReadOnlyDiscovery))
         }
         return scoped.isEmpty ? availableNames : scoped

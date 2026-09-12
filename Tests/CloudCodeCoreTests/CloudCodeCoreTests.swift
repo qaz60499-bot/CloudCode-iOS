@@ -6780,19 +6780,22 @@ final class CloudCodeCoreTests: XCTestCase {
         let hint = providerMessages.first(where: { $0.providerMetadata["context_layer"] == "harness_execution" })
         XCTAssertEqual(hint?.providerMetadata["execution_mode"], "bounded_feed_sample")
         XCTAssertEqual(hint?.providerMetadata["repeat_count"], "5")
-        XCTAssertEqual(HarnessContextManager.providerPolicy(for: current).maxMessages, 40)
+        XCTAssertEqual(HarnessContextManager.providerPolicy(for: current).maxMessages, 24)
     }
 
     func testHarnessScopesProviderToolsToCurrentTaskDomain() {
         let available: Set<String> = [
-            "apps.launch", "apps.list", "gui.screenshot", "gui.feedSample", "interaction.confirmTransition", "capability.probe",
-            "files.read", "sqlite.query", "ipa.inspect", "advanced.shell"
+            "apps.launch", "apps.list", "apps.uninstall", "gui.screenshot", "gui.feedSample", "gui.tap", "gui.tapObserve",
+            "interaction.confirmTransition", "capability.probe", "files.read", "sqlite.query", "ipa.inspect", "advanced.shell"
         ]
         let gui = HarnessContextManager.scopedProviderToolNames(for: "打开抖音刷五个视频看点赞量", availableNames: available)
         XCTAssertTrue(gui.contains("apps.launch"))
         XCTAssertTrue(gui.contains("gui.feedSample"))
         XCTAssertTrue(gui.contains("interaction.confirmTransition"))
         XCTAssertTrue(gui.contains("capability.probe"))
+        XCTAssertTrue(gui.contains("gui.tapObserve"))
+        XCTAssertFalse(gui.contains("gui.tap"))
+        XCTAssertFalse(gui.contains("apps.uninstall"))
         XCTAssertFalse(gui.contains("files.read"))
         XCTAssertFalse(gui.contains("sqlite.query"))
         XCTAssertFalse(gui.contains("ipa.inspect"))
@@ -7433,17 +7436,17 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(values.isEmpty)
     }
 
-    func testHarnessMessagingScopeExposesReadOnlyNativeDiscoveryWithoutWriteTools() {
+    func testHarnessMessagingScopeUsesCompactNativeDiscoveryMacroWithoutWriteTools() {
         let available: Set<String> = [
             "apps.launch", "apps.inspect", "gui.screenshot", "gui.typeObserve", "capability.probe",
             "container.resolve", "container.search", "files.search", "files.modify", "sqlite.query", "data.localQuery", "advanced.shell"
         ]
         let scoped = HarnessContextManager.scopedProviderToolNames(for: "打开微信找到文件传输助手并发消息", availableNames: available)
         XCTAssertTrue(scoped.contains("container.resolve"))
-        XCTAssertTrue(scoped.contains("container.search"))
-        XCTAssertTrue(scoped.contains("files.search"))
-        XCTAssertTrue(scoped.contains("sqlite.query"))
         XCTAssertTrue(scoped.contains("data.localQuery"))
+        XCTAssertFalse(scoped.contains("container.search"), "generic messaging should prefer the compact data.localQuery macro")
+        XCTAssertFalse(scoped.contains("files.search"), "generic messaging should not serialize low-level file discovery schemas before GUI is tried")
+        XCTAssertFalse(scoped.contains("sqlite.query"), "generic messaging should not serialize low-level database schemas before GUI is tried")
         XCTAssertFalse(scoped.contains("files.modify"), "messaging discovery must not gain arbitrary database/file write authority")
         XCTAssertFalse(scoped.contains("advanced.shell"))
     }

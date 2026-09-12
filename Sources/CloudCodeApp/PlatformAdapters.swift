@@ -434,27 +434,33 @@ enum EmbeddedRootHelper {
             return LaunchOutcome(accepted: true, foregroundVerified: true, detail: "隔离 helper 已验证目标安装状态并完成 App 启动路径。\(route)")
         }
 
-        // LaunchServices returning "accepted" is not evidence that the requested App became the
-        // foreground App. Build 92 repeatedly returned accepted-but-unverified and then continued
-        // target-specific GUI work against whichever App was still frontmost. A second activation
-        // through the privileged board-service route is safe and idempotent at this layer: it only
-        // asks iOS to foreground the same already-installed bundle, and success still requires an
-        // independent frontmost-bundle verification inside the helper. Therefore an unverified
-        // isolated launch must fall through to the bounded root activation path instead of being
-        // treated as good enough for screenshot-driven continuation.
+        // LaunchServices returning "accepted" is still not proof that the requested App became the
+        // foreground App. However, Build 126 device diagnostics showed that immediately replaying
+        // the same accepted request through FrontBoard/BackBoard can add ~4-5 seconds while still
+        // ending as foreground-unverified. Preserve the fail-closed identity boundary, but return
+        // accepted-unverified immediately so AgentCore can take one fresh screenshot/AX/OCR
+        // observation instead of blocking on a redundant second activation. The privileged fallback
+        // remains available only when the isolated route did not actually accept the request.
         if isolated.code == 46 {
             let isolatedDetail = failureDetail(prefix: "隔离 helper 启动 App", code: isolated.code, diagnostic: isolated.diagnostic)
+            if acceptedButUnverified(isolated) {
+                return LaunchOutcome(
+                    accepted: true,
+                    foregroundVerified: false,
+                    detail: "隔离 LaunchServices 请求已接受但前台身份暂未验证；为避免重复 FrontBoard/BackBoard 激活造成长阻塞，立即交给下一次 fresh screenshot/AX/OCR observation 验证。后续不得把截图默认解释为目标 App。\(isolatedDetail)"
+                )
+            }
             let privileged = run(["launch", bundleID], privilege: .root, timeout: 6)
             if privileged.code == 0 {
                 let route = privileged.diagnostic.isEmpty ? "" : " \(privileged.diagnostic)"
                 return LaunchOutcome(accepted: true, foregroundVerified: true, detail: "隔离 LaunchServices 路径未接受启动后，root helper 通过系统启动路由完成目标 App 前台切换。\(route)")
             }
             let privilegedDetail = failureDetail(prefix: "root helper 启动 App", code: privileged.code, diagnostic: privileged.diagnostic)
-            if acceptedButUnverified(privileged) || acceptedButUnverified(isolated) {
+            if acceptedButUnverified(privileged) {
                 return LaunchOutcome(
                     accepted: true,
                     foregroundVerified: false,
-                    detail: "隔离 LaunchServices 请求已接受但未建立可验证前台；已继续尝试一次 root/FrontBoard/BackBoard 激活，但目标前台仍未被证明。后续不得把截图默认解释为目标 App。\(isolatedDetail)；root fallback：\(privilegedDetail)"
+                    detail: "隔离 LaunchServices 路径未接受启动；root/FrontBoard/BackBoard fallback 已接受请求但目标前台仍未被证明。后续必须依赖 fresh observation 继续验证。\(isolatedDetail)；root fallback：\(privilegedDetail)"
                 )
             }
             return LaunchOutcome(accepted: false, foregroundVerified: false, detail: "\(isolatedDetail)；root fallback 同样失败：\(privilegedDetail)")
@@ -612,7 +618,7 @@ enum EmbeddedRootHelper {
         // identity instead of relying on an anonymous one-shot helper. A single bounded persona-99
         // retry remains the fail-closed fallback. Neither route mutates AXManualAccessibility, so
         // this fallback cannot reintroduce the visible green scan frame.
-        let isolated = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)
+        let isolated = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 1.25)
         if let tree = validatedTree(isolated) {
             if isolated.code == 0 {
                 let suffix = isolated.stderr.isEmpty ? "" : " helper diagnostics: \(isolated.stderr)"
@@ -624,7 +630,7 @@ enum EmbeddedRootHelper {
             return (nil, "GUI tree 输出超过 256 KiB 限制，已 fail closed。")
         }
 
-        let privileged = runSeparated(["gui-tree-json"], privilege: .root, timeout: 1.6)
+        let privileged = runSeparated(["gui-tree-json"], privilege: .root, timeout: 0.7)
         if let tree = validatedTree(privileged) {
             let suffix = privileged.stderr.isEmpty ? "" : " helper diagnostics: \(privileged.stderr)"
             return (tree, "System-app host AX fast path 未返回可用语义树；persona-99 被动 AX fallback 返回了有效 tree。\(suffix)")
@@ -646,7 +652,7 @@ enum EmbeddedRootHelper {
             return nil
         }
 
-        let isolated = runSeparated(["gui-focused-text-input-json"], privilege: .isolatedUser, timeout: 2.0)
+        let isolated = runSeparated(["gui-focused-text-input-json"], privilege: .isolatedUser, timeout: 1.25)
         if let payload = decode(isolated) {
             if isolated.code == 0 {
                 return (payload, isolated.stderr.isEmpty ? "AX focused-text probe completed via System-app host AX fast path." : "AX focused-text probe completed via System-app host AX fast path. diagnostics: \(isolated.stderr)")
@@ -654,7 +660,7 @@ enum EmbeddedRootHelper {
             return (payload, "AX focused-text probe 已由 non-root AX 路径返回完整可解码 payload；退出阶段异常不影响这份已验证的只读结果。")
         }
 
-        let privileged = runSeparated(["gui-focused-text-input-json"], privilege: .root, timeout: 1.4)
+        let privileged = runSeparated(["gui-focused-text-input-json"], privilege: .root, timeout: 0.7)
         if let payload = decode(privileged) {
             return (payload, privileged.stderr.isEmpty ? "AX focused-text probe completed via persona-99 passive fallback." : "AX focused-text probe completed via persona-99 passive fallback. helper diagnostics: \(privileged.stderr)")
         }
