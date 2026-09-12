@@ -295,16 +295,16 @@ static NSInteger CloudCodeSpawnHelperInternal(
         result = -2000 - personaError;
     } else {
         NSString *command = arguments.firstObject ?: @"";
-        NSSet<NSString *> *axLeaseCommands = [NSSet setWithArray:@[
+        NSSet<NSString *> *serializedAXCommands = [NSSet setWithArray:@[
             @"gui-tree-json", @"gui-ax-probe-json", @"gui-focused-text-input-json", @"gui-type-base64"
         ]];
-        BOOL usesAXAutomationLease = [path.lastPathComponent isEqualToString:@"CloudCodeRootHelper"]
-            && [axLeaseCommands containsObject:command];
-        // _AXSSetAutomationEnabled controls a system-wide bit. Different AX commands must therefore
-        // share one admission key instead of merely de-duplicating identical commands; otherwise one
-        // helper can restore the previous state while another helper is still reading the tree.
-        NSString *registryKey = usesAXAutomationLease
-            ? [NSString stringWithFormat:@"%@|ax-automation-lease", path]
+        BOOL usesSerializedAXRuntime = [path.lastPathComponent isEqualToString:@"CloudCodeRootHelper"]
+            && [serializedAXCommands containsObject:command];
+        // Keep detached AXRuntime calls serialized so their private requesting-client/context state
+        // cannot overlap. Production perception no longer writes the system-wide Accessibility
+        // Automation bit; serialization is now only an AXRuntime isolation boundary.
+        NSString *registryKey = usesSerializedAXRuntime
+            ? [NSString stringWithFormat:@"%@|ax-runtime-serialized", path]
             : [NSString stringWithFormat:@"%@|%@", path, command];
         NSMutableSet *registry = CloudCodeHelperRegistry();
         BOOL admitted = NO;
@@ -318,7 +318,7 @@ static NSInteger CloudCodeSpawnHelperInternal(
         int spawnError = admitted ? posix_spawn(&pid, path.fileSystemRepresentation, captureOutput ? &actions : NULL, &attributes, argv, NULL) : EBUSY;
         if (spawnError != 0) {
             if (admitted) { CloudCodeReleaseHelper(registryKey); }
-            if (!admitted) { diagnosticSuffix = @"runtime_degraded: helper admission limit, same command, or serialized AX lease still active/unreaped"; }
+            if (!admitted) { diagnosticSuffix = @"runtime_degraded: helper admission limit, same command, or serialized AX runtime still active/unreaped"; }
             result = -3000 - spawnError;
         } else {
             const BOOL tracePerception = [path.lastPathComponent hasPrefix:@"CloudCode"];

@@ -46,8 +46,9 @@ static __attribute__((noreturn)) void CloudCodeGUIExitOneShot(int code)
     // Root-helper process entry switches stdout/stderr to unbuffered mode before GUI work starts.
     // Build 108 still showed post-result screenshot timeouts while flushing these streams after
     // private framework use, so never enter stdio flush/teardown here. Observable writes have
-    // already reached the bridge synchronously. Restore only the system Automation bit this helper
-    // changed; target-app AXManualAccessibility is never mutated.
+    // already reached the bridge synchronously. Production AX/OCR perception is read-only with
+    // respect to the global Automation bit and AXManualAccessibility; the compatibility restore
+    // hook is therefore intentionally a no-op.
     CloudCodeGUIRestoreAXAutomationForProcessExit();
     _exit(code);
 }
@@ -101,7 +102,6 @@ typedef void (*CloudCodeAXAddAssociatedPidFn)(pid_t, pid_t, int);
 typedef void (*CloudCodeAXSetRequestingClientFn)(uint32_t);
 typedef uint64_t (*CloudCodeAXOverrideRequestingClientTypeFn)(uint64_t);
 typedef int (*CloudCodeAXAutomationEnabledFn)(void);
-typedef void (*CloudCodeAXSetAutomationEnabledFn)(int);
 typedef int (*CloudCodeProcListAllPidsFn)(void *, int);
 typedef int (*CloudCodeProcPidPathFn)(int, void *, uint32_t);
 
@@ -172,7 +172,6 @@ typedef struct {
     BOOL requestingClientPrepared;
     int requestingClientRoute;
     CloudCodeAXAutomationEnabledFn automationEnabled;
-    CloudCodeAXSetAutomationEnabledFn setAutomationEnabled;
     BOOL automationLeaseActive;
     CloudCodeAXValueGetTypeIDFn valueGetTypeID;
     CloudCodeAXValueGetTypeFn valueGetType;
@@ -186,17 +185,13 @@ typedef struct {
     CFStringRef attributeElementType;
 } CloudCodeAXRuntime;
 
-static CloudCodeAXSetAutomationEnabledFn CloudCodeAXAutomationRestoreSetter = NULL;
-static int CloudCodeAXAutomationOriginalState = -1;
-static BOOL CloudCodeAXAutomationStateChanged = NO;
-
 void CloudCodeGUIRestoreAXAutomationForProcessExit(void)
 {
-    if (!CloudCodeAXAutomationStateChanged || !CloudCodeAXAutomationRestoreSetter || CloudCodeAXAutomationOriginalState < 0) { return; }
-    @try {
-        CloudCodeAXAutomationRestoreSetter(CloudCodeAXAutomationOriginalState);
-    } @catch (__unused NSException *exception) {}
-    CloudCodeAXAutomationStateChanged = NO;
+    // Compatibility no-op. Production perception never mutates the system-wide Accessibility
+    // Automation bit. A prior implementation temporarily enabled it and attempted to restore it on
+    // helper exit, but the parent watchdog uses SIGKILL for wedged AX IPC; SIGKILL cannot run that
+    // cleanup and could leave the device showing the visible green automation frame. Keep all AX/OCR
+    // perception background-only and read-only with respect to global accessibility state.
 }
 
 static void *CloudCodeOpenFramework(NSArray<NSString *> *paths)
@@ -1279,24 +1274,13 @@ static CloudCodeAXRuntime CloudCodeResolveAX(void)
         } @catch (__unused NSException *exception) {}
     }
     runtime.automationEnabled = (CloudCodeAXAutomationEnabledFn)CloudCodeResolveAcrossFrameworks(paths, "_AXSAutomationEnabled");
-    runtime.setAutomationEnabled = (CloudCodeAXSetAutomationEnabledFn)CloudCodeResolveAcrossFrameworks(paths, "_AXSSetAutomationEnabled");
-    if (runtime.automationEnabled && runtime.setAutomationEnabled) {
-        int before = -1;
-        @try { before = runtime.automationEnabled(); } @catch (__unused NSException *exception) { before = -1; }
-        if (CloudCodeAXAutomationOriginalState < 0 && before >= 0) {
-            CloudCodeAXAutomationOriginalState = before ? 1 : 0;
-            CloudCodeAXAutomationRestoreSetter = runtime.setAutomationEnabled;
-        }
-        if (before == 0) {
-            @try { runtime.setAutomationEnabled(1); } @catch (__unused NSException *exception) {}
-            usleep(20000);
-            int after = 0;
-            @try { after = runtime.automationEnabled(); } @catch (__unused NSException *exception) { after = 0; }
-            runtime.automationLeaseActive = after != 0;
-            CloudCodeAXAutomationStateChanged = runtime.automationLeaseActive;
-        } else {
-            runtime.automationLeaseActive = before > 0;
-        }
+    if (runtime.automationEnabled) {
+        int observed = -1;
+        @try { observed = runtime.automationEnabled(); } @catch (__unused NSException *exception) { observed = -1; }
+        // Observation only. Never call the private write API that enables the system-wide Automation
+        // bit: a watchdog SIGKILL cannot restore it and the resulting state can surface as the green
+        // accessibility/automation frame in the user's foreground UI.
+        runtime.automationLeaseActive = observed > 0;
     }
     runtime.valueGetTypeID = (CloudCodeAXValueGetTypeIDFn)CloudCodeResolveAcrossFrameworks(paths, "AXValueGetTypeID");
     runtime.valueGetType = (CloudCodeAXValueGetTypeFn)CloudCodeResolveAcrossFrameworks(paths, "AXValueGetType");
@@ -1314,10 +1298,9 @@ static CloudCodeAXRuntime CloudCodeResolveAX(void)
 static void CloudCodePrintAXRuntimeDiagnostic(CloudCodeAXRuntime runtime, const char *stage)
 {
     fprintf(stderr,
-        "gui-tree-ax-runtime: stage=%s authority=standalone-trollstore-best-effort automation_getter=%d automation_setter=%d automation_lease=%d requesting_client=%d requesting_client_prepared=%d requesting_client_route=%d create_app=%d create_systemwide=%d copy_attribute=%d copy_multiple=%d element_at_position=%d app_at_position=%d app_context_at_position=%d element_with_parameters=%d\n",
+        "gui-tree-ax-runtime: stage=%s authority=standalone-trollstore-best-effort automation_getter=%d automation_lease=%d automation_write=disabled requesting_client=%d requesting_client_prepared=%d requesting_client_route=%d create_app=%d create_systemwide=%d copy_attribute=%d copy_multiple=%d element_at_position=%d app_at_position=%d app_context_at_position=%d element_with_parameters=%d\n",
         stage ?: "unknown",
         runtime.automationEnabled ? 1 : 0,
-        runtime.setAutomationEnabled ? 1 : 0,
         runtime.automationLeaseActive ? 1 : 0,
         (runtime.setRequestingClient || runtime.overrideRequestingClientType) ? 1 : 0,
         runtime.requestingClientPrepared ? 1 : 0,

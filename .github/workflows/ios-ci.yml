@@ -599,7 +599,7 @@ jobs:
               if marker not in bridge:
                   raise SystemExit(f'FAIL: non-root AX bridge lost host -> AXAudit broker -> persona-99 fallback ordering marker: {marker}')
           host_ax = Path('Sources/CloudCodeApp/HostAXBridge.m').read_text(encoding='utf-8')
-          for marker in ('AXRuntime.host-system-app', 'CLOUDCODE_HOST_AX_TIMEOUT_SECONDS 0.25f', 'CLOUDCODE_HOST_AX_TOTAL_BUDGET_SECONDS 1.20', 'CLOUDCODE_HOST_AX_MAX_NODES 220', 'semanticNodeCount', 'actionableNodeCount', 'AXUIElementCreateApplication', 'AXUIElementCreateSystemWide', '_AXSetRequestingClient', '_AXSAutomationEnabled', '_AXSSetAutomationEnabled', 'CloudCodeHostAXAcquireAutomationLease', 'CloudCodeHostAXAcquireCallLease', 'os_unfair_lock_trylock', 'runtime.setTimeout(element, CLOUDCODE_HOST_AX_TIMEOUT_SECONDS)', 'fail-fast to bounded fallback', 'fail-fast to AXAudit fallback'):
+          for marker in ('AXRuntime.host-system-app', 'CLOUDCODE_HOST_AX_TIMEOUT_SECONDS 0.25f', 'CLOUDCODE_HOST_AX_TOTAL_BUDGET_SECONDS 1.20', 'CLOUDCODE_HOST_AX_MAX_NODES 220', 'semanticNodeCount', 'actionableNodeCount', 'AXUIElementCreateApplication', 'AXUIElementCreateSystemWide', '_AXSetRequestingClient', '_AXSAutomationEnabled', 'CloudCodeHostAXObserveAutomationState', 'CloudCodeHostAXAcquireCallLease', 'os_unfair_lock_trylock', 'runtime.setTimeout(element, CLOUDCODE_HOST_AX_TIMEOUT_SECONDS)', 'fail-fast to bounded fallback', 'fail-fast to AXAudit fallback'):
               if marker not in host_ax:
                   raise SystemExit(f'FAIL: host AX semantic fast path lost required marker: {marker}')
           for marker in ('CloudCodeHostAXProbeJSON', 'CCPerceptionProcessEvidence(@"cloudcode_system_app_host_ax_probe")', 'AXFrontBoardFocusedAppPID', 'abi_unverified_after_build122_physical_probe', 'FBSWorkspace', 'numericAttributes', 'userTestingSnapshot', 'contextPidMatchesForeground', 'remoteViewBridgeMarker', 'axRemoteElementMarker', 'axManualAccessibilityTouched'):
@@ -622,9 +622,11 @@ jobs:
           unverified_type_index = gui_text.find(unverified_type_marker)
           if unverified_type_index < 0 or 'CloudCodeGUIExitOneShot(70);' not in gui_text[unverified_type_index:unverified_type_index + 800]:
               raise SystemExit('FAIL: unverified HID text dispatch must fail closed instead of reporting gui.type success')
-          for marker in ('_AXSAutomationEnabled', '_AXSSetAutomationEnabled', 'CloudCodeGUIRestoreAXAutomationForProcessExit();', 'automation_lease=%d'):
+          for marker in ('_AXSAutomationEnabled', 'CloudCodeGUIRestoreAXAutomationForProcessExit();', 'automation_lease=%d', 'automation_write=disabled'):
               if marker not in gui_text:
-                  raise SystemExit(f'FAIL: AX system-automation lease/restore path missing required marker: {marker}')
+                  raise SystemExit(f'FAIL: passive AX automation-state observation path missing required marker: {marker}')
+          if '_AXSSetAutomationEnabled' in gui_text or '_AXSSetAutomationEnabled' in host_ax or 'setAutomationEnabled(' in gui_text or 'setAutomationEnabled(' in host_ax:
+              raise SystemExit('FAIL: foreground-visible system Accessibility Automation writes are forbidden; AX/OCR perception must remain background-only and read-only')
           for marker in ('CloudCodeResolveAcrossFrameworks(paths, "__AXSetRequestingClient")', 'CloudCodeResolveAcrossFrameworks(paths, "_AXSetRequestingClient")', 'CloudCodeResolveAcrossFrameworks(paths, "AXSetRequestingClient")', '_AXOverrideRequestingClientType', 'runtime.setRequestingClient(2)', 'runtime.overrideRequestingClientType(2)', 'requesting_client_prepared=%d'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: AX XCTest requesting-client identity preparation missing required marker: {marker}')

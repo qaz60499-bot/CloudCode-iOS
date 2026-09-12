@@ -36,7 +36,6 @@ typedef CloudCodeHostAXError (*CloudCodeHostAXSetTimeoutFn)(CloudCodeHostAXUIEle
 typedef void (*CloudCodeHostAXSetRequestingClientFn)(uint32_t);
 typedef void (*CloudCodeHostAXAddAssociatedPidFn)(pid_t, pid_t, int);
 typedef int (*CloudCodeHostAXAutomationEnabledFn)(void);
-typedef void (*CloudCodeHostAXSetAutomationEnabledFn)(int);
 typedef CFTypeID (*CloudCodeHostAXValueGetTypeIDFn)(void);
 typedef int (*CloudCodeHostAXValueGetTypeFn)(CFTypeRef);
 typedef Boolean (*CloudCodeHostAXValueGetValueFn)(CFTypeRef, int, void *);
@@ -64,7 +63,6 @@ typedef struct {
     CloudCodeHostAXSetRequestingClientFn setRequestingClient;
     CloudCodeHostAXAddAssociatedPidFn addAssociatedPid;
     CloudCodeHostAXAutomationEnabledFn automationEnabled;
-    CloudCodeHostAXSetAutomationEnabledFn setAutomationEnabled;
     CloudCodeHostAXValueGetTypeIDFn valueGetTypeID;
     CloudCodeHostAXValueGetTypeFn valueGetType;
     CloudCodeHostAXValueGetValueFn valueGetValue;
@@ -139,7 +137,6 @@ static CloudCodeHostAXRuntime CloudCodeHostAXResolve(void)
     runtime.addAssociatedPid = (CloudCodeHostAXAddAssociatedPidFn)CloudCodeHostAXResolveAcrossFrameworks("_AXAddAssociatedPid");
     if (!runtime.addAssociatedPid) { runtime.addAssociatedPid = (CloudCodeHostAXAddAssociatedPidFn)CloudCodeHostAXResolveAcrossFrameworks("AXAddAssociatedPid"); }
     runtime.automationEnabled = (CloudCodeHostAXAutomationEnabledFn)CloudCodeHostAXResolveAcrossFrameworks("_AXSAutomationEnabled");
-    runtime.setAutomationEnabled = (CloudCodeHostAXSetAutomationEnabledFn)CloudCodeHostAXResolveAcrossFrameworks("_AXSSetAutomationEnabled");
     runtime.valueGetTypeID = (CloudCodeHostAXValueGetTypeIDFn)CloudCodeHostAXResolveAcrossFrameworks("AXValueGetTypeID");
     runtime.valueGetType = (CloudCodeHostAXValueGetTypeFn)CloudCodeHostAXResolveAcrossFrameworks("AXValueGetType");
     runtime.valueGetValue = (CloudCodeHostAXValueGetValueFn)CloudCodeHostAXResolveAcrossFrameworks("AXValueGetValue");
@@ -167,39 +164,20 @@ static CloudCodeHostAXRuntime CloudCodeHostAXResolve(void)
 }
 
 typedef struct {
-    CloudCodeHostAXSetAutomationEnabledFn setter;
-    int original;
-    BOOL changed;
+    int observed;
     BOOL active;
 } CloudCodeHostAXAutomationLease;
 
-static CloudCodeHostAXAutomationLease CloudCodeHostAXAcquireAutomationLease(CloudCodeHostAXRuntime runtime)
+static CloudCodeHostAXAutomationLease CloudCodeHostAXObserveAutomationState(CloudCodeHostAXRuntime runtime)
 {
-    CloudCodeHostAXAutomationLease lease = {0};
-    lease.setter = runtime.setAutomationEnabled;
-    lease.original = -1;
-    if (!runtime.automationEnabled || !runtime.setAutomationEnabled) { return lease; }
-    int before = -1;
-    @try { before = runtime.automationEnabled(); } @catch (__unused NSException *exception) { before = -1; }
-    lease.original = before;
-    if (before == 0) {
-        @try { runtime.setAutomationEnabled(1); } @catch (__unused NSException *exception) {}
-        usleep(20000);
-        int after = 0;
-        @try { after = runtime.automationEnabled(); } @catch (__unused NSException *exception) { after = 0; }
-        lease.changed = after != 0;
-        lease.active = after != 0;
-    } else {
-        lease.active = before > 0;
-    }
+    CloudCodeHostAXAutomationLease lease = {.observed = -1, .active = NO};
+    if (!runtime.automationEnabled) { return lease; }
+    @try { lease.observed = runtime.automationEnabled(); } @catch (__unused NSException *exception) { lease.observed = -1; }
+    lease.active = lease.observed > 0;
+    // Read-only by design. Never enable the system-wide Automation bit from the host process: if
+    // the App is terminated while a private AX call is in flight there is no reliable cleanup path,
+    // and the leaked global state can render the visible green automation frame over normal UI.
     return lease;
-}
-
-static void CloudCodeHostAXAutomationLeaseCleanup(CloudCodeHostAXAutomationLease *lease)
-{
-    if (!lease || !lease->changed || !lease->setter || lease->original < 0) { return; }
-    @try { lease->setter(lease->original); } @catch (__unused NSException *exception) {}
-    lease->changed = NO;
 }
 
 static os_unfair_lock CloudCodeHostAXProcessLock = OS_UNFAIR_LOCK_INIT;
@@ -1307,7 +1285,7 @@ NSString *CloudCodeHostAXProbeJSON(NSString * _Nullable * _Nullable diagnostic)
         return nil;
     }
     CloudCodeHostAXRuntime runtime = CloudCodeHostAXResolve();
-    CloudCodeHostAXAutomationLease automationLease __attribute__((cleanup(CloudCodeHostAXAutomationLeaseCleanup))) = CloudCodeHostAXAcquireAutomationLease(runtime);
+    CloudCodeHostAXAutomationLease automationLease = CloudCodeHostAXObserveAutomationState(runtime);
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
     result[@"schemaVersion"] = @1;
     result[@"kind"] = @"host-ax-probe";
@@ -1323,7 +1301,7 @@ NSString *CloudCodeHostAXProbeJSON(NSString * _Nullable * _Nullable diagnostic)
     CC_HOST_AX_SYMBOL(copyElementAtPosition); CC_HOST_AX_SYMBOL(copyApplicationAtPosition); CC_HOST_AX_SYMBOL(copyApplicationAndContextAtPosition);
     CC_HOST_AX_SYMBOL(copyElementWithParameters); CC_HOST_AX_SYMBOL(copyParameterizedAttributeValue);
     CC_HOST_AX_SYMBOL(copyElementUsingContextIdAtPosition); CC_HOST_AX_SYMBOL(copyElementUsingDisplayIdAtPosition);
-    CC_HOST_AX_SYMBOL(setRequestingClient); CC_HOST_AX_SYMBOL(addAssociatedPid); CC_HOST_AX_SYMBOL(automationEnabled); CC_HOST_AX_SYMBOL(setAutomationEnabled);
+    CC_HOST_AX_SYMBOL(setRequestingClient); CC_HOST_AX_SYMBOL(addAssociatedPid); CC_HOST_AX_SYMBOL(automationEnabled);
 #undef CC_HOST_AX_SYMBOL
     result[@"symbols"] = symbols;
 
@@ -1484,7 +1462,7 @@ NSString *CloudCodeHostAXTreeJSON(NSString * _Nullable * _Nullable diagnostic)
         if (diagnostic) { *diagnostic = @"host AXRuntime required symbols unavailable"; }
         return nil;
     }
-    CloudCodeHostAXAutomationLease automationLease __attribute__((cleanup(CloudCodeHostAXAutomationLeaseCleanup))) = CloudCodeHostAXAcquireAutomationLease(runtime);
+    CloudCodeHostAXAutomationLease automationLease = CloudCodeHostAXObserveAutomationState(runtime);
 
     CFAbsoluteTime deadline = started + CLOUDCODE_HOST_AX_TOTAL_BUDGET_SECONDS;
     NSString *bundleID = CloudCodeHostFrontmostBundleID();
@@ -1600,7 +1578,7 @@ NSString *CloudCodeHostAXFocusedTextInputJSON(NSString * _Nullable * _Nullable d
     }
     CloudCodeHostAXRuntime runtime = CloudCodeHostAXResolve();
     BOOL runtimeAvailable = runtime.copyAttribute != NULL && runtime.createSystemWide != NULL;
-    CloudCodeHostAXAutomationLease automationLease __attribute__((cleanup(CloudCodeHostAXAutomationLeaseCleanup))) = CloudCodeHostAXAcquireAutomationLease(runtime);
+    CloudCodeHostAXAutomationLease automationLease = CloudCodeHostAXObserveAutomationState(runtime);
     BOOL focusedElementAvailable = NO;
     BOOL focusedTextInput = NO;
     pid_t pid = 0;
