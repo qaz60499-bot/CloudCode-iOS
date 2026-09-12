@@ -211,6 +211,15 @@ public struct TaskContract: Codable, Equatable, Sendable {
             case .sendMessage: goal = "commit_message_once"
             case .verifyPostcondition: goal = "verify_task_postcondition"
             }
+            let preferredSkill: String?
+            switch obligation.kind {
+            case .observeFiniteFeed: preferredSkill = "skill.feed.collect.metric"
+            case .likeSelectedFeedItem: preferredSkill = "skill.feed.commit.like.once"
+            case .focusComposer: preferredSkill = "skill.chat.focus.composer"
+            case .enterMessageBody: preferredSkill = "skill.chat.enter.body.once"
+            case .sendMessage: preferredSkill = "skill.chat.commit.send.once"
+            case .foregroundTargetApp, .selectFeedItem, .navigateToDestination, .verifyPostcondition: preferredSkill = nil
+            }
             let milestone = Milestone(
                 id: obligation.id,
                 semanticGoal: goal,
@@ -220,10 +229,13 @@ public struct TaskContract: Codable, Equatable, Sendable {
                 failurePolicy: (obligation.kind == .sendMessage || obligation.kind == .likeSelectedFeedItem)
                     ? .reconcileBeforeRetry
                     : .replan,
-                exactlyOnce: obligation.kind == .sendMessage || obligation.kind == .likeSelectedFeedItem,
+                exactlyOnce: obligation.kind == .sendMessage
+                    || obligation.kind == .likeSelectedFeedItem
+                    || obligation.kind == .enterMessageBody,
                 verificationRequired: obligation.kind == .sendMessage
                     || obligation.kind == .likeSelectedFeedItem
-                    || obligation.kind == .verifyPostcondition
+                    || obligation.kind == .verifyPostcondition,
+                preferredSkill: preferredSkill
             )
             previousID = milestone.id
             return milestone

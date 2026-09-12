@@ -7166,6 +7166,40 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertNil(hint)
     }
 
+    func testConfirmedInteractionTransitionUpdatesExistingAppKnowledgePageGraph() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let knowledge = AppKnowledgeRegistry(fileURL: root.appendingPathComponent("app-knowledge.json"))
+        try await knowledge.upsert(AppKnowledge(appName: "Chat", bundleID: "com.example.chat", appVersion: "1.0"))
+        let experience = IOSInteractionExperienceStore(fileURL: root.appendingPathComponent("experience.json"))
+        let executor = IOSInteractionLearningExecutor(
+            experienceStore: experience,
+            appKnowledgeRegistry: knowledge
+        )
+        let descriptor = ToolDescriptor(name: "interaction.confirmTransition", summary: "test", risk: .readOnly)
+        let result = try await executor.execute(
+            ToolCall(name: descriptor.name, arguments: [
+                "bundleId": "com.example.chat",
+                "appVersion": "1.0",
+                "fromSurface": "chat",
+                "toSurface": "composer",
+                "strategy": "visibleControl",
+                "success": "true",
+                "confidence": "0.90",
+                "latencyMS": "140"
+            ], sessionID: UUID()),
+            descriptor: descriptor,
+            context: ToolExecutionContext(permissionMode: .safe, capabilityProfile: CapabilityProfile(records: []))
+        )
+        XCTAssertEqual(result.payload["learning"], "recorded")
+        let stored = await knowledge.knowledge(for: "com.example.chat")
+        XCTAssertTrue(stored?.semanticTransitions?.contains(where: {
+            $0.fromSurface == "chat" && $0.toSurface == "composer" && $0.semanticAction == "visiblecontrol"
+        }) == true)
+        XCTAssertTrue(stored?.semanticSurfaces?.contains(where: { $0.semanticSurface == "chat" }) == true)
+        XCTAssertTrue(stored?.semanticSurfaces?.contains(where: { $0.semanticSurface == "composer" }) == true)
+    }
+
     func testAppKnowledgeActionMapPartitionsVersionsAndDecaysFailedRoutes() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -7204,6 +7238,189 @@ final class CloudCodeCoreTests: XCTestCase {
         let hint = await restarted.providerHint(bundleID: "com.example.chat", appVersion: "2.0", environment: v2)
         XCTAssertTrue(hint?.contains("requiring bounded revalidation") == true)
         XCTAssertTrue(hint?.contains("examplechat") == true)
+    }
+
+    func testAppKnowledgeSemanticPageGraphPartitionsEnvironmentAndInvalidatesStaleEvidence() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent("app-knowledge.json")
+        let registry = AppKnowledgeRegistry(fileURL: fileURL)
+        try await registry.upsert(AppKnowledge(appName: "Chat", bundleID: "com.example.chat", appVersion: "1.0"))
+        let v1 = AppActionEnvironment(appVersion: "1.0", iOSMajorVersion: 18, deviceClass: "iphone")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+        try await registry.recordSemanticSurface(
+            bundleID: "com.example.chat",
+            semanticSurface: "chat.conversation",
+            genericSurface: .chat,
+            landmarks: ["composer", "send_control", "composer"],
+            environment: v1,
+            confidence: 0.90,
+            at: now
+        )
+        try await registry.recordSemanticTransition(
+            bundleID: "com.example.chat",
+            fromSurface: "chat.conversation",
+            toSurface: "chat.composer",
+            semanticAction: "focus_composer",
+            landmarks: ["composer"],
+            environment: v1,
+            success: true,
+            confidence: 0.92,
+            latencyMS: 120,
+            at: now
+        )
+
+        let current = await registry.semanticSurfaceCandidates(for: "com.example.chat", environment: v1, now: now.addingTimeInterval(60))
+        XCTAssertTrue(current.contains { $0.knowledge.semanticSurface == "chat.conversation" && !$0.requiresRevalidation })
+        let transition = await registry.semanticTransitionCandidates(
+            for: "com.example.chat",
+            fromSurface: "chat.conversation",
+            semanticAction: "focus_composer",
+            environment: v1,
+            now: now.addingTimeInterval(60)
+        )
+        XCTAssertEqual(transition.count, 1)
+        XCTAssertFalse(transition[0].requiresRevalidation)
+        XCTAssertEqual(transition[0].knowledge.toSurface, "chat.composer")
+        XCTAssertEqual(transition[0].knowledge.evidenceCount, 1)
+
+        let v2 = AppActionEnvironment(appVersion: "2.0", iOSMajorVersion: 18, deviceClass: "iphone")
+        let versionMismatch = await registry.semanticSurfaceCandidates(for: "com.example.chat", environment: v2, now: now.addingTimeInterval(60))
+        XCTAssertTrue(versionMismatch.allSatisfy(\.requiresRevalidation))
+
+        let stale = await registry.semanticSurfaceCandidates(
+            for: "com.example.chat",
+            environment: v1,
+            now: now.addingTimeInterval(31 * 24 * 60 * 60)
+        )
+        XCTAssertTrue(stale.allSatisfy(\.requiresRevalidation))
+        let invalidated = await registry.semanticSurfaceCandidates(
+            for: "com.example.chat",
+            environment: v1,
+            now: now.addingTimeInterval(181 * 24 * 60 * 60)
+        )
+        XCTAssertTrue(invalidated.isEmpty)
+
+        let hint = await registry.providerHint(bundleID: "com.example.chat", appVersion: "1.0", environment: v1)
+        XCTAssertTrue(hint?.contains("Fresh ObservationFrame evidence always overrides") == true)
+        let restarted = AppKnowledgeRegistry(fileURL: fileURL)
+        let persisted = await restarted.knowledge(for: "com.example.chat")
+        XCTAssertEqual(persisted?.semanticTransitions?.first?.semanticAction, "focus_composer")
+        XCTAssertTrue(persisted?.semanticSurfaces?.contains(where: { $0.semanticSurface == "chat.composer" }) == true)
+    }
+
+    func testSemanticSkillRegistryRequiresRepeatedExplicitValidationAndResetsAcrossEnvironment() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent("semantic-skills.json")
+        let registry = SemanticSkillRegistry(fileURL: fileURL)
+        let env1 = AppActionEnvironment(appVersion: "1.0", iOSMajorVersion: 18, deviceClass: "iphone")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+        var candidates = await registry.candidates(
+            semanticGoal: "focus_text_composer",
+            bundleID: "com.example.chat",
+            currentSemanticSurface: "chat.conversation",
+            environment: env1,
+            now: now
+        )
+        XCTAssertEqual(candidates.first?.skill.id, "skill.chat.focus.composer")
+        XCTAssertTrue(candidates.first?.requiresRevalidation == true)
+        XCTAssertEqual(candidates.first?.skill.evidenceCount, 0)
+
+        try await registry.recordExplicitValidation(
+            skillID: "skill.chat.focus.composer",
+            bundleID: "com.example.chat",
+            environment: env1,
+            success: true,
+            at: now
+        )
+        candidates = await registry.candidates(
+            semanticGoal: "focus_text_composer",
+            bundleID: "com.example.chat",
+            currentSemanticSurface: "chat.conversation",
+            environment: env1,
+            now: now.addingTimeInterval(1)
+        )
+        XCTAssertEqual(candidates.first?.skill.evidenceCount, 1)
+        XCTAssertTrue(candidates.first?.requiresRevalidation == true, "one success must not become a reusable permanent skill")
+
+        try await registry.recordExplicitValidation(
+            skillID: "skill.chat.focus.composer",
+            bundleID: "com.example.chat",
+            environment: env1,
+            success: true,
+            at: now.addingTimeInterval(2)
+        )
+        candidates = await registry.candidates(
+            semanticGoal: "focus_text_composer",
+            bundleID: "com.example.chat",
+            currentSemanticSurface: "chat.conversation",
+            environment: env1,
+            now: now.addingTimeInterval(3)
+        )
+        XCTAssertEqual(candidates.first?.skill.evidenceCount, 2)
+        XCTAssertFalse(candidates.first?.requiresRevalidation == true)
+
+        let env2 = AppActionEnvironment(appVersion: "2.0", iOSMajorVersion: 18, deviceClass: "iphone")
+        try await registry.recordExplicitValidation(
+            skillID: "skill.chat.focus.composer",
+            bundleID: "com.example.chat",
+            environment: env2,
+            success: true,
+            at: now.addingTimeInterval(4)
+        )
+        candidates = await registry.candidates(
+            semanticGoal: "focus_text_composer",
+            bundleID: "com.example.chat",
+            currentSemanticSurface: "chat.conversation",
+            environment: env2,
+            now: now.addingTimeInterval(5)
+        )
+        XCTAssertEqual(candidates.first?.skill.evidenceCount, 1, "new App/iOS/device environment must reset validation evidence")
+        XCTAssertTrue(candidates.first?.requiresRevalidation == true)
+
+        let restarted = SemanticSkillRegistry(fileURL: fileURL)
+        let persisted = await restarted.candidates(
+            semanticGoal: "focus_text_composer",
+            bundleID: "com.example.chat",
+            currentSemanticSurface: "chat.conversation",
+            environment: env2,
+            now: now.addingTimeInterval(6)
+        )
+        XCTAssertEqual(persisted.first?.skill.evidenceCount, 1)
+        let encodedSkill = try JSONEncoder().encode(try XCTUnwrap(persisted.first?.skill))
+        let encodedSkillText = try XCTUnwrap(String(data: encodedSkill, encoding: .utf8)).lowercased()
+        XCTAssertFalse(encodedSkillText.contains("coordinate"))
+        XCTAssertFalse(encodedSkillText.contains("tapx"))
+        XCTAssertFalse(encodedSkillText.contains("tapy"))
+
+        let expired = await restarted.candidates(
+            semanticGoal: "focus_text_composer",
+            bundleID: "com.example.chat",
+            currentSemanticSurface: "chat.conversation",
+            environment: env2,
+            now: now.addingTimeInterval(181 * 24 * 60 * 60)
+        )
+        XCTAssertEqual(expired.first?.skill.origin, .predefined, "expired learned evidence must fall back to the predefined template")
+        XCTAssertEqual(expired.first?.skill.evidenceCount, 0)
+        XCTAssertTrue(expired.first?.requiresRevalidation == true)
+    }
+
+    func testMilestonesReferenceGenericSkillsWithoutCreatingSecondProgressState() throws {
+        let message = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信找到文件传输助手发送 1"))
+        let messageMilestones = message.effectiveMilestones
+        XCTAssertEqual(messageMilestones.first(where: { $0.id == "composer" })?.preferredSkill, "skill.chat.focus.composer")
+        XCTAssertEqual(messageMilestones.first(where: { $0.id == "message_body" })?.preferredSkill, "skill.chat.enter.body.once")
+        XCTAssertTrue(messageMilestones.first(where: { $0.id == "message_body" })?.exactlyOnce == true)
+        XCTAssertEqual(messageMilestones.first(where: { $0.id == "send" })?.preferredSkill, "skill.chat.commit.send.once")
+
+        let feed = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开抖音刷严格 5 条视频然后点赞"))
+        let feedMilestones = feed.effectiveMilestones
+        XCTAssertEqual(feedMilestones.first(where: { $0.id == "feed" })?.preferredSkill, "skill.feed.collect.metric")
+        XCTAssertEqual(feedMilestones.first(where: { $0.id == "like" })?.preferredSkill, "skill.feed.commit.like.once")
+        XCTAssertEqual(Set(feedMilestones.flatMap(\.completionObligationIDs)), Set(feed.obligations.map(\.id)))
     }
 
     func testAppKnowledgeOversizedCacheFailsSafeOnReload() async throws {

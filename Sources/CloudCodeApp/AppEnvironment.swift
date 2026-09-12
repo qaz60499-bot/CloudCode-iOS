@@ -146,6 +146,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private let agentCore: AgentCore
     private let resourceIndex: ProgressiveResourceIndex
     private let appKnowledge: AppKnowledgeRegistry
+    private let semanticSkillRegistry: SemanticSkillRegistry
     private let customProviderFileURL: URL
     private let liveProviderCatalogFileURL: URL
     private let startupBreadcrumbStore: StartupBreadcrumbStore
@@ -218,6 +219,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let fileService = FileService()
         let resourceIndex = ProgressiveResourceIndex(fileURL: support.appendingPathComponent("Index/resource-graph.json"))
         let appKnowledge = AppKnowledgeRegistry(fileURL: support.appendingPathComponent("Index/app-knowledge.json"))
+        let semanticSkillRegistry = SemanticSkillRegistry(fileURL: support.appendingPathComponent("Index/semantic-skills.json"))
         let policy = PolicyEngine()
         let audit = AuditLogStore(fileURL: support.appendingPathComponent("Audit/audit.jsonl"))
         let trash = TrashService(root: support.appendingPathComponent("Trash", isDirectory: true))
@@ -263,7 +265,10 @@ public final class CloudCodeViewModel: ObservableObject {
         let interactionExperienceStore = IOSInteractionExperienceStore(
             fileURL: support.appendingPathComponent("Interaction/experience.json")
         )
-        let interactionLearning = IOSInteractionLearningExecutor(experienceStore: interactionExperienceStore)
+        let interactionLearning = IOSInteractionLearningExecutor(
+            experienceStore: interactionExperienceStore,
+            appKnowledgeRegistry: appKnowledge
+        )
         let executionLedgerURL = support.appendingPathComponent("Execution/tool-results.json")
         let executionLedger = ToolExecutionLedger(fileURL: executionLedgerURL)
         let urlScheme = URLSchemeExecutor(appKnowledgeRegistry: appKnowledge, policy: policy, approval: approval)
@@ -299,6 +304,7 @@ public final class CloudCodeViewModel: ObservableObject {
             memoryProvider: hermesStore,
             interactionExperienceStore: interactionExperienceStore,
             appKnowledgeRegistry: appKnowledge,
+            semanticSkillRegistry: semanticSkillRegistry,
             diagnosticLogger: diagnosticLogStore,
             runtimeBreadcrumb: { stage in
                 startupBreadcrumbStore.append(runID: resolvedStartupRunID, stage: stage)
@@ -365,6 +371,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.diagnosticSourceFiles = [
             DiagnosticBundleSource(archivePath: "index/resource-graph.json", fileURL: support.appendingPathComponent("Index/resource-graph.json")),
             DiagnosticBundleSource(archivePath: "index/app-knowledge.json", fileURL: support.appendingPathComponent("Index/app-knowledge.json")),
+            DiagnosticBundleSource(archivePath: "index/semantic-skills.json", fileURL: support.appendingPathComponent("Index/semantic-skills.json")),
             DiagnosticBundleSource(archivePath: "provider/verified-routes.json", fileURL: support.appendingPathComponent("Provider/verified-routes.json"))
         ]
         self.transactionJournal = transactionJournal
@@ -381,6 +388,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.agentCore = agent
         self.resourceIndex = resourceIndex
         self.appKnowledge = appKnowledge
+        self.semanticSkillRegistry = semanticSkillRegistry
         self.customProviderFileURL = customProviderFileURL
         self.liveProviderCatalogFileURL = liveProviderCatalogFileURL
         startupBreadcrumbStore.append(runID: resolvedStartupRunID, stage: "viewModel.init.end")

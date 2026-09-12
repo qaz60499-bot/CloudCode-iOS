@@ -195,6 +195,96 @@ public struct AppActionCandidate: Sendable, Equatable {
     }
 }
 
+/// Rebuildable semantic page/surface knowledge. This is descriptive evidence only: it contains no
+/// coordinates and never grants execution authority.
+public struct AppSemanticSurfaceKnowledge: Codable, Hashable, Sendable {
+    public var semanticSurface: String
+    public var genericSurface: IOSInteractionSurface
+    public var landmarks: [String]
+    public var environment: AppActionEnvironment
+    public var reliability: Double
+    public var evidenceCount: Int
+    public var lastValidatedAt: Date?
+    public var lastFailureAt: Date?
+
+    public init(
+        semanticSurface: String,
+        genericSurface: IOSInteractionSurface,
+        landmarks: [String] = [],
+        environment: AppActionEnvironment,
+        reliability: Double = 0.5,
+        evidenceCount: Int = 0,
+        lastValidatedAt: Date? = nil,
+        lastFailureAt: Date? = nil
+    ) {
+        self.semanticSurface = semanticSurface
+        self.genericSurface = genericSurface
+        self.landmarks = Array(landmarks.prefix(24))
+        self.environment = environment
+        self.reliability = min(max(reliability, 0), 1)
+        self.evidenceCount = max(0, evidenceCount)
+        self.lastValidatedAt = lastValidatedAt
+        self.lastFailureAt = lastFailureAt
+    }
+}
+
+public struct AppSemanticTransitionKnowledge: Codable, Hashable, Sendable {
+    public var fromSurface: String
+    public var toSurface: String
+    public var semanticAction: String
+    public var landmarks: [String]
+    public var environment: AppActionEnvironment
+    public var reliability: Double
+    public var estimatedLatencyMS: Int
+    public var evidenceCount: Int
+    public var lastValidatedAt: Date?
+    public var lastFailureAt: Date?
+
+    public init(
+        fromSurface: String,
+        toSurface: String,
+        semanticAction: String,
+        landmarks: [String] = [],
+        environment: AppActionEnvironment,
+        reliability: Double = 0.5,
+        estimatedLatencyMS: Int = 1_000,
+        evidenceCount: Int = 0,
+        lastValidatedAt: Date? = nil,
+        lastFailureAt: Date? = nil
+    ) {
+        self.fromSurface = fromSurface
+        self.toSurface = toSurface
+        self.semanticAction = semanticAction
+        self.landmarks = Array(landmarks.prefix(24))
+        self.environment = environment
+        self.reliability = min(max(reliability, 0), 1)
+        self.estimatedLatencyMS = max(0, estimatedLatencyMS)
+        self.evidenceCount = max(0, evidenceCount)
+        self.lastValidatedAt = lastValidatedAt
+        self.lastFailureAt = lastFailureAt
+    }
+}
+
+public struct AppSemanticSurfaceCandidate: Sendable, Equatable {
+    public var knowledge: AppSemanticSurfaceKnowledge
+    public var requiresRevalidation: Bool
+
+    public init(knowledge: AppSemanticSurfaceKnowledge, requiresRevalidation: Bool) {
+        self.knowledge = knowledge
+        self.requiresRevalidation = requiresRevalidation
+    }
+}
+
+public struct AppSemanticTransitionCandidate: Sendable, Equatable {
+    public var knowledge: AppSemanticTransitionKnowledge
+    public var requiresRevalidation: Bool
+
+    public init(knowledge: AppSemanticTransitionKnowledge, requiresRevalidation: Bool) {
+        self.knowledge = knowledge
+        self.requiresRevalidation = requiresRevalidation
+    }
+}
+
 public struct AppKnowledge: Codable, Hashable, Identifiable, Sendable {
     public var id: String { bundleID }
     public var appName: String
@@ -216,6 +306,10 @@ public struct AppKnowledge: Codable, Hashable, Identifiable, Sendable {
     /// Rebuildable performance/discovery hints only. This intentionally has no coordinate,
     /// credential, entitlement, message-body, or screenshot fields.
     public var actionMap: [AppActionRouteHint]?
+    /// Semantic Page Graph nodes. Current ObservationFrame evidence always outranks this cache.
+    public var semanticSurfaces: [AppSemanticSurfaceKnowledge]?
+    /// Semantic Page Graph edges. These are transition hints only and never executable plans.
+    public var semanticTransitions: [AppSemanticTransitionKnowledge]?
 
     public init(
         appName: String,
@@ -230,7 +324,9 @@ public struct AppKnowledge: Codable, Hashable, Identifiable, Sendable {
         appVersion: String? = nil,
         introspectionMetadata: [String: String]? = nil,
         localDataMap: [String: String]? = nil,
-        actionMap: [AppActionRouteHint]? = nil
+        actionMap: [AppActionRouteHint]? = nil,
+        semanticSurfaces: [AppSemanticSurfaceKnowledge]? = nil,
+        semanticTransitions: [AppSemanticTransitionKnowledge]? = nil
     ) {
         self.appName = appName
         self.bundleID = bundleID
@@ -245,6 +341,8 @@ public struct AppKnowledge: Codable, Hashable, Identifiable, Sendable {
         self.introspectionMetadata = introspectionMetadata
         self.localDataMap = localDataMap
         self.actionMap = actionMap
+        self.semanticSurfaces = semanticSurfaces
+        self.semanticTransitions = semanticTransitions
     }
 }
 

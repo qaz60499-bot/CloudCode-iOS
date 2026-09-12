@@ -451,9 +451,14 @@ public actor IOSInteractionExperienceStore {
 public struct IOSInteractionLearningExecutor: ToolExecuting, Sendable {
     public let route: AppExecutionRoute = .structuredTool
     private let experienceStore: IOSInteractionExperienceStore
+    private let appKnowledgeRegistry: AppKnowledgeRegistry?
 
-    public init(experienceStore: IOSInteractionExperienceStore) {
+    public init(
+        experienceStore: IOSInteractionExperienceStore,
+        appKnowledgeRegistry: AppKnowledgeRegistry? = nil
+    ) {
         self.experienceStore = experienceStore
+        self.appKnowledgeRegistry = appKnowledgeRegistry
     }
 
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
@@ -479,6 +484,22 @@ public struct IOSInteractionLearningExecutor: ToolExecuting, Sendable {
                 toSurface: to,
                 strategy: strategy,
                 success: success
+            )
+            let appEnvironment = AppActionEnvironment(
+                appVersion: environment.appVersion == "unknown" ? nil : environment.appVersion,
+                iOSMajorVersion: environment.osMajorVersion,
+                deviceClass: environment.deviceClass == "unknown" ? nil : environment.deviceClass
+            )
+            let latencyMS = min(max(call.arguments["latencyMS"].flatMap(Int.init) ?? 0, 0), 10 * 60 * 1_000)
+            try? await appKnowledgeRegistry?.recordSemanticTransition(
+                bundleID: bundleID,
+                fromSurface: from.rawValue,
+                toSurface: to.rawValue,
+                semanticAction: strategy.rawValue,
+                environment: appEnvironment,
+                success: success,
+                confidence: confidence,
+                latencyMS: latencyMS
             )
         }
         return ToolResult(

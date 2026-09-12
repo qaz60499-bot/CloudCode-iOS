@@ -628,6 +628,7 @@ public actor AgentCore {
     private let memoryProvider: HermesMemoryProviding
     private let interactionExperienceStore: IOSInteractionExperienceStore?
     private let appKnowledgeRegistry: AppKnowledgeRegistry?
+    private let semanticSkillRegistry: SemanticSkillRegistry?
     private let diagnosticLogger: DiagnosticLogStore?
     private let runtimeBreadcrumb: (@Sendable (String) -> Void)?
     private let maxToolRounds: Int
@@ -655,6 +656,7 @@ public actor AgentCore {
         memoryProvider: HermesMemoryProviding = NullHermesMemoryProvider(),
         interactionExperienceStore: IOSInteractionExperienceStore? = nil,
         appKnowledgeRegistry: AppKnowledgeRegistry? = nil,
+        semanticSkillRegistry: SemanticSkillRegistry? = nil,
         diagnosticLogger: DiagnosticLogStore? = nil,
         runtimeBreadcrumb: (@Sendable (String) -> Void)? = nil,
         maxToolRounds: Int = 32
@@ -670,6 +672,7 @@ public actor AgentCore {
         self.memoryProvider = memoryProvider
         self.interactionExperienceStore = interactionExperienceStore
         self.appKnowledgeRegistry = appKnowledgeRegistry
+        self.semanticSkillRegistry = semanticSkillRegistry
         self.diagnosticLogger = diagnosticLogger
         self.runtimeBreadcrumb = runtimeBreadcrumb
         self.maxToolRounds = max(1, maxToolRounds)
@@ -1181,6 +1184,30 @@ public actor AgentCore {
                                 : (unverifiedMessageCommitAttempted ? .uncertain : runtime.messageCommitState)
                             runtime.reconcileObligationProgress(contract: contract)
                             taskRuntimeState = runtime
+                            if let currentGUIBundleID,
+                               let milestone = runtime.nextPendingMilestone(contract: contract),
+                               let skillHint = await semanticSkillRegistry?.providerHint(
+                                   semanticGoal: milestone.semanticGoal,
+                                   bundleID: currentGUIBundleID,
+                                   currentSemanticSurface: runtime.semanticSurface ?? lastObservationFrame?.surfaceSnapshot?.identity,
+                                   environment: AppActionEnvironment(
+                                       appVersion: currentGUIAppVersion,
+                                       iOSMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
+                                       deviceClass: nil
+                                   )
+                               ) {
+                                providerContextMessages.append(ChatMessage(
+                                    role: .system,
+                                    content: skillHint,
+                                    providerMetadata: [
+                                        "context_layer": "semantic_skill_registry",
+                                        "bundle_id": currentGUIBundleID,
+                                        "milestone": milestone.id,
+                                        "semantic_goal": milestone.semanticGoal,
+                                        "preferred_skill": milestone.preferredSkill ?? "none"
+                                    ]
+                                ))
+                            }
                             if runtime.isComplete(contract: contract) {
                                 roundDescriptors.removeAll {
                                     Self.shouldBlockTypedTaskCompletedWrite(
@@ -2732,6 +2759,7 @@ public actor AgentCore {
                                     }
                                     synchronizeTaskRuntimeToCheckpoint()
                                     if let contract = taskContract, var runtime = taskRuntimeState {
+                                        let completedBeforeEvidence = runtime.completedObligations
                                         runtime.applyToolEvidence(
                                             toolName: name,
                                             arguments: arguments,
@@ -2740,6 +2768,37 @@ public actor AgentCore {
                                             contract: contract
                                         )
                                         taskRuntimeState = runtime
+                                        if let bundleID = currentGUIBundleID ?? contract.targetBundleID {
+                                            let skillEnvironment = AppActionEnvironment(
+                                                appVersion: currentGUIAppVersion,
+                                                iOSMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
+                                                deviceClass: nil
+                                            )
+                                            for milestone in contract.effectiveMilestones {
+                                                guard let preferredSkill = milestone.preferredSkill else { continue }
+                                                let completionIDs = Set(milestone.completionObligationIDs)
+                                                guard !completionIDs.isSubset(of: completedBeforeEvidence),
+                                                      completionIDs.isSubset(of: runtime.completedObligations),
+                                                      let obligationKind = contract.obligations.first(where: { $0.id == milestone.id })?.kind else { continue }
+                                                // Only strongly grounded obligation transitions contribute validation
+                                                // evidence. A successful text-input dispatch alone is deliberately not
+                                                // enough to validate a reusable message-body skill.
+                                                let stronglyVerified: Bool
+                                                switch obligationKind {
+                                                case .focusComposer, .observeFiniteFeed, .sendMessage, .likeSelectedFeedItem:
+                                                    stronglyVerified = true
+                                                case .foregroundTargetApp, .selectFeedItem, .navigateToDestination, .enterMessageBody, .verifyPostcondition:
+                                                    stronglyVerified = false
+                                                }
+                                                guard stronglyVerified else { continue }
+                                                try? await semanticSkillRegistry?.recordExplicitValidation(
+                                                    skillID: preferredSkill,
+                                                    bundleID: bundleID,
+                                                    environment: skillEnvironment,
+                                                    success: true
+                                                )
+                                            }
+                                        }
                                         successfulCommitAfterTextInput = runtime.successfulCommitAfterTextInput
                                         unverifiedMessageCommitAttempted = runtime.unverifiedMessageCommitAttempted
                                         verificationSinceLastStateChange = runtime.verificationSinceLastStateChange
