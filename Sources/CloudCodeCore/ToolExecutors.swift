@@ -69,7 +69,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
         let supported: Set<String> = [
             "capability.probe", "apps.list", "apps.inspect", "container.resolve", "container.list", "container.search",
-            "files.list", "files.search", "files.read", "files.stat", "files.metadata", "files.hash", "files.diff", "files.copy", "files.move",
+            "files.list", "files.search", "files.read", "files.inspectDocument", "files.stat", "files.metadata", "files.hash", "files.diff", "files.copy", "files.move",
             "plist.read", "plist.query", "plist.metadata",
             "json.read", "json.query", "json.filter", "json.aggregate",
             "sqlite.discover", "sqlite.tables", "sqlite.schema", "sqlite.query", "sqlite.filter", "sqlite.aggregate", "sqlite.sample",
@@ -355,6 +355,17 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             let text = try fileService.readText(url, allowedRoot: context.allowedRoot)
             let envelope = ToolOutputEnvelope(trust: .untrustedData, source: url.path, content: text)
             return ToolResult(toolCallID: call.id, success: true, summary: "已读取 \(url.lastPathComponent)", payload: ["content": envelope.promptSafeRepresentation])
+
+        case "files.inspectDocument":
+            let url = try requiredURL(call, key: "path")
+            let inspection = try DocumentInspectionService().inspect(url, allowedRoot: context.allowedRoot)
+            return try untrustedResult(
+                call.id,
+                summary: "已在本机解析 \(url.lastPathComponent)（\(inspection.kind)）",
+                key: "document",
+                value: inspection,
+                source: "files.inspectDocument"
+            )
 
         case "files.stat", "files.metadata":
             let url = try requiredURL(call, key: "path")

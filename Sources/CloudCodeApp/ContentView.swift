@@ -145,6 +145,9 @@ private struct ChatView: View {
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var pendingImageData: Data?
     @State private var pendingImagePreview: UIImage?
+    @State private var showDocumentImporter = false
+    @State private var pendingDocument: ImportedChatDocument?
+    @State private var isImportingDocument = false
     @State private var isConversationAtBottom = true
 
     private let conversationBottomID = "cloudcode-conversation-bottom"
@@ -174,6 +177,9 @@ private struct ChatView: View {
                                 }
                             }
                     }
+                }
+                .fileImporter(isPresented: $showDocumentImporter, allowedContentTypes: [.data]) { result in
+                    importDocument(result)
                 }
                 .onChange(of: voice.recognizedText) { value in
                     if !value.isEmpty { input = value }
@@ -297,6 +303,7 @@ private struct ChatView: View {
     private var composer: some View {
         VStack(spacing: 8) {
             pendingImageBanner
+            pendingDocumentBanner
             inputRow
             if voice.isRecording {
                 HStack(spacing: 6) {
@@ -336,8 +343,60 @@ private struct ChatView: View {
         }
     }
 
+    @ViewBuilder
+    private var pendingDocumentBanner: some View {
+        if let pendingDocument {
+            HStack(spacing: 10) {
+                Image(systemName: "doc.fill")
+                    .font(.title2)
+                    .frame(width: 42, height: 42)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(pendingDocument.attachment.filename)
+                        .font(.caption.bold())
+                        .lineLimit(1)
+                    Text(ByteCountFormatter.string(fromByteCount: pendingDocument.attachment.byteSize, countStyle: .file))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    if let kind = pendingDocument.inspection?.kind {
+                        Text("已本地解析：\(kind.uppercased())")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("原始文件已保留；可用于后续真实分享")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                Button(role: .destructive) {
+                    clearPendingDocument(removeStoredFile: true)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                }
+                .buttonStyle(.plain)
+            }
+        } else if isImportingDocument {
+            HStack(spacing: 8) {
+                ProgressView()
+                Text("正在复制并本地解析文件…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+        }
+    }
+
     private var inputRow: some View {
         HStack(alignment: .bottom, spacing: 8) {
+            Button {
+                showDocumentImporter = true
+            } label: {
+                Image(systemName: "doc.badge.plus")
+                    .frame(width: 30, height: 30)
+            }
+            .disabled(isImportingDocument)
+            .accessibilityLabel("选择本地文件")
+
             PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
                 Image(systemName: "photo")
                     .frame(width: 30, height: 30)
@@ -386,7 +445,7 @@ private struct ChatView: View {
     }
 
     private var canSend: Bool {
-        !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || pendingImageData != nil
+        !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || pendingImageData != nil || pendingDocument != nil
     }
 
     private func toggleVoiceInput() {
@@ -400,15 +459,22 @@ private struct ChatView: View {
     private func sendCurrentInput() {
         let value = input
         let image = pendingImageData
+        let document = pendingDocument
         input = ""
         clearPendingImage()
+        pendingDocument = nil
         voice.stop()
-        model.send(value, imageData: image, imageMimeType: "image/jpeg", imageFilename: "photo.jpg")
+        if let document {
+            model.send(value, document: document)
+        } else {
+            model.send(value, imageData: image, imageMimeType: "image/jpeg", imageFilename: "photo.jpg")
+        }
     }
 
     private func createNewConversation() {
         input = ""
         clearPendingImage()
+        clearPendingDocument(removeStoredFile: true)
         voice.stop()
         model.createNewSession()
     }
@@ -417,6 +483,35 @@ private struct ChatView: View {
         pendingImageData = nil
         pendingImagePreview = nil
         selectedPhotoItem = nil
+    }
+
+    private func importDocument(_ result: Result<URL, Error>) {
+        guard case .success(let url) = result else {
+            if case .failure(let error) = result {
+                model.lastError = "选择文件失败：\(error.localizedDescription)"
+            }
+            return
+        }
+        isImportingDocument = true
+        Task {
+            defer { isImportingDocument = false }
+            do {
+                let mimeType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+                let imported = try await model.importChatDocument(from: url, mimeType: mimeType)
+                clearPendingImage()
+                if pendingDocument != nil { clearPendingDocument(removeStoredFile: true) }
+                pendingDocument = imported
+            } catch {
+                model.lastError = "导入文件失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func clearPendingDocument(removeStoredFile: Bool) {
+        if removeStoredFile, let pendingDocument {
+            model.discardImportedChatDocument(pendingDocument)
+        }
+        pendingDocument = nil
     }
 
     private func loadSelectedPhoto(_ item: PhotosPickerItem?) {
@@ -429,6 +524,7 @@ private struct ChatView: View {
                     model.lastError = "无法读取所选图片。"
                     return
                 }
+                if pendingDocument != nil { clearPendingDocument(removeStoredFile: true) }
                 pendingImageData = prepared
                 pendingImagePreview = preview
             } catch {

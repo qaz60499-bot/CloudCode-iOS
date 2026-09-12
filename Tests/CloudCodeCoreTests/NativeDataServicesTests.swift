@@ -1,6 +1,7 @@
 import Foundation
 import SQLite3
 import XCTest
+import ZIPFoundation
 @testable import CloudCodeCore
 
 final class NativeDataServicesTests: XCTestCase {
@@ -8,7 +9,7 @@ final class NativeDataServicesTests: XCTestCase {
         let registry = ToolRegistry()
         let names = Set(await registry.all().map(\.name))
         let expected: Set<String> = [
-            "files.stat", "files.metadata", "files.hash", "files.diff", "files.copy", "files.move",
+            "files.inspectDocument", "files.share", "files.stat", "files.metadata", "files.hash", "files.diff", "files.copy", "files.move",
             "plist.read", "plist.query", "plist.metadata",
             "json.read", "json.query", "json.filter", "json.aggregate",
             "sqlite.discover", "sqlite.tables", "sqlite.schema", "sqlite.query", "sqlite.filter", "sqlite.aggregate", "sqlite.sample",
@@ -17,9 +18,13 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertTrue(expected.isSubset(of: names), "missing native contracts: \(expected.subtracting(names).sorted())")
 
         let copyDescriptor = await registry.descriptor(named: "files.copy")
+        let shareDescriptor = await registry.descriptor(named: "files.share")
         let sqliteDescriptor = await registry.descriptor(named: "sqlite.query")
         let macroDescriptor = await registry.descriptor(named: "data.localQuery")
         XCTAssertEqual(copyDescriptor?.preferredRoute, .structuredTool)
+        XCTAssertEqual(shareDescriptor?.preferredRoute, .structuredTool)
+        XCTAssertEqual(shareDescriptor?.risk, .sensitiveWrite)
+        XCTAssertEqual(shareDescriptor?.requiredCapabilities, ["native.files"])
         XCTAssertEqual(sqliteDescriptor?.requiredCapabilities, ["native.sqlite"])
         XCTAssertEqual(macroDescriptor?.requiredCapabilities, ["native.data_macro"])
     }
@@ -578,6 +583,95 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertTrue(result.payload["app"]?.contains("degraded_unavailable") == true)
     }
 
+    func testDocumentInspectionReadsTextZIPAndDOCXWithinBounds() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let service = DocumentInspectionService()
+
+        let textURL = root.appendingPathComponent("notes.txt")
+        try Data("第一行\nsecond line".utf8).write(to: textURL)
+        let text = try service.inspect(textURL, allowedRoot: root)
+        XCTAssertEqual(text.kind, "txt")
+        XCTAssertTrue(text.text.contains("第一行"))
+        XCTAssertFalse(text.truncated)
+
+        let zipURL = root.appendingPathComponent("bundle.zip")
+        let zip = try Archive(url: zipURL, accessMode: .create)
+        try addArchiveEntry("docs/readme.txt", data: Data("hello".utf8), to: zip)
+        try addArchiveEntry("assets/data.json", data: Data("{}".utf8), to: zip)
+        let zipInspection = try service.inspect(zipURL, allowedRoot: root)
+        XCTAssertEqual(zipInspection.kind, "zip")
+        XCTAssertTrue(zipInspection.entries.contains(where: { $0.hasPrefix("docs/readme.txt\t") }))
+        XCTAssertTrue(zipInspection.entries.contains(where: { $0.hasPrefix("assets/data.json\t") }))
+
+        let docxURL = root.appendingPathComponent("sample.docx")
+        let docx = try Archive(url: docxURL, accessMode: .create)
+        let documentXML = Data("""
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+        <w:p><w:r><w:t>Cloud Code</w:t></w:r></w:p><w:p><w:r><w:t>文件发送</w:t></w:r></w:p>
+        </w:body></w:document>
+        """.utf8)
+        try addArchiveEntry("word/document.xml", data: documentXML, to: docx)
+        let docxInspection = try service.inspect(docxURL, allowedRoot: root)
+        XCTAssertEqual(docxInspection.kind, "docx")
+        XCTAssertTrue(docxInspection.text.contains("Cloud Code"))
+        XCTAssertTrue(docxInspection.text.contains("文件发送"))
+    }
+
+    func testDocumentInspectionRejectsUnsupportedOversizedAndOutOfRootFiles() throws {
+        let root = try makeTempDirectory()
+        let outside = try makeTempDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        let service = DocumentInspectionService()
+
+        let unsupported = root.appendingPathComponent("payload.bin")
+        try Data([0x01, 0x02]).write(to: unsupported)
+        XCTAssertThrowsError(try service.inspect(unsupported, allowedRoot: root)) { error in
+            XCTAssertEqual(error as? DocumentInspectionError, .unsupportedType("bin"))
+        }
+
+        let oversized = root.appendingPathComponent("huge.txt")
+        FileManager.default.createFile(atPath: oversized.path, contents: Data())
+        let handle = try FileHandle(forWritingTo: oversized)
+        try handle.truncate(atOffset: 129 * 1024 * 1024)
+        try handle.close()
+        XCTAssertThrowsError(try service.inspect(oversized, allowedRoot: root)) { error in
+            guard let inspectionError = error as? DocumentInspectionError,
+                  case .fileTooLarge = inspectionError else {
+                XCTFail("expected fileTooLarge, got \(error)")
+                return
+            }
+        }
+
+        let outsideFile = outside.appendingPathComponent("outside.txt")
+        try Data("outside".utf8).write(to: outsideFile)
+        XCTAssertThrowsError(try service.inspect(outsideFile, allowedRoot: root))
+    }
+
+    func testInspectDocumentStructuredToolReturnsUntrustedEnvelope() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("document.txt")
+        try Data("hello local document".utf8).write(to: file)
+        let executor = try makeStructuredExecutor(
+            root: root,
+            resolver: StaticAppResolver(),
+            resourceIndex: ProgressiveResourceIndex(fileURL: root.appendingPathComponent("index/resource-graph.json"))
+        )
+        let result = try await executor.execute(
+            ToolCall(name: "files.inspectDocument", arguments: ["path": file.path], sessionID: UUID()),
+            descriptor: ToolDescriptor(name: "files.inspectDocument", summary: "", risk: .readOnly, requiredCapabilities: ["native.files"]),
+            context: ToolExecutionContext(permissionMode: .safe, capabilityProfile: publicNativeProfile(), allowedRoot: root)
+        )
+        XCTAssertTrue(result.success)
+        XCTAssertTrue(result.payload["document"]?.contains("hello local document") == true)
+        XCTAssertTrue(result.payload["document"]?.contains("untrusted") == true)
+    }
+
     func testToolRouterProviderSchemaEligibilityOmitsUnavailableCapabilities() async throws {
         let registry = ToolRegistry(descriptors: [
             ToolDescriptor(name: "test.routable", summary: "", risk: .readOnly),
@@ -609,6 +703,17 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(metric.executionLatencyMS, 0)
         XCTAssertGreaterThanOrEqual(metric.totalLatencyMS, metric.executionLatencyMS)
         XCTAssertEqual(metric.outcome, "completed")
+    }
+
+    private func addArchiveEntry(_ path: String, data: Data, to archive: Archive) throws {
+        try archive.addEntry(
+            with: path,
+            type: .file,
+            uncompressedSize: Int64(data.count),
+            provider: { position, size in
+                data.subdata(in: Int(position)..<Int(position) + size)
+            }
+        )
     }
 
     private func makeStructuredExecutor(root: URL, resolver: any AppContainerResolving, resourceIndex: ProgressiveResourceIndex, appKnowledgeRegistry: AppKnowledgeRegistry? = nil) throws -> StructuredToolExecutor {

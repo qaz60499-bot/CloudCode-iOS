@@ -407,7 +407,7 @@ public enum HarnessContextManager {
         if shouldExposeNativeMessagingDiscovery {
             let nativeReadOnlyDiscovery: Set<String> = [
                 "apps.inspect", "container.resolve", "container.list", "container.search",
-                "files.list", "files.search", "files.read", "files.stat", "files.metadata", "files.hash",
+                "files.list", "files.search", "files.read", "files.inspectDocument", "files.stat", "files.metadata", "files.hash",
                 "plist.read", "plist.query", "plist.metadata",
                 "json.read", "json.query", "json.filter", "json.aggregate",
                 "sqlite.discover", "sqlite.tables", "sqlite.schema", "sqlite.query", "sqlite.filter", "sqlite.aggregate", "sqlite.sample",

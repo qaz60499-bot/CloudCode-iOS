@@ -347,10 +347,23 @@ enum LocalVisionTextObservation {
         guard let json = helper.json,
               let data = json.data(using: .utf8),
               let response = try? JSONDecoder().decode(HelperResponse.self, from: data) else {
+            let outcomeClass: String
+            if helper.detail.contains("ocr_helper_status=helper_timeout") {
+                outcomeClass = "helper_timeout"
+            } else if helper.detail.contains("ocr_helper_status=no_json") {
+                outcomeClass = "no_json"
+            } else if helper.detail.contains("ocr_helper_status=invalid_json") {
+                outcomeClass = "invalid_json"
+            } else if helper.detail.contains("ocr_helper_status=json_oversized") {
+                outcomeClass = "json_oversized"
+            } else {
+                outcomeClass = "helper_failure"
+            }
             return Observation(payload: [
                 "localVisionOCR": "unavailable_helper_failed",
                 "localVisionBackend": "vision_helper_public_api",
                 "localVisionRegionExecution": regionExecution,
+                "localVisionOutcomeClass": outcomeClass,
                 "localVisionHelperDiagnostic": String(helper.detail.prefix(512))
             ], elements: [])
         }
@@ -376,8 +389,20 @@ enum LocalVisionTextObservation {
             encodedElements = "[]"
         }
         let visibleText = boundedElements.map(\.text).joined(separator: " | ")
+        let effectiveStatus = response.status == "recognized" && boundedElements.isEmpty ? "available_empty" : response.status
+        let outcomeClass: String
+        if response.status == "unavailable_request_failed" {
+            outcomeClass = "ocr_request_failure"
+        } else if effectiveStatus == "available_empty" {
+            outcomeClass = "ocr_completed_no_text"
+        } else if effectiveStatus == "recognized", (response.averageConfidence ?? 0) < 0.35 {
+            outcomeClass = "low_confidence"
+        } else {
+            outcomeClass = "recognized"
+        }
         var payload: [String: String] = [
-            "localVisionOCR": response.status == "recognized" && boundedElements.isEmpty ? "available_empty" : response.status,
+            "localVisionOCR": effectiveStatus,
+            "localVisionOutcomeClass": outcomeClass,
             "localVisionElementCount": String(boundedElements.count),
             "localVisionText": String(visibleText.prefix(4_096)),
             "localVisionElements": encodedElements,

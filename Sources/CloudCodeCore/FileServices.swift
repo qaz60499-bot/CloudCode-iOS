@@ -1,4 +1,8 @@
 import Foundation
+import ZIPFoundation
+#if canImport(PDFKit)
+import PDFKit
+#endif
 #if canImport(CryptoKit)
 import CryptoKit
 #endif
@@ -899,6 +903,188 @@ public actor TrashService {
         #else
         return String(seed.hashValue)
         #endif
+    }
+}
+
+public enum DocumentInspectionError: Error, Equatable {
+    case notRegularFile
+    case unsupportedType(String)
+    case invalidArchive
+    case missingWordDocument
+    case entryTooLarge(String)
+    case fileTooLarge(Int64)
+}
+
+public struct DocumentInspection: Codable, Equatable, Sendable {
+    public var kind: String
+    public var filename: String
+    public var byteSize: Int64
+    public var text: String
+    public var entries: [String]
+    public var truncated: Bool
+    public var detail: String
+
+    public init(kind: String, filename: String, byteSize: Int64, text: String = "", entries: [String] = [], truncated: Bool = false, detail: String) {
+        self.kind = kind
+        self.filename = filename
+        self.byteSize = byteSize
+        self.text = text
+        self.entries = entries
+        self.truncated = truncated
+        self.detail = detail
+    }
+}
+
+/// Bounded local inspection for common user documents. Binary files are understood locally first;
+/// only extracted text or metadata is exposed to the Agent instead of uploading the whole file.
+public struct DocumentInspectionService: Sendable {
+    private let maxFileBytes: Int64 = 128 * 1024 * 1024
+    private let maxExtractedEntryBytes: UInt32 = 4 * 1024 * 1024
+    private let maxTextCharacters = 100_000
+    private let maxArchiveEntries = 400
+
+    public init() {}
+
+    public func inspect(_ url: URL, allowedRoot: URL? = nil) throws -> DocumentInspection {
+        let safe = try PathGuard().validate(target: url, allowedRoot: allowedRoot, rejectSymlink: true)
+        let values = try safe.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values.isRegularFile == true else { throw DocumentInspectionError.notRegularFile }
+        let size = Int64(values.fileSize ?? 0)
+        guard size <= maxFileBytes else { throw DocumentInspectionError.fileTooLarge(size) }
+        let ext = safe.pathExtension.lowercased()
+
+        switch ext {
+        case "docx": return try inspectDOCX(safe, size: size)
+        case "zip": return try inspectZIP(safe, size: size)
+        case "pdf": return try inspectPDF(safe, size: size)
+        case "txt", "md", "markdown", "csv", "json", "xml", "html", "htm", "log", "rtf":
+            return try inspectText(safe, size: size, kind: ext.isEmpty ? "text" : ext)
+        default:
+            throw DocumentInspectionError.unsupportedType(ext.isEmpty ? "unknown" : ext)
+        }
+    }
+
+    private func inspectText(_ url: URL, size: Int64, kind: String) throws -> DocumentInspection {
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        let prefix = data.prefix(2 * 1024 * 1024)
+        let decoded = String(data: prefix, encoding: .utf8)
+            ?? String(data: prefix, encoding: .utf16)
+            ?? ""
+        let bounded = boundedText(decoded)
+        return DocumentInspection(
+            kind: kind,
+            filename: url.lastPathComponent,
+            byteSize: size,
+            text: bounded.text,
+            truncated: bounded.truncated || data.count > 2 * 1024 * 1024,
+            detail: "Bounded local text inspection"
+        )
+    }
+
+    private func inspectZIP(_ url: URL, size: Int64) throws -> DocumentInspection {
+        let archive: Archive
+        do { archive = try Archive(url: url, accessMode: .read) }
+        catch { throw DocumentInspectionError.invalidArchive }
+        let entries = Array(archive.prefix(maxArchiveEntries + 1))
+        let truncated = entries.count > maxArchiveEntries
+        let names = entries.prefix(maxArchiveEntries).map { "\($0.path)\t\($0.uncompressedSize)" }
+        return DocumentInspection(
+            kind: "zip",
+            filename: url.lastPathComponent,
+            byteSize: size,
+            entries: names,
+            truncated: truncated,
+            detail: "ZIP directory inspected locally; entry paths and uncompressed sizes are bounded"
+        )
+    }
+
+    private func inspectDOCX(_ url: URL, size: Int64) throws -> DocumentInspection {
+        let archive: Archive
+        do { archive = try Archive(url: url, accessMode: .read) }
+        catch { throw DocumentInspectionError.invalidArchive }
+        guard let entry = archive["word/document.xml"] else { throw DocumentInspectionError.missingWordDocument }
+        guard entry.uncompressedSize <= maxExtractedEntryBytes else {
+            throw DocumentInspectionError.entryTooLarge(entry.path)
+        }
+        var xmlData = Data()
+        _ = try archive.extract(entry) { xmlData.append($0) }
+        let bounded = boundedText(extractWordXMLText(String(data: xmlData, encoding: .utf8) ?? ""))
+        return DocumentInspection(
+            kind: "docx",
+            filename: url.lastPathComponent,
+            byteSize: size,
+            text: bounded.text,
+            truncated: bounded.truncated,
+            detail: "DOCX word/document.xml extracted locally with ZIPFoundation"
+        )
+    }
+
+    private func inspectPDF(_ url: URL, size: Int64) throws -> DocumentInspection {
+#if canImport(PDFKit)
+        guard let document = PDFDocument(url: url) else {
+            throw DocumentInspectionError.unsupportedType("pdf_unreadable")
+        }
+        let pageLimit = min(document.pageCount, 30)
+        var parts: [String] = []
+        var count = 0
+        var truncated = document.pageCount > pageLimit
+        for index in 0..<pageLimit {
+            guard let pageText = document.page(at: index)?.string, !pageText.isEmpty else { continue }
+            let remaining = maxTextCharacters - count
+            if remaining <= 0 { truncated = true; break }
+            let boundedPage = String(pageText.prefix(remaining))
+            parts.append("[Page \(index + 1)]\n\(boundedPage)")
+            count += boundedPage.count
+            if boundedPage.count < pageText.count { truncated = true; break }
+        }
+        return DocumentInspection(
+            kind: "pdf",
+            filename: url.lastPathComponent,
+            byteSize: size,
+            text: parts.joined(separator: "\n\n"),
+            truncated: truncated,
+            detail: "PDFKit local text extraction; pages=\(document.pageCount), inspected=\(pageLimit)"
+        )
+#else
+        throw DocumentInspectionError.unsupportedType("pdf_runtime_unavailable")
+#endif
+    }
+
+    private func boundedText(_ text: String) -> (text: String, truncated: Bool) {
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let bounded = String(normalized.prefix(maxTextCharacters))
+        return (bounded, bounded.count < normalized.count)
+    }
+
+    private func extractWordXMLText(_ xml: String) -> String {
+        guard !xml.isEmpty else { return "" }
+        let normalized = xml
+            .replacingOccurrences(of: "</w:p>", with: "\n")
+            .replacingOccurrences(of: "<w:tab/>", with: "\t")
+            .replacingOccurrences(of: "<w:br/>", with: "\n")
+        let pattern = #"<w:t(?:\s[^>]*)?>(.*?)</w:t>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else { return "" }
+        let range = NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)
+        var pieces: [String] = []
+        for match in regex.matches(in: normalized, options: [], range: range) {
+            guard let capture = Range(match.range(at: 1), in: normalized) else { continue }
+            pieces.append(decodeXML(String(normalized[capture])))
+            if pieces.reduce(0, { $0 + $1.count }) >= maxTextCharacters { break }
+        }
+        return pieces.joined(separator: " ")
+            .replacingOccurrences(of: "  ", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func decodeXML(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&apos;", with: "'")
+            .replacingOccurrences(of: "&amp;", with: "&")
     }
 }
 

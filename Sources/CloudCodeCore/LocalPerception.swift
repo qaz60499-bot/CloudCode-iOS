@@ -292,6 +292,166 @@ public enum LocalPerceptionGeometry {
     }
 }
 
+public enum LocalAXTreeTextExtractor {
+    /// Converts the bounded AX JSON tree used by GUIAutomationBackend into the same point-space
+    /// text elements consumed by local OCR heuristics. This lets higher-level device semantics fuse
+    /// AX + OCR instead of choosing one backend globally.
+    public static func extract(from tree: String, maximumElements: Int = 96) -> [LocalPerceptionTextElement] {
+        guard maximumElements > 0,
+              let data = tree.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) else { return [] }
+        var elements: [LocalPerceptionTextElement] = []
+        var seen = Set<String>()
+
+        func number(_ value: Any?) -> Double? {
+            if let value = value as? NSNumber { return value.doubleValue }
+            if let value = value as? String { return Double(value) }
+            return nil
+        }
+
+        func walk(_ value: Any) {
+            guard elements.count < maximumElements else { return }
+            if let array = value as? [Any] {
+                for child in array where elements.count < maximumElements { walk(child) }
+                return
+            }
+            guard let object = value as? [String: Any] else { return }
+
+            if let frame = object["frame"] as? [String: Any],
+               let x = number(frame["x"]), let y = number(frame["y"]),
+               let width = number(frame["width"]), let height = number(frame["height"]),
+               width > 0, height > 0 {
+                var texts: [String] = []
+                for key in ["label", "value", "title", "placeholder"] {
+                    guard let raw = object[key] as? String else { continue }
+                    let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !text.isEmpty, text.count <= 256, !texts.contains(text) else { continue }
+                    texts.append(text)
+                }
+                for text in texts where elements.count < maximumElements {
+                    let signature = "\(text.lowercased())|\(Int(x.rounded()))|\(Int(y.rounded()))|\(Int(width.rounded()))|\(Int(height.rounded()))"
+                    guard seen.insert(signature).inserted else { continue }
+                    elements.append(LocalPerceptionTextElement(
+                        text: text,
+                        confidence: 1,
+                        x: x,
+                        y: y,
+                        width: width,
+                        height: height
+                    ))
+                }
+            }
+
+            if let children = object["children"] { walk(children) }
+        }
+
+        walk(root)
+        return elements
+    }
+}
+
+public enum LocalPerceptionFusion {
+    /// Merges AX and OCR observations while dropping same-text/same-position duplicates. AX is kept
+    /// first because its labels are semantic; OCR then fills custom-drawn/video surfaces.
+    public static func merge(
+        ax: [LocalPerceptionTextElement],
+        ocr: [LocalPerceptionTextElement],
+        maximumElements: Int = 128
+    ) -> [LocalPerceptionTextElement] {
+        var merged: [LocalPerceptionTextElement] = []
+        for candidate in ax + ocr {
+            guard merged.count < maximumElements else { break }
+            let normalized = normalize(candidate.text)
+            guard !normalized.isEmpty else { continue }
+            let duplicate = merged.contains { existing in
+                normalize(existing.text) == normalized
+                    && hypot(existing.centerX - candidate.centerX, existing.centerY - candidate.centerY) <= 28
+            }
+            if !duplicate { merged.append(candidate) }
+        }
+        return merged
+    }
+
+    private static func normalize(_ value: String) -> String {
+        value.lowercased().unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) || $0.value > 0x7F }
+            .map(String.init)
+            .joined()
+    }
+}
+
+public enum LocalFeedIdentity {
+    /// Returns a bounded semantic identity for a short-video/feed item. Unlike a screenshot hash,
+    /// this intentionally ignores the continuously changing video pixels and relies on stable AX/OCR
+    /// overlays such as author/caption text and the right-side counter rail.
+    public static func signature(
+        elements: [LocalPerceptionTextElement],
+        screenSize: LocalPerceptionScreenSize?
+    ) -> String? {
+        guard let screenSize,
+              screenSize.width.isFinite, screenSize.height.isFinite,
+              screenSize.width >= 200, screenSize.height >= 400 else { return nil }
+
+        let generic = Set([
+            "首页", "朋友", "消息", "我", "推荐", "关注", "搜索", "更多",
+            "点赞", "喜欢", "评论", "收藏", "分享", "转发",
+            "home", "friends", "messages", "me", "like", "likes", "comment", "comments", "share", "shares"
+        ])
+        var contentCandidates: [(Double, Double, String)] = []
+        var railTokens: [(Double, String)] = []
+        var seen = Set<String>()
+
+        for element in elements where element.confidence >= 0.18 {
+            let raw = element.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalized = normalize(raw)
+            guard normalized.count >= 2 else { continue }
+
+            let onRightRail = element.centerX >= screenSize.width * 0.70
+                && element.centerX <= screenSize.width * 1.02
+                && element.centerY >= screenSize.height * 0.20
+                && element.centerY <= screenSize.height * 0.92
+            if onRightRail, CompactVisibleCountParser.parse(raw) != nil {
+                railTokens.append((element.centerY, normalized))
+                continue
+            }
+
+            guard !generic.contains(normalized), CompactVisibleCountParser.parse(raw) == nil else { continue }
+            // Short-video item identity is normally carried by author/caption/hashtags in the left
+            // or lower content region. Exclude top system chrome and the right action rail.
+            guard element.centerX <= screenSize.width * 0.78,
+                  element.centerY >= screenSize.height * 0.18,
+                  element.centerY <= screenSize.height * 0.94 else { continue }
+            let bounded = String(normalized.prefix(96))
+            if seen.insert(bounded).inserted {
+                contentCandidates.append((element.centerY, element.centerX, bounded))
+            }
+        }
+
+        // AX and OCR traversal order is not guaranteed to be identical between frames. Sort by
+        // visible geometry so the same feed item keeps the same signature even if backend ordering
+        // changes while the video pixels animate underneath it.
+        contentCandidates.sort {
+            if abs($0.0 - $1.0) > 2 { return $0.0 < $1.0 }
+            if abs($0.1 - $1.1) > 2 { return $0.1 < $1.1 }
+            return $0.2 < $1.2
+        }
+        railTokens.sort { $0.0 < $1.0 }
+        let contentTokens = contentCandidates.prefix(6).map(\.2)
+        let rail = railTokens.prefix(5).map(\.1)
+        // Require real content text when possible. A coherent 3+ count rail is accepted as a weaker
+        // identity fallback for custom-drawn feeds whose caption is not exposed to AX/OCR.
+        guard !contentTokens.isEmpty || rail.count >= 3 else { return nil }
+        return (contentTokens + rail).joined(separator: "|")
+    }
+
+    private static func normalize(_ value: String) -> String {
+        value.lowercased().unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) || $0.value > 0x7F }
+            .map(String.init)
+            .joined()
+    }
+}
+
 public struct LocalFeedMetricExtraction: Codable, Equatable, Sendable {
     public var value: Double
     public var sourceText: String

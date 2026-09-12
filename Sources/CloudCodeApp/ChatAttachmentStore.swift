@@ -36,6 +36,38 @@ struct ChatAttachmentStore: Sendable {
         )
     }
 
+    func importFile(
+        from sourceURL: URL,
+        filename: String,
+        mimeType: String,
+        sessionID: UUID,
+        maximumBytes: Int64 = 512 * 1024 * 1024
+    ) throws -> ChatAttachment {
+        let fileManager = FileManager.default
+        let safeSource = try PathGuard().validate(target: sourceURL, allowedRoot: nil, rejectSymlink: true, fileManager: fileManager)
+        let values = try safeSource.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values.isRegularFile == true else { throw CocoaError(.fileReadUnsupportedScheme) }
+        let byteSize = Int64(values.fileSize ?? 0)
+        guard byteSize <= maximumBytes else { throw CocoaError(.fileReadTooLarge) }
+
+        let sessionRoot = root.appendingPathComponent(sessionID.uuidString, isDirectory: true)
+        try fileManager.createDirectory(at: sessionRoot, withIntermediateDirectories: true)
+        let displayName = Self.safeDisplayName(filename)
+        let fileExtension = Self.safeExtension(from: displayName) ?? Self.defaultExtension(for: mimeType)
+        let storedName = fileExtension.isEmpty ? UUID().uuidString : "\(UUID().uuidString).\(fileExtension)"
+        let destination = sessionRoot.appendingPathComponent(storedName, isDirectory: false)
+        try fileManager.copyItem(at: safeSource, to: destination)
+
+        return ChatAttachment(
+            filename: displayName,
+            path: destination.path,
+            mimeType: mimeType,
+            byteSize: byteSize,
+            pixelWidth: nil,
+            pixelHeight: nil
+        )
+    }
+
     func remove(_ attachment: ChatAttachment) throws {
         let fileManager = FileManager.default
         let candidate = URL(fileURLWithPath: attachment.path).standardizedFileURL
@@ -64,7 +96,7 @@ struct ChatAttachmentStore: Sendable {
 
     private static func safeDisplayName(_ filename: String) -> String {
         let component = URL(fileURLWithPath: filename).lastPathComponent
-        return component.isEmpty || component == "." ? "image" : component
+        return component.isEmpty || component == "." ? "attachment" : component
     }
 
     private static func safeExtension(from filename: String) -> String? {
@@ -79,7 +111,16 @@ struct ChatAttachmentStore: Sendable {
         case "image/heic": return "heic"
         case "image/png": return "png"
         case "image/webp": return "webp"
-        default: return "jpg"
+        case "application/pdf": return "pdf"
+        case "application/vnd.openxmlformats-officedocument.wordprocessingml.document": return "docx"
+        case "application/zip", "application/x-zip-compressed": return "zip"
+        case "text/plain": return "txt"
+        case "text/markdown": return "md"
+        case "text/csv": return "csv"
+        case "application/json": return "json"
+        case "application/xml", "text/xml": return "xml"
+        case "text/html": return "html"
+        default: return "bin"
         }
     }
 }

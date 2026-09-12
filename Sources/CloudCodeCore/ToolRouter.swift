@@ -378,6 +378,8 @@ public actor ToolRegistry {
         ToolDescriptor(name: "files.list", summary: "List a directory through structured filesystem access.", risk: .readOnly),
         ToolDescriptor(name: "files.search", summary: "Search a bounded directory with persistent local index-first lookup. Cached candidates are revalidated against the real path before return; an index miss falls back to a bounded filesystem scan and incrementally updates the index.", risk: .readOnly),
         ToolDescriptor(name: "files.read", summary: "Read a bounded text file.", risk: .readOnly),
+        ToolDescriptor(name: "files.inspectDocument", summary: "Inspect a bounded local user document without uploading the original binary. Supports PDF text extraction, DOCX text extraction, ZIP entry listing, and common text formats.", risk: .readOnly, requiredCapabilities: ["native.files"]),
+        ToolDescriptor(name: "files.share", summary: "Present the iOS system Share Sheet for one revalidated local regular file. This only proves that the share sheet was presented; selecting an App/contact and verifying an actual send are separate GUI-authority steps.", risk: .sensitiveWrite, requiredCapabilities: ["native.files"]),
         ToolDescriptor(name: "files.stat", summary: "Read current filesystem stat-style metadata after revalidating the real path.", risk: .readOnly, requiredCapabilities: ["native.files"]),
         ToolDescriptor(name: "files.metadata", summary: "Read bounded current file metadata through public native filesystem APIs.", risk: .readOnly, requiredCapabilities: ["native.files"]),
         ToolDescriptor(name: "files.hash", summary: "Compute a bounded SHA-256 over a revalidated regular file.", risk: .readOnly, requiredCapabilities: ["native.files"]),

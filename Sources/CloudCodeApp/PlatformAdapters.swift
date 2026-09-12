@@ -48,22 +48,51 @@ enum EmbeddedVisionHelper {
 
         var standardOutput: NSString?
         var standardError: NSString?
+        let helperTimeout: TimeInterval = 6
         let code = CloudCodeSpawnHelperWithSeparatedOutput(
             executablePath,
             ["ocr-file", inputURL.path, String(boundedMaximum), forcePrecise ? "accurate" : "fast"],
             false,
-            4,
+            helperTimeout,
             &standardOutput,
             &standardError
         )
         let stdout = (standardOutput as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let stderr = (standardError as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard code == 0, !stdout.isEmpty, stdout.utf8.count <= 64 * 1024 else {
-            let diagnostic = stderr.isEmpty ? stdout : stderr
-            return (nil, diagnostic.isEmpty ? "轻量 Vision helper 退出码 \(code)。" : "轻量 Vision helper 退出码 \(code)：\(diagnostic)")
+        let stdoutData = stdout.data(using: .utf8)
+        let outputJSONValid = !stdout.isEmpty
+            && stdout.utf8.count <= 64 * 1024
+            && stdoutData.flatMap { try? JSONSerialization.jsonObject(with: $0) } != nil
+#if canImport(Darwin)
+        let parentTimeoutCode = -7000 - Int(ETIMEDOUT)
+#else
+        let parentTimeoutCode = Int.min
+#endif
+        // OCR is read-only. If a complete parseable JSON result was synchronously written before a
+        // late parent-side reap timeout, preserve that observation rather than discarding it. This
+        // mirrors the existing bounded AX read-only acceptance rule and never converts partial text
+        // into success.
+        if outputJSONValid, code == 0 || (code == parentTimeoutCode && stderr.contains("stdout-json-completed")) {
+            let suffix = stderr.isEmpty ? "" : " helper diagnostics: \(stderr)"
+            let completion = code == 0 ? "completed" : "completed_json_before_parent_timeout"
+            return (stdout, "ocr_helper_status=\(completion); OCR 已在无 root/private GUI entitlement 的轻量 Vision helper 中执行。\(suffix)")
         }
-        let suffix = stderr.isEmpty ? "" : " helper diagnostics: \(stderr)"
-        return (stdout, "OCR 已在无 root/private GUI entitlement 的轻量 Vision helper 中执行。\(suffix)")
+
+        let failureClass: String
+        if code == parentTimeoutCode || stderr.contains("helper timed out after") {
+            failureClass = "helper_timeout"
+        } else if stdout.isEmpty {
+            failureClass = "no_json"
+        } else if stdout.utf8.count > 64 * 1024 {
+            failureClass = "json_oversized"
+        } else if !outputJSONValid {
+            failureClass = "invalid_json"
+        } else {
+            failureClass = "helper_exit_failure"
+        }
+        let diagnostic = stderr.isEmpty ? stdout : stderr
+        let boundedDiagnostic = String(diagnostic.prefix(4_096))
+        return (nil, "ocr_helper_status=\(failureClass); exit=\(code); \(boundedDiagnostic.isEmpty ? "no helper diagnostic" : boundedDiagnostic)")
     }
 }
 
@@ -1924,6 +1953,109 @@ public struct URLSchemeExecutor: ToolExecuting, Sendable {
     }
 }
 
+private enum FileSharePresentationError: Error {
+    case appNotActive
+    case noPresenter
+    case fileTooLarge(Int64)
+    case notRegularFile
+}
+
+/// App-layer bridge for a real iOS Share Sheet. This executor deliberately stops at presentation:
+/// choosing WeChat/another target, choosing a recipient, committing the send, and verifying the
+/// target App state remain separate GUI-authority actions.
+public struct FileShareExecutor: ToolExecuting, Sendable {
+    public let route: AppExecutionRoute = .structuredTool
+    private let policy: PolicyEngine
+    private let approval: ApprovalRequesting
+    private let maximumBytes: Int64 = 512 * 1024 * 1024
+
+    public init(policy: PolicyEngine, approval: ApprovalRequesting) {
+        self.policy = policy
+        self.approval = approval
+    }
+
+    public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
+        tool.name == "files.share" && capabilities.status("native.files") == .available
+    }
+
+    public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
+        guard call.name == "files.share", let rawPath = call.arguments["path"], !rawPath.isEmpty else {
+            throw ToolRouterError.noExecutionRoute("files.share requires path")
+        }
+        let target = try PathGuard().validate(
+            target: URL(fileURLWithPath: rawPath),
+            allowedRoot: context.allowedRoot,
+            rejectSymlink: true
+        )
+        let values = try target.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values.isRegularFile == true else { throw FileSharePresentationError.notRegularFile }
+        let byteSize = Int64(values.fileSize ?? 0)
+        guard byteSize <= maximumBytes else { throw FileSharePresentationError.fileTooLarge(byteSize) }
+
+        let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: target.path)
+        if decision == .deny { throw TransactionError.confirmationDenied }
+        if decision == .requireConfirmation {
+            let preview = ApprovalPreview(
+                title: "打开文件分享",
+                target: target.lastPathComponent,
+                reason: "这一步只会打开 iOS Share Sheet；不会把文件自动发送给任何联系人。后续选择目标 App、收件人和最终发送仍需真实 UI 操作与结果验证。",
+                plan: ["重新校验本地文件路径/类型/大小", "打开系统 Share Sheet", "停止在分享面板，不宣称文件已经发送"],
+                risk: descriptor.risk
+            )
+            guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
+        }
+
+        let presented = try await Self.presentShareSheet(for: target)
+        return ToolResult(
+            toolCallID: call.id,
+            success: presented,
+            summary: presented
+                ? "已打开系统 Share Sheet；文件尚未发送，后续必须在目标 App 中选择收件人并验证真实发送结果。"
+                : "系统 Share Sheet 未能确认呈现。",
+            payload: [
+                "path": target.path,
+                "filename": target.lastPathComponent,
+                "byteSize": String(byteSize),
+                "shareSheetPresented": presented ? "true" : "false",
+                "businessActionCompleted": "false",
+                "effectVerification": "share_sheet_presented_only"
+            ],
+            verification: VerificationResult(
+                passed: presented,
+                checks: presented ? ["本地文件重新校验通过", "系统 Share Sheet 已呈现"] : ["本地文件重新校验通过"],
+                failures: presented ? [] : ["Share Sheet presentation was not observed"]
+            )
+        )
+    }
+
+    @MainActor
+    private static func presentShareSheet(for url: URL) throws -> Bool {
+        guard UIApplication.shared.applicationState == .active else { throw FileSharePresentationError.appNotActive }
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let window = scenes
+            .flatMap(\.windows)
+            .first(where: { $0.isKeyWindow })
+            ?? scenes.flatMap(\.windows).first(where: { !$0.isHidden && $0.alpha > 0 })
+        guard var presenter = window?.rootViewController else { throw FileSharePresentationError.noPresenter }
+        while let presented = presenter.presentedViewController { presenter = presented }
+        if let navigation = presenter as? UINavigationController, let visible = navigation.visibleViewController {
+            presenter = visible
+        } else if let tab = presenter as? UITabBarController, let selected = tab.selectedViewController {
+            presenter = selected
+        }
+        guard presenter.viewIfLoaded?.window != nil else { throw FileSharePresentationError.noPresenter }
+
+        let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        if let popover = sheet.popoverPresentationController {
+            popover.sourceView = presenter.view
+            popover.sourceRect = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.midY, width: 1, height: 1)
+            popover.permittedArrowDirections = []
+        }
+        presenter.present(sheet, animated: true)
+        return presenter.presentedViewController === sheet
+    }
+}
+
 private struct LocalGUIPlan: Decodable {
     var steps: [LocalGUIPlanStep]
 }
@@ -2766,19 +2898,25 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         // "手指向上滑" ambiguity. Positive scroll delta means advancing the scroll/feed content;
         // the helper owns the inverse physical finger trajectory needed to produce that motion.
         let deltaY = direction == "forward" ? 600.0 : -600.0
-        let settleNanoseconds: UInt64 = 650_000_000
+        // Video pixels change continuously, so a whole-frame hash is not proof that the feed moved.
+        // Give the target App enough time to settle, then require a semantic AX/OCR item identity.
+        let settleNanoseconds: UInt64 = 950_000_000
 
         var attachments: [ChatAttachment] = []
         var hashes: [String] = []
         var localVisionSamples: [[String: String]] = []
         var localElementSamples: [[LocalPerceptionTextElement]] = []
         var localScreenSamples: [LocalPerceptionScreenSize] = []
+        var sampleIdentities: [String] = []
         var sampledCount = 0
         var stoppedAtSample: Int?
+        var stoppedReason: String?
         var totalOCRLatencyMS = 0
         var successfulOCRSamples = 0
+        var axAttemptedSamples = 0
+        var axSucceededSamples = 0
 
-        func captureSample() async throws -> String {
+        func captureSample() async throws -> (hash: String, identity: String?) {
             let data = try await backend.screenshot()
             let hash = GUIAutomationPayloadPolicy.sha256Hex(data)
             if let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID) {
@@ -2792,10 +2930,30 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 requiresText: requestedMetric != nil
             )
             let local = observation.payload
-            localElementSamples.append(observation.elements)
             let localWidth = Double(local["screenPointWidth"] ?? "") ?? 0
             let localHeight = Double(local["screenPointHeight"] ?? "") ?? 0
-            localScreenSamples.append(LocalPerceptionScreenSize(width: localWidth, height: localHeight))
+            let screenSize = LocalPerceptionScreenSize(width: localWidth, height: localHeight)
+
+            axAttemptedSamples += 1
+            var axElements: [LocalPerceptionTextElement] = []
+            var axStatus = "unavailable"
+            do {
+                let tree = try await backend.tree()
+                axElements = LocalAXTreeTextExtractor.extract(from: tree, maximumElements: 96)
+                if !axElements.isEmpty {
+                    axSucceededSamples += 1
+                    axStatus = "semantic_elements"
+                } else {
+                    axStatus = "empty_tree"
+                }
+            } catch {
+                axStatus = "unavailable"
+            }
+            let fusedElements = LocalPerceptionFusion.merge(ax: axElements, ocr: observation.elements)
+            localElementSamples.append(fusedElements)
+            localScreenSamples.append(screenSize)
+            let identity = LocalFeedIdentity.signature(elements: fusedElements, screenSize: screenSize)
+            sampleIdentities.append(identity ?? "")
             totalOCRLatencyMS += Int(local["localVisionLatencyMS"] ?? "0") ?? 0
             let ocrStatus = local["localVisionOCR"] ?? ""
             if ocrStatus == "recognized" || ocrStatus == "available_empty" { successfulOCRSamples += 1 }
@@ -2806,29 +2964,57 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 "elements": String((local["localVisionElements"] ?? "[]").prefix(6_000)),
                 "width": local["screenPointWidth"] ?? "",
                 "height": local["screenPointHeight"] ?? "",
-                "backend": local["localVisionBackend"] ?? "unknown"
+                "backend": local["localVisionBackend"] ?? "unknown",
+                "ax": axStatus,
+                "semanticIdentity": identity.map { String($0.prefix(512)) } ?? ""
             ])
-            return hash
+            return (hash, identity)
         }
 
-        let baselineHash = try await captureSample()
-        var previousHash = baselineHash
-        if count >= 2 {
+        let baseline = try await captureSample()
+        let baselineHash = baseline.hash
+        var previousIdentity = baseline.identity
+        if previousIdentity == nil {
+            stoppedReason = "baseline_semantic_identity_unavailable"
+        } else if count >= 2 {
             for sampleIndex in 2...count {
                 try Task.checkCancellation()
                 try await backend.scroll(deltaX: 0, deltaY: deltaY)
                 try await Task.sleep(nanoseconds: settleNanoseconds)
                 try Task.checkCancellation()
-                let currentHash = try await captureSample()
-                if currentHash == previousHash {
+                let beforeAttachments = attachments.count
+                let beforeHashes = hashes.count
+                let beforeVision = localVisionSamples.count
+                let beforeElements = localElementSamples.count
+                let beforeScreens = localScreenSamples.count
+                let beforeIdentities = sampleIdentities.count
+                let beforeOCRLatencyMS = totalOCRLatencyMS
+                let beforeSuccessfulOCRSamples = successfulOCRSamples
+                let beforeAXAttemptedSamples = axAttemptedSamples
+                let beforeAXSucceededSamples = axSucceededSamples
+                let candidate = try await captureSample()
+                let semanticAdvanced = candidate.identity != nil && candidate.identity != previousIdentity
+                if !semanticAdvanced {
                     stoppedAtSample = sampleIndex
+                    stoppedReason = candidate.identity == nil ? "semantic_identity_unavailable" : "semantic_identity_unchanged"
+                    if attachments.count > beforeAttachments { attachments.removeSubrange(beforeAttachments..<attachments.count) }
+                    if hashes.count > beforeHashes { hashes.removeSubrange(beforeHashes..<hashes.count) }
+                    if localVisionSamples.count > beforeVision { localVisionSamples.removeSubrange(beforeVision..<localVisionSamples.count) }
+                    if localElementSamples.count > beforeElements { localElementSamples.removeSubrange(beforeElements..<localElementSamples.count) }
+                    if localScreenSamples.count > beforeScreens { localScreenSamples.removeSubrange(beforeScreens..<localScreenSamples.count) }
+                    if sampleIdentities.count > beforeIdentities { sampleIdentities.removeSubrange(beforeIdentities..<sampleIdentities.count) }
+                    totalOCRLatencyMS = beforeOCRLatencyMS
+                    successfulOCRSamples = beforeSuccessfulOCRSamples
+                    axAttemptedSamples = beforeAXAttemptedSamples
+                    axSucceededSamples = beforeAXSucceededSamples
+                    sampledCount = max(1, sampledCount - 1)
                     break
                 }
-                previousHash = currentHash
+                previousIdentity = candidate.identity
             }
         }
 
-        let completed = sampledCount == count && stoppedAtSample == nil
+        let completed = sampledCount == count && stoppedAtSample == nil && stoppedReason == nil
         var payload: [String: String] = [
             "requestedCount": String(count),
             "sampledCount": String(sampledCount),
@@ -2837,12 +3023,15 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             "frameSHA256": hashes.joined(separator: ","),
             "baselineSHA256": baselineHash,
             "sha256": hashes.last ?? baselineHash,
-            "settleMs": "650",
+            "settleMs": "950",
             "effectVerification": "semantic_review_required",
             "localObservation": "feed_samples_attached",
             "perceptionClass": "feed_sample",
-            "perceptionAXAttempted": "false",
-            "perceptionAXSucceeded": "false",
+            "perceptionAXAttempted": axAttemptedSamples > 0 ? "true" : "false",
+            "perceptionAXSucceeded": axSucceededSamples > 0 ? "true" : "false",
+            "perceptionAXSampleCount": String(axAttemptedSamples),
+            "perceptionAXSuccessfulSampleCount": String(axSucceededSamples),
+            "feedIdentityMode": "ax_ocr_semantic_signature",
             "perceptionOCRInvoked": "true",
             "perceptionOCRSucceeded": successfulOCRSamples == sampledCount ? "true" : "false",
             "perceptionOCRLatencyMS": String(totalOCRLatencyMS),
@@ -2852,6 +3041,10 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             "providerVisualRoundTripAvoided": "0"
         ]
         if let stoppedAtSample { payload["stoppedAtSample"] = String(stoppedAtSample) }
+        if let stoppedReason { payload["stoppedReason"] = stoppedReason }
+        if !sampleIdentities.isEmpty {
+            payload["semanticIdentityCount"] = String(sampleIdentities.filter { !$0.isEmpty }.count)
+        }
         if let encoded = try? JSONSerialization.data(withJSONObject: localVisionSamples, options: []),
            encoded.count <= 48 * 1024,
            let json = String(data: encoded, encoding: .utf8) {
@@ -2879,45 +3072,54 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             var selectedReturnVerified = localMetricSelection.selectedSample == sampledCount
             if returnToSelected, localMetricSelection.selectedSample < sampledCount {
                 let returnSteps = sampledCount - localMetricSelection.selectedSample
+                let targetIdentity = sampleIdentities[localMetricSelection.selectedSample - 1]
                 var completedReturnSteps = 0
-                var returnHash = hashes.last ?? baselineHash
+                var returnIdentity = sampleIdentities.last ?? ""
                 var returnedFrameData: Data?
+                var returnFailureReason: String?
                 for _ in 0..<returnSteps {
                     try Task.checkCancellation()
                     try await backend.scroll(deltaX: 0, deltaY: -deltaY)
                     try await Task.sleep(nanoseconds: settleNanoseconds)
                     try Task.checkCancellation()
                     let frame = try await backend.screenshot()
-                    let currentHash = GUIAutomationPayloadPolicy.sha256Hex(frame)
-                    if currentHash == returnHash {
-                        returnedFrameData = frame
+                    returnedFrameData = frame
+                    let returnedObservation = await LocalVisionTextObservation.observe(for: frame, maximumElements: 48, requiresText: true)
+                    totalOCRLatencyMS += Int(returnedObservation.payload["localVisionLatencyMS"] ?? "0") ?? 0
+                    let returnedScreenSize = LocalPerceptionScreenSize(
+                        width: Double(returnedObservation.payload["screenPointWidth"] ?? "") ?? 0,
+                        height: Double(returnedObservation.payload["screenPointHeight"] ?? "") ?? 0
+                    )
+                    var returnedAX: [LocalPerceptionTextElement] = []
+                    if let tree = try? await backend.tree() {
+                        returnedAX = LocalAXTreeTextExtractor.extract(from: tree, maximumElements: 96)
+                    }
+                    let returnedElements = LocalPerceptionFusion.merge(ax: returnedAX, ocr: returnedObservation.elements)
+                    guard let currentIdentity = LocalFeedIdentity.signature(elements: returnedElements, screenSize: returnedScreenSize) else {
+                        returnFailureReason = "return_semantic_identity_unavailable"
+                        break
+                    }
+                    guard currentIdentity != returnIdentity else {
+                        returnFailureReason = "return_semantic_identity_unchanged"
                         break
                     }
                     completedReturnSteps += 1
-                    returnHash = currentHash
-                    returnedFrameData = frame
+                    returnIdentity = currentIdentity
                 }
                 if completedReturnSteps == returnSteps, let returnedFrameData {
                     payload["sha256"] = GUIAutomationPayloadPolicy.sha256Hex(returnedFrameData)
                     if let attachment = try persistScreenshotAttachment(returnedFrameData, sessionID: call.sessionID) {
                         attachments.append(attachment)
                     }
-                    let returnedObservation = await LocalVisionTextObservation.observe(for: returnedFrameData, maximumElements: 48, requiresText: true)
-                    totalOCRLatencyMS += Int(returnedObservation.payload["localVisionLatencyMS"] ?? "0") ?? 0
-                    let returnedScreenSize = LocalPerceptionScreenSize(
-                        width: Double(returnedObservation.payload["screenPointWidth"] ?? "") ?? 0,
-                        height: Double(returnedObservation.payload["screenPointHeight"] ?? "") ?? 0
-                    )
-                    if let returnedMetric = LocalFeedMetricExtractor.extract(
-                        metric: localMetricSelection.metric,
-                        elements: returnedObservation.elements,
-                        screenSize: returnedScreenSize
-                    ) {
-                        selectedReturnVerified = abs(returnedMetric.value - localMetricSelection.selectedValue) < 0.5
+                    selectedReturnVerified = returnIdentity == targetIdentity
+                    if !selectedReturnVerified {
+                        returnFailureReason = "return_target_identity_mismatch"
                     }
                 }
                 payload["localMetricReturnSteps"] = String(returnSteps)
                 payload["localMetricCompletedReturnSteps"] = String(completedReturnSteps)
+                payload["localMetricReturnIdentityVerified"] = selectedReturnVerified ? "true" : "false"
+                if let returnFailureReason { payload["localMetricReturnFailureReason"] = returnFailureReason }
             }
             payload["perceptionOCRLatencyMS"] = String(totalOCRLatencyMS)
             payload["localMetricSelectedReturnVerified"] = selectedReturnVerified ? "true" : "false"
@@ -2969,7 +3171,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         } else if completed {
             summary = "Locally sampled \(sampledCount) consecutive feed items in one bounded execution; local metric evidence was insufficient or not requested, so sample screenshots remain available for one semantic review."
         } else {
-            summary = "Local feed sampling stopped at sample \(sampledCount) because the next frame was byte-identical; collected screenshots remain available for re-planning."
+            summary = "Local feed sampling stopped at sample \(sampledCount) because semantic feed identity could not prove a distinct next item (\(stoppedReason ?? "unknown")); collected screenshots remain available for re-planning."
         }
         return ToolResult(
             toolCallID: call.id,
