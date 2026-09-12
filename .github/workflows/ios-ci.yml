@@ -898,7 +898,7 @@ jobs:
                   raise SystemExit(f'FAIL: AgentRouter legacy-Key compatibility seed regressed: {marker}')
           harness = Path('Sources/CloudCodeCore/HarnessRuntime.swift').read_text(encoding='utf-8')
           agent_core = Path('Sources/CloudCodeCore/AgentCore.swift').read_text(encoding='utf-8')
-          for marker in ('currentRequest: String? = nil', 'providerPolicy(for request: String)', 'maxCharacters: 48_000, maxMessages: 40'):
+          for marker in ('currentRequest: String? = nil', 'providerPolicy(for request: String)', 'maxCharacters: 32_000, maxMessages: 24', 'latestExternalUserIndex', 'isCurrentRunMessage'):
               if marker not in harness:
                   raise SystemExit(f'FAIL: current-request GUI harness compression marker missing: {marker}')
           for marker in ('var activeRequest = text.trimmingCharacters', 'func rescopeAfterSteering()', 'policy: HarnessContextManager.providerPolicy(for: activeRequest)'):
