@@ -11,7 +11,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     private var exactRuntimeDetails: [GUIAutomationFeature: String] = [:]
     private var treeRetryAfter: Date?
     private var lastTreeFailureClass: ObservationFrame.AXFailureClass?
-    private let snapshotTTL: TimeInterval = 2
+    private let snapshotTTL: TimeInterval = 30
     private let treeFailureCooldown: TimeInterval = 30
     private let unknownClientCooldown: TimeInterval = 120
     private let diagnosticLogger: DiagnosticLogStore?
@@ -35,10 +35,12 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
            Date().timeIntervalSince(cachedSnapshotAt) <= snapshotTTL {
             return cachedSnapshot
         }
-        // Build 110 showed that a no-target LaunchServices readiness query can consume the full
-        // helper watchdog. Opening an App already has an exact bundle-scoped route with its own
-        // acceptance + foreground verification, so keep this feature deferred instead of probing.
-        let probe = EmbeddedRootHelper.guiProbe()
+        // Generic GUI readiness probing is intentionally excluded from the hot path. On the
+        // physical TrollStore runtime the broad gui-probe helper can consume its watchdog even
+        // though exact operations (launch/tree/screenshot/tap/type/gesture) remain usable. Every
+        // concrete GUI tool below already owns bounded exact-operation self-validation, so a
+        // capability snapshot must stay side-effect-free and cheap instead of paying a multi-second
+        // helper round-trip before ordinary work can begin.
         let localVisionEvidence = await LocalVisionTextObservation.capabilityEvidence()
         var statuses: [GUIAutomationFeature: CapabilityStatus] = [
             .openApp: .deviceValidationRequired,
@@ -51,38 +53,15 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             .verify: .deviceValidationRequired
         ]
         var details: [GUIAutomationFeature: String] = [
-            .openApp: "App launch uses exact bundle-scoped self-validation; no-target LaunchServices probing is intentionally disabled on this TrollStore runtime.",
-            .tree: probe.detail,
-            .screenshot: probe.detail,
+            .openApp: "App launch uses exact bundle-scoped self-validation; broad no-target readiness probing is intentionally disabled on this TrollStore runtime.",
+            .tree: "AXRuntime tree probing is deferred to the exact gui.tree/gui.verify request so ordinary routing never pays the broad GUI helper watchdog.",
+            .screenshot: "Global screenshot probing is deferred to the exact gui.screenshot request so ordinary routing never pays the broad GUI helper watchdog.",
             .ocr: localVisionEvidence.detail,
-            .touch: probe.detail,
-            .textInput: probe.detail,
-            .gestures: probe.detail,
-            .verify: probe.detail
+            .touch: "IOHID touch dispatch and coordinate-space validation are deferred to the exact gui.tap request.",
+            .textInput: "Text input remains deferred until an exact gui.type request proves a focused AX or HID Unicode route at runtime.",
+            .gestures: "IOHID gesture dispatch and coordinate-space validation are deferred to the exact gui.scroll/gui.swipe request.",
+            .verify: "Verification is deferred with fresh semantic observation and runs only for an exact gui.verify request."
         ]
-
-        if let payload = probe.payload {
-            // Explicit refresh intentionally performs only a lightweight helper handshake. The
-            // private observation and coordinate runtimes below stay deferred until the exact
-            // requested operation executes in its own bounded helper process.
-            statuses[.tree] = .deviceValidationRequired
-            statuses[.screenshot] = .deviceValidationRequired
-            // OCR is intentionally not derived from AX/tree or the root-helper handshake. Its
-            // independent Vision-helper evidence is retained above and promoted only by an exact
-            // OCR operation that actually completed on this runtime.
-            statuses[.touch] = .deviceValidationRequired
-            statuses[.textInput] = .deviceValidationRequired
-            statuses[.gestures] = .deviceValidationRequired
-            statuses[.verify] = .deviceValidationRequired
-            details[.tree] = "AXRuntime tree probing is deferred to the exact gui.tree/gui.verify request to keep device refresh crash-isolated."
-            details[.screenshot] = "Global screenshot probing is deferred to the exact gui.screenshot request to keep device refresh crash-isolated."
-            details[.touch] = "IOHID touch dispatch and coordinate-space validation are deferred to the exact gui.tap request."
-            details[.textInput] = payload.textInput
-                ? "IOHID Unicode symbols are present, but symbol presence alone is not proof that the current focused field accepts text. Exact gui.type execution now prefers focused AX value injection with read-back verification, then falls back to HID Unicode with bounded postcondition checks when AX can observe the field."
-                : "Text input remains deferred until an exact gui.type request proves a focused AX or HID Unicode route at runtime."
-            details[.gestures] = "IOHID gesture dispatch and coordinate-space validation are deferred to the exact gui.scroll/gui.swipe request."
-            details[.verify] = "Verification is deferred with AX tree observation and runs only for an exact gui.verify request."
-        }
 
         for (feature, status) in exactRuntimeStatuses {
             statuses[feature] = status

@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "id": "skill.boss.recruitment.batch",
+  "displayName": "BOSS 招聘联系",
+  "targetApp": {
+    "name": "BOSS直聘",
+    "bundleID": "com.hpbr.bosszhipin",
+    "observedAppVersion": "14.140",
+    "observedIOSVersion": "16.6"
+  },
+  "canonicalPolicy": {
+    "resource": "BOSS_CONTACT_POLICY.md",
+    "sourcePath": "D:\\wendangcodex\\boss-helper-low-risk\\BOSS_CONTACT_POLICY.md",
+    "sha256": "c3db99043a75842974a275688862d84f9b7811a8302099403472e44d3981840b",
+    "rule": "This embedded file is an exact snapshot of the canonical desktop policy. Mobile-specific code must not redefine business eligibility, pacing, blacklist, deduplication, completion, or safety rules independently."
+  },
+  "executionProfile": {
+    "mode": "human_paced",
+    "visibleControlsOnly": true,
+    "privateProtocolSending": false,
+    "perceptionOrder": [
+      "ax_tree",
+      "local_roi_ocr",
+      "screenshot_vision"
+    ],
+    "ocrPolicy": "Use OCR only for the smallest unresolved region after AX fails or lacks the required semantic field. Do not full-screen OCR on every step.",
+    "coordinatePolicy": "Raw coordinates are a last-resort action target derived from fresh local evidence only; never persist screen coordinates in the skill.",
+    "sendSemantics": "exactly_once_with_reconcile_before_retry",
+    "postconditionRequired": true
+  },
+  "surfaces": [
+    "boss.home",
+    "boss.job.search",
+    "boss.job.list",
+    "boss.job.detail",
+    "boss.recruiter.profile",
+    "boss.chat.conversation"
+  ],
+  "workflowResource": "WORKFLOW.md"
+}

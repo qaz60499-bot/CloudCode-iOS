@@ -13,11 +13,14 @@ public enum AgentEvent: Sendable, Equatable {
 
 public enum AgentRunError: Error, Equatable, CustomStringConvertible {
     case sessionAlreadyRunning(UUID)
+    case selectedSkillUnavailable(String)
 
     public var description: String {
         switch self {
         case .sessionAlreadyRunning(let id):
             return "Session \(id) already has an active Agent run; submit steering instead of starting a concurrent run"
+        case .selectedSkillUnavailable(let id):
+            return "Selected semantic skill is unavailable or failed integrity validation: \(id)"
         }
     }
 }
@@ -685,6 +688,7 @@ public actor AgentCore {
         providerConfiguration: ProviderConfiguration,
         allowedRoot: URL? = nil,
         capabilityProfile: CapabilityProfile? = nil,
+        selectedSkillID: String? = nil,
         appendUserMessage: Bool = true,
         resumeCheckpoint: TaskCheckpoint? = nil
     ) -> AsyncThrowingStream<AgentEvent, Error> {
@@ -722,7 +726,8 @@ public actor AgentCore {
                         "provider.fallbackKeyReferences": (providerConfiguration.fallbackAPIKeyReferences ?? []).joined(separator: ","),
                         "provider.fallbackProtocols": (providerConfiguration.fallbackProtocolNames ?? []).joined(separator: ","),
                         "provider.sameProviderFailover": providerConfiguration.allowSameProviderKeyFailover == true ? "true" : "false",
-                        "provider.reasoningEffort": providerConfiguration.reasoningEffort?.rawValue ?? ModelReasoningEffort.automatic.rawValue
+                        "provider.reasoningEffort": providerConfiguration.reasoningEffort?.rawValue ?? ModelReasoningEffort.automatic.rawValue,
+                        "skill.selected.id": selectedSkillID ?? ""
                     ]
                 )
                 let checkpointStepBase = resumeCheckpoint?.stepIndex ?? 0
@@ -745,6 +750,7 @@ public actor AgentCore {
                 checkpoint.payload["provider.fallbackProtocols"] = (providerConfiguration.fallbackProtocolNames ?? []).joined(separator: ",")
                 checkpoint.payload["provider.sameProviderFailover"] = providerConfiguration.allowSameProviderKeyFailover == true ? "true" : "false"
                 checkpoint.payload["provider.reasoningEffort"] = providerConfiguration.reasoningEffort?.rawValue ?? ModelReasoningEffort.automatic.rawValue
+                checkpoint.payload["skill.selected.id"] = selectedSkillID ?? checkpoint.payload["skill.selected.id"] ?? ""
                 try? await diagnosticLogger?.log(
                     level: .info,
                     subsystem: "agent",
@@ -1077,6 +1083,26 @@ public actor AgentCore {
                         "sqlite.discover", "sqlite.tables", "sqlite.schema", "sqlite.query", "sqlite.filter", "sqlite.aggregate", "sqlite.sample",
                         "data.localQuery", "storage.analyze"
                     ]
+                    var selectedSkillRuntimeContext: String?
+                    if let selectedSkillID, !selectedSkillID.isEmpty {
+                        guard let hint = await semanticSkillRegistry?.selectedSkillHint(skillID: selectedSkillID) else {
+                            throw AgentRunError.selectedSkillUnavailable(selectedSkillID)
+                        }
+                        var parts = [hint]
+                        if selectedSkillID == BossRecruitmentSkillPackage.skillID {
+                            do {
+                                let instructions = try BossRecruitmentSkillPackage.loadSkillInstructions()
+                                let policy = try BossRecruitmentSkillPackage.loadCanonicalPolicy()
+                                let workflow = try BossRecruitmentSkillPackage.loadWorkflow()
+                                parts.append("Selected Codex-style SKILL.md instructions:\n\(instructions)")
+                                parts.append("Canonical BOSS recruitment policy (integrity-verified bundled resource):\n\(policy)")
+                                parts.append("Selected BOSS recruitment workflow reference:\n\(workflow)")
+                            } catch {
+                                throw AgentRunError.selectedSkillUnavailable(selectedSkillID)
+                            }
+                        }
+                        selectedSkillRuntimeContext = parts.joined(separator: "\n\n")
+                    }
 
                     for round in 0..<maxToolRounds {
                         let cumulativeRound = checkpointStepBase + round + 1
@@ -1109,6 +1135,16 @@ public actor AgentCore {
                         var steeringInterruptedProviderStream = false
 
                         var providerContextMessages = session.messages
+                        if let selectedSkillRuntimeContext, let selectedSkillID, !selectedSkillID.isEmpty {
+                            providerContextMessages.append(ChatMessage(
+                                role: .system,
+                                content: selectedSkillRuntimeContext,
+                                providerMetadata: [
+                                    "context_layer": "user_selected_semantic_skill",
+                                    "skill_id": selectedSkillID
+                                ]
+                            ))
+                        }
                         if let currentGUIBundleID,
                            let adaptiveHint = await interactionExperienceStore?.providerHint(bundleID: currentGUIBundleID, appVersion: currentGUIAppVersion) {
                             providerContextMessages.append(ChatMessage(
@@ -1659,6 +1695,7 @@ public actor AgentCore {
                         }
 
                         var shouldReplanForSteering = false
+                        var providerPlanGUIWriteClaimed = false
                         for (providerCallID, providerToolName, argumentsJSON) in providerToolCalls {
                             try Task.checkCancellation()
                             guard let name = toolNameMap.internalName(forProviderName: providerToolName) else {
@@ -1692,6 +1729,43 @@ public actor AgentCore {
                             }
                             guard let descriptor = descriptorsByName[name] else {
                                 throw ToolArgumentValidationError.unknownTool(name)
+                            }
+                            let providerPlanGUIStateChangeCandidate = !providerCallID.hasPrefix("semantic-local-")
+                                && Self.isProviderPlanGUIStateChange(toolName: name, descriptor: descriptor)
+                            if providerPlanGUIStateChangeCandidate {
+                                if providerPlanGUIWriteClaimed {
+                                    let deferred = ToolResult(
+                                        toolCallID: callID,
+                                        success: false,
+                                        summary: "已延后同一 Provider 计划中的第二个 GUI 状态变更；必须先读取第一步后的新鲜界面，再决定下一动作。",
+                                        payload: [
+                                            "planGuard": "second_gui_state_change_deferred",
+                                            "effectVerification": "not_dispatched",
+                                            "replanRequired": "true"
+                                        ]
+                                    )
+                                    continuation.yield(.toolFinished(deferred))
+                                    let data = try JSONEncoder.pretty.encode(deferred)
+                                    let rawContent = String(data: data, encoding: .utf8) ?? deferred.summary
+                                    session.messages.append(ChatMessage(
+                                        role: .tool,
+                                        content: ToolOutputEnvelope(trust: .untrustedData, source: "tool:\(name):provider_plan_guard", content: rawContent).promptSafeRepresentation,
+                                        providerMetadata: [
+                                            "tool_call_id": providerCallID,
+                                            "tool_name": name,
+                                            "provider_tool_name": providerToolName,
+                                            "plan_guard": "second_gui_state_change_deferred"
+                                        ]
+                                    ))
+                                    session.messages.append(ChatMessage(
+                                        role: .system,
+                                        content: "A second state-changing GUI call from the same raw Provider plan was deferred before dispatch. Continue from the first action's fresh observation/read-only results on the next round. Do not treat this as a device failure and do not retry the stale second action verbatim.",
+                                        providerMetadata: ["context_layer": "provider_plan_gui_write_guard"]
+                                    ))
+                                    session.updatedAt = Date()
+                                    try await sessionStore.save(session)
+                                    continue
+                                }
                             }
                             let typedTaskAlreadyComplete: Bool = {
                                 guard descriptor.risk != .readOnly,
@@ -2674,6 +2748,9 @@ public actor AgentCore {
                                         checkpoint.updatedAt = Date()
                                         try await checkpointStore.upsert(checkpoint)
                                     }
+                                    if providerPlanGUIStateChangeCandidate, Self.shouldRecordStateChange(for: result) {
+                                        providerPlanGUIWriteClaimed = true
+                                    }
                                     if let stateChangeSignature, Self.shouldRecordStateChange(for: result) {
                                         completedAppListSignatures.removeAll()
                                         checkpoint.payload.removeValue(forKey: "tool.completedAppListSignatures")
@@ -2831,6 +2908,12 @@ public actor AgentCore {
                                         )
                                     }
                                 } catch {
+                                    if providerPlanGUIStateChangeCandidate {
+                                        // Once execution reached the GUI tool router and failed, the side-effect state can
+                                        // be uncertain. Conservatively consume this Provider plan's GUI-write slot so a
+                                        // stale second GUI write cannot run on top of a possibly changed foreground state.
+                                        providerPlanGUIWriteClaimed = true
+                                    }
                                     let toolLatencyMS = max(0, Int(Date().timeIntervalSince(toolExecutionStartedAt) * 1_000))
                                     runtimeBreadcrumb?("runtime.agent.tool.\(name).error")
                                     if axDependentGUITools.contains(name) {
@@ -3083,6 +3166,12 @@ public actor AgentCore {
     ) -> Bool {
         guard let contract, let runtime, let descriptor, descriptor.risk != .readOnly else { return false }
         return runtime.isComplete(contract: contract)
+    }
+
+    static func isProviderPlanGUIStateChange(toolName: String, descriptor: ToolDescriptor) -> Bool {
+        guard descriptor.risk != .readOnly else { return false }
+        if toolName.hasPrefix("gui.") { return true }
+        return ["apps.launch", "apps.openURL", "files.share"].contains(toolName)
     }
 
     static func shouldBlockRepeatedMessageBodyInput(

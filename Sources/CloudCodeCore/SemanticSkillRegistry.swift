@@ -35,6 +35,9 @@ public struct SemanticSkillDefinition: Codable, Hashable, Identifiable, Sendable
     public var lastValidatedAt: Date?
     public var lastFailureAt: Date?
     public var exactlyOnce: Bool
+    /// User-facing packages may opt into manual selection. Internal semantic primitives stay hidden
+    /// from the skill picker while remaining available to automatic routing.
+    public var userSelectable: Bool?
     public var origin: Origin
 
     public init(
@@ -53,6 +56,7 @@ public struct SemanticSkillDefinition: Codable, Hashable, Identifiable, Sendable
         lastValidatedAt: Date? = nil,
         lastFailureAt: Date? = nil,
         exactlyOnce: Bool = false,
+        userSelectable: Bool? = nil,
         origin: Origin = .predefined
     ) {
         self.id = String(id.prefix(128))
@@ -70,6 +74,7 @@ public struct SemanticSkillDefinition: Codable, Hashable, Identifiable, Sendable
         self.lastValidatedAt = lastValidatedAt
         self.lastFailureAt = lastFailureAt
         self.exactlyOnce = exactlyOnce
+        self.userSelectable = userSelectable
         self.origin = origin
     }
 }
@@ -146,7 +151,8 @@ public enum SemanticSkillCatalog {
             verificationObligations: ["liked_state_verified"],
             allowedLocalRecovery: ["reconcile_before_retry"],
             exactlyOnce: true
-        )
+        ),
+        BossRecruitmentSkillPackage.semanticSkill
     ]
 }
 
@@ -173,6 +179,34 @@ public actor SemanticSkillRegistry {
         var merged = predefined
         for (id, value) in validated { merged[id] = value }
         return merged.values.sorted { $0.id < $1.id }
+    }
+
+    public func skill(id: String) -> SemanticSkillDefinition? {
+        loadIfNeeded()
+        return validated[id] ?? predefined[id]
+    }
+
+    public func selectedSkillHint(skillID: String) -> String? {
+        loadIfNeeded()
+        guard let skill = validated[skillID] ?? predefined[skillID] else { return nil }
+        let capabilities = skill.requiredCapabilities.joined(separator: ",")
+        let landmarks = skill.landmarks.joined(separator: ",")
+        let transitions = skill.transitions.map { "\($0.fromSurface)->\($0.toSurface):\($0.semanticAction)" }.joined(separator: " | ")
+        let verification = skill.verificationObligations.joined(separator: ",")
+        let recovery = skill.allowedLocalRecovery.joined(separator: ",")
+        return """
+        User-selected semantic skill: \(skill.id)
+        goal=\(skill.semanticGoal)
+        bundle=\(skill.bundleID ?? "any")
+        requiredSurface=\(skill.requiredSemanticSurface)
+        requiredCapabilities=\(capabilities)
+        landmarks=\(landmarks)
+        transitions=\(transitions)
+        verification=\(verification)
+        recovery=\(recovery)
+        exactlyOnce=\(skill.exactlyOnce ? "true" : "false")
+        Treat this skill as the user's explicit planning preference for the current run. It is planning knowledge only: fresh observation, ToolRouter capability checks, PolicyEngine, confirmations, exactly-once guards, and postcondition verification always override it. Do not silently switch to a different skill unless this one is incompatible with the user's request or current device evidence.
+        """
     }
 
     public func candidates(

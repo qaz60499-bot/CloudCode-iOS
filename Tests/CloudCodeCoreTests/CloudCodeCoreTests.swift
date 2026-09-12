@@ -4052,6 +4052,18 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(GUIAutomationPayloadPolicy.isValidScreenshotJPEG(oversized))
     }
 
+    func testProviderPlanGUIWriteGuardClassifiesStateChangesButNotObservations() {
+        let tap = ToolDescriptor(name: "gui.tap", summary: "", risk: .safeWrite, preferredRoute: .guiFallback)
+        let screenshot = ToolDescriptor(name: "gui.screenshot", summary: "", risk: .readOnly, preferredRoute: .guiFallback)
+        let launch = ToolDescriptor(name: "apps.launch", summary: "", risk: .safeWrite, preferredRoute: .privateFramework)
+        let read = ToolDescriptor(name: "files.read", summary: "", risk: .readOnly)
+
+        XCTAssertTrue(AgentCore.isProviderPlanGUIStateChange(toolName: tap.name, descriptor: tap))
+        XCTAssertFalse(AgentCore.isProviderPlanGUIStateChange(toolName: screenshot.name, descriptor: screenshot))
+        XCTAssertTrue(AgentCore.isProviderPlanGUIStateChange(toolName: launch.name, descriptor: launch))
+        XCTAssertFalse(AgentCore.isProviderPlanGUIStateChange(toolName: read.name, descriptor: read))
+    }
+
     func testGUISwipeDurationNormalizesBoundedMillisecondsWithoutClampingUnsafeValues() {
         XCTAssertEqual(GUIAutomationPayloadPolicy.normalizedSwipeDuration("0.3"), 0.3)
         XCTAssertEqual(GUIAutomationPayloadPolicy.normalizedSwipeDuration("300"), 0.3)
@@ -7435,6 +7447,33 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(expired.first?.skill.origin, .predefined, "expired learned evidence must fall back to the predefined template")
         XCTAssertEqual(expired.first?.skill.evidenceCount, 0)
         XCTAssertTrue(expired.first?.requiresRevalidation == true)
+    }
+
+    func testBossRecruitmentSkillIsRegisteredAsAXFirstFallbackCapablePlanningKnowledge() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = SemanticSkillRegistry(fileURL: root.appendingPathComponent("semantic-skills.json"))
+        let all = await registry.all()
+        let skill = try XCTUnwrap(all.first(where: { $0.id == BossRecruitmentSkillPackage.skillID }))
+
+        XCTAssertEqual(skill.bundleID, "com.hpbr.bosszhipin")
+        XCTAssertEqual(skill.semanticGoal, "run_boss_recruitment_batch")
+        XCTAssertTrue(skill.requiredCapabilities.contains(GUIAutomationFeature.openApp.capabilityID))
+        XCTAssertTrue(skill.requiredCapabilities.contains(GUIAutomationFeature.screenshot.capabilityID))
+        XCTAssertTrue(skill.requiredCapabilities.contains(GUIAutomationFeature.touch.capabilityID))
+        XCTAssertTrue(skill.requiredCapabilities.contains(GUIAutomationFeature.textInput.capabilityID))
+        XCTAssertTrue(skill.requiredCapabilities.contains(GUIAutomationFeature.gestures.capabilityID))
+        XCTAssertFalse(skill.requiredCapabilities.contains(GUIAutomationFeature.tree.capabilityID), "AX is preferred but must not be a hard dependency because bounded local OCR/vision are explicit fallbacks")
+        XCTAssertTrue(skill.allowedLocalRecovery.contains("ax_first_then_local_roi_ocr"))
+        XCTAssertTrue(skill.allowedLocalRecovery.contains("screenshot_vision_last_resort"))
+        XCTAssertTrue(skill.allowedLocalRecovery.contains("reconcile_before_send_retry"))
+        XCTAssertTrue(skill.verificationObligations.contains("send_postcondition_verified"))
+        let selectedHint = await registry.selectedSkillHint(skillID: BossRecruitmentSkillPackage.skillID)
+        let missingHint = await registry.selectedSkillHint(skillID: "skill.missing")
+        XCTAssertTrue(selectedHint?.contains("User-selected semantic skill: \(BossRecruitmentSkillPackage.skillID)") == true)
+        XCTAssertTrue(selectedHint?.contains("exactlyOnce=false") == true)
+        XCTAssertNil(missingHint)
+        XCTAssertEqual(BossRecruitmentSkillPackage.canonicalPolicySHA256, "c3db99043a75842974a275688862d84f9b7811a8302099403472e44d3981840b")
     }
 
     func testMilestonesReferenceGenericSkillsWithoutCreatingSecondProgressState() throws {

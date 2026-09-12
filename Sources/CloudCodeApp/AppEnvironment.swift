@@ -105,6 +105,8 @@ public final class CloudCodeViewModel: ObservableObject {
     @Published public private(set) var hermesStatusMessage: String?
     @Published public private(set) var interactionObservationExperiences: [IOSInteractionObservationExperience] = []
     @Published public private(set) var interactionNavigationExperiences: [IOSInteractionNavigationExperience] = []
+    @Published public private(set) var semanticSkills: [SemanticSkillDefinition] = []
+    @Published public private(set) var selectedSemanticSkillID: String?
 
     @Published public private(set) var providerProfiles: [ProviderProfile]
     @Published public private(set) var installedKeyReferences: Set<String> = []
@@ -175,6 +177,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private static let manualProviderKeyOverridesDefaultsKey = "provider.key.manualOverrides"
     private static let autoResumeTaskDefaultsKey = "task.autoResumeUnlessStopped"
     private static let backgroundRunIntentDefaultsKey = "task.wasRunningInBackground"
+    private static let selectedSemanticSkillDefaultsKey = "skill.selected.id"
     private static let backgroundContinuationWindow: TimeInterval = 90 * 60
 
     private enum BootstrapManualOverridePolicy: Equatable {
@@ -314,6 +317,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let defaults = UserDefaults.standard
         let inheritedAutoResumeIntentAtLaunch = defaults.bool(forKey: Self.autoResumeTaskDefaultsKey)
         let inheritedBackgroundRunIntentAtLaunch = defaults.bool(forKey: Self.backgroundRunIntentDefaultsKey)
+        let selectedSemanticSkillAtLaunch = defaults.string(forKey: Self.selectedSemanticSkillDefaultsKey)?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.inheritedAutoResumeIntentAtLaunch = inheritedAutoResumeIntentAtLaunch
         self.inheritedBackgroundRunIntentAtLaunch = inheritedBackgroundRunIntentAtLaunch
         if inheritedAutoResumeIntentAtLaunch {
@@ -350,6 +354,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.selectedReasoningEffort = ModelReasoningEffort(rawValue: defaults.string(forKey: "provider.selected.reasoningEffort") ?? "automatic") ?? .automatic
         self.permissionMode = initialPermissionMode
         self.browsePath = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).path
+        self.selectedSemanticSkillID = selectedSemanticSkillAtLaunch.flatMap { $0.isEmpty ? nil : $0 }
         self.session = AgentSession(
             permissionMode: initialPermissionMode,
             providerID: selection.providerID,
@@ -398,6 +403,53 @@ public final class CloudCodeViewModel: ObservableObject {
         startupBreadcrumbStore.append(runID: startupRunID, stage: stage)
     }
 
+    public func reloadSemanticSkills() async {
+        let skills = await semanticSkillRegistry.all()
+        semanticSkills = skills
+        if let selectedSemanticSkillID, !skills.contains(where: { $0.id == selectedSemanticSkillID }) {
+            self.selectedSemanticSkillID = nil
+            UserDefaults.standard.removeObject(forKey: Self.selectedSemanticSkillDefaultsKey)
+        }
+    }
+
+    public var selectableSemanticSkills: [SemanticSkillDefinition] {
+        semanticSkills.filter { $0.userSelectable == true }
+    }
+
+    public func selectSemanticSkill(_ skillID: String?) {
+        let normalized = skillID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let normalized, !normalized.isEmpty {
+            guard selectableSemanticSkills.contains(where: { $0.id == normalized }) else {
+                lastError = "所选技能不存在或尚未载入。"
+                return
+            }
+            selectedSemanticSkillID = normalized
+            UserDefaults.standard.set(normalized, forKey: Self.selectedSemanticSkillDefaultsKey)
+        } else {
+            selectedSemanticSkillID = nil
+            UserDefaults.standard.removeObject(forKey: Self.selectedSemanticSkillDefaultsKey)
+        }
+    }
+
+    public func semanticSkillDisplayName(_ skill: SemanticSkillDefinition) -> String {
+        Self.semanticSkillDisplayName(skill)
+    }
+
+    private static func semanticSkillDisplayName(_ skill: SemanticSkillDefinition) -> String {
+        switch skill.id {
+        case BossRecruitmentSkillPackage.skillID: return BossRecruitmentSkillPackage.displayName
+        case "skill.chat.focus.composer": return "聊天输入框定位"
+        case "skill.chat.enter.body.once": return "聊天正文输入"
+        case "skill.chat.commit.send.once": return "聊天发送"
+        case "skill.feed.collect.metric": return "信息流采集"
+        case "skill.feed.commit.like.once": return "信息流点赞"
+        default:
+            return skill.id
+                .replacingOccurrences(of: "skill.", with: "")
+                .replacingOccurrences(of: ".", with: " · ")
+        }
+    }
+
     public func bootstrap() {
         guard !didBootstrap, bootstrapTask == nil else { return }
         bootstrapTask = Task {
@@ -412,6 +464,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 recordStartupBreadcrumb("bootstrap.recovery.begin")
                 capabilityRefreshMessage = "检测到上一轮启动未完成，已进入安全恢复模式。设备能力、日志扫描、Hermes、事务恢复和 Provider Keychain 自动处理已暂时跳过。"
                 activityLines.append("安全恢复模式：上一轮启动没有到达稳定完成点。本次先保证界面可打开；需要诊断时可在界面稳定后手动打开“日志”，再检测设备能力或 Key。")
+                await reloadSemanticSkills()
                 didBootstrap = true
                 recordStartupBreadcrumb("bootstrap.recovery.ready")
                 recordStartupBreadcrumb("bootstrap.completed")
@@ -460,6 +513,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 LocalVisionTextObservation.prepare()
             }
             await seedKnowledgeIfNeeded(apps)
+            await reloadSemanticSkills()
             recordStartupBreadcrumb("bootstrap.local-state.begin")
             do {
                 try await checkpointStore.recoverUnfinishedAfterRestart()
@@ -1197,6 +1251,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let sessionID = session.id
         let runToken = UUID()
         let initialSession = session
+        let activeSkillID = selectedSemanticSkillID
         let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
 
         runningSessionIDs.insert(sessionID)
@@ -1208,6 +1263,9 @@ public final class CloudCodeViewModel: ObservableObject {
         providerFailureSessionIDs.remove(sessionID)
         retryableProviderFailureSessionIDs.remove(sessionID)
         sessionActivityLines[sessionID, default: []].append("正在使用 \(config.name) / \(config.model) 规划请求…")
+        if let activeSkillID, let skill = semanticSkills.first(where: { $0.id == activeSkillID }) {
+            sessionActivityLines[sessionID, default: []].append("已启用技能：\(Self.semanticSkillDisplayName(skill))")
+        }
         syncVisibleSessionState(sessionID)
         autoResumeArmedInCurrentProcess = true
         UserDefaults.standard.set(true, forKey: Self.autoResumeTaskDefaultsKey)
@@ -1248,6 +1306,7 @@ public final class CloudCodeViewModel: ObservableObject {
                     providerConfiguration: config,
                     allowedRoot: allowedRoot,
                     capabilityProfile: capabilities,
+                    selectedSkillID: activeSkillID,
                     appendUserMessage: false
                 )
                 var sawAgentEvent = false
@@ -1725,6 +1784,8 @@ public final class CloudCodeViewModel: ObservableObject {
 
                 let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
                 let source = InputSource(rawValue: checkpoint.payload["inputSource"] ?? "text") ?? .text
+                let checkpointSkillID = checkpoint.payload["skill.selected.id"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let resumedSkillID = checkpointSkillID.flatMap { $0.isEmpty ? nil : $0 }
                 guard await agentCore.waitUntilSessionIdle(sessionID) else {
                     throw AgentRunError.sessionAlreadyRunning(sessionID)
                 }
@@ -1735,6 +1796,7 @@ public final class CloudCodeViewModel: ObservableObject {
                     providerConfiguration: config,
                     allowedRoot: allowedRoot,
                     capabilityProfile: capabilities,
+                    selectedSkillID: resumedSkillID,
                     appendUserMessage: false,
                     resumeCheckpoint: checkpoint
                 )
@@ -3795,6 +3857,14 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private static func userFacingRunError(_ error: Error) -> String {
+        if let agentError = error as? AgentRunError {
+            switch agentError {
+            case .sessionAlreadyRunning:
+                return "这个对话已经有任务在运行；请使用追加指令或先停止当前任务。"
+            case .selectedSkillUnavailable(let skillID):
+                return "所选技能无法载入或完整性校验失败：\(skillID)。已停止本轮执行，避免绕过技能约束。"
+            }
+        }
         if let providerError = error as? ProviderError {
             switch providerError {
             case .streamInterrupted:

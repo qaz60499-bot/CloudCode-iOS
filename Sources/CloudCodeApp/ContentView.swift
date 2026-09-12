@@ -71,7 +71,7 @@ struct ContentView: View {
 
 private struct MoreView: View {
     private enum Destination: String, Identifiable {
-        case apps, files, memory, activity, trash
+        case apps, files, skills, memory, activity, trash
 
         var id: String { rawValue }
     }
@@ -85,6 +85,7 @@ private struct MoreView: View {
                 Section("工具") {
                     moreButton(.apps, title: "应用", systemImage: "square.grid.2x2", subtitle: "查看已安装应用与应用能力")
                     moreButton(.files, title: "文件", systemImage: "folder", subtitle: "浏览当前可访问的文件系统")
+                    moreButton(.skills, title: "技能", systemImage: "wand.and.stars", subtitle: "查看并选择本轮执行使用的技能")
                     moreButton(.memory, title: "Hermes 记忆", systemImage: "books.vertical", subtitle: "查看、检索和维护本地记忆")
                 }
                 Section("维护") {
@@ -99,6 +100,8 @@ private struct MoreView: View {
                     AppsView(model: model)
                 case .files:
                     FilesView(model: model)
+                case .skills:
+                    SkillsView(model: model)
                 case .memory:
                     HermesVaultView(model: model)
                 case .activity:
@@ -133,6 +136,88 @@ private struct MoreView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(title)
+    }
+}
+
+private struct SkillsView: View {
+    @ObservedObject var model: CloudCodeViewModel
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Button {
+                        model.selectSemanticSkill(nil)
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("自动匹配")
+                                    .foregroundStyle(.primary)
+                                Text("不固定技能；由当前任务、前台 App 和新鲜观察选择最合适的执行路径。")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if model.selectedSemanticSkillID == nil {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(Color.accentColor)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                } header: {
+                    Text("当前模式")
+                }
+
+                Section("技能") {
+                    ForEach(model.selectableSemanticSkills) { skill in
+                        Button {
+                            model.selectSemanticSkill(skill.id)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text(model.semanticSkillDisplayName(skill))
+                                        .font(.headline)
+                                        .foregroundStyle(.primary)
+                                    Spacer()
+                                    if model.selectedSemanticSkillID == skill.id {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(Color.accentColor)
+                                    }
+                                }
+                                Text(skill.semanticGoal)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                if let bundleID = skill.bundleID, !bundleID.isEmpty {
+                                    Label(bundleID, systemImage: "app")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                HStack(spacing: 10) {
+                                    Label("能力 \(skill.requiredCapabilities.count)", systemImage: "bolt.horizontal.circle")
+                                    Label("验证 \(skill.verificationObligations.count)", systemImage: "checkmark.shield")
+                                    if skill.exactlyOnce {
+                                        Label("一次性", systemImage: "1.circle")
+                                    }
+                                }
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                Section("说明") {
+                    Text("技能只提供专项知识、工作流和局部恢复策略，不会绕过设备能力、权限确认、幂等保护或结果验证。选中的技能会持久化到本机，并在任务检查点续跑时保持同一个技能。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("技能")
+            .task { await model.reloadSemanticSkills() }
+        }
     }
 }
 
@@ -307,6 +392,7 @@ private struct ChatView: View {
         VStack(spacing: 8) {
             pendingImageBanner
             pendingDocumentBanner
+            skillPickerRow
             inputRow
             if voice.isRecording {
                 HStack(spacing: 6) {
@@ -319,6 +405,59 @@ private struct ChatView: View {
             }
         }
         .padding()
+    }
+
+    private var skillPickerRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "wand.and.stars")
+                .foregroundStyle(.secondary)
+            Text("技能")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Menu {
+                Button {
+                    model.selectSemanticSkill(nil)
+                } label: {
+                    if model.selectedSemanticSkillID == nil {
+                        Label("自动", systemImage: "checkmark")
+                    } else {
+                        Text("自动")
+                    }
+                }
+                if !model.selectableSemanticSkills.isEmpty {
+                    Divider()
+                }
+                ForEach(model.selectableSemanticSkills) { skill in
+                    Button {
+                        model.selectSemanticSkill(skill.id)
+                    } label: {
+                        if model.selectedSemanticSkillID == skill.id {
+                            Label(model.semanticSkillDisplayName(skill), systemImage: "checkmark")
+                        } else {
+                            Text(model.semanticSkillDisplayName(skill))
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Text(selectedSkillLabel)
+                        .lineLimit(1)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.caption2)
+                }
+            }
+            .buttonStyle(.bordered)
+            Spacer()
+        }
+        .font(.caption)
+    }
+
+    private var selectedSkillLabel: String {
+        guard let id = model.selectedSemanticSkillID,
+              let skill = model.selectableSemanticSkills.first(where: { $0.id == id }) else {
+            return "自动匹配"
+        }
+        return model.semanticSkillDisplayName(skill)
     }
 
     @ViewBuilder
