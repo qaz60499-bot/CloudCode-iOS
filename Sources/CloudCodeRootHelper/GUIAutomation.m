@@ -1484,7 +1484,9 @@ static id CloudCodeAXAuditEditingTextElement(NSString **detailOut)
         return nil;
     }
 
+    CloudCodeAXRuntime runtime = CloudCodeResolveAX();
     id match = nil;
+    NSString *matchFocusSource = nil;
     NSUInteger matches = 0;
     NSUInteger limit = MIN((NSUInteger)[(NSArray *)explorer count], (NSUInteger)CLOUDCODE_GUI_MAX_TREE_NODES);
     for (NSUInteger index = 0; index < limit; index++) {
@@ -1493,21 +1495,43 @@ static id CloudCodeAXAuditEditingTextElement(NSString **detailOut)
         if (![traitsRaw isKindOfClass:NSNumber.class]) { continue; }
         uint64_t traits = [(NSNumber *)traitsRaw unsignedLongLongValue];
         BOOL textLike = (traits & (CLOUDCODE_AX_TRAIT_SEARCH_FIELD | CLOUDCODE_AX_TRAIT_TEXT_ENTRY | CLOUDCODE_AX_TRAIT_TEXT_AREA)) != 0;
-        BOOL editing = (traits & CLOUDCODE_AX_TRAIT_IS_EDITING) != 0;
+        BOOL editingTrait = (traits & CLOUDCODE_AX_TRAIT_IS_EDITING) != 0;
         BOOL secure = (traits & CLOUDCODE_AX_TRAIT_SECURE_TEXT_FIELD) != 0;
-        if (!textLike || !editing || secure) { continue; }
+        if (!textLike || secure) { continue; }
+
+        // AXAudit's reversed kAXIsEditingTrait is not consistently present on iOS 16.6. Real
+        // WeChat evidence exposes the active composer as AXTextArea/TextEntry while omitting that
+        // bit. Use the underlying AXUIElement's standard AXFocused attribute as an independent,
+        // read-only focus proof. Never treat a merely unique text-like element as focused.
+        BOOL axFocused = NO;
+        id uiElement = CloudCodeAXAuditSafeValue(element, @"uiElement");
+        if (uiElement && runtime.copyAttribute) {
+            id focusedRaw = CloudCodeAXCopy(
+                runtime,
+                (CloudCodeAXUIElementRef)(__bridge CFTypeRef)uiElement,
+                CFSTR("AXFocused")
+            );
+            if ([focusedRaw respondsToSelector:@selector(boolValue)]) {
+                axFocused = [focusedRaw boolValue];
+            }
+        }
+        if (!editingTrait && !axFocused) { continue; }
+
         match = element;
+        matchFocusSource = axFocused ? @"AXFocused" : @"kAXIsEditingTrait";
         matches++;
         if (matches > 1) {
-            if (detailOut) { *detailOut = @"AXAudit editing text focus is ambiguous"; }
+            if (detailOut) { *detailOut = @"AXAudit focused text element is ambiguous"; }
             return nil;
         }
     }
     if (!match) {
-        if (detailOut) { *detailOut = @"AXAudit found no unique non-secure editing text element"; }
+        if (detailOut) { *detailOut = @"AXAudit found no unique non-secure text element with AXFocused or is-editing focus proof"; }
         return nil;
     }
-    if (detailOut) { *detailOut = @"AXAudit found one non-secure element with text-entry and is-editing traits"; }
+    if (detailOut) {
+        *detailOut = [NSString stringWithFormat:@"AXAudit found one non-secure focused text element; focusSource=%@", matchFocusSource ?: @"unknown"];
+    }
     return match;
 }
 
@@ -3172,10 +3196,11 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
         if (!text || text.length == 0) { return 67; }
 
         // First try AccessibilityUI's AXElement route, but only when AXAudit exposes exactly one
-        // non-secure text element carrying the reversed kAXIsEditingTrait. Do not equate AXAudit's
-        // opaque-provider navigation attribute (95226) with keyboard focus. After insertText:, read
-        // the element value back before reporting success; an unverified submission fails closed so
-        // HID fallback cannot duplicate text that may already have been inserted.
+        // non-secure text element with verified focus: either the reversed kAXIsEditingTrait or the
+        // underlying AXUIElement's AXFocused=true. Do not equate AXAudit's opaque-provider navigation
+        // attribute (95226), uniqueness, or text-entry capability with keyboard focus. After
+        // insertText:, read the element value back before reporting success; an unverified submission
+        // fails closed so HID fallback cannot duplicate text that may already have been inserted.
         NSString *auditTextDetail = nil;
         id auditFocused = CloudCodeAXAuditEditingTextElement(&auditTextDetail);
         SEL insertTextSelector = NSSelectorFromString(@"insertText:");
