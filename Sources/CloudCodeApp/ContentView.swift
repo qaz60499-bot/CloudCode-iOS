@@ -32,7 +32,7 @@ struct ContentView: View {
             SettingsView(model: model)
                 .tabItem { Label("设置", systemImage: "gearshape") }
                 .tag(RootTab.settings)
-            MoreView(model: model)
+            MoreView(model: model, onOpenChat: { selectedTab = .chat })
                 .tabItem { Label("更多", systemImage: "ellipsis.circle") }
                 .tag(RootTab.more)
         }
@@ -77,6 +77,7 @@ private struct MoreView: View {
     }
 
     @ObservedObject var model: CloudCodeViewModel
+    let onOpenChat: () -> Void
     @State private var destination: Destination?
 
     var body: some View {
@@ -85,7 +86,7 @@ private struct MoreView: View {
                 Section("工具") {
                     moreButton(.apps, title: "应用", systemImage: "square.grid.2x2", subtitle: "查看已安装应用与应用能力")
                     moreButton(.files, title: "文件", systemImage: "folder", subtitle: "浏览当前可访问的文件系统")
-                    moreButton(.skills, title: "技能", systemImage: "wand.and.stars", subtitle: "查看并选择本轮执行使用的技能")
+                    moreButton(.skills, title: "技能", systemImage: "wand.and.stars", subtitle: "进入专项对话并查看自动能力配置")
                     moreButton(.memory, title: "Hermes 记忆", systemImage: "books.vertical", subtitle: "查看、检索和维护本地记忆")
                 }
                 Section("维护") {
@@ -101,7 +102,10 @@ private struct MoreView: View {
                 case .files:
                     FilesView(model: model)
                 case .skills:
-                    SkillsView(model: model)
+                    SkillsView(model: model) {
+                        destination = nil
+                        onOpenChat()
+                    }
                 case .memory:
                     HermesVaultView(model: model)
                 case .activity:
@@ -141,38 +145,17 @@ private struct MoreView: View {
 
 private struct SkillsView: View {
     @ObservedObject var model: CloudCodeViewModel
+    let onOpenChat: () -> Void
 
     var body: some View {
         NavigationStack {
             List {
-                Section {
-                    Button {
-                        model.selectSemanticSkill(nil)
-                    } label: {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text("自动匹配")
-                                    .foregroundStyle(.primary)
-                                Text("不固定技能；由当前任务、前台 App 和新鲜观察选择最合适的执行路径。")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            if model.selectedSemanticSkillID == nil {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundStyle(Color.accentColor)
-                            }
-                        }
-                    }
-                    .buttonStyle(.plain)
-                } header: {
-                    Text("当前模式")
-                }
-
-                Section("技能") {
+                Section("专项对话") {
                     ForEach(model.selectableSemanticSkills) { skill in
                         Button {
-                            model.selectSemanticSkill(skill.id)
+                            if model.openSpecializedConversation(skillID: skill.id) {
+                                onOpenChat()
+                            }
                         } label: {
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack {
@@ -180,12 +163,10 @@ private struct SkillsView: View {
                                         .font(.headline)
                                         .foregroundStyle(.primary)
                                     Spacer()
-                                    if model.selectedSemanticSkillID == skill.id {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundStyle(Color.accentColor)
-                                    }
+                                    Image(systemName: "arrow.up.right.circle")
+                                        .foregroundStyle(Color.accentColor)
                                 }
-                                Text(skill.semanticGoal)
+                                Text("进入独立专项对话；该对话固定使用这套业务规则、工作流与恢复约束。")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                 if let bundleID = skill.bundleID, !bundleID.isEmpty {
@@ -209,8 +190,17 @@ private struct SkillsView: View {
                     }
                 }
 
+                Section("自动能力") {
+                    Label("意图识别与任务规划", systemImage: "brain.head.profile")
+                    Label("UI / AX / OCR / 截图感知", systemImage: "viewfinder")
+                    Label("应用、文件与数据工具路由", systemImage: "point.3.connected.trianglepath.dotted")
+                    Text("这些属于 Cloud Code 的自动技能配置，不需要手动选择。系统会根据任务语义、前台 App、设备能力和最新观察自动挑选，并在能力不可用时切换到合适的安全路径。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("说明") {
-                    Text("技能只提供专项知识、工作流和局部恢复策略，不会绕过设备能力、权限确认、幂等保护或结果验证。选中的技能会持久化到本机，并在任务检查点续跑时保持同一个技能。")
+                    Text("专项对话只固定专项知识、业务规则和工作流；底层 UI/OCR/AX、权限确认、幂等保护、结果验证仍由 Cloud Code 自动处理。普通对话不会继承专项技能。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -392,7 +382,7 @@ private struct ChatView: View {
         VStack(spacing: 8) {
             pendingImageBanner
             pendingDocumentBanner
-            skillPickerRow
+            specializedConversationBanner
             inputRow
             if voice.isRecording {
                 HStack(spacing: 6) {
@@ -407,57 +397,26 @@ private struct ChatView: View {
         .padding()
     }
 
-    private var skillPickerRow: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "wand.and.stars")
-                .foregroundStyle(.secondary)
-            Text("技能")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Menu {
-                Button {
-                    model.selectSemanticSkill(nil)
-                } label: {
-                    if model.selectedSemanticSkillID == nil {
-                        Label("自动", systemImage: "checkmark")
-                    } else {
-                        Text("自动")
-                    }
-                }
-                if !model.selectableSemanticSkills.isEmpty {
-                    Divider()
-                }
-                ForEach(model.selectableSemanticSkills) { skill in
-                    Button {
-                        model.selectSemanticSkill(skill.id)
-                    } label: {
-                        if model.selectedSemanticSkillID == skill.id {
-                            Label(model.semanticSkillDisplayName(skill), systemImage: "checkmark")
-                        } else {
-                            Text(model.semanticSkillDisplayName(skill))
-                        }
-                    }
-                }
-            } label: {
-                HStack(spacing: 5) {
-                    Text(selectedSkillLabel)
-                        .lineLimit(1)
-                    Image(systemName: "chevron.up.chevron.down")
+    @ViewBuilder
+    private var specializedConversationBanner: some View {
+        if let id = model.selectedSemanticSkillID,
+           let skill = model.selectableSemanticSkills.first(where: { $0.id == id }) {
+            HStack(spacing: 8) {
+                Image(systemName: "wand.and.stars")
+                    .foregroundStyle(Color.accentColor)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("专项对话 · \(model.semanticSkillDisplayName(skill))")
+                        .font(.caption.bold())
+                    Text("专项规则已绑定；UI / AX / OCR 等底层能力仍自动选择。")
                         .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
+                Spacer()
             }
-            .buttonStyle(.bordered)
-            Spacer()
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
         }
-        .font(.caption)
-    }
-
-    private var selectedSkillLabel: String {
-        guard let id = model.selectedSemanticSkillID,
-              let skill = model.selectableSemanticSkills.first(where: { $0.id == id }) else {
-            return "自动匹配"
-        }
-        return model.semanticSkillDisplayName(skill)
     }
 
     @ViewBuilder

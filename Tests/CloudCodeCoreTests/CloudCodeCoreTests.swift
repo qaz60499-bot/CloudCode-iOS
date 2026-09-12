@@ -179,6 +179,27 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(sessions.isEmpty)
     }
 
+    func testSessionStorePersistsSpecializedSkillBindingPerConversation() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionsRoot = root.appendingPathComponent("Sessions", isDirectory: true)
+        let store = SessionStore(root: sessionsRoot)
+        let session = AgentSession(
+            title: BossRecruitmentSkillPackage.displayName,
+            messages: [ChatMessage(role: .user, content: "继续当前招聘任务")],
+            permissionMode: .safe,
+            specializedSkillID: BossRecruitmentSkillPackage.skillID
+        )
+
+        try await store.save(session)
+        let restored = try await store.load(session.id)
+
+        XCTAssertEqual(restored.specializedSkillID, BossRecruitmentSkillPackage.skillID)
+        XCTAssertEqual(restored.title, BossRecruitmentSkillPackage.displayName)
+        let ordinary = AgentSession(permissionMode: .safe)
+        XCTAssertNil(ordinary.specializedSkillID, "ordinary conversations must stay on automatic skill routing")
+    }
+
     func testSessionStoreRejectsUnrecoverablyLargePersistedSessionWithoutReadingIt() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

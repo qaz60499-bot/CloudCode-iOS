@@ -764,6 +764,9 @@ public struct AgentSession: Codable, Equatable, Identifiable, Sendable {
     public var providerID: String?
     public var keySlotID: String?
     public var model: String?
+    /// Optional user-facing specialist conversation binding. Internal semantic skills remain
+    /// automatically routed and are never exposed as a per-message manual selector.
+    public var specializedSkillID: String?
     public var createdAt: Date
     public var updatedAt: Date
 
@@ -775,6 +778,7 @@ public struct AgentSession: Codable, Equatable, Identifiable, Sendable {
         providerID: String? = nil,
         keySlotID: String? = nil,
         model: String? = nil,
+        specializedSkillID: String? = nil,
         createdAt: Date = Date(),
         updatedAt: Date = Date()
     ) {
@@ -785,6 +789,7 @@ public struct AgentSession: Codable, Equatable, Identifiable, Sendable {
         self.providerID = providerID
         self.keySlotID = keySlotID
         self.model = model
+        self.specializedSkillID = specializedSkillID
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }

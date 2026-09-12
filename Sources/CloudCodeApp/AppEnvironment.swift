@@ -317,7 +317,9 @@ public final class CloudCodeViewModel: ObservableObject {
         let defaults = UserDefaults.standard
         let inheritedAutoResumeIntentAtLaunch = defaults.bool(forKey: Self.autoResumeTaskDefaultsKey)
         let inheritedBackgroundRunIntentAtLaunch = defaults.bool(forKey: Self.backgroundRunIntentDefaultsKey)
-        let selectedSemanticSkillAtLaunch = defaults.string(forKey: Self.selectedSemanticSkillDefaultsKey)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Build 131 replaces the old global skill toggle with per-session specialist bindings.
+        // Drop the legacy global selection so an ordinary conversation can never inherit BOSS mode.
+        defaults.removeObject(forKey: Self.selectedSemanticSkillDefaultsKey)
         self.inheritedAutoResumeIntentAtLaunch = inheritedAutoResumeIntentAtLaunch
         self.inheritedBackgroundRunIntentAtLaunch = inheritedBackgroundRunIntentAtLaunch
         if inheritedAutoResumeIntentAtLaunch {
@@ -354,7 +356,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.selectedReasoningEffort = ModelReasoningEffort(rawValue: defaults.string(forKey: "provider.selected.reasoningEffort") ?? "automatic") ?? .automatic
         self.permissionMode = initialPermissionMode
         self.browsePath = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).path
-        self.selectedSemanticSkillID = selectedSemanticSkillAtLaunch.flatMap { $0.isEmpty ? nil : $0 }
+        self.selectedSemanticSkillID = nil
         self.session = AgentSession(
             permissionMode: initialPermissionMode,
             providerID: selection.providerID,
@@ -406,9 +408,9 @@ public final class CloudCodeViewModel: ObservableObject {
     public func reloadSemanticSkills() async {
         let skills = await semanticSkillRegistry.all()
         semanticSkills = skills
-        if let selectedSemanticSkillID, !skills.contains(where: { $0.id == selectedSemanticSkillID }) {
+        if let selectedSemanticSkillID, !skills.contains(where: { $0.id == selectedSemanticSkillID && $0.userSelectable == true }) {
             self.selectedSemanticSkillID = nil
-            UserDefaults.standard.removeObject(forKey: Self.selectedSemanticSkillDefaultsKey)
+            session.specializedSkillID = nil
         }
     }
 
@@ -420,15 +422,52 @@ public final class CloudCodeViewModel: ObservableObject {
         let normalized = skillID?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let normalized, !normalized.isEmpty {
             guard selectableSemanticSkills.contains(where: { $0.id == normalized }) else {
-                lastError = "所选技能不存在或尚未载入。"
+                lastError = "所选专项技能不存在或尚未载入。"
                 return
             }
+            session.specializedSkillID = normalized
             selectedSemanticSkillID = normalized
-            UserDefaults.standard.set(normalized, forKey: Self.selectedSemanticSkillDefaultsKey)
         } else {
+            session.specializedSkillID = nil
             selectedSemanticSkillID = nil
-            UserDefaults.standard.removeObject(forKey: Self.selectedSemanticSkillDefaultsKey)
         }
+    }
+
+    /// Opens the persistent specialist conversation for a user-facing skill. Internal UI/OCR/AX/
+    /// intent skills remain hidden and are selected automatically by SemanticSkillRegistry.
+    @discardableResult
+    public func openSpecializedConversation(skillID: String) -> Bool {
+        let normalized = skillID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let skill = selectableSemanticSkills.first(where: { $0.id == normalized }) else {
+            lastError = "专项对话技能不存在或尚未载入。"
+            return false
+        }
+        if session.specializedSkillID == normalized {
+            selectedSemanticSkillID = normalized
+            return true
+        }
+        if let existing = sessionHistory
+            .filter({ $0.specializedSkillID == normalized })
+            .sorted(by: { $0.updatedAt > $1.updatedAt })
+            .first {
+            openSession(existing)
+            return true
+        }
+        let newSession = AgentSession(
+            title: Self.semanticSkillDisplayName(skill),
+            permissionMode: permissionMode,
+            providerID: selectedProviderID,
+            keySlotID: selectedKeySlotID,
+            model: selectedModel,
+            specializedSkillID: normalized
+        )
+        session = newSession
+        selectedSemanticSkillID = normalized
+        streamingAssistantMessageIDs.removeValue(forKey: newSession.id)
+        activityLines = ["专项对话：\(Self.semanticSkillDisplayName(skill))"]
+        lastError = nil
+        UserDefaults.standard.set(newSession.id.uuidString, forKey: "session.current.id")
+        return true
     }
 
     public func semanticSkillDisplayName(_ skill: SemanticSkillDefinition) -> String {
@@ -1251,7 +1290,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let sessionID = session.id
         let runToken = UUID()
         let initialSession = session
-        let activeSkillID = selectedSemanticSkillID
+        let activeSkillID = initialSession.specializedSkillID
         let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
 
         runningSessionIDs.insert(sessionID)
@@ -1661,9 +1700,11 @@ public final class CloudCodeViewModel: ObservableObject {
             permissionMode: permissionMode,
             providerID: selectedProviderID,
             keySlotID: selectedKeySlotID,
-            model: selectedModel
+            model: selectedModel,
+            specializedSkillID: nil
         )
         session = newSession
+        selectedSemanticSkillID = nil
         streamingAssistantMessageIDs.removeValue(forKey: newSession.id)
         activityLines = []
         lastError = nil
@@ -1713,6 +1754,7 @@ public final class CloudCodeViewModel: ObservableObject {
                     try await sessionStore.delete(candidate.id)
                     try? attachmentStore.removeAll(for: candidate.id)
                     session = replacement
+                    selectedSemanticSkillID = nil
                     streamingAssistantMessageIDs.removeValue(forKey: candidate.id)
                     activityLines = []
                     lastError = nil
@@ -3779,6 +3821,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private func adoptSession(_ loaded: AgentSession) {
         let visible = liveSessions[loaded.id] ?? loaded
         session = visible
+        selectedSemanticSkillID = visible.specializedSkillID
         if !runningSessionIDs.contains(visible.id) {
             streamingAssistantMessageIDs.removeValue(forKey: visible.id)
         }

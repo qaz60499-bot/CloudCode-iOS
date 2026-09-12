@@ -1,6 +1,6 @@
 ---
 name: boss-recruitment
-description: Use when the user explicitly selects the BOSS 招聘联系 skill or asks Cloud Code to run the bounded BOSS直聘 recruitment/contact workflow on iPhone. Apply the bundled canonical business policy, use fresh device observations, prefer AX when healthy with local OCR/screenshot fallbacks, preserve permanent deduplication and exactly-once send safety, and stop rather than guessing when a safety gate cannot be verified.
+description: Use inside the dedicated BOSS 招聘联系 specialist conversation, or when the user explicitly asks Cloud Code to run the bounded BOSS直聘 recruitment/contact workflow on iPhone. Apply the bundled canonical business policy, use fresh device observations, prefer AX when healthy with local OCR/screenshot fallbacks, preserve permanent deduplication and exactly-once send safety, and stop rather than guessing when a safety gate cannot be verified.
 ---
 
 # BOSS 招聘联系
