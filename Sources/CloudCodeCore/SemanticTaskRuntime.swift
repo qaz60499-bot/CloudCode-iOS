@@ -831,10 +831,20 @@ public enum TaskTransitionPolicy {
                 )
             }
             if runtime.pendingObligations.contains("destination") {
+                // A semantic destination is deterministic only when the latest grounded
+                // observation actually contains that exact visible label. Previously this branch
+                // always emitted tapTextObserve, which could bypass the Provider indefinitely on
+                // a WeChat surface where “文件传输助手” was not visible yet (for example, before
+                // search/navigation had been planned). Unknown/absent destination evidence must
+                // yield back to the Provider so it can choose the navigation/search step.
+                guard let observation,
+                      Self.observationContainsExactSemanticText(observation, text: message.destinationEntity) else {
+                    return nil
+                }
                 return TaskDeterministicOperation(
                     toolName: "gui.tapTextObserve",
                     arguments: ["query": message.destinationEntity, "match": "exact"],
-                    reason: "typed_message_destination"
+                    reason: "typed_message_destination_visible_exact"
                 )
             }
             if runtime.pendingObligations.contains("composer") {

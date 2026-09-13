@@ -6590,6 +6590,58 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(runtime.canDispatchFiniteFeed(units: 2, contract: contract))
     }
 
+    func testTypedMessagingDestinationLocalDispatchRequiresExactVisibleObservation() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.reconcileObligationProgress(contract: contract)
+
+        XCTAssertNil(
+            TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil),
+            "without grounded destination evidence the typed runtime must yield to the Provider for search/navigation"
+        )
+
+        let unrelatedElement = LocalPerceptionTextElement(text: "通讯录", confidence: 0.97, x: 30, y: 100, width: 100, height: 24)
+        let unrelatedEncoded = try XCTUnwrap(String(data: JSONEncoder().encode([unrelatedElement]), encoding: .utf8))
+        let unrelatedResult = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "wechat home observation",
+            payload: [
+                "sha256": "wechat-home",
+                "localVisionOCR": "recognized",
+                "localVisionElements": unrelatedEncoded,
+                "localVisionElementCount": "1"
+            ]
+        )
+        let unrelatedFrame = PerceptionBrokerFacade.frame(from: unrelatedResult, foregroundBundleID: contract.targetBundleID)
+        XCTAssertNil(
+            TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: unrelatedFrame),
+            "an unrelated visible label must not trigger a deterministic tap for a destination that is not on screen"
+        )
+
+        let destination = try XCTUnwrap(contract.message?.destinationEntity)
+        let destinationElement = LocalPerceptionTextElement(text: destination, confidence: 0.97, x: 30, y: 150, width: 180, height: 24)
+        let destinationEncoded = try XCTUnwrap(String(data: JSONEncoder().encode([destinationElement]), encoding: .utf8))
+        let destinationResult = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "destination visible",
+            payload: [
+                "sha256": "destination-visible",
+                "localVisionOCR": "recognized",
+                "localVisionElements": destinationEncoded,
+                "localVisionElementCount": "1"
+            ]
+        )
+        let destinationFrame = PerceptionBrokerFacade.frame(from: destinationResult, foregroundBundleID: contract.targetBundleID)
+        let operation = try XCTUnwrap(TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: destinationFrame))
+        XCTAssertEqual(operation.toolName, "gui.tapTextObserve")
+        XCTAssertEqual(operation.arguments["query"], destination)
+        XCTAssertEqual(operation.arguments["match"], "exact")
+        XCTAssertEqual(operation.reason, "typed_message_destination_visible_exact")
+    }
+
     func testTypedMessagingDestinationNeedsChangedPostActionSemanticEvidence() throws {
         let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
         var runtime = TaskRuntimeState(contract: contract)
