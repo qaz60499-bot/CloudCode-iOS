@@ -1836,65 +1836,6 @@ private struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Section("App Provider") {
-                    if model.appProviderPackages.filter(\.enabled).isEmpty {
-                        Text("暂无可用 App Provider Package。")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Picker("Provider Package", selection: Binding(
-                            get: { model.selectedAppProviderPackageID },
-                            set: { model.selectAppProviderPackage($0) }
-                        )) {
-                            ForEach(model.appProviderPackages.filter(\.enabled)) { package in
-                                Text(package.manifest.displayName).tag(package.id)
-                            }
-                        }
-                    }
-
-                    if let package = model.selectedAppProviderPackage {
-                        LabeledContent("Bundle ID", value: package.manifest.bundleID)
-                        LabeledContent("模式", value: package.manifest.modelLabel)
-                        LabeledContent("Selector Revision", value: package.manifest.compatibility.selectorRevision)
-                        if let status = model.appProviderStatusMessages[package.id], !status.isEmpty {
-                            Text(status)
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
-                        HStack {
-                            Button("允许使用") {
-                                Task { await model.setAppProviderUseConsent(packageID: package.id, enabled: true) }
-                            }
-                            Button("撤销授权", role: .destructive) {
-                                Task { await model.setAppProviderUseConsent(packageID: package.id, enabled: false) }
-                            }
-                        }
-                        Button("无副作用测试") {
-                            Task { _ = await model.testAppProvider(packageID: package.id) }
-                        }
-                        Button("导出当前 Provider Package") {
-                            Task {
-                                do {
-                                    let url = try await model.exportAppProvider(packageID: package.id)
-                                    appProviderShareItem = DiagnosticShareItem(url: url)
-                                } catch {
-                                    model.lastError = "导出 App Provider Package 失败：\(error)"
-                                }
-                            }
-                        }
-                    }
-
-                    Button("制作自定义 App Provider") { showCustomAppProvider = true }
-                    NavigationLink {
-                        AppProviderManagementView(model: model)
-                    } label: {
-                        Label("管理 / 制作 App Provider", systemImage: "puzzlepiece.extension")
-                    }
-                    Button("导入 Provider Package") { showAppProviderImporter = true }
-                    Text("Provider Package 只包含 declarative JSON/Markdown；不加载 Swift、dylib、shell 或 root executable。Package 与 Skills 分库存储。")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-
                 Section("Key 管理") {
                     SecureField("替换当前选择的 Key", text: $selectedKeyInput)
                         .textInputAutocapitalization(.never)
@@ -1954,6 +1895,65 @@ private struct SettingsView: View {
                     Text(model.bundledPrivateBootstrapAvailable
                          ? "当前是私有 Key 版 IPA。为避免 TrollStore 真机启动阶段触发 Keychain 问题，任何启动都不会自动读取、遍历、迁移或覆盖 Provider Keychain。需要使用安装包内置 Key 时，请显式点“一键导入预配置 Key”；已有 Key 可先点“检查当前 Key”。"
                          : "当前安装包未内置预配置 Key。任何启动都不会自动扫描 Provider Keychain；可以手动检查当前 Key 或从文件导入。真实 Key 不写入 UserDefaults。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("App Provider") {
+                    if model.appProviderPackages.filter(\.enabled).isEmpty {
+                        Text("暂无可用 App Provider Package。")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Picker("Provider Package", selection: Binding(
+                            get: { model.selectedAppProviderPackageID },
+                            set: { model.selectAppProviderPackage($0) }
+                        )) {
+                            ForEach(model.appProviderPackages.filter(\.enabled)) { package in
+                                Text(package.manifest.displayName).tag(package.id)
+                            }
+                        }
+                    }
+
+                    if let package = model.selectedAppProviderPackage {
+                        LabeledContent("Bundle ID", value: package.manifest.bundleID)
+                        LabeledContent("模式", value: package.manifest.modelLabel)
+                        LabeledContent("Selector Revision", value: package.manifest.compatibility.selectorRevision)
+                        if let status = model.appProviderStatusMessages[package.id], !status.isEmpty {
+                            Text(status)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                        HStack {
+                            Button("允许使用") {
+                                Task { await model.setAppProviderUseConsent(packageID: package.id, enabled: true) }
+                            }
+                            Button("撤销授权", role: .destructive) {
+                                Task { await model.setAppProviderUseConsent(packageID: package.id, enabled: false) }
+                            }
+                        }
+                        Button("无副作用测试") {
+                            Task { _ = await model.testAppProvider(packageID: package.id) }
+                        }
+                        Button("导出当前 Provider Package") {
+                            Task {
+                                do {
+                                    let url = try await model.exportAppProvider(packageID: package.id)
+                                    appProviderShareItem = DiagnosticShareItem(url: url)
+                                } catch {
+                                    model.lastError = "导出 App Provider Package 失败：\(error)"
+                                }
+                            }
+                        }
+                    }
+
+                    Button("制作自定义 App Provider") { showCustomAppProvider = true }
+                    NavigationLink {
+                        AppProviderManagementView(model: model)
+                    } label: {
+                        Label("管理 / 制作 App Provider", systemImage: "puzzlepiece.extension")
+                    }
+                    Button("导入 Provider Package") { showAppProviderImporter = true }
+                    Text("Provider Package 只包含 declarative JSON/Markdown；不加载 Swift、dylib、shell 或 root executable。Package 与 Skills 分库存储。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
