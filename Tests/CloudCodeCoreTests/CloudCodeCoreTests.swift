@@ -5334,6 +5334,27 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "gui.navigateBack"))
         XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "gui.tap"))
         XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "files.create"))
+
+        let destinationArguments = ["query": "文件传输助手", "match": "exact"]
+        let destinationSignature = AgentCore.semanticToolSignature(name: "gui.tapTextObserve", arguments: destinationArguments)
+        XCTAssertTrue(AgentCore.shouldYieldRepeatedDeterministicOperation(
+            toolName: "gui.tapTextObserve",
+            arguments: destinationArguments,
+            lastStateChangeSignature: destinationSignature,
+            verificationSinceLastStateChange: false
+        ))
+        XCTAssertFalse(AgentCore.shouldYieldRepeatedDeterministicOperation(
+            toolName: "gui.tapTextObserve",
+            arguments: destinationArguments,
+            lastStateChangeSignature: destinationSignature,
+            verificationSinceLastStateChange: true
+        ))
+        XCTAssertFalse(AgentCore.shouldYieldRepeatedDeterministicOperation(
+            toolName: "apps.launch",
+            arguments: ["bundleId": "com.tencent.xin"],
+            lastStateChangeSignature: AgentCore.semanticToolSignature(name: "apps.launch", arguments: ["bundleId": "com.tencent.xin"]),
+            verificationSinceLastStateChange: false
+        ))
     }
 
     func testAgentCoreReusesCompletedAppListWithinTaskInsteadOfReexecutingDeviceScan() async throws {

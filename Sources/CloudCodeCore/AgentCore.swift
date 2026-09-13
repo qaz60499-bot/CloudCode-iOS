@@ -1396,6 +1396,18 @@ public actor AgentCore {
                             ), roundDescriptors.contains(where: { $0.name == operation.toolName }) else {
                                 return nil
                             }
+                            // If the exact same deterministic write was already dispatched and no
+                            // fresh verification proved progress, do not keep bypassing the Provider.
+                            // Yield so the Provider can re-plan from the latest tool/observation
+                            // evidence instead of entering a local duplicate-block loop.
+                            if Self.shouldYieldRepeatedDeterministicOperation(
+                                toolName: operation.toolName,
+                                arguments: operation.arguments,
+                                lastStateChangeSignature: lastStateChangeSignature,
+                                verificationSinceLastStateChange: verificationSinceLastStateChange
+                            ) {
+                                return nil
+                            }
                             taskRuntimeState = runtime
                             return operation
                         }()
@@ -3665,7 +3677,7 @@ public actor AgentCore {
         activeSessionRuns.removeValue(forKey: sessionID)
     }
 
-    private static func semanticToolSignature(name: String, arguments: [String: String]) -> String {
+    static func semanticToolSignature(name: String, arguments: [String: String]) -> String {
         let canonical = ([name] + arguments.keys.sorted().map { key in "\(key)=\(arguments[key] ?? "")" }).joined(separator: "\n")
         let digest = SHA256.hash(data: Data(canonical.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
@@ -3797,6 +3809,20 @@ public actor AgentCore {
             return name == "gui.verify" || name == "gui.tree" || name == "gui.findElement" || name == "gui.waitForElement" || name == "gui.screenshot"
         }
         return false
+    }
+
+    static func shouldYieldRepeatedDeterministicOperation(
+        toolName: String,
+        arguments: [String: String],
+        lastStateChangeSignature: String?,
+        verificationSinceLastStateChange: Bool
+    ) -> Bool {
+        guard !verificationSinceLastStateChange,
+              !allowsImmediateSemanticRepeat(name: toolName),
+              let lastStateChangeSignature else {
+            return false
+        }
+        return semanticToolSignature(name: toolName, arguments: arguments) == lastStateChangeSignature
     }
 
     static func allowsImmediateSemanticRepeat(name: String) -> Bool {
