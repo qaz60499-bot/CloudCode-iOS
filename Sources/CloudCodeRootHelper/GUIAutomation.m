@@ -65,6 +65,7 @@ typedef void (*CloudCodeBKSetDigitizerInfoFn)(CloudCodeIOHIDEventRef, uint32_t, 
 typedef CloudCodeIOHIDEventRef (*CloudCodeDigitizerEventCreateFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double, double, double, double, Boolean, Boolean, CloudCodeIOOptionBits);
 typedef CloudCodeIOHIDEventRef (*CloudCodeFingerEventCreateFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t, double, double, double, double, double, Boolean, Boolean, CloudCodeIOOptionBits);
 typedef CloudCodeIOHIDEventRef (*CloudCodeUnicodeEventCreateFn)(CFAllocatorRef, uint64_t, const uint8_t *, uint32_t, uint32_t, CloudCodeIOOptionBits);
+typedef CloudCodeIOHIDEventRef (*CloudCodeKeyboardEventCreateFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, Boolean, CloudCodeIOOptionBits);
 typedef void (*CloudCodeHIDAppendFn)(CloudCodeIOHIDEventRef, CloudCodeIOHIDEventRef, CloudCodeIOOptionBits);
 typedef void (*CloudCodeHIDSetSenderFn)(CloudCodeIOHIDEventRef, uint64_t);
 typedef void (*CloudCodeHIDSetIntegerFn)(CloudCodeIOHIDEventRef, uint32_t, int32_t);
@@ -135,6 +136,7 @@ typedef struct {
     CloudCodeDigitizerEventCreateFn createDigitizer;
     CloudCodeFingerEventCreateFn createFinger;
     CloudCodeUnicodeEventCreateFn createUnicode;
+    CloudCodeKeyboardEventCreateFn createKeyboard;
     CloudCodeHIDAppendFn append;
     CloudCodeHIDSetSenderFn setSender;
     CloudCodeHIDSetIntegerFn setInteger;
@@ -259,6 +261,7 @@ static CloudCodeHIDRuntime CloudCodeResolveHID(void)
     if (!runtime.createUnicode) {
         runtime.createUnicode = (CloudCodeUnicodeEventCreateFn)CloudCodeResolve(runtime.handle, "_IOHIDEventCreateUnicodeEvent");
     }
+    runtime.createKeyboard = (CloudCodeKeyboardEventCreateFn)CloudCodeResolve(runtime.handle, "IOHIDEventCreateKeyboardEvent");
     runtime.append = (CloudCodeHIDAppendFn)CloudCodeResolve(runtime.handle, "IOHIDEventAppendEvent");
     runtime.setSender = (CloudCodeHIDSetSenderFn)CloudCodeResolve(runtime.handle, "IOHIDEventSetSenderID");
     runtime.setInteger = (CloudCodeHIDSetIntegerFn)CloudCodeResolve(runtime.handle, "IOHIDEventSetIntegerValue");
@@ -409,6 +412,32 @@ static BOOL CloudCodeDispatchSystemEventAsync(CloudCodeHIDRuntime runtime, Cloud
     return YES;
 }
 
+static BOOL CloudCodeDispatchSystemKeyPairAsync(
+    CloudCodeHIDRuntime runtime,
+    CloudCodeIOHIDEventSystemClientRef client,
+    CloudCodeIOHIDEventRef keyDown,
+    CloudCodeIOHIDEventRef keyUp)
+{
+    if (!runtime.dispatch || !client || !keyDown || !keyUp) { return NO; }
+    if (runtime.setSender) {
+        runtime.setSender(keyDown, CLOUDCODE_GUI_SENDER_ID);
+        runtime.setSender(keyUp, CLOUDCODE_GUI_SENDER_ID);
+    }
+    CloudCodeIOHIDEventSystemClientRef retainedClient = (CloudCodeIOHIDEventSystemClientRef)CFRetain(client);
+    CloudCodeIOHIDEventRef retainedDown = (CloudCodeIOHIDEventRef)CFRetain(keyDown);
+    CloudCodeIOHIDEventRef retainedUp = (CloudCodeIOHIDEventRef)CFRetain(keyUp);
+    CloudCodeHIDDispatchFn dispatchFn = runtime.dispatch;
+    dispatch_async(CloudCodeHIDDispatchQueue(), ^{
+        dispatchFn(retainedClient, retainedDown);
+        usleep(50000);
+        dispatchFn(retainedClient, retainedUp);
+        CFRelease(retainedUp);
+        CFRelease(retainedDown);
+        CFRelease(retainedClient);
+    });
+    return YES;
+}
+
 static CGSize CloudCodeScreenSize(void)
 {
     @try {
@@ -533,6 +562,42 @@ static BOOL CloudCodeDispatchTouch(CloudCodeHIDRuntime runtime, CloudCodeHIDRout
     }
     CFRelease(event);
     return YES;
+}
+
+static BOOL CloudCodePerformHomeButton(void)
+{
+    enum {
+        CloudCodeHIDPageConsumer = 0x0C,
+        CloudCodeHIDUsageConsumerMenu = 0x40,
+    };
+
+    CloudCodeHIDRuntime runtime = CloudCodeResolveHID();
+    if (!runtime.createKeyboard || !runtime.createClient || !runtime.dispatch) { return NO; }
+    CloudCodeIOHIDEventSystemClientRef client = runtime.createClient(kCFAllocatorDefault);
+    if (!client) { return NO; }
+
+    uint64_t downTime = mach_absolute_time();
+    CloudCodeIOHIDEventRef keyDown = runtime.createKeyboard(
+        kCFAllocatorDefault, downTime,
+        CloudCodeHIDPageConsumer, CloudCodeHIDUsageConsumerMenu,
+        YES, 0
+    );
+    CloudCodeIOHIDEventRef keyUp = runtime.createKeyboard(
+        kCFAllocatorDefault, downTime + 1,
+        CloudCodeHIDPageConsumer, CloudCodeHIDUsageConsumerMenu,
+        NO, 0
+    );
+    BOOL ok = keyDown && keyUp && CloudCodeDispatchSystemKeyPairAsync(runtime, client, keyDown, keyUp);
+    if (keyDown) { CFRelease(keyDown); }
+    if (keyUp) { CFRelease(keyUp); }
+    CFRelease(client);
+    if (ok) {
+        // Keep the one-shot helper alive long enough for the serial HID queue to deliver both
+        // Consumer/Menu transitions before main.m performs the bounded hard exit.
+        usleep(200000);
+        fprintf(stderr, "gui-home: profile=modern-trollstore page=0x0c usage=0x40 result=dispatched-unverified\n");
+    }
+    return ok;
 }
 
 static BOOL CloudCodePerformTap(double x, double y)
@@ -2981,6 +3046,11 @@ int CloudCodeGUITap(double x, double y)
         CGSize size = CloudCodeScreenSize();
         if (!CloudCodeValidPoint(x, y, size)) { return 64; }
         return CloudCodePerformTap(x, y) ? 0 : 65;
+}
+
+int CloudCodeGUIHome(void)
+{
+        return CloudCodePerformHomeButton() ? 0 : 69;
 }
 
 int CloudCodeGUISwipe(double fromX, double fromY, double toX, double toY, double durationSeconds)

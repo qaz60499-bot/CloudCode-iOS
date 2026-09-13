@@ -275,6 +275,8 @@ static NSDictionary *CloudCodePCActionResponse(const char *executablePath, NSDic
             return @{@"ok": @NO, @"op": operation, @"error": @"invalid-back-strategy"};
         }
         arguments = @[@"gui-navigate-back", strategy];
+    } else if ([operation isEqualToString:@"home"]) {
+        arguments = @[@"gui-home"];
     } else if ([operation isEqualToString:@"type"]) {
         NSString *text = [request[@"text"] isKindOfClass:NSString.class] ? request[@"text"] : nil;
         if (!text || text.length > 4096) {

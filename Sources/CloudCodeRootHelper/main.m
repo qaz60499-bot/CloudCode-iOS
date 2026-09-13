@@ -1367,6 +1367,9 @@ static int CloudCodeRunOneShotCommand(int argc, const char *argv[])
             if (argc < 4) { return 10; }
             return CloudCodeGUITap(strtod(argv[2], NULL), strtod(argv[3], NULL));
         }
+        if ([command isEqualToString:@"gui-home"]) {
+            return CloudCodeGUIHome();
+        }
         if ([command isEqualToString:@"gui-swipe"]) {
             if (argc < 7) { return 10; }
             return CloudCodeGUISwipe(strtod(argv[2], NULL), strtod(argv[3], NULL), strtod(argv[4], NULL), strtod(argv[5], NULL), strtod(argv[6], NULL));

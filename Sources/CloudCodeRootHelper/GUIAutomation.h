@@ -9,6 +9,7 @@ int CloudCodeGUIAXProbeJSON(NSString *stage, NSString *seedKind, pid_t targetPID
 int CloudCodeGUIScreenshotBase64(void);
 int CloudCodeGUIScreenshotFile(NSString *path);
 int CloudCodeGUITap(double x, double y);
+int CloudCodeGUIHome(void);
 int CloudCodeGUISwipe(double fromX, double fromY, double toX, double toY, double durationSeconds);
 int CloudCodeGUIScroll(double deltaX, double deltaY);
 int CloudCodeGUINavigateBack(NSString *strategy);
