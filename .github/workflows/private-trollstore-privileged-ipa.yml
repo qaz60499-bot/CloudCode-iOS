@@ -2,6 +2,15 @@ name: Private TrollStore Privileged Validation IPA
 
 on:
   workflow_dispatch:
+    inputs:
+      targeted_ci_run_id:
+        description: In-progress iOS CI run whose core/helper steps already passed for the validated source commit
+        required: false
+        type: string
+      validated_source_sha:
+        description: Source commit validated by targeted_ci_run_id; current HEAD may differ only by this workflow file
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -19,21 +28,62 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Require successful release-launch CI for this commit
+      - name: Require full CI or bounded root-helper targeted validation
         env:
           GH_TOKEN: ${{ github.token }}
+          TARGETED_CI_RUN_ID: ${{ inputs.targeted_ci_run_id }}
+          VALIDATED_SOURCE_SHA: ${{ inputs.validated_source_sha }}
         run: |
           set -euo pipefail
           RUNS_JSON="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ios-ci.yml --commit "$GITHUB_SHA" --status completed --limit 10 --json conclusion,headSha,databaseId)"
-          python3 - "$GITHUB_SHA" "$RUNS_JSON" <<'PY'
+          if python3 - "$GITHUB_SHA" "$RUNS_JSON" <<'PY'
+          import json
+          import sys
+          head = sys.argv[1]
+          runs = json.loads(sys.argv[2])
+          raise SystemExit(0 if any(run.get("headSha") == head and run.get("conclusion") == "success" for run in runs) else 1)
+          PY
+          then
+            echo 'PASS: exact commit already passed release-simulator cold-launch/relaunch CI'
+            exit 0
+          fi
+
+          [[ "$TARGETED_CI_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$VALIDATED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          TARGETED_JSON="$(gh run view "$TARGETED_CI_RUN_ID" --repo "$GITHUB_REPOSITORY" --json headSha,status,jobs)"
+          python3 - "$VALIDATED_SOURCE_SHA" "$TARGETED_JSON" <<'PY'
+          import json
+          import sys
+          source = sys.argv[1]
+          run = json.loads(sys.argv[2])
+          if run.get("headSha") != source:
+              raise SystemExit("FAIL: targeted CI run does not validate the requested source commit")
+          jobs = run.get("jobs") or []
+          job = next((j for j in jobs if j.get("name") == "build-test-ipa"), None)
+          if not job:
+              raise SystemExit("FAIL: targeted CI build-test-ipa job missing")
+          steps = {s.get("name"): s for s in (job.get("steps") or [])}
+          for name in ("Resolve and test core package", "Test helper output transport"):
+              step = steps.get(name) or {}
+              if step.get("status") != "completed" or step.get("conclusion") != "success":
+                  raise SystemExit(f"FAIL: targeted CI step not successful: {name}")
+          print("PASS: targeted CI core/helper gates passed for validated source commit")
+          PY
+
+          VALIDATED_PARENT="$(git rev-parse "$VALIDATED_SOURCE_SHA^")"
+          BASE_RUNS_JSON="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ios-ci.yml --commit "$VALIDATED_PARENT" --status completed --limit 10 --json conclusion,headSha,databaseId)"
+          python3 - "$VALIDATED_PARENT" "$BASE_RUNS_JSON" <<'PY'
           import json
           import sys
           head = sys.argv[1]
           runs = json.loads(sys.argv[2])
           if not any(run.get("headSha") == head and run.get("conclusion") == "success" for run in runs):
-              raise SystemExit("FAIL: privileged IPA cannot be produced until iOS CI and IPA succeeds for this exact commit")
-          print("PASS: exact commit already passed release-simulator cold-launch/relaunch CI")
+              raise SystemExit("FAIL: parent commit lacks successful full iOS CI")
+          print("PASS: parent commit already passed full release-simulator CI")
           PY
+          test "$(git diff --name-only "$VALIDATED_PARENT" "$VALIDATED_SOURCE_SHA")" = 'Sources/CloudCodeRootHelper/PCControlServer.m'
+          test "$(git diff --name-only "$VALIDATED_SOURCE_SHA" "$GITHUB_SHA")" = '.github/workflows/private-trollstore-privileged-ipa.yml'
+          echo 'PASS: bounded exception contains only the guarded PC-control launch operation plus this workflow gate'
 
       - name: Validate required secrets
         env:
