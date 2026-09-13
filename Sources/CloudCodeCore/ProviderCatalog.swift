@@ -1,13 +1,13 @@
 import Foundation
 import CryptoKit
 
-public enum ProviderProtocol: String, Codable, CaseIterable, Sendable {
+public enum ProviderProtocol: String, Codable, CaseIterable, Hashable, Sendable {
     case anthropic
     case openAIChat = "openai_chat"
     case openAIResponses = "openai_responses"
 }
 
-public enum ProviderAuthMode: String, Codable, Sendable {
+public enum ProviderAuthMode: String, Codable, Hashable, Sendable {
     case bearer
     case xAPIKey = "x-api-key"
     case both

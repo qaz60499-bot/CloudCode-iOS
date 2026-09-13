@@ -526,20 +526,50 @@ public final class CloudCodeViewModel: ObservableObject {
         persistProviderSelection()
     }
 
-    public func setAppProviderUseConsent(packageID: String, enabled: Bool) async {
-        await appBackedProviderRuntime.setAuthorized(enabled, packageID: packageID)
-        appProviderStatusMessages[packageID] = enabled ? "已允许 Cloud Code 使用此 App Provider。" : "已停止使用此 App Provider。"
+    @discardableResult
+    public func setAppProviderUseConsent(packageID: String, enabled: Bool) async -> Bool {
+        let persisted = await appBackedProviderRuntime.setAuthorized(enabled, packageID: packageID)
+        let snapshot = await appBackedProviderRuntime.preflightStatus(packageID: packageID)
+        appProviderStatusMessages[packageID] = Self.appProviderStatusText(snapshot)
+        if persisted {
+            lastError = nil
+        } else {
+            lastError = enabled
+                ? "App Provider 授权写入后回读失败；授权没有生效。"
+                : "App Provider 撤销授权后回读失败；请查看 App Provider 日志。"
+        }
+        return persisted
+    }
+
+    public func refreshAppProviderStatus(packageID: String) async {
+        let snapshot = await appBackedProviderRuntime.preflightStatus(packageID: packageID)
+        appProviderStatusMessages[packageID] = Self.appProviderStatusText(snapshot)
     }
 
     public func appProviderStatusLabel(packageID: String) async -> String {
-        if let snapshot = await appBackedProviderRuntime.status(packageID: packageID) {
-            return "\(snapshot.state.rawValue) · \(snapshot.detail)"
+        if let latest = await appBackedProviderRuntime.status(packageID: packageID) {
+            return Self.appProviderStatusText(latest)
         }
-        guard let package = appProviderPackages.first(where: { $0.id == packageID }) else { return "UNKNOWN" }
-        if await appResolver.appIntrospection(bundleID: package.manifest.bundleID) == nil {
-            return AppBackedProviderAvailabilityState.notInstalled.rawValue
+        let snapshot = await appBackedProviderRuntime.preflightStatus(packageID: packageID)
+        return Self.appProviderStatusText(snapshot)
+    }
+
+    private static func appProviderStatusText(_ snapshot: AppBackedProviderRuntime.StatusSnapshot) -> String {
+        var parts = [
+            snapshot.state.rawValue,
+            "阶段=\(snapshot.hostState.rawValue)",
+            snapshot.detail
+        ]
+        if let appVersion = snapshot.appVersion, !appVersion.isEmpty {
+            parts.append("App=\(appVersion)")
         }
-        return AppBackedProviderAvailabilityState.needsAuthorization.rawValue
+        if let route = snapshot.responseExtractionRoute, !route.isEmpty {
+            parts.append("提取=\(route)")
+        }
+        if let latency = snapshot.generationLatencyMS {
+            parts.append("生成=\(latency)ms")
+        }
+        return parts.joined(separator: " · ")
     }
 
     public func inspectAppProviderBuilderMetadata(bundleID: String) async -> AppProviderBuilderMetadata? {
@@ -735,6 +765,27 @@ public final class CloudCodeViewModel: ObservableObject {
             restoreTargetBundleID: Bundle.main.bundleIdentifier
         )
         do {
+            let preflight = await appBackedProviderRuntime.preflightStatus(packageID: packageID)
+            appProviderStatusMessages[packageID] = Self.appProviderStatusText(preflight)
+            guard preflight.state == .ready else {
+                switch preflight.state {
+                case .notInstalled:
+                    throw AppBackedProviderRuntimeError.notInstalled(package.manifest.bundleID)
+                case .needsAuthorization:
+                    throw AppBackedProviderRuntimeError.needsAuthorization(package.manifest.displayName)
+                case .needsLogin:
+                    throw AppBackedProviderRuntimeError.needsLogin(package.manifest.displayName)
+                case .needsPluginUpdate:
+                    throw AppBackedProviderRuntimeError.pluginUpdateRequired(preflight.detail)
+                case .timeout:
+                    throw AppBackedProviderRuntimeError.generationTimeout(preflight.detail)
+                case .degraded, .busy:
+                    throw AppBackedProviderRuntimeError.submissionFailed(preflight.detail)
+                case .ready:
+                    break
+                }
+            }
+            appProviderStatusMessages[packageID] = "BUSY · 阶段=harmless_self_test · 正在验证启动 → 前台 → selector → 输入 → 提交 → generation → 回答提取"
             var text = ""
             let request = ChatMessage(role: .user, content: "Harmless provider self-test. Return this marker in the answer: \(marker)")
             for try await event in appBackedProviderRuntime.stream(configuration: configuration, messages: [request], tools: []) {
@@ -747,8 +798,15 @@ public final class CloudCodeViewModel: ObservableObject {
             lastError = nil
             return true
         } catch {
-            appProviderStatusMessages[packageID] = await appProviderStatusLabel(packageID: packageID)
-            lastError = String(describing: error)
+            let snapshot: AppBackedProviderRuntime.StatusSnapshot
+            if let latest = await appBackedProviderRuntime.status(packageID: packageID) {
+                snapshot = latest
+            } else {
+                snapshot = await appBackedProviderRuntime.preflightStatus(packageID: packageID)
+            }
+            let detail = Self.appProviderStatusText(snapshot)
+            appProviderStatusMessages[packageID] = "\(detail) · 错误=\(String(describing: error))"
+            lastError = "App Provider 测试失败：\(String(describing: error))；\(detail)"
             return false
         }
     }
@@ -3595,7 +3653,14 @@ public final class CloudCodeViewModel: ObservableObject {
         }
     }
 
-    public func addCustomProvider(label: String, baseURLText: String, apiKey: String) {
+    public func addCustomProvider(
+        label: String,
+        baseURLText: String,
+        apiKey: String,
+        initialModel: String = "",
+        preferredProtocol: ProviderProtocol = .openAIChat,
+        authMode: ProviderAuthMode = .bearer
+    ) {
         let operationKey = Self.providerKeyMutationOperationKey
         guard beginExclusiveOperation(operationKey) else {
             lastError = "另一个厂商 Key 操作正在进行中。"
@@ -3610,38 +3675,65 @@ public final class CloudCodeViewModel: ObservableObject {
             lastError = "自定义厂商需要名称、安全 HTTPS Base URL 和 API Key。"
             return
         }
+        let manualModel = initialModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let providerID = "custom-\(UUID().uuidString.lowercased())"
         let slotID = "slot-1"
         let reference = ProviderCatalog.keyReference(providerID: providerID, keySlotID: slotID)
         let fingerprint = ProviderFingerprint.sha256(apiKey)
-        activityLines.append("正在发现 \(trimmedLabel) 的模型和协议…")
+        activityLines.append(manualModel.isEmpty
+            ? "正在发现 \(trimmedLabel) 的模型和协议…"
+            : "正在验证 \(trimmedLabel)；若自动发现不兼容，将保留手动模型/协议配置。")
         Task {
             defer { endExclusiveOperation(operationKey) }
-            try? await diagnosticLogStore.log(level: .info, subsystem: "provider-discovery", action: "discover", result: "started", metadata: ["label": trimmedLabel, "host": baseURL.host ?? ""])
+            try? await diagnosticLogStore.log(level: .info, subsystem: "provider-discovery", action: "discover", result: "started", metadata: ["label": trimmedLabel, "host": baseURL.host ?? "", "manualModel": manualModel.isEmpty ? "false" : "true"])
             do {
-                let discovery = try await ProviderDiscoveryClient().discover(baseURL: baseURL, apiKey: apiKey)
-                guard !discovery.models.isEmpty, let preferred = discovery.protocols.first else {
-                    lastError = "厂商发现流程未能验证可用的推理协议。"
-                    return
+                var discovery: ProviderDiscoveryResult?
+                var discoveryFailure: Error?
+                do {
+                    discovery = try await ProviderDiscoveryClient().discover(
+                        baseURL: baseURL,
+                        apiKey: apiKey,
+                        preferredAuthMode: authMode,
+                        fallbackInferenceCandidates: manualModel.isEmpty ? [] : [manualModel],
+                        inferenceProtocols: [preferredProtocol],
+                        allowAlternateAuthModes: false
+                    )
+                } catch {
+                    discoveryFailure = error
                 }
+
+                let discoveredModels = discovery?.models ?? []
+                let discoveredProtocols = discovery?.protocols ?? []
+                let discoveryReady = discovery?.readiness == .ready && !discoveredModels.isEmpty && !discoveredProtocols.isEmpty
+                guard discoveryReady || !manualModel.isEmpty else {
+                    throw discoveryFailure ?? ProviderError.protocolIncompatible("自动发现没有得到可执行模型/协议；请填写一个已知可用的模型 ID，并选择协议/鉴权方式后再添加。")
+                }
+
+                let models = discoveryReady ? discoveredModels : [manualModel]
+                let protocols = discoveryReady ? discoveredProtocols : [preferredProtocol]
+                let resolvedPreferred = protocols.first ?? preferredProtocol
+                let resolvedAuth = discoveryReady ? (discovery?.authMode ?? authMode) : authMode
+                let readiness: ProviderReadiness = discoveryReady ? .ready : .needsValidation
+                let keyStatus: ProviderKeyStatus = discoveryReady ? .verified : .needsValidation
                 let slot = ProviderKeySlot(
                     id: slotID,
                     label: "Key 1",
                     fingerprint: fingerprint,
-                    status: .verified,
-                    models: discovery.models,
-                    protocols: discovery.protocols
+                    status: keyStatus,
+                    models: models,
+                    protocols: protocols,
+                    modelProtocols: discoveryReady ? [models[0]: protocols] : [manualModel: [preferredProtocol]]
                 )
                 let profile = ProviderProfile(
                     id: providerID,
                     displayName: trimmedLabel,
                     baseURL: baseURL,
-                    protocols: discovery.protocols,
-                    preferredProtocol: preferred,
-                    authMode: discovery.authMode,
-                    models: discovery.models,
+                    protocols: protocols,
+                    preferredProtocol: resolvedPreferred,
+                    authMode: resolvedAuth,
+                    models: models,
                     keySlots: [slot],
-                    readiness: discovery.readiness,
+                    readiness: readiness,
                     source: .custom,
                     customModelAllowed: true
                 )
@@ -3661,8 +3753,33 @@ public final class CloudCodeViewModel: ObservableObject {
                     throw error
                 }
                 selectProvider(providerID)
-                activityLines.append("自定义厂商已就绪：\(trimmedLabel)（\(discovery.models.count) 个模型）。")
-                try? await diagnosticLogStore.log(level: .info, subsystem: "provider-discovery", action: "discover", result: "completed", metadata: ["label": trimmedLabel, "models": String(discovery.models.count)])
+                if !discoveryReady {
+                    var overrides = explicitCustomModelOverrides()
+                    overrides.insert(Self.customModelOverrideIdentity(
+                        providerID: providerID,
+                        keySlotID: slotID,
+                        model: manualModel
+                    ))
+                    UserDefaults.standard.set(overrides.sorted(), forKey: Self.explicitCustomModelOverridesDefaultsKey)
+                    selectedModel = manualModel
+                    persistProviderSelection()
+                }
+                if discoveryReady {
+                    providerKeyCheckMessage = "自定义厂商已自动验证：\(trimmedLabel) · \(models.count) 个模型 · \(resolvedPreferred.rawValue) · \(resolvedAuth.rawValue)。"
+                    activityLines.append("自定义厂商已就绪：\(trimmedLabel)（\(models.count) 个模型）。")
+                } else {
+                    providerKeyCheckMessage = "已保存手动中转站配置：\(trimmedLabel) · 模型 \(manualModel) · \(preferredProtocol.rawValue) · \(authMode.rawValue)。自动发现未通过，因此标记 NEEDS_VALIDATION；不会删除你的 Key/中转站配置。"
+                    activityLines.append("\(trimmedLabel) 自动发现未通过，但已按手动模型/协议保存为 NEEDS_VALIDATION；真实请求会继续验证。")
+                }
+                lastError = nil
+                try? await diagnosticLogStore.log(
+                    level: discoveryReady ? .info : .warning,
+                    subsystem: "provider-discovery",
+                    action: "discover",
+                    result: discoveryReady ? "completed" : "manual-fallback-saved",
+                    error: discoveryFailure,
+                    metadata: ["label": trimmedLabel, "models": String(models.count), "protocol": resolvedPreferred.rawValue, "authMode": resolvedAuth.rawValue]
+                )
             } catch {
                 try? keyVault.remove(reference)
                 providerProfiles.removeAll { $0.id == providerID }

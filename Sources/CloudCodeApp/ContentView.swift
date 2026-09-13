@@ -1923,16 +1923,17 @@ private struct SettingsView: View {
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                         }
-                        HStack {
-                            Button("允许使用") {
-                                Task { await model.setAppProviderUseConsent(packageID: package.id, enabled: true) }
-                            }
-                            Button("撤销授权", role: .destructive) {
-                                Task { await model.setAppProviderUseConsent(packageID: package.id, enabled: false) }
+                        Button("刷新授权 / 可用性状态") {
+                            Task { await model.refreshAppProviderStatus(packageID: package.id) }
+                        }
+                        Button("授权并运行无副作用测试") {
+                            Task {
+                                guard await model.setAppProviderUseConsent(packageID: package.id, enabled: true) else { return }
+                                _ = await model.testAppProvider(packageID: package.id)
                             }
                         }
-                        Button("无副作用测试") {
-                            Task { _ = await model.testAppProvider(packageID: package.id) }
+                        Button("撤销授权", role: .destructive) {
+                            Task { _ = await model.setAppProviderUseConsent(packageID: package.id, enabled: false) }
                         }
                         Button("导出当前 Provider Package") {
                             Task {
@@ -2077,6 +2078,9 @@ private struct SettingsView: View {
                 Task {
                     await model.reloadInteractionLearning()
                     await model.reloadAppProviderPackages()
+                    if let package = model.selectedAppProviderPackage {
+                        await model.refreshAppProviderStatus(packageID: package.id)
+                    }
                     _ = await model.refreshSelectedProviderModelCatalog(showStatus: false)
                 }
             }
@@ -2216,6 +2220,9 @@ private struct CustomProviderSheet: View {
     @State private var label = ""
     @State private var baseURL = ""
     @State private var apiKey = ""
+    @State private var initialModel = ""
+    @State private var preferredProtocol: ProviderProtocol = .openAIChat
+    @State private var authMode: ProviderAuthMode = .bearer
 
     var body: some View {
         NavigationStack {
@@ -2228,9 +2235,22 @@ private struct CustomProviderSheet: View {
                     SecureField("API Key", text: $apiKey)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                    TextField("已知可用模型 ID（建议填写）", text: $initialModel)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Picker("协议", selection: $preferredProtocol) {
+                        Text("OpenAI Chat").tag(ProviderProtocol.openAIChat)
+                        Text("OpenAI Responses").tag(ProviderProtocol.openAIResponses)
+                        Text("Anthropic Messages").tag(ProviderProtocol.anthropic)
+                    }
+                    Picker("鉴权", selection: $authMode) {
+                        Text("Bearer").tag(ProviderAuthMode.bearer)
+                        Text("x-api-key").tag(ProviderAuthMode.xAPIKey)
+                        Text("Bearer + x-api-key").tag(ProviderAuthMode.both)
+                    }
                 }
                 Section {
-                    Text("Cloud Code 会发现 /v1/models，并使用最小请求验证 Anthropic Messages、OpenAI Chat 和 OpenAI Responses。Key 只保存到 Keychain。")
+                    Text("Cloud Code 会优先自动发现 /v1/models 并做最小推理验证。若中转站的模型目录不标准，只要你填写已知可用模型 ID、协议和鉴权方式，配置仍会保存为 NEEDS_VALIDATION，真实调用时继续验证；不会因为 /models 不兼容就删除中转站或 Key。Key 只保存到 Keychain。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -2242,7 +2262,14 @@ private struct CustomProviderSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("添加") {
-                        model.addCustomProvider(label: label, baseURLText: baseURL, apiKey: apiKey)
+                        model.addCustomProvider(
+                            label: label,
+                            baseURLText: baseURL,
+                            apiKey: apiKey,
+                            initialModel: initialModel,
+                            preferredProtocol: preferredProtocol,
+                            authMode: authMode
+                        )
                         apiKey = ""
                         isPresented = false
                     }

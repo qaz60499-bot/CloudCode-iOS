@@ -48,12 +48,19 @@ struct AppProviderManagementView: View {
                         HStack {
                             Button("使用") { model.selectAppProviderPackage(package.id) }
                                 .disabled(!package.enabled)
-                            Button("授权") {
-                                Task { await model.setAppProviderUseConsent(packageID: package.id, enabled: true) }
+                            Button("状态") {
+                                Task { await model.refreshAppProviderStatus(packageID: package.id) }
+                            }
+                                .disabled(!package.enabled)
+                            Button("授权+测试") {
+                                Task {
+                                    guard await model.setAppProviderUseConsent(packageID: package.id, enabled: true) else { return }
+                                    _ = await model.testAppProvider(packageID: package.id)
+                                }
                             }
                                 .disabled(!package.enabled)
                             Button("撤销") {
-                                Task { await model.setAppProviderUseConsent(packageID: package.id, enabled: false) }
+                                Task { _ = await model.setAppProviderUseConsent(packageID: package.id, enabled: false) }
                             }
                             Button("探测") {
                                 Task { _ = await model.probeAppProviderSetup(packageID: package.id) }
@@ -95,8 +102,18 @@ struct AppProviderManagementView: View {
             }
         }
         .navigationTitle("App Provider")
-        .refreshable { await model.reloadAppProviderPackages() }
-        .task { await model.reloadAppProviderPackages() }
+        .refreshable {
+            await model.reloadAppProviderPackages()
+            for package in model.appProviderPackages where package.enabled {
+                await model.refreshAppProviderStatus(packageID: package.id)
+            }
+        }
+        .task {
+            await model.reloadAppProviderPackages()
+            for package in model.appProviderPackages where package.enabled {
+                await model.refreshAppProviderStatus(packageID: package.id)
+            }
+        }
         .sheet(isPresented: $showBuilder) {
             CustomAppProviderSheet(model: model, isPresented: $showBuilder)
         }

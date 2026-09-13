@@ -194,15 +194,71 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         ProviderImageCapabilityAssessment(capability: .textOnly, source: "app_backed_text_composer")
     }
 
-    public func setAuthorized(_ authorized: Bool, packageID: String) async {
-        if authorized, let package = try? await packageStore.package(id: packageID) {
-            await authorizationStore.setAuthorized(true, identity: Self.authorizationIdentity(for: package), packageID: packageID)
-        } else {
+    @discardableResult
+    public func setAuthorized(_ authorized: Bool, packageID: String) async -> Bool {
+        guard let package = try? await packageStore.package(id: packageID) else {
             await authorizationStore.setAuthorized(false, identity: "", packageID: packageID)
+            return false
         }
+        let identity = Self.authorizationIdentity(for: package)
+        await authorizationStore.setAuthorized(authorized, identity: identity, packageID: packageID)
+        let persisted = await authorizationStore.isAuthorized(identity: identity)
+        return authorized ? persisted : !persisted
     }
 
     func status(packageID: String) -> StatusSnapshot? { lastSnapshots[packageID] }
+
+    func preflightStatus(packageID: String) async -> StatusSnapshot {
+        guard let package = try? await packageStore.package(id: packageID), package.summary.enabled else {
+            return StatusSnapshot(
+                state: .needsAuthorization,
+                hostState: .classify,
+                detail: "Provider Package 不存在或已停用",
+                appVersion: nil,
+                responseExtractionRoute: nil,
+                generationLatencyMS: nil
+            )
+        }
+        guard let introspection = await appResolver.appIntrospection(bundleID: package.summary.manifest.bundleID) else {
+            return StatusSnapshot(
+                state: .notInstalled,
+                hostState: .checkInstalled,
+                detail: "未检测到目标 App：\(package.summary.manifest.bundleID)",
+                appVersion: nil,
+                responseExtractionRoute: nil,
+                generationLatencyMS: nil
+            )
+        }
+        let identity = Self.authorizationIdentity(for: package)
+        guard await authorizationStore.isAuthorized(identity: identity) else {
+            return StatusSnapshot(
+                state: .needsAuthorization,
+                hostState: .checkAuthorization,
+                detail: "目标 App 已安装，但尚未授权 Cloud Code 使用该 Provider Package",
+                appVersion: introspection.version,
+                responseExtractionRoute: nil,
+                generationLatencyMS: nil
+            )
+        }
+        guard Self.versionCompatible(introspection.version, compatibility: package.summary.manifest.compatibility) else {
+            return StatusSnapshot(
+                state: .needsPluginUpdate,
+                hostState: .checkCompatibility,
+                detail: "已授权，但当前 App 版本 \(introspection.version) 超出 Provider Package 声明兼容范围",
+                appVersion: introspection.version,
+                responseExtractionRoute: nil,
+                generationLatencyMS: nil
+            )
+        }
+        return StatusSnapshot(
+            state: .ready,
+            hostState: .checkCompatibility,
+            detail: "已安装、已授权、版本兼容；可运行 harmless marker 测试验证 selector / 提交 / 回答提取链路",
+            appVersion: introspection.version,
+            responseExtractionRoute: nil,
+            generationLatencyMS: nil
+        )
+    }
 
     func setupProbe(packageID: String) async throws -> SetupProbe {
         let package = try await packageStore.package(id: packageID)
