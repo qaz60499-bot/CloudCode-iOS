@@ -1152,7 +1152,7 @@ public actor AppProviderPackageStore {
             bundleID: "com.deepseek.chat",
             launchSchemes: ["deepseek", "dpsk"],
             declaredCapabilities: capabilities,
-            compatibility: .init(testedAppVersion: "2.3.3", selectorRevision: "1"),
+            compatibility: .init(testedAppVersion: "2.5.1", selectorRevision: "1"),
             responseExtractors: extractors
         )
         let deepseekSelectors = AppProviderSelectorSet(
@@ -1171,9 +1171,9 @@ public actor AppProviderPackageStore {
             id: "ai.chatgpt.app",
             displayName: "ChatGPT App",
             bundleID: "com.openai.chat",
-            launchSchemes: ["chatgpt"],
+            launchSchemes: ["com.openai.chat", "openai", "chatgpt"],
             declaredCapabilities: capabilities,
-            compatibility: .init(selectorRevision: "1"),
+            compatibility: .init(testedAppVersion: "1.2024.348", selectorRevision: "1"),
             responseExtractors: extractors
         )
         let chatgptSelectors = AppProviderSelectorSet(

@@ -12,7 +12,8 @@ final class AppProviderPackageStoreTests: XCTestCase {
 
         XCTAssertEqual(Set(packages.map(\.id)), Set(["ai.gemini.app", "ai.deepseek.app", "ai.chatgpt.app"]))
         XCTAssertEqual(packages.first(where: { $0.id == "ai.gemini.app" })?.manifest.bundleID, "com.google.gemini")
-        XCTAssertEqual(packages.first(where: { $0.id == "ai.deepseek.app" })?.manifest.compatibility.testedAppVersion, "2.3.3")
+        XCTAssertEqual(packages.first(where: { $0.id == "ai.deepseek.app" })?.manifest.compatibility.testedAppVersion, "2.5.1")
+        XCTAssertEqual(packages.first(where: { $0.id == "ai.chatgpt.app" })?.manifest.compatibility.testedAppVersion, "1.2024.348")
         XCTAssertTrue(packages.allSatisfy { $0.manifest.supportsBackgroundGeneration == false })
     }
 
