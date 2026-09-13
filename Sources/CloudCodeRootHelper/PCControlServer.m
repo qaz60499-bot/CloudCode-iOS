@@ -201,14 +201,19 @@ static int CloudCodePCRunOneShot(const char *executablePath, NSArray<NSString *>
     return CloudCodePCRunOneShotWithTimeout(executablePath, arguments, CLOUDCODE_PC_CONTROL_CHILD_TIMEOUT_MS);
 }
 
+static BOOL CloudCodePCIsSafeBundleIdentifier(NSString *bundleID)
+{
+    if (!bundleID.length || bundleID.length > 255) { return NO; }
+    NSCharacterSet *bundleAllowed = [NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_"];
+    return [[bundleID stringByTrimmingCharactersInSet:bundleAllowed] length] == 0;
+}
+
 static BOOL CloudCodePCIsSafeInstallRequest(NSString *path, NSString *bundleID, NSString *build)
 {
     if (!path.length || !bundleID.length || !build.length) { return NO; }
-    if (path.length > 4096 || bundleID.length > 255 || build.length > 32) { return NO; }
+    if (path.length > 4096 || build.length > 32 || !CloudCodePCIsSafeBundleIdentifier(bundleID)) { return NO; }
     if (![path hasPrefix:@"/var/mobile/Media/Downloads/"] || ![path.lowercaseString hasSuffix:@".ipa"]) { return NO; }
     if ([path containsString:@".."] || [path containsString:@"\n"] || [path containsString:@"\r"]) { return NO; }
-    NSCharacterSet *bundleAllowed = [NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_"];
-    if ([[bundleID stringByTrimmingCharactersInSet:bundleAllowed] length] != 0) { return NO; }
     NSCharacterSet *buildAllowed = NSCharacterSet.decimalDigitCharacterSet;
     if ([[build stringByTrimmingCharactersInSet:buildAllowed] length] != 0) { return NO; }
     return YES;
@@ -283,6 +288,12 @@ static NSDictionary *CloudCodePCActionResponse(const char *executablePath, NSDic
         NSData *textData = [text dataUsingEncoding:NSUTF8StringEncoding];
         NSString *encoded = [textData base64EncodedStringWithOptions:0];
         arguments = @[@"gui-type-base64", encoded];
+    } else if ([operation isEqualToString:@"launch-app"]) {
+        NSString *bundleID = [request[@"bundleID"] isKindOfClass:NSString.class] ? request[@"bundleID"] : nil;
+        if (!CloudCodePCIsSafeBundleIdentifier(bundleID)) {
+            return @{@"ok": @NO, @"op": operation, @"error": @"invalid-bundle-id"};
+        }
+        arguments = @[@"launch", bundleID];
     } else if ([operation isEqualToString:@"install-ipa"]) {
         NSString *path = [request[@"path"] isKindOfClass:NSString.class] ? request[@"path"] : nil;
         NSString *bundleID = [request[@"bundleID"] isKindOfClass:NSString.class] ? request[@"bundleID"] : nil;
