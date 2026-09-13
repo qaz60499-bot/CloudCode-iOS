@@ -649,13 +649,20 @@ jobs:
               raise SystemExit('FAIL: local Vision/OCR capability is no longer independently represented from AX tree')
           if '#define CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS 0.25f' not in gui_text:
               raise SystemExit('FAIL: AX per-request timeout budget must remain fail-fast for detached/mobile AX clients')
-          for marker in ('AXUIElementCopyMultipleAttributeValues', 'AXUIElementCopyElementWithParameters', 'typedef CloudCodeAXError (*CloudCodeAXCopyElementAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, float, float);', 'runtime.copyElementAtPosition(systemWide, &candidate, (float)points[index].x, (float)points[index].y)', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic', 'CloudCodeAXApplicationAtScreenPointRoot', 'CloudCodeAXParameterizedElementAtPoint', 'CloudCodeAXNodeLimited', 'CloudCodeAXNodeLimited(runtime, candidate, 0, 0, &localNodeCount)', 'semanticNodeCount', 'AccessibilityUI.AXAudit.AXElement', 'initWithIdentifier:serviceBundleName:', 'AXAuditAXUIClientIdentifier', 'AXAuditAXUIService', 'primaryApp', 'explorerElements', 'CloudCodeAXAuditEditingTextElement', 'CLOUDCODE_AX_TRAIT_IS_EDITING', 'CLOUDCODE_AX_TRAIT_SECURE_TEXT_FIELD', 'CFSTR("AXFocused")', 'focusSource=%@', 'Never treat a merely unique text-like element as focused', 'AccessibilityUI.AXAudit.editing.insertText', 'write-unverified', 'CloudCodePIDForBundleIdentifier'):
+          for marker in ('AXUIElementCopyMultipleAttributeValues', 'AXUIElementCopyElementWithParameters', 'typedef CloudCodeAXError (*CloudCodeAXCopyElementAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, float, float);', 'runtime.copyElementAtPosition(systemWide, &candidate, (float)points[index].x, (float)points[index].y)', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic', 'CloudCodeAXApplicationAtScreenPointRoot', 'CloudCodeAXParameterizedElementAtPoint', 'CloudCodeAXNodeLimited', 'CloudCodeAXNodeLimited(runtime, candidate, 0, 0, &localNodeCount)', 'semanticNodeCount', 'AccessibilityUI.AXAudit.AXElement', 'initWithIdentifier:serviceBundleName:', 'AXAuditAXUIClientIdentifier', 'AXAuditAXUIService', 'primaryApp', 'explorerElements', 'CloudCodeAXAuditEditingTextElement', 'CLOUDCODE_AX_TRAIT_IS_EDITING', 'CLOUDCODE_AX_TRAIT_SECURE_TEXT_FIELD', 'CFSTR("AXFocused")', 'focusSource=%@', 'Never treat a merely unique text-like element as focused', 'CloudCodePIDForBundleIdentifier'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: AX runtime lost bounded standalone/context-bound capability marker: {marker}')
-          unverified_type_marker = 'gui-type: route=hid-unicode result=dispatched-unverified'
-          unverified_type_index = gui_text.find(unverified_type_marker)
-          if unverified_type_index < 0 or 'CloudCodeGUIExitOneShot(70);' not in gui_text[unverified_type_index:unverified_type_index + 800]:
-              raise SystemExit('FAIL: unverified HID text dispatch must fail closed instead of reporting gui.type success')
+          for forbidden_ax_text_write_marker in ('AccessibilityUI.AXAudit.editing.insertText', 'route=ax-focused-value result=verified', 'route=ax-focused-value result=write-unverified'):
+              if forbidden_ax_text_write_marker in gui_text:
+                  raise SystemExit(f'FAIL: production text input reintroduced AX write path: {forbidden_ax_text_write_marker}')
+          if 'gui-type: route=hid-unicode result=dispatched-unverified-no-ax' not in gui_text:
+              raise SystemExit('FAIL: production gui.type no longer reports unverified no-AX HID dispatch')
+          if '文本输入已通过无 AX 的受控 HID 路径派发；语义结果必须由后续截图/OCR 验证。' not in adapters:
+              raise SystemExit('FAIL: GUI adapter no longer preserves screenshot/OCR postcondition after no-AX HID text dispatch')
+          action_observe = adapters.split('private func executeActionObserve(_ call: ToolCall)', 1)[1].split('private func executeStructuredPlan(_ call: ToolCall)', 1)[0]
+          for marker in ('case "gui.typeObserve":', 'let observed = try await backend.screenshot()', '"effectVerification": "semantic_required"', 'await enrichWithLocalVision(&payload, screenshot: observed)'):
+              if marker not in action_observe:
+                  raise SystemExit(f'FAIL: gui.typeObserve lost local screenshot/OCR semantic postcondition: {marker}')
           for marker in ('_AXSAutomationEnabled', 'CloudCodeGUIRestoreAXAutomationForProcessExit();', 'automation_lease=%d', 'automation_write=disabled'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: passive AX automation-state observation path missing required marker: {marker}')
