@@ -201,6 +201,125 @@ static int CloudCodePCRunOneShot(const char *executablePath, NSArray<NSString *>
     return CloudCodePCRunOneShotWithTimeout(executablePath, arguments, CLOUDCODE_PC_CONTROL_CHILD_TIMEOUT_MS);
 }
 
+static NSString *CloudCodePCFindAppStorePlusHelper(void)
+{
+    NSString *applicationRoot = @"/var/containers/Bundle/Application";
+    NSArray<NSString *> *containers = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:applicationRoot error:nil] ?: @[];
+    for (NSString *container in containers) {
+        NSString *candidate = [[[applicationRoot stringByAppendingPathComponent:container]
+            stringByAppendingPathComponent:@"AppStorePlus.app"]
+            stringByAppendingPathComponent:@"ASPSystemLogHelper"];
+        BOOL isDirectory = NO;
+        if ([[NSFileManager defaultManager] fileExistsAtPath:candidate isDirectory:&isDirectory] && !isDirectory) {
+            return candidate;
+        }
+    }
+    return nil;
+}
+
+static NSDictionary *CloudCodePCCheckChatGPTStoreVersions(void)
+{
+    static NSString * const adamID = @"6448311069";
+    static NSString * const targetExternalID = @"871595991";
+    static NSString * const rollbackExternalID = @"871272831";
+    NSString *helper = CloudCodePCFindAppStorePlusHelper();
+    if (!helper.length) {
+        return @{@"ok": @NO, @"op": @"appstore-version-check", @"error": @"appstoreplus-helper-not-found"};
+    }
+
+    int outputPipe[2] = {-1, -1};
+    if (pipe(outputPipe) != 0) {
+        return @{@"ok": @NO, @"op": @"appstore-version-check", @"error": @"pipe-failed"};
+    }
+
+    const char *argv[] = {
+        helper.fileSystemRepresentation,
+        "--store-versions",
+        adamID.UTF8String,
+        NULL
+    };
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        close(outputPipe[0]); close(outputPipe[1]);
+        return @{@"ok": @NO, @"op": @"appstore-version-check", @"error": @"spawn-actions-failed"};
+    }
+    (void)posix_spawn_file_actions_adddup2(&actions, outputPipe[1], STDOUT_FILENO);
+    (void)posix_spawn_file_actions_adddup2(&actions, outputPipe[1], STDERR_FILENO);
+    (void)posix_spawn_file_actions_addclose(&actions, outputPipe[0]);
+    (void)posix_spawn_file_actions_addclose(&actions, outputPipe[1]);
+
+    pid_t pid = 0;
+    int spawnResult = posix_spawn(&pid, helper.fileSystemRepresentation, &actions, NULL, (char * const *)argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(outputPipe[1]);
+    if (spawnResult != 0 || pid <= 1) {
+        close(outputPipe[0]);
+        return @{@"ok": @NO, @"op": @"appstore-version-check", @"error": @"spawn-failed", @"spawnCode": @(spawnResult)};
+    }
+
+    int flags = fcntl(outputPipe[0], F_GETFL, 0);
+    if (flags >= 0) { (void)fcntl(outputPipe[0], F_SETFL, flags | O_NONBLOCK); }
+    NSMutableData *captured = [NSMutableData data];
+    const NSUInteger captureLimit = 2 * 1024 * 1024;
+    const double deadline = CloudCodePCMonotonicSeconds() + 35.0;
+    int status = 0;
+    BOOL childExited = NO;
+    BOOL timedOut = NO;
+    for (;;) {
+        uint8_t buffer[4096];
+        ssize_t count = read(outputPipe[0], buffer, sizeof(buffer));
+        if (count > 0 && captured.length < captureLimit) {
+            NSUInteger remaining = captureLimit - captured.length;
+            [captured appendBytes:buffer length:MIN((NSUInteger)count, remaining)];
+        }
+        pid_t waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid) { childExited = YES; }
+        if (childExited) {
+            for (;;) {
+                count = read(outputPipe[0], buffer, sizeof(buffer));
+                if (count <= 0) { break; }
+                if (captured.length < captureLimit) {
+                    NSUInteger remaining = captureLimit - captured.length;
+                    [captured appendBytes:buffer length:MIN((NSUInteger)count, remaining)];
+                }
+            }
+            break;
+        }
+        if (CloudCodePCMonotonicSeconds() >= deadline) {
+            timedOut = YES;
+            (void)kill(pid, SIGKILL);
+            do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+            break;
+        }
+        usleep(20000);
+    }
+    close(outputPipe[0]);
+
+    NSString *text = [[NSString alloc] initWithData:captured encoding:NSUTF8StringEncoding] ?: @"";
+    BOOL targetSeen = [text containsString:targetExternalID];
+    BOOL rollbackSeen = [text containsString:rollbackExternalID];
+    BOOL targetVersionSeen = [text containsString:@"1.2025.007"];
+    BOOL rollbackVersionSeen = [text containsString:@"1.2024.348"];
+    int exitCode = 72;
+    if (WIFEXITED(status)) { exitCode = WEXITSTATUS(status); }
+    else if (WIFSIGNALED(status)) { exitCode = 128 + WTERMSIG(status); }
+
+    return @{
+        @"ok": @(!timedOut && exitCode == 0),
+        @"op": @"appstore-version-check",
+        @"adamID": adamID,
+        @"targetExternalID": targetExternalID,
+        @"rollbackExternalID": rollbackExternalID,
+        @"targetSeen": @(targetSeen),
+        @"rollbackSeen": @(rollbackSeen),
+        @"targetVersionSeen": @(targetVersionSeen),
+        @"rollbackVersionSeen": @(rollbackVersionSeen),
+        @"capturedBytes": @(captured.length),
+        @"exitCode": @(exitCode),
+        @"timedOut": @(timedOut)
+    };
+}
+
 static BOOL CloudCodePCIsSafeInstallRequest(NSString *path, NSString *bundleID, NSString *build)
 {
     if (!path.length || !bundleID.length || !build.length) { return NO; }
@@ -242,6 +361,9 @@ static NSDictionary *CloudCodePCActionResponse(const char *executablePath, NSDic
     if ([operation isEqualToString:@"shutdown"]) {
         if (shutdown) { *shutdown = YES; }
         return @{@"ok": @YES, @"op": operation, @"pid": @(getpid())};
+    }
+    if ([operation isEqualToString:@"appstore-version-check"]) {
+        return CloudCodePCCheckChatGPTStoreVersions();
     }
 
     NSArray<NSString *> *arguments = nil;
