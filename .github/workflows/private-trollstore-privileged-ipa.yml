@@ -70,6 +70,7 @@ jobs:
           print("PASS: targeted CI core/helper gates passed for validated source commit")
           PY
 
+          git fetch --no-tags --depth=2 origin "$VALIDATED_SOURCE_SHA"
           VALIDATED_PARENT="$(git rev-parse "$VALIDATED_SOURCE_SHA^")"
           BASE_RUNS_JSON="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ios-ci.yml --commit "$VALIDATED_PARENT" --status completed --limit 10 --json conclusion,headSha,databaseId)"
           python3 - "$VALIDATED_PARENT" "$BASE_RUNS_JSON" <<'PY'
