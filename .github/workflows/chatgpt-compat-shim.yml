@@ -1,0 +1,103 @@
+name: ChatGPT compatibility shim audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-authenticated-shim:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Show Apple toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun clang --version
+
+      - name: Build authenticated compatibility shim
+        run: |
+          set -euo pipefail
+          SRC='tools/chatgpt-compat/ChatGPTCompatibility.authenticated.c'
+          OUT="$RUNNER_TEMP/chatgpt-compat-shim"
+          mkdir -p "$OUT"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          CLANG="$(xcrun --find clang)"
+          COMMON=(
+            -isysroot "$SDK"
+            -miphoneos-version-min=16.6
+            -dynamiclib
+            -O2
+            -fno-common
+            -Werror
+            -Wl,-install_name,@rpath/ChatGPTCompatibility.dylib
+            -Wl,-dead_strip
+            -L "$SDK/usr/lib/swift"
+            -lswiftCore
+          )
+
+          set +e
+          "$CLANG" -target arm64-apple-ios16.6 -march=armv8.3-a "${COMMON[@]}" "$SRC" -o "$OUT/ChatGPTCompatibility.arm64.dylib" >"$OUT/arm64.stdout.log" 2>"$OUT/arm64.stderr.log"
+          ARM64_RC=$?
+          "$CLANG" -target arm64e-apple-ios16.6 "${COMMON[@]}" "$SRC" -o "$OUT/ChatGPTCompatibility.arm64e.dylib" >"$OUT/arm64e.stdout.log" 2>"$OUT/arm64e.stderr.log"
+          ARM64E_RC=$?
+          set -e
+
+          printf 'arm64=%s\narm64e=%s\n' "$ARM64_RC" "$ARM64E_RC" | tee "$OUT/build-status.txt"
+          if [[ "$ARM64_RC" -ne 0 && "$ARM64E_RC" -ne 0 ]]; then
+            cat "$OUT/arm64.stderr.log" >&2 || true
+            cat "$OUT/arm64e.stderr.log" >&2 || true
+            exit 2
+          fi
+
+          for f in "$OUT"/*.dylib; do
+            [[ -e "$f" ]] || continue
+            base="${f%.dylib}"
+            shasum -a 256 "$f" >"$base.sha256.txt"
+            file "$f" >"$base.file.txt"
+            xcrun otool -hv "$f" >"$base.header.txt"
+            xcrun otool -l "$f" >"$base.loadcmds.txt"
+            xcrun nm -gU "$f" >"$base.nm.txt"
+            xcrun otool -tvV "$f" >"$base.disasm.txt"
+          done
+
+      - name: Validate exported ABI and authenticated instructions
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/chatgpt-compat-shim"
+          required=(
+            _swift_conformsToProtocol2
+            _swift_getOpaqueTypeConformance2
+            _swift_getOpaqueTypeMetadata2
+            _swift_getTypeByMangledNameInContext2
+            _swift_getTypeByMangledNameInContextInMetadataState2
+          )
+          found_any=0
+          for f in "$OUT"/*.dylib; do
+            [[ -e "$f" ]] || continue
+            found_any=1
+            for sym in "${required[@]}"; do
+              xcrun nm -gU "$f" | grep -F "$sym" >/dev/null
+            done
+            # ptrauth_auth_data must compile to an authenticated data-pointer operation,
+            # not only XPACD stripping. Accept the assembler mnemonic variants emitted
+            # by current Apple LLVM.
+            xcrun otool -tvV "$f" | grep -E '\b(autda|autdza|pacda|pacdza)\b' >/dev/null
+            xcrun otool -l "$f" | grep -A4 LC_BUILD_VERSION | grep -E 'minos +16\.6' >/dev/null
+            xcrun otool -D "$f" | grep -F '@rpath/ChatGPTCompatibility.dylib' >/dev/null
+          done
+          test "$found_any" = 1
+
+      - name: Upload audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatgpt-compat-authenticated-shim
+          path: ${{ runner.temp }}/chatgpt-compat-shim
+          if-no-files-found: error
