@@ -640,9 +640,11 @@ jobs:
               if marker not in host_ax:
                   raise SystemExit(f'FAIL: Build123 host-context AX evidence probe lost required marker: {marker}')
           perception_probe = Path('Sources/CloudCodeApp/PerceptionProbeView.swift').read_text(encoding='utf-8')
-          for marker in ('CloudCodeHostAXProbeJSON', 'ax-host', 'ax-detached-control', 'Do not mechanically rerun the 24 old'):
+          for marker in ('CloudCodeHostAXProbeJSON', 'let hostBody = await MainActor.run', 'ax-host', 'ax-detached-control', 'Do not mechanically rerun the 24 old'):
               if marker not in perception_probe:
-                  raise SystemExit(f'FAIL: physical AX regression no longer prioritizes host-context evidence: {marker}')
+                  raise SystemExit(f'FAIL: physical AX regression no longer prioritizes main-thread host-context evidence: {marker}')
+          if 'let hostBody = await Task.detached' in perception_probe:
+              raise SystemExit('FAIL: AXFrontBoard host probe must not run from Task.detached; iOS 16.6 traps FrontBoard off-main-thread access')
           if 'for seed in ["systemWide", "application", "pid0", "springboard"]' in perception_probe:
               raise SystemExit('FAIL: physical AX regression reintroduced the already-exhausted 24-group detached matrix')
           if 'case ocr' not in tool_router_text or 'local OCR must remain independently reportable when AX tree is unavailable' not in Path('Tests/CloudCodeCoreTests/CloudCodeCoreTests.swift').read_text(encoding='utf-8'):

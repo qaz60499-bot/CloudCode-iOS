@@ -70,7 +70,10 @@ extension CloudCodeViewModel {
                 // change the decision: one bounded System-app host probe plus two detached ios-mcp
                 // controls for execution-context comparison. Do not mechanically rerun the 24 old
                 // combinations on every regression.
-                let hostBody = await Task.detached { () -> [String: String] in
+                // AXFrontBoard/FrontBoardServices enforces main-thread access on iOS 16.6.
+                // Keep the System-app host probe on MainActor; only detached helper controls
+                // below are allowed to leave the main actor.
+                let hostBody = await MainActor.run { () -> [String: String] in
                     var diagnostic: NSString?
                     let payload = CloudCodeHostAXProbeJSON(&diagnostic)
                     return [
@@ -78,7 +81,7 @@ extension CloudCodeViewModel {
                         "stdout": payload ?? "",
                         "stderr": diagnostic as String? ?? ""
                     ]
-                }.value
+                }
                 await record("ax-host", [
                     "executionContext": "system-app-host",
                     "result": hostBody
