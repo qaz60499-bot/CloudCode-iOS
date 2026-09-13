@@ -1,0 +1,66 @@
+name: ChatGPT Modern Shell iOS16
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/chatgpt-modern-shell-20260913
+    paths:
+      - 'ChatGPTModernShell/**'
+      - '.github/workflows/chatgpt-modern-shell.yml'
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          brew install xcodegen ldid
+
+      - name: Generate Xcode project
+        run: |
+          xcodegen generate --spec ChatGPTModernShell/project.yml --project ChatGPTModernShell
+
+      - name: Build iOS 16.6 device app
+        run: |
+          xcodebuild \
+            -project ChatGPTModernShell/ChatGPTModernShell.xcodeproj \
+            -scheme ChatGPTModernShell \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Package TrollStore candidate IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/ChatGPTModernShell.app"
+          test -d "$APP"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist"
+          ldid -S "$APP/ChatGPTModernShell"
+          mkdir -p "$RUNNER_TEMP/package/Payload"
+          cp -a "$APP" "$RUNNER_TEMP/package/Payload/"
+          cd "$RUNNER_TEMP/package"
+          /usr/bin/zip -qry "$GITHUB_WORKSPACE/ChatGPTModernShell_iOS16.6_TrollStore.ipa" Payload
+          cd "$GITHUB_WORKSPACE"
+          shasum -a 256 ChatGPTModernShell_iOS16.6_TrollStore.ipa | tee ChatGPTModernShell_iOS16.6_TrollStore.ipa.sha256
+          /usr/bin/unzip -l ChatGPTModernShell_iOS16.6_TrollStore.ipa | head -n 30
+          xcrun otool -l "$APP/ChatGPTModernShell" | grep -A5 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS' | head -n 20
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChatGPTModernShell-iOS16.6-TrollStore
+          path: |
+            ChatGPTModernShell_iOS16.6_TrollStore.ipa
+            ChatGPTModernShell_iOS16.6_TrollStore.ipa.sha256
+          if-no-files-found: error
+          retention-days: 14

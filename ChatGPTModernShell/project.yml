@@ -1,0 +1,29 @@
+name: ChatGPTModernShell
+options:
+  deploymentTarget:
+    iOS: "16.6"
+settings:
+  base:
+    IPHONEOS_DEPLOYMENT_TARGET: "16.6"
+    SWIFT_VERSION: "5.9"
+targets:
+  ChatGPTModernShell:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.6"
+    sources:
+      - Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.chatgptmodern
+        PRODUCT_NAME: ChatGPTModernShell
+        MARKETING_VERSION: 1.0.0
+        CURRENT_PROJECT_VERSION: 1
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: "ChatGPT Modern"
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: NO
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
