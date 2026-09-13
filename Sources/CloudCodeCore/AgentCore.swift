@@ -2484,14 +2484,54 @@ public actor AgentCore {
                                         || result.payload["treeSHA256"] != nil
                                         || result.attachments?.contains(where: { $0.mimeType.lowercased().hasPrefix("image/") }) == true
                                     if carriesPerceptionEvidence {
+                                        // Only an already verified GUI scope may be injected as foreground authority.
+                                        // An accepted-but-unverified launch is an expectation, not an observation; feeding
+                                        // it into the frame would make a screenshot/OCR result appear to prove foreground.
                                         lastObservationFrame = PerceptionBrokerFacade.frame(
                                             from: result,
-                                            foregroundBundleID: currentGUIBundleID ?? lastAcceptedUnverifiedLaunchBundleID,
+                                            foregroundBundleID: currentGUIBundleID,
                                             genericSurface: taskRuntimeState?.genericSurface ?? .unknown,
                                             semanticSurface: taskRuntimeState?.semanticSurface,
                                             axCircuitOpen: guiTreeFailedForCurrentForegroundState,
                                             ocrCircuitOpen: taskRuntimeState?.perception.ocr == .circuitOpen
                                         )
+                                        if currentGUIBundleID == nil,
+                                           let verifiedBundleID = Self.verifiedPendingForegroundBundleFromAX(
+                                               result: result,
+                                               pendingBundleID: lastAcceptedUnverifiedLaunchBundleID
+                                           ) {
+                                            currentGUIBundleID = verifiedBundleID
+                                            lastAcceptedUnverifiedLaunchBundleID = nil
+                                            checkpoint.payload["tool.currentGUIBundleID"] = verifiedBundleID
+                                            checkpoint.payload.removeValue(forKey: "tool.pendingForegroundVerificationBundleID")
+                                            checkpoint.payload.removeValue(forKey: "tool.pendingForegroundVerificationObservationAttempted")
+                                            if let contract = taskContract, var runtime = taskRuntimeState {
+                                                runtime.currentBundleID = verifiedBundleID
+                                                runtime.pendingForegroundVerificationBundleID = nil
+                                                runtime.pendingForegroundVerificationObservationAttempted = false
+                                                runtime.reconcileObligationProgress(contract: contract)
+                                                taskRuntimeState = runtime
+                                                TaskSemanticCheckpointCodec.persist(
+                                                    contract: contract,
+                                                    runtime: runtime,
+                                                    payload: &checkpoint.payload
+                                                )
+                                            }
+                                            try? await diagnosticLogger?.log(
+                                                level: .info,
+                                                subsystem: "semantic_runtime",
+                                                action: "foreground-reconcile",
+                                                result: "verified_by_ax",
+                                                sessionID: session.id,
+                                                toolCallID: call.id,
+                                                metadata: [
+                                                    "bundleID": verifiedBundleID,
+                                                    "source": "fresh_ax_exact_bundle",
+                                                    "semanticNodes": result.payload["axSemanticNodeCount"] ?? "0",
+                                                    "actionableNodes": result.payload["axActionableNodeCount"] ?? "0"
+                                                ]
+                                            )
+                                        }
                                     }
                                     let stateChangeWasNotDispatched = result.payload["effectVerification"] == "not_dispatched"
                                     let selectedExecutionRoute = result.payload["route"].flatMap(AppExecutionRoute.init(rawValue:))
@@ -3511,6 +3551,22 @@ public actor AgentCore {
         }
         let completed = max(0, completedCount)
         return completed >= requiredCount || completed + requestedUnits > requiredCount
+    }
+
+    static func verifiedPendingForegroundBundleFromAX(
+        result: ToolResult,
+        pendingBundleID: String?
+    ) -> String? {
+        guard result.success,
+              let pendingBundleID,
+              !pendingBundleID.isEmpty,
+              result.payload["perceptionAXSucceeded"] == "true",
+              result.payload["axForegroundBundleID"] == pendingBundleID,
+              (result.payload["axSemanticNodeCount"].flatMap(Int.init) ?? 0) > 0,
+              (result.payload["axActionableNodeCount"].flatMap(Int.init) ?? 0) > 0 else {
+            return nil
+        }
+        return pendingBundleID
     }
 
     static func shouldRecordStateChange(for result: ToolResult) -> Bool {

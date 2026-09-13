@@ -6513,6 +6513,73 @@ final class CloudCodeCoreTests: XCTestCase {
         )
     }
 
+    func testAcceptedLaunchMayOnlyPromoteForegroundFromExactSuccessfulAXEvidence() throws {
+        let pending = "com.tencent.xin"
+        let verifiedAX = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "GUI tree read",
+            payload: [
+                "perceptionAXAttempted": "true",
+                "perceptionAXSucceeded": "true",
+                "axForegroundBundleID": pending,
+                "axSemanticNodeCount": "20",
+                "axActionableNodeCount": "7"
+            ]
+        )
+        XCTAssertEqual(
+            AgentCore.verifiedPendingForegroundBundleFromAX(result: verifiedAX, pendingBundleID: pending),
+            pending
+        )
+
+        var mismatchedPayload = verifiedAX.payload
+        mismatchedPayload["axForegroundBundleID"] = "com.example.other"
+        XCTAssertNil(AgentCore.verifiedPendingForegroundBundleFromAX(
+            result: ToolResult(toolCallID: UUID(), success: true, summary: "other app", payload: mismatchedPayload),
+            pendingBundleID: pending
+        ))
+
+        let screenshotOCR = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "screenshot OCR",
+            payload: [
+                "sha256": "frame",
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "recognized"
+            ]
+        )
+        XCTAssertNil(
+            AgentCore.verifiedPendingForegroundBundleFromAX(result: screenshotOCR, pendingBundleID: pending),
+            "screenshot/OCR evidence alone must never upgrade an accepted launch to foreground authority"
+        )
+
+        var emptyAXPayload = verifiedAX.payload
+        emptyAXPayload["axActionableNodeCount"] = "0"
+        XCTAssertNil(AgentCore.verifiedPendingForegroundBundleFromAX(
+            result: ToolResult(toolCallID: UUID(), success: true, summary: "empty AX", payload: emptyAXPayload),
+            pendingBundleID: pending
+        ))
+    }
+
+    func testObservationFrameUsesObservedAXBundleWhenNoTrustedForegroundIsInjected() throws {
+        let result = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "GUI tree read",
+            payload: [
+                "perceptionAXAttempted": "true",
+                "perceptionAXSucceeded": "true",
+                "axForegroundBundleID": "com.tencent.xin",
+                "axSemanticNodeCount": "20",
+                "axActionableNodeCount": "7"
+            ]
+        )
+        let frame = PerceptionBrokerFacade.frame(from: result, foregroundBundleID: nil)
+        XCTAssertEqual(frame.foregroundBundleID, "com.tencent.xin")
+    }
+
     func testTypedRuntimeFailedForegroundScreenshotStillConsumesBoundedAttempt() throws {
         let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
         var runtime = TaskRuntimeState(contract: contract)
