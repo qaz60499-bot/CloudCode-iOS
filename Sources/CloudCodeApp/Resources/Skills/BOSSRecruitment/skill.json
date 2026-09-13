@@ -1,5 +1,6 @@
 {
   "schemaVersion": 1,
+  "revision": "2026-09-12-r2",
   "id": "skill.boss.recruitment.batch",
   "displayName": "BOSS 招聘联系",
   "targetApp": {
@@ -26,7 +27,28 @@
     "ocrPolicy": "Use OCR only for the smallest unresolved region after AX fails or lacks the required semantic field. Do not full-screen OCR on every step.",
     "coordinatePolicy": "Raw coordinates are a last-resort action target derived from fresh local evidence only; never persist screen coordinates in the skill.",
     "sendSemantics": "exactly_once_with_reconcile_before_retry",
-    "postconditionRequired": true
+    "postconditionRequired": true,
+    "observationEpochPolicy": "Reuse one valid AX tree and semantic extraction for an unchanged screen; OCR only unresolved ROIs; any UI mutation invalidates raw geometry and requires a fresh epoch before the next state-changing action."
+  },
+  "runControl": {
+    "defaultTargetFinalValid": 5,
+    "explicitEarlyHandoffTargetFinalValid": 3,
+    "successfulTerminalStates": [
+      "COMPLETED_5",
+      "EARLY_HANDOFF_3"
+    ],
+    "candidateOutcomeIsTerminal": false,
+    "toolCallBoundaryIsTerminal": false,
+    "transientProviderFailureIsTerminal": false,
+    "rule": "Do not return success until the canonical terminal gate is proven. Candidate handled/skipped/rejected, wave completion, cooldown, perception miss, or host/provider retry exhaustion must never be relabeled as successful batch completion."
+  },
+  "performancePolicy": {
+    "maxPrimaryAXAcquisitionsPerUnchangedScreen": 1,
+    "reuseSemanticTargetsWithinObservationEpoch": true,
+    "ocrOnlyUnresolvedROI": true,
+    "fullScreenOCRNormalLoop": false,
+    "visionLastResort": true,
+    "batchReadOnlyFieldExtraction": true
   },
   "surfaces": [
     "boss.home",
