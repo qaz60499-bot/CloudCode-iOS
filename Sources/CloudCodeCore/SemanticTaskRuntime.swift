@@ -837,8 +837,12 @@ public enum TaskTransitionPolicy {
                 // a WeChat surface where “文件传输助手” was not visible yet (for example, before
                 // search/navigation had been planned). Unknown/absent destination evidence must
                 // yield back to the Provider so it can choose the navigation/search step.
-                guard let observation,
-                      Self.observationContainsExactSemanticText(observation, text: message.destinationEntity) else {
+                let destination = message.destinationEntity.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !destination.isEmpty,
+                      let observation,
+                      observation.semanticElements.contains(where: {
+                          $0.text.trimmingCharacters(in: .whitespacesAndNewlines) == destination && $0.confidence >= 0.35
+                      }) else {
                     return nil
                 }
                 return TaskDeterministicOperation(
