@@ -118,7 +118,7 @@ final class ShareViewController: UIViewController {
            let text = try await loadText(provider: provider) {
             _ = try store.enqueueData(
                 Data(text.utf8),
-                originalFilename: provider.suggestedName.map { safeFilename($0, fallbackExtension: "txt") } ?? "Shared Text.txt",
+                originalFilename: provider.suggestedName.map { Self.safeFilename($0, fallbackExtension: "txt") } ?? "Shared Text.txt",
                 mimeType: "text/plain",
                 typeIdentifier: UTType.text.identifier,
                 sourceType: "text"
@@ -153,7 +153,8 @@ final class ShareViewController: UIViewController {
         typeIdentifier: String,
         store: CloudCodeShareInboxStore
     ) async throws -> Bool {
-        try await withCheckedThrowingContinuation { continuation in
+        let suggestedName = provider.suggestedName
+        return try await withCheckedThrowingContinuation { continuation in
             provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { url, error in
                 if let error {
                     continuation.resume(throwing: error)
@@ -166,8 +167,8 @@ final class ShareViewController: UIViewController {
                 do {
                     let type = UTType(typeIdentifier)
                     let fallbackExtension = type?.preferredFilenameExtension ?? url.pathExtension
-                    let suggested = provider.suggestedName ?? url.lastPathComponent
-                    let filename = safeFilename(suggested, fallbackExtension: fallbackExtension)
+                    let suggested = suggestedName ?? url.lastPathComponent
+                    let filename = Self.safeFilename(suggested, fallbackExtension: fallbackExtension)
                     _ = try store.enqueueFile(
                         from: url,
                         originalFilename: filename,
@@ -207,7 +208,7 @@ final class ShareViewController: UIViewController {
             if gainedSecurityScope { url.stopAccessingSecurityScopedResource() }
         }
         let type = UTType(typeIdentifier)
-        let filename = safeFilename(
+        let filename = Self.safeFilename(
             provider.suggestedName ?? url.lastPathComponent,
             fallbackExtension: type?.preferredFilenameExtension ?? url.pathExtension
         )
@@ -259,7 +260,7 @@ final class ShareViewController: UIViewController {
         }
     }
 
-    private func safeFilename(_ name: String, fallbackExtension: String?) -> String {
+    private static func safeFilename(_ name: String, fallbackExtension: String?) -> String {
         var component = URL(fileURLWithPath: name).lastPathComponent
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if component.isEmpty || component == "." || component == ".." {
