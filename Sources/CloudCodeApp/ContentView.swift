@@ -305,6 +305,7 @@ private struct ChatView: View {
     @State private var showDocumentImporter = false
     @State private var pendingDocument: ImportedChatDocument?
     @State private var pendingShareTransactionID: UUID?
+    @State private var pendingSharedAppProviderPackage: PendingSharedAppProviderPackage?
     @State private var pendingSharedSkillPackage: PendingSharedSkillPackage?
     @State private var isImportingDocument = false
     @State private var isConversationAtBottom = true
@@ -355,6 +356,16 @@ private struct ChatView: View {
                 }
                 .task {
                     await importNextSharedDocumentIfAvailable()
+                }
+                .alert("检测到 App Provider Package", isPresented: Binding(
+                    get: { pendingSharedAppProviderPackage != nil },
+                    set: { if !$0 { pendingSharedAppProviderPackage = nil } }
+                )) {
+                    Button("导入 Provider") { importPendingSharedAppProvider() }
+                    Button("作为普通附件") { importPendingSharedAppProviderAsDocument() }
+                    Button("稍后", role: .cancel) { pendingSharedAppProviderPackage = nil }
+                } message: {
+                    Text("发现包含 provider.json 的 ZIP。只会导入 declarative Provider 资源；未知 capability、额外可执行文件、路径穿越、symlink 或超限内容都会被拒绝。")
                 }
                 .alert("检测到 Cloud Code Skill", isPresented: Binding(
                     get: { pendingSharedSkillPackage != nil },
@@ -750,8 +761,15 @@ private struct ChatView: View {
 
     @MainActor
     private func importNextSharedDocumentIfAvailable() async {
-        guard pendingDocument == nil, pendingSharedSkillPackage == nil, !isImportingDocument else { return }
+        guard pendingDocument == nil,
+              pendingSharedAppProviderPackage == nil,
+              pendingSharedSkillPackage == nil,
+              !isImportingDocument else { return }
         do {
+            if let providerPackage = try model.nextPendingSharedAppProviderPackageCandidate() {
+                pendingSharedAppProviderPackage = providerPackage
+                return
+            }
             if let skillPackage = try model.nextPendingSharedSkillPackageCandidate() {
                 pendingSharedSkillPackage = skillPackage
                 return
@@ -776,6 +794,25 @@ private struct ChatView: View {
         } catch {
             model.lastError = "读取系统分享文件失败：\(error.localizedDescription)"
         }
+    }
+
+    private func importPendingSharedAppProvider() {
+        guard let pending = pendingSharedAppProviderPackage else { return }
+        pendingSharedAppProviderPackage = nil
+        Task {
+            do {
+                let package = try await model.importPendingSharedAppProviderPackage(pending)
+                model.activityLines.append("已导入 App Provider：\(package.manifest.displayName)")
+                await importNextSharedDocumentIfAvailable()
+            } catch {
+                model.lastError = "App Provider Package 导入失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func importPendingSharedAppProviderAsDocument() {
+        pendingSharedAppProviderPackage = nil
+        Task { await importPendingSharedDocumentDirectly() }
     }
 
     private func importPendingSharedSkill() {

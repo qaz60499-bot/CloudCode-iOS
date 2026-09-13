@@ -703,12 +703,18 @@ public final class CloudCodeViewModel: ObservableObject {
         )
     }
 
-    public func importAppProvider(from url: URL) async {
+    @discardableResult
+    public func installAppProviderPackage(from url: URL) async throws -> AppProviderPackageSummary {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let summary = try await appProviderPackageStore.install(from: url)
+        await reloadAppProviderPackages()
+        return summary
+    }
+
+    public func importAppProvider(from url: URL) async {
         do {
-            _ = try await appProviderPackageStore.install(from: url)
-            await reloadAppProviderPackages()
+            _ = try await installAppProviderPackage(from: url)
         } catch {
             lastError = "导入 App Provider Package 失败：\(error)"
         }

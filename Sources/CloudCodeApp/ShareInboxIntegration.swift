@@ -14,6 +14,19 @@ public struct PendingSharedSkillPackage: Equatable, Sendable, Identifiable {
     }
 }
 
+public struct PendingSharedAppProviderPackage: Equatable, Sendable, Identifiable {
+    public var id: UUID { transactionID }
+    public var transactionID: UUID
+    public var sourceURL: URL
+    public var originalFilename: String
+
+    public init(transactionID: UUID, sourceURL: URL, originalFilename: String) {
+        self.transactionID = transactionID
+        self.sourceURL = sourceURL
+        self.originalFilename = originalFilename
+    }
+}
+
 public struct PendingSharedChatDocument: Equatable, Sendable {
     public var transactionID: UUID
     public var document: ImportedChatDocument
@@ -25,6 +38,30 @@ public struct PendingSharedChatDocument: Equatable, Sendable {
 }
 
 extension CloudCodeViewModel {
+    public func nextPendingSharedAppProviderPackageCandidate() throws -> PendingSharedAppProviderPackage? {
+        let store: CloudCodeShareInboxStore
+        do {
+            store = try CloudCodeShareInboxStore.appGroupStore()
+        } catch CloudCodeShareInboxError.appGroupUnavailable {
+            return nil
+        }
+        guard let transaction = try store.pendingTransactions().first,
+              transaction.fileURL.pathExtension.lowercased() == "zip",
+              try AppProviderPackageStore.archiveContainsProviderManifest(transaction.fileURL) else { return nil }
+        return PendingSharedAppProviderPackage(
+            transactionID: transaction.id,
+            sourceURL: transaction.fileURL,
+            originalFilename: transaction.manifest.originalFilename
+        )
+    }
+
+    @discardableResult
+    public func importPendingSharedAppProviderPackage(_ pending: PendingSharedAppProviderPackage) async throws -> AppProviderPackageSummary {
+        let package = try await installAppProviderPackage(from: pending.sourceURL)
+        try completeSharedDocument(transactionID: pending.transactionID)
+        return package
+    }
+
     public func nextPendingSharedSkillPackageCandidate() throws -> PendingSharedSkillPackage? {
         let store: CloudCodeShareInboxStore
         do {
