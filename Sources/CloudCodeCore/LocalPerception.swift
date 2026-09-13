@@ -775,6 +775,38 @@ public enum LocalKeyboardHeuristic {
     }
 }
 
+public enum LocalFeedPerceptionPolicy {
+    /// Metric-heavy short-video feeds usually keep like/comment/share counts in a narrow trailing
+    /// rail. Crop that region before asking Vision for precise text: the digits become larger in the
+    /// recognizer's working image, while the caller avoids paying full-frame OCR and AX on every
+    /// sample. This is a normalized observation hint only; callers must fall back when the current
+    /// app does not expose a coherent rail in this region.
+    public static func metricRegion(screenSize: LocalPerceptionScreenSize) -> LocalPerceptionScreenRect? {
+        guard screenSize.width.isFinite, screenSize.height.isFinite,
+              screenSize.width >= 200, screenSize.height >= 400 else { return nil }
+        return LocalPerceptionScreenRect(
+            x: screenSize.width * 0.64,
+            y: screenSize.height * 0.18,
+            width: screenSize.width * 0.36,
+            height: screenSize.height * 0.74
+        )
+    }
+
+    /// A feed sample does not need a second perception backend merely for redundancy. The local
+    /// observation is sufficient when it can both identify a stable feed item and, when requested,
+    /// classify the requested metric. AX/full-frame OCR remain bounded fallbacks for incomplete or
+    /// conflicting evidence.
+    public static func observationIsSufficient(
+        metric: LocalFeedMetric?,
+        elements: [LocalPerceptionTextElement],
+        screenSize: LocalPerceptionScreenSize
+    ) -> Bool {
+        guard LocalFeedIdentity.signature(elements: elements, screenSize: screenSize) != nil else { return false }
+        guard let metric else { return true }
+        return LocalFeedMetricExtractor.extract(metric: metric, elements: elements, screenSize: screenSize) != nil
+    }
+}
+
 public enum LocalPerceptionRoutingPolicy {
     /// AX is a structural source. When it has already answered the current observation question,
     /// running OCR is redundant work.

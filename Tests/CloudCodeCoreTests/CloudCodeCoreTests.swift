@@ -2066,6 +2066,39 @@ final class CloudCodeCoreTests: XCTestCase {
         ), "the right-rail fallback requires normalized screen context")
     }
 
+    func testLocalFeedPerceptionPolicyUsesBoundedMetricRailAndSkipsRedundantAXWhenEvidenceIsComplete() throws {
+        let screen = LocalPerceptionScreenSize(width: 390, height: 844)
+        let region = try XCTUnwrap(LocalFeedPerceptionPolicy.metricRegion(screenSize: screen))
+        XCTAssertEqual(region.x, 249.6, accuracy: 0.001)
+        XCTAssertEqual(region.y, 151.92, accuracy: 0.001)
+        XCTAssertEqual(region.width, 140.4, accuracy: 0.001)
+        XCTAssertEqual(region.height, 624.56, accuracy: 0.001)
+
+        let completeRail = [
+            LocalPerceptionTextElement(text: "21.0万", confidence: 0.94, x: 330, y: 344, width: 48, height: 20),
+            LocalPerceptionTextElement(text: "2783", confidence: 0.93, x: 334, y: 430, width: 42, height: 20),
+            LocalPerceptionTextElement(text: "5363", confidence: 0.92, x: 333, y: 516, width: 42, height: 20),
+            LocalPerceptionTextElement(text: "3.6万", confidence: 0.91, x: 330, y: 602, width: 48, height: 20)
+        ]
+        XCTAssertTrue(LocalFeedPerceptionPolicy.observationIsSufficient(
+            metric: .likeCount,
+            elements: completeRail,
+            screenSize: screen
+        ))
+        XCTAssertEqual(
+            LocalFeedMetricExtractor.extract(metric: .likeCount, elements: completeRail, screenSize: screen)?.value,
+            210_000
+        )
+
+        let incompleteRail = Array(completeRail.prefix(2))
+        XCTAssertFalse(LocalFeedPerceptionPolicy.observationIsSufficient(
+            metric: .likeCount,
+            elements: incompleteRail,
+            screenSize: screen
+        ))
+        XCTAssertNil(LocalFeedPerceptionPolicy.metricRegion(screenSize: .init(width: 100, height: 100)))
+    }
+
     func testLocalFeedMetricExtractorKeepsThreeSlotRightRailShareAmbiguous() throws {
         let screen = LocalPerceptionScreenSize(width: 390, height: 844)
         let rail = [

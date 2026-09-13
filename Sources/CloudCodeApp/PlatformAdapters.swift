@@ -2898,8 +2898,12 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         // the helper owns the inverse physical finger trajectory needed to produce that motion.
         let deltaY = direction == "forward" ? 600.0 : -600.0
         // Video pixels change continuously, so a whole-frame hash is not proof that the feed moved.
-        // Give the target App enough time to settle, then require a semantic AX/OCR item identity.
-        let settleNanoseconds: UInt64 = 950_000_000
+        // The physical scroll itself already occupies ~300 ms. A second fixed 950 ms pause made a
+        // five-item scan spend several seconds doing nothing, even when the overlay was already
+        // stable. Use a shorter bounded settle; incomplete semantic evidence still takes the slower
+        // OCR/AX fallback below instead of making every successful sample pay the worst-case delay.
+        let settleNanoseconds: UInt64 = 550_000_000
+        let uncertainSettleRetryNanoseconds: UInt64 = 400_000_000
 
         var attachments: [ChatAttachment] = []
         var hashes: [String] = []
@@ -2912,8 +2916,11 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         var stoppedReason: String?
         var totalOCRLatencyMS = 0
         var successfulOCRSamples = 0
+        var preciseMetricRegionSamples = 0
+        var fullFrameOCRFallbackSamples = 0
         var axAttemptedSamples = 0
         var axSucceededSamples = 0
+        var axSkippedLocalSufficientSamples = 0
 
         func captureSample() async throws -> (hash: String, identity: String?) {
             let data = try await backend.screenshot()
@@ -2923,47 +2930,117 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             }
             hashes.append(hash)
             sampledCount += 1
-            let observation = await LocalVisionTextObservation.observe(
-                for: data,
-                maximumElements: requestedMetric == nil ? 32 : 48,
-                requiresText: requestedMetric != nil
-            )
-            let local = observation.payload
-            let localWidth = Double(local["screenPointWidth"] ?? "") ?? 0
-            let localHeight = Double(local["screenPointHeight"] ?? "") ?? 0
-            let screenSize = LocalPerceptionScreenSize(width: localWidth, height: localHeight)
 
-            axAttemptedSamples += 1
-            var axElements: [LocalPerceptionTextElement] = []
-            var axStatus = "unavailable"
-            do {
-                let tree = try await backend.tree()
-                axElements = LocalAXTreeTextExtractor.extract(from: tree, maximumElements: 96)
-                if !axElements.isEmpty {
-                    axSucceededSamples += 1
-                    axStatus = "semantic_elements"
-                } else {
-                    axStatus = "empty_tree"
+            let image = UIImage(data: data)?.cgImage
+            let imageScreenSize = LocalPerceptionScreenSize(
+                width: Double(image?.width ?? 0),
+                height: Double(image?.height ?? 0)
+            )
+            let metricRegion = requestedMetric.flatMap { _ in
+                LocalFeedPerceptionPolicy.metricRegion(screenSize: imageScreenSize)
+            }.map { CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height) }
+
+            // Metric sampling takes the precise recognizer over only the trailing action/count rail.
+            // This is both cheaper and more accurate than full-screen accurate OCR: small decimal
+            // counters occupy a much larger fraction of the cropped image (for example 21.0万),
+            // which reduces dropped/reordered digits without making every generic OCR call precise.
+            var observation = await LocalVisionTextObservation.observe(
+                for: data,
+                maximumElements: requestedMetric == nil ? 32 : 24,
+                regionInScreenPoints: metricRegion,
+                requiresText: requestedMetric != nil,
+                forcePrecise: requestedMetric != nil && metricRegion != nil
+            )
+            if requestedMetric != nil && metricRegion != nil { preciseMetricRegionSamples += 1 }
+            totalOCRLatencyMS += Int(observation.payload["localVisionLatencyMS"] ?? "0") ?? 0
+
+            var screenSize = LocalPerceptionScreenSize(
+                width: Double(observation.payload["screenPointWidth"] ?? "") ?? imageScreenSize.width,
+                height: Double(observation.payload["screenPointHeight"] ?? "") ?? imageScreenSize.height
+            )
+            if screenSize.width <= 0 || screenSize.height <= 0 { screenSize = imageScreenSize }
+            var ocrElements = observation.elements
+            var ocrBackends = [observation.payload["localVisionBackend"] ?? "unknown"]
+            var ocrStatuses = [observation.payload["localVisionOCR"] ?? "unavailable"]
+
+            var localSufficient = LocalFeedPerceptionPolicy.observationIsSufficient(
+                metric: requestedMetric,
+                elements: ocrElements,
+                screenSize: screenSize
+            )
+            if !localSufficient, metricRegion != nil {
+                // The current app may not use a right-side metric rail, or the first crop may have
+                // missed text during animation. Pay one full-frame *fast* OCR only for that sample.
+                let fallback = await LocalVisionTextObservation.observe(
+                    for: data,
+                    maximumElements: 48,
+                    requiresText: requestedMetric != nil,
+                    forcePrecise: false
+                )
+                fullFrameOCRFallbackSamples += 1
+                totalOCRLatencyMS += Int(fallback.payload["localVisionLatencyMS"] ?? "0") ?? 0
+                ocrElements = LocalPerceptionFusion.merge(ax: ocrElements, ocr: fallback.elements)
+                ocrBackends.append(fallback.payload["localVisionBackend"] ?? "unknown")
+                ocrStatuses.append(fallback.payload["localVisionOCR"] ?? "unavailable")
+                let fallbackWidth = Double(fallback.payload["screenPointWidth"] ?? "") ?? 0
+                let fallbackHeight = Double(fallback.payload["screenPointHeight"] ?? "") ?? 0
+                if fallbackWidth > 0, fallbackHeight > 0 {
+                    screenSize = .init(width: fallbackWidth, height: fallbackHeight)
                 }
-            } catch {
-                axStatus = "unavailable"
+                localSufficient = LocalFeedPerceptionPolicy.observationIsSufficient(
+                    metric: requestedMetric,
+                    elements: ocrElements,
+                    screenSize: screenSize
+                )
+                observation = fallback
             }
-            let fusedElements = LocalPerceptionFusion.merge(ax: axElements, ocr: observation.elements)
+
+            var axElements: [LocalPerceptionTextElement] = []
+            var axStatus = "skipped_local_sufficient"
+            if localSufficient {
+                axSkippedLocalSufficientSamples += 1
+            } else {
+                // Full AX trees are the most expensive/fragile perception source on custom-drawn
+                // video surfaces. Ask for one only after local OCR cannot prove this exact sample.
+                axAttemptedSamples += 1
+                axStatus = "unavailable"
+                do {
+                    let tree = try await backend.tree()
+                    axElements = LocalAXTreeTextExtractor.extract(from: tree, maximumElements: 96)
+                    if !axElements.isEmpty {
+                        axSucceededSamples += 1
+                        axStatus = "semantic_elements"
+                    } else {
+                        axStatus = "empty_tree"
+                    }
+                } catch {
+                    axStatus = "unavailable"
+                }
+            }
+
+            let fusedElements = LocalPerceptionFusion.merge(ax: axElements, ocr: ocrElements)
             localElementSamples.append(fusedElements)
             localScreenSamples.append(screenSize)
             let identity = LocalFeedIdentity.signature(elements: fusedElements, screenSize: screenSize)
             sampleIdentities.append(identity ?? "")
-            totalOCRLatencyMS += Int(local["localVisionLatencyMS"] ?? "0") ?? 0
-            let ocrStatus = local["localVisionOCR"] ?? ""
-            if ocrStatus == "recognized" || ocrStatus == "available_empty" { successfulOCRSamples += 1 }
+            if ocrStatuses.contains(where: { $0 == "recognized" || $0 == "available_empty" }) {
+                successfulOCRSamples += 1
+            }
+            let encodedElements: String
+            if let encoded = try? JSONEncoder().encode(Array(fusedElements.prefix(64))), encoded.count <= 12 * 1024 {
+                encodedElements = String(data: encoded, encoding: .utf8) ?? "[]"
+            } else {
+                encodedElements = "[]"
+            }
             localVisionSamples.append([
                 "sample": String(sampledCount),
-                "status": local["localVisionOCR"] ?? "unavailable",
-                "text": String((local["localVisionText"] ?? "").prefix(1_600)),
-                "elements": String((local["localVisionElements"] ?? "[]").prefix(6_000)),
-                "width": local["screenPointWidth"] ?? "",
-                "height": local["screenPointHeight"] ?? "",
-                "backend": local["localVisionBackend"] ?? "unknown",
+                "status": ocrStatuses.joined(separator: "+"),
+                "text": String(fusedElements.map(\.text).joined(separator: " | ").prefix(1_600)),
+                "elements": String(encodedElements.prefix(6_000)),
+                "width": String(Int(screenSize.width)),
+                "height": String(Int(screenSize.height)),
+                "backend": ocrBackends.joined(separator: "+"),
+                "region": metricRegion == nil ? "full_screen" : "metric_right_rail",
                 "ax": axStatus,
                 "semanticIdentity": identity.map { String($0.prefix(512)) } ?? ""
             ])
@@ -2987,26 +3064,48 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 let beforeElements = localElementSamples.count
                 let beforeScreens = localScreenSamples.count
                 let beforeIdentities = sampleIdentities.count
+                let beforeSampledCount = sampledCount
                 let beforeOCRLatencyMS = totalOCRLatencyMS
                 let beforeSuccessfulOCRSamples = successfulOCRSamples
+                let beforePreciseMetricRegionSamples = preciseMetricRegionSamples
+                let beforeFullFrameOCRFallbackSamples = fullFrameOCRFallbackSamples
                 let beforeAXAttemptedSamples = axAttemptedSamples
                 let beforeAXSucceededSamples = axSucceededSamples
-                let candidate = try await captureSample()
-                let semanticAdvanced = candidate.identity != nil && candidate.identity != previousIdentity
-                if !semanticAdvanced {
-                    stoppedAtSample = sampleIndex
-                    stoppedReason = candidate.identity == nil ? "semantic_identity_unavailable" : "semantic_identity_unchanged"
+                let beforeAXSkippedLocalSufficientSamples = axSkippedLocalSufficientSamples
+
+                func rollbackCandidateCapture() {
                     if attachments.count > beforeAttachments { attachments.removeSubrange(beforeAttachments..<attachments.count) }
                     if hashes.count > beforeHashes { hashes.removeSubrange(beforeHashes..<hashes.count) }
                     if localVisionSamples.count > beforeVision { localVisionSamples.removeSubrange(beforeVision..<localVisionSamples.count) }
                     if localElementSamples.count > beforeElements { localElementSamples.removeSubrange(beforeElements..<localElementSamples.count) }
                     if localScreenSamples.count > beforeScreens { localScreenSamples.removeSubrange(beforeScreens..<localScreenSamples.count) }
                     if sampleIdentities.count > beforeIdentities { sampleIdentities.removeSubrange(beforeIdentities..<sampleIdentities.count) }
+                    sampledCount = beforeSampledCount
                     totalOCRLatencyMS = beforeOCRLatencyMS
                     successfulOCRSamples = beforeSuccessfulOCRSamples
+                    preciseMetricRegionSamples = beforePreciseMetricRegionSamples
+                    fullFrameOCRFallbackSamples = beforeFullFrameOCRFallbackSamples
                     axAttemptedSamples = beforeAXAttemptedSamples
                     axSucceededSamples = beforeAXSucceededSamples
-                    sampledCount = max(1, sampledCount - 1)
+                    axSkippedLocalSufficientSamples = beforeAXSkippedLocalSufficientSamples
+                }
+
+                var candidate = try await captureSample()
+                var semanticAdvanced = candidate.identity != nil && candidate.identity != previousIdentity
+                if !semanticAdvanced {
+                    // Do not make every item pay a one-second settle just because a slow-loading item
+                    // occasionally needs it. Roll the uncertain observation back, grant that one item
+                    // another 400 ms, then re-observe. Only the ambiguous path pays this retry.
+                    rollbackCandidateCapture()
+                    try await Task.sleep(nanoseconds: uncertainSettleRetryNanoseconds)
+                    try Task.checkCancellation()
+                    candidate = try await captureSample()
+                    semanticAdvanced = candidate.identity != nil && candidate.identity != previousIdentity
+                }
+                if !semanticAdvanced {
+                    stoppedAtSample = sampleIndex
+                    stoppedReason = candidate.identity == nil ? "semantic_identity_unavailable" : "semantic_identity_unchanged"
+                    rollbackCandidateCapture()
                     break
                 }
                 previousIdentity = candidate.identity
@@ -3022,7 +3121,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             "frameSHA256": hashes.joined(separator: ","),
             "baselineSHA256": baselineHash,
             "sha256": hashes.last ?? baselineHash,
-            "settleMs": "950",
+            "settleMs": "550",
             "effectVerification": "semantic_review_required",
             "localObservation": "feed_samples_attached",
             "perceptionClass": "feed_sample",
@@ -3030,8 +3129,11 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             "perceptionAXSucceeded": axSucceededSamples > 0 ? "true" : "false",
             "perceptionAXSampleCount": String(axAttemptedSamples),
             "perceptionAXSuccessfulSampleCount": String(axSucceededSamples),
-            "feedIdentityMode": "ax_ocr_semantic_signature",
+            "perceptionAXSkippedLocalSufficientSampleCount": String(axSkippedLocalSufficientSamples),
+            "feedIdentityMode": "adaptive_precise_metric_roi_then_ocr_ax_fallback",
             "perceptionOCRInvoked": "true",
+            "perceptionOCRPreciseMetricRegionSampleCount": String(preciseMetricRegionSamples),
+            "perceptionOCRFullFrameFallbackSampleCount": String(fullFrameOCRFallbackSamples),
             "perceptionOCRSucceeded": successfulOCRSamples == sampledCount ? "true" : "false",
             "perceptionOCRLatencyMS": String(totalOCRLatencyMS),
             "perceptionLocalSufficient": "false",
@@ -3073,54 +3175,102 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 let returnSteps = sampledCount - localMetricSelection.selectedSample
                 let targetIdentity = sampleIdentities[localMetricSelection.selectedSample - 1]
                 var completedReturnSteps = 0
-                var returnIdentity = sampleIdentities.last ?? ""
-                var returnedFrameData: Data?
                 var returnFailureReason: String?
+
+                // Returning to an already sampled item is a deterministic, reversible sequence.
+                // Verifying every intermediate swipe previously repeated screenshot + OCR + AX and
+                // multiplied latency. Dispatch the bounded return sequence, then verify the final
+                // semantic identity once; a missed gesture still fails closed as a target mismatch.
                 for _ in 0..<returnSteps {
                     try Task.checkCancellation()
                     try await backend.scroll(deltaX: 0, deltaY: -deltaY)
-                    try await Task.sleep(nanoseconds: settleNanoseconds)
-                    try Task.checkCancellation()
-                    let frame = try await backend.screenshot()
-                    returnedFrameData = frame
-                    let returnedObservation = await LocalVisionTextObservation.observe(for: frame, maximumElements: 48, requiresText: true)
-                    totalOCRLatencyMS += Int(returnedObservation.payload["localVisionLatencyMS"] ?? "0") ?? 0
-                    let returnedScreenSize = LocalPerceptionScreenSize(
-                        width: Double(returnedObservation.payload["screenPointWidth"] ?? "") ?? 0,
-                        height: Double(returnedObservation.payload["screenPointHeight"] ?? "") ?? 0
-                    )
-                    var returnedAX: [LocalPerceptionTextElement] = []
-                    if let tree = try? await backend.tree() {
-                        returnedAX = LocalAXTreeTextExtractor.extract(from: tree, maximumElements: 96)
-                    }
-                    let returnedElements = LocalPerceptionFusion.merge(ax: returnedAX, ocr: returnedObservation.elements)
-                    guard let currentIdentity = LocalFeedIdentity.signature(elements: returnedElements, screenSize: returnedScreenSize) else {
-                        returnFailureReason = "return_semantic_identity_unavailable"
-                        break
-                    }
-                    guard currentIdentity != returnIdentity else {
-                        returnFailureReason = "return_semantic_identity_unchanged"
-                        break
-                    }
                     completedReturnSteps += 1
-                    returnIdentity = currentIdentity
+                    try await Task.sleep(nanoseconds: settleNanoseconds)
                 }
-                if completedReturnSteps == returnSteps, let returnedFrameData {
-                    payload["sha256"] = GUIAutomationPayloadPolicy.sha256Hex(returnedFrameData)
-                    if let attachment = try persistScreenshotAttachment(returnedFrameData, sessionID: call.sessionID) {
-                        attachments.append(attachment)
+                try Task.checkCancellation()
+                let returnedFrameData = try await backend.screenshot()
+                payload["sha256"] = GUIAutomationPayloadPolicy.sha256Hex(returnedFrameData)
+                if let attachment = try persistScreenshotAttachment(returnedFrameData, sessionID: call.sessionID) {
+                    attachments.append(attachment)
+                }
+
+                let returnedImage = UIImage(data: returnedFrameData)?.cgImage
+                var returnedScreenSize = LocalPerceptionScreenSize(
+                    width: Double(returnedImage?.width ?? 0),
+                    height: Double(returnedImage?.height ?? 0)
+                )
+                let returnedMetricRegion = LocalFeedPerceptionPolicy.metricRegion(screenSize: returnedScreenSize).map {
+                    CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+                }
+                var returnedObservation = await LocalVisionTextObservation.observe(
+                    for: returnedFrameData,
+                    maximumElements: 24,
+                    regionInScreenPoints: returnedMetricRegion,
+                    requiresText: true,
+                    forcePrecise: returnedMetricRegion != nil
+                )
+                totalOCRLatencyMS += Int(returnedObservation.payload["localVisionLatencyMS"] ?? "0") ?? 0
+                if returnedMetricRegion != nil { preciseMetricRegionSamples += 1 }
+                var returnedElements = returnedObservation.elements
+                let observedWidth = Double(returnedObservation.payload["screenPointWidth"] ?? "") ?? 0
+                let observedHeight = Double(returnedObservation.payload["screenPointHeight"] ?? "") ?? 0
+                if observedWidth > 0, observedHeight > 0 {
+                    returnedScreenSize = .init(width: observedWidth, height: observedHeight)
+                }
+
+                var returnedSufficient = LocalFeedPerceptionPolicy.observationIsSufficient(
+                    metric: requestedMetric,
+                    elements: returnedElements,
+                    screenSize: returnedScreenSize
+                )
+                if !returnedSufficient {
+                    returnedObservation = await LocalVisionTextObservation.observe(
+                        for: returnedFrameData,
+                        maximumElements: 48,
+                        requiresText: true,
+                        forcePrecise: false
+                    )
+                    fullFrameOCRFallbackSamples += 1
+                    totalOCRLatencyMS += Int(returnedObservation.payload["localVisionLatencyMS"] ?? "0") ?? 0
+                    returnedElements = LocalPerceptionFusion.merge(ax: returnedElements, ocr: returnedObservation.elements)
+                    returnedSufficient = LocalFeedPerceptionPolicy.observationIsSufficient(
+                        metric: requestedMetric,
+                        elements: returnedElements,
+                        screenSize: returnedScreenSize
+                    )
+                }
+                if !returnedSufficient {
+                    axAttemptedSamples += 1
+                    if let tree = try? await backend.tree() {
+                        let returnedAX = LocalAXTreeTextExtractor.extract(from: tree, maximumElements: 96)
+                        if !returnedAX.isEmpty { axSucceededSamples += 1 }
+                        returnedElements = LocalPerceptionFusion.merge(ax: returnedAX, ocr: returnedElements)
                     }
+                } else {
+                    axSkippedLocalSufficientSamples += 1
+                }
+
+                if let returnIdentity = LocalFeedIdentity.signature(elements: returnedElements, screenSize: returnedScreenSize) {
                     selectedReturnVerified = returnIdentity == targetIdentity
-                    if !selectedReturnVerified {
-                        returnFailureReason = "return_target_identity_mismatch"
-                    }
+                    if !selectedReturnVerified { returnFailureReason = "return_target_identity_mismatch" }
+                } else {
+                    selectedReturnVerified = false
+                    returnFailureReason = "return_semantic_identity_unavailable"
                 }
                 payload["localMetricReturnSteps"] = String(returnSteps)
                 payload["localMetricCompletedReturnSteps"] = String(completedReturnSteps)
+                payload["localMetricReturnVerificationMode"] = "final_state_only"
                 payload["localMetricReturnIdentityVerified"] = selectedReturnVerified ? "true" : "false"
                 if let returnFailureReason { payload["localMetricReturnFailureReason"] = returnFailureReason }
             }
             payload["perceptionOCRLatencyMS"] = String(totalOCRLatencyMS)
+            payload["perceptionOCRPreciseMetricRegionSampleCount"] = String(preciseMetricRegionSamples)
+            payload["perceptionOCRFullFrameFallbackSampleCount"] = String(fullFrameOCRFallbackSamples)
+            payload["perceptionAXAttempted"] = axAttemptedSamples > 0 ? "true" : "false"
+            payload["perceptionAXSucceeded"] = axSucceededSamples > 0 ? "true" : "false"
+            payload["perceptionAXSampleCount"] = String(axAttemptedSamples)
+            payload["perceptionAXSuccessfulSampleCount"] = String(axSucceededSamples)
+            payload["perceptionAXSkippedLocalSufficientSampleCount"] = String(axSkippedLocalSufficientSamples)
             payload["localMetricSelectedReturnVerified"] = selectedReturnVerified ? "true" : "false"
             if !returnToSelected || selectedReturnVerified {
                 payload["perceptionLocalSufficient"] = "true"
