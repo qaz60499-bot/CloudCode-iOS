@@ -4584,6 +4584,8 @@ public final class CloudCodeViewModel: ObservableObject {
         }
         if let providerError = error as? ProviderError {
             switch providerError {
+            case .missingAPIKey:
+                return "当前选择的 Provider Key 在 Keychain 中缺失或不可读。若这是安装包预配置 Key，请到“设置 → Key 管理”恢复当前 Key或一键导入；若是自定义中转站，请重新保存该厂商的 Key。"
             case .streamInterrupted:
                 return "厂商已经建立连接并开始返回 SSE 数据，但在完成事件前中断。这个状态不同于“Wait for API”或限流；为避免重复执行已经开始的输出，Cloud Code 不会自动重放。检查点已保留，可在“任务”中继续。"
             case .upstreamPending(let detail):
@@ -4592,8 +4594,9 @@ public final class CloudCodeViewModel: ObservableObject {
                 return "厂商请求过多/触发限流，本轮有界等待/重试已耗尽；这不是厂商断开，当前路由和 Key 保持不变，可稍后直接继续。"
             case .malformedEvent:
                 return "厂商返回的数据格式异常。详细信息已写入诊断日志；可以重试当前厂商或切换厂商。"
-            case .transport:
-                return "厂商传输异常。详细信息已写入诊断日志；可以检查网络后重试。"
+            case .transport(let detail):
+                let bounded = String(detail.prefix(600))
+                return "厂商传输异常：\(bounded)。当前厂商、Key 和模型不会因此被自动替换；可按这条具体错误检查中转站路径、协议、流格式或网络。"
             default:
                 return providerError.description
             }
