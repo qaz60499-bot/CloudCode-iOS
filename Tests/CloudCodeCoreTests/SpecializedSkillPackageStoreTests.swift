@@ -105,8 +105,9 @@ final class SpecializedSkillPackageStoreTests: XCTestCase {
         try await registry.replaceInstalledSkills(try await store.definitions())
 
         let matched = await registry.uniqueHighConfidenceUserSkill(for: "请使用 Demo Operations 完成这个任务")
+        let unmatched = await registry.uniqueHighConfidenceUserSkill(for: "帮我随便看看这个页面")
         XCTAssertEqual(matched?.id, manifest.id)
-        XCTAssertNil(await registry.uniqueHighConfidenceUserSkill(for: "帮我随便看看这个页面"))
+        XCTAssertNil(unmatched)
     }
 
     func testInstalledPackageCannotOverrideBuiltInSkillID() async throws {
@@ -150,11 +151,13 @@ final class SpecializedSkillPackageStoreTests: XCTestCase {
             environment: AppActionEnvironment(),
             success: true
         )
-        XCTAssertNotNil(await registry.skill(id: id))
+        let installedSkill = await registry.skill(id: id)
+        XCTAssertNotNil(installedSkill)
 
         try await store.remove(skillID: id)
         try await registry.replaceInstalledSkills(try await store.definitions())
-        XCTAssertNil(await registry.skill(id: id))
+        let removedSkill = await registry.skill(id: id)
+        XCTAssertNil(removedSkill)
     }
 
     private func makeManifest(id: String, revision: String) -> SpecializedSkillPackageManifest {
