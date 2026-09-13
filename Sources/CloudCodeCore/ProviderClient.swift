@@ -2235,6 +2235,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                             result: "started",
                             metadata: [
                                 "providerID": configuration.providerID ?? "",
+                                "model": configuration.model,
                                 "host": baseURLCandidate.host ?? "",
                                 "baseURL": ProviderEndpointRoutingPolicy.normalizedOrigin(baseURLCandidate),
                                 "protocol": protocolCandidate.rawValue,
@@ -2286,6 +2287,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                                 result: "completed",
                                 metadata: [
                                     "providerID": configuration.providerID ?? "",
+                                    "model": configuration.model,
                                     "host": baseURLCandidate.host ?? "",
                                     "baseURL": ProviderEndpointRoutingPolicy.normalizedOrigin(baseURLCandidate),
                                     "protocol": protocolCandidate.rawValue,
@@ -2308,7 +2310,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                             let hasAnotherProtocol = protocolIndex + 1 < orderedProtocols.count
                             let hasAnotherHost = baseURLIndex + 1 < orderedBaseURLs.count
                             let hasAnotherKey = keyIndex + 1 < keyCandidates.count
-                            let mayFallbackProtocol = !emittedOutput && hasAnotherProtocol && ProviderProtocolFallbackClassifier.shouldFallback(error)
+                            let mayFallbackProtocol = !emittedOutput && hasAnotherProtocol && ProviderProtocolFallbackClassifier.shouldFallback(error, providerID: configuration.providerID)
                             let mayFallbackHost = !emittedOutput && hasAnotherHost && ProviderHostFallbackClassifier.shouldFallback(error)
                             let mayRotateKey = !emittedOutput && hasAnotherKey && configuration.allowSameProviderKeyFailover == true && ProviderKeyRotationClassifier.shouldRotate(error)
                             if !emittedOutput && ProviderCompatibilityDriftClassifier.shouldDegradeProtocol(error) {
@@ -2333,6 +2335,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                                 error: error,
                                 metadata: [
                                     "providerID": configuration.providerID ?? "",
+                                    "model": configuration.model,
                                     "host": baseURLCandidate.host ?? "",
                                     "baseURL": ProviderEndpointRoutingPolicy.normalizedOrigin(baseURLCandidate),
                                     "protocol": protocolCandidate.rawValue,
@@ -2737,13 +2740,17 @@ public enum ProviderProtocolFallbackClassifier {
     /// Protocol failover is only allowed before any provider output. It is reserved for
     /// errors that can plausibly be route/protocol specific; credential/quota/rate-limit
     /// failures stay on the current protocol decision and move only through the Key pool.
-    public static func shouldFallback(_ error: Error) -> Bool {
+    ///
+    /// AgentRouter is the one deliberate exception for `clientRejected`: one compatibility
+    /// envelope/protocol can be rejected while the same Key×Host×model succeeds on the alternate
+    /// supported protocol. Treat that as route-scoped evidence, never as proof the model is down.
+    public static func shouldFallback(_ error: Error, providerID: String? = nil) -> Bool {
         guard let providerError = error as? ProviderError else { return false }
         switch providerError {
         case .modelUnavailable, .malformedEvent, .protocolIncompatible:
             return true
         case .clientRejected:
-            return false
+            return providerID == ProviderCatalog.agentRouterID
         case .invalidResponse(let code):
             return code == 400 || code == 404 || code == 405 || code == 422 || (500...599).contains(code)
         case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .capacityExhausted,

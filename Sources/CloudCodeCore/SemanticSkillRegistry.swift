@@ -17,10 +17,12 @@ public struct SemanticSkillTransition: Codable, Hashable, Sendable {
 public struct SemanticSkillDefinition: Codable, Hashable, Identifiable, Sendable {
     public enum Origin: String, Codable, Sendable {
         case predefined
+        case installed
         case explicitlyValidated
     }
 
     public var id: String
+    public var displayName: String?
     public var semanticGoal: String
     public var bundleID: String?
     public var requiredSemanticSurface: String
@@ -42,6 +44,7 @@ public struct SemanticSkillDefinition: Codable, Hashable, Identifiable, Sendable
 
     public init(
         id: String,
+        displayName: String? = nil,
         semanticGoal: String,
         bundleID: String? = nil,
         requiredSemanticSurface: String,
@@ -60,6 +63,7 @@ public struct SemanticSkillDefinition: Codable, Hashable, Identifiable, Sendable
         origin: Origin = .predefined
     ) {
         self.id = String(id.prefix(128))
+        self.displayName = displayName.map { String($0.prefix(128)) }
         self.semanticGoal = String(semanticGoal.prefix(128))
         self.bundleID = bundleID.map { String($0.prefix(255)) }
         self.requiredSemanticSurface = String(requiredSemanticSurface.prefix(128))
@@ -159,6 +163,7 @@ public enum SemanticSkillCatalog {
 public actor SemanticSkillRegistry {
     private let fileURL: URL
     private let predefined: [String: SemanticSkillDefinition]
+    private var installed: [String: SemanticSkillDefinition] = [:]
     private var validated: [String: SemanticSkillDefinition] = [:]
     private var didLoad = false
     private static let maxSerializedBytes: Int64 = 2 * 1024 * 1024
@@ -177,24 +182,59 @@ public actor SemanticSkillRegistry {
     public func all() -> [SemanticSkillDefinition] {
         loadIfNeeded()
         var merged = predefined
+        for (id, value) in installed { merged[id] = value }
         for (id, value) in validated { merged[id] = value }
         return merged.values.sorted { $0.id < $1.id }
     }
 
+    public func replaceInstalledSkills(_ skills: [SemanticSkillDefinition]) throws {
+        loadIfNeeded()
+        var next: [String: SemanticSkillDefinition] = [:]
+        for skill in skills {
+            guard !skill.id.isEmpty,
+                  !skill.semanticGoal.isEmpty,
+                  !skill.requiredSemanticSurface.isEmpty,
+                  skill.userSelectable == true,
+                  skill.transitions.count <= 12,
+                  skill.requiredCapabilities.count <= 16,
+                  predefined[skill.id] == nil,
+                  next[skill.id] == nil else {
+                throw SemanticSkillRegistryError.invalidSkill
+            }
+            next[skill.id] = skill
+        }
+        installed = next
+        var reconciled: [String: SemanticSkillDefinition] = [:]
+        for (id, evidence) in validated {
+            guard let base = predefined[id] ?? installed[id] else { continue }
+            var merged = base
+            merged.bundleID = base.bundleID ?? evidence.bundleID
+            merged.environment = evidence.environment
+            merged.evidenceCount = evidence.evidenceCount
+            merged.reliability = evidence.reliability
+            merged.lastValidatedAt = evidence.lastValidatedAt
+            merged.lastFailureAt = evidence.lastFailureAt
+            merged.origin = evidence.origin
+            reconciled[id] = merged
+        }
+        validated = reconciled
+        try persist()
+    }
+
     public func skill(id: String) -> SemanticSkillDefinition? {
         loadIfNeeded()
-        return validated[id] ?? predefined[id]
+        return validated[id] ?? installed[id] ?? predefined[id]
     }
 
     public func selectedSkillHint(skillID: String) -> String? {
         loadIfNeeded()
-        guard let skill = validated[skillID] ?? predefined[skillID] else { return nil }
+        guard let skill = validated[skillID] ?? installed[skillID] ?? predefined[skillID] else { return nil }
         let capabilities = skill.requiredCapabilities.joined(separator: ",")
         let landmarks = skill.landmarks.joined(separator: ",")
         let transitions = skill.transitions.map { "\($0.fromSurface)->\($0.toSurface):\($0.semanticAction)" }.joined(separator: " | ")
         let verification = skill.verificationObligations.joined(separator: ",")
         let recovery = skill.allowedLocalRecovery.joined(separator: ",")
-        return """
+        var hint = """
         User-selected semantic skill: \(skill.id)
         goal=\(skill.semanticGoal)
         bundle=\(skill.bundleID ?? "any")
@@ -207,6 +247,38 @@ public actor SemanticSkillRegistry {
         exactlyOnce=\(skill.exactlyOnce ? "true" : "false")
         Treat this skill as the user's explicit planning preference for the current run. It is planning knowledge only: fresh observation, ToolRouter capability checks, PolicyEngine, confirmations, exactly-once guards, and postcondition verification always override it. Do not silently switch to a different skill unless this one is incompatible with the user's request or current device evidence.
         """
+        if installed[skillID] != nil {
+            let supportRoot = fileURL.deletingLastPathComponent().deletingLastPathComponent()
+            let packageRoot = supportRoot.appendingPathComponent("Skills/Packages", isDirectory: true)
+            if let packageContext = try? SpecializedSkillPackageRuntimeLoader.loadContext(rootURL: packageRoot, skillID: skillID) {
+                hint += "\n\n" + packageContext
+            } else {
+                return nil
+            }
+        }
+        return hint
+    }
+
+    public func uniqueHighConfidenceUserSkill(for request: String) -> SemanticSkillDefinition? {
+        loadIfNeeded()
+        let normalizedRequest = Self.normalizedRoutingText(request)
+        guard normalizedRequest.count >= 3 else { return nil }
+        var merged = predefined
+        for (id, value) in installed { merged[id] = value }
+        for (id, value) in validated where !Self.isInvalidated(value, now: Date()) { merged[id] = value }
+
+        let matches = merged.values.filter { skill in
+            guard skill.userSelectable == true else { return false }
+            let id = Self.normalizedRoutingText(skill.id)
+            let display = Self.normalizedRoutingText(skill.displayName ?? "")
+            let goal = Self.normalizedRoutingText(skill.semanticGoal)
+            let explicitID = id.count >= 6 && normalizedRequest.contains(id)
+            let explicitDisplay = display.count >= 3 && normalizedRequest.contains(display)
+            let exactGoalPhrase = goal.count >= 5 && normalizedRequest.contains(goal)
+            return explicitID || explicitDisplay || exactGoalPhrase
+        }
+        guard matches.count == 1 else { return nil }
+        return matches[0]
     }
 
     public func candidates(
@@ -220,6 +292,7 @@ public actor SemanticSkillRegistry {
         let goal = Self.normalized(semanticGoal)
         guard !goal.isEmpty else { return [] }
         var merged = predefined
+        for (id, value) in installed { merged[id] = value }
         for (id, value) in validated where !Self.isInvalidated(value, now: now) {
             merged[id] = value
         }
@@ -256,7 +329,7 @@ public actor SemanticSkillRegistry {
         at now: Date = Date()
     ) throws {
         loadIfNeeded()
-        guard let base = validated[skillID] ?? predefined[skillID] else {
+        guard let base = validated[skillID] ?? installed[skillID] ?? predefined[skillID] else {
             throw SemanticSkillRegistryError.unknownSkill(skillID)
         }
         guard !base.id.isEmpty, !base.semanticGoal.isEmpty, !base.requiredSemanticSurface.isEmpty,
@@ -345,6 +418,15 @@ public actor SemanticSkillRegistry {
 
     private static func normalized(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func normalizedRoutingText(_ value: String) -> String {
+        value.lowercased()
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: ".", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
     }
 
     private static func isStale(_ skill: SemanticSkillDefinition, now: Date) -> Bool {

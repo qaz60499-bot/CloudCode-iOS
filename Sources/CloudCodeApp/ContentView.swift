@@ -12,6 +12,8 @@ struct ContentView: View {
     @ObservedObject var model: CloudCodeViewModel
     @ObservedObject private var approval: ApprovalCenter
     @State private var selectedTab: RootTab = .chat
+    @State private var errorBannerMessage: String?
+    @State private var errorBannerDismissTask: Task<Void, Never>?
 
     init(model: CloudCodeViewModel) {
         self.model = model
@@ -44,9 +46,24 @@ struct ContentView: View {
                 ApprovalSheet(preview: preview, approval: approval)
             }
         }
+        .overlay(alignment: .top) {
+            if let errorBannerMessage {
+                CloudCodeErrorBanner(message: errorBannerMessage) {
+                    dismissErrorBanner()
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .zIndex(50)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: errorBannerMessage)
+        .onChange(of: model.lastError) { value in
+            presentErrorBanner(value)
+        }
         .alert("Cloud Code", isPresented: Binding(
-            get: { model.lastError != nil },
-            set: { if !$0 { model.lastError = nil } }
+            get: { model.lastError != nil && model.hasCurrentProviderFailure },
+            set: { if !$0 && model.hasCurrentProviderFailure { model.lastError = nil } }
         )) {
             if model.hasCurrentProviderFailure {
                 if model.canRetryCurrentProviderFailure {
@@ -66,6 +83,63 @@ struct ContentView: View {
         } message: {
             Text(model.lastError ?? "")
         }
+    }
+
+    private func presentErrorBanner(_ value: String?) {
+        guard let value else { return }
+        let message = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { return }
+        errorBannerDismissTask?.cancel()
+        errorBannerMessage = message
+        if UIApplication.shared.applicationState != .active {
+            ErrorNotificationCoordinator.postIfEnabled(message)
+        }
+        errorBannerDismissTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard !Task.isCancelled else { return }
+            errorBannerMessage = nil
+        }
+    }
+
+    private func dismissErrorBanner() {
+        errorBannerDismissTask?.cancel()
+        errorBannerDismissTask = nil
+        errorBannerMessage = nil
+    }
+}
+
+private struct CloudCodeErrorBanner: View {
+    let message: String
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Cloud Code 需要处理")
+                    .font(.subheadline.bold())
+                Text(message)
+                    .font(.caption)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 6)
+            Button(action: dismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("关闭错误提醒")
+        }
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(.quaternary, lineWidth: 1)
+        }
+        .shadow(radius: 8, y: 3)
     }
 }
 
@@ -150,6 +224,14 @@ private struct SkillsView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section("技能管理") {
+                    NavigationLink {
+                        SpecializedSkillManagerView(model: model, onOpenChat: onOpenChat)
+                    } label: {
+                        Label("新建 / 导入专项技能", systemImage: "shippingbox.and.arrow.backward")
+                    }
+                }
+
                 Section("专项对话") {
                     ForEach(model.selectableSemanticSkills) { skill in
                         Button {
@@ -223,6 +305,7 @@ private struct ChatView: View {
     @State private var showDocumentImporter = false
     @State private var pendingDocument: ImportedChatDocument?
     @State private var pendingShareTransactionID: UUID?
+    @State private var pendingSharedSkillPackage: PendingSharedSkillPackage?
     @State private var isImportingDocument = false
     @State private var isConversationAtBottom = true
     @FocusState private var isComposerFocused: Bool
@@ -272,6 +355,16 @@ private struct ChatView: View {
                 }
                 .task {
                     await importNextSharedDocumentIfAvailable()
+                }
+                .alert("检测到 Cloud Code Skill", isPresented: Binding(
+                    get: { pendingSharedSkillPackage != nil },
+                    set: { if !$0 { pendingSharedSkillPackage = nil } }
+                )) {
+                    Button("导入技能") { importPendingSharedSkill() }
+                    Button("作为普通附件") { importPendingSharedSkillAsDocument() }
+                    Button("稍后", role: .cancel) { pendingSharedSkillPackage = nil }
+                } message: {
+                    Text("发现包含 skill.json 的 ZIP。只有通过技能包安全验证后才会安装。")
                 }
                 .onDisappear { voice.stop() }
         }
@@ -657,6 +750,21 @@ private struct ChatView: View {
 
     @MainActor
     private func importNextSharedDocumentIfAvailable() async {
+        guard pendingDocument == nil, pendingSharedSkillPackage == nil, !isImportingDocument else { return }
+        do {
+            if let skillPackage = try model.nextPendingSharedSkillPackageCandidate() {
+                pendingSharedSkillPackage = skillPackage
+                return
+            }
+        } catch {
+            model.lastError = "检查共享 Skill ZIP 失败：\(error.localizedDescription)"
+            return
+        }
+        await importPendingSharedDocumentDirectly()
+    }
+
+    @MainActor
+    private func importPendingSharedDocumentDirectly() async {
         guard pendingDocument == nil, !isImportingDocument else { return }
         isImportingDocument = true
         defer { isImportingDocument = false }
@@ -668,6 +776,25 @@ private struct ChatView: View {
         } catch {
             model.lastError = "读取系统分享文件失败：\(error.localizedDescription)"
         }
+    }
+
+    private func importPendingSharedSkill() {
+        guard let pending = pendingSharedSkillPackage else { return }
+        pendingSharedSkillPackage = nil
+        Task {
+            do {
+                let package = try await model.importPendingSharedSkillPackage(pending)
+                model.activityLines.append("已导入技能：\(package.manifest.displayName)")
+                await importNextSharedDocumentIfAvailable()
+            } catch {
+                model.lastError = "技能包导入失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func importPendingSharedSkillAsDocument() {
+        pendingSharedSkillPackage = nil
+        Task { await importPendingSharedDocumentDirectly() }
     }
 
     private func loadSelectedPhoto(_ item: PhotosPickerItem?) {
@@ -1584,6 +1711,8 @@ private struct SettingsView: View {
     @State private var customModelInput = ""
     @State private var showCustomProvider = false
     @State private var showBootstrapImporter = false
+    @State private var showRemoveProviderConfirmation = false
+    @AppStorage(ErrorNotificationCoordinator.preferenceKey) private var backgroundErrorNotificationsEnabled = false
     @FocusState private var keyInputFocused: Bool
 
     var body: some View {
@@ -1617,10 +1746,12 @@ private struct SettingsView: View {
                         ForEach(model.availableModels, id: \.self) { modelID in
                             Text(modelID).tag(modelID)
                         }
-                        if model.selectedProvider?.customModelAllowed == true,
-                           !model.selectedModel.isEmpty,
+                        if !model.selectedModel.isEmpty,
                            !model.availableModels.contains(model.selectedModel) {
-                            Text("自定义 · \(model.selectedModel)").tag(model.selectedModel)
+                            Text(model.selectedModelIsExplicitCustomOverride
+                                 ? "自定义 · \(model.selectedModel)"
+                                 : "当前不可用 · \(model.selectedModel)")
+                                .tag(model.selectedModel)
                         }
                     }
                     .disabled(model.availableModels.isEmpty)
@@ -1670,13 +1801,11 @@ private struct SettingsView: View {
                     }
                     .disabled(model.availableKeySlots.isEmpty || model.isProviderKeyMutationInFlight)
 
-                    if model.selectedProviderID == ProviderCatalog.agentRouterID {
-                        Button("刷新模型目录（实时）") {
-                            keyInputFocused = false
-                            Task { _ = await model.refreshSelectedProviderModelCatalog() }
-                        }
-                        .disabled(model.availableKeySlots.isEmpty || model.isProviderKeyMutationInFlight)
+                    Button("刷新模型目录（实时）") {
+                        keyInputFocused = false
+                        Task { _ = await model.refreshSelectedProviderModelCatalog() }
                     }
+                    .disabled(model.availableKeySlots.isEmpty || model.isProviderKeyMutationInFlight)
 
                     if let message = model.providerKeyCheckMessage, !message.isEmpty {
                         Text(message)
@@ -1730,6 +1859,22 @@ private struct SettingsView: View {
                 Section("厂商管理") {
                     Button("添加自定义厂商") { showCustomProvider = true }
                         .disabled(model.isProviderKeyMutationInFlight)
+
+                    if let provider = model.selectedProvider {
+                        Button(provider.source == .custom ? "删除当前厂商" : "从列表隐藏当前内置厂商") {
+                            showRemoveProviderConfirmation = true
+                        }
+                        .disabled(model.isProviderKeyMutationInFlight)
+                    }
+
+                    if model.hiddenProviderCount > 0 {
+                        Button("恢复隐藏的内置厂商（\(model.hiddenProviderCount)）") {
+                            model.restoreHiddenProviders()
+                        }
+                    }
+                    Text("自定义厂商删除后会同时清理该厂商的 Keychain 项和 Live Catalog 缓存；内置厂商只从列表隐藏，避免破坏安装包内置配置。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("交互学习") {
@@ -1753,6 +1898,28 @@ private struct SettingsView: View {
                         Label("日志", systemImage: "doc.text.magnifyingglass")
                     }
                     Text("结构化日志仅保存在本机，默认保留 72 小时且总量约 100 MB；写入和导出都会脱敏。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("错误提醒") {
+                    Toggle("后台错误系统通知", isOn: Binding(
+                        get: { backgroundErrorNotificationsEnabled },
+                        set: { enabled in
+                            if !enabled {
+                                backgroundErrorNotificationsEnabled = false
+                            } else {
+                                Task {
+                                    let granted = await ErrorNotificationCoordinator.requestAuthorization()
+                                    backgroundErrorNotificationsEnabled = granted
+                                    if !granted {
+                                        model.lastError = "系统通知权限未开启；前台错误浮窗仍会正常显示。"
+                                    }
+                                }
+                            }
+                        }
+                    ))
+                    Text("前台错误始终显示顶部浮窗；开启后，Cloud Code 在后台继续运行时遇到错误会发送本地系统通知，只包含用户可见的错误摘要。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -1808,6 +1975,22 @@ private struct SettingsView: View {
             }
             .sheet(isPresented: $showCustomProvider) {
                 CustomProviderSheet(model: model, isPresented: $showCustomProvider)
+            }
+            .confirmationDialog(
+                model.selectedProvider?.source == .custom ? "删除当前厂商？" : "隐藏当前内置厂商？",
+                isPresented: $showRemoveProviderConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button(model.selectedProvider?.source == .custom ? "删除厂商" : "隐藏厂商") {
+                    Task { _ = await model.removeOrHideSelectedProvider() }
+                }
+                Button("取消", role: .cancel) {}
+            } message: {
+                if let provider = model.selectedProvider {
+                    Text(provider.source == .custom
+                         ? "将删除 \(provider.displayName) 的本地配置、Keychain Key 和 Live Catalog 缓存。正在运行的任务会阻止删除。"
+                         : "\(provider.displayName) 只会从列表隐藏，安装包内置定义不会被物理删除。")
+                }
             }
             .fileImporter(isPresented: $showBootstrapImporter, allowedContentTypes: [.json]) { result in
                 switch result {

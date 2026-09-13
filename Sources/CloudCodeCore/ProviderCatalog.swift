@@ -262,8 +262,7 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
 
     public mutating func applyLiveModelCatalog(_ liveModels: [String], keySlotID: String, authoritative: Bool) {
         let discoveredModels = Self.unique(liveModels)
-        guard !discoveredModels.isEmpty,
-              let targetSlotIndex = keySlots.firstIndex(where: { $0.id == keySlotID }) else { return }
+        guard let targetSlotIndex = keySlots.firstIndex(where: { $0.id == keySlotID }) else { return }
         if authoritative {
             // Match NativeCloud's selected-Key catalog semantics: a successful authenticated
             // /models response is the current source of truth. New models appear immediately and
@@ -277,6 +276,7 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
         } else {
             // Some built-in compatible gateways expose partial/resource-pool-specific catalogs;
             // preserve the historical enrich-without-shrinking behavior for those providers.
+            guard !discoveredModels.isEmpty else { return }
             models = Self.unique(models + discoveredModels)
             keySlots[targetSlotIndex].models = Self.unique(keySlots[targetSlotIndex].models + discoveredModels)
         }
@@ -394,6 +394,45 @@ public enum ProviderLiveModelCatalogCache {
             result[providerIndex].applyLiveModelCatalog(snapshot.models, keySlotID: snapshot.keySlotID, authoritative: true)
         }
         return result
+    }
+
+    public static func remove(providerID: String, from url: URL) throws {
+        guard !providerID.isEmpty else { return }
+        var snapshots = load(from: url) ?? []
+        let originalCount = snapshots.count
+        snapshots.removeAll { $0.providerID == providerID }
+        guard snapshots.count != originalCount else { return }
+        if snapshots.isEmpty {
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+            return
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(snapshots).write(to: url, options: .atomic)
+    }
+
+    public static func lastSuccessfulUpdate(providerID: String, keySlotID: String, from url: URL) -> Date? {
+        load(from: url)?
+            .filter { $0.providerID == providerID && $0.keySlotID == keySlotID }
+            .map(\.updatedAt)
+            .max()
+    }
+
+    private static func removeExpiredSnapshots(providerID: String, from url: URL, now: Date = Date()) throws {
+        guard !providerID.isEmpty else { return }
+        var snapshots = load(from: url) ?? []
+        let originalCount = snapshots.count
+        snapshots.removeAll { $0.providerID == providerID }
+        guard snapshots.count != originalCount else { return }
+        snapshots = snapshots
+            .filter { now.timeIntervalSince($0.updatedAt) <= maximumAge }
+            .sorted { $0.updatedAt > $1.updatedAt }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(snapshots).write(to: url, options: .atomic)
     }
 
     public static func persist(

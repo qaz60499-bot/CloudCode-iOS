@@ -737,7 +737,7 @@ enum EmbeddedRootHelper {
         let encoded = utf8.base64EncodedString()
         let result = run(["gui-type-base64", encoded], privilege: .root, timeout: 6)
         return result.code == 0
-            ? (true, result.diagnostic.isEmpty ? "文本输入已通过受控 AX/HID 路径提交；输入内容未写入 helper 诊断输出。" : "文本输入已提交；输入内容未写入日志。\(result.diagnostic)")
+            ? (true, result.diagnostic.isEmpty ? "文本输入已通过无 AX 的受控 HID 路径派发；语义结果必须由后续截图/OCR 验证。" : "文本输入已通过无 AX 的 HID 路径派发；输入内容未写入日志。\(result.diagnostic)")
             : (false, failureDetail(prefix: "GUI type", code: result.code, diagnostic: result.diagnostic))
     }
 
@@ -2087,6 +2087,55 @@ private struct LocalSemanticTarget: Sendable {
     var cacheHit: Bool
 }
 
+private actor GUIObservationCache {
+    private struct ScreenshotEntry: Sendable {
+        var data: Data
+        var capturedAt: Date
+        var generation: Int
+    }
+
+    private var generation = 0
+    private var screenshot: ScreenshotEntry?
+    private var localVisionPayload: [String: String]?
+    private var localVisionGeneration: Int?
+    private let maximumAge: TimeInterval = 1.0
+
+    func currentScreenshot(now: Date = Date()) -> (data: Data, generation: Int)? {
+        guard let screenshot,
+              screenshot.generation == generation,
+              now.timeIntervalSince(screenshot.capturedAt) <= maximumAge else { return nil }
+        return (screenshot.data, generation)
+    }
+
+    func storeScreenshot(_ data: Data, now: Date = Date()) -> Int {
+        screenshot = ScreenshotEntry(data: data, capturedAt: now, generation: generation)
+        localVisionPayload = nil
+        localVisionGeneration = nil
+        return generation
+    }
+
+    func currentLocalVisionPayload() -> [String: String]? {
+        guard localVisionGeneration == generation else { return nil }
+        return localVisionPayload
+    }
+
+    func storeLocalVisionPayload(_ payload: [String: String]) {
+        localVisionPayload = payload
+        localVisionGeneration = generation
+    }
+
+    @discardableResult
+    func invalidate() -> Int {
+        generation &+= 1
+        screenshot = nil
+        localVisionPayload = nil
+        localVisionGeneration = nil
+        return generation
+    }
+
+    func currentGeneration() -> Int { generation }
+}
+
 private actor GUIElementLookupCache {
     private struct Entry: Sendable {
         var match: GUIElementMatch
@@ -2126,6 +2175,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
     private let approval: ApprovalRequesting
     private let attachmentRoot: URL?
     private let elementCache: GUIElementLookupCache
+    private let observationCache: GUIObservationCache
     private let appKnowledgeRegistry: AppKnowledgeRegistry?
 
     public init(
@@ -2140,6 +2190,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         self.approval = approval
         self.attachmentRoot = attachmentRoot
         self.elementCache = GUIElementLookupCache()
+        self.observationCache = GUIObservationCache()
         self.appKnowledgeRegistry = appKnowledgeRegistry
     }
 
@@ -2284,6 +2335,9 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 risk: descriptor.risk
             )
             guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
+        }
+        if Self.stateChangingToolNames.contains(call.name) {
+            _ = await observationCache.invalidate()
         }
         switch call.name {
         case "gui.openApp":
@@ -2608,42 +2662,45 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             let data = try await backend.screenshot()
             let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
 
-            // Prefer a structural focus proof before invoking Vision. On the real build-92 device,
-            // Cloud Code is backgrounded while WeChat owns the keyboard; Vision frequently fails
-            // there with CoreVideo/CoreML allocation errors even though AX can still expose the
-            // focused text control. The probe intentionally returns no AXValue/text content.
-            let axFocus = EmbeddedRootHelper.focusedTextInput()
-            if let focused = axFocus.payload, focused.focusedTextInput {
-                let payload: [String: String] = [
-                    "baselineSHA256": baselineSHA256,
-                    "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
-                    "focusStrategy": "bounded_bottom_center_composer_candidate",
-                    "focusX": String(focusX),
-                    "focusY": String(focusY),
-                    "composerFocusVerified": "true",
-                    "keyboardLikely": "false",
-                    "focusVerification": "ax_focused_text_input",
-                    "focusedRole": String(focused.role.prefix(128)),
-                    "effectVerification": "ax_focused_text_input_verified",
-                    "localObservation": "final_screenshot_attached",
-                    "perceptionClass": "semantic_composer_focus",
-                    "perceptionAXAttempted": "true",
-                    "perceptionAXSucceeded": "true",
-                    "perceptionAnchorCacheHit": "false",
-                    "perceptionOCRInvoked": "false",
-                    "perceptionOCRSucceeded": "false",
-                    "perceptionLocalSufficient": "true",
-                    "perceptionRemoteVisionRequired": "false",
-                    "perceptionFallbackReason": "ax_focused_text_input_verified_composer_focus",
-                    "providerVisualRoundTripAvoided": "1"
-                ]
-                return ToolResult(
-                    toolCallID: call.id,
-                    success: true,
-                    summary: "Chat composer focus was locally verified by a focused accessibility text-input element; OCR was not required.",
-                    payload: payload,
-                    attachments: attachment.map { [$0] }
-                )
+            // Production AX/AXAudit focus reads are deliberately quarantined. Build 131-133 device
+            // evidence showed that entering private accessibility client paths can surface the green
+            // system frame even without explicit Automation-state writes. Composer verification is
+            // therefore screenshot/OCR-only in normal Agent execution; the explicit Perception Probe
+            // remains the place for bounded AX diagnostics.
+            if ProductionPerceptionPolicy.accessibilityRuntimeAllowed {
+                let axFocus = EmbeddedRootHelper.focusedTextInput()
+                if let focused = axFocus.payload, focused.focusedTextInput {
+                    let payload: [String: String] = [
+                        "baselineSHA256": baselineSHA256,
+                        "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
+                        "focusStrategy": "bounded_bottom_center_composer_candidate",
+                        "focusX": String(focusX),
+                        "focusY": String(focusY),
+                        "composerFocusVerified": "true",
+                        "keyboardLikely": "false",
+                        "focusVerification": "ax_focused_text_input",
+                        "focusedRole": String(focused.role.prefix(128)),
+                        "effectVerification": "ax_focused_text_input_verified",
+                        "localObservation": "final_screenshot_attached",
+                        "perceptionClass": "semantic_composer_focus",
+                        "perceptionAXAttempted": "true",
+                        "perceptionAXSucceeded": "true",
+                        "perceptionAnchorCacheHit": "false",
+                        "perceptionOCRInvoked": "false",
+                        "perceptionOCRSucceeded": "false",
+                        "perceptionLocalSufficient": "true",
+                        "perceptionRemoteVisionRequired": "false",
+                        "perceptionFallbackReason": "ax_focused_text_input_verified_composer_focus",
+                        "providerVisualRoundTripAvoided": "1"
+                    ]
+                    return ToolResult(
+                        toolCallID: call.id,
+                        success: true,
+                        summary: "Chat composer focus was locally verified by a focused accessibility text-input element; OCR was not required.",
+                        payload: payload,
+                        attachments: attachment.map { [$0] }
+                    )
+                }
             }
 
             // Keyboard/composer verification is bottom-screen semantics. Restrict the first local
@@ -2687,7 +2744,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 "effectVerification": keyboardLikely ? "local_keyboard_heuristic_passed" : "semantic_required",
                 "localObservation": "final_screenshot_attached",
                 "perceptionClass": "semantic_composer_focus",
-                "perceptionAXAttempted": "true",
+                "perceptionAXAttempted": ProductionPerceptionPolicy.accessibilityRuntimeAllowed ? "true" : "false",
                 "perceptionAXSucceeded": "false",
                 "perceptionAnchorCacheHit": "false"
             ]
@@ -2695,7 +2752,9 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             if keyboardLikely {
                 payload["perceptionLocalSufficient"] = "true"
                 payload["perceptionRemoteVisionRequired"] = "false"
-                payload["perceptionFallbackReason"] = "ax_unavailable_local_keyboard_heuristic_verified_composer_focus"
+                payload["perceptionFallbackReason"] = ProductionPerceptionPolicy.accessibilityRuntimeAllowed
+                    ? "ax_unavailable_local_keyboard_heuristic_verified_composer_focus"
+                    : "production_ax_quarantined_local_keyboard_heuristic_verified_composer_focus"
                 payload["providerVisualRoundTripAvoided"] = "1"
             } else {
                 payload["perceptionLocalSufficient"] = "false"
@@ -2707,8 +2766,12 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 toolCallID: call.id,
                 success: keyboardLikely,
                 summary: keyboardLikely
-                    ? "AX did not prove text focus, but chat composer focus was locally verified by keyboard-like OCR evidence."
-                    : "Composer candidate was tapped, but neither AX focus nor local keyboard evidence verified the composer; raw typing remains blocked.",
+                    ? (ProductionPerceptionPolicy.accessibilityRuntimeAllowed
+                        ? "AX did not prove text focus, but chat composer focus was locally verified by keyboard-like OCR evidence."
+                        : "Chat composer focus was locally verified by keyboard-like OCR evidence without invoking production AX.")
+                    : (ProductionPerceptionPolicy.accessibilityRuntimeAllowed
+                        ? "Composer candidate was tapped, but neither AX focus nor local keyboard evidence verified the composer; raw typing remains blocked."
+                        : "Composer candidate was tapped, but local keyboard evidence did not verify focus; raw typing remains blocked without invoking production AX."),
                 payload: payload,
                 attachments: attachment.map { [$0] }
             )
@@ -2750,13 +2813,33 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.runStructuredPlan":
             return try await executeStructuredPlan(call)
         case "gui.screenshot":
-            let data = try await backend.screenshot()
+            let cached = await observationCache.currentScreenshot()
+            let data: Data
+            let generation: Int
+            if let cached {
+                data = cached.data
+                generation = cached.generation
+            } else {
+                data = try await backend.screenshot()
+                generation = await observationCache.storeScreenshot(data)
+            }
             let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
             var payload: [String: String] = [
                 "byteCount": String(data.count),
-                "sha256": GUIAutomationPayloadPolicy.sha256Hex(data)
+                "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
+                "observationGeneration": String(generation),
+                "observationCacheHit": cached == nil ? "false" : "true"
             ]
-            await enrichWithLocalVision(&payload, screenshot: data)
+            if let cachedVision = await observationCache.currentLocalVisionPayload() {
+                for (key, value) in cachedVision { payload[key] = value }
+                payload["localVisionCacheHit"] = "true"
+            } else {
+                var visionPayload: [String: String] = [:]
+                await enrichWithLocalVision(&visionPayload, screenshot: data)
+                await observationCache.storeLocalVisionPayload(visionPayload)
+                for (key, value) in visionPayload { payload[key] = value }
+                payload["localVisionCacheHit"] = "false"
+            }
             return ToolResult(
                 toolCallID: call.id,
                 success: true,
@@ -2811,6 +2894,13 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             throw ToolRouterError.noExecutionRoute(call.name)
         }
     }
+
+    private static let stateChangingToolNames: Set<String> = [
+        "gui.openApp", "gui.openAppObserve", "gui.tap", "gui.tapObserve", "gui.tapTextObserve",
+        "gui.focusComposerObserve", "gui.tapElementObserve", "gui.type", "gui.typeObserve",
+        "gui.typeElementObserve", "gui.scroll", "gui.scrollObserve", "gui.swipe", "gui.swipeObserve",
+        "gui.swipeSequence", "gui.feedSample", "gui.navigateBack", "gui.runStructuredPlan"
+    ]
 
     private func executeSwipeSequence(_ call: ToolCall) async throws -> ToolResult {
         let fromX = Double(call.arguments["fromX"] ?? "0") ?? 0

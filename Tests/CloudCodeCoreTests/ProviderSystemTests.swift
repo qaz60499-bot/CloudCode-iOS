@@ -275,6 +275,16 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.openAIChat, .anthropic])
     }
 
+    func testAuthoritativeLiveCatalogCanReplacePreviousModelsWithEmptyWithoutUnion() throws {
+        var provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.agentRouterID }))
+        XCTAssertFalse(provider.selectableModels(for: "slot-1").isEmpty)
+
+        provider.applyLiveModelCatalog([], keySlotID: "slot-1", authoritative: true)
+
+        XCTAssertTrue(provider.selectableModels(for: "slot-1").isEmpty)
+        XCTAssertTrue(provider.models.isEmpty)
+    }
+
     func testLiveModelCatalogCacheSurvivesRestartAndRespectsManualKeyOverride() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeLiveCatalog-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2432,6 +2442,12 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(try! XCTUnwrap(error)))
         XCTAssertFalse(ProviderKeyRotationClassifier.shouldRotate(try! XCTUnwrap(error)))
         XCTAssertFalse(ProviderEndpointHealthClassifier.shouldMarkDegraded(try! XCTUnwrap(error)))
+    }
+
+    func testAgentRouterClientRejectedCanFallbackProtocolWithoutCondemningModel() {
+        let error = ProviderError.clientRejected(400)
+        XCTAssertFalse(ProviderProtocolFallbackClassifier.shouldFallback(error))
+        XCTAssertTrue(ProviderProtocolFallbackClassifier.shouldFallback(error, providerID: ProviderCatalog.agentRouterID))
     }
 
     func testHTTP403QuotaIsCapacityNotCredentialFailure() {

@@ -1,6 +1,19 @@
 import Foundation
 import CloudCodeCore
 
+public struct PendingSharedSkillPackage: Equatable, Sendable, Identifiable {
+    public var id: UUID { transactionID }
+    public var transactionID: UUID
+    public var sourceURL: URL
+    public var originalFilename: String
+
+    public init(transactionID: UUID, sourceURL: URL, originalFilename: String) {
+        self.transactionID = transactionID
+        self.sourceURL = sourceURL
+        self.originalFilename = originalFilename
+    }
+}
+
 public struct PendingSharedChatDocument: Equatable, Sendable {
     public var transactionID: UUID
     public var document: ImportedChatDocument
@@ -12,6 +25,30 @@ public struct PendingSharedChatDocument: Equatable, Sendable {
 }
 
 extension CloudCodeViewModel {
+    public func nextPendingSharedSkillPackageCandidate() throws -> PendingSharedSkillPackage? {
+        let store: CloudCodeShareInboxStore
+        do {
+            store = try CloudCodeShareInboxStore.appGroupStore()
+        } catch CloudCodeShareInboxError.appGroupUnavailable {
+            return nil
+        }
+        guard let transaction = try store.pendingTransactions().first,
+              transaction.fileURL.pathExtension.lowercased() == "zip",
+              isSkillPackageArchive(transaction.fileURL) else { return nil }
+        return PendingSharedSkillPackage(
+            transactionID: transaction.id,
+            sourceURL: transaction.fileURL,
+            originalFilename: transaction.manifest.originalFilename
+        )
+    }
+
+    @discardableResult
+    public func importPendingSharedSkillPackage(_ pending: PendingSharedSkillPackage) async throws -> SpecializedSkillPackageSummary {
+        let package = try await importSpecializedSkillPackage(from: pending.sourceURL)
+        try completeSharedDocument(transactionID: pending.transactionID)
+        return package
+    }
+
     public func nextPendingSharedDocument() async throws -> PendingSharedChatDocument? {
         let store: CloudCodeShareInboxStore
         do {

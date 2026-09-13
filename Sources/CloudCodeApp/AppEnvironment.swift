@@ -175,6 +175,8 @@ public final class CloudCodeViewModel: ObservableObject {
     private var didBootstrap = false
     private static let providerKeyMutationOperationKey = "provider-key:mutation"
     private static let manualProviderKeyOverridesDefaultsKey = "provider.key.manualOverrides"
+    private static let explicitCustomModelOverridesDefaultsKey = "provider.model.explicitCustomOverrides"
+    private static let hiddenProviderIDsDefaultsKey = "provider.hidden.ids"
     private static let autoResumeTaskDefaultsKey = "task.autoResumeUnlessStopped"
     private static let backgroundRunIntentDefaultsKey = "task.wasRunningInBackground"
     private static let selectedSemanticSkillDefaultsKey = "skill.selected.id"
@@ -338,17 +340,30 @@ public final class CloudCodeViewModel: ObservableObject {
         let liveProviderCatalogFileURL = support.appendingPathComponent("Provider/live-model-catalogs.json")
         let customProfiles = Self.loadCustomProviders(from: customProviderFileURL)
         let manualOverridesAtLaunch = Set(defaults.stringArray(forKey: Self.manualProviderKeyOverridesDefaultsKey) ?? [])
+        let hiddenProviderIDsAtLaunch = Set(defaults.stringArray(forKey: Self.hiddenProviderIDsDefaultsKey) ?? [])
         let allProfiles = ProviderLiveModelCatalogCache.applyingCachedCatalogs(
             to: ProviderCatalog.desktopSnapshot + customProfiles,
             from: liveProviderCatalogFileURL,
             excludingKeyReferences: manualOverridesAtLaunch
-        )
+        ).map { profile in
+            var resolved = profile
+            if hiddenProviderIDsAtLaunch.contains(profile.id) { resolved.enabled = false }
+            return resolved
+        }
         let storedSelection = ProviderSelectionState(
             providerID: defaults.string(forKey: "provider.selected.id") ?? "",
             keySlotID: defaults.string(forKey: "provider.selected.keySlot") ?? "",
             model: defaults.string(forKey: "provider.selected.model") ?? ""
         )
-        let selection = ProviderSelectionResolver.reconcile(storedSelection, profiles: allProfiles)
+        var selection = ProviderSelectionResolver.reconcile(storedSelection, profiles: allProfiles)
+        // Preserve an exact persisted Provider/Key/model selection across restart even when the
+        // last-known-good live catalog says that model disappeared. The picker must surface the
+        // stale selection as unavailable instead of silently switching models before the user sees it.
+        if !storedSelection.model.isEmpty,
+           let persistedProvider = allProfiles.first(where: { $0.enabled && $0.id == storedSelection.providerID }),
+           persistedProvider.keySlots.contains(where: { $0.id == storedSelection.keySlotID }) {
+            selection = storedSelection
+        }
         self.providerProfiles = allProfiles
         self.selectedProviderID = selection.providerID
         self.selectedKeySlotID = selection.keySlotID
@@ -406,6 +421,13 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func reloadSemanticSkills() async {
+        let packageStore = SpecializedSkillPackageStore(
+            rootURL: Self.supportRoot().appendingPathComponent("Skills/Packages", isDirectory: true)
+        )
+        if let installed = try? await packageStore.definitions() {
+            let disabled = Set(UserDefaults.standard.stringArray(forKey: Self.disabledSpecializedSkillIDsDefaultsKey) ?? [])
+            try? await semanticSkillRegistry.replaceInstalledSkills(installed.filter { !disabled.contains($0.id) })
+        }
         let skills = await semanticSkillRegistry.all()
         semanticSkills = skills
         if let selectedSemanticSkillID, !skills.contains(where: { $0.id == selectedSemanticSkillID && $0.userSelectable == true }) {
@@ -475,6 +497,7 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private static func semanticSkillDisplayName(_ skill: SemanticSkillDefinition) -> String {
+        if let customName = skill.displayName, !customName.isEmpty { return customName }
         switch skill.id {
         case BossRecruitmentSkillPackage.skillID: return BossRecruitmentSkillPackage.displayName
         case "skill.chat.focus.composer": return "聊天输入框定位"
@@ -680,6 +703,17 @@ public final class CloudCodeViewModel: ObservableObject {
         selectedProvider?.selectableModels(for: selectedKeySlotID) ?? []
     }
 
+    public var selectedModelIsListedInCurrentCatalog: Bool {
+        selectedModel.isEmpty || availableModels.contains(selectedModel)
+    }
+
+    public var selectedModelIsExplicitCustomOverride: Bool {
+        guard !selectedProviderID.isEmpty, !selectedKeySlotID.isEmpty, !selectedModel.isEmpty else { return false }
+        return explicitCustomModelOverrides().contains(
+            Self.customModelOverrideIdentity(providerID: selectedProviderID, keySlotID: selectedKeySlotID, model: selectedModel)
+        )
+    }
+
     public var selectedProtocol: ProviderProtocol? {
         selectedProvider?.protocolFor(model: selectedModel, keySlotID: selectedKeySlotID)
     }
@@ -731,6 +765,9 @@ public final class CloudCodeViewModel: ObservableObject {
             guard !value.isEmpty else { throw ProviderError.missingAPIKey }
             installedKeyReferences.insert(reference)
             let refresh = await refreshLiveProviderMetadataIfNeeded(providerID: provider.id, keySlotID: keySlotID, apiKey: value)
+            if provider.id == selectedProviderID, keySlotID == selectedKeySlotID {
+                _ = await refreshSelectedProviderModelCatalog(showStatus: false)
+            }
             if let providerIndex = providerProfiles.firstIndex(where: { $0.id == provider.id }),
                let slotIndex = providerProfiles[providerIndex].keySlots.firstIndex(where: { $0.id == keySlotID }) {
                 switch refresh.state {
@@ -878,10 +915,11 @@ public final class CloudCodeViewModel: ObservableObject {
             if showStatus { providerKeyCheckMessage = "请先选择厂商和 Key。" }
             return false
         }
-        // AgentRouter mirrors NativeCloud's picker semantics: the selected Key's authenticated
-        // /v1/models response is the live source of truth. Other built-in providers keep their
-        // existing full discovery path because some expose partial/non-authoritative catalogs.
-        guard provider.id == ProviderCatalog.agentRouterID else { return false }
+        // A successful authenticated /models response is the current catalog source of truth for
+        // the selected Provider/Key. It replaces, rather than unions with, bundled or older models.
+        // Inference/protocol verification is intentionally separate and happens only for the chosen
+        // model (or through the explicit deep-check workflow), so a normal catalog refresh stays
+        // cheap and does not burn quota across dozens of models.
         let keySlotID = selectedKeySlotID
         let reference = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: keySlotID)
         do {
@@ -923,7 +961,9 @@ public final class CloudCodeViewModel: ObservableObject {
                         apiKey: apiKey,
                         authMode: provider.authMode
                     )
-                    guard !candidateModels.isEmpty else { throw ProviderError.malformedEvent }
+                    // Empty is still an authoritative successful catalog response. A thrown request
+                    // is failure and must retain last-known-good; an HTTP 2xx catalog containing zero
+                    // rows is not the same thing as a timeout/401/429/5xx.
                     discoveredModels = candidateModels
                     acceptedBaseURL = candidateBaseURL
                     try? await diagnosticLogStore.log(
@@ -968,18 +1008,37 @@ public final class CloudCodeViewModel: ObservableObject {
             await rememberVerifiedProviderBaseURL(acceptedBaseURL, provider: provider, keySlotID: keySlotID, apiKey: apiKey)
             guard let providerIndex = providerProfiles.firstIndex(where: { $0.id == provider.id }) else { return false }
             providerProfiles[providerIndex].applyLiveModelCatalog(models, keySlotID: keySlotID, authoritative: true)
-            try? ProviderLiveModelCatalogCache.persist(
-                provider: providerProfiles[providerIndex],
-                keySlotID: keySlotID,
-                to: liveProviderCatalogFileURL
-            )
-            let reconciled = ProviderSelectionResolver.reconcile(
-                ProviderSelectionState(providerID: selectedProviderID, keySlotID: selectedKeySlotID, model: selectedModel),
-                profiles: providerProfiles
-            )
-            applySelection(reconciled)
+            // Persist only non-empty catalogs as Last Known Good. If upstream deliberately returns an
+            // empty live catalog, keep that empty Live view for this process while retaining the older
+            // non-empty LKG as the offline fallback for a later launch.
+            if !models.isEmpty {
+                try? ProviderLiveModelCatalogCache.persist(
+                    provider: providerProfiles[providerIndex],
+                    keySlotID: keySlotID,
+                    to: liveProviderCatalogFileURL
+                )
+            }
+            let selectedStillListed = selectedModel.isEmpty || models.contains(selectedModel)
+            if selectedStillListed, selectedModelIsExplicitCustomOverride {
+                var overrides = explicitCustomModelOverrides()
+                overrides.remove(Self.customModelOverrideIdentity(
+                    providerID: provider.id,
+                    keySlotID: keySlotID,
+                    model: selectedModel
+                ))
+                UserDefaults.standard.set(overrides.sorted(), forKey: Self.explicitCustomModelOverridesDefaultsKey)
+            }
+            // Do not silently switch a user's selected model merely because a successful refresh says
+            // it disappeared. Keep the selection visible and mark it unavailable so the user can make
+            // an explicit replacement choice; only an explicit custom-model override remains callable.
             if showStatus {
-                providerKeyCheckMessage = "已从厂商实时读取当前 Key 的模型目录：\(models.count) 个模型。"
+                if selectedStillListed {
+                    providerKeyCheckMessage = "已从厂商实时读取当前 Key 的模型目录：\(models.count) 个模型。"
+                } else if selectedModelIsExplicitCustomOverride {
+                    providerKeyCheckMessage = "已刷新实时模型目录：\(models.count) 个模型。当前 \(selectedModel) 不在厂商目录中，但它是你显式设置的自定义模型；不会把它冒充成 Live Catalog 模型。"
+                } else {
+                    providerKeyCheckMessage = "已刷新实时模型目录：\(models.count) 个模型。当前模型 \(selectedModel) 已不在厂商目录中，已标记为当前不可用，未自动切换模型。"
+                }
             }
             try? await diagnosticLogStore.log(
                 level: .info,
@@ -999,7 +1058,12 @@ public final class CloudCodeViewModel: ObservableObject {
             // Desktop NativeCloud keeps the last successful catalog when the live refresh itself
             // fails. Do the same here: never replace a usable picker with an empty/error result.
             if showStatus {
-                providerKeyCheckMessage = "实时模型目录读取失败，已保留上一次成功目录：\(error)"
+                let lastSuccess = ProviderLiveModelCatalogCache.lastSuccessfulUpdate(
+                    providerID: provider.id,
+                    keySlotID: keySlotID,
+                    from: liveProviderCatalogFileURL
+                ).map { ISO8601DateFormatter().string(from: $0) } ?? "无记录"
+                providerKeyCheckMessage = "实时模型目录读取失败，已保留 Last Known Good；上次成功：\(lastSuccess)。错误：\(error)"
             }
             try? await diagnosticLogStore.log(
                 level: .warning,
@@ -1015,9 +1079,23 @@ public final class CloudCodeViewModel: ObservableObject {
 
     public func selectModel(_ model: String) {
         guard let provider = selectedProvider else { return }
+        let normalized = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return }
         let allowed = provider.selectableModels(for: selectedKeySlotID)
-        guard allowed.contains(model) || provider.customModelAllowed else { return }
-        selectedModel = model
+        let identity = Self.customModelOverrideIdentity(
+            providerID: provider.id,
+            keySlotID: selectedKeySlotID,
+            model: normalized
+        )
+        var overrides = explicitCustomModelOverrides()
+        if allowed.contains(normalized) {
+            overrides.remove(identity)
+        } else {
+            guard provider.customModelAllowed else { return }
+            overrides.insert(identity)
+        }
+        UserDefaults.standard.set(overrides.sorted(), forKey: Self.explicitCustomModelOverridesDefaultsKey)
+        selectedModel = normalized
         persistProviderSelection()
     }
 
@@ -1071,6 +1149,9 @@ public final class CloudCodeViewModel: ObservableObject {
             }
 
             await refreshLiveProviderMetadataIfNeeded(providerID: providerID, keySlotID: keySlotID, apiKey: normalizedSecret)
+            if providerID == selectedProviderID, keySlotID == selectedKeySlotID {
+                _ = await refreshSelectedProviderModelCatalog(showStatus: false)
+            }
             clearProviderEndpointHealth(providerID: providerID)
             providerFailureSessionIDs.remove(session.id)
             retryableProviderFailureSessionIDs.remove(session.id)
@@ -1103,15 +1184,18 @@ public final class CloudCodeViewModel: ObservableObject {
 
     @discardableResult
     public func saveProviderSelection() -> Bool {
-        let reconciled = ProviderSelectionResolver.reconcile(
-            ProviderSelectionState(providerID: selectedProviderID, keySlotID: selectedKeySlotID, model: selectedModel),
-            profiles: providerProfiles
-        )
-        guard !reconciled.providerID.isEmpty, !reconciled.keySlotID.isEmpty, !reconciled.model.isEmpty else {
+        guard let provider = selectedProvider,
+              provider.keySlots.contains(where: { $0.id == selectedKeySlotID }),
+              !selectedModel.isEmpty else {
             lastError = "请先选择厂商、Key 和模型。"
             return false
         }
-        applySelection(reconciled)
+        if !provider.selectableModels(for: selectedKeySlotID).contains(selectedModel),
+           !selectedModelIsExplicitCustomOverride {
+            lastError = "当前模型 \(selectedModel) 已不在厂商最新成功目录中。请显式选择新的可用模型；不会自动替换。"
+            return false
+        }
+        persistProviderSelection()
         UserDefaults.standard.set(permissionMode.rawValue, forKey: "permission.mode")
         session.permissionMode = permissionMode
         session.providerID = selectedProviderID
@@ -3235,6 +3319,75 @@ public final class CloudCodeViewModel: ObservableObject {
         }
     }
 
+    public var hiddenProviderCount: Int {
+        providerProfiles.filter { !$0.enabled && $0.source != .custom }.count
+    }
+
+    @discardableResult
+    public func removeOrHideSelectedProvider() async -> Bool {
+        guard let providerIndex = providerProfiles.firstIndex(where: { $0.id == selectedProviderID }),
+              providerProfiles.indices.contains(providerIndex) else {
+            lastError = "当前厂商不存在。"
+            return false
+        }
+        let provider = providerProfiles[providerIndex]
+        guard !activeConfigurations.values.contains(where: { $0.providerID == provider.id }) else {
+            lastError = "当前仍有任务正在使用这个厂商。请先停止相关任务，再删除或隐藏。"
+            return false
+        }
+        guard beginExclusiveOperation(Self.providerKeyMutationOperationKey) else {
+            lastError = "另一个厂商 Key 操作正在进行中。"
+            return false
+        }
+        defer { endExclusiveOperation(Self.providerKeyMutationOperationKey) }
+
+        if provider.source == .custom {
+            providerProfiles.remove(at: providerIndex)
+            do {
+                try persistCustomProviders()
+            } catch {
+                providerProfiles.insert(provider, at: min(providerIndex, providerProfiles.count))
+                lastError = "删除自定义厂商失败：\(error.localizedDescription)"
+                return false
+            }
+            for slot in provider.keySlots {
+                let reference = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: slot.id)
+                try? keyVault.remove(reference)
+                installedKeyReferences.remove(reference)
+                updateManualProviderKeyOverrides { $0.remove(reference) }
+            }
+            var customOverrides = explicitCustomModelOverrides()
+            let prefix = provider.id + "\u{001F}"
+            customOverrides = Set(customOverrides.filter { !$0.hasPrefix(prefix) })
+            UserDefaults.standard.set(customOverrides.sorted(), forKey: Self.explicitCustomModelOverridesDefaultsKey)
+            try? ProviderLiveModelCatalogCache.remove(providerID: provider.id, from: liveProviderCatalogFileURL)
+            activityLines.append("已删除自定义厂商：\(provider.displayName)。相关 Keychain 项和 Live Catalog 缓存已清理。")
+        } else {
+            providerProfiles[providerIndex].enabled = false
+            var hidden = Set(UserDefaults.standard.stringArray(forKey: Self.hiddenProviderIDsDefaultsKey) ?? [])
+            hidden.insert(provider.id)
+            UserDefaults.standard.set(hidden.sorted(), forKey: Self.hiddenProviderIDsDefaultsKey)
+            activityLines.append("已从厂商列表隐藏：\(provider.displayName)。内置配置未物理删除，可随时恢复显示。")
+        }
+
+        let next = ProviderSelectionResolver.reconcile(ProviderSelectionState(), profiles: providerProfiles)
+        applySelection(next)
+        providerKeyCheckMessage = nil
+        lastError = nil
+        return true
+    }
+
+    public func restoreHiddenProviders() {
+        var hidden = Set(UserDefaults.standard.stringArray(forKey: Self.hiddenProviderIDsDefaultsKey) ?? [])
+        guard !hidden.isEmpty else { return }
+        for index in providerProfiles.indices where hidden.contains(providerProfiles[index].id) && providerProfiles[index].source != .custom {
+            providerProfiles[index].enabled = true
+        }
+        hidden.removeAll()
+        UserDefaults.standard.set([], forKey: Self.hiddenProviderIDsDefaultsKey)
+        activityLines.append("已恢复显示所有隐藏的内置厂商。")
+    }
+
     public func importProviderBootstrap(from url: URL) {
         let operationKey = Self.providerKeyMutationOperationKey
         guard beginExclusiveOperation(operationKey) else {
@@ -3338,6 +3491,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 )
             }
             let refresh = await refreshLiveProviderMetadataIfNeeded(providerID: provider.id, keySlotID: selectedKeySlotID, apiKey: key.secret)
+            _ = await refreshSelectedProviderModelCatalog(showStatus: false)
             providerKeyCheckMessage = refresh.usable
                 ? "已把当前 Key 恢复为安装包预配置值，并通过上游验证。"
                 : "已把当前 Key 恢复为安装包预配置值；本地写入/回读已通过，但上游仍未验证成功：\(refresh.diagnostic)"
@@ -3475,18 +3629,22 @@ public final class CloudCodeViewModel: ObservableObject {
             }
             let shouldApplyDiscovery = discovery.readiness == .ready && !discovery.models.isEmpty
             if shouldApplyDiscovery {
-                providerProfiles[providerIndex].applyDiscovery(discovery, keySlotID: keySlotID)
-                try? ProviderLiveModelCatalogCache.persist(
-                    provider: providerProfiles[providerIndex],
-                    keySlotID: keySlotID,
-                    to: liveProviderCatalogFileURL
-                )
-                let reconciled = ProviderSelectionResolver.reconcile(
-                    ProviderSelectionState(providerID: selectedProviderID, keySlotID: selectedKeySlotID, model: selectedModel),
-                    profiles: providerProfiles
-                )
-                applySelection(reconciled)
-                activityLines.append("\(profile.displayName) 已按当前 Key 实时验证可用模型：\(discovery.models.count) 个。")
+                // This path validates Key/Host/protocol only. Catalog ownership belongs exclusively to
+                // refreshSelectedProviderModelCatalog(), whose authenticated /models success performs
+                // authoritative replacement. Never let inference fallback/pricing discovery union
+                // historical models back into the visible picker.
+                providerProfiles[providerIndex].authMode = discovery.authMode
+                providerProfiles[providerIndex].readiness = discovery.readiness
+                for protocolName in discovery.protocols where !providerProfiles[providerIndex].protocols.contains(protocolName) {
+                    providerProfiles[providerIndex].protocols.append(protocolName)
+                }
+                if let slotIndex = providerProfiles[providerIndex].keySlots.firstIndex(where: { $0.id == keySlotID }) {
+                    providerProfiles[providerIndex].keySlots[slotIndex].status = .verified
+                    for protocolName in discovery.protocols where !providerProfiles[providerIndex].keySlots[slotIndex].protocols.contains(protocolName) {
+                        providerProfiles[providerIndex].keySlots[slotIndex].protocols.append(protocolName)
+                    }
+                }
+                activityLines.append("\(profile.displayName) 已验证当前 Key / Host / 推理协议；模型目录由独立 Live Catalog 刷新负责。")
             } else if discovery.models.isEmpty {
                 activityLines.append("\(profile.displayName) 当前模型目录没有给出可验证模型；已保留原有厂商、Key、模型和协议配置，不会用一次网络探测覆盖本地 Catalog。")
             } else {
@@ -3496,7 +3654,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 level: shouldApplyDiscovery ? .info : .warning,
                 subsystem: "provider-discovery",
                 action: "refresh",
-                result: shouldApplyDiscovery ? "verified-catalog-applied" : "non-authoritative-catalog-preserved",
+                result: shouldApplyDiscovery ? "verified-route-metadata-applied" : "non-authoritative-catalog-preserved",
                 metadata: [
                     "providerID": providerID,
                     "keySlotID": keySlotID,
@@ -3583,6 +3741,9 @@ public final class CloudCodeViewModel: ObservableObject {
         guard let provider = selectedProvider,
               let slot = provider.keySlots.first(where: { $0.id == selectedKeySlotID }),
               !selectedModel.isEmpty else { return nil }
+        guard provider.selectableModels(for: slot.id).contains(selectedModel) || selectedModelIsExplicitCustomOverride else {
+            return nil
+        }
         let protocolCandidates = provider.protocolCandidates(for: selectedModel, keySlotID: slot.id)
         let protocolName = protocolCandidates.first ?? provider.preferredProtocol
         let references = provider.orderedKeyReferences(selectedKeySlotID: slot.id, model: selectedModel)
@@ -4051,6 +4212,14 @@ public final class CloudCodeViewModel: ObservableObject {
 
     private func manualProviderKeyOverrides() -> Set<String> {
         Set(UserDefaults.standard.stringArray(forKey: Self.manualProviderKeyOverridesDefaultsKey) ?? [])
+    }
+
+    private func explicitCustomModelOverrides() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: Self.explicitCustomModelOverridesDefaultsKey) ?? [])
+    }
+
+    private static func customModelOverrideIdentity(providerID: String, keySlotID: String, model: String) -> String {
+        [providerID, keySlotID, model].joined(separator: "\u{001F}")
     }
 
     private func updateManualProviderKeyOverrides(_ mutate: (inout Set<String>) -> Void) {

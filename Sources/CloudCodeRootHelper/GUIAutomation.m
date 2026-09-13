@@ -3176,99 +3176,11 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
         NSString *text = [[NSString alloc] initWithData:utf8 encoding:NSUTF8StringEncoding];
         if (!text || text.length == 0) { return 67; }
 
-        // First try AccessibilityUI's AXElement route, but only when AXAudit exposes exactly one
-        // non-secure text element with verified focus: either the reversed kAXIsEditingTrait or the
-        // underlying AXUIElement's AXFocused=true. Do not equate AXAudit's opaque-provider navigation
-        // attribute (95226), uniqueness, or text-entry capability with keyboard focus. After
-        // insertText:, read the element value back before reporting success; an unverified submission
-        // fails closed so HID fallback cannot duplicate text that may already have been inserted.
-        NSString *auditTextDetail = nil;
-        id auditFocused = CloudCodeAXAuditEditingTextElement(&auditTextDetail);
-        SEL insertTextSelector = NSSelectorFromString(@"insertText:");
-        if (auditFocused && [auditFocused respondsToSelector:insertTextSelector]) {
-            CloudCodeAXRuntime auditRuntime = CloudCodeResolveAX();
-            NSDictionary *auditNode = CloudCodeAXAuditElementNode(auditRuntime, auditFocused);
-            NSString *auditRole = [auditNode[@"role"] isKindOfClass:NSString.class] ? auditNode[@"role"] : @"";
-            NSString *beforeAuditText = CloudCodeAXAuditTextValue(auditRuntime, auditFocused);
-            @try {
-                ((void (*)(id, SEL, id))objc_msgSend)(auditFocused, insertTextSelector, text);
-                NSString *afterAuditText = nil;
-                for (NSUInteger attempt = 0; attempt < 4; attempt++) {
-                    usleep(50000);
-                    afterAuditText = CloudCodeAXAuditTextValue(auditRuntime, auditFocused);
-                    if (afterAuditText && (!beforeAuditText || ![afterAuditText isEqualToString:beforeAuditText])) { break; }
-                }
-                if (afterAuditText && (!beforeAuditText || ![afterAuditText isEqualToString:beforeAuditText])) {
-                    fprintf(stderr, "gui-type: route=AccessibilityUI.AXAudit.editing.insertText result=verified chars=%lu role=%s\n",
-                            (unsigned long)text.length,
-                            auditRole.UTF8String ?: "unknown");
-                    CloudCodeGUIExitOneShot(0);
-                }
-                fprintf(stderr, "gui-type: route=AccessibilityUI.AXAudit.editing.insertText result=write-unverified chars=%lu role=%s\n",
-                        (unsigned long)text.length,
-                        auditRole.UTF8String ?: "unknown");
-                CloudCodeGUIExitOneShot(70);
-            } @catch (NSException *exception) {
-                fprintf(stderr, "gui-type: route=AccessibilityUI.AXAudit.editing.insertText result=exception name=%s\n",
-                        exception.name.UTF8String ?: "unknown");
-                CloudCodeGUIExitOneShot(70);
-            }
-        } else if (auditTextDetail.length > 0) {
-            fprintf(stderr, "gui-type: AXAudit editing insertText unavailable: %s\n", auditTextDetail.UTF8String);
-        }
-
-        // Prefer the focused accessibility text element when the foreground app exposes one.
-        // This is substantially more reliable than sending a Unicode HID packet into an unknown
-        // responder. Never overwrite a non-empty field through AX: in that case preserve normal
-        // caret/append semantics and fall back to HID below.
-        CloudCodeAXRuntime ax = CloudCodeResolveAX();
-        CloudCodeAXUIElementRef focusedElement = NULL;
-        NSString *focusedBackend = nil;
-        NSString *focusedRole = nil;
-        NSString *beforeText = nil;
-        if (ax.copyAttribute && ax.setAttribute) {
-            pid_t focusedPID = 0;
-            focusedElement = CloudCodeAXCopyFocusedElement(ax, &focusedPID, &focusedBackend);
-            if (focusedElement) {
-                id rawRole = CloudCodeAXCopy(ax, focusedElement, ax.attributeElementType ?: CFSTR("AXRole"));
-                focusedRole = CloudCodeBoundedString(rawRole);
-                BOOL isTextRole = focusedRole && (
-                    [focusedRole rangeOfString:@"TextField" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                    [focusedRole rangeOfString:@"TextArea" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                    [focusedRole rangeOfString:@"TextView" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                    [focusedRole rangeOfString:@"SearchField" options:NSCaseInsensitiveSearch].location != NSNotFound
-                );
-                if (isTextRole) {
-                    id rawBefore = CloudCodeAXCopy(ax, focusedElement, ax.attributeValue ?: CFSTR("AXValue"));
-                    if ([rawBefore isKindOfClass:NSString.class]) { beforeText = [rawBefore copy]; }
-                    if (!beforeText || beforeText.length == 0) {
-                        CloudCodeAXError setCode = -1;
-                        @try {
-                            setCode = ax.setAttribute(focusedElement, ax.attributeValue ?: CFSTR("AXValue"), (__bridge CFTypeRef)text);
-                        } @catch (__unused NSException *exception) {
-                            setCode = -1;
-                        }
-                        if (setCode == 0) {
-                            usleep(80000);
-                            id rawAfter = CloudCodeAXCopy(ax, focusedElement, ax.attributeValue ?: CFSTR("AXValue"));
-                            if ([rawAfter isKindOfClass:NSString.class] && [(NSString *)rawAfter isEqualToString:text]) {
-                                fprintf(stderr, "gui-type: route=ax-focused-value result=verified chars=%lu backend=%s role=%s\n",
-                                        (unsigned long)text.length,
-                                        focusedBackend.UTF8String ?: "AXRuntime.focused",
-                                        focusedRole.UTF8String ?: "unknown");
-                                CloudCodeGUIExitOneShot(0);
-                            }
-                            fprintf(stderr, "gui-type: route=ax-focused-value result=write-unverified chars=%lu backend=%s role=%s\n",
-                                    (unsigned long)text.length,
-                                    focusedBackend.UTF8String ?: "AXRuntime.focused",
-                                    focusedRole.UTF8String ?: "unknown");
-                            CloudCodeGUIExitOneShot(70);
-                        }
-                    }
-                }
-            }
-        }
-
+        // Production text input deliberately avoids AXRuntime/AccessibilityUI/AXAudit. Build 131-133
+        // physical-device evidence showed that merely entering private accessibility client paths can
+        // surface the visible green system frame even when no Automation-state setter is called.
+        // Focus is verified by the caller from a fresh screenshot/local-OCR keyboard postcondition;
+        // this helper owns only the bounded HID Unicode dispatch and never touches AX state.
         NSData *unicode = [text dataUsingEncoding:NSUTF16LittleEndianStringEncoding];
         if (!unicode || unicode.length == 0 || unicode.length > UINT32_MAX) { CloudCodeGUIExitOneShot(67); }
         CloudCodeHIDRuntime runtime = CloudCodeResolveHID();
@@ -3298,28 +3210,10 @@ int CloudCodeGUITypeBase64(NSString *base64Text)
         CFRelease(event);
         CloudCodeReleaseHIDRoute(&route);
 
-        // Keep the helper alive briefly so UIKit can consume the event. If AX can read the same
-        // focused field, use that as a bounded postcondition and fail instead of reporting a false
-        // success when the text field did not change at all.
+        // Give UIKit a bounded moment to consume the event, then return only "dispatched" evidence.
+        // Semantic success is decided by the caller's cheap fresh screenshot/OCR postcondition; HID
+        // dispatch alone must never complete a send/task contract.
         usleep(120000);
-        if (focusedElement && beforeText) {
-            id rawAfter = CloudCodeAXCopy(ax, focusedElement, ax.attributeValue ?: CFSTR("AXValue"));
-            if ([rawAfter isKindOfClass:NSString.class]) {
-                NSString *afterText = (NSString *)rawAfter;
-                if ([afterText isEqualToString:beforeText]) {
-                    fprintf(stderr, "gui-type: route=hid-unicode result=no-observed-change chars=%lu\n", (unsigned long)text.length);
-                    CloudCodeGUIExitOneShot(70);
-                }
-                fprintf(stderr, "gui-type: route=hid-unicode result=ax-observed-change chars=%lu beforeChars=%lu afterChars=%lu\n",
-                        (unsigned long)text.length,
-                        (unsigned long)beforeText.length,
-                        (unsigned long)afterText.length);
-                CloudCodeGUIExitOneShot(0);
-            }
-        }
-        fprintf(stderr, "gui-type: route=hid-unicode result=dispatched-unverified chars=%lu\n", (unsigned long)text.length);
-        // Dispatch alone is not evidence that UIKit accepted text. Real-device Build124 showed this
-        // route returning success while the composer remained unchanged and Send stayed disabled.
-        // Fail closed unless AX/read-back above observed a real value change.
-        CloudCodeGUIExitOneShot(70);
+        fprintf(stderr, "gui-type: route=hid-unicode result=dispatched-unverified-no-ax chars=%lu\n", (unsigned long)text.length);
+        CloudCodeGUIExitOneShot(0);
 }

@@ -702,10 +702,30 @@ public actor AgentCore {
 
         return AsyncThrowingStream { continuation in
             let task = Task {
+                let taskStartedAt = Date()
                 defer {
                     self.releaseSessionRun(sessionID: initialSession.id, runID: runID)
                 }
                 var session = initialSession
+                var effectiveSelectedSkillID = selectedSkillID
+                if effectiveSelectedSkillID?.isEmpty != false,
+                   let checkpointSkillID = resumeCheckpoint?.payload["skill.selected.id"],
+                   !checkpointSkillID.isEmpty {
+                    effectiveSelectedSkillID = checkpointSkillID
+                }
+                if effectiveSelectedSkillID?.isEmpty != false,
+                   resumeCheckpoint == nil,
+                   let autoSkill = await semanticSkillRegistry?.uniqueHighConfidenceUserSkill(for: text) {
+                    effectiveSelectedSkillID = autoSkill.id
+                    try? await diagnosticLogger?.log(
+                        level: .info,
+                        subsystem: "skill-router",
+                        action: "auto-select",
+                        result: "unique-high-confidence",
+                        sessionID: session.id,
+                        metadata: ["skillID": autoSkill.id]
+                    )
+                }
                 var checkpoint = resumeCheckpoint ?? TaskCheckpoint(
                     sessionID: session.id,
                     taskName: "Agent request",
@@ -727,7 +747,7 @@ public actor AgentCore {
                         "provider.fallbackProtocols": (providerConfiguration.fallbackProtocolNames ?? []).joined(separator: ","),
                         "provider.sameProviderFailover": providerConfiguration.allowSameProviderKeyFailover == true ? "true" : "false",
                         "provider.reasoningEffort": providerConfiguration.reasoningEffort?.rawValue ?? ModelReasoningEffort.automatic.rawValue,
-                        "skill.selected.id": selectedSkillID ?? ""
+                        "skill.selected.id": effectiveSelectedSkillID ?? ""
                     ]
                 )
                 let checkpointStepBase = resumeCheckpoint?.stepIndex ?? 0
@@ -750,7 +770,7 @@ public actor AgentCore {
                 checkpoint.payload["provider.fallbackProtocols"] = (providerConfiguration.fallbackProtocolNames ?? []).joined(separator: ",")
                 checkpoint.payload["provider.sameProviderFailover"] = providerConfiguration.allowSameProviderKeyFailover == true ? "true" : "false"
                 checkpoint.payload["provider.reasoningEffort"] = providerConfiguration.reasoningEffort?.rawValue ?? ModelReasoningEffort.automatic.rawValue
-                checkpoint.payload["skill.selected.id"] = selectedSkillID ?? checkpoint.payload["skill.selected.id"] ?? ""
+                checkpoint.payload["skill.selected.id"] = effectiveSelectedSkillID ?? checkpoint.payload["skill.selected.id"] ?? ""
                 try? await diagnosticLogger?.log(
                     level: .info,
                     subsystem: "agent",
@@ -1084,7 +1104,7 @@ public actor AgentCore {
                         "data.localQuery", "storage.analyze"
                     ]
                     var selectedSkillRuntimeContext: String?
-                    if let selectedSkillID, !selectedSkillID.isEmpty {
+                    if let selectedSkillID = effectiveSelectedSkillID, !selectedSkillID.isEmpty {
                         guard let hint = await semanticSkillRegistry?.selectedSkillHint(skillID: selectedSkillID) else {
                             throw AgentRunError.selectedSkillUnavailable(selectedSkillID)
                         }
@@ -1135,7 +1155,7 @@ public actor AgentCore {
                         var steeringInterruptedProviderStream = false
 
                         var providerContextMessages = session.messages
-                        if let selectedSkillRuntimeContext, let selectedSkillID, !selectedSkillID.isEmpty {
+                        if let selectedSkillRuntimeContext, let selectedSkillID = effectiveSelectedSkillID, !selectedSkillID.isEmpty {
                             providerContextMessages.append(ChatMessage(
                                 role: .system,
                                 content: selectedSkillRuntimeContext,
@@ -1673,7 +1693,14 @@ public actor AgentCore {
                                 action: "task-complete",
                                 result: "completed",
                                 sessionID: session.id,
-                                metadata: ["roundsUsed": String(round + 1)]
+                                metadata: [
+                                    "roundsUsed": String(round + 1),
+                                    "totalMS": String(max(0, Int(Date().timeIntervalSince(taskStartedAt) * 1_000))),
+                                    "providerRoundTrips": String(providerRoundTrips),
+                                    "providerTTFTMS": providerLastTTFTMS.map { String($0) } ?? "unknown",
+                                    "providerTotalMS": providerLastTotalMS.map { String($0) } ?? "unknown",
+                                    "localTaskExecutionMS": String(localTaskExecutionMS)
+                                ]
                             )
                             runtimeBreadcrumb?("runtime.agent.completed")
                             continuation.yield(.finished)
