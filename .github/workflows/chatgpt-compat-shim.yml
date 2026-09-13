@@ -1,0 +1,59 @@
+name: ChatGPT Compatibility Shim
+
+on:
+  push:
+    branches:
+      - compat/chatgpt-1.2025.007-shim-20260913
+
+permissions:
+  contents: read
+
+jobs:
+  build-shim:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build iOS arm64 compatibility dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p out
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=16.6 \
+            -march=armv8.3-a \
+            -fvisibility=hidden \
+            -fno-stack-protector \
+            -dynamiclib \
+            CompatShim/ChatGPTCompatibility.c \
+            -L"$SDK/usr/lib/swift" \
+            -lswiftCore \
+            -Wl,-install_name,@rpath/ChatGPTCompatibility.dylib \
+            -Wl,-dead_strip \
+            -o out/ChatGPTCompatibility.dylib
+          codesign --force --sign - out/ChatGPTCompatibility.dylib
+
+      - name: Verify Mach-O and ABI surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          file out/ChatGPTCompatibility.dylib
+          otool -hv out/ChatGPTCompatibility.dylib
+          otool -l out/ChatGPTCompatibility.dylib | grep -A6 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS|LC_ID_DYLIB'
+          otool -L out/ChatGPTCompatibility.dylib
+          echo '--- exports ---'
+          nm -gU out/ChatGPTCompatibility.dylib | sort
+          echo '--- undefined ---'
+          nm -u out/ChatGPTCompatibility.dylib | sort
+          codesign -dv --verbose=4 out/ChatGPTCompatibility.dylib 2>&1
+          shasum -a 256 out/ChatGPTCompatibility.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chatgpt-compatibility-shim-ios16
+          path: out/ChatGPTCompatibility.dylib
+          if-no-files-found: error
+          retention-days: 7
