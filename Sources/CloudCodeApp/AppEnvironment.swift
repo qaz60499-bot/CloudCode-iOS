@@ -782,7 +782,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 case .degraded, .busy:
                     throw AppBackedProviderRuntimeError.submissionFailed(preflight.detail)
                 case .ready:
-                    break
+                    throw AppBackedProviderRuntimeError.submissionFailed("App Provider preflight state changed unexpectedly")
                 }
             }
             appProviderStatusMessages[packageID] = "BUSY · 阶段=harmless_self_test · 正在验证启动 → 前台 → selector → 输入 → 提交 → generation → 回答提取"
