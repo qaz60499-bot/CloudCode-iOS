@@ -104,6 +104,7 @@ enum AppBackedProviderRuntimeError: Error, CustomStringConvertible {
     case generationTimeout(String)
     case responseExtractionFailed(String)
     case responseValidationFailed(String)
+    case targetRestoreFailed(String)
 
     var description: String {
         switch self {
@@ -117,6 +118,7 @@ enum AppBackedProviderRuntimeError: Error, CustomStringConvertible {
         case .generationTimeout(let value): return "App Provider generation timeout：\(value)"
         case .responseExtractionFailed(let value): return "App Provider response extraction failed：\(value)"
         case .responseValidationFailed(let value): return "App Provider response validation failed：\(value)"
+        case .targetRestoreFailed(let value): return "App Provider 目标 App 恢复失败：\(value)"
         }
     }
 }
@@ -642,10 +644,16 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         try await transition(.restoreTarget, state: .busy, detail: "恢复 Provider 调用前的目标 App", package: package, appVersion: appVersion, extractionRoute: extractionRoute, latencyMS: latencyMS)
         do {
             let restored = try await gui.openApp(bundleID: targetBundleID)
-            let state: AppBackedProviderAvailabilityState = restored.accepted && restored.foregroundVerified ? .busy : .degraded
-            try await transition(.restoreTarget, state: state, detail: restored.detail, package: package, appVersion: appVersion, extractionRoute: extractionRoute, latencyMS: latencyMS)
+            guard restored.accepted, restored.foregroundVerified else {
+                try await transition(.restoreTarget, state: .degraded, detail: restored.detail, package: package, appVersion: appVersion, extractionRoute: extractionRoute, latencyMS: latencyMS)
+                throw AppBackedProviderRuntimeError.targetRestoreFailed(restored.detail)
+            }
+            try await transition(.restoreTarget, state: .busy, detail: restored.detail, package: package, appVersion: appVersion, extractionRoute: extractionRoute, latencyMS: latencyMS)
+        } catch let error as AppBackedProviderRuntimeError {
+            throw error
         } catch {
             try await transition(.restoreTarget, state: .degraded, detail: "目标 App 恢复失败：\(error)", package: package, appVersion: appVersion, extractionRoute: extractionRoute, latencyMS: latencyMS)
+            throw AppBackedProviderRuntimeError.targetRestoreFailed(String(describing: error))
         }
     }
 

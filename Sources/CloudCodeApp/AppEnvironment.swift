@@ -725,7 +725,8 @@ public final class CloudCodeViewModel: ObservableObject {
             displayName: package.manifest.displayName,
             bundleID: package.manifest.bundleID,
             modelLabel: package.manifest.modelLabel,
-            agentSessionID: session.id
+            agentSessionID: session.id,
+            restoreTargetBundleID: Bundle.main.bundleIdentifier
         )
         do {
             var text = ""
@@ -4095,7 +4096,8 @@ public final class CloudCodeViewModel: ObservableObject {
                 displayName: package.summary.manifest.displayName,
                 bundleID: package.summary.manifest.bundleID,
                 modelLabel: package.summary.manifest.modelLabel,
-                agentSessionID: sessionID
+                agentSessionID: sessionID,
+                restoreTargetBundleID: Bundle.main.bundleIdentifier
             ))
         }
         return .network(try ProviderCheckpointConfigurationResolver.resolve(
@@ -4112,7 +4114,8 @@ public final class CloudCodeViewModel: ObservableObject {
                 displayName: package.manifest.displayName,
                 bundleID: package.manifest.bundleID,
                 modelLabel: package.manifest.modelLabel,
-                agentSessionID: sessionID
+                agentSessionID: sessionID,
+                restoreTargetBundleID: Bundle.main.bundleIdentifier
             ))
         }
         guard let network = currentProviderConfiguration() else { return nil }
