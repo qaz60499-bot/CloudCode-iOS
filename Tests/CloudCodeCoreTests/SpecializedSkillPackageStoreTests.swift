@@ -41,7 +41,7 @@ final class SpecializedSkillPackageStoreTests: XCTestCase {
         let sourceOne = temporaryDirectory("source-r1")
         let sourceTwo = temporaryDirectory("source-r2")
         defer {
-            try? FileManager.default.removeItem(at: support.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: support)
             try? FileManager.default.removeItem(at: sourceOne)
             try? FileManager.default.removeItem(at: sourceTwo)
         }
@@ -114,7 +114,7 @@ final class SpecializedSkillPackageStoreTests: XCTestCase {
         let source = temporaryDirectory("source-reserved")
         defer {
             try? FileManager.default.removeItem(at: root)
-            try? FileManager.default.removeItem(at: source.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: source)
         }
 
         let manifest = makeManifest(id: BossRecruitmentSkillPackage.skillID, revision: "override")
@@ -133,8 +133,8 @@ final class SpecializedSkillPackageStoreTests: XCTestCase {
         let packages = support.appendingPathComponent("Skills/Packages", isDirectory: true)
         let source = temporaryDirectory("source-prune")
         defer {
-            try? FileManager.default.removeItem(at: support.deletingLastPathComponent())
-            try? FileManager.default.removeItem(at: source.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: support)
+            try? FileManager.default.removeItem(at: source)
         }
 
         let id = "skill.demo.prune"

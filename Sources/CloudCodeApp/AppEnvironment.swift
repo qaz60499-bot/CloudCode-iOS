@@ -53,6 +53,31 @@ public struct ImportedChatDocument: Equatable, Sendable {
     }
 }
 
+public struct AppProviderBuilderMetadata: Equatable, Sendable {
+    public var displayName: String
+    public var bundleID: String
+    public var appVersion: String
+    public var launchSchemes: [String]
+
+    public init(displayName: String, bundleID: String, appVersion: String, launchSchemes: [String]) {
+        self.displayName = displayName
+        self.bundleID = bundleID
+        self.appVersion = appVersion
+        self.launchSchemes = launchSchemes
+    }
+}
+
+public struct AppProviderBuilderProbeResult: Equatable, Sendable {
+    public var displayName: String
+    public var bundleID: String
+    public var appVersion: String
+    public var launchSchemes: [String]
+    public var visibleCandidates: [String]
+    public var proposedComposer: String?
+    public var proposedSend: String?
+    public var proposedReadyIndicator: String?
+}
+
 public struct ResourceExplorerStructuredPreview: Identifiable, Equatable, Sendable {
     public var id: String { path }
     public var path: String
@@ -109,7 +134,11 @@ public final class CloudCodeViewModel: ObservableObject {
     @Published public private(set) var selectedSemanticSkillID: String?
 
     @Published public private(set) var providerProfiles: [ProviderProfile]
+    @Published public private(set) var appProviderPackages: [AppProviderPackageSummary] = []
+    @Published public private(set) var appProviderStatusMessages: [String: String] = [:]
     @Published public private(set) var installedKeyReferences: Set<String> = []
+    @Published public var selectedProviderBackend: ProviderBackend
+    @Published public var selectedAppProviderPackageID: String
     @Published public var selectedProviderID: String
     @Published public var selectedKeySlotID: String
     @Published public var selectedModel: String
@@ -149,6 +178,8 @@ public final class CloudCodeViewModel: ObservableObject {
     private let resourceIndex: ProgressiveResourceIndex
     private let appKnowledge: AppKnowledgeRegistry
     private let semanticSkillRegistry: SemanticSkillRegistry
+    private let appProviderPackageStore: AppProviderPackageStore
+    private let appBackedProviderRuntime: AppBackedProviderRuntime
     private let customProviderFileURL: URL
     private let liveProviderCatalogFileURL: URL
     private let startupBreadcrumbStore: StartupBreadcrumbStore
@@ -161,7 +192,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private var lifecycleInterruptedSessionIDs: Set<UUID> = []
     private var activeTasks: [UUID: Task<Void, Never>] = [:]
     private var activeRunTokens: [UUID: UUID] = [:]
-    private var activeConfigurations: [UUID: ProviderConfiguration] = [:]
+    private var activeConfigurations: [UUID: ProviderExecutionConfiguration] = [:]
     private var liveSessions: [UUID: AgentSession] = [:]
     private var sessionActivityLines: [UUID: [String]] = [:]
     private var sessionErrors: [UUID: String] = [:]
@@ -177,6 +208,8 @@ public final class CloudCodeViewModel: ObservableObject {
     private static let manualProviderKeyOverridesDefaultsKey = "provider.key.manualOverrides"
     private static let explicitCustomModelOverridesDefaultsKey = "provider.model.explicitCustomOverrides"
     private static let hiddenProviderIDsDefaultsKey = "provider.hidden.ids"
+    private static let selectedProviderBackendDefaultsKey = "provider.selected.backend"
+    private static let selectedAppProviderPackageDefaultsKey = "provider.selected.appPackage"
     private static let autoResumeTaskDefaultsKey = "task.autoResumeUnlessStopped"
     private static let backgroundRunIntentDefaultsKey = "task.wasRunningInBackground"
     private static let selectedSemanticSkillDefaultsKey = "skill.selected.id"
@@ -296,6 +329,19 @@ public final class CloudCodeViewModel: ObservableObject {
             requestKeyState: providerRouteState,
             diagnosticLogger: diagnosticLogStore
         )
+        let appProviderPackageStore = AppProviderPackageStore(
+            rootURL: support.appendingPathComponent("Providers/Packages", isDirectory: true)
+        )
+        let appProviderLearningStore = AppBackedProviderLearningStore(
+            fileURL: support.appendingPathComponent("Providers/learning.json")
+        )
+        let appBackedProviderRuntime = AppBackedProviderRuntime(
+            packageStore: appProviderPackageStore,
+            appResolver: resolver,
+            gui: guiBackend,
+            learningStore: appProviderLearningStore,
+            diagnosticLogger: diagnosticLogStore
+        )
         let steeringMailbox = AgentSteeringMailbox()
         let agent = AgentCore(
             provider: provider,
@@ -310,6 +356,7 @@ public final class CloudCodeViewModel: ObservableObject {
             interactionExperienceStore: interactionExperienceStore,
             appKnowledgeRegistry: appKnowledge,
             semanticSkillRegistry: semanticSkillRegistry,
+            appBackedProvider: appBackedProviderRuntime,
             diagnosticLogger: diagnosticLogStore,
             runtimeBreadcrumb: { stage in
                 startupBreadcrumbStore.append(runID: resolvedStartupRunID, stage: stage)
@@ -365,6 +412,8 @@ public final class CloudCodeViewModel: ObservableObject {
             selection = storedSelection
         }
         self.providerProfiles = allProfiles
+        self.selectedProviderBackend = ProviderBackend(rawValue: defaults.string(forKey: Self.selectedProviderBackendDefaultsKey) ?? ProviderBackend.network.rawValue) ?? .network
+        self.selectedAppProviderPackageID = defaults.string(forKey: Self.selectedAppProviderPackageDefaultsKey) ?? ""
         self.selectedProviderID = selection.providerID
         self.selectedKeySlotID = selection.keySlotID
         self.selectedModel = selection.model
@@ -411,6 +460,8 @@ public final class CloudCodeViewModel: ObservableObject {
         self.resourceIndex = resourceIndex
         self.appKnowledge = appKnowledge
         self.semanticSkillRegistry = semanticSkillRegistry
+        self.appProviderPackageStore = appProviderPackageStore
+        self.appBackedProviderRuntime = appBackedProviderRuntime
         self.customProviderFileURL = customProviderFileURL
         self.liveProviderCatalogFileURL = liveProviderCatalogFileURL
         startupBreadcrumbStore.append(runID: resolvedStartupRunID, stage: "viewModel.init.end")
@@ -433,6 +484,265 @@ public final class CloudCodeViewModel: ObservableObject {
         if let selectedSemanticSkillID, !skills.contains(where: { $0.id == selectedSemanticSkillID && $0.userSelectable == true }) {
             self.selectedSemanticSkillID = nil
             session.specializedSkillID = nil
+        }
+    }
+
+    public func reloadAppProviderPackages() async {
+        do {
+            appProviderPackages = try await appProviderPackageStore.all()
+            if selectedAppProviderPackageID.isEmpty || !appProviderPackages.contains(where: { $0.id == selectedAppProviderPackageID && $0.enabled }) {
+                selectedAppProviderPackageID = appProviderPackages.first(where: \.enabled)?.id ?? ""
+            }
+            if selectedProviderBackend == .appBacked && selectedAppProviderPackageID.isEmpty {
+                selectedProviderBackend = .network
+            }
+            persistProviderSelection()
+        } catch {
+            appProviderStatusMessages["store"] = "App Provider Package 读取失败：\(error)"
+        }
+    }
+
+    public var selectedAppProviderPackage: AppProviderPackageSummary? {
+        appProviderPackages.first(where: { $0.id == selectedAppProviderPackageID && $0.enabled })
+    }
+
+    public func selectProviderBackend(_ backend: ProviderBackend) {
+        guard backend != .localModel else { return }
+        if backend == .appBacked && selectedAppProviderPackage == nil {
+            lastError = "当前没有可用的 App Provider Package。"
+            return
+        }
+        selectedProviderBackend = backend
+        persistProviderSelection()
+    }
+
+    public func selectAppProviderPackage(_ packageID: String) {
+        guard appProviderPackages.contains(where: { $0.id == packageID && $0.enabled }) else {
+            lastError = "所选 App Provider Package 不存在或已停用。"
+            return
+        }
+        selectedAppProviderPackageID = packageID
+        selectedProviderBackend = .appBacked
+        persistProviderSelection()
+    }
+
+    public func setAppProviderUseConsent(packageID: String, enabled: Bool) async {
+        await appBackedProviderRuntime.setAuthorized(enabled, packageID: packageID)
+        appProviderStatusMessages[packageID] = enabled ? "已允许 Cloud Code 使用此 App Provider。" : "已停止使用此 App Provider。"
+    }
+
+    public func appProviderStatusLabel(packageID: String) async -> String {
+        if let snapshot = await appBackedProviderRuntime.status(packageID: packageID) {
+            return "\(snapshot.state.rawValue) · \(snapshot.detail)"
+        }
+        guard let package = appProviderPackages.first(where: { $0.id == packageID }) else { return "UNKNOWN" }
+        if await appResolver.appIntrospection(bundleID: package.manifest.bundleID) == nil {
+            return AppBackedProviderAvailabilityState.notInstalled.rawValue
+        }
+        return AppBackedProviderAvailabilityState.needsAuthorization.rawValue
+    }
+
+    public func inspectAppProviderBuilderMetadata(bundleID: String) async -> AppProviderBuilderMetadata? {
+        let normalized = bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty,
+              let metadata = await appResolver.appIntrospection(bundleID: normalized) else { return nil }
+        return AppProviderBuilderMetadata(
+            displayName: metadata.displayName,
+            bundleID: metadata.bundleID,
+            appVersion: metadata.version,
+            launchSchemes: metadata.urlSchemes
+        )
+    }
+
+    public func probeAppProviderSetup(packageID: String) async -> AppProviderBuilderProbeResult? {
+        do {
+            let probe = try await appBackedProviderRuntime.setupProbe(packageID: packageID)
+            appProviderStatusMessages[packageID] = "已完成无点击界面探测；请确认候选 selector 后再保存。"
+            return AppProviderBuilderProbeResult(
+                displayName: probe.displayName,
+                bundleID: probe.bundleID,
+                appVersion: probe.appVersion,
+                launchSchemes: probe.launchSchemes,
+                visibleCandidates: probe.visibleCandidates,
+                proposedComposer: probe.proposedComposer,
+                proposedSend: probe.proposedSend,
+                proposedReadyIndicator: probe.proposedReadyIndicator
+            )
+        } catch {
+            lastError = "App Provider 引导探测失败：\(error)"
+            return nil
+        }
+    }
+
+    @discardableResult
+    public func createCustomAppProviderTemplate(displayName: String, bundleID: String, launchScheme: String) async -> Bool {
+        let normalizedBundleID = bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedBundleID.isEmpty else {
+            lastError = "Bundle ID 不能为空。"
+            return false
+        }
+        let metadata = await inspectAppProviderBuilderMetadata(bundleID: normalizedBundleID)
+        let typedName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedName = typedName.isEmpty ? (metadata?.displayName ?? normalizedBundleID) : typedName
+        let packageID = Self.customAppProviderID(displayName: resolvedName, bundleID: normalizedBundleID)
+        let typedScheme = launchScheme.trimmingCharacters(in: .whitespacesAndNewlines)
+        let schemes = typedScheme.isEmpty ? (metadata?.launchSchemes ?? []) : [typedScheme]
+        do {
+            _ = try await appProviderPackageStore.createTemplate(
+                id: packageID,
+                displayName: resolvedName,
+                bundleID: normalizedBundleID,
+                launchSchemes: schemes,
+                testedAppVersion: metadata?.appVersion
+            )
+            await reloadAppProviderPackages()
+            selectedAppProviderPackageID = packageID
+            selectedProviderBackend = .appBacked
+            persistProviderSelection()
+            appProviderStatusMessages[packageID] = "自定义 App Provider Template 已创建。"
+            return true
+        } catch {
+            lastError = "创建 App Provider Template 失败：\(error)"
+            return false
+        }
+    }
+
+    @discardableResult
+    public func saveAppProviderSelectors(
+        packageID: String,
+        composerText: String,
+        submitText: String,
+        readyText: String,
+        loginText: String = "",
+        generationStartText: String = "",
+        generationCompleteText: String = "",
+        copyText: String = "",
+        errorText: String = "",
+        requiresLogin: Bool = false,
+        generationTimeoutSeconds: Double = 180,
+        retryBudget: Int = 1
+    ) async -> Bool {
+        func visibleSelector(_ raw: String) -> [AppProviderSelector] {
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? [] : [.init(strategy: .visibleText, value: value, minimumConfidence: 0.8)]
+        }
+        guard let package = appProviderPackages.first(where: { $0.id == packageID }) else {
+            lastError = "App Provider Package 不存在。"
+            return false
+        }
+        let metadata = await inspectAppProviderBuilderMetadata(bundleID: package.manifest.bundleID)
+        let selectors = AppProviderSelectorSet(
+            composer: visibleSelector(composerText),
+            send: visibleSelector(submitText),
+            generationStart: visibleSelector(generationStartText),
+            generationComplete: visibleSelector(generationCompleteText),
+            copyButton: visibleSelector(copyText),
+            readyIndicators: visibleSelector(readyText),
+            needsLoginIndicators: visibleSelector(loginText),
+            errorIndicators: visibleSelector(errorText)
+        )
+        var workflow = AppProviderWorkflow()
+        workflow.generationTimeoutSeconds = min(900, max(1, generationTimeoutSeconds))
+        workflow.retryBudget = min(3, max(0, retryBudget))
+        let recovery = AppProviderRecoveryDocument(rules: [
+            .init(failure: "foreground_mismatch", action: "relaunch_once", maxAttempts: workflow.retryBudget > 0 ? 1 : 0),
+            .init(failure: "needs_login", action: "surface_needs_login", maxAttempts: 0),
+            .init(failure: "selector_mismatch", action: "mark_needs_plugin_update", maxAttempts: 0),
+            .init(failure: "generation_timeout", action: "mark_timeout", maxAttempts: 0)
+        ])
+        do {
+            _ = try await appProviderPackageStore.updateSetup(
+                id: packageID,
+                selectors: selectors,
+                requiresLogin: requiresLogin,
+                testedAppVersion: metadata?.appVersion,
+                launchSchemes: metadata?.launchSchemes,
+                workflow: workflow,
+                recovery: recovery
+            )
+            await appBackedProviderRuntime.setAuthorized(false, packageID: packageID)
+            await reloadAppProviderPackages()
+            appProviderStatusMessages[packageID] = "Provider selector / timeout / recovery 已保存；Package 内容变化后需重新授权并运行无副作用测试。"
+            return true
+        } catch {
+            lastError = "保存 App Provider selector 失败：\(error)"
+            return false
+        }
+    }
+
+    public func setAppProviderEnabled(packageID: String, enabled: Bool) async {
+        do {
+            try await appProviderPackageStore.setEnabled(enabled, id: packageID)
+            await reloadAppProviderPackages()
+        } catch {
+            lastError = "更新 App Provider 状态失败：\(error)"
+        }
+    }
+
+    public func deleteAppProvider(packageID: String) async {
+        guard !activeConfigurations.values.contains(where: { $0.providerID == packageID }) else {
+            lastError = "该 App Provider 正在被任务使用，不能删除。"
+            return
+        }
+        do {
+            try await appProviderPackageStore.remove(id: packageID)
+            await appBackedProviderRuntime.setAuthorized(false, packageID: packageID)
+            appProviderStatusMessages.removeValue(forKey: packageID)
+            await reloadAppProviderPackages()
+        } catch {
+            lastError = "删除 App Provider Package 失败：\(error)"
+        }
+    }
+
+    public func exportAppProvider(packageID: String) async throws -> URL {
+        let root = Self.supportRoot().appendingPathComponent("Exports", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return try await appProviderPackageStore.export(
+            id: packageID,
+            to: root.appendingPathComponent("\(packageID).provider.zip")
+        )
+    }
+
+    public func importAppProvider(from url: URL) async {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        do {
+            _ = try await appProviderPackageStore.install(from: url)
+            await reloadAppProviderPackages()
+        } catch {
+            lastError = "导入 App Provider Package 失败：\(error)"
+        }
+    }
+
+    public func testAppProvider(packageID: String) async -> Bool {
+        guard let package = appProviderPackages.first(where: { $0.id == packageID && $0.enabled }) else {
+            lastError = "App Provider Package 不存在或已停用。"
+            return false
+        }
+        let marker = "CLOUDCODE_TEST_\(UUID().uuidString.uppercased())"
+        let configuration = AppBackedProviderConfiguration(
+            packageID: package.id,
+            displayName: package.manifest.displayName,
+            bundleID: package.manifest.bundleID,
+            modelLabel: package.manifest.modelLabel,
+            agentSessionID: session.id
+        )
+        do {
+            var text = ""
+            let request = ChatMessage(role: .user, content: "Harmless provider self-test. Return this marker in the answer: \(marker)")
+            for try await event in appBackedProviderRuntime.stream(configuration: configuration, messages: [request], tools: []) {
+                if case .token(let token) = event { text += token }
+            }
+            guard text.localizedCaseInsensitiveContains(marker) else {
+                throw AppBackedProviderRuntimeError.responseValidationFailed("self-test marker missing")
+            }
+            appProviderStatusMessages[packageID] = await appProviderStatusLabel(packageID: packageID)
+            lastError = nil
+            return true
+        } catch {
+            appProviderStatusMessages[packageID] = await appProviderStatusLabel(packageID: packageID)
+            lastError = String(describing: error)
+            return false
         }
     }
 
@@ -496,6 +806,19 @@ public final class CloudCodeViewModel: ObservableObject {
         Self.semanticSkillDisplayName(skill)
     }
 
+    private static func customAppProviderID(displayName: String, bundleID: String) -> String {
+        // Bind the package identity to the target application, not merely a display name. This
+        // avoids two different installed Apps silently replacing one another because they share a
+        // human-readable title. The display name remains presentation-only metadata.
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789.-_")
+        let normalized = bundleID.lowercased().unicodeScalars.reduce(into: "") { partial, scalar in
+            partial.append(allowed.contains(scalar) ? Character(String(scalar)) : "-")
+        }
+        let slug = normalized.trimmingCharacters(in: CharacterSet(charactersIn: ".-_"))
+        let fallback = displayName.lowercased().replacingOccurrences(of: " ", with: "-")
+        return "ai.custom.\(String((slug.isEmpty ? fallback : slug).prefix(88))).app"
+    }
+
     private static func semanticSkillDisplayName(_ skill: SemanticSkillDefinition) -> String {
         if let customName = skill.displayName, !customName.isEmpty { return customName }
         switch skill.id {
@@ -527,6 +850,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 capabilityRefreshMessage = "检测到上一轮启动未完成，已进入安全恢复模式。设备能力、日志扫描、Hermes、事务恢复和 Provider Keychain 自动处理已暂时跳过。"
                 activityLines.append("安全恢复模式：上一轮启动没有到达稳定完成点。本次先保证界面可打开；需要诊断时可在界面稳定后手动打开“日志”，再检测设备能力或 Key。")
                 await reloadSemanticSkills()
+                await reloadAppProviderPackages()
                 didBootstrap = true
                 recordStartupBreadcrumb("bootstrap.recovery.ready")
                 recordStartupBreadcrumb("bootstrap.completed")
@@ -576,6 +900,13 @@ public final class CloudCodeViewModel: ObservableObject {
             }
             await seedKnowledgeIfNeeded(apps)
             await reloadSemanticSkills()
+            do {
+                try await appProviderPackageStore.seedFirstPartyIfMissing()
+                await reloadAppProviderPackages()
+            } catch {
+                appProviderStatusMessages["store"] = "首批 App Provider Package 初始化失败：\(error)"
+                try? await diagnosticLogStore.log(level: .warning, subsystem: "app-provider", action: "seed", result: "failed", error: error)
+            }
             recordStartupBreadcrumb("bootstrap.local-state.begin")
             do {
                 try await checkpointStore.recoverUnfinishedAfterRestart()
@@ -1184,6 +1515,20 @@ public final class CloudCodeViewModel: ObservableObject {
 
     @discardableResult
     public func saveProviderSelection() -> Bool {
+        if selectedProviderBackend == .appBacked {
+            guard let package = selectedAppProviderPackage else {
+                lastError = "请先选择可用的 App Provider。"
+                return false
+            }
+            persistProviderSelection()
+            UserDefaults.standard.set(permissionMode.rawValue, forKey: "permission.mode")
+            session.permissionMode = permissionMode
+            session.providerID = package.id
+            session.keySlotID = ""
+            session.model = package.manifest.modelLabel
+            return true
+        }
+
         guard let provider = selectedProvider,
               provider.keySlots.contains(where: { $0.id == selectedKeySlotID }),
               !selectedModel.isEmpty else {
@@ -1364,14 +1709,14 @@ public final class CloudCodeViewModel: ObservableObject {
             return
         }
 
-        guard saveProviderSelection(), let config = currentProviderConfiguration() else {
+        let sessionID = session.id
+        guard saveProviderSelection(), let config = currentProviderExecutionConfiguration(sessionID: sessionID) else {
             if lastError == nil { lastError = "厂商 / Key / 模型选择无效。" }
             return
         }
         // Do not preflight Keychain on the UI/startup path. Provider execution performs the single
         // authoritative Keychain read and reports missing/unavailable credentials as a recoverable error.
 
-        let sessionID = session.id
         let runToken = UUID()
         let initialSession = session
         let activeSkillID = initialSession.specializedSkillID
@@ -1426,7 +1771,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 let stream = await agentCore.send(
                     text: requestText,
                     session: requestSession,
-                    providerConfiguration: config,
+                    providerExecutionConfiguration: config,
                     allowedRoot: allowedRoot,
                     capabilityProfile: capabilities,
                     selectedSkillID: activeSkillID,
@@ -1894,13 +2239,14 @@ public final class CloudCodeViewModel: ObservableObject {
                       !request.isEmpty else {
                     throw CocoaError(.fileReadCorruptFile)
                 }
-                let config = try ProviderCheckpointConfigurationResolver.resolve(
-                    payload: checkpoint.payload,
-                    profiles: providerProfiles
-                )
+                let config = try await providerExecutionConfiguration(from: checkpoint, sessionID: sessionID)
                 resumedSession.providerID = config.providerID
                 resumedSession.model = config.model
-                resumedSession.keySlotID = keySlotID(for: config) ?? resumedSession.keySlotID
+                if case .network(let network) = config {
+                    resumedSession.keySlotID = keySlotID(for: network) ?? resumedSession.keySlotID
+                } else {
+                    resumedSession.keySlotID = ""
+                }
                 try await sessionStore.save(resumedSession)
                 guard activeRunTokens[sessionID] == runToken else { return }
                 activeConfigurations[sessionID] = config
@@ -1919,7 +2265,7 @@ public final class CloudCodeViewModel: ObservableObject {
                     text: request,
                     inputSource: source,
                     session: resumedSession,
-                    providerConfiguration: config,
+                    providerExecutionConfiguration: config,
                     allowedRoot: allowedRoot,
                     capabilityProfile: capabilities,
                     selectedSkillID: resumedSkillID,
@@ -3737,6 +4083,42 @@ public final class CloudCodeViewModel: ObservableObject {
         })?.id
     }
 
+    private func providerExecutionConfiguration(from checkpoint: TaskCheckpoint, sessionID: UUID) async throws -> ProviderExecutionConfiguration {
+        if checkpoint.payload["provider.backend"] == ProviderBackend.appBacked.rawValue {
+            let packageID = checkpoint.payload["provider.appPackageID"] ?? checkpoint.payload["provider.id"] ?? ""
+            let package = try await appProviderPackageStore.package(id: packageID)
+            guard package.summary.enabled else {
+                throw ProviderError.transport("App-backed Provider Package 已停用")
+            }
+            return .appBacked(AppBackedProviderConfiguration(
+                packageID: package.summary.id,
+                displayName: package.summary.manifest.displayName,
+                bundleID: package.summary.manifest.bundleID,
+                modelLabel: package.summary.manifest.modelLabel,
+                agentSessionID: sessionID
+            ))
+        }
+        return .network(try ProviderCheckpointConfigurationResolver.resolve(
+            payload: checkpoint.payload,
+            profiles: providerProfiles
+        ))
+    }
+
+    private func currentProviderExecutionConfiguration(sessionID: UUID) -> ProviderExecutionConfiguration? {
+        if selectedProviderBackend == .appBacked {
+            guard let package = selectedAppProviderPackage else { return nil }
+            return .appBacked(AppBackedProviderConfiguration(
+                packageID: package.id,
+                displayName: package.manifest.displayName,
+                bundleID: package.manifest.bundleID,
+                modelLabel: package.manifest.modelLabel,
+                agentSessionID: sessionID
+            ))
+        }
+        guard let network = currentProviderConfiguration() else { return nil }
+        return .network(network)
+    }
+
     private func currentProviderConfiguration() -> ProviderConfiguration? {
         guard let provider = selectedProvider,
               let slot = provider.keySlots.first(where: { $0.id == selectedKeySlotID }),
@@ -3789,6 +4171,8 @@ public final class CloudCodeViewModel: ObservableObject {
 
     private func persistProviderSelection() {
         let defaults = UserDefaults.standard
+        defaults.set(selectedProviderBackend.rawValue, forKey: Self.selectedProviderBackendDefaultsKey)
+        defaults.set(selectedAppProviderPackageID, forKey: Self.selectedAppProviderPackageDefaultsKey)
         defaults.set(selectedProviderID, forKey: "provider.selected.id")
         defaults.set(selectedKeySlotID, forKey: "provider.selected.keySlot")
         defaults.set(selectedModel, forKey: "provider.selected.model")
@@ -4061,6 +4445,9 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private static func userFacingRunError(_ error: Error) -> String {
+        if let appProviderError = error as? AppBackedProviderRuntimeError {
+            return appProviderError.description
+        }
         if let agentError = error as? AgentRunError {
             switch agentError {
             case .sessionAlreadyRunning:
@@ -4133,6 +4520,11 @@ public final class CloudCodeViewModel: ObservableObject {
         providerEndpointHealth = providerEndpointHealth.filter { !$0.key.hasPrefix(prefix) }
     }
 
+    private func markProviderEndpointHealthy(_ configuration: ProviderExecutionConfiguration) {
+        guard case .network(let network) = configuration else { return }
+        markProviderEndpointHealthy(network)
+    }
+
     private func markProviderEndpointHealthy(_ configuration: ProviderConfiguration) {
         providerEndpointHealth[providerEndpointHealthKey(configuration)] = ProviderEndpointHealth(state: .healthy)
         // The router can transparently succeed with a fallback Key. Without exposing the winning
@@ -4148,6 +4540,32 @@ public final class CloudCodeViewModel: ObservableObject {
             providerProfiles[providerIndex].keySlots[slotIndex].status = .verified
             if providerProfiles[providerIndex].source == .custom {
                 try? persistCustomProviders()
+            }
+        }
+    }
+
+    private func recordProviderFailure(_ error: Error, configuration: ProviderExecutionConfiguration, sessionID: UUID) {
+        switch configuration {
+        case .network(let network):
+            recordProviderFailure(error, configuration: network, sessionID: sessionID)
+        case .appBacked(let app):
+            providerFailureSessionIDs.insert(sessionID)
+            retryableProviderFailureSessionIDs.remove(sessionID)
+            Task {
+                try? await diagnosticLogStore.log(
+                    level: .error,
+                    subsystem: "app.provider",
+                    action: "run.failure",
+                    result: "failed",
+                    sessionID: sessionID,
+                    error: error,
+                    metadata: [
+                        "providerBackend": ProviderBackend.appBacked.rawValue,
+                        "providerID": app.packageID,
+                        "bundleID": app.bundleID,
+                        "model": app.modelLabel
+                    ]
+                )
             }
         }
     }
@@ -4230,8 +4648,9 @@ public final class CloudCodeViewModel: ObservableObject {
 
     private func isProviderKeyReferenceInUse(_ reference: String) -> Bool {
         activeConfigurations.values.contains { configuration in
-            if configuration.apiKeyReference == reference { return true }
-            return configuration.fallbackAPIKeyReferences?.contains(reference) == true
+            guard case .network(let network) = configuration else { return false }
+            if network.apiKeyReference == reference { return true }
+            return network.fallbackAPIKeyReferences?.contains(reference) == true
         }
     }
 

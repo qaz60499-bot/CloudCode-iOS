@@ -622,6 +622,7 @@ public actor AgentSteeringMailbox {
 public actor AgentCore {
     private let provider: ProviderStreaming
     private let keyVault: APIKeyVault
+    private let executionProvider: ProviderExecutionRouter
     private let toolRouter: ToolRouter
     private let registry: ToolRegistry
     private let capabilityProbe: CapabilityProbing
@@ -660,12 +661,18 @@ public actor AgentCore {
         interactionExperienceStore: IOSInteractionExperienceStore? = nil,
         appKnowledgeRegistry: AppKnowledgeRegistry? = nil,
         semanticSkillRegistry: SemanticSkillRegistry? = nil,
+        appBackedProvider: AppBackedProviderStreaming? = nil,
         diagnosticLogger: DiagnosticLogStore? = nil,
         runtimeBreadcrumb: (@Sendable (String) -> Void)? = nil,
         maxToolRounds: Int = 32
     ) {
         self.provider = provider
         self.keyVault = keyVault
+        self.executionProvider = ProviderExecutionRouter(
+            networkProvider: provider,
+            keyVault: keyVault,
+            appBackedProvider: appBackedProvider
+        )
         self.toolRouter = toolRouter
         self.registry = registry
         self.capabilityProbe = capabilityProbe
@@ -686,6 +693,78 @@ public actor AgentCore {
         inputSource: InputSource = .text,
         session initialSession: AgentSession,
         providerConfiguration: ProviderConfiguration,
+        allowedRoot: URL? = nil,
+        capabilityProfile: CapabilityProfile? = nil,
+        selectedSkillID: String? = nil,
+        appendUserMessage: Bool = true,
+        resumeCheckpoint: TaskCheckpoint? = nil
+    ) -> AsyncThrowingStream<AgentEvent, Error> {
+        sendExecution(
+            text: text,
+            inputSource: inputSource,
+            session: initialSession,
+            providerExecutionConfiguration: .network(providerConfiguration),
+            allowedRoot: allowedRoot,
+            capabilityProfile: capabilityProfile,
+            selectedSkillID: selectedSkillID,
+            appendUserMessage: appendUserMessage,
+            resumeCheckpoint: resumeCheckpoint
+        )
+    }
+
+    public func send(
+        text: String,
+        inputSource: InputSource = .text,
+        session initialSession: AgentSession,
+        appBackedProviderConfiguration: AppBackedProviderConfiguration,
+        allowedRoot: URL? = nil,
+        capabilityProfile: CapabilityProfile? = nil,
+        selectedSkillID: String? = nil,
+        appendUserMessage: Bool = true,
+        resumeCheckpoint: TaskCheckpoint? = nil
+    ) -> AsyncThrowingStream<AgentEvent, Error> {
+        sendExecution(
+            text: text,
+            inputSource: inputSource,
+            session: initialSession,
+            providerExecutionConfiguration: .appBacked(appBackedProviderConfiguration),
+            allowedRoot: allowedRoot,
+            capabilityProfile: capabilityProfile,
+            selectedSkillID: selectedSkillID,
+            appendUserMessage: appendUserMessage,
+            resumeCheckpoint: resumeCheckpoint
+        )
+    }
+
+    public func send(
+        text: String,
+        inputSource: InputSource = .text,
+        session initialSession: AgentSession,
+        providerExecutionConfiguration: ProviderExecutionConfiguration,
+        allowedRoot: URL? = nil,
+        capabilityProfile: CapabilityProfile? = nil,
+        selectedSkillID: String? = nil,
+        appendUserMessage: Bool = true,
+        resumeCheckpoint: TaskCheckpoint? = nil
+    ) -> AsyncThrowingStream<AgentEvent, Error> {
+        sendExecution(
+            text: text,
+            inputSource: inputSource,
+            session: initialSession,
+            providerExecutionConfiguration: providerExecutionConfiguration,
+            allowedRoot: allowedRoot,
+            capabilityProfile: capabilityProfile,
+            selectedSkillID: selectedSkillID,
+            appendUserMessage: appendUserMessage,
+            resumeCheckpoint: resumeCheckpoint
+        )
+    }
+
+    private func sendExecution(
+        text: String,
+        inputSource: InputSource = .text,
+        session initialSession: AgentSession,
+        providerExecutionConfiguration: ProviderExecutionConfiguration,
         allowedRoot: URL? = nil,
         capabilityProfile: CapabilityProfile? = nil,
         selectedSkillID: String? = nil,
@@ -736,17 +815,20 @@ public actor AgentCore {
                     payload: [
                         "inputSource": inputSource.rawValue,
                         "request": text,
-                        "provider.name": providerConfiguration.name,
-                        "provider.baseURL": providerConfiguration.baseURL.absoluteString,
-                        "provider.model": providerConfiguration.model,
-                        "provider.id": providerConfiguration.providerID ?? "",
-                        "provider.protocol": providerConfiguration.protocolName ?? "",
-                        "provider.authMode": providerConfiguration.authModeName ?? "",
-                        "provider.keyReference": providerConfiguration.apiKeyReference,
-                        "provider.fallbackKeyReferences": (providerConfiguration.fallbackAPIKeyReferences ?? []).joined(separator: ","),
-                        "provider.fallbackProtocols": (providerConfiguration.fallbackProtocolNames ?? []).joined(separator: ","),
-                        "provider.sameProviderFailover": providerConfiguration.allowSameProviderKeyFailover == true ? "true" : "false",
-                        "provider.reasoningEffort": providerConfiguration.reasoningEffort?.rawValue ?? ModelReasoningEffort.automatic.rawValue,
+                        "provider.backend": providerExecutionConfiguration.backend.rawValue,
+                        "provider.name": providerExecutionConfiguration.name,
+                        "provider.baseURL": providerExecutionConfiguration.baseURL?.absoluteString ?? "",
+                        "provider.model": providerExecutionConfiguration.model,
+                        "provider.id": providerExecutionConfiguration.providerID ?? "",
+                        "provider.protocol": providerExecutionConfiguration.protocolName ?? "",
+                        "provider.authMode": providerExecutionConfiguration.authModeName ?? "",
+                        "provider.keyReference": providerExecutionConfiguration.apiKeyReference ?? "",
+                        "provider.fallbackKeyReferences": providerExecutionConfiguration.fallbackAPIKeyReferences.joined(separator: ","),
+                        "provider.fallbackProtocols": providerExecutionConfiguration.fallbackProtocolNames.joined(separator: ","),
+                        "provider.sameProviderFailover": providerExecutionConfiguration.allowSameProviderKeyFailover ? "true" : "false",
+                        "provider.reasoningEffort": providerExecutionConfiguration.reasoningEffort.rawValue,
+                        "provider.appPackageID": providerExecutionConfiguration.appBackedPackageID ?? "",
+                        "provider.appBundleID": providerExecutionConfiguration.appBackedBundleID ?? "",
                         "skill.selected.id": effectiveSelectedSkillID ?? ""
                     ]
                 )
@@ -759,17 +841,20 @@ public actor AgentCore {
                 checkpoint.updatedAt = Date()
                 checkpoint.payload["inputSource"] = inputSource.rawValue
                 checkpoint.payload["request"] = text
-                checkpoint.payload["provider.name"] = providerConfiguration.name
-                checkpoint.payload["provider.baseURL"] = providerConfiguration.baseURL.absoluteString
-                checkpoint.payload["provider.model"] = providerConfiguration.model
-                checkpoint.payload["provider.id"] = providerConfiguration.providerID ?? ""
-                checkpoint.payload["provider.protocol"] = providerConfiguration.protocolName ?? ""
-                checkpoint.payload["provider.authMode"] = providerConfiguration.authModeName ?? ""
-                checkpoint.payload["provider.keyReference"] = providerConfiguration.apiKeyReference
-                checkpoint.payload["provider.fallbackKeyReferences"] = (providerConfiguration.fallbackAPIKeyReferences ?? []).joined(separator: ",")
-                checkpoint.payload["provider.fallbackProtocols"] = (providerConfiguration.fallbackProtocolNames ?? []).joined(separator: ",")
-                checkpoint.payload["provider.sameProviderFailover"] = providerConfiguration.allowSameProviderKeyFailover == true ? "true" : "false"
-                checkpoint.payload["provider.reasoningEffort"] = providerConfiguration.reasoningEffort?.rawValue ?? ModelReasoningEffort.automatic.rawValue
+                checkpoint.payload["provider.backend"] = providerExecutionConfiguration.backend.rawValue
+                checkpoint.payload["provider.name"] = providerExecutionConfiguration.name
+                checkpoint.payload["provider.baseURL"] = providerExecutionConfiguration.baseURL?.absoluteString ?? ""
+                checkpoint.payload["provider.model"] = providerExecutionConfiguration.model
+                checkpoint.payload["provider.id"] = providerExecutionConfiguration.providerID ?? ""
+                checkpoint.payload["provider.protocol"] = providerExecutionConfiguration.protocolName ?? ""
+                checkpoint.payload["provider.authMode"] = providerExecutionConfiguration.authModeName ?? ""
+                checkpoint.payload["provider.keyReference"] = providerExecutionConfiguration.apiKeyReference ?? ""
+                checkpoint.payload["provider.fallbackKeyReferences"] = providerExecutionConfiguration.fallbackAPIKeyReferences.joined(separator: ",")
+                checkpoint.payload["provider.fallbackProtocols"] = providerExecutionConfiguration.fallbackProtocolNames.joined(separator: ",")
+                checkpoint.payload["provider.sameProviderFailover"] = providerExecutionConfiguration.allowSameProviderKeyFailover ? "true" : "false"
+                checkpoint.payload["provider.reasoningEffort"] = providerExecutionConfiguration.reasoningEffort.rawValue
+                checkpoint.payload["provider.appPackageID"] = providerExecutionConfiguration.appBackedPackageID ?? ""
+                checkpoint.payload["provider.appBundleID"] = providerExecutionConfiguration.appBackedBundleID ?? ""
                 checkpoint.payload["skill.selected.id"] = effectiveSelectedSkillID ?? checkpoint.payload["skill.selected.id"] ?? ""
                 try? await diagnosticLogger?.log(
                     level: .info,
@@ -778,10 +863,11 @@ public actor AgentCore {
                     result: "started",
                     sessionID: session.id,
                     metadata: [
-                        "providerID": providerConfiguration.providerID ?? "",
-                        "model": providerConfiguration.model,
-                        "reasoningEffort": providerConfiguration.reasoningEffort?.rawValue ?? ModelReasoningEffort.automatic.rawValue,
-                        "protocol": providerConfiguration.protocolName ?? "",
+                        "providerID": providerExecutionConfiguration.providerID ?? "",
+                        "providerBackend": providerExecutionConfiguration.backend.rawValue,
+                        "model": providerExecutionConfiguration.model,
+                        "reasoningEffort": providerExecutionConfiguration.reasoningEffort.rawValue,
+                        "protocol": providerExecutionConfiguration.protocolName ?? "",
                         "maxToolRounds": String(maxToolRounds)
                     ]
                 )
@@ -873,11 +959,17 @@ public actor AgentCore {
                     runtimeBreadcrumb?("runtime.agent.reconcile.begin")
                     session = try await reconcileDanglingToolCalls(in: session)
                     runtimeBreadcrumb?("runtime.agent.reconcile.end")
-                    runtimeBreadcrumb?("runtime.agent.keychain.begin")
-                    try? await diagnosticLogger?.log(level: .debug, subsystem: "agent", action: "keychain-read", result: "started", sessionID: session.id)
-                    let key = try await keyVault.key(for: providerConfiguration.apiKeyReference)
-                    runtimeBreadcrumb?("runtime.agent.keychain.end")
-                    try? await diagnosticLogger?.log(level: .debug, subsystem: "agent", action: "keychain-read", result: "completed", sessionID: session.id)
+                    let networkKey: String?
+                    if case .network(let networkConfiguration) = providerExecutionConfiguration {
+                        runtimeBreadcrumb?("runtime.agent.keychain.begin")
+                        try? await diagnosticLogger?.log(level: .debug, subsystem: "agent", action: "keychain-read", result: "started", sessionID: session.id)
+                        networkKey = try await keyVault.key(for: networkConfiguration.apiKeyReference)
+                        runtimeBreadcrumb?("runtime.agent.keychain.end")
+                        try? await diagnosticLogger?.log(level: .debug, subsystem: "agent", action: "keychain-read", result: "completed", sessionID: session.id)
+                    } else {
+                        networkKey = nil
+                        try? await diagnosticLogger?.log(level: .debug, subsystem: "agent", action: "keychain-read", result: "skipped_app_backed", sessionID: session.id)
+                    }
                     let descriptors = await registry.all()
                     let toolNameMap = try ProviderToolNameMap(internalNames: descriptors.map(\.name))
                     session = try Self.normalizeProviderToolMetadata(in: session, using: toolNameMap)
@@ -1315,18 +1407,31 @@ public actor AgentCore {
                                 source: "semantic_runtime_local_dispatch"
                             )
                         } else if providerContextHasImages {
-                            // Resolve before schemas and before the first real screenshot-bearing Provider request.
-                            // Production clients use trusted /models input-modality metadata first, then one fixed
-                            // non-private 1px probe when metadata is absent. Unknown never means vision-supported.
-                            providerVisionAssessment = await provider.imageCapability(
-                                configuration: providerConfiguration,
-                                apiKey: key
-                            )
+                            switch providerExecutionConfiguration {
+                            case .network(let networkConfiguration):
+                                guard let networkKey else { throw ProviderError.missingAPIKey }
+                                providerVisionAssessment = await provider.imageCapability(
+                                    configuration: networkConfiguration,
+                                    apiKey: networkKey
+                                )
+                            case .appBacked:
+                                providerVisionAssessment = await executionProvider.imageCapability(
+                                    configuration: providerExecutionConfiguration
+                                )
+                            }
                         } else {
-                            providerVisionAssessment = await ProviderImageCompatibilityPolicy.currentAssessment(
-                                configuration: providerConfiguration,
-                                apiKey: key
-                            )
+                            switch providerExecutionConfiguration {
+                            case .network(let networkConfiguration):
+                                guard let networkKey else { throw ProviderError.missingAPIKey }
+                                providerVisionAssessment = await ProviderImageCompatibilityPolicy.currentAssessment(
+                                    configuration: networkConfiguration,
+                                    apiKey: networkKey
+                                )
+                            case .appBacked:
+                                providerVisionAssessment = await executionProvider.imageCapability(
+                                    configuration: providerExecutionConfiguration
+                                )
+                            }
                         }
                         if Self.shouldUseForegroundMessagingFastPath(
                             requiresMessageSend: requiresMessageSend,
@@ -1365,9 +1470,10 @@ public actor AgentCore {
                             metadata: [
                                 "providerVisionCapability": providerVisionAssessment.capability.rawValue,
                                 "providerVisionCapabilitySource": providerVisionAssessment.source,
-                                "model": providerConfiguration.model,
-                                "host": providerConfiguration.baseURL.host ?? "",
-                                "protocol": providerConfiguration.protocolName ?? "",
+                                "model": providerExecutionConfiguration.model,
+                                "backend": providerExecutionConfiguration.backend.rawValue,
+                                "host": providerExecutionConfiguration.baseURL?.host ?? "app-backed",
+                                "protocol": providerExecutionConfiguration.protocolName ?? "app-ui",
                                 "realScreenshotPending": providerContextHasImages ? "true" : "false"
                             ]
                         )
@@ -1425,10 +1531,17 @@ public actor AgentCore {
                                     "providerRoundTrips": String(providerRoundTrips)
                                 ]
                             )
+                            var roundProviderExecutionConfiguration = providerExecutionConfiguration
+                            if case .appBacked(var appConfiguration) = roundProviderExecutionConfiguration {
+                                if let currentGUIBundleID, currentGUIBundleID != appConfiguration.bundleID {
+                                    appConfiguration.restoreTargetBundleID = currentGUIBundleID
+                                }
+                                roundProviderExecutionConfiguration = .appBacked(appConfiguration)
+                            }
                             let stream = DiagnosticContext.$sessionID.withValue(session.id) {
-                                provider.stream(
-                                    configuration: providerConfiguration,
-                                    apiKey: key,
+                                executionProvider.stream(
+                                    configuration: roundProviderExecutionConfiguration,
+                                    networkAPIKey: networkKey,
                                     messages: providerMessages,
                                     tools: roundSchemas
                                 )
@@ -2186,7 +2299,7 @@ public actor AgentCore {
                                         "providerImageRoute": providerVisionAssessment.capability.rawValue,
                                         "providerVisionCapability": providerVisionAssessment.capability.rawValue,
                                         "providerVisionCapabilitySource": providerVisionAssessment.source,
-                                        "model": providerConfiguration.model
+                                        "model": providerExecutionConfiguration.model
                                     ]
                                 )
                                 let data = try JSONEncoder.pretty.encode(failure)
@@ -2745,10 +2858,18 @@ public actor AgentCore {
                                             // The screenshot is still local at this point. Probe only with the fixed
                                             // built-in 1px image before deciding whether the real observation may enter
                                             // Provider context.
-                                            attachmentVisionAssessment = await provider.imageCapability(
-                                                configuration: providerConfiguration,
-                                                apiKey: key
-                                            )
+                                            switch providerExecutionConfiguration {
+                                            case .network(let networkConfiguration):
+                                                guard let networkKey else { throw ProviderError.missingAPIKey }
+                                                attachmentVisionAssessment = await provider.imageCapability(
+                                                    configuration: networkConfiguration,
+                                                    apiKey: networkKey
+                                                )
+                                            case .appBacked:
+                                                attachmentVisionAssessment = await executionProvider.imageCapability(
+                                                    configuration: providerExecutionConfiguration
+                                                )
+                                            }
                                         } else {
                                             attachmentVisionAssessment = providerVisionAssessment
                                         }

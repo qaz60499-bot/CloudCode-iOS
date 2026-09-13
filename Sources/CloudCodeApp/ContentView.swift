@@ -1710,15 +1710,33 @@ private struct SettingsView: View {
     @State private var selectedKeyInput = ""
     @State private var customModelInput = ""
     @State private var showCustomProvider = false
+    @State private var showCustomAppProvider = false
     @State private var showBootstrapImporter = false
+    @State private var showAppProviderImporter = false
     @State private var showRemoveProviderConfirmation = false
+    @State private var appProviderShareItem: DiagnosticShareItem?
     @AppStorage(ErrorNotificationCoordinator.preferenceKey) private var backgroundErrorNotificationsEnabled = false
     @FocusState private var keyInputFocused: Bool
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("厂商 / Key / 模型") {
+                Section("推理后端") {
+                    Picker("后端", selection: Binding(
+                        get: { model.selectedProviderBackend },
+                        set: { model.selectProviderBackend($0) }
+                    )) {
+                        Text("Network Provider").tag(ProviderBackend.network)
+                        Text("App Provider").tag(ProviderBackend.appBacked)
+                    }
+                    Text(model.selectedProviderBackend == .appBacked
+                         ? "当前由已安装 AI App 提供推理；设备观察、ToolRouter、PolicyEngine、AX/OCR/HID 与文件能力仍由 Cloud Code 控制。"
+                         : "当前使用 API / Network Provider。App Provider Package 与 API Key 配置彼此独立。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Network Provider / Key / 模型") {
                     Picker("厂商", selection: Binding(
                         get: { model.selectedProviderID },
                         set: { model.selectProvider($0) }
@@ -1776,6 +1794,68 @@ private struct SettingsView: View {
                         LabeledContent("当前 Key", value: model.selectedKeyIsInstalled ? "本次已确认" : "启动未扫描")
                     }
                     LabeledContent("配置规模", value: "\(model.providerProfiles.filter(\.enabled).count) 个厂商 · \(model.providerProfiles.filter(\.enabled).reduce(0) { $0 + $1.keySlots.count }) 个 Key")
+                    Text("此区只配置 Network Provider；切到 App Provider 后仍可预先维护这里的 API 配置，但不会参与当前推理。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("App Provider") {
+                    if model.appProviderPackages.filter(\.enabled).isEmpty {
+                        Text("暂无可用 App Provider Package。")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Picker("Provider Package", selection: Binding(
+                            get: { model.selectedAppProviderPackageID },
+                            set: { model.selectAppProviderPackage($0) }
+                        )) {
+                            ForEach(model.appProviderPackages.filter(\.enabled)) { package in
+                                Text(package.manifest.displayName).tag(package.id)
+                            }
+                        }
+                    }
+
+                    if let package = model.selectedAppProviderPackage {
+                        LabeledContent("Bundle ID", value: package.manifest.bundleID)
+                        LabeledContent("模式", value: package.manifest.modelLabel)
+                        LabeledContent("Selector Revision", value: package.manifest.compatibility.selectorRevision)
+                        if let status = model.appProviderStatusMessages[package.id], !status.isEmpty {
+                            Text(status)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                        HStack {
+                            Button("允许使用") {
+                                Task { await model.setAppProviderUseConsent(packageID: package.id, enabled: true) }
+                            }
+                            Button("撤销授权", role: .destructive) {
+                                Task { await model.setAppProviderUseConsent(packageID: package.id, enabled: false) }
+                            }
+                        }
+                        Button("无副作用测试") {
+                            Task { _ = await model.testAppProvider(packageID: package.id) }
+                        }
+                        Button("导出当前 Provider Package") {
+                            Task {
+                                do {
+                                    let url = try await model.exportAppProvider(packageID: package.id)
+                                    appProviderShareItem = DiagnosticShareItem(url: url)
+                                } catch {
+                                    model.lastError = "导出 App Provider Package 失败：\(error)"
+                                }
+                            }
+                        }
+                    }
+
+                    Button("制作自定义 App Provider") { showCustomAppProvider = true }
+                    NavigationLink {
+                        AppProviderManagementView(model: model)
+                    } label: {
+                        Label("管理 / 制作 App Provider", systemImage: "puzzlepiece.extension")
+                    }
+                    Button("导入 Provider Package") { showAppProviderImporter = true }
+                    Text("Provider Package 只包含 declarative JSON/Markdown；不加载 Swift、dylib、shell 或 root executable。Package 与 Skills 分库存储。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("Key 管理") {
@@ -1959,6 +2039,7 @@ private struct SettingsView: View {
                 model.recordStartupBreadcrumb("settings.appear")
                 Task {
                     await model.reloadInteractionLearning()
+                    await model.reloadAppProviderPackages()
                     _ = await model.refreshSelectedProviderModelCatalog(showStatus: false)
                 }
             }
@@ -1975,6 +2056,12 @@ private struct SettingsView: View {
             }
             .sheet(isPresented: $showCustomProvider) {
                 CustomProviderSheet(model: model, isPresented: $showCustomProvider)
+            }
+            .sheet(isPresented: $showCustomAppProvider) {
+                CustomAppProviderSheet(model: model, isPresented: $showCustomAppProvider)
+            }
+            .sheet(item: $appProviderShareItem) { item in
+                DiagnosticActivityShareSheet(items: [item.url])
             }
             .confirmationDialog(
                 model.selectedProvider?.source == .custom ? "删除当前厂商？" : "隐藏当前内置厂商？",
@@ -1996,6 +2083,14 @@ private struct SettingsView: View {
                 switch result {
                 case .success(let url): model.importProviderBootstrap(from: url)
                 case .failure(let error): model.lastError = String(describing: error)
+                }
+            }
+            .fileImporter(isPresented: $showAppProviderImporter, allowedContentTypes: [.zip]) { result in
+                switch result {
+                case .success(let url):
+                    Task { await model.importAppProvider(from: url) }
+                case .failure(let error):
+                    model.lastError = String(describing: error)
                 }
             }
         }
