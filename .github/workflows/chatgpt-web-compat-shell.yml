@@ -1,0 +1,64 @@
+name: ChatGPT Web Compat Shell
+
+on:
+  push:
+    branches:
+      - ci/chatgpt-web-compat-shell-20260913
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+
+      - name: Install build tools
+        run: |
+          brew install xcodegen ldid-procursus
+          xcodegen --version
+          ldid -h >/dev/null 2>&1 || true
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build iOS 16 compatibility shell
+        run: |
+          set -euo pipefail
+          rm -rf build/ChatGPTWebCompatDerivedData build/chatgpt-web-compat
+          xcodebuild \
+            -project CloudCodeIOS.xcodeproj \
+            -scheme ChatGPTWebCompat \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/ChatGPTWebCompatDerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Ad-hoc sign and package IPA
+        run: |
+          set -euo pipefail
+          APP="$(find build/ChatGPTWebCompatDerivedData/Build/Products/Release-iphoneos -maxdepth 1 -type d -name 'ChatGPTWebCompat.app' -print -quit)"
+          test -n "$APP"
+          test -x "$APP/ChatGPTWebCompat"
+          ldid -S "$APP/ChatGPTWebCompat"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | grep -Fx 'com.cloudcode.chatgptwebcompat'
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist" | grep -Fx '16.0'
+          mkdir -p build/chatgpt-web-compat/Payload
+          cp -R "$APP" build/chatgpt-web-compat/Payload/
+          (cd build/chatgpt-web-compat && zip -qry ../ChatGPT-Web-Compat-iOS16-TrollStore.ipa Payload)
+          unzip -tq build/ChatGPT-Web-Compat-iOS16-TrollStore.ipa
+          shasum -a 256 build/ChatGPT-Web-Compat-iOS16-TrollStore.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChatGPT-Web-Compat-iOS16-TrollStore
+          path: build/ChatGPT-Web-Compat-iOS16-TrollStore.ipa
+          if-no-files-found: error
+          retention-days: 7
