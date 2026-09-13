@@ -132,6 +132,19 @@ done
 test "$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$ENTITLEMENTS")" = 'TROLLTROLL.*'
 test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$ENTITLEMENTS")" = 'TROLLTROLL'
 /usr/libexec/PlistBuddy -c 'Print :keychain-access-groups:0' "$ENTITLEMENTS" | grep -F 'TROLLTROLL.*' >/dev/null
+/usr/libexec/PlistBuddy -c 'Print :com.apple.security.application-groups' "$ENTITLEMENTS" | grep -F 'group.com.cloudcode.ios.share' >/dev/null
+
+SHARE_APPEX="$APP_PATH/PlugIns/CloudCodeShareExtension.appex"
+SHARE_INFO="$SHARE_APPEX/Info.plist"
+SHARE_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$SHARE_INFO")"
+test -f "$SHARE_APPEX/$SHARE_EXECUTABLE"
+codesign --verify "$SHARE_APPEX"
+SHARE_ENTITLEMENTS="$TMP_DIR/share-extension-entitlements.plist"
+codesign -d --entitlements :- "$SHARE_APPEX" > "$SHARE_ENTITLEMENTS" 2>/dev/null
+plutil -lint "$SHARE_ENTITLEMENTS" >/dev/null
+test "$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$SHARE_ENTITLEMENTS")" = 'TROLLTROLL.*'
+test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$SHARE_ENTITLEMENTS")" = 'TROLLTROLL'
+/usr/libexec/PlistBuddy -c 'Print :com.apple.security.application-groups' "$SHARE_ENTITLEMENTS" | grep -F 'group.com.cloudcode.ios.share' >/dev/null
 
 HELPER="$APP_PATH/CloudCodeRootHelper"
 VISION_HELPER="$APP_PATH/CloudCodeVisionHelper"

@@ -64,6 +64,28 @@ if ! /usr/libexec/PlistBuddy -c 'Print :CFBundleIcons:CFBundlePrimaryIcon' "$INF
   echo "FAIL: CFBundleIcons/CFBundlePrimaryIcon metadata missing" >&2
   exit 14
 fi
+SHARE_APPEX="$APP_PATH/PlugIns/CloudCodeShareExtension.appex"
+SHARE_INFO="$SHARE_APPEX/Info.plist"
+if [[ ! -f "$SHARE_INFO" ]]; then
+  echo "FAIL: CloudCodeShareExtension.appex missing from IPA" >&2
+  exit 23
+fi
+SHARE_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$SHARE_INFO" 2>/dev/null || true)"
+SHARE_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$SHARE_INFO" 2>/dev/null || true)"
+SHARE_PACKAGE_TYPE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$SHARE_INFO" 2>/dev/null || true)"
+SHARE_EXTENSION_POINT="$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionPointIdentifier' "$SHARE_INFO" 2>/dev/null || true)"
+if [[ "$SHARE_BUNDLE_ID" != "com.cloudcode.ios.share" || "$SHARE_PACKAGE_TYPE" != "XPC!" || "$SHARE_EXTENSION_POINT" != "com.apple.share-services" ]]; then
+  echo "FAIL: Share Extension metadata is invalid" >&2
+  exit 23
+fi
+if [[ -z "$SHARE_EXECUTABLE" || ! -f "$SHARE_APPEX/$SHARE_EXECUTABLE" ]]; then
+  echo "FAIL: Share Extension executable missing" >&2
+  exit 23
+fi
+if ! lipo -info "$SHARE_APPEX/$SHARE_EXECUTABLE" | grep -q 'arm64'; then
+  echo "FAIL: Share Extension does not contain arm64" >&2
+  exit 23
+fi
 HELPER="$APP_PATH/CloudCodeRootHelper"
 if [[ ! -f "$HELPER" ]]; then
   echo "FAIL: embedded CloudCodeRootHelper missing; privileged uninstall fallback would be unavailable" >&2

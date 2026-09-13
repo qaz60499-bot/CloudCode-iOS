@@ -397,6 +397,13 @@ jobs:
           grep -F 'codesign -d --entitlements :- "$ROOT_HELPER"' .github/workflows/private-trollstore-privileged-ipa.yml >/dev/null
           grep -F 'codesign -d --entitlements :- "$HELPER"' scripts/verify_privileged_private_ipa.sh >/dev/null
           grep -F 'CODE_SIGN_ENTITLEMENTS: Entitlements/CloudCode.entitlements' project.yml >/dev/null
+          grep -F 'CloudCodeShareExtension:' project.yml >/dev/null
+          grep -F 'PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.share' project.yml >/dev/null
+          grep -F '<string>group.com.cloudcode.ios.share</string>' Entitlements/CloudCode.entitlements >/dev/null
+          grep -F '<string>group.com.cloudcode.ios.share</string>' Entitlements/TrollStore.entitlements >/dev/null
+          grep -F '<string>group.com.cloudcode.ios.share</string>' Entitlements/TrollStoreFallback.entitlements >/dev/null
+          grep -F 'CloudCodeShareExtension.appex' scripts/verify_ipa.sh >/dev/null
+          grep -F 'codesign --force --sign - --entitlements Entitlements/TrollStoreFallback.entitlements "$SHARE_APPEX"' .github/workflows/private-trollstore-privileged-ipa.yml >/dev/null
           grep -F 'kSecAttrAccessibleWhenUnlockedThisDeviceOnly' Sources/CloudCodeCore/KeychainAPIKeyVault.swift >/dev/null
           if grep -F 'kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly' Sources/CloudCodeCore/KeychainAPIKeyVault.swift; then
             echo "FAIL: Provider Keys must not remain readable while the device is locked" >&2

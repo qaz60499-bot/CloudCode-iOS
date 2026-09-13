@@ -23,12 +23,34 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.core
         PRODUCT_NAME: CloudCodeCore
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 132
+        CURRENT_PROJECT_VERSION: 133
         VERSIONING_SYSTEM: apple-generic
         DEFINES_MODULE: YES
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_VERSION: 5.9
         OTHER_LDFLAGS: "$(inherited) -lsqlite3"
+        SKIP_INSTALL: YES
+  CloudCodeShareExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - Sources/CloudCodeShareExtension
+    dependencies:
+      - target: CloudCodeCore
+      - package: ZIPFoundation
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.share
+        PRODUCT_NAME: CloudCodeShareExtension
+        MARKETING_VERSION: 1.1.0
+        CURRENT_PROJECT_VERSION: 133
+        VERSIONING_SYSTEM: apple-generic
+        SWIFT_VERSION: 5.9
+        OTHER_LDFLAGS: "$(inherited) -lsqlite3"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Sources/CloudCodeShareExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Entitlements/CloudCode.entitlements
+        TARGETED_DEVICE_FAMILY: "1"
         SKIP_INSTALL: YES
   CloudCodeIOS:
     type: application
@@ -41,6 +63,8 @@ targets:
         buildPhase: resources
     dependencies:
       - target: CloudCodeCore
+      - target: CloudCodeShareExtension
+        embed: true
       - package: ZIPFoundation
       - package: IOSSystemMinimal
         product: IOSSystemRuntime
@@ -62,7 +86,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios
         PRODUCT_NAME: CloudCode
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 132
+        CURRENT_PROJECT_VERSION: 133
         VERSIONING_SYSTEM: apple-generic
         SWIFT_VERSION: 5.9
         SWIFT_OBJC_BRIDGING_HEADER: Sources/CloudCodeApp/RootHelperBridge.h

@@ -14,6 +14,10 @@
         <string>TROLLTROLL.*</string>
         <string>com.apple.token</string>
     </array>
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.com.cloudcode.ios.share</string>
+    </array>
     <key>com.apple.private.security.no-sandbox</key>
     <true/>
     <!-- TrollStore documents that no-sandbox apps may also require platform-application.

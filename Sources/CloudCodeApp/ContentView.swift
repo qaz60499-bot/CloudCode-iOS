@@ -222,6 +222,7 @@ private struct ChatView: View {
     @State private var pendingImagePreview: UIImage?
     @State private var showDocumentImporter = false
     @State private var pendingDocument: ImportedChatDocument?
+    @State private var pendingShareTransactionID: UUID?
     @State private var isImportingDocument = false
     @State private var isConversationAtBottom = true
     @FocusState private var isComposerFocused: Bool
@@ -265,6 +266,12 @@ private struct ChatView: View {
                 }
                 .onChange(of: selectedPhotoItem) { item in
                     loadSelectedPhoto(item)
+                }
+                .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+                    Task { await importNextSharedDocumentIfAvailable() }
+                }
+                .task {
+                    await importNextSharedDocumentIfAvailable()
                 }
                 .onDisappear { voice.stop() }
         }
@@ -470,7 +477,7 @@ private struct ChatView: View {
                 }
                 Spacer()
                 Button(role: .destructive) {
-                    clearPendingDocument(removeStoredFile: true)
+                    clearPendingDocument(removeStoredFile: true, loadNextShare: true)
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                 }
@@ -571,12 +578,22 @@ private struct ChatView: View {
         let value = input
         let image = pendingImageData
         let document = pendingDocument
+        let sharedTransactionID = pendingShareTransactionID
         input = ""
         clearPendingImage()
         pendingDocument = nil
+        pendingShareTransactionID = nil
         voice.stop()
         if let document {
             model.send(value, document: document)
+            if let sharedTransactionID {
+                do {
+                    try model.completeSharedDocument(transactionID: sharedTransactionID)
+                } catch {
+                    model.lastError = "共享文件已发送，但清理共享收件箱失败：\(error.localizedDescription)"
+                }
+                Task { await importNextSharedDocumentIfAvailable() }
+            }
         } else {
             model.send(value, imageData: image, imageMimeType: "image/jpeg", imageFilename: "photo.jpg")
         }
@@ -619,11 +636,38 @@ private struct ChatView: View {
         }
     }
 
-    private func clearPendingDocument(removeStoredFile: Bool) {
+    private func clearPendingDocument(removeStoredFile: Bool, loadNextShare: Bool = false) {
+        let sharedTransactionID = pendingShareTransactionID
         if removeStoredFile, let pendingDocument {
             model.discardImportedChatDocument(pendingDocument)
         }
         pendingDocument = nil
+        pendingShareTransactionID = nil
+        if let sharedTransactionID {
+            do {
+                try model.completeSharedDocument(transactionID: sharedTransactionID)
+            } catch {
+                model.lastError = "清理共享收件箱失败：\(error.localizedDescription)"
+            }
+        }
+        if loadNextShare {
+            Task { await importNextSharedDocumentIfAvailable() }
+        }
+    }
+
+    @MainActor
+    private func importNextSharedDocumentIfAvailable() async {
+        guard pendingDocument == nil, !isImportingDocument else { return }
+        isImportingDocument = true
+        defer { isImportingDocument = false }
+        do {
+            guard let shared = try await model.nextPendingSharedDocument() else { return }
+            clearPendingImage()
+            pendingShareTransactionID = shared.transactionID
+            pendingDocument = shared.document
+        } catch {
+            model.lastError = "读取系统分享文件失败：\(error.localizedDescription)"
+        }
     }
 
     private func loadSelectedPhoto(_ item: PhotosPickerItem?) {

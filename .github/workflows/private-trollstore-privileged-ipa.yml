@@ -112,6 +112,11 @@ jobs:
             test -f "$framework/$framework_name"
             ldid -S "$framework/$framework_name"
           done < <(find "$APP_PATH" -type d -name '*.framework' -print)
+          SHARE_APPEX="$APP_PATH/PlugIns/CloudCodeShareExtension.appex"
+          SHARE_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$SHARE_APPEX/Info.plist")"
+          test -f "$SHARE_APPEX/$SHARE_EXECUTABLE"
+          ldid -SEntitlements/TrollStoreFallback.entitlements "$SHARE_APPEX/$SHARE_EXECUTABLE"
+          codesign --force --sign - --entitlements Entitlements/TrollStoreFallback.entitlements "$SHARE_APPEX"
           MAIN_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
           ROOT_HELPER="$APP_PATH/CloudCodeRootHelper"
           VISION_HELPER="$APP_PATH/CloudCodeVisionHelper"
@@ -141,7 +146,13 @@ jobs:
             com.apple.accessibility.api; do
             /usr/libexec/PlistBuddy -c "Print :$required_host_entitlement" "$ENTITLEMENTS" | grep -F 'true'
           done
-          rm -f "$ENTITLEMENTS"
+          /usr/libexec/PlistBuddy -c 'Print :com.apple.security.application-groups' "$ENTITLEMENTS" | grep -F 'group.com.cloudcode.ios.share'
+          SHARE_ENTITLEMENTS="$RUNNER_TEMP/cloudcode-share-extension-entitlements.plist"
+          codesign -d --entitlements :- "$SHARE_APPEX" > "$SHARE_ENTITLEMENTS" 2>/dev/null
+          plutil -lint "$SHARE_ENTITLEMENTS" >/dev/null
+          /usr/libexec/PlistBuddy -c 'Print :com.apple.security.application-groups' "$SHARE_ENTITLEMENTS" | grep -F 'group.com.cloudcode.ios.share'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$SHARE_ENTITLEMENTS")" = 'TROLLTROLL.*'
+          rm -f "$ENTITLEMENTS" "$SHARE_ENTITLEMENTS"
           VISION_ENTITLEMENTS="$RUNNER_TEMP/cloudcode-vision-helper-entitlements.plist"
           ldid -e "$VISION_HELPER" > "$VISION_ENTITLEMENTS"
           plutil -lint "$VISION_ENTITLEMENTS" >/dev/null
