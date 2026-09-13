@@ -25,6 +25,7 @@ jobs:
         run: |
           set -euo pipefail
           SRC='tools/chatgpt-compat/ChatGPTCompatibility.authenticated.c'
+          ARM64_SRC='tools/chatgpt-compat/ChatGPTCompatibility.authenticated-arm64.c'
           OUT="$RUNNER_TEMP/chatgpt-compat-shim"
           mkdir -p "$OUT"
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
@@ -43,16 +44,18 @@ jobs:
           )
 
           set +e
-          "$CLANG" -target arm64-apple-ios16.6 -march=armv8.3-a "${COMMON[@]}" "$SRC" -o "$OUT/ChatGPTCompatibility.arm64.dylib" >"$OUT/arm64.stdout.log" 2>"$OUT/arm64.stderr.log"
-          ARM64_RC=$?
+          "$CLANG" -target arm64-apple-ios16.6 -march=armv8.3-a "${COMMON[@]}" "$SRC" -o "$OUT/ChatGPTCompatibility.arm64-intrinsic.dylib" >"$OUT/arm64-intrinsic.stdout.log" 2>"$OUT/arm64-intrinsic.stderr.log"
+          ARM64_INTRINSIC_RC=$?
           "$CLANG" -target arm64e-apple-ios16.6 "${COMMON[@]}" "$SRC" -o "$OUT/ChatGPTCompatibility.arm64e.dylib" >"$OUT/arm64e.stdout.log" 2>"$OUT/arm64e.stderr.log"
           ARM64E_RC=$?
+          "$CLANG" -target arm64-apple-ios16.6 -march=armv8.3-a "${COMMON[@]}" "$ARM64_SRC" -o "$OUT/ChatGPTCompatibility.arm64.dylib" >"$OUT/arm64-explicit.stdout.log" 2>"$OUT/arm64-explicit.stderr.log"
+          ARM64_EXPLICIT_RC=$?
           set -e
 
-          printf 'arm64=%s\narm64e=%s\n' "$ARM64_RC" "$ARM64E_RC" | tee "$OUT/build-status.txt"
-          if [[ "$ARM64_RC" -ne 0 && "$ARM64E_RC" -ne 0 ]]; then
-            cat "$OUT/arm64.stderr.log" >&2 || true
+          printf 'arm64_intrinsic=%s\narm64e=%s\narm64_explicit=%s\n' "$ARM64_INTRINSIC_RC" "$ARM64E_RC" "$ARM64_EXPLICIT_RC" | tee "$OUT/build-status.txt"
+          if [[ "$ARM64E_RC" -ne 0 || "$ARM64_EXPLICIT_RC" -ne 0 ]]; then
             cat "$OUT/arm64e.stderr.log" >&2 || true
+            cat "$OUT/arm64-explicit.stderr.log" >&2 || true
             exit 2
           fi
 
@@ -78,21 +81,22 @@ jobs:
             _swift_getTypeByMangledNameInContext2
             _swift_getTypeByMangledNameInContextInMetadataState2
           )
-          found_any=0
-          for f in "$OUT"/*.dylib; do
-            [[ -e "$f" ]] || continue
-            found_any=1
+          for f in "$OUT/ChatGPTCompatibility.arm64e.dylib" "$OUT/ChatGPTCompatibility.arm64.dylib"; do
+            test -f "$f"
             for sym in "${required[@]}"; do
               xcrun nm -gU "$f" | grep -F "$sym" >/dev/null
             done
-            # ptrauth_auth_data must compile to an authenticated data-pointer operation,
-            # not only XPACD stripping. Accept the assembler mnemonic variants emitted
-            # by current Apple LLVM.
-            xcrun otool -tvV "$f" | grep -E '\b(autda|autdza|pacda|pacdza)\b' >/dev/null
+            xcrun otool -tvV "$f" | grep -E '\bautda\b' >/dev/null
+            xcrun otool -tvV "$f" | grep -E '\bxpacd\b' >/dev/null
+            xcrun otool -tvV "$f" | grep -E '\bbrk\b' >/dev/null
             xcrun otool -l "$f" | grep -A4 LC_BUILD_VERSION | grep -E 'minos +16\.6' >/dev/null
             xcrun otool -D "$f" | grep -F '@rpath/ChatGPTCompatibility.dylib' >/dev/null
           done
-          test "$found_any" = 1
+
+          # The explicit arm64 build must remain subtype ALL (0), matching the official
+          # 1.2025.007 arm64 slices rather than becoming arm64e-only.
+          xcrun otool -hv "$OUT/ChatGPTCompatibility.arm64.dylib" | grep -E 'ARM64 +ALL' >/dev/null
+          xcrun otool -hv "$OUT/ChatGPTCompatibility.arm64e.dylib" | grep -E 'ARM64 +E' >/dev/null
 
       - name: Upload audit artifact
         if: always()
