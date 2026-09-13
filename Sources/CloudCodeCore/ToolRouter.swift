@@ -114,7 +114,7 @@ public struct GUIAutomationCapabilitySnapshot: Sendable, Equatable {
         // Production may intentionally quarantine AX/AXAudit when the OS surfaces a visible
         // accessibility frame; screenshot + local OCR + HID/native routes must remain independently
         // routable in that state.
-        let required: [GUIAutomationFeature] = [.openApp, .screenshot, .ocr, .touch, .textInput, .gestures, .verify]
+        let required: [GUIAutomationFeature] = [.openApp, .screenshot, .touch, .textInput, .gestures, .verify]
         if required.allSatisfy({ status($0) == .available }) { return .available }
         if required.contains(where: { status($0) == .deviceValidationRequired }) { return .deviceValidationRequired }
         if required.contains(where: { status($0) == .unknown }) { return .unknown }

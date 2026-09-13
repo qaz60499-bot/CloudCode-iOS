@@ -3391,18 +3391,23 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(MockCapabilityProfiles.guiUnavailable.isAvailable("automation.gui"))
     }
 
-    func testGUICompositeCapabilityRequiresEveryObservationActionVerificationFeature() {
+    func testGUICompositeRequiresCoreActionAndVerificationButNotIndependentPerceptionAccelerators() {
         var statuses = Dictionary(uniqueKeysWithValues: GUIAutomationFeature.allCases.map { ($0, CapabilityStatus.available) })
         let complete = GUIAutomationCapabilitySnapshot(backendIdentifier: "complete", statuses: statuses)
         XCTAssertEqual(complete.compositeStatus, .available)
 
         statuses[.tree] = .unavailable
-        let partial = GUIAutomationCapabilitySnapshot(backendIdentifier: "partial", statuses: statuses)
-        XCTAssertEqual(partial.compositeStatus, .unavailable)
+        statuses[.ocr] = .deviceValidationRequired
+        let perceptionDegraded = GUIAutomationCapabilitySnapshot(backendIdentifier: "perception-degraded", statuses: statuses)
+        XCTAssertEqual(perceptionDegraded.compositeStatus, .available, "AX tree and OCR are independent perception routes and must not disable core GUI automation")
 
-        statuses[.tree] = .deviceValidationRequired
-        let pending = GUIAutomationCapabilitySnapshot(backendIdentifier: "pending", statuses: statuses)
-        XCTAssertEqual(pending.compositeStatus, .deviceValidationRequired)
+        statuses[.verify] = .deviceValidationRequired
+        let pendingVerification = GUIAutomationCapabilitySnapshot(backendIdentifier: "pending-verification", statuses: statuses)
+        XCTAssertEqual(pendingVerification.compositeStatus, .deviceValidationRequired)
+
+        statuses[.verify] = .unavailable
+        let missingVerification = GUIAutomationCapabilitySnapshot(backendIdentifier: "missing-verification", statuses: statuses)
+        XCTAssertEqual(missingVerification.compositeStatus, .unavailable)
     }
 
     func testGUIToolsRequireGranularCapabilityRatherThanCompositeFlag() async throws {
