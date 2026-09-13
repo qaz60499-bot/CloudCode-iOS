@@ -3156,6 +3156,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         }
 
         var localMetricSelection: LocalFeedMetricSelectionResult?
+        var lowConfidenceMetricEvidence = false
         if completed, let metric = requestedMetric, let selection = requestedSelection {
             localMetricSelection = LocalFeedMetricExtractor.select(
                 metric: metric,
@@ -3163,6 +3164,15 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 samples: localElementSamples,
                 screenSizes: localScreenSamples
             )
+            if let candidate = localMetricSelection,
+               !LocalFeedPerceptionPolicy.metricSelectionIsTrusted(candidate) {
+                lowConfidenceMetricEvidence = true
+                payload["localMetricConfidenceFloor"] = String(format: "%.3f", LocalFeedPerceptionPolicy.minimumTrustedMetricConfidence)
+                payload["localMetricObservedConfidences"] = candidate.extractions
+                    .map { String(format: "%.3f", $0.confidence) }
+                    .joined(separator: ",")
+                localMetricSelection = nil
+            }
         }
         if let localMetricSelection {
             payload["localMetric"] = localMetricSelection.metric.rawValue
@@ -3288,7 +3298,9 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             if completed {
                 let statuses = localVisionSamples.compactMap { $0["status"] }
                 let failureReason: String
-                if statuses.contains(where: { $0.hasPrefix("unavailable") }) {
+                if lowConfidenceMetricEvidence {
+                    failureReason = "metric_confidence_below_threshold"
+                } else if statuses.contains(where: { $0.hasPrefix("unavailable") }) {
                     failureReason = "ocr_request_failed"
                 } else if statuses.contains("available_empty") {
                     failureReason = "ocr_completed_no_text"

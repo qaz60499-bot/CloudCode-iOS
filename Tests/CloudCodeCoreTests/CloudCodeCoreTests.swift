@@ -2085,10 +2085,24 @@ final class CloudCodeCoreTests: XCTestCase {
             elements: completeRail,
             screenSize: screen
         ))
-        XCTAssertEqual(
-            LocalFeedMetricExtractor.extract(metric: .likeCount, elements: completeRail, screenSize: screen)?.value,
-            210_000
+        let trustedExtraction = try XCTUnwrap(
+            LocalFeedMetricExtractor.extract(metric: .likeCount, elements: completeRail, screenSize: screen)
         )
+        XCTAssertEqual(trustedExtraction.value, 210_000)
+        XCTAssertTrue(LocalFeedPerceptionPolicy.metricExtractionIsTrusted(trustedExtraction))
+
+        var lowConfidenceRail = completeRail
+        lowConfidenceRail[0].confidence = 0.50
+        let lowConfidenceExtraction = try XCTUnwrap(
+            LocalFeedMetricExtractor.extract(metric: .likeCount, elements: lowConfidenceRail, screenSize: screen)
+        )
+        XCTAssertEqual(lowConfidenceExtraction.value, 210_000)
+        XCTAssertFalse(LocalFeedPerceptionPolicy.metricExtractionIsTrusted(lowConfidenceExtraction))
+        XCTAssertFalse(LocalFeedPerceptionPolicy.observationIsSufficient(
+            metric: .likeCount,
+            elements: lowConfidenceRail,
+            screenSize: screen
+        ))
 
         let incompleteRail = Array(completeRail.prefix(2))
         XCTAssertFalse(LocalFeedPerceptionPolicy.observationIsSufficient(

@@ -776,6 +776,13 @@ public enum LocalKeyboardHeuristic {
 }
 
 public enum LocalFeedPerceptionPolicy {
+    /// Right-rail inference intentionally discounts raw Vision confidence because the semantic role
+    /// is inferred from geometry rather than an explicit accessibility label. Values below this
+    /// floor are still useful evidence, but they must not be allowed to decide a local max/min
+    /// selection without a slower verification path. 0.42 corresponds to roughly 0.58 raw OCR
+    /// confidence for the geometry-only rail (extractFromRightRail applies a 0.72 discount).
+    public static let minimumTrustedMetricConfidence = 0.42
+
     /// Metric-heavy short-video feeds usually keep like/comment/share counts in a narrow trailing
     /// rail. Crop that region before asking Vision for precise text: the digits become larger in the
     /// recognizer's working image, while the caller avoids paying full-frame OCR and AX on every
@@ -803,7 +810,18 @@ public enum LocalFeedPerceptionPolicy {
     ) -> Bool {
         guard LocalFeedIdentity.signature(elements: elements, screenSize: screenSize) != nil else { return false }
         guard let metric else { return true }
-        return LocalFeedMetricExtractor.extract(metric: metric, elements: elements, screenSize: screenSize) != nil
+        guard let extraction = LocalFeedMetricExtractor.extract(metric: metric, elements: elements, screenSize: screenSize) else {
+            return false
+        }
+        return metricExtractionIsTrusted(extraction)
+    }
+
+    public static func metricExtractionIsTrusted(_ extraction: LocalFeedMetricExtraction) -> Bool {
+        extraction.confidence.isFinite && extraction.confidence >= minimumTrustedMetricConfidence
+    }
+
+    public static func metricSelectionIsTrusted(_ selection: LocalFeedMetricSelectionResult) -> Bool {
+        !selection.extractions.isEmpty && selection.extractions.allSatisfy(metricExtractionIsTrusted)
     }
 }
 
