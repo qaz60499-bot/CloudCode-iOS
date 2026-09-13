@@ -766,7 +766,7 @@ jobs:
           for marker in ('automatic_failure_diagnosis', 'diagnosticRecoveryBudgetKey', 'usedRecovery >= 2', 'Automatic recovery budget exhausted', 'name != "diagnostics.explainFailure"', 'localVisionFailureClass', 'localMetricExtraction'):
               if marker not in agent_core:
                   raise SystemExit(f'FAIL: bounded automatic diagnosis/recovery guard lost required marker: {marker}')
-          for marker in ('localVisionFailureClass', 'LocalPerceptionTextMatcher.resolve', 'ocr_target_not_recognized', 'ocr_unique_match_ambiguous', 'requiresText: requestedMetric != nil', 'maximumElements: requestedMetric == nil ? 32 : 48'):
+          for marker in ('localVisionFailureClass', 'LocalPerceptionTextMatcher.resolve', 'ocr_target_not_recognized', 'ocr_unique_match_ambiguous', 'requiresText: requestedMetric != nil', 'maximumElements: requestedMetric == nil ? 32 : 24', 'maximumElements: 48'):
               if marker not in adapters:
                   raise SystemExit(f'FAIL: local OCR semantic failure evidence is no longer preserved: {marker}')
           core_tests = Path('Tests/CloudCodeCoreTests/CloudCodeCoreTests.swift').read_text(encoding='utf-8')
