@@ -2938,7 +2938,9 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             )
             let metricRegion = requestedMetric.flatMap { _ in
                 LocalFeedPerceptionPolicy.metricRegion(screenSize: imageScreenSize)
-            }.map { CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height) }
+            }.map {
+                CGRect(x: CGFloat($0.x), y: CGFloat($0.y), width: CGFloat($0.width), height: CGFloat($0.height))
+            }
 
             // Metric sampling takes the precise recognizer over only the trailing action/count rail.
             // This is both cheaper and more accurate than full-screen accurate OCR: small decimal
@@ -3200,7 +3202,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                     height: Double(returnedImage?.height ?? 0)
                 )
                 let returnedMetricRegion = LocalFeedPerceptionPolicy.metricRegion(screenSize: returnedScreenSize).map {
-                    CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+                    CGRect(x: CGFloat($0.x), y: CGFloat($0.y), width: CGFloat($0.width), height: CGFloat($0.height))
                 }
                 var returnedObservation = await LocalVisionTextObservation.observe(
                     for: returnedFrameData,
