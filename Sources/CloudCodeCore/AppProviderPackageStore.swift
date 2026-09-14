@@ -1210,7 +1210,7 @@ public actor AppProviderPackageStore {
         )
         let chatgptWebCompat = AppProviderPackageManifest(
             revision: "first-party-1",
-            id: "ai.chatgpt.webcompat",
+            id: "ai.chatgpt.webcompat.app",
             displayName: "ChatGPT Web Compat",
             bundleID: "com.cloudcode.chatgptwebcompat",
             declaredCapabilities: capabilities,
