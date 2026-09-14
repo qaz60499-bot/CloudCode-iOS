@@ -217,6 +217,7 @@ jobs:
             -configuration Release \
             -destination "platform=iOS Simulator,id=$UDID" \
             -derivedDataPath build/UITestDerivedData \
+            -resultBundlePath build/UITests.xcresult \
             CODE_SIGNING_ALLOWED=NO \
             test \
             -only-testing:CloudCodeIOSUITests
@@ -1020,6 +1021,15 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Upload UI test evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: CloudCode-iOS-ui-test-evidence
+          path: build/UITests.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Upload test/build diagnostics
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1028,5 +1038,7 @@ jobs:
           path: |
             .build/debug.yaml
             build/DerivedData/Logs
+            build/SimulatorDerivedData/Logs
+            build/UITestDerivedData/Logs
           if-no-files-found: ignore
           retention-days: 7
