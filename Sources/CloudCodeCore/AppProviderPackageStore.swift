@@ -1198,21 +1198,31 @@ public actor AppProviderPackageStore {
             responseExtractors: extractors
         )
         let chatgptSelectors = AppProviderSelectorSet(
-            composer: [label("Message"), text("Message"), text("Ask anything")],
+            composer: [label("Message ChatGPT"), text("Message ChatGPT"), label("Message"), text("Message"), text("Ask anything"), text("Send a message")],
             send: [label("Send"), text("Send")],
             newConversation: [label("New chat"), text("New chat")],
             generationStart: [text("Stop")],
             generationComplete: [text("Copy")],
             response: [.init(strategy: .axRole, role: "StaticText", minimumConfidence: 0.8)],
             copyButton: [text("Copy")],
-            readyIndicators: [text("Message"), text("Ask anything")],
+            readyIndicators: [text("Message ChatGPT"), text("Message"), text("Ask anything"), text("Send a message")],
             needsLoginIndicators: [text("Log in"), text("Sign up")]
+        )
+        let chatgptWebCompat = AppProviderPackageManifest(
+            revision: "first-party-1",
+            id: "ai.chatgpt.webcompat",
+            displayName: "ChatGPT Web Compat",
+            bundleID: "com.cloudcode.chatgptwebcompat",
+            declaredCapabilities: capabilities,
+            compatibility: .init(testedAppVersion: "1.0.0", selectorRevision: "1"),
+            responseExtractors: extractors
         )
         let prompts = "# First-party App Provider\n\nThis package is declarative. It never grants root authority and cannot execute arbitrary code. All actions remain inside Cloud Code Device Runtime and ToolRouter/PolicyEngine.\n"
         return [
             (gemini, geminiSelectors, baseWorkflow(), recovery, prompts),
             (deepseek, deepseekSelectors, baseWorkflow(), recovery, prompts),
-            (chatgpt, chatgptSelectors, baseWorkflow(), recovery, prompts)
+            (chatgpt, chatgptSelectors, baseWorkflow(), recovery, prompts),
+            (chatgptWebCompat, chatgptSelectors, baseWorkflow(), recovery, prompts)
         ]
     }
 }

@@ -131,7 +131,7 @@ struct AppProviderManagementView: View {
     }
 
     private static func isFirstParty(_ id: String) -> Bool {
-        id == "ai.gemini.app" || id == "ai.deepseek.app" || id == "ai.chatgpt.app"
+        id == "ai.gemini.app" || id == "ai.deepseek.app" || id == "ai.chatgpt.app" || id == "ai.chatgpt.webcompat"
     }
 }
 

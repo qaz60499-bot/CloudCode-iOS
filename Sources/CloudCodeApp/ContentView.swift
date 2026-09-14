@@ -299,13 +299,29 @@ private struct PasteSafeComposerTextView: UIViewRepresentable {
 
     private static let maximumCharacters = 120_000
 
+    private final class PlainTextPasteView: UITextView {
+        var onPlainTextPaste: ((String) -> Void)?
+
+        override func paste(_ sender: Any?) {
+            guard let plainText = UIPasteboard.general.string else {
+                super.paste(sender)
+                return
+            }
+            onPlainTextPaste?(plainText)
+        }
+    }
+
     func makeCoordinator() -> Coordinator {
         Coordinator(text: $text, isFocused: $isFocused)
     }
 
     func makeUIView(context: Context) -> UITextView {
-        let view = UITextView()
+        let view = PlainTextPasteView()
         view.delegate = context.coordinator
+        view.onPlainTextPaste = { [weak view, weak coordinator = context.coordinator] value in
+            guard let view, let coordinator else { return }
+            coordinator.applyReplacement(in: view, range: view.selectedRange, replacement: value)
+        }
         view.backgroundColor = .clear
         view.font = UIFont.preferredFont(forTextStyle: .body)
         view.adjustsFontForContentSizeCategory = true
@@ -361,17 +377,41 @@ private struct PasteSafeComposerTextView: UIViewRepresentable {
             shouldChangeTextIn range: NSRange,
             replacementText replacement: String
         ) -> Bool {
-            let current = textView.text ?? ""
-            guard let swiftRange = Range(range, in: current) else { return false }
-            let prospectiveCount = current.count - current[swiftRange].count + replacement.count
-            guard prospectiveCount > PasteSafeComposerTextView.maximumCharacters else { return true }
-
-            let remaining = max(0, PasteSafeComposerTextView.maximumCharacters - (current.count - current[swiftRange].count))
-            let boundedReplacement = String(replacement.prefix(remaining))
-            let next = current.replacingCharacters(in: swiftRange, with: boundedReplacement)
-            textView.text = next
-            text = next
+            let currentLength = (textView.text as NSString?)?.length ?? 0
+            guard range.location <= currentLength, range.location + range.length <= currentLength else { return false }
+            let replacementLength = (replacement as NSString).length
+            if currentLength - range.length + replacementLength <= PasteSafeComposerTextView.maximumCharacters {
+                return true
+            }
+            applyReplacement(in: textView, range: range, replacement: replacement)
             return false
+        }
+
+        func applyReplacement(in textView: UITextView, range: NSRange, replacement: String) {
+            let current = textView.text ?? ""
+            let currentNSString = current as NSString
+            guard range.location <= currentNSString.length, range.location + range.length <= currentNSString.length else { return }
+            let remaining = max(0, PasteSafeComposerTextView.maximumCharacters - (currentNSString.length - range.length))
+            let boundedReplacement = Self.prefixByUTF16(replacement, maximumLength: remaining)
+            let next = currentNSString.replacingCharacters(in: range, with: boundedReplacement)
+            textView.text = next
+            let insertedLength = (boundedReplacement as NSString).length
+            textView.selectedRange = NSRange(location: min(range.location + insertedLength, (next as NSString).length), length: 0)
+            if text != next { text = next }
+        }
+
+        private static func prefixByUTF16(_ value: String, maximumLength: Int) -> String {
+            guard maximumLength > 0 else { return "" }
+            let ns = value as NSString
+            guard ns.length > maximumLength else { return value }
+            var length = maximumLength
+            if length > 0 {
+                let last = ns.character(at: length - 1)
+                if CFStringIsSurrogateHighCharacter(last), length < ns.length {
+                    length -= 1
+                }
+            }
+            return ns.substring(to: max(0, length))
         }
     }
 }

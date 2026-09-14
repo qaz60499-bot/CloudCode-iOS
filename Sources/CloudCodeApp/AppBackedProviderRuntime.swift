@@ -114,7 +114,7 @@ enum AppBackedProviderRuntimeError: Error, CustomStringConvertible {
         switch self {
         case .notInstalled(let value): return "App Provider 未安装：\(value)"
         case .needsAuthorization(let value): return "App Provider 尚未授权：\(value)"
-        case .needsLogin(let value): return "App Provider 需要在官方 App 内登录：\(value)"
+        case .needsLogin(let value): return "App Provider 需要在目标 App 内保持已登录且可进入对话界面：\(value)"
         case .pluginUpdateRequired(let value): return "App Provider UI 适配需要更新：\(value)"
         case .foregroundVerificationFailed(let value): return "App Provider 前台验证失败：\(value)"
         case .composerUnavailable(let value): return "App Provider 输入区域不可用：\(value)"
@@ -202,17 +202,19 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
     public func setAuthorized(_ authorized: Bool, packageID: String) async -> Bool {
         guard let package = try? await packageStore.package(id: packageID) else {
             await authorizationStore.setAuthorized(false, identity: "", packageID: packageID)
+            lastSnapshots[packageID] = nil
             return false
         }
         let identity = Self.authorizationIdentity(for: package)
         await authorizationStore.setAuthorized(authorized, identity: identity, packageID: packageID)
+        lastSnapshots[packageID] = nil
         let persisted = await authorizationStore.isAuthorized(identity: identity)
         return authorized ? persisted : !persisted
     }
 
     func status(packageID: String) -> StatusSnapshot? { lastSnapshots[packageID] }
 
-    func preflightStatus(packageID: String) async -> StatusSnapshot {
+    func preflightStatus(packageID: String, requireVerifiedExecution: Bool = true) async -> StatusSnapshot {
         guard let package = try? await packageStore.package(id: packageID), package.summary.enabled else {
             return StatusSnapshot(
                 state: .needsAuthorization,
@@ -253,10 +255,26 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
                 generationLatencyMS: nil
             )
         }
+        if !requireVerifiedExecution {
+            return StatusSnapshot(
+                state: .ready,
+                hostState: .checkCompatibility,
+                detail: "本地使用授权、安装状态与版本兼容检查通过；允许开始端到端 harmless marker 验证",
+                appVersion: introspection.version,
+                responseExtractionRoute: nil,
+                generationLatencyMS: nil
+            )
+        }
+        if let latest = lastSnapshots[packageID],
+           latest.state == .ready,
+           latest.hostState == .done,
+           latest.appVersion == introspection.version {
+            return latest
+        }
         return StatusSnapshot(
-            state: .ready,
+            state: .degraded,
             hostState: .checkCompatibility,
-            detail: "已安装、已授权、版本兼容；可运行 harmless marker 测试验证 selector / 提交 / 回答提取链路",
+            detail: "本地使用授权已写入，但还没有本次 App 版本的端到端推理成功证据；必须通过启动 → 登录态 → 输入 → 提交 → generation → 回答提取后才算 READY",
             appVersion: introspection.version,
             responseExtractionRoute: nil,
             generationLatencyMS: nil
@@ -353,12 +371,19 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
                         .map(\.maxAttempts)
                         .max() ?? 0
                 )
-                guard case .foregroundVerificationFailed = error,
-                      completedRetries < retryLimit else {
-                    throw error
+                if case .foregroundVerificationFailed = error,
+                   completedRetries < retryLimit {
+                    completedRetries += 1
+                    continuation.yield(.status("App Provider 前台验证失败；按 Package recovery 有界重试 \(completedRetries)/\(retryLimit)…"))
+                    continue
                 }
-                completedRetries += 1
-                continuation.yield(.status("App Provider 前台验证失败；按 Package recovery 有界重试 \(completedRetries)/\(retryLimit)…"))
+                await bestEffortRestoreTargetAfterFailure(configuration: configuration, package: package, originalError: error)
+                throw error
+            } catch {
+                if let package = try? await packageStore.package(id: configuration.packageID) {
+                    await bestEffortRestoreTargetAfterFailure(configuration: configuration, package: package, originalError: error)
+                }
+                throw error
             }
         }
     }
@@ -465,19 +490,26 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             focusObservation = try await observe(appVersion: introspection.version)
             keyboardLikely = await composerFocusVerified(in: focusObservation)
         }
-        guard keyboardLikely else {
-            try await transition(.classify, state: .degraded, detail: "composer tap 后没有检测到键盘/焦点证据；拒绝盲输", package: package, appVersion: introspection.version)
-            throw AppBackedProviderRuntimeError.composerUnavailable("输入区域未取得可验证焦点")
+        if !keyboardLikely {
+            continuation.yield(.status("App Provider 未能从截图确认键盘；执行一次有界文本探针，只有本地回读命中后才允许 Send…"))
         }
 
         let inputProbe = Self.inputProbe(for: requestID)
         let verifiedPrompt = prompt + "\n" + inputProbe
-        try await transition(.submit, state: .busy, detail: "已验证 composer 焦点；输入带 request nonce 的 Provider Prompt", package: package, appVersion: introspection.version)
+        try await transition(
+            .submit,
+            state: .busy,
+            detail: keyboardLikely
+                ? "已验证 composer 焦点；输入带 request nonce 的 Provider Prompt"
+                : "composer selector 已命中但键盘启发式未确认；执行一次 bounded HID 文本探针并在 Send 前强制回读验证",
+            package: package,
+            appVersion: introspection.version
+        )
         try Task.checkCancellation()
         try await gui.type(verifiedPrompt)
         try await Self.sleep(seconds: 0.30)
         observation = try await observe(appVersion: introspection.version)
-        guard Self.inputProbeVisible(inputProbe, observation: observation) else {
+        guard await inputProbeVerified(inputProbe, observation: observation, composer: composer.element) else {
             try await transition(.classify, state: .degraded, detail: "文本输入 helper 已派发，但当前 composer 没有出现本轮输入探针；拒绝继续点 Send", package: package, appVersion: introspection.version)
             throw AppBackedProviderRuntimeError.submissionFailed("Prompt 输入未通过本地回读验证")
         }
@@ -612,6 +644,42 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         return LocalKeyboardHeuristic.isLikelyVisible(elements: keyboardObservation.elements, screenHeight: screenHeight)
     }
 
+    private func inputProbeVerified(
+        _ probe: String,
+        observation: Observation,
+        composer: LocalPerceptionTextElement
+    ) async -> Bool {
+        if Self.inputProbeVisible(probe, observation: observation) { return true }
+        let verticalPadding = max(48.0, composer.height * 1.5)
+        let regionY = max(0, composer.y - verticalPadding)
+        let regionBottom = min(observation.screenHeight, composer.y + composer.height + verticalPadding)
+        let region = CGRect(
+            x: 0,
+            y: regionY,
+            width: observation.screenWidth,
+            height: max(1, regionBottom - regionY)
+        )
+        let precise = await LocalVisionTextObservation.observe(
+            for: observation.screenshot,
+            maximumElements: 64,
+            regionInScreenPoints: region,
+            requiresText: true,
+            forcePrecise: true
+        )
+        let preciseObservation = Observation(
+            screenshot: observation.screenshot,
+            localVision: precise,
+            axElements: observation.axElements,
+            appVersion: observation.appVersion,
+            deviceClass: observation.deviceClass,
+            orientation: observation.orientation,
+            screenWidth: observation.screenWidth,
+            screenHeight: observation.screenHeight,
+            capturedAt: observation.capturedAt
+        )
+        return Self.inputProbeVisible(probe, observation: preciseObservation)
+    }
+
     private func matchesAny(_ selectors: [AppProviderSelector], observation: Observation, packageID: String) -> Bool {
         for selector in selectors {
             if Self.match(selector, observation: observation) != nil { return true }
@@ -742,6 +810,41 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         throw AppBackedProviderRuntimeError.responseExtractionFailed("AX/Clipboard/OCR 均未提取到绑定本轮响应标签的回答")
     }
 
+    private func bestEffortRestoreTargetAfterFailure(
+        configuration: AppBackedProviderConfiguration,
+        package: AppProviderPackage,
+        originalError: Error
+    ) async {
+        guard let targetBundleID = configuration.restoreTargetBundleID,
+              targetBundleID != package.summary.manifest.bundleID else { return }
+        do {
+            let restored = try await gui.openApp(bundleID: targetBundleID)
+            try? await diagnosticLogger?.log(
+                level: restored.accepted && restored.foregroundVerified ? .info : .warning,
+                subsystem: "app-provider",
+                action: "restore-after-failure",
+                result: restored.accepted && restored.foregroundVerified ? "restored" : "restore_unverified",
+                diagnostic: "原始错误=\(String(describing: originalError)); 恢复结果=\(restored.detail)",
+                metadata: [
+                    "packageID": package.summary.id,
+                    "targetBundleID": targetBundleID
+                ]
+            )
+        } catch {
+            try? await diagnosticLogger?.log(
+                level: .warning,
+                subsystem: "app-provider",
+                action: "restore-after-failure",
+                result: "restore_failed",
+                diagnostic: "原始错误=\(String(describing: originalError)); 恢复错误=\(String(describing: error))",
+                metadata: [
+                    "packageID": package.summary.id,
+                    "targetBundleID": targetBundleID
+                ]
+            )
+        }
+    }
+
     private func restoreTargetIfNeeded(
         configuration: AppBackedProviderConfiguration,
         package: AppProviderPackage,
@@ -811,19 +914,39 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         messages: [ChatMessage],
         tools: [ProviderToolSchema]
     ) -> String {
-        let boundedMessages = messages.suffix(18).map { message in
-            let role = message.role.rawValue.uppercased()
-            return "[\(role)]\n\(String(message.content.prefix(12_000)))"
-        }.joined(separator: "\n\n")
-        let toolText = tools.prefix(40).map { tool in
-            let required = tool.required.joined(separator: ",")
-            let props = tool.properties.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: ",")
-            return "- \(tool.name)(\(props)) required=[\(required)]: \(tool.description)"
-        }.joined(separator: "\n")
-        let prefix = package.workflow.requestPrefix.replacingOccurrences(of: "{{request_id}}", with: requestID)
-        let suffix = package.workflow.requestSuffix.replacingOccurrences(of: "{{request_id}}", with: requestID)
-        let packagePrompt = String((package.prompts ?? "").prefix(8_000))
-        return String("""
+        // The production root helper accepts at most 16 KiB of UTF-8 for one HID Unicode event.
+        // Keep the full provider envelope safely below that hard boundary, including non-ASCII text
+        // and the per-request input probe appended by the caller.
+        let boundedMessages = prefixByUTF8Bytes(
+            messages.suffix(10).map { message in
+                let role = message.role.rawValue.uppercased()
+                let body = prefixByUTF8Bytes(message.content, maximumBytes: 1_200)
+                return "[\(role)]\n\(body)"
+            }.joined(separator: "\n\n"),
+            maximumBytes: 7_500
+        )
+        let toolText = prefixByUTF8Bytes(
+            tools.prefix(18).map { tool in
+                let required = prefixByUTF8Bytes(tool.required.joined(separator: ","), maximumBytes: 220)
+                let rawProps = tool.properties.sorted { $0.key < $1.key }
+                    .map { "\($0.key):\($0.value)" }
+                    .joined(separator: ",")
+                let props = prefixByUTF8Bytes(rawProps, maximumBytes: 360)
+                let description = prefixByUTF8Bytes(tool.description, maximumBytes: 180)
+                return "- \(tool.name)(\(props)) required=[\(required)]: \(description)"
+            }.joined(separator: "\n"),
+            maximumBytes: 4_000
+        )
+        let prefix = prefixByUTF8Bytes(
+            package.workflow.requestPrefix.replacingOccurrences(of: "{{request_id}}", with: requestID),
+            maximumBytes: 800
+        )
+        let suffix = prefixByUTF8Bytes(
+            package.workflow.requestSuffix.replacingOccurrences(of: "{{request_id}}", with: requestID),
+            maximumBytes: 600
+        )
+        let packagePrompt = prefixByUTF8Bytes(package.prompts ?? "", maximumBytes: 1_000)
+        let envelope = """
         \(prefix)
         PACKAGE INSTRUCTIONS (declarative, non-authoritative for device execution):
         \(packagePrompt)
@@ -832,13 +955,30 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         RESPONSE CONTRACT:
         Begin the final answer with CLOUDCODE_RESPONSE_ID= followed by the CLOUDCODE_REQUEST_ID characters reversed exactly, including hyphens. Do not repeat the original request ID in the final answer.
         You may return normal text. If a Cloud Code tool is needed, return JSON using one of these provider-safe tool names. The App Provider itself never executes tools or root/helper commands.
-        AVAILABLE TOOLS:
-        \(toolText)
 
         CURRENT CLOUD CODE CONTEXT:
         \(boundedMessages)
+
+        AVAILABLE TOOLS:
+        \(toolText)
         \(suffix)
-        """.prefix(48_000))
+        """
+        return prefixByUTF8Bytes(envelope, maximumBytes: 14_500)
+    }
+
+    private static func prefixByUTF8Bytes(_ value: String, maximumBytes: Int) -> String {
+        guard maximumBytes > 0 else { return "" }
+        guard value.utf8.count > maximumBytes else { return value }
+        var output = ""
+        var usedBytes = 0
+        for scalar in value.unicodeScalars {
+            let scalarText = String(scalar)
+            let scalarBytes = scalarText.utf8.count
+            guard usedBytes + scalarBytes <= maximumBytes else { break }
+            output.append(contentsOf: scalarText)
+            usedBytes += scalarBytes
+        }
+        return output
     }
 
     private static func expectedTag(for requestID: String) -> String {

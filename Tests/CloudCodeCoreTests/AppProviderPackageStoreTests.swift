@@ -10,10 +10,12 @@ final class AppProviderPackageStoreTests: XCTestCase {
         try await store.seedFirstPartyIfMissing()
         let packages = try await store.all()
 
-        XCTAssertEqual(Set(packages.map(\.id)), Set(["ai.gemini.app", "ai.deepseek.app", "ai.chatgpt.app"]))
+        XCTAssertEqual(Set(packages.map(\.id)), Set(["ai.gemini.app", "ai.deepseek.app", "ai.chatgpt.app", "ai.chatgpt.webcompat"]))
         XCTAssertEqual(packages.first(where: { $0.id == "ai.gemini.app" })?.manifest.bundleID, "com.google.gemini")
         XCTAssertEqual(packages.first(where: { $0.id == "ai.deepseek.app" })?.manifest.compatibility.testedAppVersion, "2.5.1")
         XCTAssertEqual(packages.first(where: { $0.id == "ai.chatgpt.app" })?.manifest.compatibility.testedAppVersion, "1.2024.348")
+        XCTAssertEqual(packages.first(where: { $0.id == "ai.chatgpt.webcompat" })?.manifest.bundleID, "com.cloudcode.chatgptwebcompat")
+        XCTAssertEqual(packages.first(where: { $0.id == "ai.chatgpt.webcompat" })?.manifest.compatibility.testedAppVersion, "1.0.0")
         XCTAssertTrue(packages.allSatisfy { $0.manifest.supportsBackgroundGeneration == false })
     }
 

@@ -775,7 +775,7 @@ public final class CloudCodeViewModel: ObservableObject {
             restoreTargetBundleID: Bundle.main.bundleIdentifier
         )
         do {
-            let preflight = await appBackedProviderRuntime.preflightStatus(packageID: packageID)
+            let preflight = await appBackedProviderRuntime.preflightStatus(packageID: packageID, requireVerifiedExecution: false)
             appProviderStatusMessages[packageID] = Self.appProviderStatusText(preflight)
             guard preflight.state == .ready else {
                 switch preflight.state {
