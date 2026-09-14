@@ -1198,23 +1198,23 @@ public actor AppProviderPackageStore {
             responseExtractors: extractors
         )
         let chatgptSelectors = AppProviderSelectorSet(
-            composer: [label("Message ChatGPT"), text("Message ChatGPT"), label("Message"), text("Message"), text("Ask anything"), text("Send a message")],
+            composer: [label("询问 ChatGPT"), text("询问 ChatGPT"), label("Message ChatGPT"), text("Message ChatGPT"), label("Message"), text("Message"), text("Ask anything"), text("Send a message")],
             send: [label("Send"), text("Send")],
             newConversation: [label("New chat"), text("New chat")],
             generationStart: [text("Stop")],
             generationComplete: [text("Copy")],
             response: [.init(strategy: .axRole, role: "StaticText", minimumConfidence: 0.8)],
             copyButton: [text("Copy")],
-            readyIndicators: [text("Message ChatGPT"), text("Message"), text("Ask anything"), text("Send a message")],
-            needsLoginIndicators: [text("Log in"), text("Sign up")]
+            readyIndicators: [text("询问 ChatGPT"), text("Message ChatGPT"), text("Message"), text("Ask anything"), text("Send a message")],
+            needsLoginIndicators: [text("登录"), text("Log in"), text("Sign up")]
         )
         let chatgptWebCompat = AppProviderPackageManifest(
-            revision: "first-party-1",
+            revision: "first-party-2",
             id: "ai.chatgpt.webcompat.app",
             displayName: "ChatGPT Web Compat",
             bundleID: "com.cloudcode.chatgptwebcompat",
             declaredCapabilities: capabilities,
-            compatibility: .init(testedAppVersion: "1.0.0", selectorRevision: "1"),
+            compatibility: .init(testedAppVersion: "1.0.2", selectorRevision: "1"),
             responseExtractors: extractors
         )
         let prompts = "# First-party App Provider\n\nThis package is declarative. It never grants root authority and cannot execute arbitrary code. All actions remain inside Cloud Code Device Runtime and ToolRouter/PolicyEngine.\n"

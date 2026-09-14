@@ -15,8 +15,21 @@ final class AppProviderPackageStoreTests: XCTestCase {
         XCTAssertEqual(packages.first(where: { $0.id == "ai.deepseek.app" })?.manifest.compatibility.testedAppVersion, "2.5.1")
         XCTAssertEqual(packages.first(where: { $0.id == "ai.chatgpt.app" })?.manifest.compatibility.testedAppVersion, "1.2024.348")
         XCTAssertEqual(packages.first(where: { $0.id == "ai.chatgpt.webcompat.app" })?.manifest.bundleID, "com.cloudcode.chatgptwebcompat")
-        XCTAssertEqual(packages.first(where: { $0.id == "ai.chatgpt.webcompat.app" })?.manifest.compatibility.testedAppVersion, "1.0.0")
+        XCTAssertEqual(packages.first(where: { $0.id == "ai.chatgpt.webcompat.app" })?.manifest.compatibility.testedAppVersion, "1.0.2")
         XCTAssertTrue(packages.allSatisfy { $0.manifest.supportsBackgroundGeneration == false })
+    }
+
+    func testChatGPTPackagesRecognizeObservedChineseLoginPage() async throws {
+        let root = temporaryDirectory("chatgpt-chinese-login")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = AppProviderPackageStore(rootURL: root)
+        try await store.seedFirstPartyIfMissing()
+        for id in ["ai.chatgpt.app", "ai.chatgpt.webcompat.app"] {
+            let package = try await store.package(id: id)
+            XCTAssertTrue(package.summary.manifest.requiresLogin)
+            XCTAssertTrue(package.selectors.needsLoginIndicators.contains { $0.value == "登录" })
+            XCTAssertTrue(package.selectors.composer.contains { $0.value == "询问 ChatGPT" })
+        }
     }
 
     func testFirstPartySeedRefreshesStaleBuiltInPackageWithoutChangingItsEnabledState() async throws {
