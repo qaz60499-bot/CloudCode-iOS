@@ -489,6 +489,7 @@ public final class CloudCodeViewModel: ObservableObject {
 
     public func reloadAppProviderPackages() async {
         do {
+            try await appProviderPackageStore.seedFirstPartyIfMissing()
             appProviderPackages = try await appProviderPackageStore.all()
             if selectedAppProviderPackageID.isEmpty || !appProviderPackages.contains(where: { $0.id == selectedAppProviderPackageID && $0.enabled }) {
                 selectedAppProviderPackageID = appProviderPackages.first(where: \.enabled)?.id ?? ""
