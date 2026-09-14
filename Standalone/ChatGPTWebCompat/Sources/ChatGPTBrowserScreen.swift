@@ -5,9 +5,21 @@ import UIKit
 struct ChatGPTBrowserScreen: View {
     static let chatGPTURL = URL(string: "https://chatgpt.com/")!
 
+    @State private var browserGeneration = 0
+    @State private var leftForeground = false
+
     var body: some View {
         SafariBrowserView(url: Self.chatGPTURL)
-            .ignoresSafeArea()
+            .id(browserGeneration)
+        .ignoresSafeArea()
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+            leftForeground = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            guard leftForeground else { return }
+            leftForeground = false
+            browserGeneration &+= 1
+        }
     }
 }
 
@@ -31,7 +43,8 @@ struct SafariBrowserView: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ uiViewController: SFSafariViewController, context: Context) {
-        // Preserve the system browser session across SwiftUI updates.
+        // SFSafariViewController owns the browsing session. Avoid replacing it during
+        // SwiftUI updates so login cookies and navigation state remain intact.
     }
 
     final class Coordinator: NSObject, SFSafariViewControllerDelegate {
@@ -39,8 +52,9 @@ struct SafariBrowserView: UIViewControllerRepresentable {
             _ controller: SFSafariViewController,
             didCompleteInitialLoad didLoadSuccessfully: Bool
         ) {
-            guard !didLoadSuccessfully else { return }
-            UIApplication.shared.open(ChatGPTBrowserScreen.chatGPTURL, options: [:], completionHandler: nil)
+            // Keep the controller alive even when the initial request fails. The system
+            // browser can show its own error UI, and recreating it is handled only after
+            // the host app actually leaves and re-enters the foreground.
         }
     }
 }
