@@ -318,13 +318,6 @@ private struct PasteSafeComposerTextView: UIViewRepresentable {
     func makeUIView(context: Context) -> UITextView {
         let view = PlainTextPasteView()
         view.delegate = context.coordinator
-        context.coordinator.editor = view
-        let keyboardToolbar = UIToolbar()
-        keyboardToolbar.sizeToFit()
-        let dismissKeyboard = UIBarButtonItem(title: "完成", style: .done, target: context.coordinator, action: #selector(Coordinator.dismissKeyboard))
-        dismissKeyboard.accessibilityIdentifier = "CloudCodeDismissKeyboard"
-        keyboardToolbar.items = [UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil), dismissKeyboard]
-        view.inputAccessoryView = keyboardToolbar
         view.onPlainTextPaste = { [weak view, weak coordinator = context.coordinator] value in
             guard let view, let coordinator else { return }
             coordinator.applyReplacement(in: view, range: view.selectedRange, replacement: value)
@@ -359,17 +352,12 @@ private struct PasteSafeComposerTextView: UIViewRepresentable {
     }
 
     final class Coordinator: NSObject, UITextViewDelegate {
-        weak var editor: UITextView?
         @Binding private var text: String
         @Binding private var isFocused: Bool
 
         init(text: Binding<String>, isFocused: Binding<Bool>) {
             _text = text
             _isFocused = isFocused
-        }
-
-        @objc func dismissKeyboard() {
-            editor?.resignFirstResponder()
         }
 
         func textViewDidBeginEditing(_ textView: UITextView) {
@@ -810,6 +798,7 @@ private struct ChatView: View {
         ToolbarItemGroup(placement: .keyboard) {
             Spacer()
             Button("收起") { isComposerFocused = false }
+                .accessibilityIdentifier("CloudCodeDismissKeyboard")
         }
     }
 
