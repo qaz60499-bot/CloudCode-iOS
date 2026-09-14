@@ -70,17 +70,28 @@ extension CloudCodeViewModel {
                 // change the decision: one bounded System-app host probe plus two detached ios-mcp
                 // controls for execution-context comparison. Do not mechanically rerun the 24 old
                 // combinations on every regression.
-                // AXFrontBoard/FrontBoardServices enforces main-thread access on iOS 16.6.
-                // Keep the System-app host probe on MainActor; only detached helper controls
-                // below are allowed to leave the main actor.
-                let hostBody = await MainActor.run { () -> [String: String] in
-                    var diagnostic: NSString?
-                    let payload = CloudCodeHostAXProbeJSON(&diagnostic)
-                    return [
-                        "code": payload == nil ? "62" : "0",
-                        "stdout": payload ?? "",
-                        "stderr": diagnostic as String? ?? ""
-                    ]
+                // AXFrontBoard/FrontBoardServices enforces the physical OS main thread on iOS 16.6.
+                // MainActor alone is insufficient evidence here: a physical Build134 regression showed
+                // CloudCodeHostAXProbeJSON still entering AXFrontBoardFocusedAppPIDs off-main-thread.
+                // Dispatch explicitly to the main queue and fail closed unless Thread.isMainThread is true.
+                let hostBody: [String: String] = await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async {
+                        guard Thread.isMainThread else {
+                            continuation.resume(returning: [
+                                "code": "63",
+                                "stdout": "",
+                                "stderr": "host AX probe refused: DispatchQueue.main is not the OS main thread"
+                            ])
+                            return
+                        }
+                        var diagnostic: NSString?
+                        let payload = CloudCodeHostAXProbeJSON(&diagnostic)
+                        continuation.resume(returning: [
+                            "code": payload == nil ? "62" : "0",
+                            "stdout": payload ?? "",
+                            "stderr": diagnostic as String? ?? ""
+                        ])
+                    }
                 }
                 await record("ax-host", [
                     "executionContext": "system-app-host",
