@@ -104,6 +104,12 @@ jobs:
               simctl_bounded 30 terminate "$UDID" com.cloudcode.ios >/dev/null 2>&1 || true
               sleep 3
             done
+            mkdir -p build/launch-diagnostics
+            if [[ -d "${breadcrumb_root:-}" ]]; then
+              cp -R "$breadcrumb_root" build/launch-diagnostics/StartupBreadcrumbs
+            fi
+            simctl_bounded 30 spawn "$UDID" log show --last 5m --style compact --predicate 'process == "CloudCode"' > build/launch-diagnostics/cloudcode.log 2>&1 || true
+            simctl_bounded 15 list devices --json > build/launch-diagnostics/simulator-state.json 2>&1 || true
             return 1
           }
           simctl_bounded 120 install "$UDID" "$APP_PATH"
@@ -1040,5 +1046,6 @@ jobs:
             build/DerivedData/Logs
             build/SimulatorDerivedData/Logs
             build/UITestDerivedData/Logs
+            build/launch-diagnostics
           if-no-files-found: ignore
           retention-days: 7
