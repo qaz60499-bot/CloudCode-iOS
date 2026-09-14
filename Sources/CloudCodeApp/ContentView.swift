@@ -320,8 +320,13 @@ private struct PasteSafeComposerTextView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: UITextView, context: Context) {
-        if uiView.text != text, !uiView.isFirstResponder {
+        if uiView.text != text {
+            let previousSelection = uiView.selectedRange
             uiView.text = text
+            if uiView.isFirstResponder {
+                let end = (uiView.text as NSString).length
+                uiView.selectedRange = NSRange(location: min(previousSelection.location, end), length: 0)
+            }
         }
         if isFocused, !uiView.isFirstResponder {
             uiView.becomeFirstResponder()

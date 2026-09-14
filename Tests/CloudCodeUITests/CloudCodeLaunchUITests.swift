@@ -22,7 +22,7 @@ final class CloudCodeLaunchUITests: XCTestCase {
         XCTAssertTrue(chatTab.waitForExistence(timeout: 20), "对话 Tab 未在启动后出现")
         chatTab.tap()
 
-        let composer = app.textFields["CloudCodeComposer"]
+        let composer = app.textViews["CloudCodeComposer"]
         XCTAssertTrue(composer.waitForExistence(timeout: 10), "聊天输入框不可用")
         composer.tap()
         composer.typeText("composer-input-test")
