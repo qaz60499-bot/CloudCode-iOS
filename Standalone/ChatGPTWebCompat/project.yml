@@ -14,8 +14,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.chatgptwebcompat
         PRODUCT_NAME: ChatGPTWebCompat
-        MARKETING_VERSION: 1.0.3
-        CURRENT_PROJECT_VERSION: 4
+        MARKETING_VERSION: 1.0.4
+        CURRENT_PROJECT_VERSION: 5
         VERSIONING_SYSTEM: apple-generic
         SWIFT_VERSION: 5.9
         GENERATE_INFOPLIST_FILE: YES
