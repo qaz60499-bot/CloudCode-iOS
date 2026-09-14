@@ -103,6 +103,8 @@ enum AppBackedProviderRuntimeError: Error, CustomStringConvertible {
     case needsLogin(String)
     case pluginUpdateRequired(String)
     case foregroundVerificationFailed(String)
+    case foregroundChanged(String)
+    case providerReportedError(String)
     case composerUnavailable(String)
     case submissionFailed(String)
     case generationTimeout(String)
@@ -117,6 +119,8 @@ enum AppBackedProviderRuntimeError: Error, CustomStringConvertible {
         case .needsLogin(let value): return "App Provider 需要在目标 App 内保持已登录且可进入对话界面：\(value)"
         case .pluginUpdateRequired(let value): return "App Provider UI 适配需要更新：\(value)"
         case .foregroundVerificationFailed(let value): return "App Provider 前台验证失败：\(value)"
+        case .foregroundChanged(let value): return "App Provider 前台已变化，当前调用已停止：\(value)"
+        case .providerReportedError(let value): return "App Provider 页面报告错误：\(value)"
         case .composerUnavailable(let value): return "App Provider 输入区域不可用：\(value)"
         case .submissionFailed(let value): return "App Provider Prompt 提交失败：\(value)"
         case .generationTimeout(let value): return "App Provider generation timeout：\(value)"
@@ -363,6 +367,10 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
                     continuation: continuation
                 )
             } catch let error as AppBackedProviderRuntimeError {
+                if case .foregroundChanged = error {
+                    // Respect the new foreground owner; do not steal focus back during cleanup.
+                    throw error
+                }
                 let package = try await packageStore.package(id: configuration.packageID)
                 let retryLimit = min(
                     package.workflow.retryBudget,
@@ -506,6 +514,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             appVersion: introspection.version
         )
         try Task.checkCancellation()
+        try await requireProviderForeground(package: package, stage: .submit, appVersion: introspection.version)
         try await gui.type(verifiedPrompt)
         try await Self.sleep(seconds: 0.30)
         observation = try await observe(appVersion: introspection.version)
@@ -518,6 +527,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             throw AppBackedProviderRuntimeError.submissionFailed("send selector 未匹配")
         }
         try Task.checkCancellation()
+        try await requireProviderForeground(package: package, stage: .verifySubmission, appVersion: introspection.version)
         try await gui.tap(x: send.element.centerX, y: send.element.centerY)
         try await transition(.verifySubmission, state: .busy, detail: "Prompt 已派发；等待 generation 状态变化", package: package, appVersion: introspection.version)
 
@@ -531,7 +541,9 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         var sawGenerationSignal = package.selectors.generationStart.isEmpty
         while Date() < startDeadline {
             try Task.checkCancellation()
+            try await requireProviderForeground(package: package, stage: .waitGenerationStart, appVersion: introspection.version)
             observation = try await observe(appVersion: introspection.version)
+            try await rejectProviderError(observation, package: package, stage: .waitGenerationStart)
             if matchesAny(package.selectors.generationStart, observation: observation, packageID: package.summary.id) {
                 sawGenerationSignal = true
                 break
@@ -556,7 +568,9 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         var finalObservation = observation
         while Date() < generationDeadline {
             try Task.checkCancellation()
+            try await requireProviderForeground(package: package, stage: .waitGeneration, appVersion: introspection.version)
             let current = try await observe(appVersion: introspection.version)
+            try await rejectProviderError(current, package: package, stage: .waitGeneration)
             finalObservation = current
             let signature = Self.visibleText(current)
             let completionSignal = package.selectors.generationComplete.isEmpty
@@ -576,6 +590,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         }
 
         try await transition(.extractResponse, state: .busy, detail: "按 AX → Copy/Clipboard → OCR 顺序提取回答", package: package, appVersion: introspection.version)
+        try await requireProviderForeground(package: package, stage: .extractResponse, appVersion: introspection.version)
         let extraction = try await extractResponse(package: package, observation: finalObservation, expectedTag: expectedTag, appVersion: introspection.version)
         let latencyMS = max(0, Int(Date().timeIntervalSince(generationStartedAt) * 1_000))
         try await transition(.validateResponse, state: .busy, detail: "验证本轮响应标签，防止把输入回显或旧回答误当成本轮结果", package: package, appVersion: introspection.version, extractionRoute: extraction.route, latencyMS: latencyMS)
@@ -588,6 +603,28 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         try await restoreTargetIfNeeded(configuration: configuration, package: package, appVersion: introspection.version, extractionRoute: extraction.route, latencyMS: latencyMS)
         try await transition(.done, state: .ready, detail: "App-backed Provider inference 完成", package: package, appVersion: introspection.version, extractionRoute: extraction.route, latencyMS: latencyMS)
         return parsed
+    }
+
+    private func requireProviderForeground(package: AppProviderPackage, stage: AppBackedProviderHostState, appVersion: String) async throws {
+        let bundleID = package.summary.manifest.bundleID
+        let result = await Task.detached(priority: .utility) {
+            EmbeddedRootHelper.verifyFrontmost(bundleID: bundleID)
+        }.value
+        try Task.checkCancellation()
+        guard result.verified else {
+            let detail = "failure_stage=\(stage.rawValue); \(result.detail)"
+            try await transition(.classify, state: .degraded, detail: detail, package: package, appVersion: appVersion)
+            // A changed foreground after a request begins must not use the initial-launch retry:
+            // the prompt may already have been submitted, and repeating it would duplicate work.
+            throw AppBackedProviderRuntimeError.foregroundChanged(detail)
+        }
+    }
+
+    private func rejectProviderError(_ observation: Observation, package: AppProviderPackage, stage: AppBackedProviderHostState) async throws {
+        guard let indicator = package.selectors.errorIndicators.first(where: { Self.match($0, observation: observation) != nil }) else { return }
+        let detail = "failure_stage=\(stage.rawValue); provider_error=\(indicator.value ?? "declared error indicator")"
+        try await transition(.classify, state: .degraded, detail: detail, package: package, appVersion: observation.appVersion)
+        throw AppBackedProviderRuntimeError.providerReportedError(detail)
     }
 
     private func observe(appVersion: String) async throws -> Observation {

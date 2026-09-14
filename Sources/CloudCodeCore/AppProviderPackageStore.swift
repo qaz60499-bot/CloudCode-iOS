@@ -1164,7 +1164,8 @@ public actor AppProviderPackageStore {
             response: [.init(strategy: .axRole, role: "StaticText", minimumConfidence: 0.8)],
             copyButton: [text("复制"), text("Copy")],
             readyIndicators: [text("问 Gemini"), text("问问 Gemini"), text("Ask Gemini")],
-            needsLoginIndicators: [text("登录"), text("Sign in")]
+            needsLoginIndicators: [text("登录"), text("Sign in")],
+            errorIndicators: [text("抱歉，无法连接到服务器")]
         )
         let deepseek = AppProviderPackageManifest(
             revision: "first-party-3",

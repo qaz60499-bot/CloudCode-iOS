@@ -71,6 +71,7 @@ final class AppProviderPackageStoreTests: XCTestCase {
 
         XCTAssertTrue(gemini.selectors.composer.contains { $0.value == "问 Gemini" })
         XCTAssertTrue(gemini.selectors.readyIndicators.contains { $0.value == "问 Gemini" })
+        XCTAssertTrue(gemini.selectors.errorIndicators.contains { $0.value == "抱歉，无法连接到服务器" })
         XCTAssertTrue(deepseek.selectors.composer.contains { $0.value == "发消息或按住说话" })
         XCTAssertTrue(deepseek.selectors.readyIndicators.contains { $0.value == "发消息或按住说话" })
     }
