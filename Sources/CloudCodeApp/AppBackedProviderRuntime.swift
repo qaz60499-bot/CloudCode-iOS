@@ -15,6 +15,10 @@ actor AppBackedProviderAuthorizationStore {
         Set(defaults.stringArray(forKey: Self.key) ?? []).contains(identity)
     }
 
+    func hasAuthorization(packageID: String) -> Bool {
+        Set(defaults.stringArray(forKey: Self.key) ?? []).contains { $0.hasPrefix(packageID + "|") }
+    }
+
     func setAuthorized(_ authorized: Bool, identity: String, packageID: String) {
         var identities = Set(defaults.stringArray(forKey: Self.key) ?? [])
         identities = Set(identities.filter { !$0.hasPrefix(packageID + "|") })
@@ -230,7 +234,17 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             )
         }
         let identity = Self.authorizationIdentity(for: package)
-        guard await authorizationStore.isAuthorized(identity: identity) else {
+        var authorized = await authorizationStore.isAuthorized(identity: identity)
+        if !authorized,
+           Self.isFirstPartyPackage(package),
+           await authorizationStore.hasAuthorization(packageID: package.summary.id) {
+            // Preserve an existing explicit consent across first-party selector/prompt maintenance.
+            // The built-in package revision remains the consent boundary; custom packages still
+            // re-authorize on any content change through their content-derived identity.
+            await authorizationStore.setAuthorized(true, identity: identity, packageID: package.summary.id)
+            authorized = await authorizationStore.isAuthorized(identity: identity)
+        }
+        guard authorized else {
             return StatusSnapshot(
                 state: .needsAuthorization,
                 hostState: .checkAuthorization,
@@ -446,12 +460,44 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         }
         try Task.checkCancellation()
         try await gui.tap(x: composer.element.centerX, y: composer.element.centerY)
-        try await Self.sleep(seconds: 0.15)
+        try await Self.sleep(seconds: 0.25)
 
-        try await transition(.submit, state: .busy, detail: "输入带 request nonce 的 Provider Prompt", package: package, appVersion: introspection.version)
+        // A successful touch dispatch is not proof that the target App accepted focus. Build 134
+        // physical-device evidence showed that raw HID text can otherwise be reported as dispatched
+        // while the App Provider composer never changes. Keep production AX quarantined and require
+        // bounded, same-screen keyboard evidence before injecting the prompt.
+        var focusObservation = try await observe(appVersion: introspection.version)
+        var keyboardLikely = LocalKeyboardHeuristic.isLikelyVisible(
+            elements: focusObservation.localVision.elements,
+            screenHeight: focusObservation.screenHeight
+        )
+        if !keyboardLikely,
+           let retryComposer = await resolve(package.selectors.composer, observation: focusObservation, packageID: package.summary.id, appVersion: introspection.version) {
+            try Task.checkCancellation()
+            try await gui.tap(x: retryComposer.element.centerX, y: retryComposer.element.centerY)
+            try await Self.sleep(seconds: 0.35)
+            focusObservation = try await observe(appVersion: introspection.version)
+            keyboardLikely = LocalKeyboardHeuristic.isLikelyVisible(
+                elements: focusObservation.localVision.elements,
+                screenHeight: focusObservation.screenHeight
+            )
+        }
+        guard keyboardLikely else {
+            try await transition(.classify, state: .degraded, detail: "composer tap 后没有检测到键盘/焦点证据；拒绝盲输", package: package, appVersion: introspection.version)
+            throw AppBackedProviderRuntimeError.composerUnavailable("输入区域未取得可验证焦点")
+        }
+
+        let inputProbe = Self.inputProbe(for: requestID)
+        let verifiedPrompt = prompt + "\n" + inputProbe
+        try await transition(.submit, state: .busy, detail: "已验证 composer 焦点；输入带 request nonce 的 Provider Prompt", package: package, appVersion: introspection.version)
         try Task.checkCancellation()
-        try await gui.type(prompt)
+        try await gui.type(verifiedPrompt)
+        try await Self.sleep(seconds: 0.30)
         observation = try await observe(appVersion: introspection.version)
+        guard Self.inputProbeVisible(inputProbe, observation: observation) else {
+            try await transition(.classify, state: .degraded, detail: "文本输入 helper 已派发，但当前 composer 没有出现本轮输入探针；拒绝继续点 Send", package: package, appVersion: introspection.version)
+            throw AppBackedProviderRuntimeError.submissionFailed("Prompt 输入未通过本地回读验证")
+        }
         guard let send = await resolve(package.selectors.send, observation: observation, packageID: package.summary.id, appVersion: introspection.version) else {
             try await transition(.classify, state: .needsPluginUpdate, detail: "send selector 未匹配；不会使用未绑定坐标盲点", package: package, appVersion: introspection.version)
             throw AppBackedProviderRuntimeError.submissionFailed("send selector 未匹配")
@@ -788,6 +834,27 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         "CLOUDCODE_RESPONSE_ID=" + String(requestID.reversed())
     }
 
+    private static func inputProbe(for requestID: String) -> String {
+        let compact = requestID.replacingOccurrences(of: "-", with: "")
+        return "CCINPUT" + String(compact.prefix(8)).uppercased()
+    }
+
+    private static func inputProbeVisible(_ probe: String, observation: Observation) -> Bool {
+        func normalized(_ value: String) -> String {
+            value.uppercased().unicodeScalars.compactMap { scalar -> Character? in
+                let value = scalar.value
+                guard (48...57).contains(value) || (65...90).contains(value) else { return nil }
+                return Character(String(scalar))
+            }.reduce(into: "") { $0.append($1) }
+        }
+        let expected = normalized(probe)
+        let observed = normalized(visibleText(observation))
+        guard expected.count >= 8, observed.contains("CCINPUT") else { return false }
+        let suffix = String(expected.dropFirst("CCINPUT".count))
+        let bindingPrefix = String(suffix.prefix(4))
+        return !bindingPrefix.isEmpty && observed.contains(bindingPrefix)
+    }
+
     private static func boundText(_ raw: String, expectedTag: String) -> String? {
         guard let range = raw.range(of: expectedTag, options: [.backwards, .caseInsensitive]) else { return nil }
         let suffix = String(raw[range.lowerBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -829,7 +896,19 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         return ParsedResult(text: cleaned, toolCalls: calls)
     }
 
+    private static func isFirstPartyPackage(_ package: AppProviderPackage) -> Bool {
+        package.summary.manifest.revision.hasPrefix("first-party-")
+    }
+
     private static func authorizationIdentity(for package: AppProviderPackage) -> String {
+        if isFirstPartyPackage(package) {
+            return [
+                package.summary.id,
+                "builtin",
+                package.summary.manifest.revision,
+                package.summary.manifest.compatibility.selectorRevision
+            ].joined(separator: "|")
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         var material = Data()

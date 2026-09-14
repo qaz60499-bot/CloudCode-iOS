@@ -14,6 +14,24 @@ final class CloudCodeLaunchUITests: XCTestCase {
         return element.exists
     }
 
+    func testChatComposerAcceptsTypingWithoutImplicitSubmit() throws {
+        let app = XCUIApplication()
+        app.launch()
+
+        let chatTab = app.tabBars.buttons["对话"]
+        XCTAssertTrue(chatTab.waitForExistence(timeout: 20), "对话 Tab 未在启动后出现")
+        chatTab.tap()
+
+        let composer = app.textFields["CloudCodeComposer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 10), "聊天输入框不可用")
+        composer.tap()
+        composer.typeText("composer-input-test")
+
+        XCTAssertEqual(composer.value as? String, "composer-input-test", "输入文字后 composer 没有保留文本")
+        let send = app.buttons["发送"].firstMatch
+        XCTAssertTrue(send.exists && send.isEnabled, "输入文字后发送按钮没有启用")
+    }
+
     func testSettingsAndProviderControlsRemainReachableAfterColdLaunch() throws {
         let app = XCUIApplication()
         app.launch()

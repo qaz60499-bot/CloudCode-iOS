@@ -626,6 +626,9 @@ private struct ChatView: View {
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...5)
                 .focused($isComposerFocused)
+                .contentShape(Rectangle())
+                .onTapGesture { isComposerFocused = true }
+                .accessibilityIdentifier("CloudCodeComposer")
 
             Button(model.isCurrentSessionRunning ? "追加" : "发送", action: sendCurrentInput)
                 .buttonStyle(.borderedProminent)
