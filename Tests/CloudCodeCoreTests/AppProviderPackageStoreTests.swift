@@ -17,6 +17,34 @@ final class AppProviderPackageStoreTests: XCTestCase {
         XCTAssertTrue(packages.allSatisfy { $0.manifest.supportsBackgroundGeneration == false })
     }
 
+    func testFirstPartySeedRefreshesStaleBuiltInPackageWithoutChangingItsEnabledState() async throws {
+        let root = temporaryDirectory("seed-refresh")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = AppProviderPackageStore(rootURL: root)
+        try await store.seedFirstPartyIfMissing()
+        let before = try await store.package(id: "ai.deepseek.app")
+        XCTAssertEqual(before.summary.manifest.revision, "first-party-2")
+
+        let staleSelectors = AppProviderSelectorSet(
+            composer: [.init(strategy: .visibleText, value: "STALE COMPOSER", minimumConfidence: 0.8)],
+            send: [.init(strategy: .visibleText, value: "STALE SEND", minimumConfidence: 0.8)]
+        )
+        _ = try await store.updateSetup(
+            id: "ai.deepseek.app",
+            selectors: staleSelectors,
+            requiresLogin: false
+        )
+        try await store.setEnabled(false, id: "ai.deepseek.app")
+
+        try await store.seedFirstPartyIfMissing()
+        let after = try await store.package(id: "ai.deepseek.app")
+        XCTAssertEqual(after.summary.manifest.revision, "first-party-2")
+        XCTAssertEqual(after.summary.manifest.compatibility.selectorRevision, "2")
+        XCTAssertNotEqual(after.selectors, staleSelectors)
+        XCTAssertFalse(after.summary.enabled)
+    }
+
     func testCustomTemplateCanBeCreatedBeforeGuidedSelectorLearning() async throws {
         let root = temporaryDirectory("template")
         defer { try? FileManager.default.removeItem(at: root) }

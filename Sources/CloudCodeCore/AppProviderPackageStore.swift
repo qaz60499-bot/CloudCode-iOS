@@ -718,7 +718,11 @@ public actor AppProviderPackageStore {
         try ensureRoot()
         for package in Self.firstPartyPackages() {
             let target = rootURL.appendingPathComponent(Self.directoryName(for: package.manifest.id), isDirectory: true)
-            guard !fileManager.fileExists(atPath: target.path) else { continue }
+            if fileManager.fileExists(atPath: target.path),
+               let installed = try? loadPackage(at: target),
+               !Self.shouldRefreshFirstParty(installed: installed.summary.manifest, bundled: package.manifest) {
+                continue
+            }
             let staging = rootURL.appendingPathComponent(".seed-\(UUID().uuidString)", isDirectory: true)
             defer { try? fileManager.removeItem(at: staging) }
             try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
@@ -732,6 +736,23 @@ public actor AppProviderPackageStore {
             )
             _ = try install(from: staging)
         }
+    }
+
+    private static func shouldRefreshFirstParty(installed: AppProviderPackageManifest, bundled: AppProviderPackageManifest) -> Bool {
+        guard installed.id == bundled.id else { return true }
+        if installed.revision == bundled.revision,
+           installed.compatibility.selectorRevision == bundled.compatibility.selectorRevision {
+            return false
+        }
+        func firstPartyRevision(_ value: String) -> Int? {
+            guard value.hasPrefix("first-party-") else { return nil }
+            return Int(value.dropFirst("first-party-".count))
+        }
+        if let installedRevision = firstPartyRevision(installed.revision),
+           let bundledRevision = firstPartyRevision(bundled.revision) {
+            return bundledRevision > installedRevision
+        }
+        return true
     }
 
     public static func archiveContainsProviderManifest(_ sourceURL: URL) throws -> Bool {
@@ -1125,13 +1146,13 @@ public actor AppProviderPackageStore {
             AppProviderResponseExtractor(kind: .ocrRegion, region: .init(x: 0.04, y: 0.08, width: 0.92, height: 0.72), minimumCharacters: 2)
         ]
         let gemini = AppProviderPackageManifest(
-            revision: "first-party-1",
+            revision: "first-party-2",
             id: "ai.gemini.app",
             displayName: "Gemini App",
             bundleID: "com.google.gemini",
             launchSchemes: ["googlegemini", "comgooglegemini"],
             declaredCapabilities: capabilities,
-            compatibility: .init(testedAppVersion: "1.2026.1870010", selectorRevision: "1"),
+            compatibility: .init(testedAppVersion: "1.2026.1870010", selectorRevision: "2"),
             responseExtractors: extractors
         )
         let geminiSelectors = AppProviderSelectorSet(
@@ -1146,13 +1167,13 @@ public actor AppProviderPackageStore {
             needsLoginIndicators: [text("登录"), text("Sign in")]
         )
         let deepseek = AppProviderPackageManifest(
-            revision: "first-party-1",
+            revision: "first-party-2",
             id: "ai.deepseek.app",
             displayName: "DeepSeek App",
             bundleID: "com.deepseek.chat",
             launchSchemes: ["deepseek", "dpsk"],
             declaredCapabilities: capabilities,
-            compatibility: .init(testedAppVersion: "2.5.1", selectorRevision: "1"),
+            compatibility: .init(testedAppVersion: "2.5.1", selectorRevision: "2"),
             responseExtractors: extractors
         )
         let deepseekSelectors = AppProviderSelectorSet(
@@ -1167,13 +1188,13 @@ public actor AppProviderPackageStore {
             needsLoginIndicators: [text("登录"), text("Sign in")]
         )
         let chatgpt = AppProviderPackageManifest(
-            revision: "first-party-1",
+            revision: "first-party-2",
             id: "ai.chatgpt.app",
             displayName: "ChatGPT App",
             bundleID: "com.openai.chat",
             launchSchemes: ["com.openai.chat", "openai", "chatgpt"],
             declaredCapabilities: capabilities,
-            compatibility: .init(testedAppVersion: "1.2024.348", selectorRevision: "1"),
+            compatibility: .init(testedAppVersion: "1.2024.348", selectorRevision: "2"),
             responseExtractors: extractors
         )
         let chatgptSelectors = AppProviderSelectorSet(

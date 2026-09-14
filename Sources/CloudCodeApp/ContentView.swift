@@ -293,6 +293,84 @@ private struct SkillsView: View {
     }
 }
 
+private struct PasteSafeComposerTextView: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var isFocused: Bool
+
+    private static let maximumCharacters = 120_000
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text, isFocused: $isFocused)
+    }
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.delegate = context.coordinator
+        view.backgroundColor = .clear
+        view.font = UIFont.preferredFont(forTextStyle: .body)
+        view.adjustsFontForContentSizeCategory = true
+        view.isScrollEnabled = true
+        view.alwaysBounceVertical = false
+        view.textContainerInset = UIEdgeInsets(top: 7, left: 6, bottom: 7, right: 6)
+        view.textContainer.lineFragmentPadding = 0
+        view.keyboardDismissMode = .interactive
+        view.accessibilityIdentifier = "CloudCodeComposer"
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return view
+    }
+
+    func updateUIView(_ uiView: UITextView, context: Context) {
+        if uiView.text != text, !uiView.isFirstResponder {
+            uiView.text = text
+        }
+        if isFocused, !uiView.isFirstResponder {
+            uiView.becomeFirstResponder()
+        } else if !isFocused, uiView.isFirstResponder {
+            uiView.resignFirstResponder()
+        }
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        @Binding private var text: String
+        @Binding private var isFocused: Bool
+
+        init(text: Binding<String>, isFocused: Binding<Bool>) {
+            _text = text
+            _isFocused = isFocused
+        }
+
+        func textViewDidBeginEditing(_ textView: UITextView) {
+            if !isFocused { isFocused = true }
+        }
+
+        func textViewDidEndEditing(_ textView: UITextView) {
+            if isFocused { isFocused = false }
+        }
+
+        func textViewDidChange(_ textView: UITextView) {
+            if text != textView.text { text = textView.text }
+        }
+
+        func textView(
+            _ textView: UITextView,
+            shouldChangeTextIn range: NSRange,
+            replacementText replacement: String
+        ) -> Bool {
+            let current = textView.text ?? ""
+            guard let swiftRange = Range(range, in: current) else { return false }
+            let prospectiveCount = current.count - current[swiftRange].count + replacement.count
+            guard prospectiveCount > PasteSafeComposerTextView.maximumCharacters else { return true }
+
+            let remaining = max(0, PasteSafeComposerTextView.maximumCharacters - (current.count - current[swiftRange].count))
+            let boundedReplacement = String(replacement.prefix(remaining))
+            let next = current.replacingCharacters(in: swiftRange, with: boundedReplacement)
+            textView.text = next
+            text = next
+            return false
+        }
+    }
+}
+
 private struct ChatView: View {
     @ObservedObject var model: CloudCodeViewModel
     @StateObject private var voice = VoiceInputController()
@@ -309,7 +387,7 @@ private struct ChatView: View {
     @State private var pendingSharedSkillPackage: PendingSharedSkillPackage?
     @State private var isImportingDocument = false
     @State private var isConversationAtBottom = true
-    @FocusState private var isComposerFocused: Bool
+    @State private var isComposerFocused = false
 
     private let conversationBottomID = "cloudcode-conversation-bottom"
 
@@ -622,13 +700,23 @@ private struct ChatView: View {
             }
             .accessibilityLabel(voice.isRecording ? "停止语音输入" : "开始语音输入")
 
-            TextField("输入要让 Cloud Code 完成的任务…", text: $input, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .lineLimit(1...5)
-                .focused($isComposerFocused)
-                .contentShape(Rectangle())
-                .onTapGesture { isComposerFocused = true }
-                .accessibilityIdentifier("CloudCodeComposer")
+            ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color(uiColor: .separator), lineWidth: 0.5)
+                if input.isEmpty {
+                    Text("输入要让 Cloud Code 完成的任务…")
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 8)
+                        .allowsHitTesting(false)
+                }
+                PasteSafeComposerTextView(text: $input, isFocused: $isComposerFocused)
+                    .padding(.horizontal, 2)
+                    .padding(.vertical, 1)
+            }
+            .frame(minHeight: 38, maxHeight: 116)
+            .contentShape(Rectangle())
+            .onTapGesture { isComposerFocused = true }
 
             Button(model.isCurrentSessionRunning ? "追加" : "发送", action: sendCurrentInput)
                 .buttonStyle(.borderedProminent)

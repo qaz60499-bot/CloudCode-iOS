@@ -532,6 +532,15 @@ public final class CloudCodeViewModel: ObservableObject {
         let snapshot = await appBackedProviderRuntime.preflightStatus(packageID: packageID)
         appProviderStatusMessages[packageID] = Self.appProviderStatusText(snapshot)
         if persisted {
+            if enabled,
+               let package = appProviderPackages.first(where: { $0.id == packageID && $0.enabled }) {
+                selectedAppProviderPackageID = packageID
+                selectedProviderBackend = .appBacked
+                persistProviderSelection()
+                session.providerID = packageID
+                session.keySlotID = ""
+                session.model = package.manifest.modelLabel
+            }
             lastError = nil
         } else {
             lastError = enabled
