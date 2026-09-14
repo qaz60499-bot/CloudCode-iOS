@@ -525,7 +525,9 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         continuation.yield(.status("App Provider 正在生成…"))
         try await transition(.waitGenerationStart, state: .busy, detail: "等待 generation start", package: package, appVersion: introspection.version)
         let startDeadline = Date().addingTimeInterval(package.workflow.generationStartTimeoutSeconds)
-        var lastObservedText = ""
+        // Compare against the verified pre-send page. Its first nonempty snapshot
+        // is not evidence that the provider started generating a response.
+        var lastObservedText = Self.visibleText(observation)
         var sawGenerationSignal = package.selectors.generationStart.isEmpty
         while Date() < startDeadline {
             try Task.checkCancellation()
