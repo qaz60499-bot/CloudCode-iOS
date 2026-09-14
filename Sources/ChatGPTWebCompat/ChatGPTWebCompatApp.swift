@@ -1,3 +1,4 @@
+import CoreGraphics
 import SwiftUI
 import UIKit
 import WebKit
@@ -173,12 +174,16 @@ private struct ChatGPTWebContainer: UIViewRepresentable {
         weak var hostView: WebHostView?
         private var navigationSerial = 0
         private var blankProbeGeneration = 0
+        private var visualRecoveryCount = 0
 
         func loadChatGPT(reason: String) {
             guard let webView else { return }
             navigationSerial += 1
             blankProbeGeneration += 1
             hostView?.showLoading("正在加载 ChatGPT…")
+            if reason == "initial" || reason == "manual-retry" {
+                visualRecoveryCount = 0
+            }
             NSLog("[ChatGPTWebCompat] load reason=%@ serial=%d url=%@", reason, navigationSerial, chatGPTURL.absoluteString)
             let request = URLRequest(url: chatGPTURL, cachePolicy: .reloadRevalidatingCacheData, timeoutInterval: 30)
             webView.load(request)
@@ -311,7 +316,7 @@ private struct ChatGPTWebContainer: UIViewRepresentable {
                 }
 
                 if textLength >= 20 {
-                    self.hostView?.showWebContent()
+                    self.verifyRenderedPixels(webView, generation: generation)
                     return
                 }
 
@@ -330,6 +335,96 @@ private struct ChatGPTWebContainer: UIViewRepresentable {
                 guard let self, let webView, generation == self.blankProbeGeneration else { return }
                 self.probeDOM(webView, generation: generation, attempt: attempt)
             }
+        }
+
+        private func verifyRenderedPixels(_ webView: WKWebView, generation: Int) {
+            guard generation == blankProbeGeneration else { return }
+            let configuration = WKSnapshotConfiguration()
+            configuration.afterScreenUpdates = true
+            webView.takeSnapshot(with: configuration) { [weak self, weak webView] image, error in
+                guard let self, let webView, generation == self.blankProbeGeneration else { return }
+                if let error {
+                    let nsError = error as NSError
+                    NSLog("[ChatGPTWebCompat] visualProbe snapshotError=%@/%d %@", nsError.domain, nsError.code, nsError.localizedDescription)
+                    self.hostView?.showWebContent()
+                    return
+                }
+
+                guard let image, let metrics = Self.pixelMetrics(image) else {
+                    NSLog("[ChatGPTWebCompat] visualProbe unavailable")
+                    self.hostView?.showWebContent()
+                    return
+                }
+
+                NSLog(
+                    "[ChatGPTWebCompat] visualProbe mean=%.2f variance=%.2f darkRatio=%.5f recovery=%d",
+                    metrics.mean,
+                    metrics.variance,
+                    metrics.darkRatio,
+                    self.visualRecoveryCount
+                )
+
+                let looksBlank = metrics.mean > 247.0 && metrics.variance < 18.0 && metrics.darkRatio < 0.0015
+                if !looksBlank {
+                    self.hostView?.showWebContent()
+                    return
+                }
+
+                if self.visualRecoveryCount == 0 {
+                    self.visualRecoveryCount = 1
+                    self.hostView?.showLoading("检测到白屏，正在自动恢复 ChatGPT…")
+                    self.blankProbeGeneration += 1
+                    let nextGeneration = self.blankProbeGeneration
+                    webView.reloadFromOrigin()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self, weak webView] in
+                        guard let self, let webView, nextGeneration == self.blankProbeGeneration else { return }
+                        self.probeDOM(webView, generation: nextGeneration, attempt: 1)
+                    }
+                    return
+                }
+
+                self.hostView?.showFailure("ChatGPT 网页已经加载，但实际画面仍是白屏。\n已自动重试一次。可以再次重新加载，或在 Safari 中打开。")
+            }
+        }
+
+        private static func pixelMetrics(_ image: UIImage) -> (mean: Double, variance: Double, darkRatio: Double)? {
+            guard let cgImage = image.cgImage else { return nil }
+            let width = 32
+            let height = 64
+            let bytesPerPixel = 4
+            let bytesPerRow = width * bytesPerPixel
+            var pixels = [UInt8](repeating: 0, count: height * bytesPerRow)
+            guard let context = CGContext(
+                data: &pixels,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: bytesPerRow,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return nil }
+
+            context.interpolationQuality = .low
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+            var sum = 0.0
+            var sumSquares = 0.0
+            var darkPixels = 0
+            let count = width * height
+            for index in 0..<count {
+                let offset = index * bytesPerPixel
+                let r = Double(pixels[offset])
+                let g = Double(pixels[offset + 1])
+                let b = Double(pixels[offset + 2])
+                let luminance = (0.2126 * r) + (0.7152 * g) + (0.0722 * b)
+                sum += luminance
+                sumSquares += luminance * luminance
+                if luminance < 220.0 { darkPixels += 1 }
+            }
+
+            let mean = sum / Double(count)
+            let variance = max(0.0, (sumSquares / Double(count)) - (mean * mean))
+            return (mean, variance, Double(darkPixels) / Double(count))
         }
     }
 }
