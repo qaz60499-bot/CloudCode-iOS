@@ -1146,55 +1146,55 @@ public actor AppProviderPackageStore {
             AppProviderResponseExtractor(kind: .ocrRegion, region: .init(x: 0.04, y: 0.08, width: 0.92, height: 0.72), minimumCharacters: 2)
         ]
         let gemini = AppProviderPackageManifest(
-            revision: "first-party-2",
+            revision: "first-party-3",
             id: "ai.gemini.app",
             displayName: "Gemini App",
             bundleID: "com.google.gemini",
             launchSchemes: ["googlegemini", "comgooglegemini"],
             declaredCapabilities: capabilities,
-            compatibility: .init(testedAppVersion: "1.2026.1870010", selectorRevision: "2"),
+            compatibility: .init(testedAppVersion: "1.2026.1870010", selectorRevision: "3"),
             responseExtractors: extractors
         )
         let geminiSelectors = AppProviderSelectorSet(
-            composer: [label("问问 Gemini"), text("问问 Gemini"), text("Ask Gemini")],
+            composer: [label("问 Gemini"), text("问 Gemini"), label("问问 Gemini"), text("问问 Gemini"), text("Ask Gemini")],
             send: [label("发送"), text("发送"), text("Send")],
             newConversation: [label("发起临时对话"), text("发起临时对话"), text("New chat")],
             generationStart: [text("停止"), text("Stop")],
             generationComplete: [text("复制"), text("Copy")],
             response: [.init(strategy: .axRole, role: "StaticText", minimumConfidence: 0.8)],
             copyButton: [text("复制"), text("Copy")],
-            readyIndicators: [text("问问 Gemini"), text("Ask Gemini")],
+            readyIndicators: [text("问 Gemini"), text("问问 Gemini"), text("Ask Gemini")],
             needsLoginIndicators: [text("登录"), text("Sign in")]
         )
         let deepseek = AppProviderPackageManifest(
-            revision: "first-party-2",
+            revision: "first-party-3",
             id: "ai.deepseek.app",
             displayName: "DeepSeek App",
             bundleID: "com.deepseek.chat",
             launchSchemes: ["deepseek", "dpsk"],
             declaredCapabilities: capabilities,
-            compatibility: .init(testedAppVersion: "2.5.1", selectorRevision: "2"),
+            compatibility: .init(testedAppVersion: "2.5.1", selectorRevision: "3"),
             responseExtractors: extractors
         )
         let deepseekSelectors = AppProviderSelectorSet(
-            composer: [label("给 DeepSeek 发消息"), text("给 DeepSeek 发消息"), text("Message DeepSeek"), text("Ask DeepSeek")],
+            composer: [label("发消息或按住说话"), text("发消息或按住说话"), label("发消息"), text("发消息"), label("给 DeepSeek 发消息"), text("给 DeepSeek 发消息"), text("Message DeepSeek"), text("Ask DeepSeek")],
             send: [label("发送"), text("发送"), text("Send")],
             newConversation: [label("新建对话"), text("新建对话"), text("New chat")],
             generationStart: [text("停止生成"), text("停止"), text("Stop")],
             generationComplete: [text("复制"), text("Copy")],
             response: [.init(strategy: .axRole, role: "StaticText", minimumConfidence: 0.8)],
             copyButton: [text("复制"), text("Copy")],
-            readyIndicators: [text("DeepSeek"), text("发送消息"), text("Message")],
+            readyIndicators: [text("发消息或按住说话"), text("发消息"), text("DeepSeek"), text("发送消息"), text("Message")],
             needsLoginIndicators: [text("登录"), text("Sign in")]
         )
         let chatgpt = AppProviderPackageManifest(
-            revision: "first-party-2",
+            revision: "first-party-3",
             id: "ai.chatgpt.app",
             displayName: "ChatGPT App",
             bundleID: "com.openai.chat",
             launchSchemes: ["com.openai.chat", "openai", "chatgpt"],
             declaredCapabilities: capabilities,
-            compatibility: .init(testedAppVersion: "1.2024.348", selectorRevision: "2"),
+            compatibility: .init(testedAppVersion: "1.2024.348", selectorRevision: "3"),
             responseExtractors: extractors
         )
         let chatgptSelectors = AppProviderSelectorSet(

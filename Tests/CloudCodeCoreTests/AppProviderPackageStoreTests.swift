@@ -24,7 +24,7 @@ final class AppProviderPackageStoreTests: XCTestCase {
         let store = AppProviderPackageStore(rootURL: root)
         try await store.seedFirstPartyIfMissing()
         let before = try await store.package(id: "ai.deepseek.app")
-        XCTAssertEqual(before.summary.manifest.revision, "first-party-2")
+        XCTAssertEqual(before.summary.manifest.revision, "first-party-3")
 
         let staleSelectors = AppProviderSelectorSet(
             composer: [.init(strategy: .visibleText, value: "STALE COMPOSER", minimumConfidence: 0.8)],
@@ -39,10 +39,25 @@ final class AppProviderPackageStoreTests: XCTestCase {
 
         try await store.seedFirstPartyIfMissing()
         let after = try await store.package(id: "ai.deepseek.app")
-        XCTAssertEqual(after.summary.manifest.revision, "first-party-2")
-        XCTAssertEqual(after.summary.manifest.compatibility.selectorRevision, "2")
+        XCTAssertEqual(after.summary.manifest.revision, "first-party-3")
+        XCTAssertEqual(after.summary.manifest.compatibility.selectorRevision, "3")
         XCTAssertNotEqual(after.selectors, staleSelectors)
         XCTAssertFalse(after.summary.enabled)
+    }
+
+    func testFirstPartySelectorsCoverCurrentGeminiAndDeepSeekChineseComposers() async throws {
+        let root = temporaryDirectory("first-party-current-selectors")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = AppProviderPackageStore(rootURL: root)
+        try await store.seedFirstPartyIfMissing()
+        let gemini = try await store.package(id: "ai.gemini.app")
+        let deepseek = try await store.package(id: "ai.deepseek.app")
+
+        XCTAssertTrue(gemini.selectors.composer.contains { $0.value == "问 Gemini" })
+        XCTAssertTrue(gemini.selectors.readyIndicators.contains { $0.value == "问 Gemini" })
+        XCTAssertTrue(deepseek.selectors.composer.contains { $0.value == "发消息或按住说话" })
+        XCTAssertTrue(deepseek.selectors.readyIndicators.contains { $0.value == "发消息或按住说话" })
     }
 
     func testCustomTemplateCanBeCreatedBeforeGuidedSelectorLearning() async throws {
