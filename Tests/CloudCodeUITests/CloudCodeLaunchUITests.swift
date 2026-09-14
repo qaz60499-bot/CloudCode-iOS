@@ -74,6 +74,9 @@ final class CloudCodeLaunchUITests: XCTestCase {
             XCTAssertEqual(composer.value as? String, payload, "Delete after paste: \(name)")
             let send = app.buttons["发送"].firstMatch
             XCTAssertTrue(send.exists && send.isEnabled, "Send remains available: \(name)")
+            let dismissKeyboard = app.buttons["CloudCodeDismissKeyboard"]
+            XCTAssertTrue(dismissKeyboard.waitForExistence(timeout: 5), "Keyboard dismissal available: \(name)")
+            dismissKeyboard.tap()
             app.tabBars.buttons["设置"].tap()
             XCTAssertTrue(app.navigationBars["设置"].waitForExistence(timeout: 5), "Navigation responsive: \(name)")
             app.terminate()
