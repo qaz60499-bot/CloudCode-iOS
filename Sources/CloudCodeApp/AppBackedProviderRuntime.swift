@@ -456,20 +456,14 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         // while the App Provider composer never changes. Keep production AX quarantined and require
         // bounded, same-screen keyboard evidence before injecting the prompt.
         var focusObservation = try await observe(appVersion: introspection.version)
-        var keyboardLikely = LocalKeyboardHeuristic.isLikelyVisible(
-            elements: focusObservation.localVision.elements,
-            screenHeight: focusObservation.screenHeight
-        )
+        var keyboardLikely = await composerFocusVerified(in: focusObservation)
         if !keyboardLikely,
            let retryComposer = await resolve(package.selectors.composer, observation: focusObservation, packageID: package.summary.id, appVersion: introspection.version) {
             try Task.checkCancellation()
             try await gui.tap(x: retryComposer.element.centerX, y: retryComposer.element.centerY)
             try await Self.sleep(seconds: 0.35)
             focusObservation = try await observe(appVersion: introspection.version)
-            keyboardLikely = LocalKeyboardHeuristic.isLikelyVisible(
-                elements: focusObservation.localVision.elements,
-                screenHeight: focusObservation.screenHeight
-            )
+            keyboardLikely = await composerFocusVerified(in: focusObservation)
         }
         guard keyboardLikely else {
             try await transition(.classify, state: .degraded, detail: "composer tap 后没有检测到键盘/焦点证据；拒绝盲输", package: package, appVersion: introspection.version)
@@ -588,6 +582,34 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             screenHeight: height,
             capturedAt: Date()
         )
+    }
+
+    private func composerFocusVerified(in observation: Observation) async -> Bool {
+        let keyboardRegion = CGRect(
+            x: 0,
+            y: observation.screenHeight * 0.42,
+            width: observation.screenWidth,
+            height: observation.screenHeight * 0.58
+        )
+        var keyboardObservation = await LocalVisionTextObservation.observe(
+            for: observation.screenshot,
+            maximumElements: 48,
+            regionInScreenPoints: keyboardRegion,
+            requiresText: true
+        )
+        var screenHeight = Double(keyboardObservation.payload["screenPointHeight"] ?? "") ?? observation.screenHeight
+        if LocalKeyboardHeuristic.isLikelyVisible(elements: keyboardObservation.elements, screenHeight: screenHeight) {
+            return true
+        }
+        keyboardObservation = await LocalVisionTextObservation.observe(
+            for: observation.screenshot,
+            maximumElements: 48,
+            regionInScreenPoints: keyboardRegion,
+            requiresText: true,
+            forcePrecise: true
+        )
+        screenHeight = Double(keyboardObservation.payload["screenPointHeight"] ?? "") ?? observation.screenHeight
+        return LocalKeyboardHeuristic.isLikelyVisible(elements: keyboardObservation.elements, screenHeight: screenHeight)
     }
 
     private func matchesAny(_ selectors: [AppProviderSelector], observation: Observation, packageID: String) -> Bool {
