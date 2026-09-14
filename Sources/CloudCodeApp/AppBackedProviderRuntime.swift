@@ -233,18 +233,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
                 generationLatencyMS: nil
             )
         }
-        let identity = Self.authorizationIdentity(for: package)
-        var authorized = await authorizationStore.isAuthorized(identity: identity)
-        if !authorized,
-           Self.isFirstPartyPackage(package),
-           await authorizationStore.hasAuthorization(packageID: package.summary.id) {
-            // Preserve an existing explicit consent across first-party selector/prompt maintenance.
-            // The built-in package revision remains the consent boundary; custom packages still
-            // re-authorize on any content change through their content-derived identity.
-            await authorizationStore.setAuthorized(true, identity: identity, packageID: package.summary.id)
-            authorized = await authorizationStore.isAuthorized(identity: identity)
-        }
-        guard authorized else {
+        guard await ensureAuthorization(for: package) else {
             return StatusSnapshot(
                 state: .needsAuthorization,
                 hostState: .checkAuthorization,
@@ -397,7 +386,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         }
 
         try await transition(.checkAuthorization, state: .busy, detail: "检查 Cloud Code Provider 授权", package: package, appVersion: introspection.version)
-        guard await authorizationStore.isAuthorized(identity: Self.authorizationIdentity(for: package)) else {
+        guard await ensureAuthorization(for: package) else {
             try await transition(.classify, state: .needsAuthorization, detail: "等待用户授权使用已登录官方 App", package: package, appVersion: introspection.version)
             throw AppBackedProviderRuntimeError.needsAuthorization(package.summary.manifest.displayName)
         }
@@ -894,6 +883,18 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             }
         }
         return ParsedResult(text: cleaned, toolCalls: calls)
+    }
+
+    private func ensureAuthorization(for package: AppProviderPackage) async -> Bool {
+        let identity = Self.authorizationIdentity(for: package)
+        if await authorizationStore.isAuthorized(identity: identity) { return true }
+        guard Self.isFirstPartyPackage(package),
+              await authorizationStore.hasAuthorization(packageID: package.summary.id) else { return false }
+        // Preserve an existing explicit consent across first-party selector/prompt maintenance.
+        // The built-in package revision remains the consent boundary; custom packages still
+        // re-authorize on any content change through their content-derived identity.
+        await authorizationStore.setAuthorized(true, identity: identity, packageID: package.summary.id)
+        return await authorizationStore.isAuthorized(identity: identity)
     }
 
     private static func isFirstPartyPackage(_ package: AppProviderPackage) -> Bool {
