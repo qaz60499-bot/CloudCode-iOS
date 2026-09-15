@@ -1190,13 +1190,13 @@ public actor AppProviderPackageStore {
             errorIndicators: [text("抱歉，无法连接到服务器")]
         )
         let deepseek = AppProviderPackageManifest(
-            revision: "first-party-5",
+            revision: "first-party-6",
             id: "ai.deepseek.app",
             displayName: "DeepSeek App",
             bundleID: "com.deepseek.chat",
             launchSchemes: ["deepseek", "dpsk"],
             declaredCapabilities: capabilities,
-            compatibility: .init(testedAppVersion: "2.5.1", selectorRevision: "5"),
+            compatibility: .init(testedAppVersion: "2.5.1", selectorRevision: "6"),
             responseExtractors: extractors
         )
         let deepseekSelectors = AppProviderSelectorSet(
@@ -1215,6 +1215,20 @@ public actor AppProviderPackageStore {
             ],
             send: [
                 label("发送"), text("发送"), text("Send"),
+                // DeepSeek 2.5.1 moves the composer/send affordance above the software keyboard.
+                // Physical-device evidence on the iPhone 14,2 390x844-point geometry places the
+                // post-input send glyph at approximately (354, 484). Keep this exact-geometry
+                // fallback ahead of the older 393x852 layout; Runtime still requires the request-
+                // unique input probe to be locally read back before any send fallback may be used.
+                .init(
+                    strategy: .coordinateFallback,
+                    coordinate: .init(
+                        x: 354, y: 484,
+                        deviceClass: "iPhone", orientation: "portrait",
+                        appVersion: "2.5.1", screenWidth: 390, screenHeight: 844
+                    ),
+                    minimumConfidence: 0.5
+                ),
                 .init(
                     strategy: .coordinateFallback,
                     coordinate: .init(
