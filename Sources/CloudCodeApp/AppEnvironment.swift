@@ -792,10 +792,8 @@ public final class CloudCodeViewModel: ObservableObject {
         do {
             let preflight = await appBackedProviderRuntime.preflightStatus(packageID: packageID, requireVerifiedExecution: false)
             appProviderStatusMessages[packageID] = Self.appProviderStatusText(preflight)
-            guard preflight.state == .ready || preflight.state == .notInstalled else {
+            if preflight.state != .ready && preflight.state != .notInstalled {
                 switch preflight.state {
-                case .notInstalled:
-                    break
                 case .needsAuthorization:
                     throw AppBackedProviderRuntimeError.needsAuthorization(package.manifest.displayName)
                 case .needsLogin:
@@ -806,8 +804,8 @@ public final class CloudCodeViewModel: ObservableObject {
                     throw AppBackedProviderRuntimeError.generationTimeout(preflight.detail)
                 case .degraded, .busy:
                     throw AppBackedProviderRuntimeError.submissionFailed(preflight.detail)
-                case .ready:
-                    throw AppBackedProviderRuntimeError.submissionFailed("App Provider preflight state changed unexpectedly")
+                case .ready, .notInstalled:
+                    break
                 }
             }
             guard appProviderSelfTestTask == nil else {
