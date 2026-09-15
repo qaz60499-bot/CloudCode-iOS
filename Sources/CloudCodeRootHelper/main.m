@@ -309,6 +309,7 @@ static NSArray *InstalledApplicationProxies(id workspace, NSString **backend)
 }
 
 static BOOL ApplicationIsInstalled(id workspace, NSString *bundleID, BOOL *known);
+static id ApplicationProxy(NSString *bundleID);
 
 static NSString *BundlePathForIdentifierFromFilesystem(NSString *bundleID)
 {
@@ -335,7 +336,27 @@ static NSString *InstalledBundlePath(id workspace, NSString *bundleID)
 {
     NSString *filesystemPath = BundlePathForIdentifierFromFilesystem(bundleID);
     if (filesystemPath.length > 0) { return filesystemPath; }
-    if (!workspace || bundleID.length == 0) { return nil; }
+    if (bundleID.length == 0) { return nil; }
+
+    // Exact Bundle-ID lookup is materially cheaper and more reliable than broad LaunchServices
+    // enumeration on the iOS 16.6 TrollStore device. Use it as the first fallback when the
+    // privileged filesystem view is temporarily incomplete (for example during container/index
+    // churn after install/update). This keeps App Provider installation checks exact without
+    // paying an allInstalledApplications watchdog.
+    id exactProxy = ApplicationProxy(bundleID);
+    if (exactProxy) {
+        NSString *candidate = SafeValue(exactProxy, @"applicationIdentifier");
+        if (![candidate isKindOfClass:NSString.class] || candidate.length == 0) {
+            candidate = SafeValue(exactProxy, @"bundleIdentifier");
+        }
+        if ([candidate isEqualToString:bundleID]) {
+            NSURL *bundleURL = SafeValue(exactProxy, @"bundleURL");
+            NSString *path = [bundleURL isKindOfClass:NSURL.class] ? bundleURL.path.stringByStandardizingPath : nil;
+            if (IsSafeBundlePath(path)) { return path; }
+        }
+    }
+
+    if (!workspace) { return nil; }
     NSArray *proxies = InstalledApplicationProxies(workspace, NULL);
     for (id proxy in proxies) {
         NSString *candidate = SafeValue(proxy, @"applicationIdentifier");
@@ -805,11 +826,19 @@ static NSArray<NSString *> *CloudCodeBoundedStringArray(id value, NSUInteger lim
 static int PrintAppIntrospectionJSON(NSString *bundleID)
 {
     if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0 || bundleID.length > 255) { CloudCodeExitOneShot(10); }
-    // Exact metadata reads do not need an LSApplicationProxy. Resolve the real bundle and data
-    // container directly from the bounded filesystem view so a degraded LaunchServices service
-    // cannot turn a simple WeChat/Douyin lookup into a 5s watchdog timeout.
-    NSString *bundlePath = BundlePathForIdentifierFromFilesystem(bundleID);
+    // Prefer the bounded filesystem view, but do not equate a transient filesystem miss with
+    // "not installed". InstalledBundlePath performs a single exact LSApplicationProxy lookup
+    // before considering the legacy broad enumeration fallback.
+    id workspace = Workspace();
+    NSString *bundlePath = InstalledBundlePath(workspace, bundleID);
     NSString *dataPath = DataContainerPathsByBundleID()[bundleID];
+    id exactProxy = nil;
+    if (!IsSafeDataPath(dataPath)) {
+        exactProxy = ApplicationProxy(bundleID);
+        NSURL *dataURL = SafeValue(exactProxy, @"dataContainerURL");
+        NSString *candidateDataPath = [dataURL isKindOfClass:NSURL.class] ? dataURL.path.stringByStandardizingPath : nil;
+        if (IsSafeDataPath(candidateDataPath)) { dataPath = candidateDataPath; }
+    }
     if (!IsSafeBundlePath(bundlePath)) { CloudCodeExitOneShot(44); }
     NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"Info.plist"]];
     if (![info isKindOfClass:NSDictionary.class]) { CloudCodeExitOneShot(78); }

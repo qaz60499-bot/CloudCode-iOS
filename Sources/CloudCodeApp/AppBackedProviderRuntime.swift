@@ -99,6 +99,7 @@ actor AppBackedProviderLearningStore {
 
 enum AppBackedProviderRuntimeError: Error, CustomStringConvertible {
     case notInstalled(String)
+    case introspectionUnavailable(String)
     case needsAuthorization(String)
     case needsLogin(String)
     case pluginUpdateRequired(String)
@@ -115,6 +116,7 @@ enum AppBackedProviderRuntimeError: Error, CustomStringConvertible {
     var description: String {
         switch self {
         case .notInstalled(let value): return "App Provider 未安装：\(value)"
+        case .introspectionUnavailable(let value): return "App Provider 已检测到安装状态，但静态元数据暂不可读取：\(value)"
         case .needsAuthorization(let value): return "App Provider 尚未授权：\(value)"
         case .needsLogin(let value): return "App Provider 需要在目标 App 内保持已登录且可进入对话界面：\(value)"
         case .pluginUpdateRequired(let value): return "App Provider UI 适配需要更新：\(value)"
@@ -171,6 +173,12 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         var score: Double
     }
 
+    private enum InstallationProbe {
+        case installed(AppStaticIntrospection)
+        case notInstalled(String)
+        case metadataUnavailable(String)
+    }
+
     private let packageStore: AppProviderPackageStore
     private let appResolver: IOSAppResolver
     private let gui: GUIAutomationBackend
@@ -218,6 +226,20 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
 
     func status(packageID: String) -> StatusSnapshot? { lastSnapshots[packageID] }
 
+    private func installationProbe(bundleID: String) async -> InstallationProbe {
+        if let introspection = await appResolver.appIntrospection(bundleID: bundleID) {
+            return .installed(introspection)
+        }
+        let state = await appResolver.installationState(bundleID: bundleID)
+        if state.installed == false {
+            return .notInstalled(state.detail)
+        }
+        if state.installed == true {
+            return .metadataUnavailable("\(bundleID)；系统已确认 App 安装，但 metadata introspection 失败。\(state.detail)")
+        }
+        return .metadataUnavailable("\(bundleID)；安装状态与 metadata introspection 均未取得可靠结果。\(state.detail)")
+    }
+
     func preflightStatus(packageID: String, requireVerifiedExecution: Bool = true) async -> StatusSnapshot {
         guard let package = try? await packageStore.package(id: packageID), package.summary.enabled else {
             return StatusSnapshot(
@@ -229,11 +251,25 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
                 generationLatencyMS: nil
             )
         }
-        guard let introspection = await appResolver.appIntrospection(bundleID: package.summary.manifest.bundleID) else {
+        let installation = await installationProbe(bundleID: package.summary.manifest.bundleID)
+        let introspection: AppStaticIntrospection
+        switch installation {
+        case .installed(let value):
+            introspection = value
+        case .notInstalled(let detail):
             return StatusSnapshot(
                 state: .notInstalled,
                 hostState: .checkInstalled,
-                detail: "未检测到目标 App：\(package.summary.manifest.bundleID)",
+                detail: "未检测到目标 App：\(package.summary.manifest.bundleID)。\(detail)",
+                appVersion: nil,
+                responseExtractionRoute: nil,
+                generationLatencyMS: nil
+            )
+        case .metadataUnavailable(let detail):
+            return StatusSnapshot(
+                state: .degraded,
+                hostState: .checkInstalled,
+                detail: detail,
                 appVersion: nil,
                 responseExtractionRoute: nil,
                 generationLatencyMS: nil
@@ -287,8 +323,14 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
 
     func setupProbe(packageID: String) async throws -> SetupProbe {
         let package = try await packageStore.package(id: packageID)
-        guard let introspection = await appResolver.appIntrospection(bundleID: package.summary.manifest.bundleID) else {
+        let introspection: AppStaticIntrospection
+        switch await installationProbe(bundleID: package.summary.manifest.bundleID) {
+        case .installed(let value):
+            introspection = value
+        case .notInstalled:
             throw AppBackedProviderRuntimeError.notInstalled(package.summary.manifest.bundleID)
+        case .metadataUnavailable(let detail):
+            throw AppBackedProviderRuntimeError.introspectionUnavailable(detail)
         }
         let launch = try await gui.openApp(bundleID: package.summary.manifest.bundleID)
         guard launch.accepted, launch.foregroundVerified else {
@@ -413,9 +455,16 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             throw AppBackedProviderRuntimeError.needsAuthorization("Provider Package 已停用")
         }
         try await transition(.checkInstalled, state: .busy, detail: "检查目标 App 安装状态", package: package)
-        guard let introspection = await appResolver.appIntrospection(bundleID: package.summary.manifest.bundleID) else {
-            try await transition(.classify, state: .notInstalled, detail: package.summary.manifest.bundleID, package: package)
+        let introspection: AppStaticIntrospection
+        switch await installationProbe(bundleID: package.summary.manifest.bundleID) {
+        case .installed(let value):
+            introspection = value
+        case .notInstalled(let detail):
+            try await transition(.classify, state: .notInstalled, detail: detail, package: package)
             throw AppBackedProviderRuntimeError.notInstalled(package.summary.manifest.bundleID)
+        case .metadataUnavailable(let detail):
+            try await transition(.classify, state: .degraded, detail: detail, package: package)
+            throw AppBackedProviderRuntimeError.introspectionUnavailable(detail)
         }
 
         try await transition(.checkAuthorization, state: .busy, detail: "检查 Cloud Code Provider 授权", package: package, appVersion: introspection.version)

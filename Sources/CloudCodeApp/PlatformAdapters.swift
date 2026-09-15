@@ -833,6 +833,19 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
         cachedApps.first(where: { $0.ownerBundleID == bundleID })?.displayName
     }
 
+    public func installationState(bundleID: String) async -> (installed: Bool?, detail: String) {
+        let result = EmbeddedRootHelper.installationState(bundleID: bundleID)
+        try? await diagnosticLogger?.log(
+            level: result.installed == true ? .info : (result.installed == false ? .warning : .error),
+            subsystem: "app-installation",
+            action: "exact-state",
+            result: result.installed.map { $0 ? "installed" : "not-installed" } ?? "unknown",
+            diagnostic: result.detail,
+            metadata: ["bundleID": bundleID]
+        )
+        return result
+    }
+
     public func appIntrospection(bundleID: String) async -> AppStaticIntrospection? {
         let indexedVersion = cachedVersion(for: bundleID)
         if let cached = cachedIntrospection[bundleID],
