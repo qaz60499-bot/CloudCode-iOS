@@ -600,8 +600,38 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         }
 
         let parsed = Self.parseResponse(boundedText, expectedTag: expectedTag, tools: tools)
-        try await restoreTargetIfNeeded(configuration: configuration, package: package, appVersion: introspection.version, extractionRoute: extraction.route, latencyMS: latencyMS)
-        try await transition(.done, state: .ready, detail: "App-backed Provider inference 完成", package: package, appVersion: introspection.version, extractionRoute: extraction.route, latencyMS: latencyMS)
+        var completionDetail = "App-backed Provider inference 完成"
+        do {
+            try await restoreTargetIfNeeded(
+                configuration: configuration,
+                package: package,
+                appVersion: introspection.version,
+                extractionRoute: extraction.route,
+                latencyMS: latencyMS
+            )
+        } catch {
+            // The provider answer has already been bound to this request and parsed at this point.
+            // A best-effort UI restore failure must not discard a valid inference and turn it into a
+            // provider error. Surface the restore problem separately; the next explicit foreground
+            // operation will re-validate its own target before acting.
+            completionDetail = "App-backed Provider inference 完成；返回目标 App 未能验证恢复，但已保留本轮已验证回答"
+            continuation.yield(.status("App Provider 已取得并验证回答；返回 Cloud Code 前台未验证，本轮回答不会因此丢弃。"))
+            try? await diagnosticLogger?.log(
+                level: .warning,
+                subsystem: "app-provider",
+                action: "restore-after-success",
+                result: "restore_unverified_but_inference_preserved",
+                diagnostic: String(describing: error),
+                metadata: [
+                    "packageID": package.summary.id,
+                    "bundleID": package.summary.manifest.bundleID,
+                    "appVersion": introspection.version,
+                    "responseExtractionRoute": extraction.route,
+                    "generationLatencyMS": String(latencyMS)
+                ]
+            )
+        }
+        try await transition(.done, state: .ready, detail: completionDetail, package: package, appVersion: introspection.version, extractionRoute: extraction.route, latencyMS: latencyMS)
         return parsed
     }
 
