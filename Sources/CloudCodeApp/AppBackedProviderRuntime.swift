@@ -115,7 +115,7 @@ enum AppBackedProviderRuntimeError: Error, CustomStringConvertible {
 
     var description: String {
         switch self {
-        case .notInstalled(let value): return "App Provider 未安装：\(value)"
+        case .notInstalled(let value): return "App Provider 未能通过运行时可用性验证：\(value)"
         case .introspectionUnavailable(let value): return "App Provider 已检测到安装状态，但静态元数据暂不可读取：\(value)"
         case .needsAuthorization(let value): return "App Provider 尚未授权：\(value)"
         case .needsLogin(let value): return "App Provider 需要在目标 App 内保持已登录且可进入对话界面：\(value)"
@@ -500,11 +500,13 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         do {
             launch = try await gui.openApp(bundleID: package.summary.manifest.bundleID)
         } catch {
-            let detail = "精确 Bundle 启动失败：\(String(describing: error))"
-            if case .notInstalled(_) = installation {
-                try await transition(.classify, state: .notInstalled, detail: detail, package: package, appVersion: introspection.version)
-                throw AppBackedProviderRuntimeError.notInstalled(package.summary.manifest.bundleID)
-            }
+            // A static installation false-negative is only a discovery hint on the TrollStore/root
+            // persona. If the exact launch also fails, do not promote that stale hint into a
+            // definitive `notInstalled` error: doing so hides the real LaunchServices/FrontBoard
+            // failure and makes an installed provider appear missing. Keep the launch failure as the
+            // authoritative runtime result and attach the static discovery detail for diagnostics.
+            let launchFailure = "精确 Bundle 启动失败：\(String(describing: error))"
+            let detail = discoveryDetail.map { "\(launchFailure)；静态发现信息：\($0)" } ?? launchFailure
             try await transition(.classify, state: .degraded, detail: detail, package: package, appVersion: introspection.version)
             throw AppBackedProviderRuntimeError.foregroundVerificationFailed(detail)
         }

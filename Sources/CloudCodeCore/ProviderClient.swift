@@ -2891,6 +2891,21 @@ enum ProviderEndpoint {
             .map(String.init)
         guard !requestedComponents.isEmpty else { throw ProviderError.invalidEndpoint }
 
+        // Google exposes an official OpenAI-compatible Gemini API under /v1beta/openai.
+        // Treat that versioned compatibility prefix as the API root instead of blindly
+        // appending our ordinary /v1 suffix (which would produce the invalid
+        // /v1beta/openai/v1/... route). Also make the documented Google root usable as a
+        // convenience base URL so a valid Gemini API key is not rejected only because the
+        // compatibility prefix was omitted in UI configuration.
+        let host = baseURL.host?.lowercased()
+        if host == "generativelanguage.googleapis.com" {
+            if baseComponents.isEmpty {
+                baseComponents = ["v1beta", "openai"]
+            } else if baseComponents == ["v1beta"] {
+                baseComponents.append("openai")
+            }
+        }
+
         if baseComponents.suffix(requestedComponents.count).elementsEqual(requestedComponents) {
             return baseURL
         }
@@ -2898,7 +2913,11 @@ enum ProviderEndpoint {
             baseComponents.removeLast(suffix.count)
             break
         }
-        if baseComponents.last != "v1" {
+        let isGeminiOpenAICompatibilityRoot = host == "generativelanguage.googleapis.com"
+            && baseComponents.count >= 2
+            && baseComponents[0] == "v1beta"
+            && baseComponents[1] == "openai"
+        if baseComponents.last != "v1" && !isGeminiOpenAICompatibilityRoot {
             baseComponents.append("v1")
         }
         baseComponents.append(contentsOf: requestedComponents)

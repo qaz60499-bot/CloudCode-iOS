@@ -1682,6 +1682,24 @@ final class ProviderProtocolClientTests: XCTestCase {
         )
         for try await _ in anthropic.stream(configuration: anthropicConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
         XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://example.com/v1/messages")
+
+        ProviderTestURLProtocol.install(status: 200, body: Data("data: [DONE]\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let geminiCompatibilityConfiguration = ProviderConfiguration(
+            name: "Gemini OpenAI Compatibility",
+            baseURL: URL(string: "https://generativelanguage.googleapis.com/v1beta/openai/")!,
+            model: "gemini-2.5-flash",
+            apiKeyReference: "key",
+            protocolName: ProviderProtocol.openAIChat.rawValue,
+            authModeName: ProviderAuthMode.bearer.rawValue
+        )
+        for try await _ in chat.stream(configuration: geminiCompatibilityConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.value(forHTTPHeaderField: "Authorization"), "Bearer secret")
+
+        var geminiRootConfiguration = geminiCompatibilityConfiguration
+        geminiRootConfiguration.baseURL = URL(string: "https://generativelanguage.googleapis.com")!
+        for try await _ in chat.stream(configuration: geminiRootConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
     }
 
     func testResponsesStreamingTextAndToolCall() async throws {

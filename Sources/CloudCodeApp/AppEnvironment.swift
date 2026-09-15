@@ -792,10 +792,10 @@ public final class CloudCodeViewModel: ObservableObject {
         do {
             let preflight = await appBackedProviderRuntime.preflightStatus(packageID: packageID, requireVerifiedExecution: false)
             appProviderStatusMessages[packageID] = Self.appProviderStatusText(preflight)
-            guard preflight.state == .ready else {
+            guard preflight.state == .ready || preflight.state == .notInstalled else {
                 switch preflight.state {
                 case .notInstalled:
-                    throw AppBackedProviderRuntimeError.notInstalled(package.manifest.bundleID)
+                    break
                 case .needsAuthorization:
                     throw AppBackedProviderRuntimeError.needsAuthorization(package.manifest.displayName)
                 case .needsLogin:
