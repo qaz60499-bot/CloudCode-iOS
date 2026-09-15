@@ -203,6 +203,8 @@ public final class CloudCodeViewModel: ObservableObject {
     #endif
     private var backgroundWindowTask: Task<Void, Never>?
     private var backgroundAssertionWorkerPID: Int32?
+    private var backgroundAssertionAcquireTask: Task<Void, Never>?
+    private var backgroundAssertionAcquireToken: UUID?
     private var didBootstrap = false
     private static let providerKeyMutationOperationKey = "provider-key:mutation"
     private static let manualProviderKeyOverridesDefaultsKey = "provider.key.manualOverrides"
@@ -530,8 +532,18 @@ public final class CloudCodeViewModel: ObservableObject {
     @discardableResult
     public func setAppProviderUseConsent(packageID: String, enabled: Bool) async -> Bool {
         let persisted = await appBackedProviderRuntime.setAuthorized(enabled, packageID: packageID)
-        let snapshot = await appBackedProviderRuntime.preflightStatus(packageID: packageID)
-        appProviderStatusMessages[packageID] = Self.appProviderStatusText(snapshot)
+        let snapshot = await appBackedProviderRuntime.preflightStatus(
+            packageID: packageID,
+            requireVerifiedExecution: enabled ? false : true
+        )
+        if persisted, enabled, snapshot.state == .ready {
+            // Authorization/install/version checks are only local readiness. Do not surface a fake
+            // READY before the harmless marker has completed the full launch -> input -> submit ->
+            // generation -> extraction round trip.
+            appProviderStatusMessages[packageID] = "AUTHORIZED · 阶段=\(snapshot.hostState.rawValue) · 本地授权、安装与版本兼容检查通过；等待端到端 harmless marker 验证后才会标记 READY"
+        } else {
+            appProviderStatusMessages[packageID] = Self.appProviderStatusText(snapshot)
+        }
         if persisted {
             if enabled,
                let package = appProviderPackages.first(where: { $0.id == packageID && $0.enabled }) {
@@ -1952,7 +1964,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 level: .info,
                 subsystem: "app",
                 action: "background.assertion.prearm",
-                result: backgroundAssertionWorkerPID == nil ? "fallback" : "armed",
+                result: backgroundAssertionWorkerPID != nil ? "armed" : (backgroundAssertionAcquireTask != nil ? "acquiring" : "fallback"),
                 metadata: ["runningSessions": String(runningSessionIDs.count)]
             )
         }
@@ -1981,11 +1993,19 @@ public final class CloudCodeViewModel: ObservableObject {
 
     public func refreshAfterForeground() {
         UserDefaults.standard.set(false, forKey: Self.backgroundRunIntentDefaultsKey)
+        // If acquisition is still in flight and no worker has been established yet, the app no
+        // longer needs that background assertion. Cancel the waiter so a late helper failure cannot
+        // create a fallback timer while the app is already foreground again. A detached helper that
+        // finishes after cancellation is stopped by acquireBackgroundAssertionIfNeeded().
+        if backgroundAssertionWorkerPID == nil {
+            backgroundAssertionAcquireTask?.cancel()
+            backgroundAssertionAcquireTask = nil
+            backgroundAssertionAcquireToken = nil
+        }
         // Returning to the foreground ends UIKit's temporary background task, but an active
-        // Agent run must keep its detached privileged assertion worker alive. Stopping that worker
-        // here caused rapid acquire/stop churn whenever cross-app automation bounced through
-        // foreground/background scene transitions. finishSessionRun remains the authoritative
-        // place that tears the privileged worker down after the final active session finishes.
+        // Agent run must keep an already-established detached privileged assertion worker alive.
+        // finishSessionRun remains the authoritative place that tears it down after the final
+        // active session finishes.
         endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: runningSessionIDs.isEmpty)
         Task {
             try? await diagnosticLogStore.log(level: .info, subsystem: "app", action: "foreground", result: "entered", metadata: ["runningSessions": String(runningSessionIDs.count), "lifecycleInterruptedSessions": String(lifecycleInterruptedSessionIDs.count)])
@@ -2012,53 +2032,94 @@ public final class CloudCodeViewModel: ObservableObject {
         }
         #endif
 
-        if let workerPID = backgroundAssertionWorkerPID,
-           !EmbeddedRootHelper.backgroundAssertionIsAlive(workerPID: workerPID) {
-            backgroundAssertionWorkerPID = nil
-            Task {
-                try? await diagnosticLogStore.log(
-                    level: .warning,
-                    subsystem: "app",
-                    action: "background.assertion",
-                    result: "stale-worker",
-                    metadata: ["workerPID": String(workerPID)]
-                )
+        // Scene phase callbacks execute on the main actor and iOS gives them a strict watchdog
+        // budget. Root-helper status/start commands can each block for seconds, so coalesce the
+        // inactive/background callbacks and do every privileged helper call off the main actor.
+        guard backgroundAssertionAcquireTask == nil else { return }
+        let token = UUID()
+        backgroundAssertionAcquireToken = token
+        backgroundAssertionAcquireTask = Task { [weak self] in
+            guard let self else { return }
+            await self.acquireBackgroundAssertionIfNeeded(token: token)
+        }
+    }
+
+    private func acquireBackgroundAssertionIfNeeded(token: UUID) async {
+        defer {
+            if backgroundAssertionAcquireToken == token {
+                backgroundAssertionAcquireTask = nil
+                backgroundAssertionAcquireToken = nil
             }
         }
 
-        if backgroundAssertionWorkerPID == nil {
-            let targetPID = ProcessInfo.processInfo.processIdentifier
-            let assertion = EmbeddedRootHelper.startBackgroundAssertion(targetPID: targetPID)
-            if let workerPID = assertion.workerPID {
-                backgroundAssertionWorkerPID = workerPID
+        if let workerPID = backgroundAssertionWorkerPID {
+            let alive = await Task.detached(priority: .utility) {
+                EmbeddedRootHelper.backgroundAssertionIsAlive(workerPID: workerPID)
+            }.value
+            guard !Task.isCancelled else { return }
+            if alive {
                 backgroundWindowTask?.cancel()
                 backgroundWindowTask = nil
-                let detail = assertion.detail
-                for sessionID in runningSessionIDs {
-                    sessionActivityLines[sessionID, default: []].append("已建立 detached root background assertion worker（PID \(workerPID)），并确认初始 assertion 有效；后台运行仍会以 assertion 实际有效性和 checkpoint 为准，不再仅凭 worker PID 宣称持续运行。")
-                }
-                Task {
-                    try? await diagnosticLogStore.log(
-                        level: .info,
-                        subsystem: "app",
-                        action: "background.assertion",
-                        result: "acquired",
-                        diagnostic: detail,
-                        metadata: ["targetPID": String(targetPID), "workerPID": String(workerPID)]
-                    )
-                }
-            } else {
-                let detail = assertion.detail
-                for sessionID in runningSessionIDs {
-                    sessionActivityLines[sessionID, default: []].append("设备未建立 root background assertion；继续使用 iOS 有界后台时间，并在系统收回后 checkpoint 恢复。\(detail)")
-                }
-                Task {
-                    try? await diagnosticLogStore.log(level: .warning, subsystem: "app", action: "background.assertion", result: "rejected", diagnostic: detail)
-                }
+                return
             }
+            if backgroundAssertionWorkerPID == workerPID {
+                backgroundAssertionWorkerPID = nil
+            }
+            try? await diagnosticLogStore.log(
+                level: .warning,
+                subsystem: "app",
+                action: "background.assertion",
+                result: "stale-worker",
+                metadata: ["workerPID": String(workerPID)]
+            )
         }
 
-        if backgroundAssertionWorkerPID == nil {
+        guard !Task.isCancelled, isRunning, backgroundAssertionWorkerPID == nil else { return }
+        let targetPID = ProcessInfo.processInfo.processIdentifier
+        let assertion = await Task.detached(priority: .utility) {
+            EmbeddedRootHelper.startBackgroundAssertion(targetPID: targetPID)
+        }.value
+
+        guard !Task.isCancelled, isRunning else {
+            if let workerPID = assertion.workerPID {
+                _ = await Task.detached(priority: .utility) {
+                    EmbeddedRootHelper.stopBackgroundAssertion(workerPID: workerPID)
+                }.value
+            }
+            return
+        }
+
+        if let workerPID = assertion.workerPID {
+            if let existingPID = backgroundAssertionWorkerPID, existingPID != workerPID {
+                _ = await Task.detached(priority: .utility) {
+                    EmbeddedRootHelper.stopBackgroundAssertion(workerPID: workerPID)
+                }.value
+                return
+            }
+            backgroundAssertionWorkerPID = workerPID
+            backgroundWindowTask?.cancel()
+            backgroundWindowTask = nil
+            let detail = assertion.detail
+            for sessionID in runningSessionIDs {
+                sessionActivityLines[sessionID, default: []].append("已建立 detached root background assertion worker（PID \(workerPID)），并确认初始 assertion 有效；后台运行仍会以 assertion 实际有效性和 checkpoint 为准，不再仅凭 worker PID 宣称持续运行。")
+            }
+            try? await diagnosticLogStore.log(
+                level: .info,
+                subsystem: "app",
+                action: "background.assertion",
+                result: "acquired",
+                diagnostic: detail,
+                metadata: ["targetPID": String(targetPID), "workerPID": String(workerPID)]
+            )
+        } else {
+            let detail = assertion.detail
+            for sessionID in runningSessionIDs {
+                sessionActivityLines[sessionID, default: []].append("设备未建立 root background assertion；继续使用 iOS 有界后台时间，并在系统收回后 checkpoint 恢复。\(detail)")
+            }
+            try? await diagnosticLogStore.log(level: .warning, subsystem: "app", action: "background.assertion", result: "rejected", diagnostic: detail)
+        }
+
+        if backgroundAssertionWorkerPID == nil, isRunning {
             backgroundWindowTask?.cancel()
             backgroundWindowTask = Task { [weak self] in
                 guard let self else { return }
@@ -2073,7 +2134,7 @@ public final class CloudCodeViewModel: ObservableObject {
         }
 
         #if canImport(UIKit)
-        if backgroundTaskIdentifier == .invalid, backgroundAssertionWorkerPID == nil {
+        if backgroundTaskIdentifier == .invalid, backgroundAssertionWorkerPID == nil, isRunning {
             let message = "系统未授予额外后台执行时间，且 root assertion worker 不可用；当前任务会依赖 checkpoint 安全恢复。"
             for sessionID in runningSessionIDs {
                 sessionActivityLines[sessionID, default: []].append(message)
@@ -2084,22 +2145,36 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private func backgroundExecutionDidExpire() {
-        if let workerPID = backgroundAssertionWorkerPID,
-           EmbeddedRootHelper.backgroundAssertionIsAlive(workerPID: workerPID) {
-            endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: false)
-            let message = "UIApplication 后台宽限已结束，但 detached root assertion worker 仍存活；Agent 保持运行，不执行 task-cancel。"
-            for sessionID in runningSessionIDs {
-                sessionActivityLines[sessionID, default: []].append(message)
-                Task {
-                    try? await diagnosticLogStore.log(level: .info, subsystem: "app", action: "background.assertion.continue", result: "running", sessionID: sessionID, metadata: ["workerPID": String(workerPID)])
-                }
-            }
-            if runningSessionIDs.contains(session.id) { syncVisibleSessionState(session.id) }
+        // Expiration itself is a UIKit lifecycle callback. End the UIKit token immediately and
+        // never spend its watchdog budget waiting for the privileged helper.
+        endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: false)
+
+        guard let workerPID = backgroundAssertionWorkerPID else {
+            backgroundAssertionAcquireTask?.cancel()
+            backgroundAssertionAcquireTask = nil
+            backgroundAssertionAcquireToken = nil
+            interruptActiveRunForBackground(reason: "iOS 已收回后台执行时间，且 detached root assertion worker 尚未建立；当前任务已安全中断并保留检查点，回到前台后自动继续。")
             return
         }
-        backgroundAssertionWorkerPID = nil
-        endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: false)
-        interruptActiveRunForBackground(reason: "iOS 已收回后台执行时间，且 detached root assertion worker 未保持存活；当前任务已安全中断并保留检查点，回到前台后自动继续。")
+
+        Task { [weak self] in
+            guard let self else { return }
+            let alive = await Task.detached(priority: .utility) {
+                EmbeddedRootHelper.backgroundAssertionIsAlive(workerPID: workerPID)
+            }.value
+            guard self.backgroundAssertionWorkerPID == workerPID else { return }
+            if alive {
+                let message = "UIApplication 后台宽限已结束，但 detached root assertion worker 仍存活；Agent 保持运行，不执行 task-cancel。"
+                for sessionID in self.runningSessionIDs {
+                    self.sessionActivityLines[sessionID, default: []].append(message)
+                    try? await self.diagnosticLogStore.log(level: .info, subsystem: "app", action: "background.assertion.continue", result: "running", sessionID: sessionID, metadata: ["workerPID": String(workerPID)])
+                }
+                if self.runningSessionIDs.contains(self.session.id) { self.syncVisibleSessionState(self.session.id) }
+                return
+            }
+            self.backgroundAssertionWorkerPID = nil
+            self.interruptActiveRunForBackground(reason: "iOS 已收回后台执行时间，且 detached root assertion worker 未保持存活；当前任务已安全中断并保留检查点，回到前台后自动继续。")
+        }
     }
 
     private func backgroundContinuationWindowDidElapse() {
@@ -2177,11 +2252,31 @@ public final class CloudCodeViewModel: ObservableObject {
     private func endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: Bool = true) {
         backgroundWindowTask?.cancel()
         backgroundWindowTask = nil
-        if stopPrivilegedAssertion, let workerPID = backgroundAssertionWorkerPID {
-            let outcome = EmbeddedRootHelper.stopBackgroundAssertion(workerPID: workerPID)
+
+        var workerToStop: Int32?
+        if stopPrivilegedAssertion {
+            backgroundAssertionAcquireTask?.cancel()
+            backgroundAssertionAcquireTask = nil
+            backgroundAssertionAcquireToken = nil
+            workerToStop = backgroundAssertionWorkerPID
             backgroundAssertionWorkerPID = nil
-            Task {
-                try? await diagnosticLogStore.log(
+        }
+
+        #if canImport(UIKit)
+        if backgroundTaskIdentifier != .invalid {
+            let identifier = backgroundTaskIdentifier
+            backgroundTaskIdentifier = .invalid
+            UIApplication.shared.endBackgroundTask(identifier)
+        }
+        #endif
+
+        if let workerPID = workerToStop {
+            Task { [weak self] in
+                guard let self else { return }
+                let outcome = await Task.detached(priority: .utility) {
+                    EmbeddedRootHelper.stopBackgroundAssertion(workerPID: workerPID)
+                }.value
+                try? await self.diagnosticLogStore.log(
                     level: outcome.success ? .info : .warning,
                     subsystem: "app",
                     action: "background.assertion.stop",
@@ -2191,12 +2286,6 @@ public final class CloudCodeViewModel: ObservableObject {
                 )
             }
         }
-        #if canImport(UIKit)
-        guard backgroundTaskIdentifier != .invalid else { return }
-        let identifier = backgroundTaskIdentifier
-        backgroundTaskIdentifier = .invalid
-        UIApplication.shared.endBackgroundTask(identifier)
-        #endif
     }
 
     public func createNewSession() {
