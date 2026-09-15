@@ -1183,6 +1183,7 @@ final class ProviderRouterTests: XCTestCase {
 final class ProviderDiscoveryTests: XCTestCase {
     override func tearDown() {
         ProviderDiscoveryURLProtocol.reset()
+        ProviderGeminiDiscoveryURLProtocol.reset()
         super.tearDown()
     }
 
@@ -1209,6 +1210,32 @@ final class ProviderDiscoveryTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
         XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "claude-cli/1.0.120 (external, cli)")
         XCTAssertEqual(request.value(forHTTPHeaderField: "x-app"), "cli")
+    }
+
+    func testGeminiOfficialDiscoveryPrioritizesExplicitModelAndUsesRuntimeCompatibleProbeBody() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProviderGeminiDiscoveryURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let result = try await ProviderDiscoveryClient(session: session).discover(
+            baseURL: URL(string: "https://generativelanguage.googleapis.com")!,
+            apiKey: "test-secret",
+            preferredAuthMode: .bearer,
+            fallbackInferenceCandidates: ["gemini-3.8-flash"],
+            inferenceProtocols: [.openAIChat],
+            allowAlternateAuthModes: false
+        )
+
+        XCTAssertEqual(result.readiness, .ready)
+        XCTAssertEqual(result.authMode, .bearer)
+        XCTAssertEqual(result.protocols, [.openAIChat])
+        XCTAssertEqual(result.models.first, "gemini-3.8-flash")
+        XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.requestCount(), 2, "official Gemini discovery should need one catalog GET and one explicit-model inference probe")
+        let probe = try XCTUnwrap(ProviderGeminiDiscoveryURLProtocol.probeBody())
+        XCTAssertEqual(probe["model"] as? String, "gemini-3.8-flash")
+        XCTAssertEqual(probe["stream"] as? Bool, false)
+        XCTAssertNil(probe["max_tokens"], "Gemini validation must not add a field absent from the real compatible request path")
     }
 
     func testAgentRouterDiscoveryCanRestrictCatalogToPreferredAuthMode() async throws {
@@ -3301,6 +3328,77 @@ private func collectText(_ stream: AsyncThrowingStream<ProviderEvent, Error>) as
         if case .token(let token) = event { text += token }
     }
     return text
+}
+
+private final class ProviderGeminiDiscoveryURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    private static var requestCountValue = 0
+    private static var probeBodyValue: [String: Any]?
+
+    static func reset() {
+        lock.lock()
+        requestCountValue = 0
+        probeBodyValue = nil
+        lock.unlock()
+    }
+
+    static func requestCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestCountValue
+    }
+
+    static func probeBody() -> [String: Any]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return probeBodyValue
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        Self.lock.lock()
+        Self.requestCountValue += 1
+        Self.lock.unlock()
+
+        let status: Int
+        let body: Data
+        if url.path == "/v1beta/openai/models" {
+            let rows = (0..<12).map { "{\"id\":\"catalog-model-\($0)\"}" }.joined(separator: ",")
+            body = Data("{\"data\":[\(rows),{\"id\":\"gemini-3.8-flash\"}]}".utf8)
+            status = 200
+        } else if url.path == "/v1beta/openai/chat/completions" {
+            let raw = request.httpBody ?? Data()
+            let object = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any]
+            Self.lock.lock()
+            Self.probeBodyValue = object
+            Self.lock.unlock()
+            let valid = request.value(forHTTPHeaderField: "Authorization") == "Bearer test-secret"
+                && object?["model"] as? String == "gemini-3.8-flash"
+                && object?["max_tokens"] == nil
+            status = valid ? 200 : 400
+            body = valid
+                ? Data(#"{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}"#.utf8)
+                : Data(#"{"error":{"message":"invalid compatibility probe"}}"#.utf8)
+        } else {
+            status = 404
+            body = Data(#"{"error":{"message":"unsupported path"}}"#.utf8)
+        }
+        guard let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"]) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
 
 private final class ProviderDiscoveryURLProtocol: URLProtocol, @unchecked Sendable {

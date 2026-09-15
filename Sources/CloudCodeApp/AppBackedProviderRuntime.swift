@@ -714,12 +714,24 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
 
     private func requireProviderForeground(package: AppProviderPackage, stage: AppBackedProviderHostState, appVersion: String) async throws {
         let bundleID = package.summary.manifest.bundleID
-        let result = await Task.detached(priority: .utility) {
+        let first = await Task.detached(priority: .utility) {
             EmbeddedRootHelper.verifyFrontmost(bundleID: bundleID)
         }.value
         try Task.checkCancellation()
-        guard result.verified else {
-            let detail = "failure_stage=\(stage.rawValue); \(result.detail)"
+        if first.verified { return }
+
+        // Cross-app activation can briefly move through an intermediate FrontBoard scene even after
+        // the requested bundle reached ForegroundFocal. A single instantaneous miss must not make a
+        // valid Provider round trip bounce back to Cloud Code. Recheck the exact same bundle once
+        // after a short settle window. We never relaunch here and never infer ownership from pixels;
+        // two failed exact-bundle checks still fail closed before any further typing/tapping.
+        try await Self.sleep(seconds: 0.20)
+        let second = await Task.detached(priority: .utility) {
+            EmbeddedRootHelper.verifyFrontmost(bundleID: bundleID)
+        }.value
+        try Task.checkCancellation()
+        guard second.verified else {
+            let detail = "failure_stage=\(stage.rawValue); first=\(first.detail); retry=\(second.detail)"
             try await transition(.classify, state: .degraded, detail: detail, package: package, appVersion: appVersion)
             // A changed foreground after a request begins must not use the initial-launch retry:
             // the prompt may already have been submitted, and repeating it would duplicate work.

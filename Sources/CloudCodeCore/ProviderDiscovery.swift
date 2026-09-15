@@ -202,13 +202,15 @@ public struct ProviderDiscoveryClient: Sendable {
         let models = discoveredCatalog.models
         let protocolsToProbe = Self.uniqueProtocols(inferenceProtocols)
 
-        // Model catalogs from compatible gateways can mix chat, image, embedding,
-        // and legacy entries. Do not assume the first row is inference-compatible.
-        // Probe a bounded prefix under each inference auth mode and only the protocols
-        // this profile actually advertises, keeping validation bounded and fast.
+        // A user-supplied model is stronger inference-routing evidence than catalog order. Official
+        // catalogs can mix chat, image, embedding, and legacy entries, so probing only the first
+        // catalog rows can falsely reject a known-good manually configured model. Keep the work
+        // bounded, but try explicit candidates first and then fill the same 12-model budget from
+        // the live catalog. A candidate is still accepted only after a real inference response.
+        let inferenceCandidates = Array(Self.unique(fallbackInferenceCandidates + models).prefix(12))
         var capacityBlockedAuthMode: ProviderAuthMode?
         for inferenceAuthMode in authModes {
-            for model in models.prefix(12) {
+            for model in inferenceCandidates {
                 var supported: [ProviderProtocol] = []
                 for protocolName in protocolsToProbe {
                     switch try await probe(protocolName, baseURL: baseURL, apiKey: apiKey, authMode: inferenceAuthMode, model: model) {
@@ -417,7 +419,14 @@ public struct ProviderDiscoveryClient: Sendable {
             body = ["model": model, "max_tokens": 1, "stream": false, "messages": [["role": "user", "content": "Reply OK"]]]
         case .openAIChat:
             path = "chat/completions"
-            body = ["model": model, "max_tokens": 1, "stream": false, "messages": [["role": "user", "content": "Reply OK"]]]
+            var chatBody: [String: Any] = ["model": model, "stream": false, "messages": [["role": "user", "content": "Reply OK"]]]
+            // Google's official Gemini OpenAI compatibility endpoint accepts the same minimal body
+            // used by our real OpenAI-compatible runtime. Do not make discovery stricter than the
+            // request path by injecting a legacy max_tokens field only during validation.
+            if baseURL.host?.lowercased() != "generativelanguage.googleapis.com" {
+                chatBody["max_tokens"] = 1
+            }
+            body = chatBody
         case .openAIResponses:
             path = "responses"
             body = ["model": model, "max_output_tokens": 1, "stream": false, "input": "Reply OK"]
