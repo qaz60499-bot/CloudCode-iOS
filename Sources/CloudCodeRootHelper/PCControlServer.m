@@ -13,6 +13,7 @@
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
+#import <sys/file.h>
 #import <sys/socket.h>
 #import <sys/stat.h>
 #import <sys/types.h>
@@ -22,7 +23,7 @@
 
 extern char **environ;
 
-#define CLOUDCODE_PC_CONTROL_PROTOCOL 1
+#define CLOUDCODE_PC_CONTROL_PROTOCOL 2
 #define CLOUDCODE_PC_CONTROL_PORT 47651
 #define CLOUDCODE_PC_CONTROL_TOKEN_BYTES 32
 #define CLOUDCODE_PC_CONTROL_MAX_REQUEST_BYTES (64 * 1024)
@@ -30,6 +31,13 @@ extern char **environ;
 #define CLOUDCODE_PC_CONTROL_INSTALL_TIMEOUT_MS 110000
 
 static NSString * const CloudCodePCControlTokenPath = @"/var/mobile/Media/Downloads/CloudCode-PC-Control.json";
+static NSString * const CloudCodePCControlLockPath = @"/var/mobile/Media/Downloads/CloudCode-PC-Control.lock";
+
+typedef NS_ENUM(NSInteger, CloudCodePCExistingTransport) {
+    CloudCodePCExistingTransportAmbiguous = 0,
+    CloudCodePCExistingTransportResponse = 1,
+    CloudCodePCExistingTransportAbsent = 2,
+};
 
 static double CloudCodePCMonotonicSeconds(void)
 {
@@ -66,20 +74,26 @@ static NSString *CloudCodePCRandomToken(void)
     return token;
 }
 
-static NSDictionary *CloudCodePCReadTokenRecord(void)
+static NSDictionary *CloudCodePCReadTokenRecordRaw(void)
 {
     NSData *data = [NSData dataWithContentsOfFile:CloudCodePCControlTokenPath];
     if (!data.length) { return nil; }
     id object = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
     if (![object isKindOfClass:NSDictionary.class]) { return nil; }
     NSDictionary *record = object;
-    NSNumber *protocol = [record[@"protocol"] isKindOfClass:NSNumber.class] ? record[@"protocol"] : nil;
     NSNumber *port = [record[@"port"] isKindOfClass:NSNumber.class] ? record[@"port"] : nil;
     NSString *token = [record[@"token"] isKindOfClass:NSString.class] ? record[@"token"] : nil;
-    if (protocol.integerValue != CLOUDCODE_PC_CONTROL_PROTOCOL || port.integerValue != CLOUDCODE_PC_CONTROL_PORT || token.length != CLOUDCODE_PC_CONTROL_TOKEN_BYTES * 2) {
+    if (port.integerValue != CLOUDCODE_PC_CONTROL_PORT || token.length != CLOUDCODE_PC_CONTROL_TOKEN_BYTES * 2) {
         return nil;
     }
     return record;
+}
+
+static NSDictionary *CloudCodePCReadTokenRecord(void)
+{
+    NSDictionary *record = CloudCodePCReadTokenRecordRaw();
+    NSNumber *protocol = [record[@"protocol"] isKindOfClass:NSNumber.class] ? record[@"protocol"] : nil;
+    return protocol.integerValue == CLOUDCODE_PC_CONTROL_PROTOCOL ? record : nil;
 }
 
 static BOOL CloudCodePCWriteTokenRecord(NSString *token)
@@ -317,11 +331,12 @@ static NSDictionary *CloudCodePCActionResponse(const char *executablePath, NSDic
     };
 }
 
-static BOOL CloudCodePCPingExisting(NSString *token)
+static NSDictionary *CloudCodePCRequestExisting(NSString *token, NSString *operation, CloudCodePCExistingTransport *transport)
 {
-    if (token.length != CLOUDCODE_PC_CONTROL_TOKEN_BYTES * 2) { return NO; }
+    if (transport) { *transport = CloudCodePCExistingTransportAmbiguous; }
+    if (token.length != CLOUDCODE_PC_CONTROL_TOKEN_BYTES * 2 || !operation.length) { return nil; }
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) { return NO; }
+    if (fd < 0) { return nil; }
 #ifdef SO_NOSIGPIPE
     int one = 1;
     (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
@@ -334,24 +349,77 @@ static BOOL CloudCodePCPingExisting(NSString *token)
     address.sin_port = htons(CLOUDCODE_PC_CONTROL_PORT);
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        int connectError = errno;
         close(fd);
-        return NO;
+        if (transport && connectError == ECONNREFUSED) { *transport = CloudCodePCExistingTransportAbsent; }
+        return nil;
     }
-    NSDictionary *request = @{@"token": token, @"op": @"status"};
+
+    NSDictionary *request = @{@"token": token, @"op": operation};
     NSData *data = [NSJSONSerialization dataWithJSONObject:request options:0 error:nil];
+    if (!data.length) { close(fd); return nil; }
     NSMutableData *line = [data mutableCopy];
     const uint8_t newline = '\n';
     [line appendBytes:&newline length:1];
-    BOOL sent = CloudCodePCWriteAll(fd, line.bytes, line.length);
-    uint8_t responseBytes[4096];
-    ssize_t count = sent ? recv(fd, responseBytes, sizeof(responseBytes), 0) : -1;
+    if (!CloudCodePCWriteAll(fd, line.bytes, line.length)) { close(fd); return nil; }
+
+    NSMutableData *responseData = [NSMutableData data];
+    BOOL completeFrame = NO;
+    uint8_t responseBytes[1024];
+    const double responseDeadline = CloudCodePCMonotonicSeconds() + 1.0;
+    while (responseData.length <= 4096) {
+        double remaining = responseDeadline - CloudCodePCMonotonicSeconds();
+        if (remaining <= 0) { break; }
+        int waitMS = (int)(remaining * 1000.0);
+        if (waitMS < 1) { waitMS = 1; }
+        if (waitMS > 350) { waitMS = 350; }
+        struct pollfd responsePoll = {.fd = fd, .events = POLLIN | POLLHUP, .revents = 0};
+        int pollResult = 0;
+        do {
+            pollResult = poll(&responsePoll, 1, waitMS);
+        } while (pollResult < 0 && errno == EINTR && CloudCodePCMonotonicSeconds() < responseDeadline);
+        if (pollResult <= 0) { break; }
+
+        ssize_t count = recv(fd, responseBytes, sizeof(responseBytes), 0);
+        if (count > 0) {
+            const void *newlineLocation = memchr(responseBytes, '\n', (size_t)count);
+            size_t appendLength = newlineLocation ? (size_t)((const uint8_t *)newlineLocation - responseBytes) : (size_t)count;
+            [responseData appendBytes:responseBytes length:appendLength];
+            if (newlineLocation) { completeFrame = YES; break; }
+            continue;
+        }
+        if (count < 0 && errno == EINTR) { continue; }
+        break;
+    }
     close(fd);
-    if (count <= 0) { return NO; }
-    NSData *responseData = [NSData dataWithBytes:responseBytes length:(NSUInteger)count];
+    if (!completeFrame || !responseData.length) { return nil; }
     id object = [NSJSONSerialization JSONObjectWithData:responseData options:0 error:nil];
-    if (![object isKindOfClass:NSDictionary.class]) { return NO; }
-    NSDictionary *response = object;
-    return [response[@"ok"] boolValue] && [response[@"protocol"] integerValue] == CLOUDCODE_PC_CONTROL_PROTOCOL;
+    if (![object isKindOfClass:NSDictionary.class]) { return nil; }
+    if (transport) { *transport = CloudCodePCExistingTransportResponse; }
+    return object;
+}
+
+static BOOL CloudCodePCShutdownExisting(NSString *token)
+{
+    CloudCodePCExistingTransport transport = CloudCodePCExistingTransportAmbiguous;
+    NSDictionary *response = CloudCodePCRequestExisting(token, @"shutdown", &transport);
+    return transport == CloudCodePCExistingTransportResponse && [response[@"ok"] boolValue];
+}
+
+static int CloudCodePCAcquireServerMigrationLock(void)
+{
+    int fd = open(CloudCodePCControlLockPath.fileSystemRepresentation, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) { return -1; }
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (flock(fd, LOCK_EX) != 0) { close(fd); return -1; }
+    return fd;
+}
+
+static void CloudCodePCReleaseServerMigrationLock(int fd)
+{
+    if (fd < 0) { return; }
+    (void)flock(fd, LOCK_UN);
+    close(fd);
 }
 
 static pid_t CloudCodePCStartBackgroundGuardian(const char *executablePath, pid_t targetPID)
@@ -421,23 +489,77 @@ int CloudCodePCControlServerStart(const char *executablePath)
 {
     if (getuid() != 0 || geteuid() != 0 || !executablePath || !*executablePath) { return 11; }
 
-    NSDictionary *existing = CloudCodePCReadTokenRecord();
+    int migrationLockFD = CloudCodePCAcquireServerMigrationLock();
+    if (migrationLockFD < 0) {
+        fprintf(stderr, "pc-control-server-start: unable to acquire migration lock\n");
+        return 83;
+    }
+
+    NSDictionary *existing = CloudCodePCReadTokenRecordRaw();
     NSString *existingToken = [existing[@"token"] isKindOfClass:NSString.class] ? existing[@"token"] : nil;
-    if (existingToken.length && CloudCodePCPingExisting(existingToken)) {
-        NSDictionary *result = @{@"ok": @YES, @"reused": @YES, @"port": @(CLOUDCODE_PC_CONTROL_PORT)};
-        NSData *json = [NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingSortedKeys error:nil];
-        if (json.length) { fwrite(json.bytes, 1, json.length, stdout); fputc('\n', stdout); }
-        return 0;
+    if (existingToken.length) {
+        CloudCodePCExistingTransport statusTransport = CloudCodePCExistingTransportAmbiguous;
+        NSDictionary *existingStatus = CloudCodePCRequestExisting(existingToken, @"status", &statusTransport);
+        if (statusTransport == CloudCodePCExistingTransportResponse) {
+            BOOL authenticated = [existingStatus[@"ok"] boolValue];
+            NSInteger existingProtocol = [existingStatus[@"protocol"] integerValue];
+            if (authenticated && existingProtocol == CLOUDCODE_PC_CONTROL_PROTOCOL) {
+                NSDictionary *result = @{@"ok": @YES, @"reused": @YES, @"port": @(CLOUDCODE_PC_CONTROL_PORT)};
+                NSData *json = [NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingSortedKeys error:nil];
+                if (json.length) { fwrite(json.bytes, 1, json.length, stdout); fputc('\n', stdout); }
+                CloudCodePCReleaseServerMigrationLock(migrationLockFD);
+                return 0;
+            }
+            if (!authenticated || existingProtocol != 1) {
+                fprintf(stderr, "pc-control-server-start: existing listener did not authenticate as supported legacy protocol\n");
+                CloudCodePCReleaseServerMigrationLock(migrationLockFD);
+                return 83;
+            }
+
+            // Same-version TrollStore coverage installs can leave the detached worker from the
+            // previous helper binary alive. Protocol v2 intentionally invalidates protocol v1.
+            // Only an authenticated v1 status response is eligible for the shutdown migration.
+            if (!CloudCodePCShutdownExisting(existingToken)) {
+                fprintf(stderr, "pc-control-server-start: stale authenticated worker refused shutdown\n");
+                CloudCodePCReleaseServerMigrationLock(migrationLockFD);
+                return 83;
+            }
+            BOOL staleWorkerGone = NO;
+            for (int attempt = 0; attempt < 30; attempt++) {
+                usleep(50000);
+                CloudCodePCExistingTransport probeTransport = CloudCodePCExistingTransportAmbiguous;
+                (void)CloudCodePCRequestExisting(existingToken, @"status", &probeTransport);
+                if (probeTransport == CloudCodePCExistingTransportAbsent) {
+                    staleWorkerGone = YES;
+                    break;
+                }
+            }
+            if (!staleWorkerGone) {
+                fprintf(stderr, "pc-control-server-start: stale authenticated worker kept the control port after shutdown\n");
+                CloudCodePCReleaseServerMigrationLock(migrationLockFD);
+                return 83;
+            }
+        } else if (statusTransport == CloudCodePCExistingTransportAmbiguous) {
+            fprintf(stderr, "pc-control-server-start: existing token present but listener state is ambiguous\n");
+            CloudCodePCReleaseServerMigrationLock(migrationLockFD);
+            return 83;
+        }
+        // CloudCodePCExistingTransportAbsent proves ECONNREFUSED: the token record is stale and can
+        // be removed safely while the migration lock prevents another starter from racing this one.
     }
     (void)unlink(CloudCodePCControlTokenPath.fileSystemRepresentation);
 
     NSString *token = CloudCodePCRandomToken();
     int handshake[2] = {-1, -1};
-    if (pipe(handshake) != 0) { return 78; }
+    if (pipe(handshake) != 0) {
+        CloudCodePCReleaseServerMigrationLock(migrationLockFD);
+        return 78;
+    }
 
     posix_spawn_file_actions_t actions;
     if (posix_spawn_file_actions_init(&actions) != 0) {
         close(handshake[0]); close(handshake[1]);
+        CloudCodePCReleaseServerMigrationLock(migrationLockFD);
         return 78;
     }
     (void)posix_spawn_file_actions_addclose(&actions, handshake[0]);
@@ -460,6 +582,7 @@ int CloudCodePCControlServerStart(const char *executablePath)
     handshake[1] = -1;
     if (spawnResult != 0 || workerPID <= 1) {
         close(handshake[0]);
+        CloudCodePCReleaseServerMigrationLock(migrationLockFD);
         return 78;
     }
 
@@ -478,10 +601,12 @@ int CloudCodePCControlServerStart(const char *executablePath)
         };
         NSData *json = [NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingSortedKeys error:nil];
         if (json.length) { fwrite(json.bytes, 1, json.length, stdout); fputc('\n', stdout); }
+        CloudCodePCReleaseServerMigrationLock(migrationLockFD);
         return 0;
     }
 
     (void)kill(workerPID, SIGKILL);
+    CloudCodePCReleaseServerMigrationLock(migrationLockFD);
     return 79;
 }
 

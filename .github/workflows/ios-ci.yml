@@ -552,6 +552,14 @@ jobs:
           for marker in ('CloudCodePCStartBackgroundGuardian', 'background-assert-worker', 'CloudCodePCStartBackgroundGuardian(executablePath, getpid())', 'signal(SIGHUP, SIG_IGN)', 'setsid()', 'poll(&pollFD, 1, 5000)', 'CloudCodePCStopBackgroundGuardian(guardianPID)'):
               if marker not in pc_control:
                   raise SystemExit(f'FAIL: PC-control server lost detached background-survival guardrail: {marker}')
+          for marker in ('#define CLOUDCODE_PC_CONTROL_PROTOCOL 2', 'CloudCodePCReadTokenRecordRaw', 'CloudCodePCExistingTransportAbsent', 'connectError == ECONNREFUSED', 'memchr(responseBytes', 'completeFrame', 'responseDeadline = CloudCodePCMonotonicSeconds() + 1.0', 'poll(&responsePoll, 1, waitMS)', 'existingProtocol != 1', 'CloudCodePCShutdownExisting(existingToken)', 'CloudCodePCAcquireServerMigrationLock', 'flock(fd, LOCK_EX)', 'FD_CLOEXEC', 'stale authenticated worker refused shutdown', 'stale authenticated worker kept the control port after shutdown'):
+              if marker not in pc_control:
+                  raise SystemExit(f'FAIL: PC-control stale-worker replacement guard missing: {marker}')
+          pc_control_bootstrap = Path('Sources/CloudCodeApp/PCControlBootstrap.swift').read_text(encoding='utf-8')
+          if 'FileManager.default.fileExists(atPath: helperURL.path)' not in pc_control_bootstrap:
+              raise SystemExit('FAIL: PC-control bootstrap no longer accepts TrollStore/System-app helper existence as the bounded spawn preflight')
+          if 'isExecutableFile(atPath: helperURL.path)' in pc_control_bootstrap:
+              raise SystemExit('FAIL: PC-control bootstrap reintroduced Foundation executable-bit gating that false-negatives on TrollStore/System-app installs')
           for marker in ('enumerate-json', 'probe-filesystem-json', 'probe-launch', 'probe-uninstall', 'probe-ipa-install', 'install-ipa', 'trollstorehelper', 'trollstore-install: verified', 'is-installed', 'launch', 'uninstall', 'cleanup-unregistered', 'MCMMetadataIdentifier', 'BundleFilesystem(read-only-discovery)', 'BundlePathForIdentifierFromFilesystem', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-screenshot-file', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-navigate-back', 'gui-type-base64', 'background-assert-worker', 'background-assert-start', 'background-assert-status', 'background-assert-stop', 'BKSProcessAssertion', 'CloudCode.BackgroundAgent'):
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: root helper command missing: {marker}')

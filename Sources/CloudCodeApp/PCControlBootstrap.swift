@@ -22,8 +22,12 @@ enum PCControlBootstrap {
 
         DispatchQueue.global(qos: .utility).async {
             let helperURL = Bundle.main.bundleURL.appendingPathComponent("CloudCodeRootHelper", isDirectory: false)
-            guard FileManager.default.isExecutableFile(atPath: helperURL.path) else {
-                NSLog("[PCControl] embedded root helper missing or not executable")
+            // TrollStore/System-app installs can report the embedded helper as non-executable to
+            // Foundation even though the privileged spawn bridge can execute that exact bundle
+            // binary. Treat existence as the cheap preflight and let the bounded spawn result be
+            // authoritative for executability/privilege failures.
+            guard FileManager.default.fileExists(atPath: helperURL.path) else {
+                NSLog("[PCControl] embedded root helper missing")
                 return
             }
 
