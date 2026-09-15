@@ -226,6 +226,27 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
 
     func status(packageID: String) -> StatusSnapshot? { lastSnapshots[packageID] }
 
+    private static let runtimeUnverifiedAppVersion = "runtime-unverified"
+
+    private static func runtimeFallbackIntrospection(for package: AppProviderPackage) -> AppStaticIntrospection {
+        AppStaticIntrospection(
+            bundleID: package.summary.manifest.bundleID,
+            displayName: package.summary.manifest.displayName,
+            version: runtimeUnverifiedAppVersion,
+            build: "",
+            bundlePath: "",
+            dataContainerPath: "",
+            executable: "",
+            urlSchemes: package.summary.manifest.launchSchemes,
+            documentTypes: [],
+            utTypes: [],
+            extensions: [],
+            frameworks: [],
+            appGroups: [],
+            localData: [:]
+        )
+    }
+
     private func installationProbe(bundleID: String) async -> InstallationProbe {
         if let introspection = await appResolver.appIntrospection(bundleID: bundleID) {
             return .installed(introspection)
@@ -253,34 +274,27 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         }
         let installation = await installationProbe(bundleID: package.summary.manifest.bundleID)
         let introspection: AppStaticIntrospection
+        let discoveryDetail: String?
         switch installation {
         case .installed(let value):
             introspection = value
+            discoveryDetail = nil
         case .notInstalled(let detail):
-            return StatusSnapshot(
-                state: .notInstalled,
-                hostState: .checkInstalled,
-                detail: "未检测到目标 App：\(package.summary.manifest.bundleID)。\(detail)",
-                appVersion: nil,
-                responseExtractionRoute: nil,
-                generationLatencyMS: nil
-            )
+            // iOS 16.6 TrollStore/root LaunchServices can report a false negative. Keep the read-only
+            // status as diagnostic evidence, but do not hard-block an explicit provider self-test;
+            // the exact launch + frontmost verification in run() is the authoritative runtime proof.
+            introspection = Self.runtimeFallbackIntrospection(for: package)
+            discoveryDetail = "静态安装索引返回未安装，但该结果在当前 TrollStore persona 上不是权威证据。\(detail)"
         case .metadataUnavailable(let detail):
-            return StatusSnapshot(
-                state: .degraded,
-                hostState: .checkInstalled,
-                detail: detail,
-                appVersion: nil,
-                responseExtractionRoute: nil,
-                generationLatencyMS: nil
-            )
+            introspection = Self.runtimeFallbackIntrospection(for: package)
+            discoveryDetail = detail
         }
         guard await ensureAuthorization(for: package) else {
             return StatusSnapshot(
                 state: .needsAuthorization,
                 hostState: .checkAuthorization,
-                detail: "目标 App 已安装，但尚未授权 Cloud Code 使用该 Provider Package",
-                appVersion: introspection.version,
+                detail: discoveryDetail.map { "尚未授权 Cloud Code 使用该 Provider Package；静态发现信息：\($0)" } ?? "目标 App metadata 已读取，但尚未授权 Cloud Code 使用该 Provider Package",
+                appVersion: introspection.version == Self.runtimeUnverifiedAppVersion ? nil : introspection.version,
                 responseExtractionRoute: nil,
                 generationLatencyMS: nil
             )
@@ -299,8 +313,8 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             return StatusSnapshot(
                 state: .ready,
                 hostState: .checkCompatibility,
-                detail: "本地使用授权、安装状态与版本兼容检查通过；允许开始端到端 harmless marker 验证",
-                appVersion: introspection.version,
+                detail: discoveryDetail.map { "本地授权已通过；静态发现暂不可靠（\($0)），允许进入精确 Bundle 启动 + 前台验证的 harmless marker 测试。" } ?? "本地使用授权、安装状态与版本兼容检查通过；允许开始端到端 harmless marker 验证",
+                appVersion: introspection.version == Self.runtimeUnverifiedAppVersion ? nil : introspection.version,
                 responseExtractionRoute: nil,
                 generationLatencyMS: nil
             )
@@ -327,10 +341,8 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         switch await installationProbe(bundleID: package.summary.manifest.bundleID) {
         case .installed(let value):
             introspection = value
-        case .notInstalled:
-            throw AppBackedProviderRuntimeError.notInstalled(package.summary.manifest.bundleID)
-        case .metadataUnavailable(let detail):
-            throw AppBackedProviderRuntimeError.introspectionUnavailable(detail)
+        case .notInstalled(_), .metadataUnavailable(_):
+            introspection = Self.runtimeFallbackIntrospection(for: package)
         }
         let launch = try await gui.openApp(bundleID: package.summary.manifest.bundleID)
         guard launch.accepted, launch.foregroundVerified else {
@@ -455,16 +467,19 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             throw AppBackedProviderRuntimeError.needsAuthorization("Provider Package 已停用")
         }
         try await transition(.checkInstalled, state: .busy, detail: "检查目标 App 安装状态", package: package)
+        let installation = await installationProbe(bundleID: package.summary.manifest.bundleID)
         let introspection: AppStaticIntrospection
-        switch await installationProbe(bundleID: package.summary.manifest.bundleID) {
+        let discoveryDetail: String?
+        switch installation {
         case .installed(let value):
             introspection = value
+            discoveryDetail = nil
         case .notInstalled(let detail):
-            try await transition(.classify, state: .notInstalled, detail: detail, package: package)
-            throw AppBackedProviderRuntimeError.notInstalled(package.summary.manifest.bundleID)
+            introspection = Self.runtimeFallbackIntrospection(for: package)
+            discoveryDetail = "静态安装索引返回未安装；将以精确启动 + 前台 Bundle 验证作为最终证据。\(detail)"
         case .metadataUnavailable(let detail):
-            try await transition(.classify, state: .degraded, detail: detail, package: package)
-            throw AppBackedProviderRuntimeError.introspectionUnavailable(detail)
+            introspection = Self.runtimeFallbackIntrospection(for: package)
+            discoveryDetail = detail
         }
 
         try await transition(.checkAuthorization, state: .busy, detail: "检查 Cloud Code Provider 授权", package: package, appVersion: introspection.version)
@@ -473,7 +488,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             throw AppBackedProviderRuntimeError.needsAuthorization(package.summary.manifest.displayName)
         }
 
-        try await transition(.checkCompatibility, state: .busy, detail: "检查 App 版本与 selector revision", package: package, appVersion: introspection.version)
+        try await transition(.checkCompatibility, state: .busy, detail: discoveryDetail.map { "静态 metadata 暂不可靠；跳过版本硬门禁并转入精确启动验证。\($0)" } ?? "检查 App 版本与 selector revision", package: package, appVersion: introspection.version)
         if !Self.versionCompatible(introspection.version, compatibility: package.summary.manifest.compatibility) {
             try await transition(.classify, state: .needsPluginUpdate, detail: "当前 App 版本 \(introspection.version) 超出 Provider Package 声明兼容范围", package: package, appVersion: introspection.version)
             throw AppBackedProviderRuntimeError.pluginUpdateRequired(introspection.version)
@@ -481,7 +496,18 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
 
         try await transition(.launchApp, state: .busy, detail: "启动 \(package.summary.manifest.displayName)", package: package, appVersion: introspection.version)
         try Task.checkCancellation()
-        let launch = try await gui.openApp(bundleID: package.summary.manifest.bundleID)
+        let launch: GUIOpenAppOutcome
+        do {
+            launch = try await gui.openApp(bundleID: package.summary.manifest.bundleID)
+        } catch {
+            let detail = "精确 Bundle 启动失败：\(String(describing: error))"
+            if case .notInstalled(_) = installation {
+                try await transition(.classify, state: .notInstalled, detail: detail, package: package, appVersion: introspection.version)
+                throw AppBackedProviderRuntimeError.notInstalled(package.summary.manifest.bundleID)
+            }
+            try await transition(.classify, state: .degraded, detail: detail, package: package, appVersion: introspection.version)
+            throw AppBackedProviderRuntimeError.foregroundVerificationFailed(detail)
+        }
         guard launch.accepted, launch.foregroundVerified else {
             try await transition(.classify, state: .degraded, detail: launch.detail, package: package, appVersion: introspection.version)
             throw AppBackedProviderRuntimeError.foregroundVerificationFailed(launch.detail)
@@ -1236,6 +1262,9 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
     }
 
     private static func versionCompatible(_ version: String, compatibility: AppProviderCompatibility) -> Bool {
+        // Unknown static metadata must never enable an exact-version coordinate selector, but it also
+        // must not prevent the runtime from reaching the stronger launch/frontmost verification path.
+        if version == runtimeUnverifiedAppVersion { return true }
         if let min = compatibility.minimumAppVersion, compareVersion(version, min) == .orderedAscending { return false }
         if let max = compatibility.maximumAppVersion, compareVersion(version, max) == .orderedDescending { return false }
         return true

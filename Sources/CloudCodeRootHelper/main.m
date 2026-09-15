@@ -605,8 +605,15 @@ static int LaunchApplication(NSString *bundleID)
     if (!workspace) { CloudCodeExitOneShot(23); }
     BOOL known = NO;
     BOOL installed = ApplicationIsInstalled(workspace, bundleID, &known);
-    if (!known) { CloudCodeExitOneShot(43); }
-    if (!installed) { CloudCodeExitOneShot(47); }
+    if (known && !installed) {
+        // On the iOS 16.6 TrollStore/root persona this API can return a false negative for an
+        // actually installed App. Do not turn that hint into a launch gate: the bounded launch
+        // below is itself exact to one Bundle ID and success still requires that same Bundle ID to
+        // become the verified frontmost application.
+        fprintf(stderr, "launch: applicationIsInstalled returned false; continuing with exact launch verification\n");
+    } else if (!known) {
+        fprintf(stderr, "launch: installation state unavailable; continuing with exact launch verification\n");
+    }
 
     if ([[FrontmostApplicationBundleID() lowercaseString] isEqualToString:bundleID.lowercaseString]) {
         fprintf(stderr, "launch: target already foreground route=springboard-frontmost\n");
