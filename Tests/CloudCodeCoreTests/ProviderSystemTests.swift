@@ -1259,6 +1259,18 @@ final class ProviderDiscoveryTests: XCTestCase {
         XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.probeBody()?["model"] as? String, "gemini-3.8-flash")
     }
 
+    func testGeminiInferenceCandidateRankingPullsChatModelIntoBoundedProbeWindow() {
+        let specialized = (0..<12).map { "text-embedding-\($0)" }
+        let candidates = ProviderDiscoveryClient.inferenceCandidates(
+            fallbackInferenceCandidates: [],
+            catalogModels: specialized + ["gemini-3.8-flash"],
+            baseURL: URL(string: "https://generativelanguage.googleapis.com")!,
+            limit: 12
+        )
+        XCTAssertEqual(candidates.first, "gemini-3.8-flash")
+        XCTAssertEqual(candidates.count, 12)
+    }
+
     func testInferenceCandidateRankingDoesNotReorderOrdinaryCompatibleProviderCatalog() {
         let candidates = ProviderDiscoveryClient.inferenceCandidates(
             fallbackInferenceCandidates: [],
@@ -3404,8 +3416,21 @@ private final class ProviderGeminiDiscoveryURLProtocol: URLProtocol, @unchecked 
             body = Data("{\"data\":[\(rows),{\"id\":\"gemini-3.8-flash\"}]}".utf8)
             status = 200
         } else if url.path == "/v1beta/openai/chat/completions" {
-            let raw = request.httpBody ?? Data()
-            let object = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any]
+            var raw = request.httpBody
+            if raw == nil, let stream = request.httpBodyStream {
+                stream.open()
+                defer { stream.close() }
+                var data = Data()
+                let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+                defer { buffer.deallocate() }
+                while true {
+                    let count = stream.read(buffer, maxLength: 4096)
+                    if count <= 0 { break }
+                    data.append(buffer, count: count)
+                }
+                raw = data
+            }
+            let object = raw.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             Self.lock.lock()
             Self.probeBodyValue = object
             Self.lock.unlock()
