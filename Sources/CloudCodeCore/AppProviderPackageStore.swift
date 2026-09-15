@@ -1168,25 +1168,44 @@ public actor AppProviderPackageStore {
             errorIndicators: [text("抱歉，无法连接到服务器")]
         )
         let deepseek = AppProviderPackageManifest(
-            revision: "first-party-3",
+            revision: "first-party-4",
             id: "ai.deepseek.app",
             displayName: "DeepSeek App",
             bundleID: "com.deepseek.chat",
             launchSchemes: ["deepseek", "dpsk"],
             declaredCapabilities: capabilities,
-            compatibility: .init(testedAppVersion: "2.5.1", selectorRevision: "3"),
+            compatibility: .init(testedAppVersion: "2.5.1", selectorRevision: "4"),
             responseExtractors: extractors
         )
         let deepseekSelectors = AppProviderSelectorSet(
             composer: [label("发消息或按住说话"), text("发消息或按住说话"), label("发消息"), text("发消息"), label("给 DeepSeek 发消息"), text("给 DeepSeek 发消息"), text("Message DeepSeek"), text("Ask DeepSeek")],
-            send: [label("发送"), text("发送"), text("Send")],
+            send: [
+                label("发送"), text("发送"), text("Send"),
+                .init(
+                    strategy: .coordinateFallback,
+                    coordinate: .init(
+                        x: 353, y: 727,
+                        deviceClass: "iPhone", orientation: "portrait",
+                        appVersion: "2.5.1", screenWidth: 393, screenHeight: 852
+                    ),
+                    minimumConfidence: 0.5
+                )
+            ],
             newConversation: [label("新建对话"), text("新建对话"), text("New chat")],
             generationStart: [text("停止生成"), text("停止"), text("Stop")],
-            generationComplete: [text("复制"), text("Copy")],
+            // DeepSeek 2.5.1 exposes the completed-answer actions primarily as glyph buttons.
+            // Production AX remains quarantined, so requiring OCR-visible "复制/Copy" would turn a
+            // successful generation into a deterministic timeout. The runtime still requires a
+            // changed post-send frame followed by a bounded stable window before extraction.
+            generationComplete: [],
             response: [.init(strategy: .axRole, role: "StaticText", minimumConfidence: 0.8)],
             copyButton: [text("复制"), text("Copy")],
             readyIndicators: [text("发消息或按住说话"), text("发消息"), text("DeepSeek"), text("发送消息"), text("Message")],
-            needsLoginIndicators: [text("登录"), text("Sign in")]
+            needsLoginIndicators: [text("登录"), text("Sign in")],
+            errorIndicators: [
+                text("服务器繁忙"), text("网络连接失败"), text("请求失败"),
+                text("出了点问题"), text("Something went wrong")
+            ]
         )
         let chatgpt = AppProviderPackageManifest(
             revision: "first-party-3",

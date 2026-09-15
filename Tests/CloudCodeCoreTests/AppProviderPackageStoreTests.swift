@@ -39,7 +39,7 @@ final class AppProviderPackageStoreTests: XCTestCase {
         let store = AppProviderPackageStore(rootURL: root)
         try await store.seedFirstPartyIfMissing()
         let before = try await store.package(id: "ai.deepseek.app")
-        XCTAssertEqual(before.summary.manifest.revision, "first-party-3")
+        XCTAssertEqual(before.summary.manifest.revision, "first-party-4")
 
         let staleSelectors = AppProviderSelectorSet(
             composer: [.init(strategy: .visibleText, value: "STALE COMPOSER", minimumConfidence: 0.8)],
@@ -54,8 +54,8 @@ final class AppProviderPackageStoreTests: XCTestCase {
 
         try await store.seedFirstPartyIfMissing()
         let after = try await store.package(id: "ai.deepseek.app")
-        XCTAssertEqual(after.summary.manifest.revision, "first-party-3")
-        XCTAssertEqual(after.summary.manifest.compatibility.selectorRevision, "3")
+        XCTAssertEqual(after.summary.manifest.revision, "first-party-4")
+        XCTAssertEqual(after.summary.manifest.compatibility.selectorRevision, "4")
         XCTAssertNotEqual(after.selectors, staleSelectors)
         XCTAssertFalse(after.summary.enabled)
     }
@@ -74,6 +74,14 @@ final class AppProviderPackageStoreTests: XCTestCase {
         XCTAssertTrue(gemini.selectors.errorIndicators.contains { $0.value == "抱歉，无法连接到服务器" })
         XCTAssertTrue(deepseek.selectors.composer.contains { $0.value == "发消息或按住说话" })
         XCTAssertTrue(deepseek.selectors.readyIndicators.contains { $0.value == "发消息或按住说话" })
+        XCTAssertTrue(deepseek.selectors.generationComplete.isEmpty)
+        XCTAssertTrue(deepseek.selectors.send.contains { selector in
+            selector.strategy == .coordinateFallback
+                && selector.coordinate?.appVersion == "2.5.1"
+                && selector.coordinate?.screenWidth == 393
+                && selector.coordinate?.screenHeight == 852
+        })
+        XCTAssertTrue(deepseek.selectors.errorIndicators.contains { $0.value == "服务器繁忙" })
     }
 
     func testCustomTemplateCanBeCreatedBeforeGuidedSelectorLearning() async throws {
