@@ -1,0 +1,135 @@
+name: Temporary Build138 Secure Delivery Release
+
+on:
+  push:
+    branches:
+      - 'delivery/build138-secure-e03bc50-*'
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  deliver-build138:
+    runs-on: macos-15
+    timeout-minutes: 12
+    env:
+      SOURCE_RUN_ID: '35076117783'
+      EXPECTED_HEAD: 'e03bc5033b68f7c5359d97b0ff165c3fe0b5eb53'
+      EXPECTED_BUILD: '138'
+      DELIVERY_PUBLIC_KEY_B64: 'LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUlJQklqQU5CZ2txaGtpRzl3MEJBUUVGQUFPQ0FROEFNSUlCQ2dLQ0FRRUFwTnp6Ui8yb3F0c0FWeTh6MVJPOQphRzVmQW9GOFJSenZhb3RWT0l4NEVJSlhnNzA5WFZwNFpNMnJnVUFSbHhjblY2M3dzdytTTWFRSUZPNUE5RldYCldDK3NXcGcyRHY0aFhrRkFtZlp6RVBnQ1Z2bUVuUXh6L1RNMEhmbldCTHQ0WUpMZitNNk53RjZhRWNFY3dxRVkKeVpiYzJCa0Q5NDFaVmZQUjhKRjBsT29scUpwQjR0T25vMkJaMENGaDZuYlplajB1WUxrMUpJVjE0Uk9pdjdWVgpIbW8vZll5MlhXbnVXSWtEN3VNc09aVlpnTmVvTGt3WEJRa0VlT25jbXUvcUphQUVkbXZweWlWV1pnaHRHY2Z1CmxtNnZKeGpyclRWUS9QNWhBM2tFZ0p1V1Urc3BvbzJhZk5KOVozbG9mS1ptSm9ISXcwS0V0T21PNzc3bW4zM3gKNHdJREFRQUIKLS0tLS1FTkQgUFVCTElDIEtFWS0tLS0tCg=='
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate exact privileged source run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RUN_JSON="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json status,conclusion,headSha,name)"
+          python3 - "$RUN_JSON" "$EXPECTED_HEAD" <<'PY'
+          import json, sys
+          run = json.loads(sys.argv[1])
+          expected = sys.argv[2]
+          assert run.get('status') == 'completed', run
+          assert run.get('conclusion') == 'success', run
+          assert run.get('name') == 'Private TrollStore Privileged Validation IPA', run
+          assert run.get('headSha') == expected, (run.get('headSha'), expected)
+          print('PASS: exact privileged Build138 source run validated')
+          PY
+
+      - name: Download and decrypt source only inside runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD: ${{ secrets.CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD"
+          mkdir -p "$RUNNER_TEMP/source" "$RUNNER_TEMP/plain" "$RUNNER_TEMP/delivery"
+          gh run download "$SOURCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name CloudCode-iOS-TrollStore-PRIVILEGED-private-encrypted \
+            --dir "$RUNNER_TEMP/source"
+          SOURCE_ENC="$(find "$RUNNER_TEMP/source" -maxdepth 1 -type f -name 'CloudCode-iOS-TrollStore-PRIVILEGED-*.ipa.enc' -print -quit)"
+          test -n "$SOURCE_ENC"
+          IPA_NAME="$(basename "$SOURCE_ENC" .enc)"
+          IPA="$RUNNER_TEMP/plain/$IPA_NAME"
+          openssl enc -d -aes-256-cbc -pbkdf2 \
+            -in "$SOURCE_ENC" -out "$IPA" \
+            -pass env:CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD
+          test -s "$IPA"
+          unzip -tq "$IPA" >/dev/null
+          unzip -p "$IPA" Payload/CloudCode.app/Info.plist > "$RUNNER_TEMP/Info.plist"
+          plutil -lint "$RUNNER_TEMP/Info.plist" >/dev/null
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$RUNNER_TEMP/Info.plist")"
+          BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$RUNNER_TEMP/Info.plist")"
+          BUNDLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$RUNNER_TEMP/Info.plist")"
+          test "$BUILD" = "$EXPECTED_BUILD"
+          test "$BUNDLE" = 'com.cloudcode.ios'
+          unzip -l "$IPA" | grep -F 'Payload/CloudCode.app/CloudCodeRootHelper' >/dev/null
+          unzip -l "$IPA" | grep -F 'Payload/CloudCode.app/CloudCodeVisionHelper' >/dev/null
+          unzip -l "$IPA" | grep -F 'Payload/CloudCode.app/CloudCode-Provider-Bootstrap.json' >/dev/null
+          printf '%s' "$IPA" > "$RUNNER_TEMP/plain-ipa-path.txt"
+          printf '%s' "$IPA_NAME" > "$RUNNER_TEMP/ipa-name.txt"
+          printf '%s' "$VERSION" > "$RUNNER_TEMP/version.txt"
+          printf '%s' "$BUILD" > "$RUNNER_TEMP/build.txt"
+          echo 'PASS: plaintext Build138 verified only inside runner'
+
+      - name: Re-encrypt for local RSA recipient
+        run: |
+          set -euo pipefail
+          IPA="$(cat "$RUNNER_TEMP/plain-ipa-path.txt")"
+          IPA_NAME="$(cat "$RUNNER_TEMP/ipa-name.txt")"
+          OUT="$RUNNER_TEMP/delivery"
+          PUB="$RUNNER_TEMP/delivery-public.pem"
+          KEYTXT="$RUNNER_TEMP/delivery-key.txt"
+          printf '%s' "$DELIVERY_PUBLIC_KEY_B64" | base64 --decode > "$PUB"
+          openssl pkey -pubin -in "$PUB" -noout
+          KEY_HEX="$(openssl rand -hex 32)"
+          IV_HEX="$(openssl rand -hex 16)"
+          printf '%s:%s' "$KEY_HEX" "$IV_HEX" > "$KEYTXT"
+          openssl enc -aes-256-cbc -K "$KEY_HEX" -iv "$IV_HEX" \
+            -in "$IPA" -out "$OUT/$IPA_NAME.delivery.enc"
+          openssl pkeyutl -encrypt -pubin -inkey "$PUB" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -in "$KEYTXT" -out "$OUT/$IPA_NAME.key.enc"
+          SHA="$(shasum -a 256 "$IPA" | awk '{print $1}')"
+          SIZE="$(stat -f '%z' "$IPA")"
+          VERSION="$(cat "$RUNNER_TEMP/version.txt")"
+          BUILD="$(cat "$RUNNER_TEMP/build.txt")"
+          cat > "$OUT/$IPA_NAME.metadata.txt" <<EOF
+          source_run_id=$SOURCE_RUN_ID
+          source_head=$EXPECTED_HEAD
+          version=$VERSION
+          build=$BUILD
+          ipa_name=$IPA_NAME
+          sha256=$SHA
+          size_bytes=$SIZE
+          EOF
+          rm -f "$KEYTXT" "$PUB" "$IPA" "$RUNNER_TEMP/Info.plist"
+          rm -rf "$RUNNER_TEMP/source"
+          test ! -e "$IPA"
+          test -s "$OUT/$IPA_NAME.delivery.enc"
+          test -s "$OUT/$IPA_NAME.key.enc"
+          test -s "$OUT/$IPA_NAME.metadata.txt"
+          if find "$OUT" -maxdepth 1 -type f -name '*.ipa' -print | grep -q .; then
+            echo 'FAIL: plaintext IPA in delivery output' >&2
+            exit 1
+          fi
+          echo 'PASS: delivery bundle contains encrypted assets only'
+
+      - name: Publish temporary encrypted release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="cloudcode-secure-delivery-build138-${GITHUB_RUN_ID}"
+          OUT="$RUNNER_TEMP/delivery"
+          gh release create "$TAG" "$OUT"/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Cloud Code Build138 secure delivery ${GITHUB_RUN_ID}" \
+            --notes "Temporary encrypted delivery bundle for verified privileged source run ${SOURCE_RUN_ID}. No plaintext IPA or provider credential is included."
+          echo "DELIVERY_TAG=$TAG"
