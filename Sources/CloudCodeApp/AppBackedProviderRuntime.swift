@@ -1167,7 +1167,23 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
     }
 
     private static func selectorKey(_ selector: AppProviderSelector) -> String {
-        [selector.strategy.rawValue, selector.value ?? "", selector.role ?? "", selector.relation ?? ""].joined(separator: "|")
+        var components = [selector.strategy.rawValue, selector.value ?? "", selector.role ?? "", selector.relation ?? ""]
+        if selector.strategy == .coordinateFallback, let coordinate = selector.coordinate {
+            // A coordinate fallback is only valid for one exact App/device geometry. Keep its
+            // reliability history isolated as well: composer/send coordinates (and old screen
+            // geometries) must never poison a newly maintained fallback that happens to use the
+            // same strategy name.
+            components.append(contentsOf: [
+                coordinate.deviceClass.lowercased(),
+                coordinate.orientation.lowercased(),
+                coordinate.appVersion,
+                String(coordinate.screenWidth),
+                String(coordinate.screenHeight),
+                String(coordinate.x),
+                String(coordinate.y)
+            ])
+        }
+        return components.joined(separator: "|")
     }
 
     private static func versionCompatible(_ version: String, compatibility: AppProviderCompatibility) -> Bool {

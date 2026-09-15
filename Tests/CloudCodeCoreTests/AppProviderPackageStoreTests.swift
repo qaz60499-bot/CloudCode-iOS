@@ -12,6 +12,8 @@ final class AppProviderPackageStoreTests: XCTestCase {
 
         XCTAssertEqual(Set(packages.map(\.id)), Set(["ai.gemini.app", "ai.deepseek.app", "ai.chatgpt.app", "ai.chatgpt.webcompat.app"]))
         XCTAssertEqual(packages.first(where: { $0.id == "ai.gemini.app" })?.manifest.bundleID, "com.google.gemini")
+        XCTAssertEqual(packages.first(where: { $0.id == "ai.gemini.app" })?.manifest.revision, "first-party-4")
+        XCTAssertEqual(packages.first(where: { $0.id == "ai.deepseek.app" })?.manifest.revision, "first-party-5")
         XCTAssertEqual(packages.first(where: { $0.id == "ai.deepseek.app" })?.manifest.compatibility.testedAppVersion, "2.5.1")
         XCTAssertEqual(packages.first(where: { $0.id == "ai.chatgpt.app" })?.manifest.compatibility.testedAppVersion, "1.2024.348")
         XCTAssertEqual(packages.first(where: { $0.id == "ai.chatgpt.webcompat.app" })?.manifest.bundleID, "com.cloudcode.chatgptwebcompat")
@@ -39,7 +41,7 @@ final class AppProviderPackageStoreTests: XCTestCase {
         let store = AppProviderPackageStore(rootURL: root)
         try await store.seedFirstPartyIfMissing()
         let before = try await store.package(id: "ai.deepseek.app")
-        XCTAssertEqual(before.summary.manifest.revision, "first-party-4")
+        XCTAssertEqual(before.summary.manifest.revision, "first-party-5")
 
         let staleSelectors = AppProviderSelectorSet(
             composer: [.init(strategy: .visibleText, value: "STALE COMPOSER", minimumConfidence: 0.8)],
@@ -54,8 +56,8 @@ final class AppProviderPackageStoreTests: XCTestCase {
 
         try await store.seedFirstPartyIfMissing()
         let after = try await store.package(id: "ai.deepseek.app")
-        XCTAssertEqual(after.summary.manifest.revision, "first-party-4")
-        XCTAssertEqual(after.summary.manifest.compatibility.selectorRevision, "4")
+        XCTAssertEqual(after.summary.manifest.revision, "first-party-5")
+        XCTAssertEqual(after.summary.manifest.compatibility.selectorRevision, "5")
         XCTAssertNotEqual(after.selectors, staleSelectors)
         XCTAssertFalse(after.summary.enabled)
     }
@@ -72,7 +74,31 @@ final class AppProviderPackageStoreTests: XCTestCase {
         XCTAssertTrue(gemini.selectors.composer.contains { $0.value == "问 Gemini" })
         XCTAssertTrue(gemini.selectors.readyIndicators.contains { $0.value == "问 Gemini" })
         XCTAssertTrue(gemini.selectors.errorIndicators.contains { $0.value == "抱歉，无法连接到服务器" })
+        XCTAssertTrue(gemini.selectors.composer.contains { selector in
+            selector.strategy == .coordinateFallback
+                && selector.coordinate?.appVersion == "1.2026.1870010"
+                && selector.coordinate?.screenWidth == 390
+                && selector.coordinate?.screenHeight == 844
+                && selector.coordinate?.x == 150
+                && selector.coordinate?.y == 757
+        })
+        XCTAssertTrue(gemini.selectors.send.contains { selector in
+            selector.strategy == .coordinateFallback
+                && selector.coordinate?.appVersion == "1.2026.1870010"
+                && selector.coordinate?.screenWidth == 390
+                && selector.coordinate?.screenHeight == 844
+                && selector.coordinate?.x == 345
+                && selector.coordinate?.y == 460
+        })
         XCTAssertTrue(deepseek.selectors.composer.contains { $0.value == "发消息或按住说话" })
+        XCTAssertTrue(deepseek.selectors.composer.contains { selector in
+            selector.strategy == .coordinateFallback
+                && selector.coordinate?.appVersion == "2.5.1"
+                && selector.coordinate?.screenWidth == 390
+                && selector.coordinate?.screenHeight == 844
+                && selector.coordinate?.x == 130
+                && selector.coordinate?.y == 727
+        })
         XCTAssertTrue(deepseek.selectors.readyIndicators.contains { $0.value == "发消息或按住说话" })
         XCTAssertTrue(deepseek.selectors.generationComplete.isEmpty)
         XCTAssertTrue(deepseek.selectors.send.contains { selector in

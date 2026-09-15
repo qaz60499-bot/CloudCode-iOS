@@ -1146,18 +1146,40 @@ public actor AppProviderPackageStore {
             AppProviderResponseExtractor(kind: .ocrRegion, region: .init(x: 0.04, y: 0.08, width: 0.92, height: 0.72), minimumCharacters: 2)
         ]
         let gemini = AppProviderPackageManifest(
-            revision: "first-party-3",
+            revision: "first-party-4",
             id: "ai.gemini.app",
             displayName: "Gemini App",
             bundleID: "com.google.gemini",
             launchSchemes: ["googlegemini", "comgooglegemini"],
             declaredCapabilities: capabilities,
-            compatibility: .init(testedAppVersion: "1.2026.1870010", selectorRevision: "3"),
+            compatibility: .init(testedAppVersion: "1.2026.1870010", selectorRevision: "4"),
             responseExtractors: extractors
         )
         let geminiSelectors = AppProviderSelectorSet(
-            composer: [label("问 Gemini"), text("问 Gemini"), label("问问 Gemini"), text("问问 Gemini"), text("Ask Gemini")],
-            send: [label("发送"), text("发送"), text("Send")],
+            composer: [
+                label("问 Gemini"), text("问 Gemini"), label("问问 Gemini"), text("问问 Gemini"), text("Ask Gemini"),
+                .init(
+                    strategy: .coordinateFallback,
+                    coordinate: .init(
+                        x: 150, y: 757,
+                        deviceClass: "iPhone", orientation: "portrait",
+                        appVersion: "1.2026.1870010", screenWidth: 390, screenHeight: 844
+                    ),
+                    minimumConfidence: 0.5
+                )
+            ],
+            send: [
+                label("发送"), text("发送"), text("Send"),
+                .init(
+                    strategy: .coordinateFallback,
+                    coordinate: .init(
+                        x: 345, y: 460,
+                        deviceClass: "iPhone", orientation: "portrait",
+                        appVersion: "1.2026.1870010", screenWidth: 390, screenHeight: 844
+                    ),
+                    minimumConfidence: 0.5
+                )
+            ],
             newConversation: [label("发起临时对话"), text("发起临时对话"), text("New chat")],
             generationStart: [text("停止"), text("Stop")],
             generationComplete: [text("复制"), text("Copy")],
@@ -1168,17 +1190,29 @@ public actor AppProviderPackageStore {
             errorIndicators: [text("抱歉，无法连接到服务器")]
         )
         let deepseek = AppProviderPackageManifest(
-            revision: "first-party-4",
+            revision: "first-party-5",
             id: "ai.deepseek.app",
             displayName: "DeepSeek App",
             bundleID: "com.deepseek.chat",
             launchSchemes: ["deepseek", "dpsk"],
             declaredCapabilities: capabilities,
-            compatibility: .init(testedAppVersion: "2.5.1", selectorRevision: "4"),
+            compatibility: .init(testedAppVersion: "2.5.1", selectorRevision: "5"),
             responseExtractors: extractors
         )
         let deepseekSelectors = AppProviderSelectorSet(
-            composer: [label("发消息或按住说话"), text("发消息或按住说话"), label("发消息"), text("发消息"), label("给 DeepSeek 发消息"), text("给 DeepSeek 发消息"), text("Message DeepSeek"), text("Ask DeepSeek")],
+            composer: [
+                label("发消息或按住说话"), text("发消息或按住说话"), label("发消息"), text("发消息"),
+                label("给 DeepSeek 发消息"), text("给 DeepSeek 发消息"), text("Message DeepSeek"), text("Ask DeepSeek"),
+                .init(
+                    strategy: .coordinateFallback,
+                    coordinate: .init(
+                        x: 130, y: 727,
+                        deviceClass: "iPhone", orientation: "portrait",
+                        appVersion: "2.5.1", screenWidth: 390, screenHeight: 844
+                    ),
+                    minimumConfidence: 0.5
+                )
+            ],
             send: [
                 label("发送"), text("发送"), text("Send"),
                 .init(

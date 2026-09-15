@@ -205,6 +205,9 @@ public final class CloudCodeViewModel: ObservableObject {
     private var backgroundAssertionWorkerPID: Int32?
     private var backgroundAssertionAcquireTask: Task<Void, Never>?
     private var backgroundAssertionAcquireToken: UUID?
+    private var appProviderSelfTestTask: Task<String, Error>?
+    private var appProviderSelfTestPackageID: String?
+    private var appProviderSelfTestLifecycleFailureReason: String?
     private var didBootstrap = false
     private static let providerKeyMutationOperationKey = "provider-key:mutation"
     private static let manualProviderKeyOverridesDefaultsKey = "provider.key.manualOverrides"
@@ -807,19 +810,42 @@ public final class CloudCodeViewModel: ObservableObject {
                     throw AppBackedProviderRuntimeError.submissionFailed("App Provider preflight state changed unexpectedly")
                 }
             }
-            appProviderStatusMessages[packageID] = "BUSY · 阶段=harmless_self_test · 正在验证启动 → 前台 → selector → 输入 → 提交 → generation → 回答提取"
-            var text = ""
-            let request = ChatMessage(role: .user, content: "Harmless provider self-test. Return this marker in the answer: \(marker)")
-            for try await event in appBackedProviderRuntime.stream(configuration: configuration, messages: [request], tools: []) {
-                if case .token(let token) = event { text += token }
+            guard appProviderSelfTestTask == nil else {
+                throw AppBackedProviderRuntimeError.submissionFailed("另一个 App Provider 无副作用测试正在运行；手机前台 Provider 测试只能串行执行。")
             }
+            appProviderStatusMessages[packageID] = "BUSY · 阶段=harmless_self_test · 正在验证启动 → 前台 → selector → 输入 → 提交 → generation → 回答提取"
+            appProviderSelfTestPackageID = packageID
+            appProviderSelfTestLifecycleFailureReason = nil
+            defer {
+                appProviderSelfTestTask = nil
+                appProviderSelfTestPackageID = nil
+                if runningSessionIDs.isEmpty { endBackgroundExecutionIfNeeded() }
+            }
+            let request = ChatMessage(role: .user, content: "Harmless provider self-test. Return this marker in the answer: \(marker)")
+            let selfTestTask = Task { () throws -> String in
+                var text = ""
+                for try await event in appBackedProviderRuntime.stream(configuration: configuration, messages: [request], tools: []) {
+                    try Task.checkCancellation()
+                    if case .token(let token) = event { text += token }
+                }
+                return text
+            }
+            appProviderSelfTestTask = selfTestTask
+            // Pre-arm background execution after the cancellable task has been registered but before
+            // this MainActor method suspends and lets the Provider task launch another App. This closes
+            // both gaps: lifecycle expiry can cancel the task immediately, and scene callbacks do not
+            // have to race the first foreground transition to acquire execution time.
+            beginBackgroundExecutionIfNeeded()
+            let text = try await selfTestTask.value
             guard text.localizedCaseInsensitiveContains(marker) else {
                 throw AppBackedProviderRuntimeError.responseValidationFailed("self-test marker missing")
             }
             appProviderStatusMessages[packageID] = await appProviderStatusLabel(packageID: packageID)
+            appProviderSelfTestLifecycleFailureReason = nil
             lastError = nil
             return true
         } catch {
+            let lifecycleFailureReason = appProviderSelfTestLifecycleFailureReason
             let snapshot: AppBackedProviderRuntime.StatusSnapshot
             if let latest = await appBackedProviderRuntime.status(packageID: packageID) {
                 snapshot = latest
@@ -827,8 +853,14 @@ public final class CloudCodeViewModel: ObservableObject {
                 snapshot = await appBackedProviderRuntime.preflightStatus(packageID: packageID)
             }
             let detail = Self.appProviderStatusText(snapshot)
-            appProviderStatusMessages[packageID] = "\(detail) · 错误=\(String(describing: error))"
-            lastError = "App Provider 测试失败：\(String(describing: error))；\(detail)"
+            if let lifecycleFailureReason {
+                appProviderStatusMessages[packageID] = "DEGRADED · 阶段=background_execution · \(lifecycleFailureReason)"
+                lastError = "App Provider 测试因后台执行被系统收回而停止：\(lifecycleFailureReason)"
+            } else {
+                appProviderStatusMessages[packageID] = "\(detail) · 错误=\(String(describing: error))"
+                lastError = "App Provider 测试失败：\(String(describing: error))；\(detail)"
+            }
+            appProviderSelfTestLifecycleFailureReason = nil
             return false
         }
     }
@@ -1956,8 +1988,18 @@ public final class CloudCodeViewModel: ObservableObject {
         syncVisibleSessionState(sessionID)
     }
 
+    private var hasBackgroundCriticalActivity: Bool {
+        isRunning || appProviderSelfTestPackageID != nil
+    }
+
+    private func cancelAppProviderSelfTestForBackground(reason: String) {
+        guard appProviderSelfTestPackageID != nil else { return }
+        appProviderSelfTestLifecycleFailureReason = reason
+        appProviderSelfTestTask?.cancel()
+    }
+
     public func prepareForBackgroundTransition() {
-        guard isRunning else { return }
+        guard hasBackgroundCriticalActivity else { return }
         beginBackgroundExecutionIfNeeded()
         Task {
             try? await diagnosticLogStore.log(
@@ -1965,19 +2007,32 @@ public final class CloudCodeViewModel: ObservableObject {
                 subsystem: "app",
                 action: "background.assertion.prearm",
                 result: backgroundAssertionWorkerPID != nil ? "armed" : (backgroundAssertionAcquireTask != nil ? "acquiring" : "fallback"),
-                metadata: ["runningSessions": String(runningSessionIDs.count)]
+                metadata: [
+                    "runningSessions": String(runningSessionIDs.count),
+                    "appProviderSelfTest": appProviderSelfTestPackageID ?? ""
+                ]
             )
         }
     }
 
     public func suspendForBackground() {
-        guard isRunning else { return }
-        // Persist the scene provenance separately from the generic run-resume bit. If iOS kills
-        // the process while it is backgrounded, the next process may safely distinguish that case
-        // from a foreground crash and perform one bounded checkpoint recovery.
-        UserDefaults.standard.set(true, forKey: Self.backgroundRunIntentDefaultsKey)
+        guard hasBackgroundCriticalActivity else { return }
+        // Persist background provenance only for checkpoint-backed Agent runs. A standalone App
+        // Provider self-test has no Agent checkpoint and must never arm cold-launch task replay.
+        if isRunning {
+            UserDefaults.standard.set(true, forKey: Self.backgroundRunIntentDefaultsKey)
+        }
         Task {
-            try? await diagnosticLogStore.log(level: .info, subsystem: "app", action: "background", result: "entered", metadata: ["runningSessions": String(runningSessionIDs.count)])
+            try? await diagnosticLogStore.log(
+                level: .info,
+                subsystem: "app",
+                action: "background",
+                result: "entered",
+                metadata: [
+                    "runningSessions": String(runningSessionIDs.count),
+                    "appProviderSelfTest": appProviderSelfTestPackageID ?? ""
+                ]
+            )
         }
         // 系统弹窗、App 切换或 LaunchServices 状态变化都可能让 scenePhase 短暂进入后台。
         // 立即取消会把已经被系统接受的状态变更卡在“请求已发出、结果未校验”的窗口。
@@ -2006,7 +2061,7 @@ public final class CloudCodeViewModel: ObservableObject {
         // Agent run must keep an already-established detached privileged assertion worker alive.
         // finishSessionRun remains the authoritative place that tears it down after the final
         // active session finishes.
-        endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: runningSessionIDs.isEmpty)
+        endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: !hasBackgroundCriticalActivity)
         Task {
             try? await diagnosticLogStore.log(level: .info, subsystem: "app", action: "foreground", result: "entered", metadata: ["runningSessions": String(runningSessionIDs.count), "lifecycleInterruptedSessions": String(lifecycleInterruptedSessionIDs.count)])
             await settleLifecycleInterruptedRunsBeforeResume()
@@ -2074,13 +2129,13 @@ public final class CloudCodeViewModel: ObservableObject {
             )
         }
 
-        guard !Task.isCancelled, isRunning, backgroundAssertionWorkerPID == nil else { return }
+        guard !Task.isCancelled, hasBackgroundCriticalActivity, backgroundAssertionWorkerPID == nil else { return }
         let targetPID = ProcessInfo.processInfo.processIdentifier
         let assertion = await Task.detached(priority: .utility) {
             EmbeddedRootHelper.startBackgroundAssertion(targetPID: targetPID)
         }.value
 
-        guard !Task.isCancelled, isRunning else {
+        guard !Task.isCancelled, hasBackgroundCriticalActivity else {
             if let workerPID = assertion.workerPID {
                 _ = await Task.detached(priority: .utility) {
                     EmbeddedRootHelper.stopBackgroundAssertion(workerPID: workerPID)
@@ -2119,7 +2174,7 @@ public final class CloudCodeViewModel: ObservableObject {
             try? await diagnosticLogStore.log(level: .warning, subsystem: "app", action: "background.assertion", result: "rejected", diagnostic: detail)
         }
 
-        if backgroundAssertionWorkerPID == nil, isRunning {
+        if backgroundAssertionWorkerPID == nil, hasBackgroundCriticalActivity {
             backgroundWindowTask?.cancel()
             backgroundWindowTask = Task { [weak self] in
                 guard let self else { return }
@@ -2134,7 +2189,7 @@ public final class CloudCodeViewModel: ObservableObject {
         }
 
         #if canImport(UIKit)
-        if backgroundTaskIdentifier == .invalid, backgroundAssertionWorkerPID == nil, isRunning {
+        if backgroundTaskIdentifier == .invalid, backgroundAssertionWorkerPID == nil, hasBackgroundCriticalActivity {
             let message = "系统未授予额外后台执行时间，且 root assertion worker 不可用；当前任务会依赖 checkpoint 安全恢复。"
             for sessionID in runningSessionIDs {
                 sessionActivityLines[sessionID, default: []].append(message)
@@ -2153,7 +2208,9 @@ public final class CloudCodeViewModel: ObservableObject {
             backgroundAssertionAcquireTask?.cancel()
             backgroundAssertionAcquireTask = nil
             backgroundAssertionAcquireToken = nil
-            interruptActiveRunForBackground(reason: "iOS 已收回后台执行时间，且 detached root assertion worker 尚未建立；当前任务已安全中断并保留检查点，回到前台后自动继续。")
+            let reason = "iOS 已收回后台执行时间，且 detached root assertion worker 尚未建立。"
+            cancelAppProviderSelfTestForBackground(reason: reason)
+            interruptActiveRunForBackground(reason: reason + " 当前 Agent 任务已安全中断并保留检查点，回到前台后自动继续。")
             return
         }
 
@@ -2173,13 +2230,17 @@ public final class CloudCodeViewModel: ObservableObject {
                 return
             }
             self.backgroundAssertionWorkerPID = nil
-            self.interruptActiveRunForBackground(reason: "iOS 已收回后台执行时间，且 detached root assertion worker 未保持存活；当前任务已安全中断并保留检查点，回到前台后自动继续。")
+            let reason = "iOS 已收回后台执行时间，且 detached root assertion worker 未保持存活。"
+            self.cancelAppProviderSelfTestForBackground(reason: reason)
+            self.interruptActiveRunForBackground(reason: reason + " 当前 Agent 任务已安全中断并保留检查点，回到前台后自动继续。")
         }
     }
 
     private func backgroundContinuationWindowDidElapse() {
+        let reason = "后台连续任务已达到 90 分钟保留上限。"
+        cancelAppProviderSelfTestForBackground(reason: reason)
         endBackgroundExecutionIfNeeded()
-        interruptActiveRunForBackground(reason: "后台连续任务已达到 90 分钟保留上限；当前任务已安全中断并保留检查点，避免无限后台占用。回到前台后可从最近检查点继续。")
+        interruptActiveRunForBackground(reason: reason + " 当前 Agent 任务已安全中断并保留检查点，避免无限后台占用。回到前台后可从最近检查点继续。")
     }
 
     private func interruptActiveRunForBackground(reason: String) {
@@ -4970,7 +5031,9 @@ public final class CloudCodeViewModel: ObservableObject {
                 autoResumeArmedInCurrentProcess = false
                 UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
             }
-            endBackgroundExecutionIfNeeded()
+            if !hasBackgroundCriticalActivity {
+                endBackgroundExecutionIfNeeded()
+            }
         }
         syncVisibleSessionState(sessionID)
     }

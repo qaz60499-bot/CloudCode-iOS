@@ -922,6 +922,28 @@ jobs:
           for marker in ('lifecycleInterruptedSessionIDs', 'settleLifecycleInterruptedRunsBeforeResume()', 'await agentCore.waitUntilSessionIdle(sessionID)', 'foreground.lifecycle-settle', 'backgroundAssertionWorkerPID', 'prepareForBackgroundTransition()', 'background.assertion.prearm', 'EmbeddedRootHelper.startBackgroundAssertion', 'backgroundAssertionIsAlive', 'background.assertion.continue', 'endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: false)'):
               if marker not in app:
                   raise SystemExit(f'FAIL: same-process background resume synchronization missing: {marker}')
+          for marker in ('appProviderSelfTestTask', 'appProviderSelfTestPackageID', 'hasBackgroundCriticalActivity', 'cancelAppProviderSelfTestForBackground(reason:', '阶段=background_execution'):
+              if marker not in app:
+                  raise SystemExit(f'FAIL: App Provider harmless self-test lost lifecycle/background integration: {marker}')
+          self_test = app.split('public func testAppProvider(packageID:', 1)[1].split('public var selectableSemanticSkills', 1)[0]
+          for marker in ('appProviderSelfTestPackageID = packageID', 'beginBackgroundExecutionIfNeeded()', 'appProviderSelfTestTask = selfTestTask', 'let text = try await selfTestTask.value'):
+              if marker not in self_test:
+                  raise SystemExit(f'FAIL: App Provider harmless self-test lost cancellable execution marker: {marker}')
+          for forbidden in ('runningSessionIDs.insert', 'autoResumeArmedInCurrentProcess = true', 'task.autoResumeUnlessStopped'):
+              if forbidden in self_test:
+                  raise SystemExit(f'FAIL: App Provider harmless self-test must not masquerade as a checkpoint-backed Agent run: {forbidden}')
+          app_provider_runtime = Path('Sources/CloudCodeApp/AppBackedProviderRuntime.swift').read_text(encoding='utf-8')
+          for marker in ('func hasAuthorization(packageID: String)', 'Self.isFirstPartyPackage(package)', 'await authorizationStore.hasAuthorization(packageID: package.summary.id)', 'await authorizationStore.setAuthorized(true, identity: identity, packageID: package.summary.id)'):
+              if marker not in app_provider_runtime:
+                  raise SystemExit(f'FAIL: first-party App Provider authorization no longer migrates across selector/package maintenance revisions: {marker}')
+          coordinate_match = app_provider_runtime.split('case .coordinateFallback:', 1)[1].split('if selector.strategy == .axRole', 1)[0]
+          for marker in ('coordinate.deviceClass.caseInsensitiveCompare(observation.deviceClass)', 'coordinate.orientation.caseInsensitiveCompare(observation.orientation)', 'coordinate.appVersion == observation.appVersion', 'abs(coordinate.screenWidth - observation.screenWidth) <= 1', 'abs(coordinate.screenHeight - observation.screenHeight) <= 1'):
+              if marker not in coordinate_match:
+                  raise SystemExit(f'FAIL: App Provider coordinate fallback lost strict runtime applicability guard: {marker}')
+          selector_key = app_provider_runtime.split('private static func selectorKey(_ selector:', 1)[1].split('private static func versionCompatible', 1)[0]
+          for marker in ('coordinate.deviceClass.lowercased()', 'coordinate.orientation.lowercased()', 'coordinate.appVersion', 'String(coordinate.screenWidth)', 'String(coordinate.screenHeight)', 'String(coordinate.x)', 'String(coordinate.y)'):
+              if marker not in selector_key:
+                  raise SystemExit(f'FAIL: coordinate fallback reliability key can collide across maintained selectors: {marker}')
           background_interrupt = app.split('private func interruptActiveRunForBackground(reason:', 1)[1].split('private func settleLifecycleInterruptedRunsBeforeResume()', 1)[0]
           for forbidden in ('activeTasks.removeValue(forKey: sessionID)', 'activeRunTokens.removeValue(forKey: sessionID)', 'runningSessionIDs.remove(sessionID)'):
               if forbidden in background_interrupt:
