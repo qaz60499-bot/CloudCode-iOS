@@ -714,12 +714,36 @@ static BOOL ApplicationIsInstalled(id workspace, NSString *bundleID, BOOL *known
 static int InstalledState(NSString *bundleID)
 {
     if (bundleID.length == 0) { CloudCodeExitOneShot(10); }
+
+    // `LSApplicationWorkspace applicationIsInstalled:` is not authoritative on the iOS 16.6
+    // TrollStore/root persona used by Cloud Code. Physical-device evidence shows it can return a
+    // false negative while InstallationProxy still reports the target App and its bundle is present.
+    // Treat a positive answer as sufficient, but require corroborating exact evidence before a
+    // negative answer becomes `not installed`. This prevents App-backed Providers from being blocked
+    // at preflight while preserving fail-closed launch/foreground verification later in the flow.
     id workspace = Workspace();
-    if (!workspace) { CloudCodeExitOneShot(23); }
     BOOL known = NO;
     BOOL installed = ApplicationIsInstalled(workspace, bundleID, &known);
-    if (!known) { CloudCodeExitOneShot(43); }
-    CloudCodeExitOneShot(installed ? 0 : 47);
+    if (known && installed) { CloudCodeExitOneShot(0); }
+
+    id proxy = ApplicationProxy(bundleID);
+    if (proxy) {
+        NSString *candidate = SafeValue(proxy, @"applicationIdentifier");
+        if (![candidate isKindOfClass:NSString.class] || candidate.length == 0) {
+            candidate = SafeValue(proxy, @"bundleIdentifier");
+        }
+        NSURL *bundleURL = SafeValue(proxy, @"bundleURL");
+        NSString *bundlePath = [bundleURL isKindOfClass:NSURL.class] ? bundleURL.path.stringByStandardizingPath : nil;
+        if ([candidate isEqualToString:bundleID] && IsSafeBundlePath(bundlePath)) {
+            CloudCodeExitOneShot(0);
+        }
+    }
+
+    NSString *filesystemPath = BundlePathForIdentifierFromFilesystem(bundleID);
+    if (IsSafeBundlePath(filesystemPath)) { CloudCodeExitOneShot(0); }
+
+    if (known) { CloudCodeExitOneShot(47); }
+    CloudCodeExitOneShot(43);
 }
 
 static BOOL UnregisterApplication(id workspace, NSString *appPath)
