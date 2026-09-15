@@ -534,7 +534,13 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
 
         try await transition(.prepareSession, state: .busy, detail: "准备隔离的 Provider 请求上下文", package: package, appVersion: introspection.version)
         if package.workflow.preferNewConversation,
-           let newConversation = await resolve(package.selectors.newConversation, observation: observation, packageID: package.summary.id, appVersion: introspection.version) {
+           let newConversation = await resolve(
+               package.selectors.newConversation,
+               observation: observation,
+               packageID: package.summary.id,
+               appVersion: introspection.version,
+               testedCoordinateAppVersion: package.summary.manifest.compatibility.testedAppVersion
+           ) {
             try Task.checkCancellation()
             try await gui.tap(x: newConversation.element.centerX, y: newConversation.element.centerY)
             try await Self.sleep(seconds: 0.35)
@@ -553,7 +559,13 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
 
         continuation.yield(.status("App Provider 正在定位输入区域…"))
         try await transition(.locateComposer, state: .busy, detail: "定位输入区域", package: package, appVersion: introspection.version)
-        guard let composer = await resolve(package.selectors.composer, observation: observation, packageID: package.summary.id, appVersion: introspection.version) else {
+        guard let composer = await resolve(
+            package.selectors.composer,
+            observation: observation,
+            packageID: package.summary.id,
+            appVersion: introspection.version,
+            testedCoordinateAppVersion: package.summary.manifest.compatibility.testedAppVersion
+        ) else {
             try await transition(.classify, state: .needsPluginUpdate, detail: "composer selector 未匹配", package: package, appVersion: introspection.version)
             throw AppBackedProviderRuntimeError.composerUnavailable("没有高置信 composer selector")
         }
@@ -568,7 +580,13 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         var focusObservation = try await observe(appVersion: introspection.version)
         var keyboardLikely = await composerFocusVerified(in: focusObservation)
         if !keyboardLikely,
-           let retryComposer = await resolve(package.selectors.composer, observation: focusObservation, packageID: package.summary.id, appVersion: introspection.version) {
+           let retryComposer = await resolve(
+               package.selectors.composer,
+               observation: focusObservation,
+               packageID: package.summary.id,
+               appVersion: introspection.version,
+               testedCoordinateAppVersion: package.summary.manifest.compatibility.testedAppVersion
+           ) {
             try Task.checkCancellation()
             try await gui.tap(x: retryComposer.element.centerX, y: retryComposer.element.centerY)
             try await Self.sleep(seconds: 0.35)
@@ -599,7 +617,13 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             try await transition(.classify, state: .degraded, detail: "文本输入 helper 已派发，但当前 composer 没有出现本轮输入探针；拒绝继续点 Send", package: package, appVersion: introspection.version)
             throw AppBackedProviderRuntimeError.submissionFailed("Prompt 输入未通过本地回读验证")
         }
-        guard let send = await resolve(package.selectors.send, observation: observation, packageID: package.summary.id, appVersion: introspection.version) else {
+        guard let send = await resolve(
+            package.selectors.send,
+            observation: observation,
+            packageID: package.summary.id,
+            appVersion: introspection.version,
+            testedCoordinateAppVersion: package.summary.manifest.compatibility.testedAppVersion
+        ) else {
             try await transition(.classify, state: .needsPluginUpdate, detail: "send selector 未匹配；不会使用未绑定坐标盲点", package: package, appVersion: introspection.version)
             throw AppBackedProviderRuntimeError.submissionFailed("send selector 未匹配")
         }
@@ -875,11 +899,16 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         _ selectors: [AppProviderSelector],
         observation: Observation,
         packageID: String,
-        appVersion: String?
+        appVersion: String?,
+        testedCoordinateAppVersion: String? = nil
     ) async -> ResolvedSelector? {
         var matches: [ResolvedSelector] = []
         for selector in selectors {
-            guard let resolved = Self.match(selector, observation: observation) else { continue }
+            guard let resolved = Self.match(
+                selector,
+                observation: observation,
+                testedCoordinateAppVersion: testedCoordinateAppVersion
+            ) else { continue }
             let key = Self.selectorKey(selector)
             let learned = await learningStore.reliability(packageID: packageID, selectorKey: key) ?? 0.5
             var candidate = resolved
@@ -890,7 +919,11 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         return winner
     }
 
-    private static func match(_ selector: AppProviderSelector, observation: Observation) -> ResolvedSelector? {
+    private static func match(
+        _ selector: AppProviderSelector,
+        observation: Observation,
+        testedCoordinateAppVersion: String? = nil
+    ) -> ResolvedSelector? {
         let candidates: [LocalPerceptionTextElement]
         let source: String
         switch selector.strategy {
@@ -902,10 +935,18 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             candidates = observation.localVision.elements
             source = "ocr"
         case .coordinateFallback:
-            guard let coordinate = selector.coordinate,
-                  coordinate.deviceClass.caseInsensitiveCompare(observation.deviceClass) == .orderedSame,
+            guard let coordinate = selector.coordinate else { return nil }
+            let exactVersionMatch = coordinate.appVersion == observation.appVersion
+            // TrollStore/root LaunchServices can leave static metadata unavailable even after the
+            // exact Provider bundle was launched and verified frontmost. Do not make coordinates
+            // universal in that state: only allow the package's own tested App version, while exact
+            // device class/orientation/screen geometry and the normal higher-level UI gates still
+            // have to match. A real, different App version always rejects the stale coordinate.
+            let boundedRuntimeUnverifiedMatch = observation.appVersion == runtimeUnverifiedAppVersion
+                && testedCoordinateAppVersion == coordinate.appVersion
+            guard coordinate.deviceClass.caseInsensitiveCompare(observation.deviceClass) == .orderedSame,
                   coordinate.orientation.caseInsensitiveCompare(observation.orientation) == .orderedSame,
-                  coordinate.appVersion == observation.appVersion,
+                  exactVersionMatch || boundedRuntimeUnverifiedMatch,
                   abs(coordinate.screenWidth - observation.screenWidth) <= 1,
                   abs(coordinate.screenHeight - observation.screenHeight) <= 1 else { return nil }
             let element = LocalPerceptionTextElement(text: "coordinate-fallback", confidence: 0.5, x: coordinate.x, y: coordinate.y, width: 1, height: 1)
