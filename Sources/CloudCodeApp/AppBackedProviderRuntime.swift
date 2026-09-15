@@ -808,18 +808,44 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         composer: LocalPerceptionTextElement
     ) async -> Bool {
         if Self.inputProbeVisible(probe, observation: observation) { return true }
+
+        // The composer geometry was resolved before focus. On apps such as DeepSeek, presenting the
+        // software keyboard moves the composer hundreds of points upward. Restricting the precise
+        // readback to the old pre-keyboard rectangle therefore creates a deterministic false
+        // negative even when HID input succeeded. The nonce is request-unique, so a bounded precise
+        // pass over the lower interactive area is safe evidence and is stronger than reusing stale
+        // coordinates. Keep the old composer neighborhood first for the common fast path, then widen
+        // only when that readback misses.
         let verticalPadding = max(48.0, composer.height * 1.5)
-        let regionY = max(0, composer.y - verticalPadding)
-        let regionBottom = min(observation.screenHeight, composer.y + composer.height + verticalPadding)
-        let region = CGRect(
+        let localRegionY = max(0, composer.y - verticalPadding)
+        let localRegionBottom = min(observation.screenHeight, composer.y + composer.height + verticalPadding)
+        let localRegion = CGRect(
             x: 0,
-            y: regionY,
+            y: localRegionY,
             width: observation.screenWidth,
-            height: max(1, regionBottom - regionY)
+            height: max(1, localRegionBottom - localRegionY)
         )
+        if await inputProbeVisiblePrecisely(probe, observation: observation, region: localRegion) {
+            return true
+        }
+
+        let interactiveRegion = CGRect(
+            x: 0,
+            y: observation.screenHeight * 0.30,
+            width: observation.screenWidth,
+            height: observation.screenHeight * 0.70
+        )
+        return await inputProbeVisiblePrecisely(probe, observation: observation, region: interactiveRegion)
+    }
+
+    private func inputProbeVisiblePrecisely(
+        _ probe: String,
+        observation: Observation,
+        region: CGRect
+    ) async -> Bool {
         let precise = await LocalVisionTextObservation.observe(
             for: observation.screenshot,
-            maximumElements: 64,
+            maximumElements: 96,
             regionInScreenPoints: region,
             requiresText: true,
             forcePrecise: true

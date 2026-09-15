@@ -1238,6 +1238,37 @@ final class ProviderDiscoveryTests: XCTestCase {
         XCTAssertNil(probe["max_tokens"], "Gemini validation must not add a field absent from the real compatible request path")
     }
 
+    func testGeminiOfficialDiscoveryPrioritizesChatCapableCatalogModelWithoutManualModel() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProviderGeminiDiscoveryURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let result = try await ProviderDiscoveryClient(session: session).discover(
+            baseURL: URL(string: "https://generativelanguage.googleapis.com")!,
+            apiKey: "test-secret",
+            preferredAuthMode: .bearer,
+            inferenceProtocols: [.openAIChat],
+            allowAlternateAuthModes: false
+        )
+
+        XCTAssertEqual(result.readiness, .ready)
+        XCTAssertEqual(result.models.first, "gemini-3.8-flash")
+        XCTAssertEqual(result.protocols, [.openAIChat])
+        XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.requestCount(), 2, "a live chat-capable Gemini model outside the first 12 catalog rows must be ranked into the bounded probe set")
+        XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.probeBody()?["model"] as? String, "gemini-3.8-flash")
+    }
+
+    func testInferenceCandidateRankingDoesNotReorderOrdinaryCompatibleProviderCatalog() {
+        let candidates = ProviderDiscoveryClient.inferenceCandidates(
+            fallbackInferenceCandidates: [],
+            catalogModels: (0..<14).map { "model-\($0)" },
+            baseURL: URL(string: "https://api.example.com")!,
+            limit: 12
+        )
+        XCTAssertEqual(candidates, (0..<12).map { "model-\($0)" })
+    }
+
     func testAgentRouterDiscoveryCanRestrictCatalogToPreferredAuthMode() async throws {
         ProviderTestURLProtocol.install(
             status: 401,
