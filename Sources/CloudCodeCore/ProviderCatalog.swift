@@ -1,13 +1,13 @@
 import Foundation
 import CryptoKit
 
-public enum ProviderProtocol: String, Codable, CaseIterable, Sendable {
+public enum ProviderProtocol: String, Codable, CaseIterable, Hashable, Sendable {
     case anthropic
     case openAIChat = "openai_chat"
     case openAIResponses = "openai_responses"
 }
 
-public enum ProviderAuthMode: String, Codable, Sendable {
+public enum ProviderAuthMode: String, Codable, Hashable, Sendable {
     case bearer
     case xAPIKey = "x-api-key"
     case both
@@ -262,8 +262,7 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
 
     public mutating func applyLiveModelCatalog(_ liveModels: [String], keySlotID: String, authoritative: Bool) {
         let discoveredModels = Self.unique(liveModels)
-        guard !discoveredModels.isEmpty,
-              let targetSlotIndex = keySlots.firstIndex(where: { $0.id == keySlotID }) else { return }
+        guard let targetSlotIndex = keySlots.firstIndex(where: { $0.id == keySlotID }) else { return }
         if authoritative {
             // Match NativeCloud's selected-Key catalog semantics: a successful authenticated
             // /models response is the current source of truth. New models appear immediately and
@@ -277,6 +276,7 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
         } else {
             // Some built-in compatible gateways expose partial/resource-pool-specific catalogs;
             // preserve the historical enrich-without-shrinking behavior for those providers.
+            guard !discoveredModels.isEmpty else { return }
             models = Self.unique(models + discoveredModels)
             keySlots[targetSlotIndex].models = Self.unique(keySlots[targetSlotIndex].models + discoveredModels)
         }
@@ -348,6 +348,130 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
     private static func uniqueProtocols(_ values: [ProviderProtocol]) -> [ProviderProtocol] {
         var seen = Set<String>()
         return values.filter { seen.insert($0.rawValue).inserted }
+    }
+}
+
+public struct ProviderLiveModelCatalogSnapshot: Codable, Equatable, Sendable {
+    public var providerID: String
+    public var keySlotID: String
+    public var keyFingerprint: String
+    public var models: [String]
+    public var updatedAt: Date
+
+    public init(providerID: String, keySlotID: String, keyFingerprint: String, models: [String], updatedAt: Date = Date()) {
+        self.providerID = providerID
+        self.keySlotID = keySlotID
+        self.keyFingerprint = keyFingerprint
+        self.models = models
+        self.updatedAt = updatedAt
+    }
+}
+
+/// Persists only non-secret, last-known-good model catalogs. This lets the picker retain a
+/// successfully refreshed provider catalog across App restarts without touching Provider Keychain
+/// during cold launch. A snapshot is applied only to the same provider/key slot/fingerprint and can
+/// be excluded when that slot has a manual Key override.
+public enum ProviderLiveModelCatalogCache {
+    private static let maximumBytes = 512 * 1024
+    private static let maximumAge: TimeInterval = 30 * 24 * 60 * 60
+
+    public static func applyingCachedCatalogs(
+        to profiles: [ProviderProfile],
+        from url: URL,
+        excludingKeyReferences: Set<String> = [],
+        now: Date = Date()
+    ) -> [ProviderProfile] {
+        guard let snapshots = load(from: url) else { return profiles }
+        var result = profiles
+        for snapshot in snapshots where now.timeIntervalSince(snapshot.updatedAt) <= maximumAge {
+            let reference = ProviderCatalog.keyReference(providerID: snapshot.providerID, keySlotID: snapshot.keySlotID)
+            guard !excludingKeyReferences.contains(reference),
+                  let providerIndex = result.firstIndex(where: { $0.id == snapshot.providerID }),
+                  let slot = result[providerIndex].keySlots.first(where: { $0.id == snapshot.keySlotID }),
+                  !snapshot.models.isEmpty,
+                  !snapshot.keyFingerprint.isEmpty,
+                  slot.fingerprint == snapshot.keyFingerprint else { continue }
+            result[providerIndex].applyLiveModelCatalog(snapshot.models, keySlotID: snapshot.keySlotID, authoritative: true)
+        }
+        return result
+    }
+
+    public static func remove(providerID: String, from url: URL) throws {
+        guard !providerID.isEmpty else { return }
+        var snapshots = load(from: url) ?? []
+        let originalCount = snapshots.count
+        snapshots.removeAll { $0.providerID == providerID }
+        guard snapshots.count != originalCount else { return }
+        if snapshots.isEmpty {
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+            return
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(snapshots).write(to: url, options: .atomic)
+    }
+
+    public static func lastSuccessfulUpdate(providerID: String, keySlotID: String, from url: URL) -> Date? {
+        load(from: url)?
+            .filter { $0.providerID == providerID && $0.keySlotID == keySlotID }
+            .map(\.updatedAt)
+            .max()
+    }
+
+    private static func removeExpiredSnapshots(providerID: String, from url: URL, now: Date = Date()) throws {
+        guard !providerID.isEmpty else { return }
+        var snapshots = load(from: url) ?? []
+        let originalCount = snapshots.count
+        snapshots.removeAll { $0.providerID == providerID }
+        guard snapshots.count != originalCount else { return }
+        snapshots = snapshots
+            .filter { now.timeIntervalSince($0.updatedAt) <= maximumAge }
+            .sorted { $0.updatedAt > $1.updatedAt }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(snapshots).write(to: url, options: .atomic)
+    }
+
+    public static func persist(
+        provider: ProviderProfile,
+        keySlotID: String,
+        to url: URL,
+        now: Date = Date()
+    ) throws {
+        guard let slot = provider.keySlots.first(where: { $0.id == keySlotID }) else { return }
+        let models = provider.selectableModels(for: keySlotID)
+        guard !slot.fingerprint.isEmpty, !models.isEmpty else { return }
+        var snapshots = load(from: url) ?? []
+        snapshots.removeAll { $0.providerID == provider.id && $0.keySlotID == keySlotID }
+        snapshots.append(ProviderLiveModelCatalogSnapshot(
+            providerID: provider.id,
+            keySlotID: keySlotID,
+            keyFingerprint: slot.fingerprint,
+            models: models,
+            updatedAt: now
+        ))
+        snapshots = snapshots
+            .filter { now.timeIntervalSince($0.updatedAt) <= maximumAge }
+            .sorted { $0.updatedAt > $1.updatedAt }
+            .prefix(128)
+            .map { $0 }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(snapshots).write(to: url, options: .atomic)
+    }
+
+    private static func load(from url: URL) -> [ProviderLiveModelCatalogSnapshot]? {
+        guard FileManager.default.fileExists(atPath: url.path),
+              let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber,
+              size.intValue >= 0,
+              size.intValue <= maximumBytes,
+              let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) else { return nil }
+        return try? JSONDecoder().decode([ProviderLiveModelCatalogSnapshot].self, from: data)
     }
 }
 

@@ -20,6 +20,46 @@
 typedef int (*PersonaSetFn)(const posix_spawnattr_t * _Nonnull __restrict, uid_t, uint32_t);
 typedef int (*PersonaUIDFn)(const posix_spawnattr_t * _Nonnull __restrict, uid_t);
 typedef int (*PersonaGIDFn)(const posix_spawnattr_t * _Nonnull __restrict, gid_t);
+typedef pid_t (*CloudCodeWaitPidFn)(pid_t, int *, int);
+
+static CloudCodeWaitPidFn CloudCodeDarwinWaitPidFunction(void)
+{
+    static CloudCodeWaitPidFn function = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // IOSSystemRuntime deliberately embeds ios_system.framework, which exports its own waitpid
+        // implementation for virtual shell processes. RootHelperBridge manages real Darwin children
+        // created by posix_spawn, so binding that interposed symbol makes real-helper polling spin in
+        // ios_system instead of waiting on the kernel. Resolve the system implementation from an
+        // explicit Apple image and reject any accidental ios_system resolution.
+        static const char *candidates[] = {
+            "/usr/lib/libSystem.B.dylib",
+            "/usr/lib/system/libsystem_c.dylib",
+        };
+        for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); index++) {
+            void *handle = dlopen(candidates[index], RTLD_LAZY | RTLD_LOCAL);
+            if (!handle) { continue; }
+            void *symbol = dlsym(handle, "waitpid");
+            if (!symbol) { continue; }
+            Dl_info info = {0};
+            if (dladdr(symbol, &info) == 0 || !info.dli_fname) { continue; }
+            if (strstr(info.dli_fname, "ios_system.framework") != NULL) { continue; }
+            function = (CloudCodeWaitPidFn)symbol;
+            break;
+        }
+    });
+    return function;
+}
+
+static pid_t CloudCodeDarwinWaitPid(pid_t pid, int *status, int options)
+{
+    CloudCodeWaitPidFn function = CloudCodeDarwinWaitPidFunction();
+    if (!function) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return function(pid, status, options);
+}
 
 static double CloudCodeMonotonicSeconds(void)
 {
@@ -37,11 +77,29 @@ static void CloudCodeFreeArgv(char **argv, NSUInteger count)
     free(argv);
 }
 
-static void CloudCodeDrainPipe(int fd, NSMutableData *captured, BOOL *truncated)
+// Admission includes timed-out children until the kernel has reaped them. No PID scans or
+// signals to unrelated processes: the registry only owns children spawned by this bridge.
+static NSMutableSet<NSString *> *CloudCodeHelperRegistry(void)
 {
+    static NSMutableSet<NSString *> *registry;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ registry = [NSMutableSet set]; });
+    return registry;
+}
+
+static void CloudCodeReleaseHelper(NSString *key)
+{
+    NSMutableSet *registry = CloudCodeHelperRegistry();
+    @synchronized (registry) { [registry removeObject:key]; }
+}
+
+static void CloudCodeDrainPipe(int *descriptor, NSMutableData *captured, BOOL *truncated)
+{
+    int fd = *descriptor;
     if (fd < 0 || !captured) { return; }
     uint8_t buffer[2048];
-    while (YES) {
+    // A continuously writing child must not starve waitpid/deadline checks.
+    for (NSUInteger chunk = 0; chunk < 128; chunk++) {
         ssize_t readCount = read(fd, buffer, sizeof(buffer));
         if (readCount > 0) {
             NSUInteger incoming = (NSUInteger)readCount;
@@ -55,10 +113,10 @@ static void CloudCodeDrainPipe(int fd, NSMutableData *captured, BOOL *truncated)
             }
             continue;
         }
-        if (readCount == 0) { return; }
+        if (readCount == 0) { close(fd); *descriptor = -1; return; }
         if (errno == EINTR) { continue; }
         if (errno == EAGAIN || errno == EWOULDBLOCK) { return; }
-        return;
+        close(fd); *descriptor = -1; return;
     }
 }
 
@@ -98,10 +156,61 @@ static NSInteger CloudCodeSpawnHelperInternal(
     if (standardOutput) { *standardOutput = nil; }
     if (standardError) { *standardError = nil; }
     if (path.length == 0) { return -1001; }
+    if (asRoot && [path.lastPathComponent isEqualToString:@"CloudCodeVisionHelper"]) {
+        // CloudCodeVisionHelper is intentionally not a TSRootBinary. Vision must never inherit
+        // persona-99/root; prior iOS 16.6 device evidence showed root-persona Vision traps.
+        return -1911;
+    }
+
+    // Build 120 proved that an anonymous one-shot CloudCodeRootHelper can have working AXRuntime
+    // symbols/transport yet still receive an empty semantic tree on iOS 16.6. For the two passive
+    // semantic reads, preserve the existing helper API but execute the first (non-root) attempt in
+    // the real System-app host identity. If that raw AXRuntime route is empty, continue into the
+    // isolated helper so AccessibilityUI/AXAudit gets one bounded attempt before PlatformAdapters
+    // performs its existing single persona-99 fallback.
+    if (!asRoot
+        && [NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.cloudcode.ios"]
+        && [path.lastPathComponent isEqualToString:@"CloudCodeRootHelper"]
+        && arguments.count > 0) {
+        NSString *command = arguments.firstObject;
+        NSString *hostDiagnostic = nil;
+        NSString *hostPayload = nil;
+        if ([command isEqualToString:@"gui-tree-json"]) {
+            hostPayload = CloudCodeHostAXTreeJSON(&hostDiagnostic);
+        } else if ([command isEqualToString:@"gui-focused-text-input-json"]) {
+            hostPayload = CloudCodeHostAXFocusedTextInputJSON(&hostDiagnostic);
+        }
+        if ([command isEqualToString:@"gui-tree-json"] || [command isEqualToString:@"gui-focused-text-input-json"]) {
+            if (hostPayload.length > 0) {
+                if (standardOutput) { *standardOutput = hostPayload; }
+                if (standardError && hostDiagnostic.length > 0) { *standardError = hostDiagnostic; }
+                return 0;
+            }
+            // Build 123 adds a materially different standalone route: AccessibilityUI's AXAudit
+            // broker (AXUIClient + AXElement.primaryApp/explorerElements). If the System-app host's
+            // raw AXRuntime path is empty, allow the normal isolated helper spawn below to try that
+            // broker for both semantic-tree and focused-text observation before PlatformAdapters
+            // proceeds to its single persona-99 fallback.
+        }
+    }
+
     if (timeout <= 0) { timeout = CLOUDCODE_HELPER_DEFAULT_TIMEOUT; }
+    // Fail before spawning a real child if we cannot prove that process observation/reaping will
+    // use Darwin's waitpid rather than ios_system's virtual-process implementation.
+    if (!CloudCodeDarwinWaitPidFunction()) { return -1950; }
 
     NSMutableArray<NSString *> *argvStrings = [NSMutableArray arrayWithObject:path];
     [argvStrings addObjectsFromArray:arguments ?: @[]];
+    // A mobile parent cannot reliably SIGKILL a persona-99/UID-0 child after the child has changed
+    // credentials. Real-device Build 113 left many timed-out CloudCodeRootHelper processes alive,
+    // which then amplified AX latency and Vision/CoreVideo allocation pressure. Arm the privileged
+    // helper with its own bounded watchdog so it can hard-exit itself shortly before the parent
+    // deadline. The long-lived background-assert worker is spawned directly by the helper and does
+    // not inherit this one-shot argument.
+    if (asRoot && [path.lastPathComponent isEqualToString:@"CloudCodeRootHelper"]) {
+        NSInteger watchdogMS = MAX(250, (NSInteger)(timeout * 1000.0) - 150);
+        [argvStrings addObject:[NSString stringWithFormat:@"--cloudcode-watchdog-ms=%ld", (long)watchdogMS]];
+    }
 
     const NSUInteger count = argvStrings.count;
     char **argv = calloc(count + 1, sizeof(char *));
@@ -185,11 +294,37 @@ static NSInteger CloudCodeSpawnHelperInternal(
     } else if (personaError != 0) {
         result = -2000 - personaError;
     } else {
+        NSString *command = arguments.firstObject ?: @"";
+        NSSet<NSString *> *serializedAXCommands = [NSSet setWithArray:@[
+            @"gui-tree-json", @"gui-ax-probe-json", @"gui-focused-text-input-json", @"gui-type-base64"
+        ]];
+        BOOL usesSerializedAXRuntime = [path.lastPathComponent isEqualToString:@"CloudCodeRootHelper"]
+            && [serializedAXCommands containsObject:command];
+        // Keep detached AXRuntime calls serialized so their private requesting-client/context state
+        // cannot overlap. Production perception no longer writes the system-wide Accessibility
+        // Automation bit; serialization is now only an AXRuntime isolation boundary.
+        NSString *registryKey = usesSerializedAXRuntime
+            ? [NSString stringWithFormat:@"%@|ax-runtime-serialized", path]
+            : [NSString stringWithFormat:@"%@|%@", path, command];
+        NSMutableSet *registry = CloudCodeHelperRegistry();
+        BOOL admitted = NO;
+        @synchronized (registry) {
+            if (registry.count < 4 && ![registry containsObject:registryKey]) {
+                [registry addObject:registryKey];
+                admitted = YES;
+            }
+        }
         pid_t pid = 0;
-        int spawnError = posix_spawn(&pid, path.fileSystemRepresentation, captureOutput ? &actions : NULL, &attributes, argv, NULL);
+        int spawnError = admitted ? posix_spawn(&pid, path.fileSystemRepresentation, captureOutput ? &actions : NULL, &attributes, argv, NULL) : EBUSY;
         if (spawnError != 0) {
+            if (admitted) { CloudCodeReleaseHelper(registryKey); }
+            if (!admitted) { diagnosticSuffix = @"runtime_degraded: helper admission limit, same command, or serialized AX runtime still active/unreaped"; }
             result = -3000 - spawnError;
         } else {
+            const BOOL tracePerception = [path.lastPathComponent hasPrefix:@"CloudCode"];
+            BOOL parentTimeout = NO;
+            int timeoutKillResult = 0;
+            int timeoutKillErrno = 0;
             if (captureStdout) {
                 close(stdoutPipe[1]);
                 stdoutPipe[1] = -1;
@@ -205,13 +340,16 @@ static NSInteger CloudCodeSpawnHelperInternal(
 
             const double start = CloudCodeMonotonicSeconds();
             int status = 0;
+            BOOL statusObserved = NO;
+            BOOL reapDeferred = NO;
             BOOL finished = NO;
             while (!finished) {
-                if (captureStdout) { CloudCodeDrainPipe(stdoutPipe[0], capturedStdout, &stdoutTruncated); }
-                if (captureStderr) { CloudCodeDrainPipe(stderrPipe[0], capturedStderr, &stderrTruncated); }
+                if (captureStdout) { CloudCodeDrainPipe(&stdoutPipe[0], capturedStdout, &stdoutTruncated); }
+                if (captureStderr) { CloudCodeDrainPipe(&stderrPipe[0], capturedStderr, &stderrTruncated); }
 
-                pid_t waited = waitpid(pid, &status, WNOHANG);
+                pid_t waited = CloudCodeDarwinWaitPid(pid, &status, WNOHANG);
                 if (waited == pid) {
+                    statusObserved = YES;
                     finished = YES;
                     break;
                 }
@@ -224,7 +362,9 @@ static NSInteger CloudCodeSpawnHelperInternal(
 
                 double elapsed = CloudCodeMonotonicSeconds() - start;
                 if (elapsed >= timeout) {
-                    (void)kill(pid, SIGKILL);
+                    parentTimeout = YES;
+                    timeoutKillResult = kill(pid, SIGKILL);
+                    timeoutKillErrno = timeoutKillResult == 0 ? 0 : errno;
                     // A helper can be wedged inside private AX IPC. A blocking waitpid after SIGKILL
                     // made the nominal 3s AX deadline stretch past 15s on-device. Reap synchronously
                     // only for a short bounded grace period; if the kernel has not released the child
@@ -232,26 +372,18 @@ static NSInteger CloudCodeSpawnHelperInternal(
                     BOOL reaped = NO;
                     double reapDeadline = CloudCodeMonotonicSeconds() + 0.25;
                     do {
-                        waited = waitpid(pid, &status, WNOHANG);
+                        waited = CloudCodeDarwinWaitPid(pid, &status, WNOHANG);
                         if (waited == pid || (waited == -1 && errno == ECHILD)) {
+                            statusObserved = waited == pid;
                             reaped = YES;
                             break;
                         }
                         if (waited == -1 && errno != EINTR) { break; }
                         usleep(10000);
                     } while (CloudCodeMonotonicSeconds() < reapDeadline);
-                    if (!reaped) {
-                        pid_t timedOutPID = pid;
-                        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                            int reaperStatus = 0;
-                            pid_t reaperWaited = 0;
-                            do {
-                                reaperWaited = waitpid(timedOutPID, &reaperStatus, 0);
-                            } while (reaperWaited == -1 && errno == EINTR);
-                        });
-                    }
+                    reapDeferred = !reaped;
                     result = -7000 - ETIMEDOUT;
-                    diagnosticSuffix = [NSString stringWithFormat:@"helper timed out after %.1f seconds and was terminated%@", timeout, reaped ? @"" : @"; process reap deferred"];
+                    diagnosticSuffix = [NSString stringWithFormat:@"helper timed out after %.1f seconds; killResult=%d killErrno=%d%@", timeout, timeoutKillResult, timeoutKillErrno, reaped ? @"; process reaped" : @"; process reap deferred"];
                     finished = YES;
                     break;
                 }
@@ -259,20 +391,37 @@ static NSInteger CloudCodeSpawnHelperInternal(
                 if (captureOutput) {
                     struct pollfd pollFDs[2];
                     nfds_t countFDs = 0;
-                    if (captureStdout) {
+                    if (stdoutPipe[0] >= 0) {
                         pollFDs[countFDs++] = (struct pollfd){.fd = stdoutPipe[0], .events = POLLIN | POLLHUP, .revents = 0};
                     }
-                    if (captureStderr) {
+                    if (stderrPipe[0] >= 0) {
                         pollFDs[countFDs++] = (struct pollfd){.fd = stderrPipe[0], .events = POLLIN | POLLHUP, .revents = 0};
                     }
-                    if (countFDs > 0) { (void)poll(pollFDs, countFDs, 50); }
+                    // poll with zero descriptors sleeps too. Closed pipes must never remain
+                    // in this set: POLLHUP is level-triggered and otherwise spins at 100% CPU.
+                    (void)poll(pollFDs, countFDs, 50);
                 } else {
                     usleep(50000);
                 }
             }
 
-            if (captureStdout) { CloudCodeDrainPipe(stdoutPipe[0], capturedStdout, &stdoutTruncated); }
-            if (captureStderr) { CloudCodeDrainPipe(stderrPipe[0], capturedStderr, &stderrTruncated); }
+            if (captureStdout) { CloudCodeDrainPipe(&stdoutPipe[0], capturedStdout, &stdoutTruncated); }
+            if (captureStderr) { CloudCodeDrainPipe(&stderrPipe[0], capturedStderr, &stderrTruncated); }
+            if (reapDeferred || (!statusObserved && result != -4000 - ECHILD)) {
+                pid_t timedOutPID = pid;
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                    int reaperStatus = 0;
+                    pid_t reaperWaited;
+                    do {
+                        reaperWaited = CloudCodeDarwinWaitPid(timedOutPID, &reaperStatus, 0);
+                    } while (reaperWaited == -1 && errno == EINTR);
+                    int reaperErrno = reaperWaited < 0 ? errno : 0;
+                    if (reaperWaited == timedOutPID || reaperErrno == ECHILD) { CloudCodeReleaseHelper(registryKey); }
+                    NSLog(@"[CloudCodeHelperReaper] pid=%d waited=%d errno=%d status=%d", timedOutPID, reaperWaited, reaperErrno, reaperStatus);
+                });
+            } else {
+                CloudCodeReleaseHelper(registryKey);
+            }
             if (result == 0) {
                 if (WIFEXITED(status)) {
                     result = WEXITSTATUS(status);
@@ -281,6 +430,30 @@ static NSInteger CloudCodeSpawnHelperInternal(
                     diagnosticSuffix = [NSString stringWithFormat:@"helper terminated by signal %d", WTERMSIG(status)];
                 } else {
                     result = -5001;
+                }
+            }
+            if (tracePerception) {
+                Dl_info waitImage = {0};
+                dladdr((void *)CloudCodeDarwinWaitPidFunction(), &waitImage);
+                NSDictionary *exitEvidence = @{
+                    @"schemaVersion": @1, @"stage": @"helper-exit",
+                    @"helper": path.lastPathComponent, @"pid": @(pid), @"parentPID": @(getpid()),
+                    @"parentUID": @(getuid()), @"parentGID": @(getgid()), @"rootRequested": @(asRoot),
+                    @"elapsedMS": @((NSInteger)((CloudCodeMonotonicSeconds() - start) * 1000)),
+                    @"timeoutSeconds": @(timeout), @"parentTimeout": @(parentTimeout),
+                    @"timeoutKillResult": @(timeoutKillResult), @"timeoutKillErrno": @(timeoutKillErrno),
+                    @"result": @(result),
+                    @"waitStatusObserved": @(statusObserved),
+                    @"reapDeferred": @(reapDeferred),
+                    @"waitpidImage": waitImage.dli_fname ? @(waitImage.dli_fname) : @"unknown",
+                    @"signal": statusObserved && WIFSIGNALED(status) ? @(WTERMSIG(status)) : NSNull.null,
+                    @"exitCode": statusObserved && WIFEXITED(status) ? @(WEXITSTATUS(status)) : NSNull.null,
+                    @"systemTerminationReason": @"requires_correlated_system_report"
+                };
+                NSData *json = [NSJSONSerialization dataWithJSONObject:exitEvidence options:0 error:nil];
+                NSString *record = json ? [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding] : @"";
+                if (record.length) {
+                    diagnosticSuffix = CloudCodeCombinedOutput(diagnosticSuffix, record);
                 }
             }
             if (stdoutTruncated || stderrTruncated) {

@@ -29,7 +29,7 @@ enum EmbeddedVisionHelper {
         return helperData.range(of: markerData) != nil
     }()
 
-    static func guiOCR(jpegData: Data, maximumElements: Int) -> (json: String?, detail: String) {
+    static func guiOCR(jpegData: Data, maximumElements: Int, forcePrecise: Bool = false) -> (json: String?, detail: String) {
         guard embeddedHelperMatchesExpectedProtocol,
               FileManager.default.isExecutableFile(atPath: executablePath),
               GUIAutomationPayloadPolicy.isValidScreenshotJPEG(jpegData) else {
@@ -48,22 +48,51 @@ enum EmbeddedVisionHelper {
 
         var standardOutput: NSString?
         var standardError: NSString?
+        let helperTimeout: TimeInterval = 6
         let code = CloudCodeSpawnHelperWithSeparatedOutput(
             executablePath,
-            ["ocr-file", inputURL.path, String(boundedMaximum)],
+            ["ocr-file", inputURL.path, String(boundedMaximum), forcePrecise ? "accurate" : "fast"],
             false,
-            4,
+            helperTimeout,
             &standardOutput,
             &standardError
         )
         let stdout = (standardOutput as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let stderr = (standardError as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard code == 0, !stdout.isEmpty, stdout.utf8.count <= 64 * 1024 else {
-            let diagnostic = stderr.isEmpty ? stdout : stderr
-            return (nil, diagnostic.isEmpty ? "轻量 Vision helper 退出码 \(code)。" : "轻量 Vision helper 退出码 \(code)：\(diagnostic)")
+        let stdoutData = stdout.data(using: .utf8)
+        let outputJSONValid = !stdout.isEmpty
+            && stdout.utf8.count <= 64 * 1024
+            && stdoutData.flatMap { try? JSONSerialization.jsonObject(with: $0) } != nil
+#if canImport(Darwin)
+        let parentTimeoutCode = -7000 - Int(ETIMEDOUT)
+#else
+        let parentTimeoutCode = Int.min
+#endif
+        // OCR is read-only. If a complete parseable JSON result was synchronously written before a
+        // late parent-side reap timeout, preserve that observation rather than discarding it. This
+        // mirrors the existing bounded AX read-only acceptance rule and never converts partial text
+        // into success.
+        if outputJSONValid, code == 0 || (code == parentTimeoutCode && stderr.contains("stdout-json-completed")) {
+            let suffix = stderr.isEmpty ? "" : " helper diagnostics: \(stderr)"
+            let completion = code == 0 ? "completed" : "completed_json_before_parent_timeout"
+            return (stdout, "ocr_helper_status=\(completion); OCR 已在无 root/private GUI entitlement 的轻量 Vision helper 中执行。\(suffix)")
         }
-        let suffix = stderr.isEmpty ? "" : " helper diagnostics: \(stderr)"
-        return (stdout, "OCR 已在无 root/private GUI entitlement 的轻量 Vision helper 中执行。\(suffix)")
+
+        let failureClass: String
+        if code == parentTimeoutCode || stderr.contains("helper timed out after") {
+            failureClass = "helper_timeout"
+        } else if stdout.isEmpty {
+            failureClass = "no_json"
+        } else if stdout.utf8.count > 64 * 1024 {
+            failureClass = "json_oversized"
+        } else if !outputJSONValid {
+            failureClass = "invalid_json"
+        } else {
+            failureClass = "helper_exit_failure"
+        }
+        let diagnostic = stderr.isEmpty ? stdout : stderr
+        let boundedDiagnostic = String(diagnostic.prefix(4_096))
+        return (nil, "ocr_helper_status=\(failureClass); exit=\(code); \(boundedDiagnostic.isEmpty ? "no helper diagnostic" : boundedDiagnostic)")
     }
 }
 
@@ -123,6 +152,15 @@ enum EmbeddedRootHelper {
         var detail: String
     }
 
+    struct FocusedTextInputPayload: Decodable, Sendable {
+        var runtimeAvailable: Bool
+        var focusedElementAvailable: Bool
+        var focusedTextInput: Bool
+        var role: String
+        var backend: String
+        var pid: Int32
+    }
+
     static let executableName = "CloudCodeRootHelper"
     static let expectedProtocolMarker = "cloudcode-root-helper-protocol=1"
 
@@ -147,16 +185,31 @@ enum EmbeddedRootHelper {
         guard embeddedHelperMatchesExpectedProtocol else {
             return (69, "内嵌 CloudCodeRootHelper 与当前 App 协议不匹配；拒绝执行，避免误用旧 helper。")
         }
-        var diagnostic: NSString?
-        let code = CloudCodeSpawnHelperWithOutput(
+
+        // RootHelperBridge appends transport/process evidence to stderr for CloudCode helpers.
+        // Machine-readable helper payloads and exact probe markers live on stdout. Keeping the two
+        // streams merged made a successful `enumerate-json` look like two concatenated JSON objects
+        // and also made the exact protocol marker probe fail. Preserve stdout as the authoritative
+        // success payload; only fold stderr into the diagnostic on failure (or when success has no
+        // stdout payload at all).
+        var standardOutput: NSString?
+        var standardError: NSString?
+        let code = CloudCodeSpawnHelperWithSeparatedOutput(
             executablePath,
             arguments,
             privilege == .root,
             timeout,
-            &diagnostic
+            &standardOutput,
+            &standardError
         )
-        let text = (diagnostic as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return (code, text)
+        let stdout = (standardOutput as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let stderr = (standardError as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if code == 0 {
+            return (code, stdout)
+        }
+        if stdout.isEmpty { return (code, stderr) }
+        if stderr.isEmpty { return (code, stdout) }
+        return (code, stdout + "\n" + stderr)
     }
 
     private static func runSeparated(_ arguments: [String], privilege: PrivilegeMode, timeout: TimeInterval = 6) -> (code: Int, stdout: String, stderr: String) {
@@ -178,6 +231,13 @@ enum EmbeddedRootHelper {
             (standardOutput as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
             (standardError as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         )
+    }
+
+    private static func mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: Int, diagnostic: String) -> Bool {
+        let parentTimeoutCode = -7000 - Int(ETIMEDOUT)
+        return code == parentTimeoutCode
+            && diagnostic.contains("helper timed out after")
+            && !diagnostic.contains("capture truncated")
     }
 
     private static func failureDetail(prefix: String, code: Int, diagnostic: String) -> String {
@@ -223,6 +283,10 @@ enum EmbeddedRootHelper {
         case 79: meaning = "App introspection 输出无法安全序列化或超过上限"
         case 80: meaning = "URL 已被系统接受，但目标 App 前台状态无法验证"
         case 81: meaning = "URL 路由被系统拒绝"
+        case 82: meaning = "IPA 路径、文件类型或期望 Bundle/Build 元数据无效"
+        case 83: meaning = "未发现可信且可执行的 TrollStore trollstorehelper"
+        case 84: meaning = "TrollStore 签名/安装 helper 执行失败或超时"
+        case 85: meaning = "TrollStore 返回成功，但安装后的 Bundle/Build 最终状态不匹配"
         default: meaning = ""
         }
         let suffix = meaning.isEmpty ? "" : "（\(meaning)）"
@@ -234,43 +298,83 @@ enum EmbeddedRootHelper {
         guard FileManager.default.fileExists(atPath: path), FileManager.default.isExecutableFile(atPath: path) else {
             return (nil, "\(executableName) 不可执行；跨 App 枚举保持不可用。")
         }
-        let result = run(["enumerate-json"], privilege: .isolatedUser, timeout: 5)
-        guard result.code == 0 else {
-            return (nil, failureDetail(prefix: "\(executableName) 隔离枚举", code: result.code, diagnostic: result.diagnostic))
+
+        func decode(_ diagnostic: String) -> EnumerationPayload? {
+            let decoder = JSONDecoder()
+            if let data = diagnostic.data(using: .utf8), let payload = try? decoder.decode(EnumerationPayload.self, from: data) {
+                return payload
+            }
+            if let start = diagnostic.firstIndex(of: "{"), let end = diagnostic.lastIndex(of: "}") {
+                let json = String(diagnostic[start...end])
+                if let data = json.data(using: .utf8), let payload = try? decoder.decode(EnumerationPayload.self, from: data) {
+                    return payload
+                }
+            }
+            return nil
         }
-        let decoder = JSONDecoder()
-        if let data = result.diagnostic.data(using: .utf8), let payload = try? decoder.decode(EnumerationPayload.self, from: data) {
-            return (payload, "\(payload.backend) 已在 helper 子进程内完成枚举。")
+
+        func hasCrossAppEvidence(_ payload: EnumerationPayload) -> Bool {
+            let ownBundleID = Bundle.main.bundleIdentifier
+            return payload.apps.contains { !$0.bundleID.isEmpty && $0.bundleID != ownBundleID }
         }
-        if let start = result.diagnostic.firstIndex(of: "{"), let end = result.diagnostic.lastIndex(of: "}") {
-            let json = String(result.diagnostic[start...end])
-            if let data = json.data(using: .utf8), let payload = try? decoder.decode(EnumerationPayload.self, from: data) {
-                return (payload, "\(payload.backend) 已在 helper 子进程内完成枚举。")
+
+        // Cross-App discovery is invoked only by an explicit apps.list/apps.inspect/container request,
+        // never by the startup-safe path. On TrollStore, a detached non-root helper can receive a
+        // partial LaunchServices view and then spend the full watchdog window walking hundreds of
+        // Bundle containers, which made Build 99 collapse the live index back to Cloud Code itself.
+        // Prefer the same embedded helper under the TrollStore root persona for this read-only,
+        // bounded inventory operation; exact launch/uninstall still revalidate their own authority.
+        let privileged = runSeparated(["enumerate-json"], privilege: .root, timeout: 7)
+        if let payload = decode(privileged.stdout), hasCrossAppEvidence(payload) {
+            if privileged.code == 0 {
+                return (payload, "\(payload.backend) 已通过 bounded root helper 完成跨 App 枚举。")
+            }
+            if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: privileged.code, diagnostic: privileged.stderr) {
+                return (payload, "\(payload.backend) 已返回可完整解码的跨 App 只读枚举；helper 随后在退出阶段触发父进程超时，因此保留已验证 payload，同时把退出超时留给诊断。")
             }
         }
-        return (nil, "\(executableName) 枚举输出无法解析；已按 fail-closed 处理。")
+        let privilegedDiagnostic = privileged.stderr.isEmpty ? privileged.stdout : privileged.stderr
+        let privilegedDetail = privileged.code == 0
+            ? "root helper 只返回 Cloud Code 自身或输出无法解析"
+            : failureDetail(prefix: "\(executableName) root 枚举", code: privileged.code, diagnostic: privilegedDiagnostic)
+
+        // Keep the isolated path as a compatibility fallback for runtimes where persona/root spawn is
+        // unavailable but LaunchServices is still fully visible to the embedded helper.
+        let isolated = runSeparated(["enumerate-json"], privilege: .isolatedUser, timeout: 5)
+        if let payload = decode(isolated.stdout), hasCrossAppEvidence(payload) {
+            if isolated.code == 0 {
+                return (payload, "\(payload.backend) 已在隔离 helper 子进程内完成跨 App 枚举；root 路径未采用：\(privilegedDetail)")
+            }
+            if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: isolated.code, diagnostic: isolated.stderr) {
+                return (payload, "\(payload.backend) 已返回可完整解码的隔离只读枚举；helper 随后在退出阶段触发父进程超时。root 路径未采用：\(privilegedDetail)")
+            }
+        }
+        let isolatedDiagnostic = isolated.stderr.isEmpty ? isolated.stdout : isolated.stderr
+        let isolatedDetail = isolated.code == 0
+            ? "隔离 helper 只返回 Cloud Code 自身或输出无法解析"
+            : failureDetail(prefix: "\(executableName) 隔离枚举", code: isolated.code, diagnostic: isolatedDiagnostic)
+        return (nil, "跨 App 枚举未建立有效索引；root：\(privilegedDetail)；isolated：\(isolatedDetail)。")
     }
 
     static func appIntrospection(bundleID: String) -> (payload: AppIntrospectionPayload?, detail: String) {
         let result = runSeparated(["app-introspect-json", bundleID], privilege: .root, timeout: 5)
-        guard result.code == 0 else {
-            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
-            return (nil, failureDetail(prefix: "App introspection", code: result.code, diagnostic: diagnostic))
-        }
         guard let data = result.stdout.data(using: .utf8), data.count <= 256 * 1024,
               let payload = try? JSONDecoder().decode(AppIntrospectionPayload.self, from: data),
               payload.bundleID == bundleID else {
+            if result.code != 0 {
+                let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+                return (nil, failureDetail(prefix: "App introspection", code: result.code, diagnostic: diagnostic))
+            }
             return (nil, "App introspection 返回内容无法验证；已按 fail-closed 处理。")
         }
-        return (payload, "已通过 bounded root helper 读取当前 App 静态 metadata；结果仅作为 discovery/performance hint。")
-    }
-
-    static func launchCapability() -> RootHelperCapabilitySnapshot {
-        let result = run(["probe-launch"], privilege: .isolatedUser, timeout: 4)
         if result.code == 0 {
-            return RootHelperCapabilitySnapshot(available: true, detail: "LaunchServices 启动 selector 已在 helper 子进程内验证。")
+            return (payload, "已通过 bounded root helper 读取当前 App 静态 metadata；结果仅作为 discovery/performance hint。")
         }
-        return RootHelperCapabilitySnapshot(available: false, detail: failureDetail(prefix: "helper 启动能力探测", code: result.code, diagnostic: result.diagnostic))
+        if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.stderr) {
+            return (payload, "App introspection 已返回 bundleID 匹配且可完整解码的只读 metadata；helper 随后在退出阶段触发父进程超时，因此保留已验证 payload。")
+        }
+        let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+        return (nil, failureDetail(prefix: "App introspection", code: result.code, diagnostic: diagnostic))
     }
 
     static func uninstallCapability(bundleID: String) -> RootHelperCapabilitySnapshot {
@@ -279,6 +383,24 @@ enum EmbeddedRootHelper {
             return RootHelperCapabilitySnapshot(available: true, detail: "卸载后端、权威安装状态查询及必要的 Bundle 容器兜底访问已在 helper 子进程内验证。")
         }
         return RootHelperCapabilitySnapshot(available: false, detail: failureDetail(prefix: "helper 卸载能力探测", code: result.code, diagnostic: result.diagnostic))
+    }
+
+    static func ipaInstallCapability() -> RootHelperCapabilitySnapshot {
+        // Discovery is filesystem-only inside the root helper. It does not invoke TrollStore or
+        // install a canary, so privileged capability validation remains side-effect free.
+        let result = run(["probe-ipa-install"], privilege: .root, timeout: 5)
+        if result.code == 0 {
+            return RootHelperCapabilitySnapshot(available: true, detail: "已发现可信 TrollStore 安装包及其 trollstorehelper；实际 IPA 仍需 ToolRouter 系统变更审批。")
+        }
+        return RootHelperCapabilitySnapshot(available: false, detail: failureDetail(prefix: "TrollStore IPA 安装能力探测", code: result.code, diagnostic: result.diagnostic))
+    }
+
+    static func installIPA(path: String, bundleID: String, build: String) -> (success: Bool, detail: String) {
+        let result = run(["install-ipa", path, bundleID, build], privilege: .root, timeout: 100)
+        if result.code == 0 {
+            return (true, result.diagnostic.isEmpty ? "TrollStore helper 已完成签名/安装并核对 Bundle/Build。" : result.diagnostic)
+        }
+        return (false, failureDetail(prefix: "TrollStore IPA 安装", code: result.code, diagnostic: result.diagnostic))
     }
 
     static func installationState(bundleID: String) -> (installed: Bool?, detail: String) {
@@ -312,34 +434,26 @@ enum EmbeddedRootHelper {
             return LaunchOutcome(accepted: true, foregroundVerified: true, detail: "隔离 helper 已验证目标安装状态并完成 App 启动路径。\(route)")
         }
 
-        // Some third-party apps accept the LaunchServices request but the helper cannot read back
-        // a reliable foreground bundle identifier. Once LaunchServices explicitly reports that the
-        // write was accepted, do not immediately issue a second root/FrontBoard launch: that is a
-        // duplicate state-changing write and costs several seconds on real devices. Return the
-        // accepted-but-unverified state and let the caller obtain one fresh screenshot as the next
-        // independent observation. Only use the privileged fallback when the isolated route did not
-        // actually report an accepted launch.
+        // LaunchServices returning "accepted" is not evidence that the requested App became the
+        // foreground App. Build 129 physical-device evidence reproduced the failure mode directly:
+        // WeChat remained installed and discoverable while an accepted-but-unverified isolated launch
+        // left Cloud Code frontmost. Therefore an unverified isolated activation must always fall
+        // through to the bounded root/FrontBoard/BackBoard path. The root helper first rechecks the
+        // current frontmost bundle, so a late successful LaunchServices transition returns quickly;
+        // otherwise the board-service fallback performs one exact, idempotent activation attempt.
         if isolated.code == 46 {
             let isolatedDetail = failureDetail(prefix: "隔离 helper 启动 App", code: isolated.code, diagnostic: isolated.diagnostic)
-            if acceptedButUnverified(isolated) {
-                return LaunchOutcome(
-                    accepted: true,
-                    foregroundVerified: false,
-                    detail: "系统已接受目标 App 启动请求，但 helper 无法可靠读取前台 Bundle ID；已跳过重复 root 启动并等待新鲜截图验证。\(isolatedDetail)"
-                )
-            }
-
             let privileged = run(["launch", bundleID], privilege: .root, timeout: 6)
             if privileged.code == 0 {
                 let route = privileged.diagnostic.isEmpty ? "" : " \(privileged.diagnostic)"
-                return LaunchOutcome(accepted: true, foregroundVerified: true, detail: "隔离 LaunchServices 路径未接受启动后，root helper 通过系统启动路由完成目标 App 前台切换。\(route)")
+                return LaunchOutcome(accepted: true, foregroundVerified: true, detail: "隔离 LaunchServices 未建立可验证前台后，root helper 通过 bounded 系统启动路由完成目标 App 前台切换。\(route)")
             }
             let privilegedDetail = failureDetail(prefix: "root helper 启动 App", code: privileged.code, diagnostic: privileged.diagnostic)
-            if acceptedButUnverified(privileged) {
+            if acceptedButUnverified(privileged) || acceptedButUnverified(isolated) {
                 return LaunchOutcome(
                     accepted: true,
                     foregroundVerified: false,
-                    detail: "root 系统启动请求已被接受，但前台 Bundle ID 仍无法可靠读取；等待截图验证。\(privilegedDetail)"
+                    detail: "启动请求曾被系统接受但目标前台仍未被证明；已继续尝试一次 root/FrontBoard/BackBoard 激活，后续必须依赖 fresh observation 验证且不得把截图默认解释为目标 App。\(isolatedDetail)；root fallback：\(privilegedDetail)"
                 )
             }
             return LaunchOutcome(accepted: false, foregroundVerified: false, detail: "\(isolatedDetail)；root fallback 同样失败：\(privilegedDetail)")
@@ -360,6 +474,10 @@ enum EmbeddedRootHelper {
         if result.code == 0, result.diagnostic == expectedProtocolMarker {
             return RootHelperCapabilitySnapshot(available: true, detail: "\(executableName) 已通过 persona 99 / UID 0 / GID 0 及 helper 协议指纹探测。")
         }
+        if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.diagnostic),
+           String(result.diagnostic.split(separator: "\n", maxSplits: 1).first ?? "") == expectedProtocolMarker {
+            return RootHelperCapabilitySnapshot(available: true, detail: "\(executableName) 已返回精确 helper 协议指纹；随后仅在退出阶段触发父进程超时，因此保留已验证的只读 capability 结果。")
+        }
         if result.code == 0 {
             return RootHelperCapabilitySnapshot(available: false, detail: "\(executableName) root 探测返回了非预期协议指纹；拒绝使用可能过期的 helper。")
         }
@@ -367,36 +485,42 @@ enum EmbeddedRootHelper {
     }
 
     static func filesystemCapability() -> PrivilegedFilesystemCapabilitySnapshot {
-        let result = run(["probe-filesystem-json"], privilege: .root, timeout: 5)
-        guard result.code == 0 else {
-            return PrivilegedFilesystemCapabilitySnapshot(
-                sharedUserFilesAvailable: false,
-                unrestrictedAvailable: false,
-                detail: failureDetail(prefix: "helper 高权限文件系统探测", code: result.code, diagnostic: result.diagnostic)
-            )
-        }
-        let decoder = JSONDecoder()
-        var payload: FilesystemProbePayload?
-        if let data = result.diagnostic.data(using: .utf8) {
-            payload = try? decoder.decode(FilesystemProbePayload.self, from: data)
-        }
-        if payload == nil, let start = result.diagnostic.firstIndex(of: "{"), let end = result.diagnostic.lastIndex(of: "}") {
-            let json = String(result.diagnostic[start...end])
-            if let data = json.data(using: .utf8) {
-                payload = try? decoder.decode(FilesystemProbePayload.self, from: data)
-            }
-        }
+        // Keep the machine-readable capability payload separate from bridge timeout diagnostics so
+        // a fully completed bounded canary cannot be confused with the helper's later exit timeout.
+        let result = runSeparated(["probe-filesystem-json"], privilege: .root, timeout: 5)
+        let payload = result.stdout.data(using: .utf8).flatMap { try? JSONDecoder().decode(FilesystemProbePayload.self, from: $0) }
         guard let payload else {
+            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
             return PrivilegedFilesystemCapabilitySnapshot(
                 sharedUserFilesAvailable: false,
                 unrestrictedAvailable: false,
-                detail: "helper 高权限文件系统探测输出无法解析；已按 fail-closed 处理。"
+                detail: result.code == 0
+                    ? "helper 高权限文件系统探测输出无法解析；已按 fail-closed 处理。"
+                    : failureDetail(prefix: "helper 高权限文件系统探测", code: result.code, diagnostic: diagnostic)
             )
         }
+        if result.code == 0 {
+            return PrivilegedFilesystemCapabilitySnapshot(
+                sharedUserFilesAvailable: payload.sharedUserFiles,
+                unrestrictedAvailable: payload.unrestricted,
+                detail: payload.detail
+            )
+        }
+        if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.stderr) {
+            // The JSON is useful diagnostic evidence that the bounded canary finished, but this
+            // capability gates later filesystem writes/deletes. A parent exit timeout must not turn
+            // that evidence into destructive authority; keep both capabilities fail-closed.
+            return PrivilegedFilesystemCapabilitySnapshot(
+                sharedUserFilesAvailable: false,
+                unrestrictedAvailable: false,
+                detail: payload.detail + "；helper 随后在退出阶段触发父进程超时。完整 JSON 仅保留为诊断证据，不授予共享文件或 unrestricted 写/删权限"
+            )
+        }
+        let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
         return PrivilegedFilesystemCapabilitySnapshot(
-            sharedUserFilesAvailable: payload.sharedUserFiles,
-            unrestrictedAvailable: payload.unrestricted,
-            detail: payload.detail
+            sharedUserFilesAvailable: false,
+            unrestrictedAvailable: false,
+            detail: failureDetail(prefix: "helper 高权限文件系统探测", code: result.code, diagnostic: diagnostic)
         )
     }
 
@@ -457,31 +581,86 @@ enum EmbeddedRootHelper {
             return (nil, "\(executableName) 不可执行；GUI backend 保持不可用。")
         }
         let result = runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)
-        guard result.code == 0, let payload = decodeGUIProbe(result.stdout) else {
+        guard let payload = decodeGUIProbe(result.stdout) else {
             let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
             return (nil, failureDetail(prefix: "隔离 GUI readiness 探测", code: result.code, diagnostic: diagnostic))
         }
-        let diagnosticSuffix = result.stderr.isEmpty ? "" : " helper diagnostics: \(result.stderr)"
-        return (payload, "\(payload.backend) 已在受限 root helper 内完成只读 readiness handshake。\(diagnosticSuffix)")
+        if result.code == 0 {
+            let diagnosticSuffix = result.stderr.isEmpty ? "" : " helper diagnostics: \(result.stderr)"
+            return (payload, "\(payload.backend) 已在受限 root helper 内完成只读 readiness handshake。\(diagnosticSuffix)")
+        }
+        if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.stderr) {
+            return (payload, "\(payload.backend) 已返回完整可解码的只读 readiness payload；helper 随后仅在退出阶段触发父进程超时，因此保留已验证结果。")
+        }
+        let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
+        return (nil, failureDetail(prefix: "隔离 GUI readiness 探测", code: result.code, diagnostic: diagnostic))
     }
 
     static func guiTree() -> (tree: String?, detail: String) {
-        // AX is an accessibility-client capability, not a UID-0 capability. The real-device build
-        // repeatedly timed out when the detached helper was spawned as persona-99/root. Execute the
-        // same entitlement-bearing helper as the ordinary mobile user instead; if iOS refuses this
-        // standalone client, fail quickly and let screenshot/OCR remain the deterministic path.
-        // Full XCTest/XCAXClient behavior requires an automation session and cannot be manufactured
-        // merely by adding root privileges to a TrollStore process.
-        let result = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)
-        guard result.code == 0, !result.stdout.isEmpty else {
-            let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
-            return (nil, failureDetail(prefix: "GUI tree (mobile AX client)", code: result.code, diagnostic: diagnostic))
+        func validatedTree(_ result: (code: Int, stdout: String, stderr: String)) -> String? {
+            guard !result.stdout.isEmpty, result.stdout.utf8.count <= 256 * 1024,
+                  let treeData = result.stdout.data(using: .utf8),
+                  (try? JSONSerialization.jsonObject(with: treeData)) != nil else { return nil }
+            if result.code == 0 { return result.stdout }
+            if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.stderr) { return result.stdout }
+            return nil
         }
-        guard result.stdout.utf8.count <= 256 * 1024 else {
+
+        // AX authority on TrollStore is runtime-dependent. The non-root bridge call is intercepted
+        // inside the real System-app host first so semantic reads keep a registered RunningBoard/App
+        // identity instead of relying on an anonymous one-shot helper. A single bounded persona-99
+        // retry remains the fail-closed fallback. Neither route mutates AXManualAccessibility, so
+        // this fallback cannot reintroduce the visible green scan frame.
+        let isolated = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 1.25)
+        if let tree = validatedTree(isolated) {
+            if isolated.code == 0 {
+                let suffix = isolated.stderr.isEmpty ? "" : " helper diagnostics: \(isolated.stderr)"
+                return (tree, "AXRuntime tree 已由 System-app host AX fast path 返回。\(suffix)")
+            }
+            return (tree, "AXRuntime tree 已由 non-root AX 路径返回完整可解析 JSON；退出阶段异常不影响这份已验证的只读 tree。")
+        }
+        if isolated.stdout.utf8.count > 256 * 1024 {
             return (nil, "GUI tree 输出超过 256 KiB 限制，已 fail closed。")
         }
-        let diagnosticSuffix = result.stderr.isEmpty ? "" : " helper diagnostics: \(result.stderr)"
-        return (result.stdout, "AXRuntime tree 已由 mobile 身份 helper 返回。\(diagnosticSuffix)")
+
+        let privileged = runSeparated(["gui-tree-json"], privilege: .root, timeout: 0.7)
+        if let tree = validatedTree(privileged) {
+            let suffix = privileged.stderr.isEmpty ? "" : " helper diagnostics: \(privileged.stderr)"
+            return (tree, "System-app host AX fast path 未返回可用语义树；persona-99 被动 AX fallback 返回了有效 tree。\(suffix)")
+        }
+
+        let isolatedDiagnostic = isolated.stderr.isEmpty ? isolated.stdout : isolated.stderr
+        let privilegedDiagnostic = privileged.stderr.isEmpty ? privileged.stdout : privileged.stderr
+        let isolatedDetail = failureDetail(prefix: "GUI tree (System-app host AX fast path)", code: isolated.code, diagnostic: isolatedDiagnostic)
+        let privilegedDetail = failureDetail(prefix: "GUI tree (persona-99 passive fallback)", code: privileged.code, diagnostic: privilegedDiagnostic)
+        return (nil, "\(isolatedDetail)；root fallback：\(privilegedDetail)")
+    }
+
+    static func focusedTextInput() -> (payload: FocusedTextInputPayload?, detail: String) {
+        func decode(_ result: (code: Int, stdout: String, stderr: String)) -> FocusedTextInputPayload? {
+            guard let data = result.stdout.data(using: .utf8), data.count <= 4 * 1024,
+                  let payload = try? JSONDecoder().decode(FocusedTextInputPayload.self, from: data) else { return nil }
+            if result.code == 0 { return payload }
+            if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.stderr) { return payload }
+            return nil
+        }
+
+        let isolated = runSeparated(["gui-focused-text-input-json"], privilege: .isolatedUser, timeout: 1.25)
+        if let payload = decode(isolated) {
+            if isolated.code == 0 {
+                return (payload, isolated.stderr.isEmpty ? "AX focused-text probe completed via System-app host AX fast path." : "AX focused-text probe completed via System-app host AX fast path. diagnostics: \(isolated.stderr)")
+            }
+            return (payload, "AX focused-text probe 已由 non-root AX 路径返回完整可解码 payload；退出阶段异常不影响这份已验证的只读结果。")
+        }
+
+        let privileged = runSeparated(["gui-focused-text-input-json"], privilege: .root, timeout: 0.7)
+        if let payload = decode(privileged) {
+            return (payload, privileged.stderr.isEmpty ? "AX focused-text probe completed via persona-99 passive fallback." : "AX focused-text probe completed via persona-99 passive fallback. helper diagnostics: \(privileged.stderr)")
+        }
+
+        let isolatedDiagnostic = isolated.stderr.isEmpty ? isolated.stdout : isolated.stderr
+        let privilegedDiagnostic = privileged.stderr.isEmpty ? privileged.stdout : privileged.stderr
+        return (nil, "\(failureDetail(prefix: "GUI focused text input (System-app host AX fast path)", code: isolated.code, diagnostic: isolatedDiagnostic))；root fallback：\(failureDetail(prefix: "GUI focused text input (persona-99 passive fallback)", code: privileged.code, diagnostic: privilegedDiagnostic))")
     }
 
     static func guiScreenshot() -> (data: Data?, detail: String) {
@@ -503,15 +682,21 @@ enum EmbeddedRootHelper {
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: outputURL.path)
         defer { try? FileManager.default.removeItem(at: outputURL) }
         let result = run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)
-        guard result.code == 0 else {
-            return (nil, failureDetail(prefix: "GUI screenshot", code: result.code, diagnostic: result.diagnostic))
-        }
         guard let data = try? Data(contentsOf: outputURL, options: [.mappedIfSafe]),
               GUIAutomationPayloadPolicy.isValidScreenshotJPEG(data) else {
+            if result.code != 0 {
+                return (nil, failureDetail(prefix: "GUI screenshot", code: result.code, diagnostic: result.diagnostic))
+            }
             return (nil, "GUI screenshot helper 返回成功，但 tmp 文件不是有效的 bounded JPEG；已按 fail-closed 处理。")
         }
-        let routeDetail = result.diagnostic.isEmpty ? "" : " helper diagnostics: \(result.diagnostic)"
-        return (data, "全局截图已通过独立 tmp JPEG 通道返回。\(routeDetail)")
+        if result.code == 0 {
+            let routeDetail = result.diagnostic.isEmpty ? "" : " helper diagnostics: \(result.diagnostic)"
+            return (data, "全局截图已通过独立 tmp JPEG 通道返回。\(routeDetail)")
+        }
+        if mayAcceptValidatedReadOnlyPayloadAfterParentTimeout(code: result.code, diagnostic: result.diagnostic) {
+            return (data, "全局截图 JPEG 已完整写入并通过格式/大小校验；helper 随后仅在退出阶段触发父进程超时，因此保留已验证的只读截图。")
+        }
+        return (nil, failureDetail(prefix: "GUI screenshot", code: result.code, diagnostic: result.diagnostic))
     }
 
     static func guiTap(x: Double, y: Double) -> (success: Bool, detail: String) {
@@ -552,26 +737,33 @@ enum EmbeddedRootHelper {
         let encoded = utf8.base64EncodedString()
         let result = run(["gui-type-base64", encoded], privilege: .root, timeout: 6)
         return result.code == 0
-            ? (true, result.diagnostic.isEmpty ? "文本输入已通过受控 AX/HID 路径提交；输入内容未写入 helper 诊断输出。" : "文本输入已提交；输入内容未写入日志。\(result.diagnostic)")
+            ? (true, result.diagnostic.isEmpty ? "文本输入已通过无 AX 的受控 HID 路径派发；语义结果必须由后续截图/OCR 验证。" : "文本输入已通过无 AX 的 HID 路径派发；输入内容未写入日志。\(result.diagnostic)")
             : (false, failureDetail(prefix: "GUI type", code: result.code, diagnostic: result.diagnostic))
     }
 
     static func startBackgroundAssertion(targetPID: Int32) -> (workerPID: Int32?, detail: String) {
         guard targetPID > 1 else { return (nil, "后台 assertion 目标 PID 无效。") }
-        let result = run(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)
+        // `background-assert-start` writes its authoritative workerPID handshake to stderr before
+        // hard-exiting. The generic run() intentionally discards stderr on code 0, which made Build
+        // 113 create a real detached worker but then report "no worker PID" to the App. Every later
+        // background transition therefore spawned another orphan worker. Preserve both streams for
+        // this command and parse the success handshake from stderr (stdout remains accepted for old
+        // helper compatibility).
+        let result = runSeparated(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)
+        let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
         guard result.code == 0 else {
-            return (nil, failureDetail(prefix: "后台 assertion worker", code: result.code, diagnostic: result.diagnostic))
+            return (nil, failureDetail(prefix: "后台 assertion worker", code: result.code, diagnostic: diagnostic))
         }
         let marker = "workerPID="
-        guard let range = result.diagnostic.range(of: marker) else {
+        guard let range = diagnostic.range(of: marker) else {
             return (nil, "后台 assertion worker 已返回成功，但没有提供 worker PID；按 fail-closed 处理。")
         }
-        let suffix = result.diagnostic[range.upperBound...]
+        let suffix = diagnostic[range.upperBound...]
         let digits = suffix.prefix { $0.isNumber }
         guard let workerPID = Int32(digits), workerPID > 1 else {
             return (nil, "后台 assertion worker PID 无法解析；按 fail-closed 处理。")
         }
-        return (workerPID, result.diagnostic)
+        return (workerPID, diagnostic)
     }
 
     static func backgroundAssertionIsAlive(workerPID: Int32) -> Bool {
@@ -588,7 +780,7 @@ enum EmbeddedRootHelper {
     }
 }
 
-public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, RootHelperCapabilityProviding, PrivilegedFilesystemCapabilityProviding, AppLifecycleCapabilityProviding {
+public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, AppEnumerationCapabilityProviding, AppUninstallCapabilityProviding, RootHelperCapabilityProviding, IPAInstallationCapabilityProviding, PrivilegedFilesystemCapabilityProviding, AppLifecycleCapabilityProviding {
     private var cachedApps: [ResourceNode] = []
     private var bundlePaths: [String: String] = [:]
     private var containerPaths: [String: String] = [:]
@@ -597,10 +789,10 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
     private var negativeBundleIDs: Set<String> = []
     private var unregisteredBundleIDs: Set<String> = []
     private var enumerationProven = false
+    private var hasLastKnownGoodCrossAppIndex = false
     private var enumerationDetail = "尚未检测已安装 App 枚举能力。"
     private var uninstallDetail = "尚未检测 App 卸载后端。"
     private var pendingUninstallBundleID: String?
-    private var cachedLaunchCapability: AppLifecycleCapabilitySnapshot?
     private var cachedIntrospection: [String: AppStaticIntrospection] = [:]
     private let diagnosticLogger: DiagnosticLogStore?
 
@@ -610,9 +802,9 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
 
     public func startupSafeApps() -> [ResourceNode] {
         enumerationProven = false
+        hasLastKnownGoodCrossAppIndex = false
         enumerationDetail = "自动启动阶段仅加载 Cloud Code 自身；跨 App 私有 API 探测已延后。"
         uninstallDetail = "卸载能力尚未进行显式设备验证。"
-        cachedLaunchCapability = nil
         bundlePaths = [:]
         containerPaths = [:]
         cachedApps = fallbackOwnApp()
@@ -641,9 +833,25 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
         cachedApps.first(where: { $0.ownerBundleID == bundleID })?.displayName
     }
 
+    public func installationState(bundleID: String) async -> (installed: Bool?, detail: String) {
+        let result = EmbeddedRootHelper.installationState(bundleID: bundleID)
+        try? await diagnosticLogger?.log(
+            level: result.installed == true ? .info : (result.installed == false ? .warning : .error),
+            subsystem: "app-installation",
+            action: "exact-state",
+            result: result.installed.map { $0 ? "installed" : "not-installed" } ?? "unknown",
+            diagnostic: result.detail,
+            metadata: ["bundleID": bundleID]
+        )
+        return result
+    }
+
     public func appIntrospection(bundleID: String) async -> AppStaticIntrospection? {
         let indexedVersion = cachedVersion(for: bundleID)
-        if let cached = cachedIntrospection[bundleID], indexedVersion == nil || cached.version == indexedVersion {
+        if let cached = cachedIntrospection[bundleID],
+           let indexedVersion,
+           cached.version == indexedVersion,
+           bundlePaths[bundleID] == cached.bundlePath {
             return cached
         }
         let result = EmbeddedRootHelper.appIntrospection(bundleID: bundleID)
@@ -690,6 +898,9 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
             localData: payload.localData
         )
         cachedIntrospection[bundleID] = introspection
+        if !introspection.bundlePath.isEmpty { bundlePaths[bundleID] = introspection.bundlePath }
+        if !introspection.dataContainerPath.isEmpty { containerPaths[bundleID] = introspection.dataContainerPath }
+        negativeBundleIDs.remove(bundleID)
         return introspection
     }
 
@@ -697,6 +908,16 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
         if bundleID == Bundle.main.bundleIdentifier { return bundlePaths[bundleID] ?? Bundle.main.bundleURL.path }
         if shouldRefreshIndex() { refresh() }
         if let value = bundlePaths[bundleID] { return value }
+
+        // A full installed-App inventory is useful for discovery, but it is not a prerequisite for
+        // an exact Bundle-ID lookup. Detached TrollStore helpers can occasionally lose the broad
+        // LaunchServices enumeration view while an exact LSApplicationProxy lookup still resolves
+        // the requested App correctly. Reuse the bounded single-App introspection path before
+        // concluding that a known target such as WeChat is absent.
+        if let exact = await appIntrospection(bundleID: bundleID), !exact.bundlePath.isEmpty {
+            return exact.bundlePath
+        }
+
         guard enumerationProven, !negativeBundleIDs.contains(bundleID) else { return nil }
         // A cache miss can mean a newly installed App. Permit one refresh for that bundle ID, then
         // remember a negative lookup so a stale/invalid ID cannot trigger a full 385-App scan forever.
@@ -713,6 +934,14 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
         // If the bundle itself is already in the index, an absent container path is a known value,
         // not evidence that the whole App index is stale.
         if bundlePaths[bundleID] != nil { return nil }
+
+        // Exact container resolution stays available even when broad installed-App enumeration is
+        // temporarily degraded. The single-App helper verifies the current Bundle ID and returns the
+        // current container UUID dynamically, so no historical UUID path is treated as identity.
+        if let exact = await appIntrospection(bundleID: bundleID), !exact.dataContainerPath.isEmpty {
+            return exact.dataContainerPath
+        }
+
         guard enumerationProven, !negativeBundleIDs.contains(bundleID) else { return nil }
         refresh()
         if let value = containerPaths[bundleID] { return value }
@@ -721,12 +950,20 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
     }
 
     public func canEnumerateInstalledApps() async -> Bool {
-        if shouldRefreshIndex() { refresh() }
+        // Capability/status reads must not start a second broad scan. Callers such as apps.list
+        // first obtain installedApps(), which is the single place allowed to perform the necessary
+        // refresh for that read. This method only reports whether that completed refresh earned
+        // fresh cross-App authority.
         return enumerationProven
     }
 
+    public func canUseInstalledAppIndex() async -> Bool {
+        // Same one-refresh rule as above: report whether the current in-memory snapshot is usable
+        // for read-only discovery, including a retained last-known-good cross-App index.
+        return enumerationProven || hasLastKnownGoodCrossAppIndex
+    }
+
     public func installedAppEnumerationDetail() async -> String {
-        if shouldRefreshIndex() { refresh() }
         return enumerationDetail
     }
 
@@ -740,6 +977,39 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
             diagnostic: snapshot.detail
         )
         return snapshot
+    }
+
+    public func ipaInstallationCapability() async -> RootHelperCapabilitySnapshot {
+        let snapshot = EmbeddedRootHelper.ipaInstallCapability()
+        try? await diagnosticLogger?.log(
+            level: snapshot.available ? .info : .warning,
+            subsystem: "root-helper",
+            action: "ipa-install-capability",
+            result: snapshot.available ? "available" : "device_validation_required",
+            diagnostic: snapshot.detail
+        )
+        return snapshot
+    }
+
+    public func installIPA(path: String, bundleID: String, build: String) async -> (success: Bool, detail: String) {
+        let outcome = EmbeddedRootHelper.installIPA(path: path, bundleID: bundleID, build: build)
+        try? await diagnosticLogger?.log(
+            level: outcome.success ? .info : .error,
+            subsystem: "root-helper",
+            action: "ipa-install",
+            result: outcome.success ? "installed_verified" : "failed",
+            diagnostic: outcome.detail,
+            metadata: ["bundleID": bundleID, "build": build]
+        )
+        if outcome.success {
+            // The app index is a rebuildable discovery cache. Force its next reader to observe the
+            // newly installed bundle rather than serving the pre-install path/version snapshot.
+            appIndexNeedsRefresh = true
+            failedIndexRetryAfter = nil
+            negativeBundleIDs.remove(bundleID)
+            cachedIntrospection.removeValue(forKey: bundleID)
+        }
+        return outcome
     }
 
     public func privilegedFilesystemCapability() async -> PrivilegedFilesystemCapabilitySnapshot {
@@ -759,20 +1029,13 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
     }
 
     public func appLaunchCapability() async -> AppLifecycleCapabilitySnapshot {
-        if let cachedLaunchCapability, cachedLaunchCapability.available {
-            return cachedLaunchCapability
-        }
-        let snapshot = EmbeddedRootHelper.launchCapability()
-        let lifecycle = AppLifecycleCapabilitySnapshot(available: snapshot.available, detail: snapshot.detail)
-        if lifecycle.available { cachedLaunchCapability = lifecycle }
-        try? await diagnosticLogger?.log(
-            level: snapshot.available ? .info : .warning,
-            subsystem: "root-helper",
-            action: "launch-capability",
-            result: snapshot.available ? "available" : "unavailable",
-            diagnostic: snapshot.detail
+        // Build 110 proved that asking LaunchServices a no-target capability question can block for
+        // the entire helper watchdog even though exact app launches remain independently testable.
+        // Keep the capability deferred and let the exact bundle-scoped operation self-validate.
+        return AppLifecycleCapabilitySnapshot(
+            available: false,
+            detail: "Launch capability uses exact-operation self-validation; the no-target LaunchServices probe is intentionally disabled because it can block on this TrollStore runtime."
         )
-        return lifecycle
     }
 
     public func appTerminateCapability() async -> AppLifecycleCapabilitySnapshot {
@@ -798,10 +1061,8 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
         guard !bundleID.isEmpty, bundleID != Bundle.main.bundleIdentifier else {
             return (false, false, "目标 Bundle ID 无效，或目标是 Cloud Code 自身。")
         }
-        let capability = await appLaunchCapability()
-        guard capability.available else {
-            return (false, false, "启动能力不可用：\(capability.detail)")
-        }
+        // Do not run the old no-target launch capability probe here. The exact helper call below
+        // validates installation state, dispatch acceptance and foreground state for this bundle.
         let helperOutcome = EmbeddedRootHelper.launch(bundleID: bundleID)
         let outcome = (accepted: helperOutcome.accepted, foregroundVerified: helperOutcome.foregroundVerified, detail: helperOutcome.detail)
         var metadata = ["bundleID": bundleID, "foregroundVerified": outcome.foregroundVerified ? "true" : "false"]
@@ -1050,18 +1311,52 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
     private func refresh() {
         defer { appIndexNeedsRefresh = false }
 
+        // A manual capability refresh is advisory discovery, not authority to erase a previously
+        // verified installed-App index. Build 107 cleared the last-known-good cache before running
+        // the helper; when the helper emitted a complete list but then hit its parent timeout, the
+        // resolver collapsed to Cloud Code-only and subsequently reported real apps such as WeChat
+        // as missing. Preserve the previous cross-app snapshot until a new snapshot is fully proven.
+        let previousApps = cachedApps
+        let previousBundlePaths = bundlePaths
+        let previousContainerPaths = containerPaths
+        let previousUnregisteredBundleIDs = unregisteredBundleIDs
+        let ownBundleID = Bundle.main.bundleIdentifier
+        let hadLastKnownGoodCrossAppIndex = hasLastKnownGoodCrossAppIndex && previousApps.contains {
+            $0.ownerBundleID != nil && $0.ownerBundleID != ownBundleID
+        }
+        // Every refresh must earn fresh authority again. A retained last-known-good index remains
+        // usable only for read-only discovery and exact routing hints.
         enumerationProven = false
-        enumerationDetail = "已安装 App 枚举尚未得到跨 App 可见性的有效证据。"
+
+        enumerationDetail = "正在根据本次 helper 隔离探测刷新已安装 App 索引。"
         uninstallDetail = "正在根据本次 helper 隔离探测重新判断卸载后端。"
-        bundlePaths = [:]
-        containerPaths = [:]
-        unregisteredBundleIDs.removeAll()
 
         let isolated = EmbeddedRootHelper.enumerateInstalledApps()
         guard let payload = isolated.payload, !payload.apps.isEmpty else {
-            enumerationDetail = isolated.detail + " 失败结果会缓存 30 秒，避免模型循环触发全量枚举。"
-            cachedApps = fallbackOwnApp()
             failedIndexRetryAfter = Date().addingTimeInterval(30)
+            if hadLastKnownGoodCrossAppIndex {
+                cachedApps = previousApps
+                bundlePaths = previousBundlePaths
+                containerPaths = previousContainerPaths
+                unregisteredBundleIDs = previousUnregisteredBundleIDs
+                hasLastKnownGoodCrossAppIndex = true
+                enumerationDetail = "本次重新检测失败；继续保留最近一次已验证的跨 App 内存索引，不把临时 helper 故障解释成 App 不存在。失败详情：\(isolated.detail.prefix(1200))。30 秒后才允许再次做全量枚举；当前枚举权威状态保持未验证，卸载/停止等状态改变操作不能使用这份旧索引作为授权依据。"
+                uninstallDetail = "本次索引刷新失败；保留最近一次只读 App 索引。任何卸载仍必须重新通过精确安装状态和卸载后端验证。"
+            } else {
+                enumerationProven = false
+                hasLastKnownGoodCrossAppIndex = false
+                enumerationDetail = isolated.detail + " 失败结果会缓存 30 秒，避免模型循环触发全量枚举。"
+                cachedApps = fallbackOwnApp()
+                bundlePaths = Dictionary(uniqueKeysWithValues: cachedApps.compactMap { node in
+                    guard let bundleID = node.ownerBundleID, let path = node.resolvedPath else { return nil }
+                    return (bundleID, path)
+                })
+                containerPaths = [:]
+                if let ownBundleID = Bundle.main.bundleIdentifier {
+                    containerPaths[ownBundleID] = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).path
+                }
+                unregisteredBundleIDs.removeAll()
+            }
             return
         }
 
@@ -1089,15 +1384,36 @@ public actor IOSAppResolver: AppContainerResolving, AppIntrospectionProviding, A
         }
 
         let parsedApps = appsByBundleID.values.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
-        let ownBundleID = Bundle.main.bundleIdentifier
         let crossAppCount = parsedApps.filter { $0.ownerBundleID != nil && $0.ownerBundleID != ownBundleID }.count
         guard crossAppCount > 0 else {
-            enumerationDetail = "\(payload.backend) helper 只返回 Cloud Code 自身或无法解析的记录；跨 App 枚举未通过。"
-            cachedApps = fallbackOwnApp()
+            failedIndexRetryAfter = Date().addingTimeInterval(30)
+            if hadLastKnownGoodCrossAppIndex {
+                cachedApps = previousApps
+                bundlePaths = previousBundlePaths
+                containerPaths = previousContainerPaths
+                unregisteredBundleIDs = previousUnregisteredBundleIDs
+                hasLastKnownGoodCrossAppIndex = true
+                enumerationDetail = "\(payload.backend) 本次只返回 Cloud Code 自身或无法解析的记录；未覆盖最近一次已验证的跨 App 只读索引。当前枚举权威状态保持未验证，30 秒后允许重试。"
+                uninstallDetail = "本次索引刷新未建立新的跨 App 权威快照；旧索引仅供只读发现，卸载仍要求新的设备验证。"
+            } else {
+                cachedApps = fallbackOwnApp()
+                bundlePaths = Dictionary(uniqueKeysWithValues: cachedApps.compactMap { node in
+                    guard let bundleID = node.ownerBundleID, let path = node.resolvedPath else { return nil }
+                    return (bundleID, path)
+                })
+                containerPaths = [:]
+                if let ownBundleID = Bundle.main.bundleIdentifier {
+                    containerPaths[ownBundleID] = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).path
+                }
+                unregisteredBundleIDs.removeAll()
+                hasLastKnownGoodCrossAppIndex = false
+                enumerationDetail = "\(payload.backend) helper 只返回 Cloud Code 自身或无法解析的记录；跨 App 枚举未通过。失败结果缓存 30 秒，避免同一任务反复触发慢枚举。"
+            }
             return
         }
 
         enumerationProven = true
+        hasLastKnownGoodCrossAppIndex = true
         failedIndexRetryAfter = nil
         negativeBundleIDs.removeAll()
         enumerationDetail = "\(payload.backend) 已在 helper 子进程内返回 \(parsedApps.count) 个有效应用，其中 \(crossAppCount) 个不是 Cloud Code 自身；后续沿用内存索引直到显式失效。"
@@ -1172,40 +1488,6 @@ public final class ApprovalCenter: ObservableObject, ApprovalRequesting, @unchec
     }
 }
 
-public struct IOSSystemExecutor: ToolExecuting, Sendable {
-    public let route: AppExecutionRoute = .cli
-    private let policy: PolicyEngine
-    private let approval: ApprovalRequesting
-
-    public init(policy: PolicyEngine, approval: ApprovalRequesting) {
-        self.policy = policy
-        self.approval = approval
-    }
-
-    public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
-        tool.name == "advanced.shell" && capabilities.isAvailable("execution.ios_system")
-    }
-
-    public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
-        guard let command = call.arguments["command"], !command.isEmpty else { throw ToolRouterError.noExecutionRoute("command missing") }
-        let decision = policy.decision(mode: context.permissionMode, tool: descriptor)
-        if decision == .deny { throw TransactionError.confirmationDenied }
-        if decision == .requireConfirmation {
-            let preview = ApprovalPreview(title: "Run advanced shell", target: command, originalSummary: nil, diff: nil, reason: "Generic shell bypasses typed-tool safety and is high risk", plan: ["Validate permission", "Execute ios_system", "Capture exit status"], risk: .systemChange)
-            guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
-        }
-        #if canImport(Darwin)
-        guard let handle = dlopen(nil, RTLD_NOW), let symbol = dlsym(handle, "ios_system") else { throw ToolRouterError.noExecutionRoute("ios_system symbol missing") }
-        typealias IOSSystemFunction = @convention(c) (UnsafePointer<CChar>) -> Int32
-        let function = unsafeBitCast(symbol, to: IOSSystemFunction.self)
-        let code = command.withCString { function($0) }
-        return ToolResult(toolCallID: call.id, success: code == 0, summary: "ios_system exited \(code)", payload: ["exitCode": String(code)])
-        #else
-        throw ToolRouterError.noExecutionRoute("ios_system unavailable")
-        #endif
-    }
-}
-
 public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecutor, Sendable {
     public let route: AppExecutionRoute = .privateFramework
     private let appResolver: IOSAppResolver
@@ -1213,19 +1495,25 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
     private let approval: ApprovalRequesting
     private let audit: AuditLogStore
     private let resourceIndex: ProgressiveResourceIndex?
+    private let appKnowledgeRegistry: AppKnowledgeRegistry?
+    private let ipaService: IPAService
 
     public init(
         appResolver: IOSAppResolver,
         policy: PolicyEngine,
         approval: ApprovalRequesting,
         audit: AuditLogStore,
-        resourceIndex: ProgressiveResourceIndex? = nil
+        resourceIndex: ProgressiveResourceIndex? = nil,
+        appKnowledgeRegistry: AppKnowledgeRegistry? = nil,
+        ipaService: IPAService = IPAService()
     ) {
         self.appResolver = appResolver
         self.policy = policy
         self.approval = approval
         self.audit = audit
         self.resourceIndex = resourceIndex
+        self.appKnowledgeRegistry = appKnowledgeRegistry
+        self.ipaService = ipaService
     }
 
     public func allowsDeferredCapabilityAttempt(
@@ -1236,8 +1524,10 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
         guard capabilityIDs.count == 1, let capabilityID = capabilityIDs.first,
               capabilities.status(capabilityID) == .deviceValidationRequired else { return false }
         switch tool.name {
+        case "apps.launch": return capabilityID == "apps.launch"
         case "apps.terminate": return capabilityID == "apps.terminate"
         case "apps.uninstall": return capabilityID == "apps.uninstall"
+        case "ipa.install": return capabilityID == "ipa.install"
         default: return false
         }
     }
@@ -1245,20 +1535,85 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
         switch tool.name {
         case "apps.launch":
-            if capabilities.isAvailable("apps.launch") { return true }
-            guard capabilities.status("apps.launch") != .unavailable else { return false }
-            return await appResolver.appLaunchCapability().available
+            let status = capabilities.status("apps.launch")
+            return status == .available || status == .deviceValidationRequired
         case "apps.terminate":
             let status = capabilities.status("apps.terminate")
             return status == .available || status == .deviceValidationRequired
         case "apps.uninstall":
             let status = capabilities.status("apps.uninstall")
             return status == .available || status == .deviceValidationRequired
+        case "ipa.install":
+            let status = capabilities.status("ipa.install")
+            return status == .available || status == .deviceValidationRequired
         default: return false
         }
     }
 
     public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
+        if call.name == "ipa.install" {
+            guard let rawPath = call.arguments["path"], !rawPath.isEmpty else {
+                throw ToolRouterError.noExecutionRoute("ipa.install requires path")
+            }
+            let target = URL(fileURLWithPath: rawPath).standardizedFileURL
+            let inspection = try ipaService.inspect(target, allowedRoot: context.allowedRoot)
+            guard let bundleID = inspection.bundleIdentifier, Self.isValidBundleIdentifier(bundleID) else {
+                throw ToolRouterError.noExecutionRoute("IPA does not contain a valid bundle identifier")
+            }
+            let build = inspection.build ?? ""
+            guard !build.isEmpty else {
+                throw ToolRouterError.noExecutionRoute("IPA does not contain CFBundleVersion; refusing an unverifiable self/update install")
+            }
+
+            let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: target.path)
+            if decision == .deny { throw TransactionError.confirmationDenied }
+            if decision == .requireConfirmation {
+                let preview = ApprovalPreview(
+                    title: bundleID == Bundle.main.bundleIdentifier ? "安装 Cloud Code 更新" : "安装 IPA",
+                    target: "\(bundleID) · build \(build)",
+                    reason: "TrollStore 将对该 IPA 执行 CoreTrust/ldid 签名处理并写入系统 App 安装状态。",
+                    plan: ["检查 IPA 的 Bundle/Build 和归档结构", "通过受限 root helper 调用已安装 TrollStore 的 trollstorehelper", "重新读取安装后的 Bundle ID 与 Build，只有完全匹配才判定成功"],
+                    risk: descriptor.risk
+                )
+                guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
+            }
+
+            let capability = await appResolver.ipaInstallationCapability()
+            guard capability.available else {
+                throw ToolRouterError.noExecutionRoute("ipa.install device validation failed: \(capability.detail)")
+            }
+            let outcome = await appResolver.installIPA(path: target.path, bundleID: bundleID, build: build)
+            try await audit.append(AuditEvent(
+                sessionID: call.sessionID,
+                toolCallID: call.id,
+                action: call.name,
+                target: target.path,
+                risk: descriptor.risk,
+                result: outcome.success ? "installed_verified" : "install_failed",
+                detail: ["bundleID": bundleID, "build": build, "diagnostic": outcome.detail]
+            ))
+            return ToolResult(
+                toolCallID: call.id,
+                success: outcome.success,
+                summary: outcome.success
+                    ? "已通过 TrollStore 安装并验证 \(bundleID) build \(build)"
+                    : "IPA 安装失败：\(outcome.detail)",
+                payload: [
+                    "path": target.path,
+                    "bundleId": bundleID,
+                    "version": inspection.version ?? "",
+                    "build": build,
+                    "selfUpdate": bundleID == Bundle.main.bundleIdentifier ? "true" : "false",
+                    "diagnostic": outcome.detail
+                ],
+                verification: VerificationResult(
+                    passed: outcome.success,
+                    checks: ["IPA 元数据和归档结构通过本地检查", "可信 TrollStore helper 完成签名/安装", "安装后 Bundle ID 与 CFBundleVersion 和 IPA 完全匹配"],
+                    failures: outcome.success ? [] : [outcome.detail]
+                )
+            )
+        }
+
         guard let bundleID = call.arguments["bundleId"], Self.isValidBundleIdentifier(bundleID) else {
             throw ToolRouterError.noExecutionRoute("bundleId missing or invalid")
         }
@@ -1276,7 +1631,9 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
                 )
                 guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
             }
+            let launchStartedAt = Date()
             let outcome = await appResolver.launchApplication(bundleID: bundleID)
+            let launchLatencyMS = max(0, Int(Date().timeIntervalSince(launchStartedAt) * 1_000))
             try await audit.append(AuditEvent(
                 sessionID: call.sessionID,
                 toolCallID: call.id,
@@ -1287,6 +1644,24 @@ public struct IOSPrivateAppExecutor: DeferredCapabilitySelfValidatingToolExecuto
                 detail: ["diagnostic": outcome.detail, "foregroundVerified": outcome.foregroundVerified ? "true" : "false"]
             ))
             let version = await appResolver.cachedVersion(for: bundleID) ?? ""
+            // Learn only from a semantically verified foreground transition, or from an outright
+            // rejected launch. "Accepted but foreground unverified" is deliberately not training
+            // evidence because dispatch acceptance is not proof that open_app succeeded.
+            if outcome.foregroundVerified || !outcome.accepted {
+                let environment = AppActionEnvironment(
+                    appVersion: version.isEmpty ? nil : version,
+                    iOSMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
+                    deviceClass: nil
+                )
+                try? await appKnowledgeRegistry?.recordActionOutcome(
+                    bundleID: bundleID,
+                    semanticAction: "open_app",
+                    route: .privateFramework,
+                    environment: environment,
+                    success: outcome.foregroundVerified,
+                    latencyMS: launchLatencyMS
+                )
+            }
             return ToolResult(
                 toolCallID: call.id,
                 success: outcome.accepted,
@@ -1590,6 +1965,109 @@ public struct URLSchemeExecutor: ToolExecuting, Sendable {
     }
 }
 
+private enum FileSharePresentationError: Error {
+    case appNotActive
+    case noPresenter
+    case fileTooLarge(Int64)
+    case notRegularFile
+}
+
+/// App-layer bridge for a real iOS Share Sheet. This executor deliberately stops at presentation:
+/// choosing WeChat/another target, choosing a recipient, committing the send, and verifying the
+/// target App state remain separate GUI-authority actions.
+public struct FileShareExecutor: ToolExecuting, Sendable {
+    public let route: AppExecutionRoute = .structuredTool
+    private let policy: PolicyEngine
+    private let approval: ApprovalRequesting
+    private let maximumBytes: Int64 = 512 * 1024 * 1024
+
+    public init(policy: PolicyEngine, approval: ApprovalRequesting) {
+        self.policy = policy
+        self.approval = approval
+    }
+
+    public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
+        tool.name == "files.share" && capabilities.status("native.files") == .available
+    }
+
+    public func execute(_ call: ToolCall, descriptor: ToolDescriptor, context: ToolExecutionContext) async throws -> ToolResult {
+        guard call.name == "files.share", let rawPath = call.arguments["path"], !rawPath.isEmpty else {
+            throw ToolRouterError.noExecutionRoute("files.share requires path")
+        }
+        let target = try PathGuard().validate(
+            target: URL(fileURLWithPath: rawPath),
+            allowedRoot: context.allowedRoot,
+            rejectSymlink: true
+        )
+        let values = try target.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values.isRegularFile == true else { throw FileSharePresentationError.notRegularFile }
+        let byteSize = Int64(values.fileSize ?? 0)
+        guard byteSize <= maximumBytes else { throw FileSharePresentationError.fileTooLarge(byteSize) }
+
+        let decision = policy.decision(mode: context.permissionMode, tool: descriptor, targetPath: target.path)
+        if decision == .deny { throw TransactionError.confirmationDenied }
+        if decision == .requireConfirmation {
+            let preview = ApprovalPreview(
+                title: "打开文件分享",
+                target: target.lastPathComponent,
+                reason: "这一步只会打开 iOS Share Sheet；不会把文件自动发送给任何联系人。后续选择目标 App、收件人和最终发送仍需真实 UI 操作与结果验证。",
+                plan: ["重新校验本地文件路径/类型/大小", "打开系统 Share Sheet", "停止在分享面板，不宣称文件已经发送"],
+                risk: descriptor.risk
+            )
+            guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
+        }
+
+        let presented = try await Self.presentShareSheet(for: target)
+        return ToolResult(
+            toolCallID: call.id,
+            success: presented,
+            summary: presented
+                ? "已打开系统 Share Sheet；文件尚未发送，后续必须在目标 App 中选择收件人并验证真实发送结果。"
+                : "系统 Share Sheet 未能确认呈现。",
+            payload: [
+                "path": target.path,
+                "filename": target.lastPathComponent,
+                "byteSize": String(byteSize),
+                "shareSheetPresented": presented ? "true" : "false",
+                "businessActionCompleted": "false",
+                "effectVerification": "share_sheet_presented_only"
+            ],
+            verification: VerificationResult(
+                passed: presented,
+                checks: presented ? ["本地文件重新校验通过", "系统 Share Sheet 已呈现"] : ["本地文件重新校验通过"],
+                failures: presented ? [] : ["Share Sheet presentation was not observed"]
+            )
+        )
+    }
+
+    @MainActor
+    private static func presentShareSheet(for url: URL) throws -> Bool {
+        guard UIApplication.shared.applicationState == .active else { throw FileSharePresentationError.appNotActive }
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let window = scenes
+            .flatMap(\.windows)
+            .first(where: { $0.isKeyWindow })
+            ?? scenes.flatMap(\.windows).first(where: { !$0.isHidden && $0.alpha > 0 })
+        guard var presenter = window?.rootViewController else { throw FileSharePresentationError.noPresenter }
+        while let presented = presenter.presentedViewController { presenter = presented }
+        if let navigation = presenter as? UINavigationController, let visible = navigation.visibleViewController {
+            presenter = visible
+        } else if let tab = presenter as? UITabBarController, let selected = tab.selectedViewController {
+            presenter = selected
+        }
+        guard presenter.viewIfLoaded?.window != nil else { throw FileSharePresentationError.noPresenter }
+
+        let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        if let popover = sheet.popoverPresentationController {
+            popover.sourceView = presenter.view
+            popover.sourceRect = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.midY, width: 1, height: 1)
+            popover.permittedArrowDirections = []
+        }
+        presenter.present(sheet, animated: true)
+        return presenter.presentedViewController === sheet
+    }
+}
+
 private struct LocalGUIPlan: Decodable {
     var steps: [LocalGUIPlanStep]
 }
@@ -1612,6 +2090,63 @@ private struct LocalGUIPlanStep: Decodable {
     var expectMatch: String?
     var expect: String?
     var timeoutMs: Int?
+}
+
+private struct LocalSemanticTarget: Sendable {
+    var centerX: Double
+    var centerY: Double
+    var searchableText: String
+    var source: String
+    var cacheHit: Bool
+}
+
+private actor GUIObservationCache {
+    private struct ScreenshotEntry: Sendable {
+        var data: Data
+        var capturedAt: Date
+        var generation: Int
+    }
+
+    private var generation = 0
+    private var screenshot: ScreenshotEntry?
+    private var localVisionPayload: [String: String]?
+    private var localVisionGeneration: Int?
+    private let maximumAge: TimeInterval = 1.0
+
+    func currentScreenshot(now: Date = Date()) -> (data: Data, generation: Int)? {
+        guard let screenshot,
+              screenshot.generation == generation,
+              now.timeIntervalSince(screenshot.capturedAt) <= maximumAge else { return nil }
+        return (screenshot.data, generation)
+    }
+
+    func storeScreenshot(_ data: Data, now: Date = Date()) -> Int {
+        screenshot = ScreenshotEntry(data: data, capturedAt: now, generation: generation)
+        localVisionPayload = nil
+        localVisionGeneration = nil
+        return generation
+    }
+
+    func currentLocalVisionPayload() -> [String: String]? {
+        guard localVisionGeneration == generation else { return nil }
+        return localVisionPayload
+    }
+
+    func storeLocalVisionPayload(_ payload: [String: String]) {
+        localVisionPayload = payload
+        localVisionGeneration = generation
+    }
+
+    @discardableResult
+    func invalidate() -> Int {
+        generation &+= 1
+        screenshot = nil
+        localVisionPayload = nil
+        localVisionGeneration = nil
+        return generation
+    }
+
+    func currentGeneration() -> Int { generation }
 }
 
 private actor GUIElementLookupCache {
@@ -1653,18 +2188,23 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
     private let approval: ApprovalRequesting
     private let attachmentRoot: URL?
     private let elementCache: GUIElementLookupCache
+    private let observationCache: GUIObservationCache
+    private let appKnowledgeRegistry: AppKnowledgeRegistry?
 
     public init(
         backend: GUIAutomationBackend,
         policy: PolicyEngine,
         approval: ApprovalRequesting,
-        attachmentRoot: URL? = nil
+        attachmentRoot: URL? = nil,
+        appKnowledgeRegistry: AppKnowledgeRegistry? = nil
     ) {
         self.backend = backend
         self.policy = policy
         self.approval = approval
         self.attachmentRoot = attachmentRoot
         self.elementCache = GUIElementLookupCache()
+        self.observationCache = GUIObservationCache()
+        self.appKnowledgeRegistry = appKnowledgeRegistry
     }
 
     public func allowsDeferredCapabilityAttempt(
@@ -1809,12 +2349,26 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             )
             guard await approval.requestApproval(preview) else { throw TransactionError.confirmationDenied }
         }
+        if Self.stateChangingToolNames.contains(call.name) {
+            _ = await observationCache.invalidate()
+        }
         switch call.name {
         case "gui.openApp":
             guard let bundle = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
-            let outcome = call.arguments["_reuseVerifiedForeground"] == "true"
+            let reusedForeground = call.arguments["_reuseVerifiedForeground"] == "true"
+            let launchStartedAt = Date()
+            let outcome = reusedForeground
                 ? GUIOpenAppOutcome(accepted: true, foregroundVerified: true, detail: "current verified foreground reused")
                 : try await backend.openApp(bundleID: bundle)
+            let launchLatencyMS = max(0, Int(Date().timeIntervalSince(launchStartedAt) * 1_000))
+            if !reusedForeground, outcome.foregroundVerified || !outcome.accepted {
+                await recordActionOutcomeIfKnown(
+                    bundleID: bundle,
+                    semanticAction: "open_app",
+                    success: outcome.foregroundVerified,
+                    latencyMS: launchLatencyMS
+                )
+            }
             return ToolResult(
                 toolCallID: call.id,
                 success: true,
@@ -1832,12 +2386,22 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             let reusedForeground = call.arguments["_reuseVerifiedForeground"] == "true"
             let reusedAcceptedLaunch = call.arguments["_reuseAcceptedLaunch"] == "true"
             let outcome: GUIOpenAppOutcome
+            let launchStartedAt = Date()
             if reusedForeground {
                 outcome = GUIOpenAppOutcome(accepted: true, foregroundVerified: true, detail: "current verified foreground reused")
             } else if reusedAcceptedLaunch {
                 outcome = GUIOpenAppOutcome(accepted: true, foregroundVerified: false, detail: "prior accepted launch reused for fresh observation")
             } else {
                 outcome = try await backend.openApp(bundleID: bundle)
+            }
+            let launchLatencyMS = max(0, Int(Date().timeIntervalSince(launchStartedAt) * 1_000))
+            if !reusedForeground && !reusedAcceptedLaunch, outcome.foregroundVerified || !outcome.accepted {
+                await recordActionOutcomeIfKnown(
+                    bundleID: bundle,
+                    semanticAction: "open_app",
+                    success: outcome.foregroundVerified,
+                    latencyMS: launchLatencyMS
+                )
             }
             if !reusedForeground && !reusedAcceptedLaunch {
                 try await Task.sleep(nanoseconds: 200_000_000)
@@ -1855,7 +2419,22 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                     : "launch_accepted_foreground_unverified_screenshot_semantic_required",
                 "localObservation": "final_screenshot_attached"
             ]
-            await enrichWithLocalVision(&payload, screenshot: data)
+            if outcome.foregroundVerified {
+                await enrichWithLocalVision(&payload, screenshot: data)
+            } else {
+                // Foreground identity is not strong enough to authorize a semantic action, but the
+                // freshly captured frame is still valuable as read-only local perception evidence.
+                // Run OCR without dispatching any action and keep the result explicitly untrusted for
+                // target identity. This avoids turning a flaky frontmost check into "OCR unavailable"
+                // while preserving the fail-closed action boundary.
+                await enrichWithLocalVision(&payload, screenshot: data)
+                payload["perceptionAXAttempted"] = "false"
+                payload["perceptionAXSucceeded"] = "false"
+                payload["perceptionLocalSufficient"] = "false"
+                payload["perceptionRemoteVisionRequired"] = "true"
+                payload["perceptionFallbackReason"] = "foreground_unverified_local_ocr_observation_only"
+                payload["providerVisualRoundTripAvoided"] = "0"
+            }
             return ToolResult(
                 toolCallID: call.id,
                 success: true,
@@ -1873,22 +2452,37 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 "tree": ToolOutputEnvelope(trust: .untrustedData, source: "gui.tree", content: tree).promptSafeRepresentation,
                 "perceptionClass": "accessibility_tree",
                 "perceptionAXAttempted": "true",
-                "perceptionAXSucceeded": "true",
+                "perceptionAXSucceeded": "false",
                 "perceptionOCRInvoked": "false",
                 "perceptionOCRSucceeded": "false",
-                "axStage": "direct_root_then_sampled_hit_test",
+                "axStage": "direct_root_then_position_root_then_sampled_hit_test",
                 "axLatencyMS": String(axLatencyMS)
             ]
+            var semanticTreeUsable = false
             if let data = tree.data(using: .utf8),
                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 let scope = object["scope"] as? String ?? "unknown"
+                let nodeCount = (object["nodeCount"] as? NSNumber)?.intValue ?? 0
+                let semanticNodeCount = (object["semanticNodeCount"] as? NSNumber)?.intValue ?? 0
+                let actionableNodeCount = (object["actionableNodeCount"] as? NSNumber)?.intValue ?? 0
+                let bundleID = (object["bundleId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                semanticTreeUsable = nodeCount > 0 && semanticNodeCount > 0 && actionableNodeCount > 0
                 payload["axScope"] = scope
                 payload["axBackend"] = object["backend"] as? String ?? "unknown"
-                if let nodeCount = object["nodeCount"] as? NSNumber { payload["axNodeCount"] = nodeCount.stringValue }
-                let complete = scope == "full_application_tree_opportunistic"
+                payload["axNodeCount"] = String(nodeCount)
+                payload["axSemanticNodeCount"] = String(semanticNodeCount)
+                payload["axActionableNodeCount"] = String(actionableNodeCount)
+                payload["axForegroundBundleID"] = bundleID
+                payload["perceptionAXSucceeded"] = semanticTreeUsable ? "true" : "false"
+                let fullApplicationScopes: Set<String> = ["full_application_tree_opportunistic", "full_application_tree_bounded"]
+                let complete = semanticTreeUsable && fullApplicationScopes.contains(scope)
                 payload["perceptionLocalSufficient"] = complete ? "true" : "false"
                 payload["perceptionRemoteVisionRequired"] = complete ? "false" : "true"
-                payload["perceptionFallbackReason"] = complete ? "fresh_ax_application_tree" : "bounded_ax_sampled_semantics"
+                if !semanticTreeUsable {
+                    payload["perceptionFallbackReason"] = "ax_transport_returned_semantically_empty_tree"
+                } else {
+                    payload["perceptionFallbackReason"] = complete ? "fresh_ax_application_tree" : "bounded_ax_sampled_semantics"
+                }
                 payload["providerVisualRoundTripAvoided"] = complete ? "1" : "0"
             } else {
                 payload["axScope"] = "unknown"
@@ -1897,7 +2491,12 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 payload["perceptionFallbackReason"] = "ax_tree_scope_unparsed"
                 payload["providerVisualRoundTripAvoided"] = "0"
             }
-            return ToolResult(toolCallID: call.id, success: true, summary: "GUI tree read", payload: payload)
+            return ToolResult(
+                toolCallID: call.id,
+                success: semanticTreeUsable,
+                summary: semanticTreeUsable ? "GUI tree read" : "AX transport responded without usable foreground semantics",
+                payload: payload
+            )
         case "gui.findElement":
             let resolved = try await resolveElement(call)
             return ToolResult(
@@ -1949,7 +2548,55 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.tapTextObserve":
             let baseline = try await backend.screenshot()
             let baselineSHA256 = GUIAutomationPayloadPolicy.sha256Hex(baseline)
-            let resolution = await resolveLocalVisionText(call, screenshot: baseline)
+
+            // Named visible text is exactly where AX and OCR should complement each other. Build 92
+            // went straight to Vision here, so a background CoreVideo/CoreML allocation failure left
+            // "文件传输助手" with no second local semantic path even when AX might expose it. Try one
+            // bounded current-tree lookup first; TrollStoreGUIBackend already suppresses repeated AX
+            // timeouts for the same foreground state. OCR remains the fallback and is not required for
+            // the descriptor/capability gate, so devices without a usable AX backend still work.
+            do {
+                let axResolved = try await resolveElement(call)
+                guard !Self.isProtectedElement(axResolved.match) else {
+                    throw ToolRouterError.noExecutionRoute("protected/system-confirmation AX text cannot be automated")
+                }
+                try await backend.tap(x: axResolved.match.frame.centerX, y: axResolved.match.frame.centerY)
+                try await Task.sleep(nanoseconds: 250_000_000)
+                try Task.checkCancellation()
+                let data = try await backend.screenshot()
+                let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
+                var payload = elementPayload(axResolved.match, treeHash: axResolved.treeHash, cacheHit: axResolved.cacheHit)
+                payload["baselineSHA256"] = baselineSHA256
+                payload["sha256"] = GUIAutomationPayloadPolicy.sha256Hex(data)
+                payload["effectVerification"] = "semantic_required"
+                payload["localObservation"] = "final_screenshot_attached"
+                payload["structuredPath"] = "ax_text_first"
+                payload["perceptionClass"] = "ax_text_action"
+                payload["perceptionAXAttempted"] = "true"
+                payload["perceptionAXSucceeded"] = "true"
+                payload["perceptionOCRInvoked"] = "false"
+                payload["perceptionOCRSucceeded"] = "false"
+                payload["perceptionLocalSufficient"] = "false"
+                payload["perceptionRemoteVisionRequired"] = "true"
+                payload["perceptionFallbackReason"] = "fresh_ax_unique_text_match_post_action_semantics_need_fresh_observation"
+                payload["providerVisualRoundTripAvoided"] = "0"
+                return ToolResult(
+                    toolCallID: call.id,
+                    success: true,
+                    summary: "Unique visible text was resolved through the current accessibility tree and tapped locally; final screenshot attached for semantic verification.",
+                    payload: payload,
+                    attachments: attachment.map { [$0] }
+                )
+            } catch {
+                // AX failure is expected on some third-party surfaces. Do not retry it here; continue
+                // immediately to one OCR pass from the already-captured current frame.
+            }
+
+            var resolution = await resolveLocalVisionText(call, screenshot: baseline)
+            if resolution.match == nil,
+               resolution.observation.payload["localVisionPrecisionRecommended"] == "true" {
+                resolution = await resolveLocalVisionText(call, screenshot: baseline, forcePrecise: true)
+            }
             guard let resolved = resolution.match else {
                 let attachment = try persistScreenshotAttachment(baseline, sessionID: call.sessionID)
                 var payload: [String: String] = [
@@ -1957,8 +2604,8 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                     "baselineSHA256": baselineSHA256,
                     "effectVerification": "not_dispatched",
                     "localObservation": "baseline_screenshot_attached",
-                    "perceptionClass": "local_ocr_text_lookup",
-                    "perceptionAXAttempted": "false",
+                    "perceptionClass": "ax_then_local_ocr_text_lookup",
+                    "perceptionAXAttempted": "true",
                     "perceptionAXSucceeded": "false",
                     "perceptionAnchorCacheHit": "false",
                     "perceptionLocalSufficient": "false",
@@ -1971,7 +2618,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 return ToolResult(
                     toolCallID: call.id,
                     success: false,
-                    summary: resolution.failureSummary ?? "Local OCR text lookup did not produce one unique current-frame target.",
+                    summary: resolution.failureSummary ?? "AX and local OCR did not produce one unique current-frame text target.",
                     payload: payload,
                     attachments: attachment.map { [$0] }
                 )
@@ -1997,17 +2644,17 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
                 "effectVerification": "semantic_required",
                 "localObservation": "final_screenshot_attached",
-                "perceptionClass": "local_ocr_text_action",
-                "perceptionAXAttempted": "false",
+                "perceptionClass": "ax_then_local_ocr_text_action",
+                "perceptionAXAttempted": "true",
                 "perceptionAXSucceeded": "false",
                 "perceptionAnchorCacheHit": "false",
-                "perceptionFallbackReason": "fresh_local_ocr_unique_text_match"
+                "perceptionFallbackReason": "ax_unavailable_fresh_local_ocr_unique_text_match"
             ]
             await enrichWithLocalVision(&payload, screenshot: data)
             return ToolResult(
                 toolCallID: call.id,
                 success: true,
-                summary: "Unique visible OCR text was resolved and tapped locally; final screenshot attached for semantic verification.",
+                summary: "AX did not resolve the text, but one unique visible OCR label was resolved and tapped locally; final screenshot attached for semantic verification.",
                 payload: payload,
                 attachments: attachment.map { [$0] }
             )
@@ -2027,20 +2674,90 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             try Task.checkCancellation()
             let data = try await backend.screenshot()
             let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
-            let observation = await LocalVisionTextObservation.observe(for: data, maximumElements: 48, requiresText: true)
-            let screenHeight = Double(observation.payload["screenPointHeight"] ?? "") ?? Double(image.size.height)
-            let keyboardLikely = LocalKeyboardHeuristic.isLikelyVisible(elements: observation.elements, screenHeight: screenHeight)
+
+            // Production AX/AXAudit focus reads are deliberately quarantined. Build 131-133 device
+            // evidence showed that entering private accessibility client paths can surface the green
+            // system frame even without explicit Automation-state writes. Composer verification is
+            // therefore screenshot/OCR-only in normal Agent execution; the explicit Perception Probe
+            // remains the place for bounded AX diagnostics.
+            if ProductionPerceptionPolicy.accessibilityRuntimeAllowed {
+                let axFocus = EmbeddedRootHelper.focusedTextInput()
+                if let focused = axFocus.payload, focused.focusedTextInput {
+                    let payload: [String: String] = [
+                        "baselineSHA256": baselineSHA256,
+                        "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
+                        "focusStrategy": "bounded_bottom_center_composer_candidate",
+                        "focusX": String(focusX),
+                        "focusY": String(focusY),
+                        "composerFocusVerified": "true",
+                        "keyboardLikely": "false",
+                        "focusVerification": "ax_focused_text_input",
+                        "focusedRole": String(focused.role.prefix(128)),
+                        "effectVerification": "ax_focused_text_input_verified",
+                        "localObservation": "final_screenshot_attached",
+                        "perceptionClass": "semantic_composer_focus",
+                        "perceptionAXAttempted": "true",
+                        "perceptionAXSucceeded": "true",
+                        "perceptionAnchorCacheHit": "false",
+                        "perceptionOCRInvoked": "false",
+                        "perceptionOCRSucceeded": "false",
+                        "perceptionLocalSufficient": "true",
+                        "perceptionRemoteVisionRequired": "false",
+                        "perceptionFallbackReason": "ax_focused_text_input_verified_composer_focus",
+                        "providerVisualRoundTripAvoided": "1"
+                    ]
+                    return ToolResult(
+                        toolCallID: call.id,
+                        success: true,
+                        summary: "Chat composer focus was locally verified by a focused accessibility text-input element; OCR was not required.",
+                        payload: payload,
+                        attachments: attachment.map { [$0] }
+                    )
+                }
+            }
+
+            // Keyboard/composer verification is bottom-screen semantics. Restrict the first local
+            // OCR pass to that region instead of paying for full-screen recognition. Vision ROI is
+            // expressed in normalized lower-left coordinates internally; LocalVisionTextObservation
+            // accepts top-left screen points and keeps all returned boxes in screen_points_top_left.
+            let keyboardRegion = CGRect(
+                x: 0,
+                y: image.size.height * 0.42,
+                width: image.size.width,
+                height: image.size.height * 0.58
+            )
+            var observation = await LocalVisionTextObservation.observe(
+                for: data,
+                maximumElements: 48,
+                regionInScreenPoints: keyboardRegion,
+                requiresText: true
+            )
+            var screenHeight = Double(observation.payload["screenPointHeight"] ?? "") ?? Double(image.size.height)
+            var keyboardLikely = LocalKeyboardHeuristic.isLikelyVisible(elements: observation.elements, screenHeight: screenHeight)
+            if !keyboardLikely {
+                observation = await LocalVisionTextObservation.observe(
+                    for: data,
+                    maximumElements: 48,
+                    regionInScreenPoints: keyboardRegion,
+                    requiresText: true,
+                    forcePrecise: true
+                )
+                screenHeight = Double(observation.payload["screenPointHeight"] ?? "") ?? Double(image.size.height)
+                keyboardLikely = LocalKeyboardHeuristic.isLikelyVisible(elements: observation.elements, screenHeight: screenHeight)
+            }
             var payload: [String: String] = [
                 "baselineSHA256": baselineSHA256,
                 "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
                 "focusStrategy": "bounded_bottom_center_composer_candidate",
                 "focusX": String(focusX),
                 "focusY": String(focusY),
+                "composerFocusVerified": keyboardLikely ? "true" : "false",
                 "keyboardLikely": keyboardLikely ? "true" : "false",
+                "focusVerification": keyboardLikely ? "ocr_keyboard_heuristic" : "unverified",
                 "effectVerification": keyboardLikely ? "local_keyboard_heuristic_passed" : "semantic_required",
                 "localObservation": "final_screenshot_attached",
                 "perceptionClass": "semantic_composer_focus",
-                "perceptionAXAttempted": "false",
+                "perceptionAXAttempted": ProductionPerceptionPolicy.accessibilityRuntimeAllowed ? "true" : "false",
                 "perceptionAXSucceeded": "false",
                 "perceptionAnchorCacheHit": "false"
             ]
@@ -2048,20 +2765,26 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             if keyboardLikely {
                 payload["perceptionLocalSufficient"] = "true"
                 payload["perceptionRemoteVisionRequired"] = "false"
-                payload["perceptionFallbackReason"] = "local_keyboard_heuristic_verified_composer_focus"
+                payload["perceptionFallbackReason"] = ProductionPerceptionPolicy.accessibilityRuntimeAllowed
+                    ? "ax_unavailable_local_keyboard_heuristic_verified_composer_focus"
+                    : "production_ax_quarantined_local_keyboard_heuristic_verified_composer_focus"
                 payload["providerVisualRoundTripAvoided"] = "1"
             } else {
                 payload["perceptionLocalSufficient"] = "false"
                 payload["perceptionRemoteVisionRequired"] = "true"
-                payload["perceptionFallbackReason"] = "composer_focus_keyboard_not_locally_verified"
+                payload["perceptionFallbackReason"] = "composer_focus_not_locally_verified"
                 payload["providerVisualRoundTripAvoided"] = "0"
             }
             return ToolResult(
                 toolCallID: call.id,
                 success: keyboardLikely,
                 summary: keyboardLikely
-                    ? "Chat composer focus was locally verified by keyboard-like OCR evidence."
-                    : "Composer candidate was tapped, but local keyboard evidence was insufficient; raw typing remains blocked until focus is verified.",
+                    ? (ProductionPerceptionPolicy.accessibilityRuntimeAllowed
+                        ? "AX did not prove text focus, but chat composer focus was locally verified by keyboard-like OCR evidence."
+                        : "Chat composer focus was locally verified by keyboard-like OCR evidence without invoking production AX.")
+                    : (ProductionPerceptionPolicy.accessibilityRuntimeAllowed
+                        ? "Composer candidate was tapped, but neither AX focus nor local keyboard evidence verified the composer; raw typing remains blocked."
+                        : "Composer candidate was tapped, but local keyboard evidence did not verify focus; raw typing remains blocked without invoking production AX."),
                 payload: payload,
                 attachments: attachment.map { [$0] }
             )
@@ -2103,13 +2826,33 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.runStructuredPlan":
             return try await executeStructuredPlan(call)
         case "gui.screenshot":
-            let data = try await backend.screenshot()
+            let cached = await observationCache.currentScreenshot()
+            let data: Data
+            let generation: Int
+            if let cached {
+                data = cached.data
+                generation = cached.generation
+            } else {
+                data = try await backend.screenshot()
+                generation = await observationCache.storeScreenshot(data)
+            }
             let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
             var payload: [String: String] = [
                 "byteCount": String(data.count),
-                "sha256": GUIAutomationPayloadPolicy.sha256Hex(data)
+                "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
+                "observationGeneration": String(generation),
+                "observationCacheHit": cached == nil ? "false" : "true"
             ]
-            await enrichWithLocalVision(&payload, screenshot: data)
+            if let cachedVision = await observationCache.currentLocalVisionPayload() {
+                for (key, value) in cachedVision { payload[key] = value }
+                payload["localVisionCacheHit"] = "true"
+            } else {
+                var visionPayload: [String: String] = [:]
+                await enrichWithLocalVision(&visionPayload, screenshot: data)
+                await observationCache.storeLocalVisionPayload(visionPayload)
+                for (key, value) in visionPayload { payload[key] = value }
+                payload["localVisionCacheHit"] = "false"
+            }
             return ToolResult(
                 toolCallID: call.id,
                 success: true,
@@ -2164,6 +2907,13 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             throw ToolRouterError.noExecutionRoute(call.name)
         }
     }
+
+    private static let stateChangingToolNames: Set<String> = [
+        "gui.openApp", "gui.openAppObserve", "gui.tap", "gui.tapObserve", "gui.tapTextObserve",
+        "gui.focusComposerObserve", "gui.tapElementObserve", "gui.type", "gui.typeObserve",
+        "gui.typeElementObserve", "gui.scroll", "gui.scrollObserve", "gui.swipe", "gui.swipeObserve",
+        "gui.swipeSequence", "gui.feedSample", "gui.navigateBack", "gui.runStructuredPlan"
+    ]
 
     private func executeSwipeSequence(_ call: ToolCall) async throws -> ToolResult {
         let fromX = Double(call.arguments["fromX"] ?? "0") ?? 0
@@ -2250,19 +3000,32 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         // "手指向上滑" ambiguity. Positive scroll delta means advancing the scroll/feed content;
         // the helper owns the inverse physical finger trajectory needed to produce that motion.
         let deltaY = direction == "forward" ? 600.0 : -600.0
-        let settleNanoseconds: UInt64 = 650_000_000
+        // Video pixels change continuously, so a whole-frame hash is not proof that the feed moved.
+        // The physical scroll itself already occupies ~300 ms. A second fixed 950 ms pause made a
+        // five-item scan spend several seconds doing nothing, even when the overlay was already
+        // stable. Use a shorter bounded settle; incomplete semantic evidence still takes the slower
+        // OCR/AX fallback below instead of making every successful sample pay the worst-case delay.
+        let settleNanoseconds: UInt64 = 550_000_000
+        let uncertainSettleRetryNanoseconds: UInt64 = 400_000_000
 
         var attachments: [ChatAttachment] = []
         var hashes: [String] = []
         var localVisionSamples: [[String: String]] = []
         var localElementSamples: [[LocalPerceptionTextElement]] = []
         var localScreenSamples: [LocalPerceptionScreenSize] = []
+        var sampleIdentities: [String] = []
         var sampledCount = 0
         var stoppedAtSample: Int?
+        var stoppedReason: String?
         var totalOCRLatencyMS = 0
         var successfulOCRSamples = 0
+        var preciseMetricRegionSamples = 0
+        var fullFrameOCRFallbackSamples = 0
+        var axAttemptedSamples = 0
+        var axSucceededSamples = 0
+        var axSkippedLocalSufficientSamples = 0
 
-        func captureSample() async throws -> String {
+        func captureSample() async throws -> (hash: String, identity: String?) {
             let data = try await backend.screenshot()
             let hash = GUIAutomationPayloadPolicy.sha256Hex(data)
             if let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID) {
@@ -2270,49 +3033,191 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             }
             hashes.append(hash)
             sampledCount += 1
-            let observation = await LocalVisionTextObservation.observe(
-                for: data,
-                maximumElements: requestedMetric == nil ? 32 : 48,
-                requiresText: requestedMetric != nil
+
+            let image = UIImage(data: data)?.cgImage
+            let imageScreenSize = LocalPerceptionScreenSize(
+                width: Double(image?.width ?? 0),
+                height: Double(image?.height ?? 0)
             )
-            let local = observation.payload
-            localElementSamples.append(observation.elements)
-            let localWidth = Double(local["screenPointWidth"] ?? "") ?? 0
-            let localHeight = Double(local["screenPointHeight"] ?? "") ?? 0
-            localScreenSamples.append(LocalPerceptionScreenSize(width: localWidth, height: localHeight))
-            totalOCRLatencyMS += Int(local["localVisionLatencyMS"] ?? "0") ?? 0
-            let ocrStatus = local["localVisionOCR"] ?? ""
-            if ocrStatus == "recognized" || ocrStatus == "available_empty" { successfulOCRSamples += 1 }
+            let metricRegion = requestedMetric.flatMap { _ in
+                LocalFeedPerceptionPolicy.metricRegion(screenSize: imageScreenSize)
+            }.map {
+                CGRect(x: CGFloat($0.x), y: CGFloat($0.y), width: CGFloat($0.width), height: CGFloat($0.height))
+            }
+
+            // Metric sampling takes the precise recognizer over only the trailing action/count rail.
+            // This is both cheaper and more accurate than full-screen accurate OCR: small decimal
+            // counters occupy a much larger fraction of the cropped image (for example 21.0万),
+            // which reduces dropped/reordered digits without making every generic OCR call precise.
+            var observation = await LocalVisionTextObservation.observe(
+                for: data,
+                maximumElements: requestedMetric == nil ? 32 : 24,
+                regionInScreenPoints: metricRegion,
+                requiresText: requestedMetric != nil,
+                forcePrecise: requestedMetric != nil && metricRegion != nil
+            )
+            if requestedMetric != nil && metricRegion != nil { preciseMetricRegionSamples += 1 }
+            totalOCRLatencyMS += Int(observation.payload["localVisionLatencyMS"] ?? "0") ?? 0
+
+            var screenSize = LocalPerceptionScreenSize(
+                width: Double(observation.payload["screenPointWidth"] ?? "") ?? imageScreenSize.width,
+                height: Double(observation.payload["screenPointHeight"] ?? "") ?? imageScreenSize.height
+            )
+            if screenSize.width <= 0 || screenSize.height <= 0 { screenSize = imageScreenSize }
+            var ocrElements = observation.elements
+            var ocrBackends = [observation.payload["localVisionBackend"] ?? "unknown"]
+            var ocrStatuses = [observation.payload["localVisionOCR"] ?? "unavailable"]
+
+            var localSufficient = LocalFeedPerceptionPolicy.observationIsSufficient(
+                metric: requestedMetric,
+                elements: ocrElements,
+                screenSize: screenSize
+            )
+            if !localSufficient, metricRegion != nil {
+                // The current app may not use a right-side metric rail, or the first crop may have
+                // missed text during animation. Pay one full-frame *fast* OCR only for that sample.
+                let fallback = await LocalVisionTextObservation.observe(
+                    for: data,
+                    maximumElements: 48,
+                    requiresText: requestedMetric != nil,
+                    forcePrecise: false
+                )
+                fullFrameOCRFallbackSamples += 1
+                totalOCRLatencyMS += Int(fallback.payload["localVisionLatencyMS"] ?? "0") ?? 0
+                ocrElements = LocalPerceptionFusion.merge(ax: ocrElements, ocr: fallback.elements)
+                ocrBackends.append(fallback.payload["localVisionBackend"] ?? "unknown")
+                ocrStatuses.append(fallback.payload["localVisionOCR"] ?? "unavailable")
+                let fallbackWidth = Double(fallback.payload["screenPointWidth"] ?? "") ?? 0
+                let fallbackHeight = Double(fallback.payload["screenPointHeight"] ?? "") ?? 0
+                if fallbackWidth > 0, fallbackHeight > 0 {
+                    screenSize = .init(width: fallbackWidth, height: fallbackHeight)
+                }
+                localSufficient = LocalFeedPerceptionPolicy.observationIsSufficient(
+                    metric: requestedMetric,
+                    elements: ocrElements,
+                    screenSize: screenSize
+                )
+                observation = fallback
+            }
+
+            var axElements: [LocalPerceptionTextElement] = []
+            var axStatus = "skipped_local_sufficient"
+            if localSufficient {
+                axSkippedLocalSufficientSamples += 1
+            } else {
+                // Full AX trees are the most expensive/fragile perception source on custom-drawn
+                // video surfaces. Ask for one only after local OCR cannot prove this exact sample.
+                axAttemptedSamples += 1
+                axStatus = "unavailable"
+                do {
+                    let tree = try await backend.tree()
+                    axElements = LocalAXTreeTextExtractor.extract(from: tree, maximumElements: 96)
+                    if !axElements.isEmpty {
+                        axSucceededSamples += 1
+                        axStatus = "semantic_elements"
+                    } else {
+                        axStatus = "empty_tree"
+                    }
+                } catch {
+                    axStatus = "unavailable"
+                }
+            }
+
+            let fusedElements = LocalPerceptionFusion.merge(ax: axElements, ocr: ocrElements)
+            localElementSamples.append(fusedElements)
+            localScreenSamples.append(screenSize)
+            let identity = LocalFeedIdentity.signature(elements: fusedElements, screenSize: screenSize)
+            sampleIdentities.append(identity ?? "")
+            if ocrStatuses.contains(where: { $0 == "recognized" || $0 == "available_empty" }) {
+                successfulOCRSamples += 1
+            }
+            let encodedElements: String
+            if let encoded = try? JSONEncoder().encode(Array(fusedElements.prefix(64))), encoded.count <= 12 * 1024 {
+                encodedElements = String(data: encoded, encoding: .utf8) ?? "[]"
+            } else {
+                encodedElements = "[]"
+            }
             localVisionSamples.append([
                 "sample": String(sampledCount),
-                "status": local["localVisionOCR"] ?? "unavailable",
-                "text": String((local["localVisionText"] ?? "").prefix(1_600)),
-                "elements": String((local["localVisionElements"] ?? "[]").prefix(6_000)),
-                "width": local["screenPointWidth"] ?? "",
-                "height": local["screenPointHeight"] ?? "",
-                "backend": local["localVisionBackend"] ?? "unknown"
+                "status": ocrStatuses.joined(separator: "+"),
+                "text": String(fusedElements.map(\.text).joined(separator: " | ").prefix(1_600)),
+                "elements": String(encodedElements.prefix(6_000)),
+                "width": String(Int(screenSize.width)),
+                "height": String(Int(screenSize.height)),
+                "backend": ocrBackends.joined(separator: "+"),
+                "region": metricRegion == nil ? "full_screen" : "metric_right_rail",
+                "ax": axStatus,
+                "semanticIdentity": identity.map { String($0.prefix(512)) } ?? ""
             ])
-            return hash
+            return (hash, identity)
         }
 
-        let baselineHash = try await captureSample()
-        var previousHash = baselineHash
-        if count >= 2 {
+        let baseline = try await captureSample()
+        let baselineHash = baseline.hash
+        var previousIdentity = baseline.identity
+        if previousIdentity == nil {
+            stoppedReason = "baseline_semantic_identity_unavailable"
+        } else if count >= 2 {
             for sampleIndex in 2...count {
                 try Task.checkCancellation()
                 try await backend.scroll(deltaX: 0, deltaY: deltaY)
                 try await Task.sleep(nanoseconds: settleNanoseconds)
                 try Task.checkCancellation()
-                let currentHash = try await captureSample()
-                if currentHash == previousHash {
+                let beforeAttachments = attachments.count
+                let beforeHashes = hashes.count
+                let beforeVision = localVisionSamples.count
+                let beforeElements = localElementSamples.count
+                let beforeScreens = localScreenSamples.count
+                let beforeIdentities = sampleIdentities.count
+                let beforeSampledCount = sampledCount
+                let beforeOCRLatencyMS = totalOCRLatencyMS
+                let beforeSuccessfulOCRSamples = successfulOCRSamples
+                let beforePreciseMetricRegionSamples = preciseMetricRegionSamples
+                let beforeFullFrameOCRFallbackSamples = fullFrameOCRFallbackSamples
+                let beforeAXAttemptedSamples = axAttemptedSamples
+                let beforeAXSucceededSamples = axSucceededSamples
+                let beforeAXSkippedLocalSufficientSamples = axSkippedLocalSufficientSamples
+
+                func rollbackCandidateCapture() {
+                    if attachments.count > beforeAttachments { attachments.removeSubrange(beforeAttachments..<attachments.count) }
+                    if hashes.count > beforeHashes { hashes.removeSubrange(beforeHashes..<hashes.count) }
+                    if localVisionSamples.count > beforeVision { localVisionSamples.removeSubrange(beforeVision..<localVisionSamples.count) }
+                    if localElementSamples.count > beforeElements { localElementSamples.removeSubrange(beforeElements..<localElementSamples.count) }
+                    if localScreenSamples.count > beforeScreens { localScreenSamples.removeSubrange(beforeScreens..<localScreenSamples.count) }
+                    if sampleIdentities.count > beforeIdentities { sampleIdentities.removeSubrange(beforeIdentities..<sampleIdentities.count) }
+                    sampledCount = beforeSampledCount
+                    totalOCRLatencyMS = beforeOCRLatencyMS
+                    successfulOCRSamples = beforeSuccessfulOCRSamples
+                    preciseMetricRegionSamples = beforePreciseMetricRegionSamples
+                    fullFrameOCRFallbackSamples = beforeFullFrameOCRFallbackSamples
+                    axAttemptedSamples = beforeAXAttemptedSamples
+                    axSucceededSamples = beforeAXSucceededSamples
+                    axSkippedLocalSufficientSamples = beforeAXSkippedLocalSufficientSamples
+                }
+
+                var candidate = try await captureSample()
+                var semanticAdvanced = candidate.identity != nil && candidate.identity != previousIdentity
+                if !semanticAdvanced {
+                    // Do not make every item pay a one-second settle just because a slow-loading item
+                    // occasionally needs it. Roll the uncertain observation back, grant that one item
+                    // another 400 ms, then re-observe. Only the ambiguous path pays this retry.
+                    rollbackCandidateCapture()
+                    try await Task.sleep(nanoseconds: uncertainSettleRetryNanoseconds)
+                    try Task.checkCancellation()
+                    candidate = try await captureSample()
+                    semanticAdvanced = candidate.identity != nil && candidate.identity != previousIdentity
+                }
+                if !semanticAdvanced {
                     stoppedAtSample = sampleIndex
+                    stoppedReason = candidate.identity == nil ? "semantic_identity_unavailable" : "semantic_identity_unchanged"
+                    rollbackCandidateCapture()
                     break
                 }
-                previousHash = currentHash
+                previousIdentity = candidate.identity
             }
         }
 
-        let completed = sampledCount == count && stoppedAtSample == nil
+        let completed = sampledCount == count && stoppedAtSample == nil && stoppedReason == nil
         var payload: [String: String] = [
             "requestedCount": String(count),
             "sampledCount": String(sampledCount),
@@ -2321,13 +3226,19 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             "frameSHA256": hashes.joined(separator: ","),
             "baselineSHA256": baselineHash,
             "sha256": hashes.last ?? baselineHash,
-            "settleMs": "650",
+            "settleMs": "550",
             "effectVerification": "semantic_review_required",
             "localObservation": "feed_samples_attached",
             "perceptionClass": "feed_sample",
-            "perceptionAXAttempted": "false",
-            "perceptionAXSucceeded": "false",
+            "perceptionAXAttempted": axAttemptedSamples > 0 ? "true" : "false",
+            "perceptionAXSucceeded": axSucceededSamples > 0 ? "true" : "false",
+            "perceptionAXSampleCount": String(axAttemptedSamples),
+            "perceptionAXSuccessfulSampleCount": String(axSucceededSamples),
+            "perceptionAXSkippedLocalSufficientSampleCount": String(axSkippedLocalSufficientSamples),
+            "feedIdentityMode": "adaptive_precise_metric_roi_then_ocr_ax_fallback",
             "perceptionOCRInvoked": "true",
+            "perceptionOCRPreciseMetricRegionSampleCount": String(preciseMetricRegionSamples),
+            "perceptionOCRFullFrameFallbackSampleCount": String(fullFrameOCRFallbackSamples),
             "perceptionOCRSucceeded": successfulOCRSamples == sampledCount ? "true" : "false",
             "perceptionOCRLatencyMS": String(totalOCRLatencyMS),
             "perceptionLocalSufficient": "false",
@@ -2336,6 +3247,10 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             "providerVisualRoundTripAvoided": "0"
         ]
         if let stoppedAtSample { payload["stoppedAtSample"] = String(stoppedAtSample) }
+        if let stoppedReason { payload["stoppedReason"] = stoppedReason }
+        if !sampleIdentities.isEmpty {
+            payload["semanticIdentityCount"] = String(sampleIdentities.filter { !$0.isEmpty }.count)
+        }
         if let encoded = try? JSONSerialization.data(withJSONObject: localVisionSamples, options: []),
            encoded.count <= 48 * 1024,
            let json = String(data: encoded, encoding: .utf8) {
@@ -2344,6 +3259,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         }
 
         var localMetricSelection: LocalFeedMetricSelectionResult?
+        var lowConfidenceMetricEvidence = false
         if completed, let metric = requestedMetric, let selection = requestedSelection {
             localMetricSelection = LocalFeedMetricExtractor.select(
                 metric: metric,
@@ -2351,6 +3267,15 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 samples: localElementSamples,
                 screenSizes: localScreenSamples
             )
+            if let candidate = localMetricSelection,
+               !LocalFeedPerceptionPolicy.metricSelectionIsTrusted(candidate) {
+                lowConfidenceMetricEvidence = true
+                payload["localMetricConfidenceFloor"] = String(format: "%.3f", LocalFeedPerceptionPolicy.minimumTrustedMetricConfidence)
+                payload["localMetricObservedConfidences"] = candidate.extractions
+                    .map { String(format: "%.3f", $0.confidence) }
+                    .joined(separator: ",")
+                localMetricSelection = nil
+            }
         }
         if let localMetricSelection {
             payload["localMetric"] = localMetricSelection.metric.rawValue
@@ -2363,47 +3288,104 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             var selectedReturnVerified = localMetricSelection.selectedSample == sampledCount
             if returnToSelected, localMetricSelection.selectedSample < sampledCount {
                 let returnSteps = sampledCount - localMetricSelection.selectedSample
+                let targetIdentity = sampleIdentities[localMetricSelection.selectedSample - 1]
                 var completedReturnSteps = 0
-                var returnHash = hashes.last ?? baselineHash
-                var returnedFrameData: Data?
+                var returnFailureReason: String?
+
+                // Returning to an already sampled item is a deterministic, reversible sequence.
+                // Verifying every intermediate swipe previously repeated screenshot + OCR + AX and
+                // multiplied latency. Dispatch the bounded return sequence, then verify the final
+                // semantic identity once; a missed gesture still fails closed as a target mismatch.
                 for _ in 0..<returnSteps {
                     try Task.checkCancellation()
                     try await backend.scroll(deltaX: 0, deltaY: -deltaY)
-                    try await Task.sleep(nanoseconds: settleNanoseconds)
-                    try Task.checkCancellation()
-                    let frame = try await backend.screenshot()
-                    let currentHash = GUIAutomationPayloadPolicy.sha256Hex(frame)
-                    if currentHash == returnHash {
-                        returnedFrameData = frame
-                        break
-                    }
                     completedReturnSteps += 1
-                    returnHash = currentHash
-                    returnedFrameData = frame
+                    try await Task.sleep(nanoseconds: settleNanoseconds)
                 }
-                if completedReturnSteps == returnSteps, let returnedFrameData {
-                    payload["sha256"] = GUIAutomationPayloadPolicy.sha256Hex(returnedFrameData)
-                    if let attachment = try persistScreenshotAttachment(returnedFrameData, sessionID: call.sessionID) {
-                        attachments.append(attachment)
-                    }
-                    let returnedObservation = await LocalVisionTextObservation.observe(for: returnedFrameData, maximumElements: 48, requiresText: true)
-                    totalOCRLatencyMS += Int(returnedObservation.payload["localVisionLatencyMS"] ?? "0") ?? 0
-                    let returnedScreenSize = LocalPerceptionScreenSize(
-                        width: Double(returnedObservation.payload["screenPointWidth"] ?? "") ?? 0,
-                        height: Double(returnedObservation.payload["screenPointHeight"] ?? "") ?? 0
+                try Task.checkCancellation()
+                let returnedFrameData = try await backend.screenshot()
+                payload["sha256"] = GUIAutomationPayloadPolicy.sha256Hex(returnedFrameData)
+                if let attachment = try persistScreenshotAttachment(returnedFrameData, sessionID: call.sessionID) {
+                    attachments.append(attachment)
+                }
+
+                let returnedImage = UIImage(data: returnedFrameData)?.cgImage
+                var returnedScreenSize = LocalPerceptionScreenSize(
+                    width: Double(returnedImage?.width ?? 0),
+                    height: Double(returnedImage?.height ?? 0)
+                )
+                let returnedMetricRegion = LocalFeedPerceptionPolicy.metricRegion(screenSize: returnedScreenSize).map {
+                    CGRect(x: CGFloat($0.x), y: CGFloat($0.y), width: CGFloat($0.width), height: CGFloat($0.height))
+                }
+                var returnedObservation = await LocalVisionTextObservation.observe(
+                    for: returnedFrameData,
+                    maximumElements: 24,
+                    regionInScreenPoints: returnedMetricRegion,
+                    requiresText: true,
+                    forcePrecise: returnedMetricRegion != nil
+                )
+                totalOCRLatencyMS += Int(returnedObservation.payload["localVisionLatencyMS"] ?? "0") ?? 0
+                if returnedMetricRegion != nil { preciseMetricRegionSamples += 1 }
+                var returnedElements = returnedObservation.elements
+                let observedWidth = Double(returnedObservation.payload["screenPointWidth"] ?? "") ?? 0
+                let observedHeight = Double(returnedObservation.payload["screenPointHeight"] ?? "") ?? 0
+                if observedWidth > 0, observedHeight > 0 {
+                    returnedScreenSize = .init(width: observedWidth, height: observedHeight)
+                }
+
+                var returnedSufficient = LocalFeedPerceptionPolicy.observationIsSufficient(
+                    metric: requestedMetric,
+                    elements: returnedElements,
+                    screenSize: returnedScreenSize
+                )
+                if !returnedSufficient {
+                    returnedObservation = await LocalVisionTextObservation.observe(
+                        for: returnedFrameData,
+                        maximumElements: 48,
+                        requiresText: true,
+                        forcePrecise: false
                     )
-                    if let returnedMetric = LocalFeedMetricExtractor.extract(
-                        metric: localMetricSelection.metric,
-                        elements: returnedObservation.elements,
+                    fullFrameOCRFallbackSamples += 1
+                    totalOCRLatencyMS += Int(returnedObservation.payload["localVisionLatencyMS"] ?? "0") ?? 0
+                    returnedElements = LocalPerceptionFusion.merge(ax: returnedElements, ocr: returnedObservation.elements)
+                    returnedSufficient = LocalFeedPerceptionPolicy.observationIsSufficient(
+                        metric: requestedMetric,
+                        elements: returnedElements,
                         screenSize: returnedScreenSize
-                    ) {
-                        selectedReturnVerified = abs(returnedMetric.value - localMetricSelection.selectedValue) < 0.5
+                    )
+                }
+                if !returnedSufficient {
+                    axAttemptedSamples += 1
+                    if let tree = try? await backend.tree() {
+                        let returnedAX = LocalAXTreeTextExtractor.extract(from: tree, maximumElements: 96)
+                        if !returnedAX.isEmpty { axSucceededSamples += 1 }
+                        returnedElements = LocalPerceptionFusion.merge(ax: returnedAX, ocr: returnedElements)
                     }
+                } else {
+                    axSkippedLocalSufficientSamples += 1
+                }
+
+                if let returnIdentity = LocalFeedIdentity.signature(elements: returnedElements, screenSize: returnedScreenSize) {
+                    selectedReturnVerified = returnIdentity == targetIdentity
+                    if !selectedReturnVerified { returnFailureReason = "return_target_identity_mismatch" }
+                } else {
+                    selectedReturnVerified = false
+                    returnFailureReason = "return_semantic_identity_unavailable"
                 }
                 payload["localMetricReturnSteps"] = String(returnSteps)
                 payload["localMetricCompletedReturnSteps"] = String(completedReturnSteps)
+                payload["localMetricReturnVerificationMode"] = "final_state_only"
+                payload["localMetricReturnIdentityVerified"] = selectedReturnVerified ? "true" : "false"
+                if let returnFailureReason { payload["localMetricReturnFailureReason"] = returnFailureReason }
             }
             payload["perceptionOCRLatencyMS"] = String(totalOCRLatencyMS)
+            payload["perceptionOCRPreciseMetricRegionSampleCount"] = String(preciseMetricRegionSamples)
+            payload["perceptionOCRFullFrameFallbackSampleCount"] = String(fullFrameOCRFallbackSamples)
+            payload["perceptionAXAttempted"] = axAttemptedSamples > 0 ? "true" : "false"
+            payload["perceptionAXSucceeded"] = axSucceededSamples > 0 ? "true" : "false"
+            payload["perceptionAXSampleCount"] = String(axAttemptedSamples)
+            payload["perceptionAXSuccessfulSampleCount"] = String(axSucceededSamples)
+            payload["perceptionAXSkippedLocalSufficientSampleCount"] = String(axSkippedLocalSufficientSamples)
             payload["localMetricSelectedReturnVerified"] = selectedReturnVerified ? "true" : "false"
             if !returnToSelected || selectedReturnVerified {
                 payload["perceptionLocalSufficient"] = "true"
@@ -2419,7 +3401,9 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             if completed {
                 let statuses = localVisionSamples.compactMap { $0["status"] }
                 let failureReason: String
-                if statuses.contains(where: { $0.hasPrefix("unavailable") }) {
+                if lowConfidenceMetricEvidence {
+                    failureReason = "metric_confidence_below_threshold"
+                } else if statuses.contains(where: { $0.hasPrefix("unavailable") }) {
                     failureReason = "ocr_request_failed"
                 } else if statuses.contains("available_empty") {
                     failureReason = "ocr_completed_no_text"
@@ -2453,7 +3437,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         } else if completed {
             summary = "Locally sampled \(sampledCount) consecutive feed items in one bounded execution; local metric evidence was insufficient or not requested, so sample screenshots remain available for one semantic review."
         } else {
-            summary = "Local feed sampling stopped at sample \(sampledCount) because the next frame was byte-identical; collected screenshots remain available for re-planning."
+            summary = "Local feed sampling stopped at sample \(sampledCount) because semantic feed identity could not prove a distinct next item (\(stoppedReason ?? "unknown")); collected screenshots remain available for re-planning."
         }
         return ToolResult(
             toolCallID: call.id,
@@ -2538,31 +3522,31 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                     stateChanges += 1
                 case "waitForElement":
                     let elementCall = Self.elementLookupCall(from: step, sessionID: call.sessionID, toolName: "gui.waitForElement")
-                    let resolved = try await waitForElement(elementCall, timeoutMS: timeoutMS)
+                    let resolved = try await waitForSemanticTarget(elementCall, timeoutMS: timeoutMS)
                     if resolved.cacheHit { elementCacheHits += 1 }
                 case "tapElement":
                     let elementCall = Self.elementLookupCall(from: step, sessionID: call.sessionID, toolName: "gui.findElement")
-                    let resolved = try await resolveElement(elementCall)
+                    let resolved = try await resolveSemanticTarget(elementCall)
                     if resolved.cacheHit { elementCacheHits += 1 }
-                    guard !Self.isProtectedElement(resolved.match) else {
+                    guard !Self.isProtectedLocalVisionText(resolved.searchableText) else {
                         throw ToolRouterError.noExecutionRoute("structured plan stopped at protected/system-confirmation element")
                     }
-                    guard !Self.isCommitElement(resolved.match) else {
+                    guard !Self.isCommitLocalVisionText(resolved.searchableText) else {
                         throw ToolRouterError.noExecutionRoute("structured plan stopped before a commit/irreversible element; execute that action as a separately verified tool step")
                     }
-                    try await backend.tap(x: resolved.match.frame.centerX, y: resolved.match.frame.centerY)
+                    try await backend.tap(x: resolved.centerX, y: resolved.centerY)
                     stateChanges += 1
                     if !isFinal || step.expectQuery != nil {
                         try await validateExpectation(step, timeoutMS: timeoutMS)
                     }
                 case "typeElement":
                     let elementCall = Self.elementLookupCall(from: step, sessionID: call.sessionID, toolName: "gui.findElement")
-                    let resolved = try await resolveElement(elementCall)
+                    let resolved = try await resolveSemanticTarget(elementCall)
                     if resolved.cacheHit { elementCacheHits += 1 }
-                    guard !Self.isProtectedElement(resolved.match) else {
+                    guard !Self.isProtectedLocalVisionText(resolved.searchableText) else {
                         throw ToolRouterError.noExecutionRoute("structured plan stopped at protected/secure input element")
                     }
-                    try await backend.tap(x: resolved.match.frame.centerX, y: resolved.match.frame.centerY)
+                    try await backend.tap(x: resolved.centerX, y: resolved.centerY)
                     try await Task.sleep(nanoseconds: 120_000_000)
                     try Task.checkCancellation()
                     try await backend.type(step.text ?? "")
@@ -2655,17 +3639,52 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         let mode = GUIElementMatchMode(rawValue: step.expectMatch ?? "exact") ?? .exact
         repeat {
             try Task.checkCancellation()
-            let tree = try await backend.tree()
-            let matches = GUIElementResolver.find(in: tree, query: query, role: step.expectRole, mode: mode, maximumMatches: 3)
-            if expectation == "present", matches.count == 1 { return }
-            if expectation == "absent", matches.isEmpty { return }
-            if expectation == "present", matches.count > 1 {
-                throw ToolRouterError.noExecutionRoute("structured plan expectation is ambiguous; refine expectQuery/expectRole")
+
+            var axResolved = false
+            do {
+                let tree = try await backend.tree()
+                let matches = GUIElementResolver.find(in: tree, query: query, role: step.expectRole, mode: mode, maximumMatches: 3)
+                if expectation == "present", matches.count == 1 { return }
+                if expectation == "absent", matches.isEmpty { return }
+                if matches.count > 1 {
+                    throw ToolRouterError.noExecutionRoute("structured plan expectation is ambiguous; refine expectQuery/expectRole")
+                }
+                axResolved = true
+            } catch let error as ToolRouterError {
+                if String(describing: error).contains("ambiguous") { throw error }
+            } catch {
+                // AX is best-effort on standalone TrollStore. Continue immediately to same-frame OCR.
             }
+
+            let screenshot = try await backend.screenshot()
+            let ocrCall = ToolCall(
+                name: "gui.findElement",
+                arguments: ["query": query, "match": mode.rawValue],
+                sessionID: UUID()
+            )
+            let first = await resolveLocalVisionText(ocrCall, screenshot: screenshot)
+            var ocrResolution = first
+            if first.match == nil,
+               first.observation.payload["localVisionPrecisionRecommended"] == "true" {
+                ocrResolution = await resolveLocalVisionText(ocrCall, screenshot: screenshot, forcePrecise: true)
+            }
+            if expectation == "present", ocrResolution.match != nil { return }
+            if ocrResolution.failureReason == "ocr_unique_match_ambiguous" {
+                throw ToolRouterError.noExecutionRoute("structured plan expectation is ambiguous in local OCR; refine expectQuery")
+            }
+            if expectation == "absent" {
+                let status = ocrResolution.observation.payload["localVisionOCR"] ?? ""
+                if ocrResolution.match == nil, (status == "recognized" || status == "available_empty") { return }
+            }
+
             if Date() >= deadline { break }
-            try await Task.sleep(nanoseconds: 180_000_000)
+            if axResolved {
+                try await Task.sleep(nanoseconds: 120_000_000)
+            } else {
+                try await Task.sleep(nanoseconds: 80_000_000)
+            }
         } while Date() < deadline
-        throw ToolRouterError.noExecutionRoute("structured plan local expectation did not become true before timeout")
+        throw ToolRouterError.noExecutionRoute("structured plan local semantic expectation did not become true before timeout")
     }
 
     private static func validateStructuredPlan(_ plan: LocalGUIPlan) throws {
@@ -2773,36 +3792,163 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         throw lastError ?? ToolRouterError.noExecutionRoute("structured element did not appear before timeout")
     }
 
+    private func resolveSemanticTarget(_ call: ToolCall) async throws -> LocalSemanticTarget {
+        do {
+            let resolved = try await resolveElement(call)
+            return LocalSemanticTarget(
+                centerX: resolved.match.frame.centerX,
+                centerY: resolved.match.frame.centerY,
+                searchableText: resolved.match.searchableText,
+                source: "ax",
+                cacheHit: resolved.cacheHit
+            )
+        } catch {
+            let screenshot = try await backend.screenshot()
+            var resolution = await resolveLocalVisionText(call, screenshot: screenshot)
+            if resolution.match == nil,
+               resolution.observation.payload["localVisionPrecisionRecommended"] == "true" {
+                resolution = await resolveLocalVisionText(call, screenshot: screenshot, forcePrecise: true)
+            }
+            guard let match = resolution.match else {
+                throw ToolRouterError.noExecutionRoute(resolution.failureSummary ?? "AX and local OCR could not resolve one unique semantic target")
+            }
+            return LocalSemanticTarget(
+                centerX: match.centerX,
+                centerY: match.centerY,
+                searchableText: match.text,
+                source: "ocr",
+                cacheHit: resolution.observation.payload["localVisionCacheHit"] == "true"
+            )
+        }
+    }
+
+    private func waitForSemanticTarget(_ call: ToolCall, timeoutMS: Int) async throws -> LocalSemanticTarget {
+        let deadline = Date().addingTimeInterval(Double(timeoutMS) / 1_000.0)
+        var lastError: Error?
+        repeat {
+            do {
+                return try await resolveSemanticTarget(call)
+            } catch {
+                lastError = error
+            }
+            try Task.checkCancellation()
+            if Date() >= deadline { break }
+            try await Task.sleep(nanoseconds: 120_000_000)
+        } while Date() < deadline
+        throw lastError ?? ToolRouterError.noExecutionRoute("local semantic target did not appear before timeout")
+    }
+
     private func resolveLocalVisionText(
         _ call: ToolCall,
-        screenshot: Data
+        screenshot: Data,
+        forcePrecise: Bool = false
     ) async -> (match: LocalPerceptionTextElement?, observation: LocalVisionTextObservation.Observation, failureReason: String?, failureSummary: String?) {
         let query = call.arguments["query"] ?? ""
         let mode = GUIElementMatchMode(rawValue: call.arguments["match"] ?? "exact") ?? .exact
-        let observation = await LocalVisionTextObservation.observe(for: screenshot, maximumElements: 48, requiresText: true)
-        let status = observation.payload["localVisionOCR"] ?? "unavailable"
-        guard status == "recognized" else {
-            let reason = status == "available_empty" ? "ocr_completed_no_text" : "ocr_request_failed"
-            return (nil, observation, reason, "Local OCR text lookup could not resolve a target: \(status).")
-        }
-        switch LocalPerceptionTextMatcher.resolve(query: query, mode: mode, elements: observation.elements) {
-        case .unique(let match):
-            return (match, observation, nil, nil)
-        case .ambiguous(let count):
-            return (
-                nil,
-                observation,
-                "ocr_unique_match_ambiguous",
-                "Local OCR text query is ambiguous (\(count) matches); refine the query instead of guessing coordinates."
+        let regions: [CGRect?] = forcePrecise ? [nil] : Self.semanticOCRRegions(query: query, screenshot: screenshot)
+        var attemptLabels: [String] = []
+        var lastObservation = LocalVisionTextObservation.Observation(
+            payload: ["localVisionOCR": "unavailable_not_attempted"],
+            elements: []
+        )
+        var lastFailureReason = "ocr_request_failed"
+        var lastFailureSummary = "Local OCR text lookup did not run."
+
+        for (index, region) in regions.enumerated() {
+            var observation = await LocalVisionTextObservation.observe(
+                for: screenshot,
+                maximumElements: 48,
+                regionInScreenPoints: region,
+                requiresText: true,
+                forcePrecise: forcePrecise
             )
-        case .notFound:
-            return (
-                nil,
-                observation,
-                "ocr_target_not_recognized",
-                "Local OCR completed, but the requested visible text did not produce one unique current-frame match."
-            )
+            let regionLabel = observation.payload["localVisionRegion"] ?? (region == nil ? "full_screen" : "roi")
+            let passLabel = forcePrecise ? "precise" : "fast"
+            attemptLabels.append("\(index + 1):\(passLabel):\(regionLabel)")
+            observation.payload["localVisionAttemptSequence"] = attemptLabels.joined(separator: " -> ")
+            lastObservation = observation
+
+            let status = observation.payload["localVisionOCR"] ?? "unavailable"
+            guard status == "recognized" else {
+                lastFailureReason = status == "available_empty" ? "ocr_completed_no_text" : "ocr_request_failed"
+                lastFailureSummary = "Local OCR text lookup could not resolve a target: \(status)."
+                continue
+            }
+
+            switch LocalPerceptionTextMatcher.resolve(query: query, mode: mode, elements: observation.elements) {
+            case .unique(let match):
+                observation.payload["localVisionPrecisionRecommended"] = "false"
+                observation.payload["localVisionAttemptSequence"] = attemptLabels.joined(separator: " -> ")
+                return (match, observation, nil, nil)
+            case .ambiguous(let count):
+                observation.payload["localVisionPrecisionRecommended"] = "false"
+                observation.payload["localVisionAttemptSequence"] = attemptLabels.joined(separator: " -> ")
+                return (
+                    nil,
+                    observation,
+                    "ocr_unique_match_ambiguous",
+                    "Local OCR text query is ambiguous (\(count) matches); refine the query instead of guessing coordinates."
+                )
+            case .notFound:
+                lastObservation = observation
+                lastFailureReason = "ocr_target_not_recognized"
+                lastFailureSummary = "Local OCR completed, but the requested visible text did not produce one unique current-frame match."
+            }
         }
+
+        if !forcePrecise {
+            let shortSemanticTarget = query.trimmingCharacters(in: .whitespacesAndNewlines).count <= 6
+            let sparseFastResult = lastObservation.elements.count < 12
+            let noText = lastObservation.payload["localVisionOCR"] == "available_empty"
+            let preciseRecommended = noText || (shortSemanticTarget && sparseFastResult)
+            lastObservation.payload["localVisionPrecisionRecommended"] = preciseRecommended ? "true" : "false"
+            lastObservation.payload["localVisionPrecisionReason"] = preciseRecommended
+                ? (noText ? "fast_completed_no_text" : "short_target_sparse_fast_result")
+                : "fast_elements_sufficient_do_not_repeat_same_frame_precise"
+        } else {
+            lastObservation.payload["localVisionPrecisionRecommended"] = "false"
+            lastObservation.payload["localVisionPrecisionReason"] = "precise_already_attempted"
+        }
+        lastObservation.payload["localVisionAttemptSequence"] = attemptLabels.joined(separator: " -> ")
+        return (nil, lastObservation, lastFailureReason, lastFailureSummary)
+    }
+
+    private static func semanticOCRRegions(query: String, screenshot: Data) -> [CGRect?] {
+        guard let image = UIImage(data: screenshot), image.size.width >= 100, image.size.height >= 200 else {
+            return [nil]
+        }
+        let width = image.size.width
+        let height = image.size.height
+        let normalized = query.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        let searchMarkers = ["搜索", "搜", "查找", "search", "find"]
+        let commitMarkers = ["发送", "回复", "send", "reply"]
+        let conversationMarkers = ["文件传输助手", "联系人", "群聊", "conversation", "contact", "chat"]
+
+        if searchMarkers.contains(where: normalized.contains) {
+            return [
+                CGRect(x: 0, y: 0, width: width, height: height * 0.34),
+                CGRect(x: 0, y: 0, width: width, height: height * 0.56),
+                nil
+            ]
+        }
+        if commitMarkers.contains(where: normalized.contains) {
+            return [
+                CGRect(x: 0, y: height * 0.62, width: width, height: height * 0.38),
+                CGRect(x: 0, y: height * 0.44, width: width, height: height * 0.56),
+                nil
+            ]
+        }
+        if conversationMarkers.contains(where: normalized.contains) {
+            return [
+                CGRect(x: 0, y: height * 0.10, width: width, height: height * 0.68),
+                CGRect(x: 0, y: height * 0.04, width: width, height: height * 0.86),
+                nil
+            ]
+        }
+        return [nil]
     }
 
     private func elementPayload(_ match: GUIElementMatch, treeHash: String, cacheHit: Bool) -> [String: String] {
@@ -2849,7 +3995,11 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
     }
 
     private static func isCommitElement(_ match: GUIElementMatch) -> Bool {
-        let haystack = match.searchableText.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        isCommitLocalVisionText(match.searchableText)
+    }
+
+    private static func isCommitLocalVisionText(_ text: String) -> Bool {
+        let haystack = text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
         let commitMarkers = [
             "send", "submit", "publish", "post", "delete", "remove", "purchase", "buy", "pay", "checkout", "confirm order",
             "发送", "提交", "发布", "删除", "移除", "购买", "支付", "结算", "确认订单", "卸载"
@@ -2880,6 +4030,29 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         if payload["providerVisualRoundTripAvoided"] == nil { payload["providerVisualRoundTripAvoided"] = "0" }
     }
 
+    private func recordActionOutcomeIfKnown(
+        bundleID: String,
+        semanticAction: String,
+        success: Bool,
+        latencyMS: Int
+    ) async {
+        guard let appKnowledgeRegistry,
+              let knowledge = await appKnowledgeRegistry.knowledge(for: bundleID) else { return }
+        let environment = AppActionEnvironment(
+            appVersion: knowledge.appVersion,
+            iOSMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
+            deviceClass: nil
+        )
+        try? await appKnowledgeRegistry.recordActionOutcome(
+            bundleID: bundleID,
+            semanticAction: semanticAction,
+            route: .guiFallback,
+            environment: environment,
+            success: success,
+            latencyMS: latencyMS
+        )
+    }
+
     private func persistScreenshotAttachment(_ data: Data, sessionID: UUID) throws -> ChatAttachment? {
         guard let attachmentRoot else { return nil }
         guard !data.isEmpty, data.count <= ChatMessageAttachmentPolicy.maxImageBytes else {
@@ -2906,7 +4079,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
         case "gui.tapElementObserve": return [.tree, .touch, .screenshot]
         case "gui.tapTextObserve", "gui.focusComposerObserve": return [.screenshot, .touch]
         case "gui.typeElementObserve": return [.tree, .touch, .textInput, .screenshot]
-        case "gui.runStructuredPlan": return [.openApp, .tree, .screenshot, .touch, .textInput, .gestures]
+        case "gui.runStructuredPlan": return [.openApp, .screenshot, .touch, .textInput, .gestures]
         case "gui.screenshot": return [.screenshot]
         case "gui.tap": return [.touch]
         case "gui.type": return [.textInput]

@@ -202,13 +202,20 @@ public struct ProviderDiscoveryClient: Sendable {
         let models = discoveredCatalog.models
         let protocolsToProbe = Self.uniqueProtocols(inferenceProtocols)
 
-        // Model catalogs from compatible gateways can mix chat, image, embedding,
-        // and legacy entries. Do not assume the first row is inference-compatible.
-        // Probe a bounded prefix under each inference auth mode and only the protocols
-        // this profile actually advertises, keeping validation bounded and fast.
+        // A user-supplied model is stronger inference-routing evidence than catalog order. Official
+        // catalogs can mix chat, image, embedding, and legacy entries, so probing only the first
+        // catalog rows can falsely reject a known-good manually configured model. Keep the work
+        // bounded, but try explicit candidates first and then fill the same 12-model budget from
+        // the live catalog. A candidate is still accepted only after a real inference response.
+        let inferenceCandidates = Self.inferenceCandidates(
+            fallbackInferenceCandidates: fallbackInferenceCandidates,
+            catalogModels: models,
+            baseURL: baseURL,
+            limit: 12
+        )
         var capacityBlockedAuthMode: ProviderAuthMode?
         for inferenceAuthMode in authModes {
-            for model in models.prefix(12) {
+            for model in inferenceCandidates {
                 var supported: [ProviderProtocol] = []
                 for protocolName in protocolsToProbe {
                     switch try await probe(protocolName, baseURL: baseURL, apiKey: apiKey, authMode: inferenceAuthMode, model: model) {
@@ -343,6 +350,52 @@ public struct ProviderDiscoveryClient: Sendable {
         return values.filter { !$0.isEmpty && seen.insert($0).inserted }
     }
 
+    static func inferenceCandidates(
+        fallbackInferenceCandidates: [String],
+        catalogModels: [String],
+        baseURL: URL,
+        limit: Int
+    ) -> [String] {
+        let boundedLimit = max(1, limit)
+        let explicit = unique(fallbackInferenceCandidates)
+        let explicitSet = Set(explicit)
+        let catalog = unique(catalogModels).filter { !explicitSet.contains($0) }
+        guard baseURL.host?.lowercased() == "generativelanguage.googleapis.com" else {
+            return Array((explicit + catalog).prefix(boundedLimit))
+        }
+
+        // Google's OpenAI-compatible /models catalog contains text-generation models alongside
+        // embeddings, image/video generation, TTS/audio and other specialized endpoints. Probing
+        // only the first catalog rows can therefore reject a perfectly valid Gemini API key before
+        // reaching a chat-capable model. Preserve any user-supplied model at the front, then rank
+        // the live Google catalog toward Gemini text-generation models. The catalog remains the
+        // authority: this never invents a model id that Google did not return.
+        func score(_ model: String) -> Int {
+            let value = model.lowercased()
+            var result = 0
+            if value.contains("gemini-3.8-flash") { result += 500 }
+            if value.contains("gemini") { result += 180 }
+            if value.contains("flash") { result += 60 }
+            if value.contains("pro") { result += 35 }
+            if value.contains("lite") { result += 10 }
+
+            let nonChatMarkers = [
+                "embedding", "embed", "imagen", "image-generation", "image_generation",
+                "veo", "tts", "text-to-speech", "audio", "aqa", "robotics", "computer-use"
+            ]
+            if nonChatMarkers.contains(where: { value.contains($0) }) { result -= 400 }
+            return result
+        }
+
+        let rankedCatalog = catalog.enumerated().sorted { lhs, rhs in
+            let leftScore = score(lhs.element)
+            let rightScore = score(rhs.element)
+            if leftScore != rightScore { return leftScore > rightScore }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+        return Array((explicit + rankedCatalog).prefix(boundedLimit))
+    }
+
     private static func uniqueProtocols(_ values: [ProviderProtocol]) -> [ProviderProtocol] {
         var seen = Set<String>()
         return values.filter { seen.insert($0.rawValue).inserted }
@@ -417,7 +470,14 @@ public struct ProviderDiscoveryClient: Sendable {
             body = ["model": model, "max_tokens": 1, "stream": false, "messages": [["role": "user", "content": "Reply OK"]]]
         case .openAIChat:
             path = "chat/completions"
-            body = ["model": model, "max_tokens": 1, "stream": false, "messages": [["role": "user", "content": "Reply OK"]]]
+            var chatBody: [String: Any] = ["model": model, "stream": false, "messages": [["role": "user", "content": "Reply OK"]]]
+            // Google's official Gemini OpenAI compatibility endpoint accepts the same minimal body
+            // used by our real OpenAI-compatible runtime. Do not make discovery stricter than the
+            // request path by injecting a legacy max_tokens field only during validation.
+            if baseURL.host?.lowercased() != "generativelanguage.googleapis.com" {
+                chatBody["max_tokens"] = 1
+            }
+            body = chatBody
         case .openAIResponses:
             path = "responses"
             body = ["model": model, "max_output_tokens": 1, "stream": false, "input": "Reply OK"]

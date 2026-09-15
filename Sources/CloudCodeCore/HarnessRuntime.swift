@@ -19,7 +19,8 @@ public enum HarnessContextManager {
     public static func providerMessages(
         from messages: [ChatMessage],
         policy: HarnessContextPolicy = HarnessContextPolicy(),
-        currentRequest: String? = nil
+        currentRequest: String? = nil,
+        finiteRepeatCompletedCount: Int = 0
     ) -> [ChatMessage] {
         guard !messages.isEmpty else { return [] }
         let normalizedMessages = pruningHistoricalObservationAttachments(in: messages)
@@ -30,6 +31,9 @@ public enum HarnessContextManager {
         var selectedIndexes = Set<Int>()
         var requiredToolCallIDs = Set<String>()
         var selectedCount = 0
+        let latestExternalUserIndex = normalizedMessages.indices.reversed().first(where: {
+            normalizedMessages[$0].role == .user && normalizedMessages[$0].providerMetadata["internal_observation"] == nil
+        })
 
         for pair in conversational.reversed() {
             let index = pair.offset
@@ -38,9 +42,16 @@ public enum HarnessContextManager {
             let toolCallID = message.providerMetadata["tool_call_id"]
             let isRequiredAssistant = message.role == .assistant && toolCallID.map(requiredToolCallIDs.contains) == true
             let mustKeepLatestUser = selectedIndexes.isEmpty && message.role == .user
-            let fits = selectedCount < policy.maxMessages && cost <= remainingBudget
+            let withinMessageLimit = selectedCount < policy.maxMessages
+            let isCurrentRunMessage = latestExternalUserIndex.map { index >= $0 } ?? false
+            let fits = withinMessageLimit && cost <= remainingBudget
 
-            if fits || isRequiredAssistant || mustKeepLatestUser {
+            // Historical context obeys the strict character budget, but the active request's own
+            // bounded execution tail must not disappear merely because fixed system instructions
+            // already consumed that budget. Losing a fresh tool call/result makes the Provider
+            // repeat a completed stage and can turn context compression into a tool-round loop.
+            // maxMessages still caps this protected current-run tail.
+            if fits || (isCurrentRunMessage && withinMessageLimit) || isRequiredAssistant || mustKeepLatestUser {
                 selectedIndexes.insert(index)
                 selectedCount += 1
                 remainingBudget = max(0, remainingBudget - cost)
@@ -88,7 +99,11 @@ public enum HarnessContextManager {
         })
 
         var result = systemMessages
-        result.append(contentsOf: executionHints(from: normalizedMessages, currentRequest: currentRequest))
+        result.append(contentsOf: executionHints(
+            from: normalizedMessages,
+            currentRequest: currentRequest,
+            finiteRepeatCompletedCount: finiteRepeatCompletedCount
+        ))
         let omitted = conversational.count - selectedIndexes.count
         if omitted > 0 {
             result.append(ChatMessage(
@@ -103,35 +118,79 @@ public enum HarnessContextManager {
         return result
     }
 
-    static func executionHints(from messages: [ChatMessage], currentRequest: String? = nil) -> [ChatMessage] {
+    static func executionHints(
+        from messages: [ChatMessage],
+        currentRequest: String? = nil,
+        finiteRepeatCompletedCount: Int = 0
+    ) -> [ChatMessage] {
         let explicitRequest = currentRequest?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard let request = !explicitRequest.isEmpty ? explicitRequest : messages.reversed().first(where: {
             $0.role == .user && $0.providerMetadata["internal_observation"] == nil
         })?.content else { return [] }
         var hints: [ChatMessage] = []
         if let count = boundedRepeatedSwipeCount(in: request) {
-            let needsFeedReview = feedSamplingNeedsIntermediateReview(in: request)
-            let namesFeedItems = requestsConsecutiveFeedItems(in: request)
-            let useFeedSample = needsFeedReview || namesFeedItems
+            let completed = max(0, finiteRepeatCompletedCount)
+            let remaining = max(0, count - completed)
+            if remaining == 0 {
+                hints.append(ChatMessage(
+                    role: .system,
+                    content: "Harness execution state: the user's finite browse/swipe obligation is already complete at \(completed)/\(count). Do not request gui.feedSample, gui.swipeSequence, gui.swipe, gui.scroll, or their Observe variants again for this request. Continue only with another still-pending action such as Like/tap/verification, or finish.",
+                    providerMetadata: [
+                        "context_layer": "harness_execution",
+                        "execution_mode": "finite_repeat_complete",
+                        "repeat_required": String(count),
+                        "repeat_completed": String(completed),
+                        "repeat_remaining": "0"
+                    ]
+                ))
+            } else {
+                let needsFeedReview = feedSamplingNeedsIntermediateReview(in: request)
+                let namesFeedItems = requestsConsecutiveFeedItems(in: request)
+                let useFeedSample = needsFeedReview || namesFeedItems
+                hints.append(ChatMessage(
+                    role: .system,
+                    content: useFeedSample
+                        ? (remaining == 1
+                            ? "Harness execution hint: the latest user request requires \(count) consecutive feed/video items; \(completed) are already accounted for and exactly 1 remains. gui.feedSample intentionally requires at least 2 samples, so do not round this up or restart a batch. Advance exactly one unit with one bounded gui.scrollObserve; after that, reconcile any still-pending metric/selection obligation from existing evidence or one bounded re-plan."
+                            : "Harness execution hint: the latest user request requires \(count) consecutive feed/video items; \(completed) are already accounted for and only \(remaining) remain. After the target feed is foreground, request at most one gui.feedSample with direction=forward and count=\(remaining). This coordinate-free local macro owns the physical gesture direction and must never restart the original full batch after progress has been recorded.")
+                        : "Harness execution hint: the latest user request requires \(count) finite repeated swipes; \(completed) are already accounted for and only \(remaining) remain. After a fresh foreground observation, request at most one gui.swipeSequence with count=\(remaining) when the repeated motion is mechanically identical and no intermediate semantic decision is required. Swipe coordinates are screen-point coordinates and duration is seconds (0.05–5.0, typically about 0.3); do not emit millisecond duration values. Never restart the original full batch after progress has been recorded.",
+                    providerMetadata: [
+                        "context_layer": "harness_execution",
+                        "execution_mode": useFeedSample ? "bounded_feed_sample" : "bounded_repeated_swipe",
+                        "repeat_count": String(remaining),
+                        "repeat_required": String(count),
+                        "repeat_completed": String(completed),
+                        "repeat_remaining": String(remaining)
+                    ]
+                ))
+            }
+        }
+        if requestsIPAWorkflow(in: request) {
             hints.append(ChatMessage(
                 role: .system,
-                content: useFeedSample
-                    ? "Harness execution hint: the latest user request names \(count) consecutive feed/video items. After the target feed is foreground, prefer one gui.feedSample with direction=forward and count=\(count). This coordinate-free local macro owns the physical gesture direction, captures the requested consecutive items, and avoids raw swipe-coordinate/unit mistakes. Review the returned current screenshots when semantic comparison is required; do not translate forward into user-facing up/down finger-motion wording."
-                    : "Harness execution hint: the latest user request contains an explicit finite repeated swipe count of \(count). After a fresh foreground observation, prefer one gui.swipeSequence with count=\(count) when the repeated motion is mechanically identical and no intermediate semantic decision is required. Swipe coordinates are screen-point coordinates and duration is seconds (0.05–5.0, typically about 0.3); do not emit millisecond duration values. This hint is advisory only: if the screen changes into a state that requires interpretation, use a bounded local semantic macro or individual observe/action steps instead. Never turn this hint into an unbounded loop.",
+                content: "Harness device-operation hint: this request targets an IPA/package workflow. Prefer deterministic typed operations in this order: ipa.inspect → ipa.extract when needed → bounded files/plist/json modification → ipa.repack → ipa.install → apps.inspect/launch plus exact build/bundle verification. Do not use GUI automation to edit an IPA archive. Do not claim compiled executable code was rebuilt unless a verified compile/link/sign toolchain actually exists; otherwise modify only data/resources that can be safely repacked and signed.",
                 providerMetadata: [
                     "context_layer": "harness_execution",
-                    "execution_mode": useFeedSample ? "bounded_feed_sample" : "bounded_repeated_swipe",
-                    "repeat_count": String(count)
+                    "execution_mode": "ipa_native_pipeline"
+                ]
+            ))
+        } else if requestsDeviceNativeOperation(in: request) || requestsLocalDataAccess(in: request) {
+            hints.append(ChatMessage(
+                role: .system,
+                content: "Harness device-operation hint: this request can use direct device/native operations. Prefer typed apps/container/files/data/plist/json/sqlite tools over GUI automation when they can express and verify the requested change. Use cli.run only for bounded read-only gaps and advanced.shell only when the request genuinely requires a command-line mutation that typed tools cannot express. Use GUI only for state that exists solely in the visible App interface or requires a real external App action.",
+                providerMetadata: [
+                    "context_layer": "harness_execution",
+                    "execution_mode": "device_native_first"
                 ]
             ))
         }
         if requiresMessageSend(in: request) {
             hints.append(ChatMessage(
                 role: .system,
-                content: "Harness execution hint: this is a messaging/contact task. Prefer deterministic local discovery before visual navigation when the target App exposes accessible container data: apps.inspect/container.resolve/container.search/data.localQuery/sqlite.* are read-only discovery aids for locating the contact/conversation and must never be used to forge a sent-message state by editing an App database. After the destination is resolved, use the cheapest verified App/private/deep-link/AX-text path and reserve screenshot GUI for the remaining state-dependent steps. A final send/commit is an external App action and still requires a real send control/private route plus fresh postcondition verification.",
+                content: "Harness execution hint: this is a messaging/contact task. Once the target App is foreground and a fresh screenshot is available, stay on the current in-App GUI/search path and act from that observation; do not detour through apps.list, container, filesystem, or SQLite discovery merely to locate a visible contact. Read-only native/container discovery is a fallback for an explicit local-data request or when no fresh GUI observation can resolve the destination and the exact container route is already verified. It must never be used to forge a sent-message state by editing an App database. A final send/commit is an external App action and still requires a real send control/private/GUI route plus fresh postcondition verification.",
                 providerMetadata: [
                     "context_layer": "harness_execution",
-                    "execution_mode": "native_messaging_discovery"
+                    "execution_mode": "foreground_messaging_fast_path"
                 ]
             ))
         }
@@ -148,8 +207,16 @@ public enum HarnessContextManager {
         return hints
     }
 
-    static func executionHint(from messages: [ChatMessage], currentRequest: String? = nil) -> ChatMessage? {
-        executionHints(from: messages, currentRequest: currentRequest).first
+    static func executionHint(
+        from messages: [ChatMessage],
+        currentRequest: String? = nil,
+        finiteRepeatCompletedCount: Int = 0
+    ) -> ChatMessage? {
+        executionHints(
+            from: messages,
+            currentRequest: currentRequest,
+            finiteRepeatCompletedCount: finiteRepeatCompletedCount
+        ).first
     }
 
     static func providerPolicy(for request: String) -> HarnessContextPolicy {
@@ -162,7 +229,7 @@ public enum HarnessContextManager {
             // GUI execution is dominated by current foreground evidence. Retaining dozens of old
             // screenshot/tool turns makes gateway payloads slower and can trigger compatibility
             // failures without improving the next local action. Full history stays persisted locally.
-            return HarnessContextPolicy(maxCharacters: 48_000, maxMessages: 40)
+            return HarnessContextPolicy(maxCharacters: 32_000, maxMessages: 24)
         }
         return HarnessContextPolicy()
     }
@@ -255,6 +322,56 @@ public enum HarnessContextManager {
         return markers.contains(where: normalized.contains)
     }
 
+    static func requiresLikeAction(in request: String) -> Bool {
+        let normalized = request.lowercased()
+        // A count/comparison mention is read-only only when it is the sole Like occurrence. Golden
+        // tasks often say “比较点赞量，给最高的一条点赞”; the second explicit Like is a write
+        // obligation and must not be erased merely because the same sentence also names the metric.
+        let countOnlyMarkers = ["点赞量", "点赞数", "点赞数量", "like count", "likes count"]
+        let chineseLikeOccurrences = normalized.components(separatedBy: "点赞").count - 1
+        let explicitChineseWrite = chineseLikeOccurrences >= 2
+            || ["点赞一下", "点个赞", "然后点赞", "并点赞", "去点赞"].contains(where: normalized.contains)
+        if explicitChineseWrite { return true }
+        if countOnlyMarkers.contains(where: normalized.contains) { return false }
+        if normalized.contains("点赞") { return true }
+        return normalized.range(of: #"\blike\b"#, options: .regularExpression) != nil
+    }
+
+    static func requiresNavigationSearch(in request: String) -> Bool {
+        let normalized = request.lowercased()
+        let markers = ["找", "找到", "查找", "搜索", "搜", "find", "search", "locate"]
+        return markers.contains(where: normalized.contains)
+    }
+
+    static func requestsLocalDataAccess(in request: String) -> Bool {
+        let normalized = request.lowercased()
+        let markers = [
+            "读取文件", "删除文件", "复制文件", "移动文件", "搜索文件", "文件路径", "文件夹", "目录",
+            "json", "plist", "sqlite", "数据库", "container", "local data", "filesystem", "file path", "folder", "directory"
+        ]
+        return markers.contains(where: normalized.contains)
+    }
+
+    static func requestsDeviceNativeOperation(in request: String) -> Bool {
+        let normalized = request.lowercased()
+        let markers = [
+            "app容器", "应用容器", "数据容器", "配置文件", "偏好文件", "info.plist", "bundle id", "bundleid",
+            "修改文件", "改文件", "改配置", "写文件", "替换文件", "文件系统", "数据库", "sqlite", "plist", "json",
+            "安装应用", "安装app", "卸载应用", "卸载app", "启动应用", "终止应用", "进程", "container", "filesystem",
+            "modify file", "edit file", "app container", "install app", "uninstall app", "launch app", "terminate app"
+        ]
+        return markers.contains(where: normalized.contains)
+    }
+
+    static func requestsIPAWorkflow(in request: String) -> Bool {
+        let normalized = request.lowercased()
+        let markers = [
+            "ipa", "安装包", "重打包", "重新打包", "重签", "签名", "entitlement", "entitlements",
+            "repack", "resign", "sign ipa", "install ipa"
+        ]
+        return markers.contains(where: normalized.contains)
+    }
+
     static func scopedProviderToolNames(for request: String, availableNames: Set<String>) -> Set<String> {
         let normalized = request.lowercased()
         var prefixes = Set<String>()
@@ -282,33 +399,83 @@ public enum HarnessContextManager {
             && messagingMarkers.contains(where: normalized.contains)
             && messagingActions.contains(where: normalized.contains)
 
-        let dataMarkers = [
-            "读取文件", "删除文件", "复制文件", "移动文件", "搜索文件", "文件路径", "文件夹", "目录", "json", "plist", "sqlite", "数据库", "container"
-        ]
-        if dataMarkers.contains(where: normalized.contains) {
-            prefixes.formUnion(["files.", "container.", "data.", "json.", "plist.", "sqlite.", "storage.", "trash.", "capability."])
+        if requestsLocalDataAccess(in: request) || requestsDeviceNativeOperation(in: request) {
+            prefixes.formUnion(["apps.", "files.", "container.", "data.", "json.", "plist.", "sqlite.", "storage.", "trash.", "capability."])
         }
-        if normalized.contains("ipa") || normalized.contains("安装包") {
-            prefixes.formUnion(["ipa.", "files.", "capability."])
+        if requestsIPAWorkflow(in: request) {
+            prefixes.formUnion(["ipa.", "apps.", "files.", "json.", "plist.", "capability."])
         }
         if normalized.contains("shell") || normalized.contains("命令行") || normalized.contains("cli") {
-            prefixes.formUnion(["advanced.", "capability."])
+            prefixes.formUnion(["cli.", "advanced.", "capability."])
         }
 
         guard !prefixes.isEmpty else { return availableNames }
         var scoped = Set(availableNames.filter { name in prefixes.contains(where: name.hasPrefix) })
+
+        if isGUIRequest {
+            // GUI rounds are latency-sensitive and dominated by the current foreground state. Do not
+            // serialize every apps.* and gui.* capability into each Provider request: the duplicate raw
+            // actions and unrelated destructive lifecycle tools materially increase schema size and TTFT.
+            // Keep one bounded tool for each semantic job, then add only task-specific fast paths.
+            var guiFastPath: Set<String> = [
+                "apps.launch", "apps.list", "apps.inspect",
+                "gui.openAppObserve", "gui.screenshot", "gui.tree", "gui.findElement",
+                "gui.tapElementObserve", "gui.tapTextObserve", "gui.tapObserve", "gui.verify",
+                "interaction.confirmTransition", "capability.probe"
+            ]
+            if requiresMessageSend(in: request) || messagingMarkers.contains(where: normalized.contains) {
+                guiFastPath.formUnion([
+                    "gui.waitForElement", "gui.focusComposerObserve", "gui.typeElementObserve",
+                    "gui.typeObserve", "gui.runStructuredPlan", "gui.navigateBack"
+                ])
+            }
+            if boundedRepeatedSwipeCount(in: request) != nil || requestsConsecutiveFeedItems(in: request) {
+                guiFastPath.formUnion([
+                    "gui.feedSample", "gui.swipeSequence", "gui.scrollObserve", "gui.swipeObserve",
+                    "gui.navigateBack"
+                ])
+            } else if ["滑", "滚动", "swipe", "scroll"].contains(where: normalized.contains) {
+                guiFastPath.formUnion(["gui.scrollObserve", "gui.swipeObserve", "gui.navigateBack"])
+            }
+
+            // Prefer observation-producing actions, but do not erase the only executable semantic
+            // route when a reduced registry (tests, older device runtime, capability downgrade) has
+            // only the raw primitive. Raw actions remain hidden whenever the corresponding Observe
+            // variant is actually available, preserving the small Provider schema on normal builds.
+            if !availableNames.contains("gui.tapObserve"), availableNames.contains("gui.tap") {
+                guiFastPath.insert("gui.tap")
+            }
+            if !availableNames.contains("gui.swipeObserve"), availableNames.contains("gui.swipe") {
+                guiFastPath.insert("gui.swipe")
+            }
+            if !availableNames.contains("gui.scrollObserve"), availableNames.contains("gui.scroll") {
+                guiFastPath.insert("gui.scroll")
+            }
+            scoped = scoped.intersection(guiFastPath)
+        }
+
         // Failure explanation is a local read-only introspection tool and remains useful even when
         // the provider schema is domain-scoped. It never broadens execution authority.
         if availableNames.contains("diagnostics.explainFailure") { scoped.insert("diagnostics.explainFailure") }
         if shouldExposeNativeMessagingDiscovery {
-            let nativeReadOnlyDiscovery: Set<String> = [
-                "apps.inspect", "container.resolve", "container.list", "container.search",
-                "files.list", "files.search", "files.read", "files.stat", "files.metadata", "files.hash",
-                "plist.read", "plist.query", "plist.metadata",
-                "json.read", "json.query", "json.filter", "json.aggregate",
-                "sqlite.discover", "sqlite.tables", "sqlite.schema", "sqlite.query", "sqlite.filter", "sqlite.aggregate", "sqlite.sample",
-                "data.localQuery", "storage.analyze"
-            ]
+            // A generic messaging task should not pay for dozens of low-level filesystem/database
+            // schemas before the foreground GUI path has even been tried. data.localQuery already
+            // provides the bounded resolve→search→inspect→query macro when deterministic native
+            // discovery is needed. Expand to the lower-level read-only surface only when the user
+            // explicitly asked to inspect local files/data.
+            let nativeReadOnlyDiscovery: Set<String>
+            if requestsLocalDataAccess(in: request) {
+                nativeReadOnlyDiscovery = [
+                    "apps.inspect", "container.resolve", "container.list", "container.search",
+                    "files.list", "files.search", "files.read", "files.inspectDocument", "files.stat", "files.metadata", "files.hash",
+                    "plist.read", "plist.query", "plist.metadata",
+                    "json.read", "json.query", "json.filter", "json.aggregate",
+                    "sqlite.discover", "sqlite.tables", "sqlite.schema", "sqlite.query", "sqlite.filter", "sqlite.aggregate", "sqlite.sample",
+                    "data.localQuery", "storage.analyze"
+                ]
+            } else {
+                nativeReadOnlyDiscovery = ["apps.inspect", "container.resolve", "data.localQuery"]
+            }
             scoped.formUnion(availableNames.intersection(nativeReadOnlyDiscovery))
         }
         return scoped.isEmpty ? availableNames : scoped

@@ -112,17 +112,23 @@ jobs:
             test -f "$framework/$framework_name"
             ldid -S "$framework/$framework_name"
           done < <(find "$APP_PATH" -type d -name '*.framework' -print)
+          SHARE_APPEX="$APP_PATH/PlugIns/CloudCodeShareExtension.appex"
+          SHARE_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$SHARE_APPEX/Info.plist")"
+          test -f "$SHARE_APPEX/$SHARE_EXECUTABLE"
+          ldid -SEntitlements/TrollStoreFallback.entitlements "$SHARE_APPEX/$SHARE_EXECUTABLE"
+          codesign --force --sign - --entitlements Entitlements/TrollStoreFallback.entitlements "$SHARE_APPEX"
           MAIN_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
           ROOT_HELPER="$APP_PATH/CloudCodeRootHelper"
           VISION_HELPER="$APP_PATH/CloudCodeVisionHelper"
           test -f "$ROOT_HELPER"
           test -f "$VISION_HELPER"
           ldid -SEntitlements/CloudCodeRootHelper.entitlements "$ROOT_HELPER"
-          # Vision OCR intentionally runs outside the privileged GUI execution profile. Keep this
-          # helper ad-hoc signed with no private/root entitlement dictionary so Vision/CoreML uses
-          # the ordinary application execution class on-device.
-          ldid -S "$VISION_HELPER"
-          codesign --force --sign - "$VISION_HELPER"
+          # Vision OCR remains a separate mobile-user child, outside the root GUI/HID profile. Fresh
+          # Build 120 device evidence showed the helper was SIGKILLed before main() when restricted
+          # IOKit entitlements lacked a launchable System-app identity, so its dedicated profile now
+          # carries that mobile System identity plus only the graphics/decode/ANE clients proven necessary by device syslog.
+          ldid -SEntitlements/CloudCodeVisionHelper.entitlements "$VISION_HELPER"
+          codesign --force --sign - --entitlements Entitlements/CloudCodeVisionHelper.entitlements "$VISION_HELPER"
           # Procursus ldid 2.1.5 can emit an entitlement blob that macOS codesign/Security.framework
           # refuses to parse. Preserve the TrollStore-native ldid pass, then normalize only the
           # embedded helper with Apple's ad-hoc signer so the packaged entitlement claim is readable
@@ -136,10 +142,38 @@ jobs:
             com.apple.private.security.no-sandbox \
             platform-application \
             com.apple.private.security.storage.AppDataContainers \
-            com.apple.private.persona-mgmt; do
+            com.apple.private.persona-mgmt \
+            com.apple.accessibility.api; do
             /usr/libexec/PlistBuddy -c "Print :$required_host_entitlement" "$ENTITLEMENTS" | grep -F 'true'
           done
-          rm -f "$ENTITLEMENTS"
+          /usr/libexec/PlistBuddy -c 'Print :com.apple.security.application-groups' "$ENTITLEMENTS" | grep -F 'group.com.cloudcode.ios.share'
+          SHARE_ENTITLEMENTS="$RUNNER_TEMP/cloudcode-share-extension-entitlements.plist"
+          codesign -d --entitlements :- "$SHARE_APPEX" > "$SHARE_ENTITLEMENTS" 2>/dev/null
+          plutil -lint "$SHARE_ENTITLEMENTS" >/dev/null
+          /usr/libexec/PlistBuddy -c 'Print :com.apple.security.application-groups' "$SHARE_ENTITLEMENTS" | grep -F 'group.com.cloudcode.ios.share'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$SHARE_ENTITLEMENTS")" = 'TROLLTROLL.*'
+          rm -f "$ENTITLEMENTS" "$SHARE_ENTITLEMENTS"
+          VISION_ENTITLEMENTS="$RUNNER_TEMP/cloudcode-vision-helper-entitlements.plist"
+          ldid -e "$VISION_HELPER" > "$VISION_ENTITLEMENTS"
+          plutil -lint "$VISION_ENTITLEMENTS" >/dev/null
+          for required_vision_entitlement in \
+            get-task-allow \
+            com.apple.private.security.no-sandbox \
+            platform-application \
+            com.apple.private.security.storage.AppDataContainers; do
+            /usr/libexec/PlistBuddy -c "Print :$required_vision_entitlement" "$VISION_ENTITLEMENTS" | grep -F 'true'
+          done
+          /usr/libexec/PlistBuddy -c 'Print :com.apple.private.security.container-required' "$VISION_ENTITLEMENTS" | grep -F 'false'
+          for required_vision_iokit_class in \
+            IOSurfaceAcceleratorClient \
+            H11ANEInDirectPathClient; do
+            for iokit_entitlement in \
+              com.apple.security.iokit-user-client-class \
+              com.apple.security.exception.iokit-user-client-class; do
+              /usr/libexec/PlistBuddy -c "Print :$iokit_entitlement" "$VISION_ENTITLEMENTS" | grep -F "$required_vision_iokit_class"
+            done
+          done
+          rm -f "$VISION_ENTITLEMENTS"
           HELPER_ENTITLEMENTS="$RUNNER_TEMP/cloudcode-root-helper-entitlements.plist"
           ldid -e "$ROOT_HELPER" > "$HELPER_ENTITLEMENTS"
           plutil -lint "$HELPER_ENTITLEMENTS" >/dev/null

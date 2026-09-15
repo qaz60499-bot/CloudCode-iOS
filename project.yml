@@ -8,6 +8,8 @@ packages:
   ZIPFoundation:
     url: https://github.com/weichsel/ZIPFoundation.git
     revision: 22787ffb59de99e5dc1fbfe80b19c97a904ad48d
+  IOSSystemMinimal:
+    path: Vendor/IOSSystemMinimal
 targets:
   CloudCodeCore:
     type: library.static
@@ -21,27 +23,70 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.core
         PRODUCT_NAME: CloudCodeCore
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 88
+        CURRENT_PROJECT_VERSION: 135
         VERSIONING_SYSTEM: apple-generic
         DEFINES_MODULE: YES
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_VERSION: 5.9
         OTHER_LDFLAGS: "$(inherited) -lsqlite3"
         SKIP_INSTALL: YES
-  CloudCodeIOS:
-    type: application
+  CloudCodeShareExtension:
+    type: app-extension
     platform: iOS
     sources:
-      - Sources/CloudCodeApp
+      - Sources/CloudCodeShareExtension
     dependencies:
       - target: CloudCodeCore
       - package: ZIPFoundation
     settings:
       base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.share
+        PRODUCT_NAME: CloudCodeShareExtension
+        MARKETING_VERSION: 1.1.0
+        CURRENT_PROJECT_VERSION: 135
+        VERSIONING_SYSTEM: apple-generic
+        SWIFT_VERSION: 5.9
+        OTHER_LDFLAGS: "$(inherited) -lsqlite3"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Sources/CloudCodeShareExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Entitlements/CloudCode.entitlements
+        TARGETED_DEVICE_FAMILY: "1"
+        SKIP_INSTALL: YES
+  CloudCodeIOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources/CloudCodeApp
+        excludes:
+          - Resources
+      - path: Sources/CloudCodeApp/Resources
+        buildPhase: resources
+    dependencies:
+      - target: CloudCodeCore
+      - target: CloudCodeShareExtension
+        embed: true
+      - package: ZIPFoundation
+      - package: IOSSystemMinimal
+        product: IOSSystemRuntime
+        embed: false
+      - package: IOSSystemMinimal
+        product: IOSSystemFiles
+        link: false
+        embed: false
+      - package: IOSSystemMinimal
+        product: IOSSystemShell
+        link: false
+        embed: false
+      - package: IOSSystemMinimal
+        product: IOSSystemText
+        link: false
+        embed: false
+    settings:
+      base:
         PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios
         PRODUCT_NAME: CloudCode
         MARKETING_VERSION: 1.1.0
-        CURRENT_PROJECT_VERSION: 88
+        CURRENT_PROJECT_VERSION: 135
         VERSIONING_SYSTEM: apple-generic
         SWIFT_VERSION: 5.9
         SWIFT_OBJC_BRIDGING_HEADER: Sources/CloudCodeApp/RootHelperBridge.h
@@ -66,6 +111,22 @@ targets:
           SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" xcrun --sdk macosx swift scripts/materialize_app_icon.swift
         basedOnDependencyAnalysis: false
     postBuildScripts:
+      - name: Embed Bounded CLI Frameworks
+        script: |
+          set -euo pipefail
+          DESTINATION="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH"
+          mkdir -p "$DESTINATION"
+          for framework in ios_system files shell text; do
+            SOURCE="$BUILT_PRODUCTS_DIR/$framework.framework"
+            TARGET="$DESTINATION/$framework.framework"
+            if [ ! -d "$SOURCE" ]; then
+              echo "FAIL: processed ios_system framework missing: $SOURCE" >&2
+              exit 1
+            fi
+            rm -rf "$TARGET"
+            ditto "$SOURCE" "$TARGET"
+          done
+        basedOnDependencyAnalysis: false
       - name: Build Embedded Root Helper
         script: |
           set -euo pipefail
@@ -81,9 +142,11 @@ targets:
             -target arm64-apple-ios16.0 \
             "$SRCROOT/Sources/CloudCodeRootHelper/main.m" \
             "$SRCROOT/Sources/CloudCodeRootHelper/GUIAutomation.m" \
+            "$SRCROOT/Sources/CloudCodeRootHelper/PCControlServer.m" \
             -framework Foundation \
             -framework UIKit \
             -framework CoreGraphics \
+            -framework ImageIO \
             -o "$HELPER"
           xcrun --sdk iphoneos clang \
             -fobjc-arc \
@@ -102,6 +165,9 @@ targets:
           /usr/libexec/PlistBuddy -c 'Delete :TSRootBinaries' "$INFO" >/dev/null 2>&1 || true
           /usr/libexec/PlistBuddy -c 'Add :TSRootBinaries array' "$INFO"
           /usr/libexec/PlistBuddy -c 'Add :TSRootBinaries:0 string CloudCodeRootHelper' "$INFO"
+          # TSRootBinaries is only for binaries that require TrollStore's special root-helper
+          # permissions. CloudCodeVisionHelper must remain an ordinary embedded mobile-user child;
+          # listing it here makes that execution identity contradictory and was rejected on-device.
         basedOnDependencyAnalysis: false
     scheme:
       testTargets:

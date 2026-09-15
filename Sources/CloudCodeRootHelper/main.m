@@ -3,20 +3,81 @@
 #import <errno.h>
 #import <fcntl.h>
 #import <poll.h>
+#import <pthread.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <stdio.h>
 #import <unistd.h>
 #import <signal.h>
 #import <spawn.h>
+#import <sys/wait.h>
+#import <time.h>
 #import <stdlib.h>
+#import <string.h>
 #import "GUIAutomation.h"
+#import "PCControlServer.h"
 
 #define CLOUDCODE_PROC_PATH_MAX 4096
 #define CLOUDCODE_ROOT_HELPER_PROTOCOL_MARKER "cloudcode-root-helper-protocol=1"
 typedef int (*CloudCodeProcListAllPidsFn)(void *, int);
 typedef int (*CloudCodeProcPidPathFn)(int, void *, uint32_t);
 extern char **environ;
+extern void *objc_autoreleasePoolPush(void);
+
+typedef struct {
+    uint64_t milliseconds;
+} CloudCodeOneShotWatchdogContext;
+
+static void *CloudCodeOneShotWatchdogMain(void *rawContext)
+{
+    CloudCodeOneShotWatchdogContext *context = (CloudCodeOneShotWatchdogContext *)rawContext;
+    uint64_t milliseconds = context ? context->milliseconds : 0;
+    if (context) { free(context); }
+    if (milliseconds == 0) { return NULL; }
+    struct timespec delay = {
+        .tv_sec = (time_t)(milliseconds / 1000),
+        .tv_nsec = (long)((milliseconds % 1000) * 1000000ULL)
+    };
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+    static const char marker[] = "cloudcode-root-helper: self-watchdog deadline reached; restoring AX automation lease and hard-exiting one-shot helper\n";
+    (void)write(STDERR_FILENO, marker, sizeof(marker) - 1);
+    CloudCodeGUIRestoreAXAutomationForProcessExit();
+    _exit(124);
+}
+
+static void CloudCodeArmOneShotWatchdog(int argc, const char *argv[])
+{
+    static const char prefix[] = "--cloudcode-watchdog-ms=";
+    uint64_t milliseconds = 0;
+    for (int index = 2; index < argc; index++) {
+        const char *argument = argv[index];
+        if (!argument || strncmp(argument, prefix, sizeof(prefix) - 1) != 0) { continue; }
+        unsigned long long parsed = strtoull(argument + sizeof(prefix) - 1, NULL, 10);
+        if (parsed >= 100 && parsed <= 120000) { milliseconds = (uint64_t)parsed; }
+        break;
+    }
+    if (milliseconds == 0) { return; }
+    CloudCodeOneShotWatchdogContext *context = calloc(1, sizeof(*context));
+    if (!context) { return; }
+    context->milliseconds = milliseconds;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, CloudCodeOneShotWatchdogMain, context) == 0) {
+        (void)pthread_detach(thread);
+    } else {
+        free(context);
+    }
+}
+
+static __attribute__((noreturn)) void CloudCodeExitOneShot(int code)
+{
+    CloudCodeGUIRestoreAXAutomationForProcessExit();
+    // stdout/stderr are switched to unbuffered mode at process entry before any helper I/O occurs.
+    // Build 108 real-device evidence showed that even an explicit stdout/stderr flush could wedge after a
+    // private framework had already produced the final observable result, turning successful app
+    // launch, screenshot and background-assert handshakes into false parent timeouts. Do not enter
+    // stdio teardown/flush paths here: every write is already delivered synchronously to the bridge.
+    _exit(code);
+}
 
 static NSString *NormalizePath(NSString *path)
 {
@@ -248,10 +309,54 @@ static NSArray *InstalledApplicationProxies(id workspace, NSString **backend)
 }
 
 static BOOL ApplicationIsInstalled(id workspace, NSString *bundleID, BOOL *known);
+static id ApplicationProxy(NSString *bundleID);
+
+static NSString *BundlePathForIdentifierFromFilesystem(NSString *bundleID)
+{
+    if (bundleID.length == 0 || bundleID.length > 255) { return nil; }
+    NSString *bundleRoot = @"/var/containers/Bundle/Application";
+    NSArray<NSString *> *containers = [NSFileManager.defaultManager contentsOfDirectoryAtPath:bundleRoot error:nil] ?: @[];
+    for (NSString *containerName in containers) {
+        NSString *containerPath = [bundleRoot stringByAppendingPathComponent:containerName];
+        if (!IsSafeBundleContainerPath(containerPath)) { continue; }
+        NSArray<NSString *> *entries = [NSFileManager.defaultManager contentsOfDirectoryAtPath:containerPath error:nil] ?: @[];
+        for (NSString *entry in entries) {
+            if (![entry.pathExtension.lowercaseString isEqualToString:@"app"]) { continue; }
+            NSString *bundlePath = [containerPath stringByAppendingPathComponent:entry];
+            if (!IsSafeBundlePath(bundlePath)) { continue; }
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"Info.plist"]];
+            NSString *candidate = [info[@"CFBundleIdentifier"] isKindOfClass:NSString.class] ? info[@"CFBundleIdentifier"] : nil;
+            if ([candidate isEqualToString:bundleID]) { return bundlePath.stringByStandardizingPath; }
+        }
+    }
+    return nil;
+}
 
 static NSString *InstalledBundlePath(id workspace, NSString *bundleID)
 {
-    if (!workspace || bundleID.length == 0) { return nil; }
+    NSString *filesystemPath = BundlePathForIdentifierFromFilesystem(bundleID);
+    if (filesystemPath.length > 0) { return filesystemPath; }
+    if (bundleID.length == 0) { return nil; }
+
+    // Exact Bundle-ID lookup is materially cheaper and more reliable than broad LaunchServices
+    // enumeration on the iOS 16.6 TrollStore device. Use it as the first fallback when the
+    // privileged filesystem view is temporarily incomplete (for example during container/index
+    // churn after install/update). This keeps App Provider installation checks exact without
+    // paying an allInstalledApplications watchdog.
+    id exactProxy = ApplicationProxy(bundleID);
+    if (exactProxy) {
+        NSString *candidate = SafeValue(exactProxy, @"applicationIdentifier");
+        if (![candidate isKindOfClass:NSString.class] || candidate.length == 0) {
+            candidate = SafeValue(exactProxy, @"bundleIdentifier");
+        }
+        if ([candidate isEqualToString:bundleID]) {
+            NSURL *bundleURL = SafeValue(exactProxy, @"bundleURL");
+            NSString *path = [bundleURL isKindOfClass:NSURL.class] ? bundleURL.path.stringByStandardizingPath : nil;
+            if (IsSafeBundlePath(path)) { return path; }
+        }
+    }
+
+    if (!workspace) { return nil; }
     NSArray *proxies = InstalledApplicationProxies(workspace, NULL);
     for (id proxy in proxies) {
         NSString *candidate = SafeValue(proxy, @"applicationIdentifier");
@@ -265,6 +370,115 @@ static NSString *InstalledBundlePath(id workspace, NSString *bundleID)
         return IsSafeBundlePath(path) ? path : nil;
     }
     return nil;
+}
+
+static BOOL IsSafeIPAPath(NSString *path)
+{
+    NSString *normalized = NormalizePath(path);
+    NSString *extension = normalized.pathExtension.lowercaseString;
+    if (!normalized || (![extension isEqualToString:@"ipa"] && ![extension isEqualToString:@"tipa"])) { return NO; }
+    if (!HasAnyPrefix(normalized, @[
+        @"/var/mobile/",
+        @"/private/var/mobile/"
+    ])) { return NO; }
+    NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:normalized error:nil];
+    if (![attributes[NSFileType] isEqualToString:NSFileTypeRegular]) { return NO; }
+    unsigned long long size = [attributes[NSFileSize] unsignedLongLongValue];
+    return size > 0 && size <= (4ULL * 1024ULL * 1024ULL * 1024ULL);
+}
+
+static NSString *TrollStoreHelperPathFromFilesystem(void)
+{
+    NSString *bundleRoot = @"/var/containers/Bundle/Application";
+    NSArray<NSString *> *containers = [NSFileManager.defaultManager contentsOfDirectoryAtPath:bundleRoot error:nil] ?: @[];
+    for (NSString *containerName in containers) {
+        NSString *containerPath = [bundleRoot stringByAppendingPathComponent:containerName];
+        if (!IsSafeBundleContainerPath(containerPath)) { continue; }
+        NSArray<NSString *> *entries = [NSFileManager.defaultManager contentsOfDirectoryAtPath:containerPath error:nil] ?: @[];
+        for (NSString *entry in entries) {
+            if (![entry.pathExtension.lowercaseString isEqualToString:@"app"]) { continue; }
+            NSString *bundlePath = [containerPath stringByAppendingPathComponent:entry];
+            if (!IsSafeBundlePath(bundlePath)) { continue; }
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"Info.plist"]];
+            NSString *bundleID = [info[@"CFBundleIdentifier"] isKindOfClass:NSString.class] ? [info[@"CFBundleIdentifier"] lowercaseString] : @"";
+            // Current TrollStore uses com.opa334.TrollStore; stealth builds keep that namespace and
+            // append a randomized TS suffix. Never execute an arbitrary app-provided helper merely
+            // because it happens to be named trollstorehelper.
+            if (![bundleID hasPrefix:@"com.opa334.trollstore"]) { continue; }
+            NSString *helper = [bundlePath stringByAppendingPathComponent:@"trollstorehelper"];
+            if ([NSFileManager.defaultManager fileExistsAtPath:helper] && [NSFileManager.defaultManager isExecutableFileAtPath:helper]) {
+                return helper.stringByStandardizingPath;
+            }
+        }
+    }
+    return nil;
+}
+
+static int ProbeIPAInstallCapability(void)
+{
+    if (getuid() != 0 || geteuid() != 0) { CloudCodeExitOneShot(11); }
+    NSString *helper = TrollStoreHelperPathFromFilesystem();
+    if (helper.length == 0) { CloudCodeExitOneShot(83); }
+    fputs("trollstore-install-backend=available\n", stdout);
+    CloudCodeExitOneShot(0);
+}
+
+static int InstallIPAThroughTrollStore(NSString *ipaPath, NSString *expectedBundleID, NSString *expectedBuild)
+{
+    if (getuid() != 0 || geteuid() != 0) { CloudCodeExitOneShot(11); }
+    NSString *normalized = NormalizePath(ipaPath);
+    if (!IsSafeIPAPath(normalized) || expectedBundleID.length == 0 || expectedBundleID.length > 255 || expectedBuild.length > 128) {
+        CloudCodeExitOneShot(82);
+    }
+    NSString *helper = TrollStoreHelperPathFromFilesystem();
+    if (helper.length == 0) { CloudCodeExitOneShot(83); }
+
+    const char *helperPath = helper.fileSystemRepresentation;
+    const char *command = "install";
+    const char *mode = "custom";
+    const char *archive = normalized.fileSystemRepresentation;
+    char *const childArgv[] = {(char *)helperPath, (char *)command, (char *)mode, (char *)archive, NULL};
+    pid_t child = 0;
+    int spawnError = posix_spawn(&child, helperPath, NULL, NULL, childArgv, environ);
+    if (spawnError != 0 || child <= 1) {
+        fprintf(stderr, "trollstore-install: spawn failed error=%d\n", spawnError);
+        CloudCodeExitOneShot(84);
+    }
+
+    int status = 0;
+    BOOL reaped = NO;
+    for (int attempt = 0; attempt < 900; attempt++) {
+        pid_t waited = waitpid(child, &status, WNOHANG);
+        if (waited == child) { reaped = YES; break; }
+        if (waited == -1 && errno != EINTR) { break; }
+        usleep(100000);
+    }
+    if (!reaped) {
+        (void)kill(child, SIGKILL);
+        do { } while (waitpid(child, &status, 0) == -1 && errno == EINTR);
+        fprintf(stderr, "trollstore-install: timed out after 90 seconds\n");
+        CloudCodeExitOneShot(84);
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        fprintf(stderr, "trollstore-install: helper returned %d\n", code);
+        CloudCodeExitOneShot(84);
+    }
+
+    NSString *installedBundlePath = BundlePathForIdentifierFromFilesystem(expectedBundleID);
+    NSDictionary *installedInfo = installedBundlePath.length > 0
+        ? [NSDictionary dictionaryWithContentsOfFile:[installedBundlePath stringByAppendingPathComponent:@"Info.plist"]]
+        : nil;
+    NSString *installedBundleID = [installedInfo[@"CFBundleIdentifier"] isKindOfClass:NSString.class] ? installedInfo[@"CFBundleIdentifier"] : @"";
+    NSString *installedBuild = [installedInfo[@"CFBundleVersion"] isKindOfClass:NSString.class] ? installedInfo[@"CFBundleVersion"] : @"";
+    if (![installedBundleID isEqualToString:expectedBundleID] || (expectedBuild.length > 0 && ![installedBuild isEqualToString:expectedBuild])) {
+        fprintf(stderr, "trollstore-install: postcondition mismatch expectedBundle=%s expectedBuild=%s actualBundle=%s actualBuild=%s\n",
+                expectedBundleID.UTF8String ?: "", expectedBuild.UTF8String ?: "",
+                installedBundleID.UTF8String ?: "", installedBuild.UTF8String ?: "");
+        CloudCodeExitOneShot(85);
+    }
+    fprintf(stdout, "trollstore-install: verified bundle=%s build=%s\n", installedBundleID.UTF8String ?: "", installedBuild.UTF8String ?: "");
+    CloudCodeExitOneShot(0);
 }
 
 static NSDictionary<NSString *, NSString *> *DataContainerPathsByBundleID(void)
@@ -285,45 +499,13 @@ static NSDictionary<NSString *, NSString *> *DataContainerPathsByBundleID(void)
 
 static int PrintInstalledApplicationsJSON(void)
 {
-    id workspace = Workspace();
-    if (!workspace) { return 23; }
-    NSString *backend = @"LaunchServices";
-    NSArray *proxies = InstalledApplicationProxies(workspace, &backend);
-    if (proxies.count == 0) { return 40; }
-
+    // Read-only discovery must not depend on LaunchServices. On the TrollStore iOS 16.6 device,
+    // allInstalledApplications/allApplications can block until the parent watchdog while the same
+    // app bundles and MCM metadata are immediately readable through the privileged filesystem view.
+    // Treat physical presence as discovery evidence only; exact launch/uninstall still revalidate
+    // installation state through their own bounded system routes.
     NSMutableDictionary<NSString *, NSDictionary *> *byBundleID = [NSMutableDictionary dictionary];
     NSDictionary<NSString *, NSString *> *dataPathsByBundleID = DataContainerPathsByBundleID();
-    for (id proxy in proxies) {
-        NSString *bundleID = SafeValue(proxy, @"applicationIdentifier");
-        if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0) {
-            bundleID = SafeValue(proxy, @"bundleIdentifier");
-        }
-        if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0) { continue; }
-        NSString *name = SafeValue(proxy, @"localizedName");
-        if (![name isKindOfClass:NSString.class] || name.length == 0) { name = SafeValue(proxy, @"itemName"); }
-        if (![name isKindOfClass:NSString.class] || name.length == 0) { name = bundleID; }
-        NSString *version = SafeValue(proxy, @"shortVersionString");
-        if (![version isKindOfClass:NSString.class]) { version = @""; }
-        NSURL *bundleURL = SafeValue(proxy, @"bundleURL");
-        NSURL *dataURL = SafeValue(proxy, @"dataContainerURL");
-        NSString *bundlePath = [bundleURL isKindOfClass:NSURL.class] ? bundleURL.path : @"";
-        NSString *dataPath = [dataURL isKindOfClass:NSURL.class] ? dataURL.path : @"";
-        if (dataPath.length == 0) { dataPath = dataPathsByBundleID[bundleID] ?: @""; }
-        byBundleID[bundleID] = @{
-            @"bundleID": bundleID,
-            @"name": name,
-            @"version": version,
-            @"bundlePath": bundlePath ?: @"",
-            @"dataContainerPath": dataPath ?: @"",
-            @"registered": @YES
-        };
-    }
-
-    // LaunchServices can lose registration before a failed uninstall has actually removed the
-    // bundle container. Merge only physically present, one-level user .app bundles that LS did
-    // not report so a later explicit apps.uninstall can reconcile that orphan instead of losing
-    // its path forever. This is read-only discovery and never deletes or registers anything.
-    NSUInteger orphanCount = 0;
     NSString *bundleRoot = @"/var/containers/Bundle/Application";
     NSArray<NSString *> *containers = [NSFileManager.defaultManager contentsOfDirectoryAtPath:bundleRoot error:nil] ?: @[];
     for (NSString *containerName in containers) {
@@ -347,23 +529,21 @@ static int PrintInstalledApplicationsJSON(void)
                 @"version": version ?: @"",
                 @"bundlePath": bundlePath,
                 @"dataContainerPath": dataPathsByBundleID[bundleID] ?: @"",
-                @"registered": @NO
+                @"registered": @YES
             };
-            orphanCount++;
         }
     }
-    if (byBundleID.count == 0) { return 40; }
-    if (orphanCount > 0) { backend = [backend stringByAppendingString:@"+BundleFilesystemOrphans"]; }
+    if (byBundleID.count == 0) { CloudCodeExitOneShot(40); }
     NSArray *apps = [[byBundleID allValues] sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *lhs, NSDictionary *rhs) {
         return [lhs[@"name"] localizedCaseInsensitiveCompare:rhs[@"name"]];
     }];
-    NSDictionary *payload = @{@"backend": backend ?: @"LaunchServices", @"apps": apps};
+    NSDictionary *payload = @{@"backend": @"BundleFilesystem(read-only-discovery)", @"apps": apps};
     NSError *error = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
-    if (!data || error) { return 41; }
+    if (!data || error) { CloudCodeExitOneShot(41); }
     fwrite(data.bytes, 1, data.length, stdout);
     fputc('\n', stdout);
-    return 0;
+    CloudCodeExitOneShot(0);
 }
 
 static int ProbePrivilegedFilesystemJSON(void)
@@ -405,32 +585,39 @@ static int ProbePrivilegedFilesystemJSON(void)
     };
     NSError *error = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
-    if (!data || error) { return 41; }
+    if (!data || error) { CloudCodeExitOneShot(41); }
     fwrite(data.bytes, 1, data.length, stdout);
     fputc('\n', stdout);
-    return 0;
+    CloudCodeExitOneShot(0);
 }
 
 static int ProbeLaunchCapability(void)
 {
     id workspace = Workspace();
-    if (!workspace) { return 23; }
-    return [workspace respondsToSelector:NSSelectorFromString(@"openApplicationWithBundleID:")] ? 0 : 42;
+    if (!workspace) { CloudCodeExitOneShot(23); }
+    CloudCodeExitOneShot([workspace respondsToSelector:NSSelectorFromString(@"openApplicationWithBundleID:")] ? 0 : 42);
 }
 
 static int LaunchApplication(NSString *bundleID)
 {
-    if (bundleID.length == 0 || [bundleID isEqualToString:@"com.cloudcode.ios"]) { return 10; }
+    if (bundleID.length == 0 || [bundleID isEqualToString:@"com.cloudcode.ios"]) { CloudCodeExitOneShot(10); }
     id workspace = Workspace();
-    if (!workspace) { return 23; }
+    if (!workspace) { CloudCodeExitOneShot(23); }
     BOOL known = NO;
     BOOL installed = ApplicationIsInstalled(workspace, bundleID, &known);
-    if (!known) { return 43; }
-    if (!installed) { return 47; }
+    if (known && !installed) {
+        // On the iOS 16.6 TrollStore/root persona this API can return a false negative for an
+        // actually installed App. Do not turn that hint into a launch gate: the bounded launch
+        // below is itself exact to one Bundle ID and success still requires that same Bundle ID to
+        // become the verified frontmost application.
+        fprintf(stderr, "launch: applicationIsInstalled returned false; continuing with exact launch verification\n");
+    } else if (!known) {
+        fprintf(stderr, "launch: installation state unavailable; continuing with exact launch verification\n");
+    }
 
     if ([[FrontmostApplicationBundleID() lowercaseString] isEqualToString:bundleID.lowercaseString]) {
         fprintf(stderr, "launch: target already foreground route=springboard-frontmost\n");
-        return 0;
+        CloudCodeExitOneShot(0);
     }
 
     SEL selector = NSSelectorFromString(@"openApplicationWithBundleID:");
@@ -445,11 +632,11 @@ static int LaunchApplication(NSString *bundleID)
         if (launchServicesAccepted) {
             BOOL foregroundVerified = WaitForFrontmostApplication(bundleID, 750000);
             fprintf(stderr, "launch: route=launchservices accepted=1 foreground=%s\n", foregroundVerified ? "verified" : "unverified");
-            if (foregroundVerified) { return 0; }
+            if (foregroundVerified) { CloudCodeExitOneShot(0); }
         }
         if (WaitForFrontmostApplication(bundleID, 150000)) {
             fprintf(stderr, "launch: route=launchservices accepted=0 but target is foreground\n");
-            return 0;
+            CloudCodeExitOneShot(0);
         }
     }
 
@@ -459,19 +646,19 @@ static int LaunchApplication(NSString *bundleID)
     // and success requires the requested App to become the actual frontmost application.
     if (geteuid() != 0) {
         fprintf(stderr, "launch: isolated LaunchServices path did not establish target foreground; privileged board fallback required\n");
-        return [workspace respondsToSelector:selector] ? 46 : 42;
+        CloudCodeExitOneShot([workspace respondsToSelector:selector] ? 46 : 42);
     }
 
     NSString *frontBoardDiagnostic = nil;
     if (LaunchViaBoardSystemService(bundleID, @"FBSSystemService", @"FrontBoardServices", &frontBoardDiagnostic)) {
         fprintf(stderr, "launch: route=frontboard %s\n", frontBoardDiagnostic.UTF8String ?: "verified");
-        return 0;
+        CloudCodeExitOneShot(0);
     }
 
     NSString *backBoardDiagnostic = nil;
     if (LaunchViaBoardSystemService(bundleID, @"BKSSystemService", @"BackBoardServices", &backBoardDiagnostic)) {
         fprintf(stderr, "launch: route=backboard %s\n", backBoardDiagnostic.UTF8String ?: "verified");
-        return 0;
+        CloudCodeExitOneShot(0);
     }
 
     fprintf(stderr,
@@ -479,7 +666,7 @@ static int LaunchApplication(NSString *bundleID)
             [workspace respondsToSelector:selector] ? "available" : "unavailable",
             frontBoardDiagnostic.UTF8String ?: "unavailable",
             backBoardDiagnostic.UTF8String ?: "unavailable");
-    return [workspace respondsToSelector:selector] ? 46 : 42;
+    CloudCodeExitOneShot([workspace respondsToSelector:selector] ? 46 : 42);
 }
 
 static int ProbeUninstallCapability(NSString *bundleID)
@@ -533,13 +720,37 @@ static BOOL ApplicationIsInstalled(id workspace, NSString *bundleID, BOOL *known
 
 static int InstalledState(NSString *bundleID)
 {
-    if (bundleID.length == 0) { return 10; }
+    if (bundleID.length == 0) { CloudCodeExitOneShot(10); }
+
+    // `LSApplicationWorkspace applicationIsInstalled:` is not authoritative on the iOS 16.6
+    // TrollStore/root persona used by Cloud Code. Physical-device evidence shows it can return a
+    // false negative while InstallationProxy still reports the target App and its bundle is present.
+    // Treat a positive answer as sufficient, but require corroborating exact evidence before a
+    // negative answer becomes `not installed`. This prevents App-backed Providers from being blocked
+    // at preflight while preserving fail-closed launch/foreground verification later in the flow.
     id workspace = Workspace();
-    if (!workspace) { return 23; }
     BOOL known = NO;
     BOOL installed = ApplicationIsInstalled(workspace, bundleID, &known);
-    if (!known) { return 43; }
-    return installed ? 0 : 47;
+    if (known && installed) { CloudCodeExitOneShot(0); }
+
+    id proxy = ApplicationProxy(bundleID);
+    if (proxy) {
+        NSString *candidate = SafeValue(proxy, @"applicationIdentifier");
+        if (![candidate isKindOfClass:NSString.class] || candidate.length == 0) {
+            candidate = SafeValue(proxy, @"bundleIdentifier");
+        }
+        NSURL *bundleURL = SafeValue(proxy, @"bundleURL");
+        NSString *bundlePath = [bundleURL isKindOfClass:NSURL.class] ? bundleURL.path.stringByStandardizingPath : nil;
+        if ([candidate isEqualToString:bundleID] && IsSafeBundlePath(bundlePath)) {
+            CloudCodeExitOneShot(0);
+        }
+    }
+
+    NSString *filesystemPath = BundlePathForIdentifierFromFilesystem(bundleID);
+    if (IsSafeBundlePath(filesystemPath)) { CloudCodeExitOneShot(0); }
+
+    if (known) { CloudCodeExitOneShot(47); }
+    CloudCodeExitOneShot(43);
 }
 
 static BOOL UnregisterApplication(id workspace, NSString *appPath)
@@ -645,18 +856,25 @@ static NSArray<NSString *> *CloudCodeBoundedStringArray(id value, NSUInteger lim
 
 static int PrintAppIntrospectionJSON(NSString *bundleID)
 {
-    if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0 || bundleID.length > 255) { return 10; }
-    id proxy = ApplicationProxy(bundleID);
-    if (!proxy) { return 44; }
-    NSURL *bundleURL = SafeValue(proxy, @"bundleURL");
-    NSURL *dataURL = SafeValue(proxy, @"dataContainerURL");
-    NSString *bundlePath = [bundleURL isKindOfClass:NSURL.class] ? bundleURL.path : nil;
-    NSString *dataPath = [dataURL isKindOfClass:NSURL.class] ? dataURL.path : nil;
-    if (!IsSafeBundlePath(bundlePath)) { return 20; }
+    if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0 || bundleID.length > 255) { CloudCodeExitOneShot(10); }
+    // Prefer the bounded filesystem view, but do not equate a transient filesystem miss with
+    // "not installed". InstalledBundlePath performs a single exact LSApplicationProxy lookup
+    // before considering the legacy broad enumeration fallback.
+    id workspace = Workspace();
+    NSString *bundlePath = InstalledBundlePath(workspace, bundleID);
+    NSString *dataPath = DataContainerPathsByBundleID()[bundleID];
+    id exactProxy = nil;
+    if (!IsSafeDataPath(dataPath)) {
+        exactProxy = ApplicationProxy(bundleID);
+        NSURL *dataURL = SafeValue(exactProxy, @"dataContainerURL");
+        NSString *candidateDataPath = [dataURL isKindOfClass:NSURL.class] ? dataURL.path.stringByStandardizingPath : nil;
+        if (IsSafeDataPath(candidateDataPath)) { dataPath = candidateDataPath; }
+    }
+    if (!IsSafeBundlePath(bundlePath)) { CloudCodeExitOneShot(44); }
     NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"Info.plist"]];
-    if (![info isKindOfClass:NSDictionary.class]) { return 78; }
+    if (![info isKindOfClass:NSDictionary.class]) { CloudCodeExitOneShot(78); }
     NSString *actualBundleID = [info[@"CFBundleIdentifier"] isKindOfClass:NSString.class] ? info[@"CFBundleIdentifier"] : nil;
-    if (![actualBundleID isEqualToString:bundleID]) { return 78; }
+    if (![actualBundleID isEqualToString:bundleID]) { CloudCodeExitOneShot(78); }
 
     NSMutableOrderedSet<NSString *> *schemes = [NSMutableOrderedSet orderedSet];
     for (id rawType in ([info[@"CFBundleURLTypes"] isKindOfClass:NSArray.class] ? info[@"CFBundleURLTypes"] : @[])) {
@@ -701,14 +919,10 @@ static int PrintAppIntrospectionJSON(NSString *bundleID)
         }
     }
 
+    // App-group container discovery is a secondary hint and previously forced LSApplicationProxy
+    // back into this otherwise filesystem-only metadata path. Keep it empty when not available from
+    // bounded static metadata; the runtime does not require app groups for app launch or GUI control.
     NSMutableOrderedSet<NSString *> *appGroups = [NSMutableOrderedSet orderedSet];
-    id rawGroups = SafeValue(proxy, @"groupContainerURLs");
-    if ([rawGroups isKindOfClass:NSDictionary.class]) {
-        for (id key in [(NSDictionary *)rawGroups allKeys]) {
-            if (appGroups.count >= 48) { break; }
-            if ([key isKindOfClass:NSString.class] && [(NSString *)key length] <= 512) { [appGroups addObject:key]; }
-        }
-    }
 
     NSMutableDictionary<NSString *, NSString *> *localData = [NSMutableDictionary dictionary];
     if (IsSafeDataPath(dataPath)) {
@@ -748,10 +962,12 @@ static int PrintAppIntrospectionJSON(NSString *bundleID)
     };
     NSError *error = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
-    if (!data || error || data.length == 0 || data.length > (256 * 1024)) { return 79; }
+    if (!data || error || data.length == 0 || data.length > (256 * 1024)) { CloudCodeExitOneShot(79); }
     fwrite(data.bytes, 1, data.length, stdout);
     fputc('\n', stdout);
-    return 0;
+    // Do not return through ARC cleanup after touching app-container metadata. On-device evidence
+    // shows private helper teardown can outlive the parent watchdog after the payload is complete.
+    CloudCodeExitOneShot(0);
 }
 
 static BOOL RemovePath(NSString *path, BOOL required)
@@ -1104,12 +1320,15 @@ static int StartDetachedBackgroundAssertion(pid_t targetPID, const char *helperE
     close(handshake[0]);
     if (count == sizeof(acquired) && acquired == 1) {
         fprintf(stderr, "background-assert: acquired targetPID=%d workerPID=%d spawn=posix_spawn flags=1 reason=10004\n", targetPID, workerPID);
-        return 0;
+        // This command's only observable result is the detached worker PID written above. Build 110
+        // repeatedly reached this line and then still hit the parent watchdog. Cross the one-shot
+        // boundary here instead of unwinding through any process-global Foundation/private state.
+        CloudCodeExitOneShot(0);
     }
 
     (void)kill(workerPID, SIGKILL);
     fprintf(stderr, "background-assert: acquisition failed targetPID=%d workerPID=%d poll=%d errno=%d\n", targetPID, workerPID, pollResult, errno);
-    return 75;
+    CloudCodeExitOneShot(75);
 }
 
 static int StopDetachedBackgroundAssertion(pid_t workerPID)
@@ -1127,9 +1346,8 @@ static int BackgroundAssertionWorkerStatus(pid_t workerPID)
     return kill(workerPID, 0) == 0 ? 0 : 77;
 }
 
-int main(int argc, const char *argv[])
+static int CloudCodeRunOneShotCommand(int argc, const char *argv[])
 {
-    @autoreleasepool {
         if (argc < 2) { return 10; }
         NSString *command = [NSString stringWithUTF8String:argv[1]];
         if ([command isEqualToString:@"probe"]) {
@@ -1161,6 +1379,16 @@ int main(int argc, const char *argv[])
             NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
             return ProbeUninstallCapability(bundleID);
         }
+        if ([command isEqualToString:@"probe-ipa-install"]) {
+            return ProbeIPAInstallCapability();
+        }
+        if ([command isEqualToString:@"install-ipa"]) {
+            if (argc < 5) { return 10; }
+            NSString *ipaPath = [NSString stringWithUTF8String:argv[2]];
+            NSString *bundleID = [NSString stringWithUTF8String:argv[3]];
+            NSString *build = [NSString stringWithUTF8String:argv[4]];
+            return InstallIPAThroughTrollStore(ipaPath, bundleID, build);
+        }
         if ([command isEqualToString:@"is-installed"]) {
             if (getuid() != 0 || geteuid() != 0 || argc < 3) { return 11; }
             NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
@@ -1181,6 +1409,11 @@ int main(int argc, const char *argv[])
         }
         if ([command isEqualToString:@"gui-tree-json"]) {
             return CloudCodeGUITreeJSON();
+        }
+        if ([command isEqualToString:@"gui-ax-probe-json"]) {
+            if (argc < 6) { return 10; }
+            return CloudCodeGUIAXProbeJSON([NSString stringWithUTF8String:argv[2]], [NSString stringWithUTF8String:argv[3]],
+                (pid_t)strtol(argv[4], NULL, 10), [NSString stringWithUTF8String:argv[5]]);
         }
         if ([command isEqualToString:@"gui-screenshot-base64"]) {
             return CloudCodeGUIScreenshotBase64();
@@ -1207,10 +1440,22 @@ int main(int argc, const char *argv[])
             NSString *strategy = [NSString stringWithUTF8String:argv[2]];
             return CloudCodeGUINavigateBack(strategy);
         }
+        if ([command isEqualToString:@"gui-focused-text-input-json"]) {
+            return CloudCodeGUIFocusedTextInputJSON();
+        }
         if ([command isEqualToString:@"gui-type-base64"]) {
             if (argc < 3) { return 10; }
             NSString *encoded = [NSString stringWithUTF8String:argv[2]];
             return CloudCodeGUITypeBase64(encoded);
+        }
+        if ([command isEqualToString:@"pc-control-server-start"]) {
+            return CloudCodePCControlServerStart(argv[0]);
+        }
+        if ([command isEqualToString:@"pc-control-server-worker"]) {
+            if (argc < 4) { return 10; }
+            NSString *token = [NSString stringWithUTF8String:argv[2]];
+            int handshakeFD = (int)strtol(argv[3], NULL, 10);
+            return CloudCodePCControlServerWorker(argv[0], token, handshakeFD);
         }
         if ([command isEqualToString:@"background-assert-worker"]) {
             if (argc < 4) { return 10; }
@@ -1252,5 +1497,40 @@ int main(int argc, const char *argv[])
             return TerminateApplication(bundlePath);
         }
         return 10;
+}
+
+int main(int argc, const char *argv[])
+{
+    // Make bridge-owned stdout/stderr synchronous before any Foundation/private-framework work.
+    // This lets all one-shot commands hard-exit after their final write without calling fflush on
+    // process-global stdio state that can wedge on-device after LaunchServices/BackBoard/AX use.
+    (void)setvbuf(stdout, NULL, _IONBF, 0);
+    (void)setvbuf(stderr, NULL, _IONBF, 0);
+
+    // The background assertion worker and PC-control worker are deliberately long-lived and are
+    // not observed by the one-shot parent bridge after their handshakes. Preserve normal
+    // Objective-C cleanup for them instead of arming the one-shot watchdog.
+    if (argc > 1 && (strcmp(argv[1], "background-assert-worker") == 0 || strcmp(argv[1], "pc-control-server-worker") == 0)) {
+        @autoreleasepool {
+            return CloudCodeRunOneShotCommand(argc, argv);
+        }
     }
+
+    // Every other command is a one-shot helper. Persona-99 children may no longer be signalable by
+    // the mobile parent after credential override, so arm an in-process watchdog before entering any
+    // private framework call. This prevents a wedged AX/LaunchServices helper from surviving the
+    // parent deadline and accumulating across requests.
+    CloudCodeArmOneShotWatchdog(argc, argv);
+
+    // Some private iOS frameworks retain process-global
+    // objects whose autorelease teardown can block after the command has already emitted its final
+    // result. Build 98 therefore paid the full parent watchdog (5–6s) for successful work. Keep one
+    // process-lifetime pool, flush observable output, and terminate without teardown after dispatch.
+    // The kernel reclaims all helper memory immediately; no state is shared with the host process.
+    (void)objc_autoreleasePoolPush();
+    int result = CloudCodeRunOneShotCommand(argc, argv);
+    // Streams are unbuffered from process entry, so returning commands can hard-exit without any
+    // stdio flush/teardown. This is the same post-result boundary used by CloudCodeExitOneShot.
+    CloudCodeGUIRestoreAXAutomationForProcessExit();
+    _exit(result);
 }

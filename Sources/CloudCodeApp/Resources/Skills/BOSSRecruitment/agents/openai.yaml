@@ -1,0 +1,4 @@
+interface:
+  display_name: "BOSS 招聘联系"
+  short_description: "按本机安全规则执行 BOSS 招聘候选筛选、联系与验证"
+  default_prompt: "使用 BOSS 招聘联系技能处理当前招聘任务；严格执行内置业务规则、永久去重、一次发送与结果验证。"

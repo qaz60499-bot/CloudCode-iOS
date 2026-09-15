@@ -20,7 +20,8 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(profile.status("filesystem.shared_user_files"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("filesystem.unrestricted"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("apps.enumerate"), .deviceValidationRequired)
-        XCTAssertEqual(profile.status("execution.ios_system"), .deviceValidationRequired)
+        XCTAssertEqual(profile.status("execution.ios_system"), .unavailable)
+        XCTAssertEqual(profile.status("cli.runtime"), .unavailable)
         XCTAssertEqual(profile.status("execution.posix_spawn_symbol"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("execution.root_helper"), .deviceValidationRequired)
         XCTAssertEqual(profile.status("apps.launch"), .deviceValidationRequired)
@@ -65,6 +66,7 @@ final class CloudCodeCoreTests: XCTestCase {
                 .openApp: .available,
                 .tree: .unavailable,
                 .screenshot: .available,
+                .ocr: .available,
                 .touch: .available,
                 .textInput: .available,
                 .gestures: .available,
@@ -77,12 +79,51 @@ final class CloudCodeCoreTests: XCTestCase {
 
         XCTAssertEqual(profile.status(GUIAutomationFeature.openApp.capabilityID), .available)
         XCTAssertEqual(profile.status(GUIAutomationFeature.screenshot.capabilityID), .available)
+        XCTAssertEqual(profile.status(GUIAutomationFeature.ocr.capabilityID), .available, "local OCR must remain independently reportable when AX tree is unavailable")
         XCTAssertEqual(profile.status(GUIAutomationFeature.touch.capabilityID), .available)
         XCTAssertEqual(profile.status(GUIAutomationFeature.tree.capabilityID), .unavailable)
         XCTAssertEqual(profile.status(GUIAutomationFeature.verify.capabilityID), .unavailable)
         XCTAssertEqual(profile.status("automation.gui"), .unavailable, "partial capability must never masquerade as complete GUI automation")
         let guiCallCount = await guiProvider.totalCalls()
         XCTAssertEqual(guiCallCount, 1)
+    }
+
+    func testGUICompositeDoesNotTreatIndependentOCRAsRequiredForCoreGUIReadiness() {
+        var statuses = Dictionary(uniqueKeysWithValues: GUIAutomationFeature.allCases.map { ($0, CapabilityStatus.available) })
+        statuses[.ocr] = .unavailable
+        let snapshot = GUIAutomationCapabilitySnapshot(backendIdentifier: "test-gui", statuses: statuses)
+
+        XCTAssertEqual(snapshot.status(.ocr), .unavailable)
+        XCTAssertEqual(snapshot.compositeStatus, .available, "automation.gui composite must not couple independent local OCR readiness to AX/HID/screenshot readiness")
+    }
+
+    func testStructuredPlanCapabilitiesRemainRoutableWhenAXTreeIsUnavailable() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let guiProvider = CountingGUIProvider(snapshot: GUIAutomationCapabilitySnapshot(
+            backendIdentifier: "ax-degraded-gui",
+            statuses: [
+                .openApp: .available,
+                .tree: .unavailable,
+                .screenshot: .available,
+                .ocr: .available,
+                .touch: .available,
+                .textInput: .available,
+                .gestures: .available,
+                .verify: .unavailable
+            ]
+        ))
+        let probe = CapabilityProbe(appResolver: StaticAppResolver(), homeDirectory: root, guiCapabilityProvider: guiProvider)
+        let profile = await probe.probePrivileged()
+        let registry = ToolRegistry()
+        let descriptorValue = await registry.descriptor(named: "gui.runStructuredPlan")
+        let descriptor = try XCTUnwrap(descriptorValue)
+
+        XCTAssertEqual(profile.status(GUIAutomationFeature.tree.capabilityID), .unavailable)
+        XCTAssertFalse(descriptor.requiredCapabilities.contains(GUIAutomationFeature.tree.capabilityID))
+        for capability in descriptor.requiredCapabilities {
+            XCTAssertEqual(profile.status(capability), .available, "StructuredPlan local executor should remain routable without AX tree: \(capability)")
+        }
     }
 
     func testExtendedCapabilityProbeRebuildsHomeOSAggregatesWithoutDuplicateStaleRecords() async throws {
@@ -136,6 +177,27 @@ final class CloudCodeCoreTests: XCTestCase {
         let store = SessionStore(root: sessionsRoot)
         let sessions = try await store.all()
         XCTAssertTrue(sessions.isEmpty)
+    }
+
+    func testSessionStorePersistsSpecializedSkillBindingPerConversation() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionsRoot = root.appendingPathComponent("Sessions", isDirectory: true)
+        let store = SessionStore(root: sessionsRoot)
+        let session = AgentSession(
+            title: BossRecruitmentSkillPackage.displayName,
+            messages: [ChatMessage(role: .user, content: "继续当前招聘任务")],
+            permissionMode: .safe,
+            specializedSkillID: BossRecruitmentSkillPackage.skillID
+        )
+
+        try await store.save(session)
+        let restored = try await store.load(session.id)
+
+        XCTAssertEqual(restored.specializedSkillID, BossRecruitmentSkillPackage.skillID)
+        XCTAssertEqual(restored.title, BossRecruitmentSkillPackage.displayName)
+        let ordinary = AgentSession(permissionMode: .safe)
+        XCTAssertNil(ordinary.specializedSkillID, "ordinary conversations must stay on automatic skill routing")
     }
 
     func testSessionStoreRejectsUnrecoverablyLargePersistedSessionWithoutReadingIt() async throws {
@@ -586,6 +648,46 @@ final class CloudCodeCoreTests: XCTestCase {
         let normalPackage = DiagnosticProblemPackageBuilder.build(records: [normal], executionMetrics: [], context: context)
         XCTAssertTrue(normalPackage.capsules.isEmpty)
 
+        let successfulHelperWithTimeoutEvidence = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "gui",
+            action: "tap.helper",
+            result: "dispatched-unverified",
+            diagnostic: #"IOHID tap dispatched {"parentTimeout":false,"timeoutSeconds":3,"timeoutKillResult":0}"#
+        )
+        let successfulCapabilityWithTimeoutProse = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "capability",
+            action: "native.sqlite",
+            result: "available",
+            diagnostic: "libsqlite3 support is available with bounded timeout enforcement"
+        )
+        let successfulAssertionWithTimeoutEvidence = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "app",
+            action: "background.assertion",
+            result: "acquired",
+            diagnostic: #"assertion acquired {"parentTimeout":false,"timeoutSeconds":4}"#
+        )
+        let helperNoisePackage = DiagnosticProblemPackageBuilder.build(
+            records: [successfulHelperWithTimeoutEvidence, successfulCapabilityWithTimeoutProse, successfulAssertionWithTimeoutEvidence],
+            executionMetrics: [],
+            context: context
+        )
+        XCTAssertTrue(helperNoisePackage.capsules.isEmpty)
+
+        let launchUnverified = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "tool",
+            action: "gui.openAppObserve",
+            result: "completed",
+            diagnostic: "launch accepted; semantic review pending",
+            metadata: ["foregroundVerified": "false"]
+        )
+        let launchPackage = DiagnosticProblemPackageBuilder.build(records: [launchUnverified], executionMetrics: [], context: context)
+        XCTAssertEqual(launchPackage.capsules.count, 1)
+        XCTAssertTrue(launchPackage.capsules[0].failureSignature.contains("foreground_unverified"))
+
         let slowButCompleted = DiagnosticLogRecord(
             level: .warning,
             subsystem: "tool",
@@ -746,6 +848,8 @@ final class CloudCodeCoreTests: XCTestCase {
             (DiagnosticLogRecord(level: .error, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "required AXRuntime creation/copy symbols are unavailable"), "ax_backend_unavailable"),
             (DiagnosticLogRecord(level: .error, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "AX request transport failed"), "ax_request_failed"),
             (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "no readable UI nodes; empty tree"), "ax_tree_empty"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "AX transport responded but no semantic/actionable foreground UI nodes were returned", metadata: ["perceptionFallbackReason": "ax_transport_returned_semantically_empty_tree"]), "ax_tree_empty"),
+            (DiagnosticLogRecord(level: .warning, subsystem: "privileged-helper", action: "gui.tree", result: "failed", diagnostic: "gui-tree-ax-runtime: stage=empty-semantic-tree; helper-exit {\"parentTimeout\":false,\"timeoutSeconds\":2}"), "ax_tree_empty"),
             (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.findElement", result: "failed", diagnostic: "structured element query returned no usable visible match"), "ax_target_absent"),
             (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.waitForElement", result: "failed", diagnostic: "structured plan local expectation did not become true before timeout"), "ax_target_absent"),
             (DiagnosticLogRecord(level: .warning, subsystem: "tool", action: "gui.tree", result: "failed", diagnostic: "node budget output exceeded"), "ax_tree_budget_truncated"),
@@ -780,6 +884,87 @@ final class CloudCodeCoreTests: XCTestCase {
             XCTAssertEqual(explanation.failureLayer, .localVision)
             XCTAssertTrue(explanation.failureSignature.contains(expectedReason), "expected \(expectedReason), got \(explanation.failureSignature)")
         }
+    }
+
+    func testCoreVideoAllocationFailureSelfDiagnosisTripsCircuitInsteadOfBlindVisionRetry() throws {
+        let record = DiagnosticLogRecord(
+            level: .warning,
+            subsystem: "localVision",
+            action: "localVision.lookup",
+            result: "failed",
+            diagnostic: "Vision request failed",
+            metadata: [
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "false",
+                "localVisionOCR": "unavailable",
+                "localVisionErrorDomain": NSOSStatusErrorDomain,
+                "localVisionErrorCode": "-6662",
+                "localVisionFailureClass": "ocr_request_failed"
+            ]
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+        ))
+        XCTAssertTrue(explanation.failureSignature.contains("corevideo_allocation_failed"))
+        XCTAssertFalse(explanation.automaticRecoveryAllowed, "same-context -6662 must trip the circuit instead of spending another self-repair attempt")
+        XCTAssertEqual(explanation.recoveryReason, "failure_requires_developer_or_manual_resolution")
+        XCTAssertTrue(explanation.recommendedNextAction.contains("corevideo_circuit_breaker"))
+        XCTAssertTrue(explanation.recommendedNextAction.contains("avoid_same_context_vision_retry"))
+    }
+
+    func testTapTextObserveDiagnosesFailedOCRFallbackAheadOfEarlierAXFailure() throws {
+        let record = DiagnosticLogRecord(
+            level: .warning,
+            subsystem: "tool",
+            action: "gui.tapTextObserve",
+            result: "failed",
+            diagnostic: "Local OCR text lookup could not resolve a target: unavailable_request_failed.",
+            metadata: [
+                "perceptionAXAttempted": "true",
+                "perceptionAXSucceeded": "false",
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "false",
+                "localVisionOCR": "unavailable_request_failed",
+                "localVisionErrorDomain": NSOSStatusErrorDomain,
+                "localVisionErrorCode": "-6662",
+                "localVisionFailureClass": "ocr_request_failed"
+            ]
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+        ))
+        XCTAssertEqual(explanation.failureLayer, .localVision)
+        XCTAssertEqual(explanation.failureStage, "ocr_recognition")
+        XCTAssertTrue(explanation.failureSignature.contains("corevideo_allocation_failed"))
+        XCTAssertFalse(explanation.automaticRecoveryAllowed)
+    }
+
+    func testSuccessfulScreenshotWithOCRFailureKeepsScreenshotSuccessAndDiagnosesCoreVideo() throws {
+        let record = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "tool",
+            action: "gui.screenshot",
+            result: "completed",
+            diagnostic: "Screenshot captured with bounded on-device text observation when available",
+            metadata: [
+                "sha256": "valid-screenshot",
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "false",
+                "localVisionOCR": "unavailable_request_failed",
+                "localVisionErrorDomain": NSOSStatusErrorDomain,
+                "localVisionErrorCode": "-6662",
+                "localVisionFailureClass": "ocr_request_failed",
+                "localVisionSecondaryStatus": "unavailable_helper_failed"
+            ]
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+        ))
+        XCTAssertEqual(explanation.failureLayer, .localVision)
+        XCTAssertEqual(explanation.failureStage, "ocr_recognition")
+        XCTAssertTrue(explanation.failureSignature.contains("corevideo_allocation_failed"))
+        XCTAssertFalse(explanation.failureSignature.contains("screenshot_capture_failed"))
+        XCTAssertFalse(explanation.automaticRecoveryAllowed)
     }
 
     func testDiagnosticFailureTaxonomyDoesNotMistakeScreenWidth400ForHTTP400() throws {
@@ -930,6 +1115,281 @@ final class CloudCodeCoreTests: XCTestCase {
         ))
     }
 
+    func testImageCapableRemoteVisionFallbackDoesNotSpendRecoveryBudgetForSuccessfulOrNonDispatchedLocalOCRFailure() {
+        let screenshot = ChatAttachment(
+            filename: "feed-sample.jpg",
+            path: "/tmp/feed-sample.jpg",
+            mimeType: "image/jpeg",
+            byteSize: 4_096
+        )
+        let fallbackResult = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "Feed samples captured for semantic review.",
+            payload: [
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "false",
+                "localVisionOCR": "unavailable_request_failed",
+                "localVisionFailureClass": "ocr_request_failed",
+                "localMetricExtraction": "incomplete_or_ambiguous",
+                "perceptionRemoteVisionRequired": "true"
+            ],
+            attachments: [screenshot]
+        )
+
+        XCTAssertFalse(AgentCore.shouldExplainFailure(
+            toolName: "gui.feedSample",
+            result: fallbackResult,
+            providerVisionCapability: .supported
+        ))
+        XCTAssertTrue(AgentCore.shouldExplainFailure(
+            toolName: "gui.feedSample",
+            result: fallbackResult,
+            providerVisionCapability: .textOnly
+        ))
+
+        var localTextLookupFallback = fallbackResult
+        localTextLookupFallback.success = false
+        localTextLookupFallback.summary = "Local OCR text lookup could not resolve a target."
+        localTextLookupFallback.payload["effectVerification"] = "not_dispatched"
+        XCTAssertFalse(AgentCore.shouldExplainFailure(
+            toolName: "gui.tapTextObserve",
+            result: localTextLookupFallback,
+            providerVisionCapability: .supported
+        ))
+        XCTAssertFalse(AgentCore.shouldRecordStateChange(for: localTextLookupFallback))
+
+        var failedWithoutNonDispatchProof = localTextLookupFallback
+        failedWithoutNonDispatchProof.payload.removeValue(forKey: "effectVerification")
+        XCTAssertTrue(AgentCore.shouldExplainFailure(
+            toolName: "gui.tapTextObserve",
+            result: failedWithoutNonDispatchProof,
+            providerVisionCapability: .supported
+        ))
+        XCTAssertTrue(AgentCore.shouldRecordStateChange(for: failedWithoutNonDispatchProof))
+
+        var missingImage = fallbackResult
+        missingImage.attachments = nil
+        XCTAssertTrue(AgentCore.shouldExplainFailure(
+            toolName: "gui.feedSample",
+            result: missingImage,
+            providerVisionCapability: .supported
+        ))
+
+        var hardFailure = fallbackResult
+        hardFailure.payload["effectVerification"] = "no_effect"
+        XCTAssertTrue(AgentCore.shouldExplainFailure(
+            toolName: "gui.feedSample",
+            result: hardFailure,
+            providerVisionCapability: .supported
+        ))
+    }
+
+    func testForegroundMessagingFastPathRequiresFreshSupportedVisualContextAndNoLocalDataIntent() {
+        XCTAssertTrue(AgentCore.shouldUseForegroundMessagingFastPath(
+            requiresMessageSend: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true,
+            requestsLocalDataAccess: false
+        ))
+        XCTAssertFalse(AgentCore.shouldUseForegroundMessagingFastPath(
+            requiresMessageSend: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .textOnly,
+            hasForegroundTarget: true,
+            requestsLocalDataAccess: false
+        ))
+        XCTAssertFalse(AgentCore.shouldUseForegroundMessagingFastPath(
+            requiresMessageSend: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true,
+            requestsLocalDataAccess: true
+        ))
+        XCTAssertFalse(HarnessContextManager.requestsLocalDataAccess(in: "打开微信找到文件传输助手并发消息"))
+        XCTAssertTrue(HarnessContextManager.requestsLocalDataAccess(in: "读取微信数据库里的本地记录"))
+    }
+
+    func testMessagingNavigationSearchTypingIsNarrowlySeparatedFromMessageBodyCompletion() {
+        XCTAssertTrue(HarnessContextManager.requiresNavigationSearch(in: "打开微信，找文件传输助手并发消息"))
+        XCTAssertFalse(HarnessContextManager.requiresNavigationSearch(in: "打开微信直接给文件传输助手发消息"))
+
+        XCTAssertTrue(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "navigation_search",
+            verifiedMessagingComposerFocus: false,
+            requiresNavigationSearch: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true
+        ))
+        XCTAssertFalse(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "navigation_search",
+            verifiedMessagingComposerFocus: false,
+            requiresNavigationSearch: true,
+            providerContextHasImages: false,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true
+        ))
+        XCTAssertFalse(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "navigation_search",
+            verifiedMessagingComposerFocus: false,
+            requiresNavigationSearch: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .textOnly,
+            hasForegroundTarget: true
+        ))
+
+        XCTAssertFalse(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "message_body",
+            verifiedMessagingComposerFocus: false,
+            requiresNavigationSearch: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true
+        ))
+        XCTAssertTrue(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "message_body",
+            verifiedMessagingComposerFocus: true,
+            requiresNavigationSearch: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true
+        ))
+        XCTAssertFalse(AgentCore.rawMessagingTextInputAllowed(
+            purpose: "unexpected-purpose",
+            verifiedMessagingComposerFocus: true,
+            requiresNavigationSearch: true,
+            providerContextHasImages: true,
+            providerVisionCapability: .supported,
+            hasForegroundTarget: true
+        ))
+
+        XCTAssertFalse(AgentCore.shouldCountSuccessfulTextInputAsMessageBody(
+            requiresMessageSend: true,
+            purpose: "navigation_search"
+        ))
+        XCTAssertTrue(AgentCore.shouldCountSuccessfulTextInputAsMessageBody(
+            requiresMessageSend: true,
+            purpose: "message_body"
+        ))
+        XCTAssertTrue(AgentCore.isSemanticMessageCommitAction(
+            name: "gui.tapTextObserve",
+            arguments: ["query": "发送"]
+        ))
+        XCTAssertFalse(AgentCore.isSemanticMessageCommitAction(
+            name: "gui.tap",
+            arguments: ["x": "300", "y": "700"]
+        ))
+
+        XCTAssertTrue(AgentCore.shouldBlockRepeatedMessageBodyInput(
+            requiresMessageSend: true,
+            toolName: "gui.typeObserve",
+            purpose: "message_body",
+            successfulTextInputCount: 1
+        ))
+        XCTAssertFalse(AgentCore.shouldBlockRepeatedMessageBodyInput(
+            requiresMessageSend: true,
+            toolName: "gui.typeObserve",
+            purpose: "navigation_search",
+            successfulTextInputCount: 1
+        ))
+        XCTAssertTrue(AgentCore.shouldBlockUnverifiedMessageCommitRepeat(
+            requiresMessageSend: true,
+            toolName: "gui.tapObserve",
+            successfulTextInputCount: 1,
+            unverifiedMessageCommitAttempted: true,
+            successfulCommitAfterTextInput: false
+        ))
+        XCTAssertFalse(AgentCore.shouldBlockUnverifiedMessageCommitRepeat(
+            requiresMessageSend: true,
+            toolName: "gui.tapTextObserve",
+            successfulTextInputCount: 1,
+            unverifiedMessageCommitAttempted: false,
+            successfulCommitAfterTextInput: false
+        ))
+    }
+
+    func testTypedMessagingGuardLocksDestinationAndMessageBodyAcrossPhases() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.reconcileObligationProgress(contract: contract)
+
+        XCTAssertNil(AgentCore.typedMessagingTextInputViolation(
+            contract: contract,
+            runtime: runtime,
+            toolName: "gui.typeObserve",
+            arguments: ["purpose": "navigation_search", "text": "文件传输助手"]
+        ))
+        XCTAssertEqual(AgentCore.typedMessagingTextInputViolation(
+            contract: contract,
+            runtime: runtime,
+            toolName: "gui.typeObserve",
+            arguments: ["purpose": "navigation_search", "text": "文件 助手 1"]
+        ), "navigation_search_target_mismatch")
+        XCTAssertEqual(AgentCore.typedMessagingTextInputViolation(
+            contract: contract,
+            runtime: runtime,
+            toolName: "gui.typeObserve",
+            arguments: ["purpose": "message_body", "text": "1"]
+        ), "message_body_before_destination_verified")
+
+        runtime.markObligationCompleted("destination")
+        runtime.reconcileObligationProgress(contract: contract)
+        XCTAssertNil(AgentCore.typedMessagingTextInputViolation(
+            contract: contract,
+            runtime: runtime,
+            toolName: "gui.typeObserve",
+            arguments: ["purpose": "message_body", "text": "1"]
+        ))
+        XCTAssertEqual(AgentCore.typedMessagingTextInputViolation(
+            contract: contract,
+            runtime: runtime,
+            toolName: "gui.typeObserve",
+            arguments: ["purpose": "message_body", "text": "文件传输助手"]
+        ), "message_body_target_mismatch")
+        XCTAssertEqual(AgentCore.typedMessagingTextInputViolation(
+            contract: contract,
+            runtime: runtime,
+            toolName: "gui.typeObserve",
+            arguments: ["purpose": "navigation_search", "text": "文件传输助手"]
+        ), "navigation_search_after_destination_resolved")
+
+        let mixedPlan = #"{"steps":[{"action":"typeElement","text":"文件传输助手"}]}"#
+        XCTAssertEqual(AgentCore.typedMessagingTextInputViolation(
+            contract: contract,
+            runtime: runtime,
+            toolName: "gui.runStructuredPlan",
+            arguments: ["plan": mixedPlan]
+        ), "structured_typing_requires_phase_separation")
+    }
+
+    func testStructuredMessagingPlanRejectsMultipleTypingMilestonesAndRepeatBodyInput() {
+        let twoTypePlan = #"{"steps":[{"action":"typeElement","text":"文件传输助手"},{"action":"typeElement","text":"1"}]}"#
+        XCTAssertEqual(AgentCore.structuredPlanTypeElementCount(arguments: ["plan": twoTypePlan]), 2)
+        XCTAssertTrue(AgentCore.shouldBlockStructuredMessagingTyping(
+            requiresMessageSend: true,
+            toolName: "gui.runStructuredPlan",
+            arguments: ["plan": twoTypePlan],
+            successfulTextInputCount: 0
+        ))
+
+        let singleTypePlan = #"{"steps":[{"action":"typeElement","text":"1"}]}"#
+        XCTAssertFalse(AgentCore.shouldBlockStructuredMessagingTyping(
+            requiresMessageSend: true,
+            toolName: "gui.runStructuredPlan",
+            arguments: ["plan": singleTypePlan],
+            successfulTextInputCount: 0
+        ))
+        XCTAssertTrue(AgentCore.shouldBlockStructuredMessagingTyping(
+            requiresMessageSend: true,
+            toolName: "gui.runStructuredPlan",
+            arguments: ["plan": singleTypePlan],
+            successfulTextInputCount: 1
+        ))
+    }
+
     func testDiagnosticFailureExplanationClassifiesTextOnlyProviderLocalFallbackGap() throws {
         let record = DiagnosticLogRecord(
             level: .warning,
@@ -954,6 +1414,28 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(explanation.failureSignature.contains("provider_text_only_local_fallback_missing"))
         XCTAssertTrue(explanation.probableCauses.contains("provider_route_cannot_consume_image_observation"))
         XCTAssertTrue(explanation.recommendedNextAction.contains("semantic_local_tool"))
+    }
+
+    func testDiagnosticFailureExplanationClassifiesToolRouteDeepFallbackAsDiagnosticOnly() throws {
+        let record = DiagnosticLogRecord(
+            level: .info,
+            subsystem: "tool-route",
+            action: "files.list",
+            result: "selected",
+            metadata: [
+                "route": AppExecutionRoute.guiFallback.rawValue,
+                "routeCandidates": "structuredTool,cli,privateFramework,urlScheme,guiFallback",
+                "fallbackReason": "structuredTool:no_executor;cli:no_executor;privateFramework:no_executor;urlScheme:no_executor",
+                "fallbackDepth": "4"
+            ]
+        )
+        let explanation = try XCTUnwrap(DiagnosticProblemPackageBuilder.explainFailure(
+            records: [record], executionMetrics: [], capabilities: CapabilityProfile(records: [])
+        ))
+        XCTAssertEqual(explanation.failureLayer, .toolRouting)
+        XCTAssertTrue(explanation.failureSignature.contains("deep_route_fallback"))
+        XCTAssertFalse(explanation.automaticRecoveryAllowed)
+        XCTAssertEqual(explanation.recoveryReason, "diagnostic_only_route_degradation")
     }
 
     func testDiagnosticFailureHistoryReportsChangedLayerAndRemainingFailureWithoutGuessing() throws {
@@ -1582,6 +2064,53 @@ final class CloudCodeCoreTests: XCTestCase {
             elements: rail,
             screenSize: nil
         ), "the right-rail fallback requires normalized screen context")
+    }
+
+    func testLocalFeedPerceptionPolicyUsesBoundedMetricRailAndSkipsRedundantAXWhenEvidenceIsComplete() throws {
+        let screen = LocalPerceptionScreenSize(width: 390, height: 844)
+        let region = try XCTUnwrap(LocalFeedPerceptionPolicy.metricRegion(screenSize: screen))
+        XCTAssertEqual(region.x, 249.6, accuracy: 0.001)
+        XCTAssertEqual(region.y, 151.92, accuracy: 0.001)
+        XCTAssertEqual(region.width, 140.4, accuracy: 0.001)
+        XCTAssertEqual(region.height, 624.56, accuracy: 0.001)
+
+        let completeRail = [
+            LocalPerceptionTextElement(text: "21.0万", confidence: 0.94, x: 330, y: 344, width: 48, height: 20),
+            LocalPerceptionTextElement(text: "2783", confidence: 0.93, x: 334, y: 430, width: 42, height: 20),
+            LocalPerceptionTextElement(text: "5363", confidence: 0.92, x: 333, y: 516, width: 42, height: 20),
+            LocalPerceptionTextElement(text: "3.6万", confidence: 0.91, x: 330, y: 602, width: 48, height: 20)
+        ]
+        XCTAssertTrue(LocalFeedPerceptionPolicy.observationIsSufficient(
+            metric: .likeCount,
+            elements: completeRail,
+            screenSize: screen
+        ))
+        let trustedExtraction = try XCTUnwrap(
+            LocalFeedMetricExtractor.extract(metric: .likeCount, elements: completeRail, screenSize: screen)
+        )
+        XCTAssertEqual(trustedExtraction.value, 210_000)
+        XCTAssertTrue(LocalFeedPerceptionPolicy.metricExtractionIsTrusted(trustedExtraction))
+
+        var lowConfidenceRail = completeRail
+        lowConfidenceRail[0].confidence = 0.50
+        let lowConfidenceExtraction = try XCTUnwrap(
+            LocalFeedMetricExtractor.extract(metric: .likeCount, elements: lowConfidenceRail, screenSize: screen)
+        )
+        XCTAssertEqual(lowConfidenceExtraction.value, 210_000)
+        XCTAssertFalse(LocalFeedPerceptionPolicy.metricExtractionIsTrusted(lowConfidenceExtraction))
+        XCTAssertFalse(LocalFeedPerceptionPolicy.observationIsSufficient(
+            metric: .likeCount,
+            elements: lowConfidenceRail,
+            screenSize: screen
+        ))
+
+        let incompleteRail = Array(completeRail.prefix(2))
+        XCTAssertFalse(LocalFeedPerceptionPolicy.observationIsSufficient(
+            metric: .likeCount,
+            elements: incompleteRail,
+            screenSize: screen
+        ))
+        XCTAssertNil(LocalFeedPerceptionPolicy.metricRegion(screenSize: .init(width: 100, height: 100)))
     }
 
     func testLocalFeedMetricExtractorKeepsThreeSlotRightRailShareAmbiguous() throws {
@@ -2862,18 +3391,23 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(MockCapabilityProfiles.guiUnavailable.isAvailable("automation.gui"))
     }
 
-    func testGUICompositeCapabilityRequiresEveryObservationActionVerificationFeature() {
+    func testGUICompositeRequiresCoreActionAndVerificationButNotIndependentPerceptionAccelerators() {
         var statuses = Dictionary(uniqueKeysWithValues: GUIAutomationFeature.allCases.map { ($0, CapabilityStatus.available) })
         let complete = GUIAutomationCapabilitySnapshot(backendIdentifier: "complete", statuses: statuses)
         XCTAssertEqual(complete.compositeStatus, .available)
 
         statuses[.tree] = .unavailable
-        let partial = GUIAutomationCapabilitySnapshot(backendIdentifier: "partial", statuses: statuses)
-        XCTAssertEqual(partial.compositeStatus, .unavailable)
+        statuses[.ocr] = .deviceValidationRequired
+        let perceptionDegraded = GUIAutomationCapabilitySnapshot(backendIdentifier: "perception-degraded", statuses: statuses)
+        XCTAssertEqual(perceptionDegraded.compositeStatus, .available, "AX tree and OCR are independent perception routes and must not disable core GUI automation")
 
-        statuses[.tree] = .deviceValidationRequired
-        let pending = GUIAutomationCapabilitySnapshot(backendIdentifier: "pending", statuses: statuses)
-        XCTAssertEqual(pending.compositeStatus, .deviceValidationRequired)
+        statuses[.verify] = .deviceValidationRequired
+        let pendingVerification = GUIAutomationCapabilitySnapshot(backendIdentifier: "pending-verification", statuses: statuses)
+        XCTAssertEqual(pendingVerification.compositeStatus, .deviceValidationRequired)
+
+        statuses[.verify] = .unavailable
+        let missingVerification = GUIAutomationCapabilitySnapshot(backendIdentifier: "missing-verification", statuses: statuses)
+        XCTAssertEqual(missingVerification.compositeStatus, .unavailable)
     }
 
     func testGUIToolsRequireGranularCapabilityRatherThanCompositeFlag() async throws {
@@ -2922,11 +3456,11 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(learning.requiredCapabilities.isEmpty)
         XCTAssertEqual(learning.risk, .readOnly)
         XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.typeObserve", arguments: ["text": "secret text"], sessionID: UUID())), "当前前台 App · 输入 11 个字符（内容已隐藏）")
-        XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.tapTextObserve", arguments: ["query": "文件传输助手"], sessionID: UUID())), "当前前台 App · local OCR text tap")
+        XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.tapTextObserve", arguments: ["query": "文件传输助手"], sessionID: UUID())), "当前前台 App · local AX/OCR text tap")
         XCTAssertEqual(GUIApprovalTargetSanitizer.target(for: ToolCall(name: "gui.focusComposerObserve", arguments: [:], sessionID: UUID())), "当前前台 App · semantic chat composer focus")
     }
 
-    func testStructuredGUIElementToolsPreferTreeAndBoundedLocalExecutionCapabilities() async throws {
+    func testStructuredGUIElementToolsKeepAXSpecificToolsButPlanDoesNotRequireTreeCapability() async throws {
         let registry = ToolRegistry()
         let findDescriptor = await registry.descriptor(named: "gui.findElement")
         let waitDescriptor = await registry.descriptor(named: "gui.waitForElement")
@@ -2945,7 +3479,8 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(wait.requiredCapabilities, [GUIAutomationFeature.tree.capabilityID])
         XCTAssertEqual(tap.requiredCapabilities, [GUIAutomationFeature.tree.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
         XCTAssertEqual(type.requiredCapabilities, [GUIAutomationFeature.tree.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
-        XCTAssertEqual(plan.requiredCapabilities, [GUIAutomationFeature.openApp.capabilityID, GUIAutomationFeature.tree.capabilityID, GUIAutomationFeature.screenshot.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.gestures.capabilityID])
+        XCTAssertEqual(plan.requiredCapabilities, [GUIAutomationFeature.openApp.capabilityID, GUIAutomationFeature.screenshot.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.gestures.capabilityID])
+        XCTAssertFalse(plan.requiredCapabilities.contains(GUIAutomationFeature.tree.capabilityID))
         XCTAssertEqual(openObserve.requiredCapabilities, [GUIAutomationFeature.openApp.capabilityID, GUIAutomationFeature.screenshot.capabilityID])
         XCTAssertEqual(type.risk, .sensitiveWrite)
         XCTAssertEqual(plan.risk, .sensitiveWrite)
@@ -3040,9 +3575,9 @@ final class CloudCodeCoreTests: XCTestCase {
 
         XCTAssertEqual(first.status("filesystem.own_container"), .available)
         XCTAssertEqual(first.status("apps.enumerate"), .unavailable)
-        XCTAssertEqual(first.status("automation.url_scheme"), .unavailable)
+        XCTAssertEqual(first.status("automation.url_scheme"), .deviceValidationRequired)
         XCTAssertEqual(first.status("ipa.inspect"), .available)
-        XCTAssertEqual(second.status("automation.url_scheme"), .unavailable)
+        XCTAssertEqual(second.status("automation.url_scheme"), .deviceValidationRequired)
         XCTAssertGreaterThanOrEqual(second.generatedAt, first.generatedAt)
     }
 
@@ -3645,6 +4180,18 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(GUIAutomationPayloadPolicy.isValidScreenshotJPEG(oversized))
     }
 
+    func testProviderPlanGUIWriteGuardClassifiesStateChangesButNotObservations() {
+        let tap = ToolDescriptor(name: "gui.tap", summary: "", risk: .safeWrite, preferredRoute: .guiFallback)
+        let screenshot = ToolDescriptor(name: "gui.screenshot", summary: "", risk: .readOnly, preferredRoute: .guiFallback)
+        let launch = ToolDescriptor(name: "apps.launch", summary: "", risk: .safeWrite, preferredRoute: .privateFramework)
+        let read = ToolDescriptor(name: "files.read", summary: "", risk: .readOnly)
+
+        XCTAssertTrue(AgentCore.isProviderPlanGUIStateChange(toolName: tap.name, descriptor: tap))
+        XCTAssertFalse(AgentCore.isProviderPlanGUIStateChange(toolName: screenshot.name, descriptor: screenshot))
+        XCTAssertTrue(AgentCore.isProviderPlanGUIStateChange(toolName: launch.name, descriptor: launch))
+        XCTAssertFalse(AgentCore.isProviderPlanGUIStateChange(toolName: read.name, descriptor: read))
+    }
+
     func testGUISwipeDurationNormalizesBoundedMillisecondsWithoutClampingUnsafeValues() {
         XCTAssertEqual(GUIAutomationPayloadPolicy.normalizedSwipeDuration("0.3"), 0.3)
         XCTAssertEqual(GUIAutomationPayloadPolicy.normalizedSwipeDuration("300"), 0.3)
@@ -3742,7 +4289,11 @@ final class CloudCodeCoreTests: XCTestCase {
             keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
             toolRouter: ToolRouter(
                 registry: registry,
-                executors: [CountingExecutor(route: .privateFramework, names: ["apps.launch"], counter: InvocationCounter())],
+                executors: [FixedPayloadExecutor(
+                    route: .privateFramework,
+                    names: ["apps.launch"],
+                    payload: ["foregroundVerified": "true"]
+                )],
                 diagnosticLogger: logStore
             ),
             registry: registry,
@@ -3775,6 +4326,7 @@ final class CloudCodeCoreTests: XCTestCase {
         })
         let diagnoses = saved.messages.filter { $0.providerMetadata["context_layer"] == "automatic_completion_diagnosis" }
         XCTAssertEqual(diagnoses.count, 3)
+        guard diagnoses.count == 3 else { return }
         XCTAssertEqual(diagnoses[0].providerMetadata["automatic_recovery_allowed"], "true")
         XCTAssertEqual(diagnoses[0].providerMetadata["recovery_reason"], "bounded_replan_available")
         XCTAssertEqual(diagnoses[1].providerMetadata["automatic_recovery_allowed"], "true")
@@ -3782,7 +4334,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(diagnoses[2].providerMetadata["automatic_recovery_allowed"], "false")
         XCTAssertEqual(diagnoses[2].providerMetadata["recovery_reason"], "recovery_budget_exhausted")
         let providerStreamCalls = await provider.streamCallCount()
-        XCTAssertEqual(providerStreamCalls, 4, "one launch round plus three completion attempts must stop before any fourth completion re-plan")
+        XCTAssertEqual(providerStreamCalls, 3, "typed deterministic launch bypasses Provider; exactly three premature completion attempts must exhaust the bounded recovery budget")
     }
 
     func testMessagingRawTypeIsBlockedUntilComposerFocusIsLocallyVerified() async throws {
@@ -3808,7 +4360,7 @@ final class CloudCodeCoreTests: XCTestCase {
         )
         let session = AgentSession(permissionMode: .full)
         let stream = await agent.send(
-            text: "打开微信给文件传输助手发一个一",
+            text: "打开微信给联系人发一个一",
             session: session,
             providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key")
         )
@@ -3866,7 +4418,7 @@ final class CloudCodeCoreTests: XCTestCase {
         )
         let session = AgentSession(permissionMode: .full)
         let stream = await agent.send(
-            text: "打开微信给文件传输助手发一个一",
+            text: "打开微信给联系人发一个一",
             session: session,
             providerConfiguration: ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com")!, model: "test", apiKeyReference: "test-key")
         )
@@ -4782,6 +5334,27 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "gui.navigateBack"))
         XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "gui.tap"))
         XCTAssertFalse(AgentCore.allowsImmediateSemanticRepeat(name: "files.create"))
+
+        let destinationArguments = ["query": "文件传输助手", "match": "exact"]
+        let destinationSignature = AgentCore.semanticToolSignature(name: "gui.tapTextObserve", arguments: destinationArguments)
+        XCTAssertTrue(AgentCore.shouldYieldRepeatedDeterministicOperation(
+            toolName: "gui.tapTextObserve",
+            arguments: destinationArguments,
+            lastStateChangeSignature: destinationSignature,
+            verificationSinceLastStateChange: false
+        ))
+        XCTAssertFalse(AgentCore.shouldYieldRepeatedDeterministicOperation(
+            toolName: "gui.tapTextObserve",
+            arguments: destinationArguments,
+            lastStateChangeSignature: destinationSignature,
+            verificationSinceLastStateChange: true
+        ))
+        XCTAssertFalse(AgentCore.shouldYieldRepeatedDeterministicOperation(
+            toolName: "apps.launch",
+            arguments: ["bundleId": "com.tencent.xin"],
+            lastStateChangeSignature: AgentCore.semanticToolSignature(name: "apps.launch", arguments: ["bundleId": "com.tencent.xin"]),
+            verificationSinceLastStateChange: false
+        ))
     }
 
     func testAgentCoreReusesCompletedAppListWithinTaskInsteadOfReexecutingDeviceScan() async throws {
@@ -5217,6 +5790,10 @@ final class CloudCodeCoreTests: XCTestCase {
         let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
         let checkpoints = TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json"))
         let mailbox = AgentSteeringMailbox()
+        let memory = TrackingHermesMemoryProvider(responses: [
+            "initial": "Hermes current memory for initial",
+            "steer now": "Hermes current memory for steering"
+        ])
         let agent = AgentCore(
             provider: SteeringAwareProvider(),
             keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
@@ -5226,6 +5803,7 @@ final class CloudCodeCoreTests: XCTestCase {
             sessionStore: sessions,
             checkpointStore: checkpoints,
             steeringMailbox: mailbox,
+            memoryProvider: memory,
             maxToolRounds: 4
         )
         let session = AgentSession(permissionMode: .safe)
@@ -5248,6 +5826,100 @@ final class CloudCodeCoreTests: XCTestCase {
         let saved = try await sessions.load(session.id)
         XCTAssertTrue(saved.messages.contains { $0.role == .user && $0.content == "steer now" })
         XCTAssertTrue(saved.messages.contains { $0.role == .assistant && $0.content.contains("new") })
+        let memoryQueries = await memory.queries()
+        XCTAssertTrue(memoryQueries.contains { $0.query == "initial" })
+        XCTAssertTrue(memoryQueries.contains { $0.query == "steer now" })
+    }
+
+    func testAgentCoreResumeRefreshesHermesInsteadOfReusingCheckpointText() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = ToolRegistry(descriptors: [])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let recorder = MessageRecordingProvider()
+        let memory = TrackingHermesMemoryProvider(responses: [
+            "resume request": "FRESH_HERMES_CONTEXT"
+        ])
+        let session = AgentSession(title: "CloudCode", permissionMode: .safe)
+        let checkpoint = TaskCheckpoint(
+            sessionID: session.id,
+            taskName: "resume",
+            stepIndex: 2,
+            stepName: "interrupted",
+            totalSteps: 8,
+            state: "interrupted",
+            payload: [
+                "hermes.context": "STALE_HERMES_CONTEXT",
+                "hermes.memoryIDs": UUID().uuidString
+            ]
+        )
+        let agent = AgentCore(
+            provider: recorder,
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(registry: registry, executors: []),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            memoryProvider: memory,
+            maxToolRounds: 2
+        )
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        _ = try await collectAgentTokenText(await agent.send(
+            text: "resume request",
+            session: session,
+            providerConfiguration: config,
+            resumeCheckpoint: checkpoint
+        ))
+
+        let messages = await recorder.lastMessages()
+        XCTAssertTrue(messages.contains { $0.providerMetadata["context_layer"] == "hermes" && $0.content.contains("FRESH_HERMES_CONTEXT") })
+        XCTAssertFalse(messages.contains { $0.content.contains("STALE_HERMES_CONTEXT") })
+        let memoryQueries = await memory.queries()
+        XCTAssertTrue(memoryQueries.contains { $0.query == "resume request" && $0.project == "CloudCode" })
+    }
+
+    func testAgentCoreResumeDoesNotFallBackToCheckpointWhenHermesRefreshFails() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = ToolRegistry(descriptors: [])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let recorder = MessageRecordingProvider()
+        let session = AgentSession(title: "CloudCode", permissionMode: .safe)
+        let checkpoint = TaskCheckpoint(
+            sessionID: session.id,
+            taskName: "resume",
+            stepIndex: 2,
+            stepName: "interrupted",
+            totalSteps: 8,
+            state: "interrupted",
+            payload: [
+                "hermes.context": "STALE_HERMES_CONTEXT",
+                "hermes.memoryIDs": UUID().uuidString
+            ]
+        )
+        let agent = AgentCore(
+            provider: recorder,
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(registry: registry, executors: []),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            memoryProvider: FailingHermesMemoryProvider(),
+            maxToolRounds: 2
+        )
+        let config = ProviderConfiguration(name: "test", baseURL: URL(string: "https://example.com/v1")!, model: "test", apiKeyReference: "test-key")
+        _ = try await collectAgentTokenText(await agent.send(
+            text: "resume request",
+            session: session,
+            providerConfiguration: config,
+            resumeCheckpoint: checkpoint
+        ))
+
+        let messages = await recorder.lastMessages()
+        XCTAssertFalse(messages.contains { $0.content.contains("STALE_HERMES_CONTEXT") })
+        XCTAssertFalse(messages.contains { $0.providerMetadata["context_layer"] == "hermes" })
     }
 
     func testHermesMemoryStoreSearchSupersedeExpiryAndMarkdownRoundTrip() async throws {
@@ -5322,6 +5994,163 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(recent.first(where: { $0.kind == .currentState })?.body.contains("第二轮状态") == true)
     }
 
+    func testHermesExplicitPreferenceCrossesSessionTitlesWithoutLeakingCurrentState() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = HermesMemoryStore(root: root.appendingPathComponent("Hermes", isDirectory: true))
+        try await store.bootstrap()
+
+        try await store.recordCompletedTurn(
+            sessionID: UUID(),
+            sessionTitle: "旧会话标题",
+            userText: "记住：以后默认用中文简洁回答。",
+            assistantText: "已记录。"
+        )
+        try await store.recordCompletedTurn(
+            sessionID: UUID(),
+            sessionTitle: "另一个旧任务",
+            userText: "当前正在处理临时 PID 12345。",
+            assistantText: "临时状态。"
+        )
+
+        let snapshot = try await store.context(query: "继续处理这个任务", project: "全新会话标题", limit: 8)
+        XCTAssertTrue(snapshot.records.contains { $0.kind == .userPreference && $0.body.contains("中文简洁") })
+        XCTAssertFalse(snapshot.records.contains { $0.kind == .currentState || $0.kind == .temporaryContext })
+        XCTAssertFalse(snapshot.renderedText.contains("PID 12345"))
+    }
+
+    func testHermesAutomaticTurnCurationRequiresDurableIntentAndExpiresSessionState() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = HermesMemoryStore(root: root.appendingPathComponent("Hermes", isDirectory: true))
+        try await store.bootstrap()
+        let sessionID = UUID()
+
+        try await store.recordCompletedTurn(
+            sessionID: sessionID,
+            sessionTitle: "CloudCode",
+            userText: "不要重启服务，检查 PID 12345 的任务",
+            assistantText: "当前任务已检查。"
+        )
+        var recent = try await store.recent(limit: 100, project: "CloudCode")
+        XCTAssertFalse(recent.contains { $0.kind == .permanentRule && $0.body.contains("PID 12345") })
+        let currentState = try XCTUnwrap(recent.first(where: { $0.kind == .currentState }))
+        XCTAssertNotNil(currentState.expiresAt)
+        XCTAssertLessThanOrEqual(currentState.expiresAt?.timeIntervalSinceNow ?? .infinity, 24 * 60 * 60 + 5)
+        let currentContext = try await store.context(query: "PID 12345", project: "CloudCode", limit: 8)
+        XCTAssertFalse(currentContext.records.contains { $0.kind == .currentState || $0.kind == .temporaryContext })
+        XCTAssertFalse(currentContext.renderedText.contains("PID 12345"))
+
+        try await store.recordCompletedTurn(
+            sessionID: sessionID,
+            sessionTitle: "CloudCode",
+            userText: "记住：以后默认 Provider 重试必须最多 3 次。",
+            assistantText: "已记录。"
+        )
+        try await store.recordCompletedTurn(
+            sessionID: sessionID,
+            sessionTitle: "CloudCode",
+            userText: "纠正：以后默认 Provider 重试必须最多 2 次。",
+            assistantText: "已纠正。"
+        )
+        recent = try await store.recent(limit: 100, project: "CloudCode")
+        let activeRules = recent.filter { $0.kind == .permanentRule }
+        XCTAssertEqual(activeRules.count, 1)
+        XCTAssertTrue(activeRules[0].body.contains("最多 2 次"))
+        XCTAssertTrue(activeRules[0].pinned)
+
+        try await store.recordCompletedTurn(
+            sessionID: sessionID,
+            sessionTitle: "CloudCode",
+            userText: "纠正：以后默认数据库必须使用 PostgreSQL。",
+            assistantText: "已收到纠正。"
+        )
+        recent = try await store.recent(limit: 100, project: "CloudCode")
+        XCTAssertEqual(recent.filter { $0.kind == .permanentRule }.count, 1)
+        XCTAssertTrue(recent.contains { $0.kind == .permanentRule && $0.body.contains("最多 2 次") })
+
+        _ = try await store.upsert(HermesMemoryRecord(
+            kind: .permanentRule,
+            title: "Legacy duplicate provider retry rule",
+            body: "记住：以后默认 Provider 重试必须最多 4 次。",
+            project: "CloudCode",
+            tags: ["auto", "explicit"],
+            pinned: true
+        ))
+        recent = try await store.recent(limit: 100, project: "CloudCode")
+        XCTAssertEqual(recent.filter { $0.kind == .permanentRule }.count, 2)
+
+        try await store.recordCompletedTurn(
+            sessionID: sessionID,
+            sessionTitle: "CloudCode",
+            userText: "纠正：以后默认 Provider 重试必须最多 1 次。",
+            assistantText: "已纠正。"
+        )
+        recent = try await store.recent(limit: 100, project: "CloudCode")
+        let reconciledRules = recent.filter { $0.kind == .permanentRule }
+        XCTAssertEqual(reconciledRules.count, 1)
+        XCTAssertTrue(reconciledRules[0].body.contains("最多 1 次"))
+    }
+
+    func testHermesContextKeepsRelevantProjectMemoryAndBoundsGlobalPinnedBudget() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = HermesMemoryStore(root: root.appendingPathComponent("Hermes", isDirectory: true))
+        try await store.bootstrap()
+
+        let relevant = try await store.upsert(HermesMemoryRecord(
+            kind: .projectMemory,
+            title: "Project A retry policy",
+            body: "Project A uses bounded provider retry semantics.",
+            project: "Project A"
+        ))
+        _ = try await store.upsert(HermesMemoryRecord(
+            kind: .permanentRule,
+            title: "Project A pinned",
+            body: "Project A pinned rule.",
+            project: "Project A",
+            pinned: true
+        ))
+        _ = try await store.upsert(HermesMemoryRecord(
+            kind: .permanentRule,
+            title: "Explicit global",
+            body: "Explicit global durable rule.",
+            tags: ["global"],
+            pinned: true
+        ))
+        _ = try await store.upsert(HermesMemoryRecord(
+            kind: .projectMemory,
+            title: "Untagged nil-project",
+            body: "Untagged global-looking text must not cross project scope."
+        ))
+        for index in 0..<8 {
+            _ = try await store.upsert(HermesMemoryRecord(
+                kind: .permanentRule,
+                title: "Project B pinned \(index)",
+                body: "Project B unrelated pinned rule \(index).",
+                project: "Project B",
+                pinned: true
+            ))
+        }
+
+        let snapshot = try await store.context(query: "bounded provider retry", project: "Project A", limit: 8)
+        XCTAssertTrue(snapshot.records.contains { $0.id == relevant.id })
+        XCTAssertTrue(snapshot.records.contains { $0.title == "Project A pinned" && $0.project == "Project A" })
+        XCTAssertFalse(snapshot.records.contains { $0.project == "Project B" })
+        XCTAssertLessThanOrEqual(snapshot.records.filter { $0.project == nil && $0.pinned }.count, 1)
+        XCTAssertLessThanOrEqual(snapshot.records.count, 8)
+
+        let limitOne = try await store.context(query: "bounded provider retry", project: "Project A", limit: 1)
+        XCTAssertEqual(limitOne.records.map(\.id), [relevant.id])
+
+        let missingScope = try await store.context(query: "bounded provider retry", project: nil, limit: 8)
+        XCTAssertFalse(missingScope.records.contains { $0.id == relevant.id })
+        XCTAssertTrue(missingScope.records.allSatisfy { $0.project == nil && $0.tags.contains(where: { $0.lowercased() == "global" }) })
+        let explicitGlobal = try await store.context(query: "global durable", project: nil, limit: 8)
+        XCTAssertTrue(explicitGlobal.records.contains { $0.title == "Explicit global" })
+        XCTAssertFalse(explicitGlobal.records.contains { $0.title == "Untagged nil-project" })
+    }
+
     func testHermesContextCompressionIsBoundedAndMarkedUntrusted() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -5355,6 +6184,27 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertLessThan(compressed.count, messages.count)
     }
 
+    func testHarnessContextCompressionPreservesCurrentRunToolTailWhenSystemContextConsumesBudget() {
+        let messages = [
+            ChatMessage(role: .system, content: String(repeating: "system ", count: 2_000)),
+            ChatMessage(role: .user, content: "older request"),
+            ChatMessage(role: .assistant, content: "older answer"),
+            ChatMessage(role: .user, content: "current request"),
+            ChatMessage(role: .assistant, content: "", providerMetadata: ["tool_call_id": "current-call", "tool_name": "gui.screenshot"]),
+            ChatMessage(role: .tool, content: String(repeating: "observation ", count: 700), providerMetadata: ["tool_call_id": "current-call", "tool_name": "gui.screenshot"])
+        ]
+
+        let compressed = HarnessContextManager.providerMessages(
+            from: messages,
+            policy: HarnessContextPolicy(maxCharacters: 8_000, maxMessages: 12)
+        )
+
+        XCTAssertTrue(compressed.contains { $0.role == .user && $0.content == "current request" })
+        XCTAssertTrue(compressed.contains { $0.role == .assistant && $0.providerMetadata["tool_call_id"] == "current-call" })
+        XCTAssertTrue(compressed.contains { $0.role == .tool && $0.providerMetadata["tool_call_id"] == "current-call" })
+        XCTAssertFalse(compressed.contains { $0.role == .user && $0.content == "older request" })
+    }
+
     func testHarnessContextCompressionBudgetsScreenshotBytesAndPreservesLatestExternalUser() {
         let oldScreenshot = ChatAttachment(
             filename: "old.jpg",
@@ -5383,6 +6233,815 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(compressed.contains { $0.role == .user && $0.content == "open app and inspect the current screen" })
         XCTAssertTrue(compressed.contains { $0.providerMetadata["internal_observation"] == "gui.screenshot" && $0.content == "current screenshot" })
         XCTAssertFalse(compressed.contains { $0.content == "old screenshot" })
+    }
+
+    func testTaskContractCompilesDouyinGoldenTaskWithHardFiniteInvariant() {
+        let contract = TaskContractCompiler.compileKnownRequest("打开抖音，刷严格 5 条视频，比较点赞量，给点赞最高的一条点赞，然后停止")
+        XCTAssertEqual(contract?.intent, .finiteFeed)
+        XCTAssertEqual(contract?.limits.exactFeedItemCount, 5)
+        XCTAssertEqual(contract?.limits.exactLikeCount, 1)
+        XCTAssertEqual(contract?.feed?.metric, .likeCount)
+        XCTAssertEqual(contract?.feed?.selectionRule, .maximum)
+        XCTAssertEqual(contract?.feed?.requiresLikeAction, true)
+        XCTAssertTrue(contract?.limits.forbidFeedOverrun == true)
+    }
+
+    func testTaskContractCompilesWeChatGoldenTaskWithExactlyOneSend() {
+        let contract = TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1")
+        XCTAssertEqual(contract?.intent, .messaging)
+        XCTAssertEqual(contract?.targetBundleID, "com.tencent.xin")
+        XCTAssertEqual(contract?.message?.destinationEntity, "文件传输助手")
+        XCTAssertEqual(contract?.message?.messageBody, "1")
+        XCTAssertEqual(contract?.limits.exactSendCount, 1)
+        XCTAssertTrue(contract?.limits.reconcileUncertainSendBeforeRetry == true)
+    }
+
+    func testTaskRuntimeHardInvariantsBlockFeedOverrunAndUncertainSendRetry() throws {
+        let feedContract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开抖音刷 5 条然后点赞"))
+        var feedState = TaskRuntimeState(contract: feedContract)
+        feedState.finiteFeedCompleted = 3
+        XCTAssertTrue(feedState.canDispatchFiniteFeed(units: 2, contract: feedContract))
+        XCTAssertFalse(feedState.canDispatchFiniteFeed(units: 3, contract: feedContract))
+        feedState.finiteFeedCompleted = 5
+        XCTAssertFalse(feedState.canDispatchFiniteFeed(units: 1, contract: feedContract))
+
+        let messageContract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信找到文件传输助手发送 1"))
+        var messageState = TaskRuntimeState(contract: messageContract)
+        XCTAssertTrue(messageState.canDispatchMessageCommit(contract: messageContract))
+        messageState.messageCommitState = .uncertain
+        XCTAssertFalse(messageState.canDispatchMessageCommit(contract: messageContract))
+        messageState.messageCommitState = .verified
+        XCTAssertFalse(messageState.canDispatchMessageCommit(contract: messageContract))
+    }
+
+    func testTypedMessagingCompletionHardStopRequiresVerifiedCommitAndPostcondition() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.markObligationCompleted("destination")
+        runtime.composerFocusVerified = true
+        runtime.textInputActionsCompleted = 1
+        runtime.messageCommitState = .verified
+        runtime.postconditionVerified = true
+        runtime.reconcileObligationProgress(contract: contract)
+
+        XCTAssertTrue(runtime.isComplete(contract: contract))
+        for descriptor in [
+            ToolDescriptor(name: "gui.typeObserve", summary: "", risk: .sensitiveWrite),
+            ToolDescriptor(name: "gui.tapTextObserve", summary: "", risk: .safeWrite),
+            ToolDescriptor(name: "gui.runStructuredPlan", summary: "", risk: .sensitiveWrite),
+            ToolDescriptor(name: "gui.scrollObserve", summary: "", risk: .safeWrite)
+        ] {
+            XCTAssertTrue(AgentCore.shouldBlockTypedTaskCompletedWrite(
+                contract: contract,
+                runtime: runtime,
+                descriptor: descriptor
+            ), "completed task must block \(descriptor.name)")
+        }
+        XCTAssertFalse(AgentCore.shouldBlockTypedTaskCompletedWrite(
+            contract: contract,
+            runtime: runtime,
+            descriptor: ToolDescriptor(name: "gui.screenshot", summary: "", risk: .readOnly)
+        ))
+
+        runtime.messageCommitState = .uncertain
+        runtime.completedObligations.remove("send")
+        runtime.completedObligations.remove("verify")
+        runtime.pendingObligations.insert("send")
+        runtime.pendingObligations.insert("verify")
+        runtime.postconditionVerified = false
+        runtime.reconcileObligationProgress(contract: contract)
+        XCTAssertFalse(runtime.isComplete(contract: contract))
+    }
+
+    func testFiniteFeedSelectionRequiresExactMetricEvidenceAndVerifiedReturn() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开抖音，刷严格 5 条视频，比较点赞量，给点赞最高的一条点赞，然后停止"))
+
+        func result(values: String, returnVerified: Bool) -> ToolResult {
+            ToolResult(
+                toolCallID: UUID(),
+                success: true,
+                summary: "local feed sample",
+                payload: [
+                    "localMetricExtraction": "complete",
+                    "localMetricSelectedSample": "3",
+                    "localMetricSelectedValue": "30",
+                    "localMetricValues": values,
+                    "localMetricSelectedReturnVerified": returnVerified ? "true" : "false",
+                    "sampledCount": "5"
+                ]
+            )
+        }
+
+        var incompleteValues = TaskRuntimeState(contract: contract)
+        incompleteValues.currentBundleID = contract.targetBundleID
+        incompleteValues.finiteFeedCompleted = 5
+        incompleteValues.applyToolEvidence(
+            toolName: "gui.feedSample",
+            arguments: ["count": "5"],
+            result: result(values: "10,20,30,40", returnVerified: true),
+            observation: nil,
+            contract: contract
+        )
+        XCTAssertNil(incompleteValues.selectedFeedSample)
+        XCTAssertTrue(incompleteValues.pendingObligations.contains("selection"))
+
+        var unverifiedReturn = TaskRuntimeState(contract: contract)
+        unverifiedReturn.currentBundleID = contract.targetBundleID
+        unverifiedReturn.finiteFeedCompleted = 5
+        unverifiedReturn.applyToolEvidence(
+            toolName: "gui.feedSample",
+            arguments: ["count": "5"],
+            result: result(values: "10,20,30,40,50", returnVerified: false),
+            observation: nil,
+            contract: contract
+        )
+        XCTAssertEqual(unverifiedReturn.selectedFeedSample, 3)
+        XCTAssertFalse(unverifiedReturn.selectedFeedReturnVerified)
+        XCTAssertTrue(unverifiedReturn.pendingObligations.contains("selection"))
+
+        var complete = TaskRuntimeState(contract: contract)
+        complete.currentBundleID = contract.targetBundleID
+        complete.finiteFeedCompleted = 5
+        complete.applyToolEvidence(
+            toolName: "gui.feedSample",
+            arguments: ["count": "5"],
+            result: result(values: "10,20,30,40,50", returnVerified: true),
+            observation: nil,
+            contract: contract
+        )
+        XCTAssertEqual(complete.selectedFeedSample, 3)
+        XCTAssertTrue(complete.selectedFeedReturnVerified)
+        XCTAssertTrue(complete.completedObligations.contains("selection"))
+        XCTAssertEqual(complete.semanticSurface, "feed.item.selected")
+    }
+
+    func testGenericMilestonesReuseObligationsAndExposeExactlyOnceMetadata() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        let milestones = contract.effectiveMilestones
+        XCTAssertEqual(milestones.map(\.id), contract.obligations.map(\.id))
+        XCTAssertEqual(milestones.first?.prerequisiteIDs, [])
+        XCTAssertEqual(milestones.dropFirst().first?.prerequisiteIDs, ["foreground"])
+
+        let send = try XCTUnwrap(milestones.first(where: { $0.id == "send" }))
+        XCTAssertTrue(send.exactlyOnce)
+        XCTAssertTrue(send.verificationRequired)
+        XCTAssertEqual(send.failurePolicy, .reconcileBeforeRetry)
+        XCTAssertEqual(send.completionObligationIDs, ["send"])
+
+        var runtime = TaskRuntimeState(contract: contract)
+        XCTAssertEqual(runtime.nextPendingMilestone(contract: contract)?.id, "foreground")
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.reconcileObligationProgress(contract: contract)
+        XCTAssertEqual(runtime.nextPendingMilestone(contract: contract)?.id, "destination")
+    }
+
+    func testExecutionTraceMetadataIsPrivacySafeAndOmitsMessageBody() throws {
+        let secretBody = "secret_body_927"
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 \(secretBody)"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.reconcileObligationProgress(contract: contract)
+        let metadata = runtime.traceMetadata(contract: contract)
+
+        XCTAssertFalse(metadata.keys.contains("messageBody"))
+        XCTAssertFalse(metadata.values.contains(where: { $0.contains(secretBody) }))
+        XCTAssertEqual(metadata["intent"], "messaging")
+        XCTAssertEqual(metadata["nextMilestone"], "destination")
+        XCTAssertEqual(metadata["taskFingerprint"]?.count, 16)
+    }
+
+    func testTaskSemanticCheckpointMigratesLegacyPayloadAndDualWritesCompatibility() throws {
+        let request = "打开抖音刷 5 条然后点赞"
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest(request))
+        var payload: [String: String] = [
+            "tool.completedRepeatedSwipeCount": "3",
+            "tool.successfulLikeActionCount": "0",
+            "tool.currentGUIBundleID": "com.ss.iphone.ugc.aweme",
+            "tool.verificationSinceLastStateChange": "true"
+        ]
+        var runtime = TaskSemanticCheckpointCodec.restoreRuntime(contract: contract, payload: payload)
+        XCTAssertEqual(runtime.finiteFeedCompleted, 3)
+        XCTAssertEqual(runtime.currentBundleID, "com.ss.iphone.ugc.aweme")
+        XCTAssertTrue(runtime.verificationSinceLastStateChange)
+
+        runtime.finiteFeedCompleted = 5
+        runtime.likeActionsCompleted = 1
+        runtime.reconcileObligationProgress(contract: contract)
+        TaskSemanticCheckpointCodec.persist(contract: contract, runtime: runtime, payload: &payload)
+        XCTAssertEqual(payload["tool.completedRepeatedSwipeCount"], "5")
+        XCTAssertEqual(payload["tool.successfulLikeActionCount"], "1")
+        XCTAssertNotNil(payload[TaskSemanticCheckpointCodec.contractKey])
+        XCTAssertNotNil(payload[TaskSemanticCheckpointCodec.runtimeKey])
+        let restored = TaskSemanticCheckpointCodec.restoreRuntime(contract: contract, payload: payload)
+        XCTAssertEqual(restored, runtime)
+        XCTAssertEqual(payload["tool.semanticReconcileObservationCount"], "0")
+    }
+
+    func testTypedRuntimeDecodesCheckpointWrittenBeforeReconcileCounterField() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信找到文件传输助手发送 1"))
+        let runtime = TaskRuntimeState(contract: contract)
+        let encoded = try JSONEncoder().encode(runtime)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "reconcileObservationCount")
+        object.removeValue(forKey: "pendingForegroundVerificationBundleID")
+        object.removeValue(forKey: "pendingForegroundVerificationObservationAttempted")
+        let legacyTypedData = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        let legacyTypedJSON = try XCTUnwrap(String(data: legacyTypedData, encoding: .utf8))
+        let restored = TaskSemanticCheckpointCodec.restoreRuntime(
+            contract: contract,
+            payload: [TaskSemanticCheckpointCodec.runtimeKey: legacyTypedJSON]
+        )
+        XCTAssertEqual(restored.requestFingerprint, runtime.requestFingerprint)
+        XCTAssertEqual(restored.boundedReconcileObservationCount, 0)
+        XCTAssertNil(restored.pendingForegroundVerificationBundleID)
+        XCTAssertFalse(restored.pendingForegroundVerificationObservationAttempted == true)
+    }
+
+    func testTaskContractCompilerDoesNotForceUnknownTaskIntoSemanticRuntime() {
+        XCTAssertNil(TaskContractCompiler.compileKnownRequest("帮我看看这个页面"))
+    }
+
+    func testTypedRuntimeAcceptedLaunchObservesOnceInsteadOfRelaunchSpinning() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        let bundleID = try XCTUnwrap(contract.targetBundleID)
+
+        let accepted = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "launch accepted; foreground pending",
+            payload: [
+                "bundleId": bundleID,
+                "foregroundVerified": "false",
+                "effectVerification": "screenshot_required"
+            ]
+        )
+        runtime.applyToolEvidence(
+            toolName: "apps.launch",
+            arguments: ["bundleId": bundleID],
+            result: accepted,
+            observation: nil,
+            contract: contract
+        )
+
+        XCTAssertNil(runtime.currentBundleID, "accepted launch must not be promoted to foreground authority")
+        XCTAssertEqual(runtime.pendingForegroundVerificationBundleID, bundleID)
+        XCTAssertEqual(
+            TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil)?.toolName,
+            "gui.screenshot"
+        )
+
+        let screenshot = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "fresh screenshot",
+            payload: ["sha256": "foreground-check"]
+        )
+        runtime.applyToolEvidence(
+            toolName: "gui.screenshot",
+            arguments: [:],
+            result: screenshot,
+            observation: nil,
+            contract: contract
+        )
+
+        XCTAssertTrue(runtime.pendingForegroundVerificationObservationAttempted == true)
+        XCTAssertNil(
+            TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil),
+            "after one fresh observation the local runtime must yield instead of relaunching/screenshot spinning"
+        )
+    }
+
+    func testAcceptedLaunchMayOnlyPromoteForegroundFromExactSuccessfulAXEvidence() throws {
+        let pending = "com.tencent.xin"
+        let verifiedAX = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "GUI tree read",
+            payload: [
+                "perceptionAXAttempted": "true",
+                "perceptionAXSucceeded": "true",
+                "axForegroundBundleID": pending,
+                "axSemanticNodeCount": "20",
+                "axActionableNodeCount": "7"
+            ]
+        )
+        XCTAssertEqual(
+            AgentCore.verifiedPendingForegroundBundleFromAX(result: verifiedAX, pendingBundleID: pending),
+            pending
+        )
+
+        var mismatchedPayload = verifiedAX.payload
+        mismatchedPayload["axForegroundBundleID"] = "com.example.other"
+        XCTAssertNil(AgentCore.verifiedPendingForegroundBundleFromAX(
+            result: ToolResult(toolCallID: UUID(), success: true, summary: "other app", payload: mismatchedPayload),
+            pendingBundleID: pending
+        ))
+
+        let screenshotOCR = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "screenshot OCR",
+            payload: [
+                "sha256": "frame",
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "recognized"
+            ]
+        )
+        XCTAssertNil(
+            AgentCore.verifiedPendingForegroundBundleFromAX(result: screenshotOCR, pendingBundleID: pending),
+            "screenshot/OCR evidence alone must never upgrade an accepted launch to foreground authority"
+        )
+
+        var emptyAXPayload = verifiedAX.payload
+        emptyAXPayload["axActionableNodeCount"] = "0"
+        XCTAssertNil(AgentCore.verifiedPendingForegroundBundleFromAX(
+            result: ToolResult(toolCallID: UUID(), success: true, summary: "empty AX", payload: emptyAXPayload),
+            pendingBundleID: pending
+        ))
+    }
+
+    func testObservationFrameUsesObservedAXBundleWhenNoTrustedForegroundIsInjected() throws {
+        let result = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "GUI tree read",
+            payload: [
+                "perceptionAXAttempted": "true",
+                "perceptionAXSucceeded": "true",
+                "axForegroundBundleID": "com.tencent.xin",
+                "axSemanticNodeCount": "20",
+                "axActionableNodeCount": "7"
+            ]
+        )
+        let frame = PerceptionBrokerFacade.frame(from: result, foregroundBundleID: nil)
+        XCTAssertEqual(frame.foregroundBundleID, "com.tencent.xin")
+    }
+
+    func testTypedRuntimeFailedForegroundScreenshotStillConsumesBoundedAttempt() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        let bundleID = try XCTUnwrap(contract.targetBundleID)
+        runtime.pendingForegroundVerificationBundleID = bundleID
+        runtime.pendingForegroundVerificationObservationAttempted = false
+
+        let failedScreenshot = ToolResult(
+            toolCallID: UUID(),
+            success: false,
+            summary: "screenshot failed",
+            payload: ["error": "capture unavailable"]
+        )
+        runtime.applyToolEvidence(
+            toolName: "gui.screenshot",
+            arguments: [:],
+            result: failedScreenshot,
+            observation: nil,
+            contract: contract
+        )
+
+        XCTAssertTrue(runtime.pendingForegroundVerificationObservationAttempted == true)
+        XCTAssertNil(
+            TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil),
+            "a failed bounded screenshot must not trigger another deterministic screenshot/relaunch loop"
+        )
+    }
+
+    func testTypedRuntimeVerifiedLaunchClearsPendingForegroundVerification() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        let bundleID = try XCTUnwrap(contract.targetBundleID)
+        runtime.pendingForegroundVerificationBundleID = bundleID
+        runtime.pendingForegroundVerificationObservationAttempted = true
+
+        let verified = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "foreground verified",
+            payload: ["foregroundVerified": "true"]
+        )
+        runtime.applyToolEvidence(
+            toolName: "apps.launch",
+            arguments: ["bundleId": bundleID],
+            result: verified,
+            observation: nil,
+            contract: contract
+        )
+
+        XCTAssertEqual(runtime.currentBundleID, bundleID)
+        XCTAssertNil(runtime.pendingForegroundVerificationBundleID)
+        XCTAssertFalse(runtime.pendingForegroundVerificationObservationAttempted == true)
+    }
+
+    func testTypedRuntimeTerminateClearsPendingForegroundVerification() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        let bundleID = try XCTUnwrap(contract.targetBundleID)
+        runtime.pendingForegroundVerificationBundleID = bundleID
+        runtime.pendingForegroundVerificationObservationAttempted = true
+
+        let terminated = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "terminated",
+            payload: [:]
+        )
+        runtime.applyToolEvidence(
+            toolName: "apps.terminate",
+            arguments: ["bundleId": bundleID],
+            result: terminated,
+            observation: nil,
+            contract: contract
+        )
+
+        XCTAssertNil(runtime.currentBundleID)
+        XCTAssertNil(runtime.pendingForegroundVerificationBundleID)
+        XCTAssertFalse(runtime.pendingForegroundVerificationObservationAttempted == true)
+        XCTAssertEqual(
+            TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil)?.toolName,
+            "apps.launch",
+            "after an explicit terminate, the runtime must allow a fresh launch instead of treating stale pending verification as active"
+        )
+    }
+
+    func testTypedFiniteFeedFinalRemainderNeverRoundsOneUpToAnotherBatch() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开抖音，刷严格 5 条视频然后点赞"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.finiteFeedCompleted = 4
+        let operation = try XCTUnwrap(TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil))
+        XCTAssertEqual(operation.toolName, "gui.scrollObserve")
+        XCTAssertEqual(operation.arguments["dy"], "600")
+        XCTAssertNil(operation.arguments["count"])
+        XCTAssertTrue(runtime.canDispatchFiniteFeed(units: 1, contract: contract))
+        XCTAssertFalse(runtime.canDispatchFiniteFeed(units: 2, contract: contract))
+    }
+
+    func testTypedMessagingDestinationLocalDispatchRequiresExactVisibleObservation() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.reconcileObligationProgress(contract: contract)
+
+        XCTAssertNil(
+            TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil),
+            "without grounded destination evidence the typed runtime must yield to the Provider for search/navigation"
+        )
+
+        let unrelatedElement = LocalPerceptionTextElement(text: "通讯录", confidence: 0.97, x: 30, y: 100, width: 100, height: 24)
+        let unrelatedEncoded = try XCTUnwrap(String(data: JSONEncoder().encode([unrelatedElement]), encoding: .utf8))
+        let unrelatedResult = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "wechat home observation",
+            payload: [
+                "sha256": "wechat-home",
+                "localVisionOCR": "recognized",
+                "localVisionElements": unrelatedEncoded,
+                "localVisionElementCount": "1"
+            ]
+        )
+        let unrelatedFrame = PerceptionBrokerFacade.frame(from: unrelatedResult, foregroundBundleID: contract.targetBundleID)
+        XCTAssertNil(
+            TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: unrelatedFrame),
+            "an unrelated visible label must not trigger a deterministic tap for a destination that is not on screen"
+        )
+
+        let destination = try XCTUnwrap(contract.message?.destinationEntity)
+        let destinationElement = LocalPerceptionTextElement(text: destination, confidence: 0.97, x: 30, y: 150, width: 180, height: 24)
+        let destinationEncoded = try XCTUnwrap(String(data: JSONEncoder().encode([destinationElement]), encoding: .utf8))
+        let destinationResult = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "destination visible",
+            payload: [
+                "sha256": "destination-visible",
+                "localVisionOCR": "recognized",
+                "localVisionElements": destinationEncoded,
+                "localVisionElementCount": "1"
+            ]
+        )
+        let destinationFrame = PerceptionBrokerFacade.frame(from: destinationResult, foregroundBundleID: contract.targetBundleID)
+        let operation = try XCTUnwrap(TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: destinationFrame))
+        XCTAssertEqual(operation.toolName, "gui.tapTextObserve")
+        XCTAssertEqual(operation.arguments["query"], destination)
+        XCTAssertEqual(operation.arguments["match"], "exact")
+        XCTAssertEqual(operation.reason, "typed_message_destination_visible_exact")
+    }
+
+    func testTypedMessagingDestinationNeedsChangedPostActionSemanticEvidence() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        let destination = try XCTUnwrap(contract.message?.destinationEntity)
+        let element = LocalPerceptionTextElement(text: destination, confidence: 0.95, x: 90, y: 50, width: 180, height: 24)
+        let encoded = try XCTUnwrap(String(data: JSONEncoder().encode([element]), encoding: .utf8))
+
+        let unchanged = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "tap returned same frame",
+            payload: [
+                "baselineSHA256": "same",
+                "sha256": "same",
+                "localVisionOCR": "recognized",
+                "localVisionElements": encoded,
+                "localVisionElementCount": "1"
+            ]
+        )
+        let unchangedFrame = PerceptionBrokerFacade.frame(from: unchanged, foregroundBundleID: contract.targetBundleID)
+        runtime.applyToolEvidence(
+            toolName: "gui.tapTextObserve",
+            arguments: ["query": destination],
+            result: unchanged,
+            observation: unchangedFrame,
+            contract: contract
+        )
+        XCTAssertTrue(runtime.pendingObligations.contains("destination"))
+
+        let changed = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "conversation opened",
+            payload: [
+                "baselineSHA256": "before",
+                "sha256": "after",
+                "localVisionOCR": "recognized",
+                "localVisionElements": encoded,
+                "localVisionElementCount": "1"
+            ]
+        )
+        let changedFrame = PerceptionBrokerFacade.frame(from: changed, foregroundBundleID: contract.targetBundleID)
+        runtime.applyToolEvidence(
+            toolName: "gui.tapTextObserve",
+            arguments: ["query": destination],
+            result: changed,
+            observation: changedFrame,
+            contract: contract
+        )
+        XCTAssertTrue(runtime.completedObligations.contains("destination"))
+        XCTAssertEqual(runtime.semanticSurface, "chat.conversation")
+    }
+
+    func testTypedMessagingUncertainSendStaysPendingAndOnlyReconcilesOnceLocally() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.markObligationCompleted("destination")
+        runtime.composerFocusVerified = true
+        runtime.textInputActionsCompleted = 1
+        runtime.messageCommitState = .uncertain
+        runtime.reconcileObligationProgress(contract: contract)
+
+        XCTAssertTrue(runtime.pendingObligations.contains("send"))
+        XCTAssertFalse(runtime.completedObligations.contains("send"))
+        XCTAssertFalse(runtime.canDispatchMessageCommit(contract: contract))
+        XCTAssertEqual(
+            TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil)?.toolName,
+            "gui.screenshot"
+        )
+
+        runtime.reconcileObservationCount = 1
+        XCTAssertNil(TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil))
+    }
+
+    func testTypedMessagingRequiresExactPostSendSemanticBodyBeforeVerified() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信，找到文件传输助手，发送 1"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.textInputActionsCompleted = 1
+        runtime.messageCommitState = .uncertain
+        let bodyElement = LocalPerceptionTextElement(text: "1", confidence: 0.92, x: 220, y: 510, width: 18, height: 22)
+        let encoded = try XCTUnwrap(String(data: JSONEncoder().encode([bodyElement]), encoding: .utf8))
+        let result = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "post-send screenshot",
+            payload: [
+                "sha256": "post-send-frame",
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "recognized",
+                "localVisionElements": encoded,
+                "localVisionElementCount": "1"
+            ]
+        )
+        let frame = PerceptionBrokerFacade.frame(from: result, foregroundBundleID: contract.targetBundleID)
+        runtime.applyToolEvidence(
+            toolName: "gui.screenshot",
+            arguments: [:],
+            result: result,
+            observation: frame,
+            contract: contract
+        )
+
+        XCTAssertEqual(runtime.messageCommitState, .verified)
+        XCTAssertTrue(runtime.postconditionVerified)
+        XCTAssertTrue(runtime.completedObligations.contains("send"))
+        XCTAssertTrue(runtime.completedObligations.contains("verify"))
+    }
+
+    func testTypedLikeAttemptDoesNotCompleteLikeUntilSemanticPostcondition() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开抖音，刷严格 5 条视频然后点赞"))
+        var runtime = TaskRuntimeState(contract: contract)
+        runtime.currentBundleID = contract.targetBundleID
+        runtime.finiteFeedCompleted = 5
+        runtime.likeActionsCompleted = 1
+        runtime.reconcileObligationProgress(contract: contract)
+
+        XCTAssertFalse(runtime.completedObligations.contains("like"))
+        XCTAssertEqual(
+            TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil)?.toolName,
+            "gui.screenshot"
+        )
+
+        runtime.reconcileObservationCount = 1
+        XCTAssertNil(TaskTransitionPolicy.nextOperation(contract: contract, runtime: runtime, observation: nil))
+    }
+
+    func testTypedLikeExactlyOnceGuardBlocksProviderOrLocalSecondLike() throws {
+        let contract = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开抖音，刷严格 5 条视频然后点赞"))
+        XCTAssertFalse(AgentCore.shouldBlockTypedLikeRepeat(
+            contract: contract,
+            successfulLikeActionCount: 0,
+            toolName: "gui.tapTextObserve",
+            arguments: ["query": "点赞"]
+        ))
+        XCTAssertTrue(AgentCore.shouldBlockTypedLikeRepeat(
+            contract: contract,
+            successfulLikeActionCount: 1,
+            toolName: "gui.tapTextObserve",
+            arguments: ["query": "点赞"]
+        ))
+        XCTAssertTrue(AgentCore.shouldBlockTypedLikeRepeat(
+            contract: contract,
+            successfulLikeActionCount: 1,
+            toolName: "gui.tapObserve",
+            arguments: ["semanticTarget": "like"]
+        ))
+        XCTAssertFalse(AgentCore.shouldBlockTypedLikeRepeat(
+            contract: contract,
+            successfulLikeActionCount: 1,
+            toolName: "gui.tapTextObserve",
+            arguments: ["query": "评论"]
+        ))
+    }
+
+    func testObservationFrameNormalizesExistingOCRAndScreenshotEvidenceWithoutNewPerceptionWork() throws {
+        let elements = [
+            LocalPerceptionTextElement(text: "文件传输助手", confidence: 0.96, x: 18, y: 120, width: 160, height: 28)
+        ]
+        let encoded = try XCTUnwrap(String(data: JSONEncoder().encode(elements), encoding: .utf8))
+        let result = ToolResult(
+            toolCallID: UUID(),
+            success: true,
+            summary: "local observation",
+            payload: [
+                "sha256": "frame-1",
+                "perceptionAXAttempted": "true",
+                "perceptionAXSucceeded": "false",
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "recognized",
+                "localVisionElements": encoded,
+                "localVisionElementCount": "1",
+                "localVisionRegion": "0,80,390,500",
+                "localVisionRecognitionLevel": "fast",
+                "localVisionLatencyMS": "210",
+                "localVisionCacheHit": "true",
+                "perceptionLocalSufficient": "true",
+                "perceptionFallbackReason": "ax_transport_returned_semantically_empty_tree"
+            ]
+        )
+        let frame = PerceptionBrokerFacade.frame(from: result, foregroundBundleID: "com.tencent.xin")
+        XCTAssertEqual(frame.foregroundBundleID, "com.tencent.xin")
+        XCTAssertEqual(frame.screenRevision, "frame-1")
+        XCTAssertEqual(frame.ocr.status, .recognized)
+        XCTAssertEqual(frame.ocr.elementCount, 1)
+        XCTAssertEqual(frame.semanticElements.first?.text, "文件传输助手")
+        XCTAssertEqual(frame.ax.failureClass, .semanticEmpty)
+        XCTAssertTrue(frame.canReuseOCR(screenRevision: "frame-1", region: "0,80,390,500", recognitionLevel: "fast"))
+        XCTAssertFalse(frame.canReuseOCR(screenRevision: "frame-2", region: "0,80,390,500", recognitionLevel: "fast"))
+        XCTAssertFalse(frame.canReuseOCR(screenRevision: "frame-1", region: "0,80,390,500", recognitionLevel: "accurate"))
+        XCTAssertFalse(frame.canReuseOCR(screenRevision: "frame-1", region: "0,0,390,844", recognitionLevel: "fast"))
+    }
+
+    func testSemanticSurfaceSnapshotPreservesOCRAXAndAmbiguityEvidence() throws {
+        let elements = [LocalPerceptionTextElement(text: "发送", confidence: 0.91, x: 310, y: 710, width: 46, height: 28)]
+        let encoded = try XCTUnwrap(String(data: JSONEncoder().encode(elements), encoding: .utf8))
+
+        let ocrOnly = ToolResult(
+            toolCallID: UUID(), success: true, summary: "ocr only",
+            payload: [
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "recognized",
+                "localVisionElements": encoded,
+                "localVisionElementCount": "1",
+                "perceptionLocalSufficient": "true"
+            ]
+        )
+        let ocrFrame = PerceptionBrokerFacade.frame(
+            from: ocrOnly,
+            foregroundBundleID: "com.tencent.xin",
+            genericSurface: .chat,
+            semanticSurface: "chat.conversation"
+        )
+        XCTAssertEqual(ocrFrame.surfaceSnapshot?.identity, "chat.conversation")
+        XCTAssertEqual(ocrFrame.surfaceSnapshot?.evidenceSources, [.localOCR])
+        XCTAssertTrue(ocrFrame.surfaceSnapshot?.landmarks.contains("发送") == true)
+
+        let axOnly = ToolResult(
+            toolCallID: UUID(), success: true, summary: "ax only",
+            payload: [
+                "perceptionAXAttempted": "true",
+                "perceptionAXSucceeded": "true",
+                "axSemanticNodeCount": "4",
+                "perceptionLocalSufficient": "true"
+            ]
+        )
+        let axFrame = PerceptionBrokerFacade.frame(from: axOnly, foregroundBundleID: "com.tencent.xin", genericSurface: .chat)
+        XCTAssertEqual(axFrame.surfaceSnapshot?.evidenceSources, [.accessibility])
+
+        let combined = ToolResult(
+            toolCallID: UUID(), success: true, summary: "combined",
+            payload: [
+                "perceptionAXAttempted": "true",
+                "perceptionAXSucceeded": "true",
+                "perceptionOCRInvoked": "true",
+                "perceptionOCRSucceeded": "true",
+                "localVisionOCR": "recognized",
+                "localVisionElements": encoded,
+                "perceptionLocalSufficient": "true",
+                "perceptionFallbackReason": "multiple_match_ambiguous"
+            ]
+        )
+        let combinedFrame = PerceptionBrokerFacade.frame(from: combined, foregroundBundleID: "com.tencent.xin", genericSurface: .chat)
+        XCTAssertEqual(Set(combinedFrame.surfaceSnapshot?.evidenceSources ?? []), Set([.accessibility, .localOCR]))
+        XCTAssertTrue(combinedFrame.surfaceSnapshot?.ambiguous == true)
+        XCTAssertLessThanOrEqual(combinedFrame.surfaceSnapshot?.confidence ?? 1, 0.45)
+    }
+
+    func testSemanticSurfaceSnapshotTracksComposerKeyboardStatesAndFreshness() {
+        let focused = ToolResult(
+            toolCallID: UUID(), success: true, summary: "composer focused",
+            payload: ["composerFocusVerified": "true", "keyboardLikely": "true", "sha256": "focused"]
+        )
+        let focusedFrame = PerceptionBrokerFacade.frame(
+            from: focused,
+            foregroundBundleID: "com.tencent.xin",
+            genericSurface: .composer,
+            semanticSurface: "chat.composer"
+        )
+        XCTAssertEqual(focusedFrame.surfaceSnapshot?.composerState, .focused)
+        XCTAssertEqual(focusedFrame.surfaceSnapshot?.keyboardState, .present)
+
+        let keyboardAbsent = ToolResult(
+            toolCallID: UUID(), success: true, summary: "composer visible",
+            payload: ["keyboardLikely": "false", "sha256": "visible"]
+        )
+        let visibleFrame = PerceptionBrokerFacade.frame(from: keyboardAbsent, foregroundBundleID: "com.tencent.xin", genericSurface: .composer)
+        XCTAssertEqual(visibleFrame.surfaceSnapshot?.composerState, .visible)
+        XCTAssertEqual(visibleFrame.surfaceSnapshot?.keyboardState, .absent)
+
+        let unknownKeyboard = ToolResult(toolCallID: UUID(), success: true, summary: "unknown", payload: [:])
+        let staleFrame = PerceptionBrokerFacade.frame(
+            from: unknownKeyboard,
+            foregroundBundleID: "com.tencent.xin",
+            capturedAt: Date(timeIntervalSinceNow: -10)
+        )
+        XCTAssertEqual(staleFrame.surfaceSnapshot?.keyboardState, .unknown)
+        XCTAssertFalse(staleFrame.isFresh)
+    }
+
+    func testObservationFrameClassifiesAXUnknownClientSeparatelyFromTimeoutAndSemanticEmpty() {
+        XCTAssertEqual(
+            PerceptionBrokerFacade.classifyAXFailure(attempted: true, succeeded: false, text: "AXRuntime: Unknown client: CloudCodeRootHelper"),
+            .unknownClient
+        )
+        XCTAssertEqual(
+            PerceptionBrokerFacade.classifyAXFailure(attempted: true, succeeded: false, text: "helper timed out"),
+            .transportTimeout
+        )
+        XCTAssertEqual(
+            PerceptionBrokerFacade.classifyAXFailure(attempted: true, succeeded: false, text: "no semantic/actionable foreground UI nodes", semanticNodeCount: 0),
+            .semanticEmpty
+        )
+        XCTAssertEqual(
+            PerceptionBrokerFacade.classifyAXFailure(attempted: true, succeeded: false, text: "host AX transport responded but semantic/actionable tree insufficient; nodes=1 semantic=0 actionable=0"),
+            .semanticEmpty
+        )
+        XCTAssertEqual(
+            PerceptionBrokerFacade.classifyAXFailure(
+                attempted: true,
+                succeeded: false,
+                text: "gui-tree-ax-runtime: stage=empty-semantic-tree; helper-exit {\"parentTimeout\":false,\"timeoutSeconds\":2}",
+                semanticNodeCount: 0
+            ),
+            .semanticEmpty,
+            "a configured timeout field must not turn a prompt semantic-empty AX response into transport_timeout"
+        )
     }
 
     func testHarnessExecutionHintRecognizesExplicitBoundedRepeatedSwipe() {
@@ -5422,19 +7081,22 @@ final class CloudCodeCoreTests: XCTestCase {
         let hint = providerMessages.first(where: { $0.providerMetadata["context_layer"] == "harness_execution" })
         XCTAssertEqual(hint?.providerMetadata["execution_mode"], "bounded_feed_sample")
         XCTAssertEqual(hint?.providerMetadata["repeat_count"], "5")
-        XCTAssertEqual(HarnessContextManager.providerPolicy(for: current).maxMessages, 40)
+        XCTAssertEqual(HarnessContextManager.providerPolicy(for: current).maxMessages, 24)
     }
 
     func testHarnessScopesProviderToolsToCurrentTaskDomain() {
         let available: Set<String> = [
-            "apps.launch", "apps.list", "gui.screenshot", "gui.feedSample", "interaction.confirmTransition", "capability.probe",
-            "files.read", "sqlite.query", "ipa.inspect", "advanced.shell"
+            "apps.launch", "apps.list", "apps.uninstall", "gui.screenshot", "gui.feedSample", "gui.tap", "gui.tapObserve",
+            "interaction.confirmTransition", "capability.probe", "files.read", "sqlite.query", "ipa.inspect", "advanced.shell"
         ]
         let gui = HarnessContextManager.scopedProviderToolNames(for: "打开抖音刷五个视频看点赞量", availableNames: available)
         XCTAssertTrue(gui.contains("apps.launch"))
         XCTAssertTrue(gui.contains("gui.feedSample"))
         XCTAssertTrue(gui.contains("interaction.confirmTransition"))
         XCTAssertTrue(gui.contains("capability.probe"))
+        XCTAssertTrue(gui.contains("gui.tapObserve"))
+        XCTAssertFalse(gui.contains("gui.tap"))
+        XCTAssertFalse(gui.contains("apps.uninstall"))
         XCTAssertFalse(gui.contains("files.read"))
         XCTAssertFalse(gui.contains("sqlite.query"))
         XCTAssertFalse(gui.contains("ipa.inspect"))
@@ -5446,8 +7108,41 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertFalse(sendCorrection.contains("sqlite.query"))
         XCTAssertFalse(sendCorrection.contains("advanced.shell"))
 
+        let native = HarnessContextManager.scopedProviderToolNames(for: "修改这个 App 容器里的 plist 配置文件", availableNames: available)
+        XCTAssertTrue(native.contains("apps.launch"))
+        XCTAssertTrue(native.contains("files.read"))
+        XCTAssertTrue(native.contains("sqlite.query"))
+        XCTAssertFalse(native.contains("gui.feedSample"))
+        XCTAssertFalse(native.contains("advanced.shell"))
+
+        let ipa = HarnessContextManager.scopedProviderToolNames(for: "检查并修改这个 IPA 然后重新安装", availableNames: available)
+        XCTAssertTrue(ipa.contains("ipa.inspect"))
+        XCTAssertTrue(ipa.contains("files.read"))
+        XCTAssertTrue(ipa.contains("apps.launch"))
+        XCTAssertFalse(ipa.contains("gui.feedSample"))
+
+        let rawFallbackAvailable: Set<String> = ["gui.tree", "gui.screenshot", "gui.swipe", "gui.tap"]
+        let rawFallback = HarnessContextManager.scopedProviderToolNames(for: "打开抖音向上滑动一次", availableNames: rawFallbackAvailable)
+        XCTAssertTrue(rawFallback.contains("gui.swipe"), "raw swipe must remain available when no observation-producing swipe variant exists")
+        XCTAssertTrue(rawFallback.contains("gui.tap"), "raw tap must remain available when no observation-producing tap variant exists")
+
         let unknown = HarnessContextManager.scopedProviderToolNames(for: "帮我处理一下", availableNames: available)
         XCTAssertEqual(unknown, available)
+    }
+
+    func testHarnessProvidesNativeDeviceAndIPAPipelineHints() {
+        let native = HarnessContextManager.executionHint(from: [
+            ChatMessage(role: .user, content: "修改这个应用容器里的配置文件")
+        ])
+        XCTAssertEqual(native?.providerMetadata["execution_mode"], "device_native_first")
+        XCTAssertTrue(native?.content.contains("apps/container/files/data/plist/json/sqlite") == true)
+
+        let ipa = HarnessContextManager.executionHint(from: [
+            ChatMessage(role: .user, content: "把这个 IPA 解包修改后重新打包安装")
+        ])
+        XCTAssertEqual(ipa?.providerMetadata["execution_mode"], "ipa_native_pipeline")
+        XCTAssertTrue(ipa?.content.contains("ipa.inspect") == true)
+        XCTAssertTrue(ipa?.content.contains("ipa.install") == true)
     }
 
     func testHarnessPrunesOlderObservationImagesButKeepsNewestMultiImageObservation() {
@@ -5476,6 +7171,28 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(hint?.providerMetadata["repeat_count"], "5")
     }
 
+    func testHarnessFiniteRepeatHintUsesRemainingProgressInsteadOfRestartingFullBatch() {
+        let messages = [ChatMessage(role: .user, content: "打开抖音刷 5 条然后点赞")]
+        let partial = HarnessContextManager.executionHint(from: messages, finiteRepeatCompletedCount: 3)
+        XCTAssertEqual(partial?.providerMetadata["execution_mode"], "bounded_feed_sample")
+        XCTAssertEqual(partial?.providerMetadata["repeat_required"], "5")
+        XCTAssertEqual(partial?.providerMetadata["repeat_completed"], "3")
+        XCTAssertEqual(partial?.providerMetadata["repeat_remaining"], "2")
+        XCTAssertEqual(partial?.providerMetadata["repeat_count"], "2")
+        XCTAssertTrue(partial?.content.contains("count=2") == true)
+        XCTAssertFalse(partial?.content.contains("count=5") == true)
+
+        let finalSingle = HarnessContextManager.executionHint(from: messages, finiteRepeatCompletedCount: 4)
+        XCTAssertEqual(finalSingle?.providerMetadata["repeat_remaining"], "1")
+        XCTAssertTrue(finalSingle?.content.contains("gui.scrollObserve") == true)
+        XCTAssertFalse(finalSingle?.content.contains("gui.feedSample with direction=forward and count=1") == true)
+
+        let complete = HarnessContextManager.executionHint(from: messages, finiteRepeatCompletedCount: 5)
+        XCTAssertEqual(complete?.providerMetadata["execution_mode"], "finite_repeat_complete")
+        XCTAssertEqual(complete?.providerMetadata["repeat_remaining"], "0")
+        XCTAssertTrue(complete?.content.contains("Do not request gui.feedSample") == true)
+    }
+
     func testHarnessExecutionHintDoesNotInventUnboundedSwipeCount() {
         XCTAssertNil(HarnessContextManager.boundedRepeatedSwipeCount(in: "打开抖音一直刷视频，直到我叫停"))
         XCTAssertNil(HarnessContextManager.boundedRepeatedSwipeCount(in: "打开热门页面看看"))
@@ -5490,6 +7207,9 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(HarnessContextManager.requiresMessageSend(in: "发微信告诉他我到了"))
         XCTAssertTrue(HarnessContextManager.requiresMessageSend(in: "打开微信给文件传输助手发一个一"))
         XCTAssertTrue(HarnessContextManager.requiresExplicitTapAction(in: "刷三条抖音然后点赞"))
+        XCTAssertTrue(HarnessContextManager.requiresLikeAction(in: "刷三条抖音然后点赞"))
+        XCTAssertTrue(HarnessContextManager.requiresLikeAction(in: "like this video"))
+        XCTAssertFalse(HarnessContextManager.requiresLikeAction(in: "比较五条视频的点赞量"))
         XCTAssertFalse(HarnessContextManager.requiresExplicitTapAction(in: "打开微信看看"))
         XCTAssertFalse(HarnessContextManager.requiresMessageSend(in: "打开微信看看"))
     }
@@ -5512,6 +7232,57 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(hint?.content.contains("coordinate-free") == true)
         XCTAssertEqual(hint?.providerMetadata["execution_mode"], "bounded_feed_sample")
         XCTAssertEqual(hint?.providerMetadata["repeat_count"], "5")
+    }
+
+    func testAgentFiniteRepeatGuardBlocksAnotherFullFeedBatchAfterFiveAreComplete() {
+        XCTAssertTrue(AgentCore.shouldBlockFiniteRepeatedGUIAction(
+            requiredCount: 5,
+            completedCount: 5,
+            toolName: "gui.feedSample",
+            arguments: ["count": "5", "direction": "forward"]
+        ))
+        XCTAssertTrue(AgentCore.shouldBlockFiniteRepeatedGUIAction(
+            requiredCount: 5,
+            completedCount: 5,
+            toolName: "gui.swipeObserve",
+            arguments: [:]
+        ))
+    }
+
+    func testAgentFiniteRepeatGuardRejectsOverBudgetBatchButAllowsExactRemainingUnits() {
+        XCTAssertTrue(AgentCore.shouldBlockFiniteRepeatedGUIAction(
+            requiredCount: 5,
+            completedCount: 3,
+            toolName: "gui.swipeSequence",
+            arguments: ["count": "5"]
+        ))
+        XCTAssertFalse(AgentCore.shouldBlockFiniteRepeatedGUIAction(
+            requiredCount: 5,
+            completedCount: 3,
+            toolName: "gui.swipeSequence",
+            arguments: ["count": "2"]
+        ))
+        XCTAssertEqual(AgentCore.finiteRepeatedGUIActionUnits(toolName: "gui.feedSample", arguments: ["count": "5"]), 5)
+        XCTAssertNil(AgentCore.finiteRepeatedGUIActionUnits(toolName: "gui.tapObserve", arguments: ["x": "350", "y": "400"]))
+    }
+
+    func testAgentLikeAccountingRejectsNavigationTapAndAcceptsExplicitSemanticTarget() {
+        XCTAssertFalse(AgentCore.isSemanticLikeAction(
+            name: "gui.tapObserve",
+            arguments: ["x": "350", "y": "150"]
+        ))
+        XCTAssertFalse(AgentCore.isSemanticLikeAction(
+            name: "gui.tapTextObserve",
+            arguments: ["query": "搜索"]
+        ))
+        XCTAssertTrue(AgentCore.isSemanticLikeAction(
+            name: "gui.tapObserve",
+            arguments: ["x": "350", "y": "420", "semanticTarget": "like"]
+        ))
+        XCTAssertTrue(AgentCore.isSemanticLikeAction(
+            name: "gui.tapElementObserve",
+            arguments: ["query": "点赞"]
+        ))
     }
 
     func testHarnessExecutionHintTracksTransientVideoReturnBeforeTyping() {
@@ -5561,6 +7332,23 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(snapshot.count, 2)
         XCTAssertEqual(snapshot.first(where: { $0.backend == .screenshot })?.successes, 4)
         XCTAssertEqual(snapshot.first(where: { $0.backend == .accessibilityTree })?.failures, 3)
+    }
+
+    func testIOSInteractionExperienceLearnsLocalOCRAsIndependentObservationBackend() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = IOSInteractionExperienceStore(fileURL: root.appendingPathComponent("experience.json"))
+        let bundleID = "com.example.search"
+
+        for latency in [120, 130, 125] {
+            await store.recordObservation(bundleID: bundleID, backend: .localOCR, success: true, latencyMS: latency)
+        }
+        await store.recordObservation(bundleID: bundleID, backend: .accessibilityTree, success: false, latencyMS: 3_200)
+
+        let hint = await store.providerHint(bundleID: bundleID)
+        XCTAssertTrue(hint?.contains("prefer localOCR") == true)
+        let avoidAX = await store.shouldTemporarilyAvoidObservation(bundleID: bundleID, backend: .accessibilityTree)
+        XCTAssertTrue(avoidAX, "a proven local OCR route may serve as the working alternate to a failing AX backend")
     }
 
     func testIOSInteractionExperienceTemporarilySuppressesRepeatedSlowAXWhenScreenshotWorks() async throws {
@@ -5687,6 +7475,40 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertNil(hint)
     }
 
+    func testConfirmedInteractionTransitionUpdatesExistingAppKnowledgePageGraph() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let knowledge = AppKnowledgeRegistry(fileURL: root.appendingPathComponent("app-knowledge.json"))
+        try await knowledge.upsert(AppKnowledge(appName: "Chat", bundleID: "com.example.chat", appVersion: "1.0"))
+        let experience = IOSInteractionExperienceStore(fileURL: root.appendingPathComponent("experience.json"))
+        let executor = IOSInteractionLearningExecutor(
+            experienceStore: experience,
+            appKnowledgeRegistry: knowledge
+        )
+        let descriptor = ToolDescriptor(name: "interaction.confirmTransition", summary: "test", risk: .readOnly)
+        let result = try await executor.execute(
+            ToolCall(name: descriptor.name, arguments: [
+                "bundleId": "com.example.chat",
+                "appVersion": "1.0",
+                "fromSurface": "chat",
+                "toSurface": "composer",
+                "strategy": "visibleControl",
+                "success": "true",
+                "confidence": "0.90",
+                "latencyMS": "140"
+            ], sessionID: UUID()),
+            descriptor: descriptor,
+            context: ToolExecutionContext(permissionMode: .safe, capabilityProfile: CapabilityProfile(records: []))
+        )
+        XCTAssertEqual(result.payload["learning"], "recorded")
+        let stored = await knowledge.knowledge(for: "com.example.chat")
+        XCTAssertTrue(stored?.semanticTransitions?.contains(where: {
+            $0.fromSurface == "chat" && $0.toSurface == "composer" && $0.semanticAction == "visiblecontrol"
+        }) == true)
+        XCTAssertTrue(stored?.semanticSurfaces?.contains(where: { $0.semanticSurface == "chat" }) == true)
+        XCTAssertTrue(stored?.semanticSurfaces?.contains(where: { $0.semanticSurface == "composer" }) == true)
+    }
+
     func testAppKnowledgeActionMapPartitionsVersionsAndDecaysFailedRoutes() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -5727,6 +7549,216 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(hint?.contains("examplechat") == true)
     }
 
+    func testAppKnowledgeSemanticPageGraphPartitionsEnvironmentAndInvalidatesStaleEvidence() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent("app-knowledge.json")
+        let registry = AppKnowledgeRegistry(fileURL: fileURL)
+        try await registry.upsert(AppKnowledge(appName: "Chat", bundleID: "com.example.chat", appVersion: "1.0"))
+        let v1 = AppActionEnvironment(appVersion: "1.0", iOSMajorVersion: 18, deviceClass: "iphone")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+        try await registry.recordSemanticSurface(
+            bundleID: "com.example.chat",
+            semanticSurface: "chat.conversation",
+            genericSurface: .chat,
+            landmarks: ["composer", "send_control", "composer"],
+            environment: v1,
+            confidence: 0.90,
+            at: now
+        )
+        try await registry.recordSemanticTransition(
+            bundleID: "com.example.chat",
+            fromSurface: "chat.conversation",
+            toSurface: "chat.composer",
+            semanticAction: "focus_composer",
+            landmarks: ["composer"],
+            environment: v1,
+            success: true,
+            confidence: 0.92,
+            latencyMS: 120,
+            at: now
+        )
+
+        let current = await registry.semanticSurfaceCandidates(for: "com.example.chat", environment: v1, now: now.addingTimeInterval(60))
+        XCTAssertTrue(current.contains { $0.knowledge.semanticSurface == "chat.conversation" && !$0.requiresRevalidation })
+        let transition = await registry.semanticTransitionCandidates(
+            for: "com.example.chat",
+            fromSurface: "chat.conversation",
+            semanticAction: "focus_composer",
+            environment: v1,
+            now: now.addingTimeInterval(60)
+        )
+        XCTAssertEqual(transition.count, 1)
+        XCTAssertFalse(transition[0].requiresRevalidation)
+        XCTAssertEqual(transition[0].knowledge.toSurface, "chat.composer")
+        XCTAssertEqual(transition[0].knowledge.evidenceCount, 1)
+
+        let v2 = AppActionEnvironment(appVersion: "2.0", iOSMajorVersion: 18, deviceClass: "iphone")
+        let versionMismatch = await registry.semanticSurfaceCandidates(for: "com.example.chat", environment: v2, now: now.addingTimeInterval(60))
+        XCTAssertTrue(versionMismatch.allSatisfy(\.requiresRevalidation))
+
+        let stale = await registry.semanticSurfaceCandidates(
+            for: "com.example.chat",
+            environment: v1,
+            now: now.addingTimeInterval(31 * 24 * 60 * 60)
+        )
+        XCTAssertTrue(stale.allSatisfy(\.requiresRevalidation))
+        let invalidated = await registry.semanticSurfaceCandidates(
+            for: "com.example.chat",
+            environment: v1,
+            now: now.addingTimeInterval(181 * 24 * 60 * 60)
+        )
+        XCTAssertTrue(invalidated.isEmpty)
+
+        let hint = await registry.providerHint(bundleID: "com.example.chat", appVersion: "1.0", environment: v1)
+        XCTAssertTrue(hint?.contains("Fresh ObservationFrame evidence always overrides") == true)
+        let restarted = AppKnowledgeRegistry(fileURL: fileURL)
+        let persisted = await restarted.knowledge(for: "com.example.chat")
+        XCTAssertEqual(persisted?.semanticTransitions?.first?.semanticAction, "focus_composer")
+        XCTAssertTrue(persisted?.semanticSurfaces?.contains(where: { $0.semanticSurface == "chat.composer" }) == true)
+    }
+
+    func testSemanticSkillRegistryRequiresRepeatedExplicitValidationAndResetsAcrossEnvironment() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent("semantic-skills.json")
+        let registry = SemanticSkillRegistry(fileURL: fileURL)
+        let env1 = AppActionEnvironment(appVersion: "1.0", iOSMajorVersion: 18, deviceClass: "iphone")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+        var candidates = await registry.candidates(
+            semanticGoal: "focus_text_composer",
+            bundleID: "com.example.chat",
+            currentSemanticSurface: "chat.conversation",
+            environment: env1,
+            now: now
+        )
+        XCTAssertEqual(candidates.first?.skill.id, "skill.chat.focus.composer")
+        XCTAssertTrue(candidates.first?.requiresRevalidation == true)
+        XCTAssertEqual(candidates.first?.skill.evidenceCount, 0)
+
+        try await registry.recordExplicitValidation(
+            skillID: "skill.chat.focus.composer",
+            bundleID: "com.example.chat",
+            environment: env1,
+            success: true,
+            at: now
+        )
+        candidates = await registry.candidates(
+            semanticGoal: "focus_text_composer",
+            bundleID: "com.example.chat",
+            currentSemanticSurface: "chat.conversation",
+            environment: env1,
+            now: now.addingTimeInterval(1)
+        )
+        XCTAssertEqual(candidates.first?.skill.evidenceCount, 1)
+        XCTAssertTrue(candidates.first?.requiresRevalidation == true, "one success must not become a reusable permanent skill")
+
+        try await registry.recordExplicitValidation(
+            skillID: "skill.chat.focus.composer",
+            bundleID: "com.example.chat",
+            environment: env1,
+            success: true,
+            at: now.addingTimeInterval(2)
+        )
+        candidates = await registry.candidates(
+            semanticGoal: "focus_text_composer",
+            bundleID: "com.example.chat",
+            currentSemanticSurface: "chat.conversation",
+            environment: env1,
+            now: now.addingTimeInterval(3)
+        )
+        XCTAssertEqual(candidates.first?.skill.evidenceCount, 2)
+        XCTAssertFalse(candidates.first?.requiresRevalidation == true)
+
+        let env2 = AppActionEnvironment(appVersion: "2.0", iOSMajorVersion: 18, deviceClass: "iphone")
+        try await registry.recordExplicitValidation(
+            skillID: "skill.chat.focus.composer",
+            bundleID: "com.example.chat",
+            environment: env2,
+            success: true,
+            at: now.addingTimeInterval(4)
+        )
+        candidates = await registry.candidates(
+            semanticGoal: "focus_text_composer",
+            bundleID: "com.example.chat",
+            currentSemanticSurface: "chat.conversation",
+            environment: env2,
+            now: now.addingTimeInterval(5)
+        )
+        XCTAssertEqual(candidates.first?.skill.evidenceCount, 1, "new App/iOS/device environment must reset validation evidence")
+        XCTAssertTrue(candidates.first?.requiresRevalidation == true)
+
+        let restarted = SemanticSkillRegistry(fileURL: fileURL)
+        let persisted = await restarted.candidates(
+            semanticGoal: "focus_text_composer",
+            bundleID: "com.example.chat",
+            currentSemanticSurface: "chat.conversation",
+            environment: env2,
+            now: now.addingTimeInterval(6)
+        )
+        XCTAssertEqual(persisted.first?.skill.evidenceCount, 1)
+        let encodedSkill = try JSONEncoder().encode(try XCTUnwrap(persisted.first?.skill))
+        let encodedSkillText = try XCTUnwrap(String(data: encodedSkill, encoding: .utf8)).lowercased()
+        XCTAssertFalse(encodedSkillText.contains("coordinate"))
+        XCTAssertFalse(encodedSkillText.contains("tapx"))
+        XCTAssertFalse(encodedSkillText.contains("tapy"))
+
+        let expired = await restarted.candidates(
+            semanticGoal: "focus_text_composer",
+            bundleID: "com.example.chat",
+            currentSemanticSurface: "chat.conversation",
+            environment: env2,
+            now: now.addingTimeInterval(181 * 24 * 60 * 60)
+        )
+        XCTAssertEqual(expired.first?.skill.origin, .predefined, "expired learned evidence must fall back to the predefined template")
+        XCTAssertEqual(expired.first?.skill.evidenceCount, 0)
+        XCTAssertTrue(expired.first?.requiresRevalidation == true)
+    }
+
+    func testBossRecruitmentSkillIsRegisteredAsAXFirstFallbackCapablePlanningKnowledge() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = SemanticSkillRegistry(fileURL: root.appendingPathComponent("semantic-skills.json"))
+        let all = await registry.all()
+        let skill = try XCTUnwrap(all.first(where: { $0.id == BossRecruitmentSkillPackage.skillID }))
+
+        XCTAssertEqual(skill.bundleID, "com.hpbr.bosszhipin")
+        XCTAssertEqual(skill.semanticGoal, "run_boss_recruitment_batch")
+        XCTAssertTrue(skill.requiredCapabilities.contains(GUIAutomationFeature.openApp.capabilityID))
+        XCTAssertTrue(skill.requiredCapabilities.contains(GUIAutomationFeature.screenshot.capabilityID))
+        XCTAssertTrue(skill.requiredCapabilities.contains(GUIAutomationFeature.touch.capabilityID))
+        XCTAssertTrue(skill.requiredCapabilities.contains(GUIAutomationFeature.textInput.capabilityID))
+        XCTAssertTrue(skill.requiredCapabilities.contains(GUIAutomationFeature.gestures.capabilityID))
+        XCTAssertFalse(skill.requiredCapabilities.contains(GUIAutomationFeature.tree.capabilityID), "AX is preferred but must not be a hard dependency because bounded local OCR/vision are explicit fallbacks")
+        XCTAssertTrue(skill.allowedLocalRecovery.contains("ax_first_then_local_roi_ocr"))
+        XCTAssertTrue(skill.allowedLocalRecovery.contains("screenshot_vision_last_resort"))
+        XCTAssertTrue(skill.allowedLocalRecovery.contains("reconcile_before_send_retry"))
+        XCTAssertTrue(skill.verificationObligations.contains("send_postcondition_verified"))
+        let selectedHint = await registry.selectedSkillHint(skillID: BossRecruitmentSkillPackage.skillID)
+        let missingHint = await registry.selectedSkillHint(skillID: "skill.missing")
+        XCTAssertTrue(selectedHint?.contains("User-selected semantic skill: \(BossRecruitmentSkillPackage.skillID)") == true)
+        XCTAssertTrue(selectedHint?.contains("exactlyOnce=false") == true)
+        XCTAssertNil(missingHint)
+        XCTAssertEqual(BossRecruitmentSkillPackage.canonicalPolicySHA256, "c3db99043a75842974a275688862d84f9b7811a8302099403472e44d3981840b")
+    }
+
+    func testMilestonesReferenceGenericSkillsWithoutCreatingSecondProgressState() throws {
+        let message = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开微信找到文件传输助手发送 1"))
+        let messageMilestones = message.effectiveMilestones
+        XCTAssertEqual(messageMilestones.first(where: { $0.id == "composer" })?.preferredSkill, "skill.chat.focus.composer")
+        XCTAssertEqual(messageMilestones.first(where: { $0.id == "message_body" })?.preferredSkill, "skill.chat.enter.body.once")
+        XCTAssertTrue(messageMilestones.first(where: { $0.id == "message_body" })?.exactlyOnce == true)
+        XCTAssertEqual(messageMilestones.first(where: { $0.id == "send" })?.preferredSkill, "skill.chat.commit.send.once")
+
+        let feed = try XCTUnwrap(TaskContractCompiler.compileKnownRequest("打开抖音刷严格 5 条视频然后点赞"))
+        let feedMilestones = feed.effectiveMilestones
+        XCTAssertEqual(feedMilestones.first(where: { $0.id == "feed" })?.preferredSkill, "skill.feed.collect.metric")
+        XCTAssertEqual(feedMilestones.first(where: { $0.id == "like" })?.preferredSkill, "skill.feed.commit.like.once")
+        XCTAssertEqual(Set(feedMilestones.flatMap(\.completionObligationIDs)), Set(feed.obligations.map(\.id)))
+    }
+
     func testAppKnowledgeOversizedCacheFailsSafeOnReload() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -5737,17 +7769,17 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertTrue(values.isEmpty)
     }
 
-    func testHarnessMessagingScopeExposesReadOnlyNativeDiscoveryWithoutWriteTools() {
+    func testHarnessMessagingScopeUsesCompactNativeDiscoveryMacroWithoutWriteTools() {
         let available: Set<String> = [
             "apps.launch", "apps.inspect", "gui.screenshot", "gui.typeObserve", "capability.probe",
             "container.resolve", "container.search", "files.search", "files.modify", "sqlite.query", "data.localQuery", "advanced.shell"
         ]
         let scoped = HarnessContextManager.scopedProviderToolNames(for: "打开微信找到文件传输助手并发消息", availableNames: available)
         XCTAssertTrue(scoped.contains("container.resolve"))
-        XCTAssertTrue(scoped.contains("container.search"))
-        XCTAssertTrue(scoped.contains("files.search"))
-        XCTAssertTrue(scoped.contains("sqlite.query"))
         XCTAssertTrue(scoped.contains("data.localQuery"))
+        XCTAssertFalse(scoped.contains("container.search"), "generic messaging should prefer the compact data.localQuery macro")
+        XCTAssertFalse(scoped.contains("files.search"), "generic messaging should not serialize low-level file discovery schemas before GUI is tried")
+        XCTAssertFalse(scoped.contains("sqlite.query"), "generic messaging should not serialize low-level database schemas before GUI is tried")
         XCTAssertFalse(scoped.contains("files.modify"), "messaging discovery must not gain arbitrary database/file write authority")
         XCTAssertFalse(scoped.contains("advanced.shell"))
     }
@@ -5783,6 +7815,8 @@ final class CloudCodeCoreTests: XCTestCase {
             CapabilityRecord(id: "filesystem.unrestricted", domain: .filesystem, status: .unavailable, detail: "no"),
             CapabilityRecord(id: "execution.root_helper", domain: .execution, status: .deviceValidationRequired, detail: "pending"),
             CapabilityRecord(id: "execution.ios_system", domain: .execution, status: .unavailable, detail: "no"),
+            CapabilityRecord(id: "cli.runtime", domain: .execution, status: .unavailable, detail: "no"),
+            CapabilityRecord(id: "cli.command.sh", domain: .execution, status: .unavailable, detail: "no interpreter"),
             CapabilityRecord(id: "ipa.inspect", domain: .ipa, status: .available, detail: "yes")
         ]
         let snapshots = HomeOSCapabilityLayer.snapshots(from: records)
@@ -6605,6 +8639,35 @@ private struct FixedHermesMemoryProvider: HermesMemoryProviding, Sendable {
     func context(query: String, project: String?, limit: Int) async throws -> HermesContextSnapshot {
         HermesContextSnapshot(records: [], renderedText: text)
     }
+}
+
+private struct FailingHermesMemoryProvider: HermesMemoryProviding, Sendable {
+    enum Failure: Error { case unavailable }
+
+    func context(query: String, project: String?, limit: Int) async throws -> HermesContextSnapshot {
+        throw Failure.unavailable
+    }
+}
+
+private actor TrackingHermesMemoryProvider: HermesMemoryProviding {
+    struct Query: Sendable, Equatable {
+        let query: String
+        let project: String?
+    }
+
+    private let responses: [String: String]
+    private var observedQueries: [Query] = []
+
+    init(responses: [String: String]) {
+        self.responses = responses
+    }
+
+    func context(query: String, project: String?, limit: Int) async throws -> HermesContextSnapshot {
+        observedQueries.append(Query(query: query, project: project))
+        return HermesContextSnapshot(records: [], renderedText: responses[query] ?? "")
+    }
+
+    func queries() -> [Query] { observedQueries }
 }
 
 private actor MessageRecordingProvider: ProviderStreaming {

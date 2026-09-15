@@ -275,6 +275,40 @@ final class ProviderCatalogTests: XCTestCase {
         XCTAssertEqual(provider.protocolCandidates(for: "deepseek-v4-flash", keySlotID: "slot-1"), [.openAIChat, .anthropic])
     }
 
+    func testAuthoritativeLiveCatalogCanReplacePreviousModelsWithEmptyWithoutUnion() throws {
+        var provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.agentRouterID }))
+        XCTAssertFalse(provider.selectableModels(for: "slot-1").isEmpty)
+
+        provider.applyLiveModelCatalog([], keySlotID: "slot-1", authoritative: true)
+
+        XCTAssertTrue(provider.selectableModels(for: "slot-1").isEmpty)
+        XCTAssertTrue(provider.models.isEmpty)
+    }
+
+    func testLiveModelCatalogCacheSurvivesRestartAndRespectsManualKeyOverride() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudCodeLiveCatalog-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("live-model-catalogs.json")
+        var provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == ProviderCatalog.agentRouterID }))
+        let liveModels = ["claude-opus-5", "gpt-5.6-sol", "new-live-model"]
+        provider.applyLiveModelCatalog(liveModels, keySlotID: "slot-1", authoritative: true)
+        try ProviderLiveModelCatalogCache.persist(provider: provider, keySlotID: "slot-1", to: url)
+
+        let restored = ProviderLiveModelCatalogCache.applyingCachedCatalogs(to: ProviderCatalog.desktopSnapshot, from: url)
+        let restoredProvider = try XCTUnwrap(restored.first(where: { $0.id == ProviderCatalog.agentRouterID }))
+        XCTAssertEqual(restoredProvider.selectableModels(for: "slot-1"), liveModels)
+
+        let reference = ProviderCatalog.keyReference(providerID: ProviderCatalog.agentRouterID, keySlotID: "slot-1")
+        let excluded = ProviderLiveModelCatalogCache.applyingCachedCatalogs(
+            to: ProviderCatalog.desktopSnapshot,
+            from: url,
+            excludingKeyReferences: [reference]
+        )
+        let excludedProvider = try XCTUnwrap(excluded.first(where: { $0.id == ProviderCatalog.agentRouterID }))
+        XCTAssertNotEqual(excludedProvider.selectableModels(for: "slot-1"), liveModels)
+        XCTAssertFalse(excludedProvider.selectableModels(for: "slot-1").contains("new-live-model"))
+    }
+
     func testPerKeyModelScopeOverridesProviderCatalog() throws {
         let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-sharellm-cn" }))
         let key1 = provider.models(for: "slot-1")
@@ -1149,6 +1183,7 @@ final class ProviderRouterTests: XCTestCase {
 final class ProviderDiscoveryTests: XCTestCase {
     override func tearDown() {
         ProviderDiscoveryURLProtocol.reset()
+        ProviderGeminiDiscoveryURLProtocol.reset()
         super.tearDown()
     }
 
@@ -1175,6 +1210,75 @@ final class ProviderDiscoveryTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
         XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "claude-cli/1.0.120 (external, cli)")
         XCTAssertEqual(request.value(forHTTPHeaderField: "x-app"), "cli")
+    }
+
+    func testGeminiOfficialDiscoveryPrioritizesExplicitModelAndUsesRuntimeCompatibleProbeBody() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProviderGeminiDiscoveryURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let result = try await ProviderDiscoveryClient(session: session).discover(
+            baseURL: URL(string: "https://generativelanguage.googleapis.com")!,
+            apiKey: "test-secret",
+            preferredAuthMode: .bearer,
+            fallbackInferenceCandidates: ["gemini-3.8-flash"],
+            inferenceProtocols: [.openAIChat],
+            allowAlternateAuthModes: false
+        )
+
+        XCTAssertEqual(result.readiness, .ready)
+        XCTAssertEqual(result.authMode, .bearer)
+        XCTAssertEqual(result.protocols, [.openAIChat])
+        XCTAssertEqual(result.models.first, "gemini-3.8-flash")
+        XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.requestCount(), 2, "official Gemini discovery should need one catalog GET and one explicit-model inference probe")
+        let probe = try XCTUnwrap(ProviderGeminiDiscoveryURLProtocol.probeBody())
+        XCTAssertEqual(probe["model"] as? String, "gemini-3.8-flash")
+        XCTAssertEqual(probe["stream"] as? Bool, false)
+        XCTAssertNil(probe["max_tokens"], "Gemini validation must not add a field absent from the real compatible request path")
+    }
+
+    func testGeminiOfficialDiscoveryPrioritizesChatCapableCatalogModelWithoutManualModel() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProviderGeminiDiscoveryURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let result = try await ProviderDiscoveryClient(session: session).discover(
+            baseURL: URL(string: "https://generativelanguage.googleapis.com")!,
+            apiKey: "test-secret",
+            preferredAuthMode: .bearer,
+            inferenceProtocols: [.openAIChat],
+            allowAlternateAuthModes: false
+        )
+
+        XCTAssertEqual(result.readiness, .ready)
+        XCTAssertEqual(result.models.first, "gemini-3.8-flash")
+        XCTAssertEqual(result.protocols, [.openAIChat])
+        XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.requestCount(), 2, "a live chat-capable Gemini model outside the first 12 catalog rows must be ranked into the bounded probe set")
+        XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.probeBody()?["model"] as? String, "gemini-3.8-flash")
+    }
+
+    func testGeminiInferenceCandidateRankingPullsChatModelIntoBoundedProbeWindow() {
+        let specialized = (0..<12).map { "text-embedding-\($0)" }
+        let candidates = ProviderDiscoveryClient.inferenceCandidates(
+            fallbackInferenceCandidates: [],
+            catalogModels: specialized + ["gemini-3.8-flash"],
+            baseURL: URL(string: "https://generativelanguage.googleapis.com")!,
+            limit: 12
+        )
+        XCTAssertEqual(candidates.first, "gemini-3.8-flash")
+        XCTAssertEqual(candidates.count, 12)
+    }
+
+    func testInferenceCandidateRankingDoesNotReorderOrdinaryCompatibleProviderCatalog() {
+        let candidates = ProviderDiscoveryClient.inferenceCandidates(
+            fallbackInferenceCandidates: [],
+            catalogModels: (0..<14).map { "model-\($0)" },
+            baseURL: URL(string: "https://api.example.com")!,
+            limit: 12
+        )
+        XCTAssertEqual(candidates, (0..<12).map { "model-\($0)" })
     }
 
     func testAgentRouterDiscoveryCanRestrictCatalogToPreferredAuthMode() async throws {
@@ -1648,6 +1752,24 @@ final class ProviderProtocolClientTests: XCTestCase {
         )
         for try await _ in anthropic.stream(configuration: anthropicConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
         XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://example.com/v1/messages")
+
+        ProviderTestURLProtocol.install(status: 200, body: Data("data: [DONE]\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let geminiCompatibilityConfiguration = ProviderConfiguration(
+            name: "Gemini OpenAI Compatibility",
+            baseURL: URL(string: "https://generativelanguage.googleapis.com/v1beta/openai/")!,
+            model: "gemini-2.5-flash",
+            apiKeyReference: "key",
+            protocolName: ProviderProtocol.openAIChat.rawValue,
+            authModeName: ProviderAuthMode.bearer.rawValue
+        )
+        for try await _ in chat.stream(configuration: geminiCompatibilityConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.value(forHTTPHeaderField: "Authorization"), "Bearer secret")
+
+        var geminiRootConfiguration = geminiCompatibilityConfiguration
+        geminiRootConfiguration.baseURL = URL(string: "https://generativelanguage.googleapis.com")!
+        for try await _ in chat.stream(configuration: geminiRootConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
     }
 
     func testResponsesStreamingTextAndToolCall() async throws {
@@ -2408,6 +2530,12 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertTrue(ProviderHostFallbackClassifier.shouldFallback(try! XCTUnwrap(error)))
         XCTAssertFalse(ProviderKeyRotationClassifier.shouldRotate(try! XCTUnwrap(error)))
         XCTAssertFalse(ProviderEndpointHealthClassifier.shouldMarkDegraded(try! XCTUnwrap(error)))
+    }
+
+    func testAgentRouterClientRejectedCanFallbackProtocolWithoutCondemningModel() {
+        let error = ProviderError.clientRejected(400)
+        XCTAssertFalse(ProviderProtocolFallbackClassifier.shouldFallback(error))
+        XCTAssertTrue(ProviderProtocolFallbackClassifier.shouldFallback(error, providerID: ProviderCatalog.agentRouterID))
     }
 
     func testHTTP403QuotaIsCapacityNotCredentialFailure() {
@@ -3243,6 +3371,90 @@ private func collectText(_ stream: AsyncThrowingStream<ProviderEvent, Error>) as
         if case .token(let token) = event { text += token }
     }
     return text
+}
+
+private final class ProviderGeminiDiscoveryURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    private static var requestCountValue = 0
+    private static var probeBodyValue: [String: Any]?
+
+    static func reset() {
+        lock.lock()
+        requestCountValue = 0
+        probeBodyValue = nil
+        lock.unlock()
+    }
+
+    static func requestCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestCountValue
+    }
+
+    static func probeBody() -> [String: Any]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return probeBodyValue
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        Self.lock.lock()
+        Self.requestCountValue += 1
+        Self.lock.unlock()
+
+        let status: Int
+        let body: Data
+        if url.path == "/v1beta/openai/models" {
+            let rows = (0..<12).map { "{\"id\":\"catalog-model-\($0)\"}" }.joined(separator: ",")
+            body = Data("{\"data\":[\(rows),{\"id\":\"gemini-3.8-flash\"}]}".utf8)
+            status = 200
+        } else if url.path == "/v1beta/openai/chat/completions" {
+            var raw = request.httpBody
+            if raw == nil, let stream = request.httpBodyStream {
+                stream.open()
+                defer { stream.close() }
+                var data = Data()
+                let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+                defer { buffer.deallocate() }
+                while true {
+                    let count = stream.read(buffer, maxLength: 4096)
+                    if count <= 0 { break }
+                    data.append(buffer, count: count)
+                }
+                raw = data
+            }
+            let object = raw.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            Self.lock.lock()
+            Self.probeBodyValue = object
+            Self.lock.unlock()
+            let valid = request.value(forHTTPHeaderField: "Authorization") == "Bearer test-secret"
+                && object?["model"] as? String == "gemini-3.8-flash"
+                && object?["max_tokens"] == nil
+            status = valid ? 200 : 400
+            body = valid
+                ? Data(#"{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}"#.utf8)
+                : Data(#"{"error":{"message":"invalid compatibility probe"}}"#.utf8)
+        } else {
+            status = 404
+            body = Data(#"{"error":{"message":"unsupported path"}}"#.utf8)
+        }
+        guard let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"]) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
 
 private final class ProviderDiscoveryURLProtocol: URLProtocol, @unchecked Sendable {

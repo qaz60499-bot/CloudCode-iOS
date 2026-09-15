@@ -4,10 +4,22 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <math.h>
 #import <stdio.h>
+#import <string.h>
+#import <unistd.h>
+#import "../CloudCodeApp/PerceptionVisionProbe.h"
+
+extern void *objc_autoreleasePoolPush(void);
 
 static NSString * const CloudCodeVisionProtocolMarker = @"cloudcode-vision-helper-protocol=1";
 static const NSUInteger CloudCodeVisionMaxInputBytes = 8 * 1024 * 1024;
 static const NSUInteger CloudCodeVisionMaxOutputBytes = 64 * 1024;
+
+static void CloudCodeVisionStage(const char *stage, NSError *error)
+{
+    fprintf(stderr, "vision-helper: stage=%s pid=%d ppid=%d uid=%d time=%.3f errorDomain=%s errorCode=%ld\n",
+        stage, getpid(), getppid(), getuid(), CFAbsoluteTimeGetCurrent(),
+        error.domain.UTF8String ?: "none", (long)error.code);
+}
 
 static void CloudCodePrintJSON(NSDictionary *payload)
 {
@@ -19,6 +31,7 @@ static void CloudCodePrintJSON(NSDictionary *payload)
     }
     fwrite(data.bytes, 1, data.length, stdout);
     fputc('\n', stdout);
+    CloudCodeVisionStage("stdout-json-completed", nil);
 }
 
 static BOOL CloudCodeIsBoundedTempJPEG(NSString *path)
@@ -49,15 +62,15 @@ static NSArray<NSString *> *CloudCodePreferredLanguages(VNRequestTextRecognition
     return preferred;
 }
 
-static VNRecognizeTextRequest *CloudCodeMakeRequest(BOOL cpuOnly, NSString **levelName)
+static VNRecognizeTextRequest *CloudCodeMakeRequest(BOOL cpuOnly, BOOL forceAccurate, NSString **levelName)
 {
     VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] init];
     request.usesLanguageCorrection = NO;
-    request.minimumTextHeight = 0.009f;
-    request.preferBackgroundProcessing = YES;
+    request.minimumTextHeight = 0.020f;
+    request.preferBackgroundProcessing = NO;
 
     NSArray<NSString *> *fastLanguages = CloudCodePreferredLanguages(VNRequestTextRecognitionLevelFast);
-    if ([fastLanguages containsObject:@"zh-Hans"]) {
+    if (!forceAccurate && [fastLanguages containsObject:@"zh-Hans"]) {
         request.recognitionLevel = VNRequestTextRecognitionLevelFast;
         request.recognitionLanguages = fastLanguages;
         if (levelName) { *levelName = @"fast"; }
@@ -79,12 +92,14 @@ static VNRecognizeTextRequest *CloudCodeMakeRequest(BOOL cpuOnly, NSString **lev
     return request;
 }
 
-static NSError *CloudCodePerformOCR(CGImageRef image, VNRecognizeTextRequest **requestOut, BOOL cpuOnly, NSString **levelName)
+static NSError *CloudCodePerformOCR(CGImageRef image, VNRecognizeTextRequest **requestOut, BOOL cpuOnly, BOOL forceAccurate, NSString **levelName)
 {
-    VNRecognizeTextRequest *request = CloudCodeMakeRequest(cpuOnly, levelName);
+    VNRecognizeTextRequest *request = CloudCodeMakeRequest(cpuOnly, forceAccurate, levelName);
     VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image options:@{}];
     NSError *error = nil;
+    CloudCodeVisionStage("vision-request-start", nil);
     BOOL ok = [handler performRequests:@[request] error:&error];
+    CloudCodeVisionStage("vision-request-completed", error);
     if (requestOut) { *requestOut = request; }
     if (ok && !error) { return nil; }
     return error ?: [NSError errorWithDomain:@"CloudCodeVisionHelper" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Vision request failed without NSError"}];
@@ -96,7 +111,7 @@ static NSError *CloudCodePerformFastFallbackOCR(CGImageRef image, VNRecognizeTex
     request.recognitionLevel = VNRequestTextRecognitionLevelFast;
     request.usesLanguageCorrection = NO;
     request.minimumTextHeight = 0.012f;
-    request.preferBackgroundProcessing = YES;
+    request.preferBackgroundProcessing = NO;
     if (@available(iOS 16.0, *)) { request.automaticallyDetectsLanguage = YES; }
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -105,13 +120,15 @@ static NSError *CloudCodePerformFastFallbackOCR(CGImageRef image, VNRecognizeTex
     if (levelName) { *levelName = @"fast"; }
     VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image options:@{}];
     NSError *error = nil;
+    CloudCodeVisionStage("vision-fast-fallback-start", nil);
     BOOL ok = [handler performRequests:@[request] error:&error];
+    CloudCodeVisionStage("vision-fast-fallback-completed", error);
     if (requestOut) { *requestOut = request; }
     if (ok && !error) { return nil; }
     return error ?: [NSError errorWithDomain:@"CloudCodeVisionHelper" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Fast fallback Vision request failed without NSError"}];
 }
 
-static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements)
+static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements, BOOL forceAccurate)
 {
     CFAbsoluteTime startedAt = CFAbsoluteTimeGetCurrent();
     if (!CloudCodeIsBoundedTempJPEG(path)) {
@@ -140,13 +157,35 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements)
 
     NSString *recognitionLevelName = nil;
     VNRecognizeTextRequest *request = nil;
+    // Interactive OCR normally needs coordinates/text anchors, not full-resolution typography.
+    // Build 126 device diagnostics showed the public CPU Vision pass spending ~0.7-2.3s on full
+    // iPhone screenshots. Keep accurate mode on the original image, but run the default fast pass
+    // on a 960px ImageIO thumbnail. Vision boxes are normalized, so coordinates are still projected
+    // back into the original screen size below without losing point-space semantics.
+    CGImageRef primaryImage = image;
+    CGImageRef primaryThumbnail = NULL;
+    NSString *backendName = @"vision_helper_public_api";
+    if (!forceAccurate) {
+        CGImageSourceRef fastSource = CGImageSourceCreateWithData((__bridge CFDataRef)jpeg, NULL);
+        NSDictionary *fastOptions = @{
+            (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+            (id)kCGImageSourceThumbnailMaxPixelSize: @960,
+            (id)kCGImageSourceCreateThumbnailWithTransform: @YES
+        };
+        primaryThumbnail = fastSource ? CGImageSourceCreateThumbnailAtIndex(fastSource, 0, (__bridge CFDictionaryRef)fastOptions) : NULL;
+        if (fastSource) { CFRelease(fastSource); }
+        if (primaryThumbnail) {
+            primaryImage = primaryThumbnail;
+            backendName = @"vision_helper_public_api_fast_thumbnail";
+        }
+    }
+
     // This helper exists specifically to provide a normal, non-root Vision execution context when
     // the host App cannot finish OCR while backgrounded. Do not first enter GPU/ANE/CoreVideo paths
     // that already failed on-device with CoreVideo -6662 / CoreML code 0 and then repeat the work.
-    NSError *primaryError = CloudCodePerformOCR(image, &request, YES, &recognitionLevelName);
+    NSError *primaryError = CloudCodePerformOCR(primaryImage, &request, YES, forceAccurate, &recognitionLevelName);
     BOOL cpuFallbackUsed = NO;
     NSError *finalError = primaryError;
-    NSString *backendName = @"vision_helper_public_api";
 
     if (primaryError) {
         // A fresh helper process is valuable only if it does materially less work after the same
@@ -185,6 +224,7 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements)
             @"elements": @[]
         };
         CloudCodePrintJSON(failure);
+        if (primaryThumbnail) { CGImageRelease(primaryThumbnail); }
         CGImageRelease(image);
         return 0;
     }
@@ -192,6 +232,9 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements)
     NSMutableArray<NSDictionary *> *elements = [NSMutableArray arrayWithCapacity:boundedMaximum];
     NSMutableArray<NSString *> *textParts = [NSMutableArray array];
     NSUInteger textCharacters = 0;
+    double confidenceTotal = 0.0;
+    double confidenceMinimum = 1.0;
+    double confidenceMaximum = 0.0;
     NSArray<VNRecognizedTextObservation *> *observations = request.results ?: @[];
     observations = [observations sortedArrayUsingComparator:^NSComparisonResult(VNRecognizedTextObservation *lhs, VNRecognizedTextObservation *rhs) {
         CGFloat lhsTop = 1.0 - CGRectGetMaxY(lhs.boundingBox);
@@ -222,9 +265,13 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements)
         double y = (1.0 - maxY) * (double)pixelHeight;
         double width = (maxX - minX) * (double)pixelWidth;
         double height = (maxY - minY) * (double)pixelHeight;
+        double confidence = (double)candidate.confidence;
+        confidenceTotal += confidence;
+        confidenceMinimum = MIN(confidenceMinimum, confidence);
+        confidenceMaximum = MAX(confidenceMaximum, confidence);
         [elements addObject:@{
             @"text": text,
-            @"confidence": @(round((double)candidate.confidence * 1000.0) / 1000.0),
+            @"confidence": @(round(confidence * 1000.0) / 1000.0),
             @"x": @(round(x * 10.0) / 10.0),
             @"y": @(round(y * 10.0) / 10.0),
             @"width": @(round(width * 10.0) / 10.0),
@@ -238,45 +285,87 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements)
         }
     }
 
+    double averageConfidence = elements.count > 0 ? confidenceTotal / (double)elements.count : 0.0;
     NSDictionary *payload = @{
         @"status": elements.count > 0 ? @"recognized" : @"available_empty",
         @"screenPointWidth": @(pixelWidth),
         @"screenPointHeight": @(pixelHeight),
         @"latencyMS": @((NSInteger)MAX(0.0, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000.0)),
         @"recognitionLevel": recognitionLevelName ?: @"unknown",
+        @"inputOrientation": @"up",
+        @"averageConfidence": @(round(averageConfidence * 1000.0) / 1000.0),
+        @"averageConfidencePercent": @(round(averageConfidence * 10000.0) / 100.0),
+        @"minimumConfidence": @(elements.count > 0 ? round(confidenceMinimum * 1000.0) / 1000.0 : 0.0),
+        @"maximumConfidence": @(elements.count > 0 ? round(confidenceMaximum * 1000.0) / 1000.0 : 0.0),
         @"backend": backendName,
         @"cpuFallbackUsed": @(cpuFallbackUsed),
         @"visibleText": [textParts componentsJoinedByString:@" | "],
         @"elements": elements
     };
     CloudCodePrintJSON(payload);
+    if (primaryThumbnail) { CGImageRelease(primaryThumbnail); }
     CGImageRelease(image);
     return 0;
 }
 
-int main(int argc, char *argv[])
+static int CloudCodeRunOneShotVisionCommand(int argc, char *argv[])
 {
-    @autoreleasepool {
-        if (argc < 2) {
-            fprintf(stderr, "vision-helper: missing command\n");
-            return 64;
-        }
-        NSString *command = [NSString stringWithUTF8String:argv[1]];
-        if ([command isEqualToString:@"probe"]) {
-            fprintf(stdout, "%s\n", CloudCodeVisionProtocolMarker.UTF8String);
-            return 0;
-        }
-        if ([command isEqualToString:@"ocr-file"]) {
-            if (argc < 4) {
-                fprintf(stderr, "vision-helper: ocr-file requires path and maximumElements\n");
-                return 64;
-            }
-            NSString *path = [NSString stringWithUTF8String:argv[2]];
-            NSInteger parsed = [[NSString stringWithUTF8String:argv[3]] integerValue];
-            NSUInteger maximumElements = (NSUInteger)MIN(MAX(parsed, 1), 48);
-            return CloudCodeOCRFile(path, maximumElements);
-        }
-        fprintf(stderr, "vision-helper: unsupported command\n");
+    // OCR must run as the ordinary mobile user. Do not declare this binary in TSRootBinaries:
+    // that list is reserved for helpers that need TrollStore's special root-helper permissions.
+    // Root/persona-99 Vision was proven unstable on iOS 16.6, so fail closed on elevation.
+    if (getuid() == 0 || geteuid() == 0) {
+        fprintf(stderr, "vision-helper: root execution is forbidden\n");
+        return 77;
+    }
+    if (argc < 2) {
+        fprintf(stderr, "vision-helper: missing command\n");
         return 64;
     }
+    NSString *command = [NSString stringWithUTF8String:argv[1]];
+    if ([command isEqualToString:@"probe-ocr-file"]) {
+        if (argc != 8) { return 64; }
+        NSString *path = [NSString stringWithUTF8String:argv[2]];
+        if (!CloudCodeIsBoundedTempJPEG(path)) { return 71; }
+        // Process identity is written synchronously before the first Vision call so pre-/post-main
+        // deaths can be distinguished even when no OCR result survives.
+        NSData *entry = [NSJSONSerialization dataWithJSONObject:CCPerceptionProcessEvidence(@"vision_helper") options:0 error:nil];
+        if (entry) { fwrite(entry.bytes, 1, entry.length, stderr); fputc('\n', stderr); }
+        NSData *jpeg = [NSData dataWithContentsOfFile:path options:0 error:nil];
+        NSDictionary *result = CCPerceptionVisionProbe(jpeg, [NSString stringWithUTF8String:argv[3]],
+            [NSString stringWithUTF8String:argv[4]], atoi(argv[5]) != 0, atof(argv[6]), atof(argv[7]), @"vision_helper");
+        CloudCodePrintJSON(result);
+        return 0;
+    }
+    if ([command isEqualToString:@"probe"]) {
+        fprintf(stdout, "%s\n", CloudCodeVisionProtocolMarker.UTF8String);
+        return 0;
+    }
+    if ([command isEqualToString:@"ocr-file"]) {
+        if (argc < 4) {
+            fprintf(stderr, "vision-helper: ocr-file requires path and maximumElements\n");
+            return 64;
+        }
+        NSString *path = [NSString stringWithUTF8String:argv[2]];
+        NSInteger parsed = [[NSString stringWithUTF8String:argv[3]] integerValue];
+        NSUInteger maximumElements = (NSUInteger)MIN(MAX(parsed, 1), 48);
+        BOOL forceAccurate = argc >= 5 && strcmp(argv[4], "accurate") == 0;
+        return CloudCodeOCRFile(path, maximumElements, forceAccurate);
+    }
+    fprintf(stderr, "vision-helper: unsupported command\n");
+    return 64;
+}
+
+int main(int argc, char *argv[])
+{
+    // Vision/CoreML/CoreVideo may retain process-global objects whose autorelease teardown blocks
+    // after the final OCR JSON has already been produced on the TrollStore iOS 16.6 device. Match
+    // the root/GUI one-shot contract: make observable writes synchronous, keep one process-lifetime
+    // pool, and terminate without ARC/Foundation/Vision teardown after dispatch.
+    (void)setvbuf(stdout, NULL, _IONBF, 0);
+    (void)setvbuf(stderr, NULL, _IONBF, 0);
+    (void)objc_autoreleasePoolPush();
+    CloudCodeVisionStage("startup", nil);
+    int result = CloudCodeRunOneShotVisionCommand(argc, argv);
+    CloudCodeVisionStage("exit", nil);
+    _exit(result);
 }

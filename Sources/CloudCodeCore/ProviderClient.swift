@@ -2235,6 +2235,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                             result: "started",
                             metadata: [
                                 "providerID": configuration.providerID ?? "",
+                                "model": configuration.model,
                                 "host": baseURLCandidate.host ?? "",
                                 "baseURL": ProviderEndpointRoutingPolicy.normalizedOrigin(baseURLCandidate),
                                 "protocol": protocolCandidate.rawValue,
@@ -2286,6 +2287,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                                 result: "completed",
                                 metadata: [
                                     "providerID": configuration.providerID ?? "",
+                                    "model": configuration.model,
                                     "host": baseURLCandidate.host ?? "",
                                     "baseURL": ProviderEndpointRoutingPolicy.normalizedOrigin(baseURLCandidate),
                                     "protocol": protocolCandidate.rawValue,
@@ -2308,7 +2310,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                             let hasAnotherProtocol = protocolIndex + 1 < orderedProtocols.count
                             let hasAnotherHost = baseURLIndex + 1 < orderedBaseURLs.count
                             let hasAnotherKey = keyIndex + 1 < keyCandidates.count
-                            let mayFallbackProtocol = !emittedOutput && hasAnotherProtocol && ProviderProtocolFallbackClassifier.shouldFallback(error)
+                            let mayFallbackProtocol = !emittedOutput && hasAnotherProtocol && ProviderProtocolFallbackClassifier.shouldFallback(error, providerID: configuration.providerID)
                             let mayFallbackHost = !emittedOutput && hasAnotherHost && ProviderHostFallbackClassifier.shouldFallback(error)
                             let mayRotateKey = !emittedOutput && hasAnotherKey && configuration.allowSameProviderKeyFailover == true && ProviderKeyRotationClassifier.shouldRotate(error)
                             if !emittedOutput && ProviderCompatibilityDriftClassifier.shouldDegradeProtocol(error) {
@@ -2333,6 +2335,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                                 error: error,
                                 metadata: [
                                     "providerID": configuration.providerID ?? "",
+                                    "model": configuration.model,
                                     "host": baseURLCandidate.host ?? "",
                                     "baseURL": ProviderEndpointRoutingPolicy.normalizedOrigin(baseURLCandidate),
                                     "protocol": protocolCandidate.rawValue,
@@ -2737,13 +2740,17 @@ public enum ProviderProtocolFallbackClassifier {
     /// Protocol failover is only allowed before any provider output. It is reserved for
     /// errors that can plausibly be route/protocol specific; credential/quota/rate-limit
     /// failures stay on the current protocol decision and move only through the Key pool.
-    public static func shouldFallback(_ error: Error) -> Bool {
+    ///
+    /// AgentRouter is the one deliberate exception for `clientRejected`: one compatibility
+    /// envelope/protocol can be rejected while the same Key×Host×model succeeds on the alternate
+    /// supported protocol. Treat that as route-scoped evidence, never as proof the model is down.
+    public static func shouldFallback(_ error: Error, providerID: String? = nil) -> Bool {
         guard let providerError = error as? ProviderError else { return false }
         switch providerError {
         case .modelUnavailable, .malformedEvent, .protocolIncompatible:
             return true
         case .clientRejected:
-            return false
+            return providerID == ProviderCatalog.agentRouterID
         case .invalidResponse(let code):
             return code == 400 || code == 404 || code == 405 || code == 422 || (500...599).contains(code)
         case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .capacityExhausted,
@@ -2884,6 +2891,21 @@ enum ProviderEndpoint {
             .map(String.init)
         guard !requestedComponents.isEmpty else { throw ProviderError.invalidEndpoint }
 
+        // Google exposes an official OpenAI-compatible Gemini API under /v1beta/openai.
+        // Treat that versioned compatibility prefix as the API root instead of blindly
+        // appending our ordinary /v1 suffix (which would produce the invalid
+        // /v1beta/openai/v1/... route). Also make the documented Google root usable as a
+        // convenience base URL so a valid Gemini API key is not rejected only because the
+        // compatibility prefix was omitted in UI configuration.
+        let host = baseURL.host?.lowercased()
+        if host == "generativelanguage.googleapis.com" {
+            if baseComponents.isEmpty {
+                baseComponents = ["v1beta", "openai"]
+            } else if baseComponents == ["v1beta"] {
+                baseComponents.append("openai")
+            }
+        }
+
         if baseComponents.suffix(requestedComponents.count).elementsEqual(requestedComponents) {
             return baseURL
         }
@@ -2891,7 +2913,11 @@ enum ProviderEndpoint {
             baseComponents.removeLast(suffix.count)
             break
         }
-        if baseComponents.last != "v1" {
+        let isGeminiOpenAICompatibilityRoot = host == "generativelanguage.googleapis.com"
+            && baseComponents.count >= 2
+            && baseComponents[0] == "v1beta"
+            && baseComponents[1] == "openai"
+        if baseComponents.last != "v1" && !isGeminiOpenAICompatibilityRoot {
             baseComponents.append("v1")
         }
         baseComponents.append(contentsOf: requestedComponents)

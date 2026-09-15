@@ -12,6 +12,8 @@ struct ContentView: View {
     @ObservedObject var model: CloudCodeViewModel
     @ObservedObject private var approval: ApprovalCenter
     @State private var selectedTab: RootTab = .chat
+    @State private var errorBannerMessage: String?
+    @State private var errorBannerDismissTask: Task<Void, Never>?
 
     init(model: CloudCodeViewModel) {
         self.model = model
@@ -32,7 +34,7 @@ struct ContentView: View {
             SettingsView(model: model)
                 .tabItem { Label("设置", systemImage: "gearshape") }
                 .tag(RootTab.settings)
-            MoreView(model: model)
+            MoreView(model: model, onOpenChat: { selectedTab = .chat })
                 .tabItem { Label("更多", systemImage: "ellipsis.circle") }
                 .tag(RootTab.more)
         }
@@ -44,9 +46,24 @@ struct ContentView: View {
                 ApprovalSheet(preview: preview, approval: approval)
             }
         }
+        .overlay(alignment: .top) {
+            if let errorBannerMessage {
+                CloudCodeErrorBanner(message: errorBannerMessage) {
+                    dismissErrorBanner()
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .zIndex(50)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: errorBannerMessage)
+        .onChange(of: model.lastError) { value in
+            presentErrorBanner(value)
+        }
         .alert("Cloud Code", isPresented: Binding(
-            get: { model.lastError != nil },
-            set: { if !$0 { model.lastError = nil } }
+            get: { model.lastError != nil && model.hasCurrentProviderFailure },
+            set: { if !$0 && model.hasCurrentProviderFailure { model.lastError = nil } }
         )) {
             if model.hasCurrentProviderFailure {
                 if model.canRetryCurrentProviderFailure {
@@ -67,16 +84,74 @@ struct ContentView: View {
             Text(model.lastError ?? "")
         }
     }
+
+    private func presentErrorBanner(_ value: String?) {
+        guard let value else { return }
+        let message = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { return }
+        errorBannerDismissTask?.cancel()
+        errorBannerMessage = message
+        if UIApplication.shared.applicationState != .active {
+            ErrorNotificationCoordinator.postIfEnabled(message)
+        }
+        errorBannerDismissTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard !Task.isCancelled else { return }
+            errorBannerMessage = nil
+        }
+    }
+
+    private func dismissErrorBanner() {
+        errorBannerDismissTask?.cancel()
+        errorBannerDismissTask = nil
+        errorBannerMessage = nil
+    }
+}
+
+private struct CloudCodeErrorBanner: View {
+    let message: String
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Cloud Code 需要处理")
+                    .font(.subheadline.bold())
+                Text(message)
+                    .font(.caption)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 6)
+            Button(action: dismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("关闭错误提醒")
+        }
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(.quaternary, lineWidth: 1)
+        }
+        .shadow(radius: 8, y: 3)
+    }
 }
 
 private struct MoreView: View {
     private enum Destination: String, Identifiable {
-        case apps, files, memory, activity, trash
+        case apps, files, skills, memory, activity, trash
 
         var id: String { rawValue }
     }
 
     @ObservedObject var model: CloudCodeViewModel
+    let onOpenChat: () -> Void
     @State private var destination: Destination?
 
     var body: some View {
@@ -85,6 +160,7 @@ private struct MoreView: View {
                 Section("工具") {
                     moreButton(.apps, title: "应用", systemImage: "square.grid.2x2", subtitle: "查看已安装应用与应用能力")
                     moreButton(.files, title: "文件", systemImage: "folder", subtitle: "浏览当前可访问的文件系统")
+                    moreButton(.skills, title: "技能", systemImage: "wand.and.stars", subtitle: "进入专项对话并查看自动能力配置")
                     moreButton(.memory, title: "Hermes 记忆", systemImage: "books.vertical", subtitle: "查看、检索和维护本地记忆")
                 }
                 Section("维护") {
@@ -99,6 +175,11 @@ private struct MoreView: View {
                     AppsView(model: model)
                 case .files:
                     FilesView(model: model)
+                case .skills:
+                    SkillsView(model: model) {
+                        destination = nil
+                        onOpenChat()
+                    }
                 case .memory:
                     HermesVaultView(model: model)
                 case .activity:
@@ -136,6 +217,224 @@ private struct MoreView: View {
     }
 }
 
+private struct SkillsView: View {
+    @ObservedObject var model: CloudCodeViewModel
+    let onOpenChat: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("技能管理") {
+                    NavigationLink {
+                        SpecializedSkillManagerView(model: model, onOpenChat: onOpenChat)
+                    } label: {
+                        Label("新建 / 导入专项技能", systemImage: "shippingbox.and.arrow.backward")
+                    }
+                }
+
+                Section("专项对话") {
+                    ForEach(model.selectableSemanticSkills) { skill in
+                        Button {
+                            if model.openSpecializedConversation(skillID: skill.id) {
+                                onOpenChat()
+                            }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text(model.semanticSkillDisplayName(skill))
+                                        .font(.headline)
+                                        .foregroundStyle(.primary)
+                                    Spacer()
+                                    Image(systemName: "arrow.up.right.circle")
+                                        .foregroundStyle(Color.accentColor)
+                                }
+                                Text("进入独立专项对话；该对话固定使用这套业务规则、工作流与恢复约束。")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                if let bundleID = skill.bundleID, !bundleID.isEmpty {
+                                    Label(bundleID, systemImage: "app")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                HStack(spacing: 10) {
+                                    Label("能力 \(skill.requiredCapabilities.count)", systemImage: "bolt.horizontal.circle")
+                                    Label("验证 \(skill.verificationObligations.count)", systemImage: "checkmark.shield")
+                                    if skill.exactlyOnce {
+                                        Label("一次性", systemImage: "1.circle")
+                                    }
+                                }
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                Section("自动能力") {
+                    Label("意图识别与任务规划", systemImage: "brain.head.profile")
+                    Label("UI / AX / OCR / 截图感知", systemImage: "viewfinder")
+                    Label("应用、文件与数据工具路由", systemImage: "point.3.connected.trianglepath.dotted")
+                    Text("这些属于 Cloud Code 的自动技能配置，不需要手动选择。系统会根据任务语义、前台 App、设备能力和最新观察自动挑选，并在能力不可用时切换到合适的安全路径。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("说明") {
+                    Text("专项对话只固定专项知识、业务规则和工作流；底层 UI/OCR/AX、权限确认、幂等保护、结果验证仍由 Cloud Code 自动处理。普通对话不会继承专项技能。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("技能")
+            .task { await model.reloadSemanticSkills() }
+        }
+    }
+}
+
+private struct PasteSafeComposerTextView: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var isFocused: Bool
+
+    private static let maximumCharacters = 120_000
+
+    private final class PlainTextPasteView: UITextView {
+        var onPlainTextPaste: ((String) -> Void)?
+
+        override func paste(_ sender: Any?) {
+            guard let plainText = UIPasteboard.general.string else {
+                super.paste(sender)
+                return
+            }
+            onPlainTextPaste?(plainText)
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text, isFocused: $isFocused)
+    }
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = PlainTextPasteView()
+        view.delegate = context.coordinator
+        view.onPlainTextPaste = { [weak view, weak coordinator = context.coordinator] value in
+            guard let view, let coordinator else { return }
+            coordinator.applyReplacement(in: view, range: view.selectedRange, replacement: value)
+        }
+        view.backgroundColor = .clear
+        view.font = UIFont.preferredFont(forTextStyle: .body)
+        view.adjustsFontForContentSizeCategory = true
+        view.isScrollEnabled = true
+        view.alwaysBounceVertical = false
+        view.textContainerInset = UIEdgeInsets(top: 7, left: 6, bottom: 7, right: 6)
+        view.textContainer.lineFragmentPadding = 0
+        view.keyboardDismissMode = .interactive
+        view.accessibilityIdentifier = "CloudCodeComposer"
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let accessory = UIToolbar(frame: CGRect(x: 0, y: 0, width: 0, height: 44))
+        accessory.autoresizingMask = [.flexibleWidth]
+        let dismissButton = UIButton(type: .system)
+        dismissButton.setTitle("收起", for: .normal)
+        dismissButton.accessibilityIdentifier = "CloudCodeDismissKeyboard"
+        dismissButton.addTarget(context.coordinator, action: #selector(Coordinator.dismissKeyboard), for: .touchUpInside)
+        accessory.items = [
+            UIBarButtonItem(systemItem: .flexibleSpace),
+            UIBarButtonItem(customView: dismissButton)
+        ]
+        view.inputAccessoryView = accessory
+        context.coordinator.activeTextView = view
+        return view
+    }
+
+    func updateUIView(_ uiView: UITextView, context: Context) {
+        if uiView.text != text {
+            let previousSelection = uiView.selectedRange
+            uiView.text = text
+            if uiView.isFirstResponder {
+                let end = (uiView.text as NSString).length
+                uiView.selectedRange = NSRange(location: min(previousSelection.location, end), length: 0)
+            }
+        }
+        if isFocused, !uiView.isFirstResponder {
+            uiView.becomeFirstResponder()
+        } else if !isFocused, uiView.isFirstResponder {
+            uiView.resignFirstResponder()
+        }
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        @Binding private var text: String
+        @Binding private var isFocused: Bool
+        weak var activeTextView: UITextView?
+
+        init(text: Binding<String>, isFocused: Binding<Bool>) {
+            _text = text
+            _isFocused = isFocused
+        }
+
+        @objc func dismissKeyboard() {
+            activeTextView?.resignFirstResponder()
+            if isFocused { isFocused = false }
+        }
+
+        func textViewDidBeginEditing(_ textView: UITextView) {
+            if !isFocused { isFocused = true }
+        }
+
+        func textViewDidEndEditing(_ textView: UITextView) {
+            if isFocused { isFocused = false }
+        }
+
+        func textViewDidChange(_ textView: UITextView) {
+            if text != textView.text { text = textView.text }
+        }
+
+        func textView(
+            _ textView: UITextView,
+            shouldChangeTextIn range: NSRange,
+            replacementText replacement: String
+        ) -> Bool {
+            let currentLength = (textView.text as NSString?)?.length ?? 0
+            guard range.location <= currentLength, range.location + range.length <= currentLength else { return false }
+            let replacementLength = (replacement as NSString).length
+            if currentLength - range.length + replacementLength <= PasteSafeComposerTextView.maximumCharacters {
+                return true
+            }
+            applyReplacement(in: textView, range: range, replacement: replacement)
+            return false
+        }
+
+        func applyReplacement(in textView: UITextView, range: NSRange, replacement: String) {
+            let current = textView.text ?? ""
+            let currentNSString = current as NSString
+            guard range.location <= currentNSString.length, range.location + range.length <= currentNSString.length else { return }
+            let remaining = max(0, PasteSafeComposerTextView.maximumCharacters - (currentNSString.length - range.length))
+            let boundedReplacement = Self.prefixByUTF16(replacement, maximumLength: remaining)
+            let next = currentNSString.replacingCharacters(in: range, with: boundedReplacement)
+            textView.text = next
+            let insertedLength = (boundedReplacement as NSString).length
+            textView.selectedRange = NSRange(location: min(range.location + insertedLength, (next as NSString).length), length: 0)
+            if text != next { text = next }
+        }
+
+        private static func prefixByUTF16(_ value: String, maximumLength: Int) -> String {
+            guard maximumLength > 0 else { return "" }
+            let ns = value as NSString
+            guard ns.length > maximumLength else { return value }
+            var length = maximumLength
+            if length > 0 {
+                let last = ns.character(at: length - 1)
+                if CFStringIsSurrogateHighCharacter(last), length < ns.length {
+                    length -= 1
+                }
+            }
+            return ns.substring(to: max(0, length))
+        }
+    }
+}
+
 private struct ChatView: View {
     @ObservedObject var model: CloudCodeViewModel
     @StateObject private var voice = VoiceInputController()
@@ -145,7 +444,14 @@ private struct ChatView: View {
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var pendingImageData: Data?
     @State private var pendingImagePreview: UIImage?
+    @State private var showDocumentImporter = false
+    @State private var pendingDocument: ImportedChatDocument?
+    @State private var pendingShareTransactionID: UUID?
+    @State private var pendingSharedAppProviderPackage: PendingSharedAppProviderPackage?
+    @State private var pendingSharedSkillPackage: PendingSharedSkillPackage?
+    @State private var isImportingDocument = false
     @State private var isConversationAtBottom = true
+    @State private var isComposerFocused = false
 
     private let conversationBottomID = "cloudcode-conversation-bottom"
 
@@ -175,6 +481,9 @@ private struct ChatView: View {
                             }
                     }
                 }
+                .fileImporter(isPresented: $showDocumentImporter, allowedContentTypes: [.data]) { result in
+                    importDocument(result)
+                }
                 .onChange(of: voice.recognizedText) { value in
                     if !value.isEmpty { input = value }
                 }
@@ -183,6 +492,32 @@ private struct ChatView: View {
                 }
                 .onChange(of: selectedPhotoItem) { item in
                     loadSelectedPhoto(item)
+                }
+                .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+                    Task { await importNextSharedDocumentIfAvailable() }
+                }
+                .task {
+                    await importNextSharedDocumentIfAvailable()
+                }
+                .alert("检测到 App Provider Package", isPresented: Binding(
+                    get: { pendingSharedAppProviderPackage != nil },
+                    set: { if !$0 { pendingSharedAppProviderPackage = nil } }
+                )) {
+                    Button("导入 Provider") { importPendingSharedAppProvider() }
+                    Button("作为普通附件") { importPendingSharedAppProviderAsDocument() }
+                    Button("稍后", role: .cancel) { pendingSharedAppProviderPackage = nil }
+                } message: {
+                    Text("发现包含 provider.json 的 ZIP。只会导入 declarative Provider 资源；未知 capability、额外可执行文件、路径穿越、symlink 或超限内容都会被拒绝。")
+                }
+                .alert("检测到 Cloud Code Skill", isPresented: Binding(
+                    get: { pendingSharedSkillPackage != nil },
+                    set: { if !$0 { pendingSharedSkillPackage = nil } }
+                )) {
+                    Button("导入技能") { importPendingSharedSkill() }
+                    Button("作为普通附件") { importPendingSharedSkillAsDocument() }
+                    Button("稍后", role: .cancel) { pendingSharedSkillPackage = nil }
+                } message: {
+                    Text("发现包含 skill.json 的 ZIP。只有通过技能包安全验证后才会安装。")
                 }
                 .onDisappear { voice.stop() }
         }
@@ -244,6 +579,8 @@ private struct ChatView: View {
                     }
                     .padding()
                 }
+                .scrollDismissesKeyboard(.interactively)
+                .simultaneousGesture(TapGesture().onEnded { isComposerFocused = false })
                 .onAppear {
                     isConversationAtBottom = true
                     scrollConversationToBottom(proxy, animated: false)
@@ -297,6 +634,8 @@ private struct ChatView: View {
     private var composer: some View {
         VStack(spacing: 8) {
             pendingImageBanner
+            pendingDocumentBanner
+            specializedConversationBanner
             inputRow
             if voice.isRecording {
                 HStack(spacing: 6) {
@@ -309,6 +648,28 @@ private struct ChatView: View {
             }
         }
         .padding()
+    }
+
+    @ViewBuilder
+    private var specializedConversationBanner: some View {
+        if let id = model.selectedSemanticSkillID,
+           let skill = model.selectableSemanticSkills.first(where: { $0.id == id }) {
+            HStack(spacing: 8) {
+                Image(systemName: "wand.and.stars")
+                    .foregroundStyle(Color.accentColor)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("专项对话 · \(model.semanticSkillDisplayName(skill))")
+                        .font(.caption.bold())
+                    Text("专项规则已绑定；UI / AX / OCR 等底层能力仍自动选择。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
+        }
     }
 
     @ViewBuilder
@@ -336,12 +697,66 @@ private struct ChatView: View {
         }
     }
 
+    @ViewBuilder
+    private var pendingDocumentBanner: some View {
+        if let pendingDocument {
+            HStack(spacing: 10) {
+                Image(systemName: "doc.fill")
+                    .font(.title2)
+                    .frame(width: 42, height: 42)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(pendingDocument.attachment.filename)
+                        .font(.caption.bold())
+                        .lineLimit(1)
+                    Text(ByteCountFormatter.string(fromByteCount: pendingDocument.attachment.byteSize, countStyle: .file))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    if let kind = pendingDocument.inspection?.kind {
+                        Text("已本地解析：\(kind.uppercased())")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("原始文件已保留；可用于后续真实分享")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                Button(role: .destructive) {
+                    clearPendingDocument(removeStoredFile: true, loadNextShare: true)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                }
+                .buttonStyle(.plain)
+            }
+        } else if isImportingDocument {
+            HStack(spacing: 8) {
+                ProgressView()
+                Text("正在复制并本地解析文件…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+        }
+    }
+
     private var inputRow: some View {
         HStack(alignment: .bottom, spacing: 8) {
+            Button {
+                isComposerFocused = false
+                showDocumentImporter = true
+            } label: {
+                Image(systemName: "doc.badge.plus")
+                    .frame(width: 30, height: 30)
+            }
+            .disabled(isImportingDocument)
+            .accessibilityLabel("选择本地文件")
+
             PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
                 Image(systemName: "photo")
                     .frame(width: 30, height: 30)
             }
+            .simultaneousGesture(TapGesture().onEnded { isComposerFocused = false })
 
             Button(action: toggleVoiceInput) {
                 Image(systemName: voice.isRecording ? "stop.circle.fill" : "mic")
@@ -349,9 +764,23 @@ private struct ChatView: View {
             }
             .accessibilityLabel(voice.isRecording ? "停止语音输入" : "开始语音输入")
 
-            TextField("输入要让 Cloud Code 完成的任务…", text: $input, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .lineLimit(1...5)
+            ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color(uiColor: .separator), lineWidth: 0.5)
+                if input.isEmpty {
+                    Text("输入要让 Cloud Code 完成的任务…")
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 8)
+                        .allowsHitTesting(false)
+                }
+                PasteSafeComposerTextView(text: $input, isFocused: $isComposerFocused)
+                    .padding(.horizontal, 2)
+                    .padding(.vertical, 1)
+            }
+            .frame(minHeight: 38, maxHeight: 116)
+            .contentShape(Rectangle())
+            .onTapGesture { isComposerFocused = true }
 
             Button(model.isCurrentSessionRunning ? "追加" : "发送", action: sendCurrentInput)
                 .buttonStyle(.borderedProminent)
@@ -368,12 +797,14 @@ private struct ChatView: View {
     private var chatToolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .topBarTrailing) {
             Button {
+                isComposerFocused = false
                 showDiagnostics = true
             } label: {
                 Label("日志", systemImage: "doc.text.magnifyingglass")
             }
 
             Button {
+                isComposerFocused = false
                 showSessionHistory = true
             } label: {
                 Label("历史", systemImage: "clock.arrow.circlepath")
@@ -386,7 +817,7 @@ private struct ChatView: View {
     }
 
     private var canSend: Bool {
-        !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || pendingImageData != nil
+        !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || pendingImageData != nil || pendingDocument != nil
     }
 
     private func toggleVoiceInput() {
@@ -398,17 +829,36 @@ private struct ChatView: View {
     }
 
     private func sendCurrentInput() {
+        isComposerFocused = false
         let value = input
         let image = pendingImageData
+        let document = pendingDocument
+        let sharedTransactionID = pendingShareTransactionID
         input = ""
         clearPendingImage()
+        pendingDocument = nil
+        pendingShareTransactionID = nil
         voice.stop()
-        model.send(value, imageData: image, imageMimeType: "image/jpeg", imageFilename: "photo.jpg")
+        if let document {
+            model.send(value, document: document)
+            if let sharedTransactionID {
+                do {
+                    try model.completeSharedDocument(transactionID: sharedTransactionID)
+                } catch {
+                    model.lastError = "共享文件已发送，但清理共享收件箱失败：\(error.localizedDescription)"
+                }
+                Task { await importNextSharedDocumentIfAvailable() }
+            }
+        } else {
+            model.send(value, imageData: image, imageMimeType: "image/jpeg", imageFilename: "photo.jpg")
+        }
     }
 
     private func createNewConversation() {
+        isComposerFocused = false
         input = ""
         clearPendingImage()
+        clearPendingDocument(removeStoredFile: true)
         voice.stop()
         model.createNewSession()
     }
@@ -417,6 +867,122 @@ private struct ChatView: View {
         pendingImageData = nil
         pendingImagePreview = nil
         selectedPhotoItem = nil
+    }
+
+    private func importDocument(_ result: Result<URL, Error>) {
+        guard case .success(let url) = result else {
+            if case .failure(let error) = result {
+                model.lastError = "选择文件失败：\(error.localizedDescription)"
+            }
+            return
+        }
+        isImportingDocument = true
+        Task {
+            defer { isImportingDocument = false }
+            do {
+                let mimeType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+                let imported = try await model.importChatDocument(from: url, mimeType: mimeType)
+                clearPendingImage()
+                if pendingDocument != nil { clearPendingDocument(removeStoredFile: true) }
+                pendingDocument = imported
+            } catch {
+                model.lastError = "导入文件失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func clearPendingDocument(removeStoredFile: Bool, loadNextShare: Bool = false) {
+        let sharedTransactionID = pendingShareTransactionID
+        if removeStoredFile, let pendingDocument {
+            model.discardImportedChatDocument(pendingDocument)
+        }
+        pendingDocument = nil
+        pendingShareTransactionID = nil
+        if let sharedTransactionID {
+            do {
+                try model.completeSharedDocument(transactionID: sharedTransactionID)
+            } catch {
+                model.lastError = "清理共享收件箱失败：\(error.localizedDescription)"
+            }
+        }
+        if loadNextShare {
+            Task { await importNextSharedDocumentIfAvailable() }
+        }
+    }
+
+    @MainActor
+    private func importNextSharedDocumentIfAvailable() async {
+        guard pendingDocument == nil,
+              pendingSharedAppProviderPackage == nil,
+              pendingSharedSkillPackage == nil,
+              !isImportingDocument else { return }
+        do {
+            if let providerPackage = try model.nextPendingSharedAppProviderPackageCandidate() {
+                pendingSharedAppProviderPackage = providerPackage
+                return
+            }
+            if let skillPackage = try model.nextPendingSharedSkillPackageCandidate() {
+                pendingSharedSkillPackage = skillPackage
+                return
+            }
+        } catch {
+            model.lastError = "检查共享 Skill ZIP 失败：\(error.localizedDescription)"
+            return
+        }
+        await importPendingSharedDocumentDirectly()
+    }
+
+    @MainActor
+    private func importPendingSharedDocumentDirectly() async {
+        guard pendingDocument == nil, !isImportingDocument else { return }
+        isImportingDocument = true
+        defer { isImportingDocument = false }
+        do {
+            guard let shared = try await model.nextPendingSharedDocument() else { return }
+            clearPendingImage()
+            pendingShareTransactionID = shared.transactionID
+            pendingDocument = shared.document
+        } catch {
+            model.lastError = "读取系统分享文件失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func importPendingSharedAppProvider() {
+        guard let pending = pendingSharedAppProviderPackage else { return }
+        pendingSharedAppProviderPackage = nil
+        Task {
+            do {
+                let package = try await model.importPendingSharedAppProviderPackage(pending)
+                model.activityLines.append("已导入 App Provider：\(package.manifest.displayName)")
+                await importNextSharedDocumentIfAvailable()
+            } catch {
+                model.lastError = "App Provider Package 导入失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func importPendingSharedAppProviderAsDocument() {
+        pendingSharedAppProviderPackage = nil
+        Task { await importPendingSharedDocumentDirectly() }
+    }
+
+    private func importPendingSharedSkill() {
+        guard let pending = pendingSharedSkillPackage else { return }
+        pendingSharedSkillPackage = nil
+        Task {
+            do {
+                let package = try await model.importPendingSharedSkillPackage(pending)
+                model.activityLines.append("已导入技能：\(package.manifest.displayName)")
+                await importNextSharedDocumentIfAvailable()
+            } catch {
+                model.lastError = "技能包导入失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func importPendingSharedSkillAsDocument() {
+        pendingSharedSkillPackage = nil
+        Task { await importPendingSharedDocumentDirectly() }
     }
 
     private func loadSelectedPhoto(_ item: PhotosPickerItem?) {
@@ -429,6 +995,7 @@ private struct ChatView: View {
                     model.lastError = "无法读取所选图片。"
                     return
                 }
+                if pendingDocument != nil { clearPendingDocument(removeStoredFile: true) }
                 pendingImageData = prepared
                 pendingImagePreview = preview
             } catch {
@@ -1331,13 +1898,33 @@ private struct SettingsView: View {
     @State private var selectedKeyInput = ""
     @State private var customModelInput = ""
     @State private var showCustomProvider = false
+    @State private var showCustomAppProvider = false
     @State private var showBootstrapImporter = false
+    @State private var showAppProviderImporter = false
+    @State private var showRemoveProviderConfirmation = false
+    @State private var appProviderShareItem: DiagnosticShareItem?
+    @AppStorage(ErrorNotificationCoordinator.preferenceKey) private var backgroundErrorNotificationsEnabled = false
     @FocusState private var keyInputFocused: Bool
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("厂商 / Key / 模型") {
+                Section("推理后端") {
+                    Picker("后端", selection: Binding(
+                        get: { model.selectedProviderBackend },
+                        set: { model.selectProviderBackend($0) }
+                    )) {
+                        Text("Network Provider").tag(ProviderBackend.network)
+                        Text("App Provider").tag(ProviderBackend.appBacked)
+                    }
+                    Text(model.selectedProviderBackend == .appBacked
+                         ? "当前由已安装 AI App 提供推理；设备观察、ToolRouter、PolicyEngine、AX/OCR/HID 与文件能力仍由 Cloud Code 控制。"
+                         : "当前使用 API / Network Provider。App Provider Package 与 API Key 配置彼此独立。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Network Provider / Key / 模型") {
                     Picker("厂商", selection: Binding(
                         get: { model.selectedProviderID },
                         set: { model.selectProvider($0) }
@@ -1365,10 +1952,12 @@ private struct SettingsView: View {
                         ForEach(model.availableModels, id: \.self) { modelID in
                             Text(modelID).tag(modelID)
                         }
-                        if model.selectedProvider?.customModelAllowed == true,
-                           !model.selectedModel.isEmpty,
+                        if !model.selectedModel.isEmpty,
                            !model.availableModels.contains(model.selectedModel) {
-                            Text("自定义 · \(model.selectedModel)").tag(model.selectedModel)
+                            Text(model.selectedModelIsExplicitCustomOverride
+                                 ? "自定义 · \(model.selectedModel)"
+                                 : "当前不可用 · \(model.selectedModel)")
+                                .tag(model.selectedModel)
                         }
                     }
                     .disabled(model.availableModels.isEmpty)
@@ -1393,6 +1982,9 @@ private struct SettingsView: View {
                         LabeledContent("当前 Key", value: model.selectedKeyIsInstalled ? "本次已确认" : "启动未扫描")
                     }
                     LabeledContent("配置规模", value: "\(model.providerProfiles.filter(\.enabled).count) 个厂商 · \(model.providerProfiles.filter(\.enabled).reduce(0) { $0 + $1.keySlots.count }) 个 Key")
+                    Text("此区只配置 Network Provider；切到 App Provider 后仍可预先维护这里的 API 配置，但不会参与当前推理。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("Key 管理") {
@@ -1418,13 +2010,11 @@ private struct SettingsView: View {
                     }
                     .disabled(model.availableKeySlots.isEmpty || model.isProviderKeyMutationInFlight)
 
-                    if model.selectedProviderID == ProviderCatalog.agentRouterID {
-                        Button("刷新模型目录（实时）") {
-                            keyInputFocused = false
-                            Task { _ = await model.refreshSelectedProviderModelCatalog() }
-                        }
-                        .disabled(model.availableKeySlots.isEmpty || model.isProviderKeyMutationInFlight)
+                    Button("刷新模型目录（实时）") {
+                        keyInputFocused = false
+                        Task { _ = await model.refreshSelectedProviderModelCatalog() }
                     }
+                    .disabled(model.availableKeySlots.isEmpty || model.isProviderKeyMutationInFlight)
 
                     if let message = model.providerKeyCheckMessage, !message.isEmpty {
                         Text(message)
@@ -1460,6 +2050,66 @@ private struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
+                Section("App Provider") {
+                    if model.appProviderPackages.filter(\.enabled).isEmpty {
+                        Text("暂无可用 App Provider Package。")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Picker("Provider Package", selection: Binding(
+                            get: { model.selectedAppProviderPackageID },
+                            set: { model.selectAppProviderPackage($0) }
+                        )) {
+                            ForEach(model.appProviderPackages.filter(\.enabled)) { package in
+                                Text(package.manifest.displayName).tag(package.id)
+                            }
+                        }
+                    }
+
+                    if let package = model.selectedAppProviderPackage {
+                        LabeledContent("Bundle ID", value: package.manifest.bundleID)
+                        LabeledContent("模式", value: package.manifest.modelLabel)
+                        LabeledContent("Selector Revision", value: package.manifest.compatibility.selectorRevision)
+                        if let status = model.appProviderStatusMessages[package.id], !status.isEmpty {
+                            Text(status)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                        Button("刷新授权 / 可用性状态") {
+                            Task { await model.refreshAppProviderStatus(packageID: package.id) }
+                        }
+                        Button("授权并运行无副作用测试") {
+                            Task {
+                                guard await model.setAppProviderUseConsent(packageID: package.id, enabled: true) else { return }
+                                _ = await model.testAppProvider(packageID: package.id)
+                            }
+                        }
+                        Button("撤销授权", role: .destructive) {
+                            Task { _ = await model.setAppProviderUseConsent(packageID: package.id, enabled: false) }
+                        }
+                        Button("导出当前 Provider Package") {
+                            Task {
+                                do {
+                                    let url = try await model.exportAppProvider(packageID: package.id)
+                                    appProviderShareItem = DiagnosticShareItem(url: url)
+                                } catch {
+                                    model.lastError = "导出 App Provider Package 失败：\(error)"
+                                }
+                            }
+                        }
+                    }
+
+                    Button("制作自定义 App Provider") { showCustomAppProvider = true }
+                    NavigationLink {
+                        AppProviderManagementView(model: model)
+                    } label: {
+                        Label("管理 / 制作 App Provider", systemImage: "puzzlepiece.extension")
+                    }
+                    Button("导入 Provider Package") { showAppProviderImporter = true }
+                    Text("Provider Package 只包含 declarative JSON/Markdown；不加载 Swift、dylib、shell 或 root executable。Package 与 Skills 分库存储。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 if model.selectedProvider?.customModelAllowed == true {
                     Section("自定义模型") {
                         TextField("模型 ID", text: $customModelInput)
@@ -1478,6 +2128,22 @@ private struct SettingsView: View {
                 Section("厂商管理") {
                     Button("添加自定义厂商") { showCustomProvider = true }
                         .disabled(model.isProviderKeyMutationInFlight)
+
+                    if let provider = model.selectedProvider {
+                        Button(provider.source == .custom ? "删除当前厂商" : "从列表隐藏当前内置厂商") {
+                            showRemoveProviderConfirmation = true
+                        }
+                        .disabled(model.isProviderKeyMutationInFlight)
+                    }
+
+                    if model.hiddenProviderCount > 0 {
+                        Button("恢复隐藏的内置厂商（\(model.hiddenProviderCount)）") {
+                            model.restoreHiddenProviders()
+                        }
+                    }
+                    Text("自定义厂商删除后会同时清理该厂商的 Keychain 项和 Live Catalog 缓存；内置厂商只从列表隐藏，避免破坏安装包内置配置。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("交互学习") {
@@ -1494,12 +2160,35 @@ private struct SettingsView: View {
                 }
 
                 Section("诊断") {
+                    NavigationLink("感知专项探针") { PerceptionProbeView(model: model) }
                     NavigationLink {
                         DiagnosticLogsView(model: model)
                     } label: {
                         Label("日志", systemImage: "doc.text.magnifyingglass")
                     }
                     Text("结构化日志仅保存在本机，默认保留 72 小时且总量约 100 MB；写入和导出都会脱敏。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("错误提醒") {
+                    Toggle("后台错误系统通知", isOn: Binding(
+                        get: { backgroundErrorNotificationsEnabled },
+                        set: { enabled in
+                            if !enabled {
+                                backgroundErrorNotificationsEnabled = false
+                            } else {
+                                Task {
+                                    let granted = await ErrorNotificationCoordinator.requestAuthorization()
+                                    backgroundErrorNotificationsEnabled = granted
+                                    if !granted {
+                                        model.lastError = "系统通知权限未开启；前台错误浮窗仍会正常显示。"
+                                    }
+                                }
+                            }
+                        }
+                    ))
+                    Text("前台错误始终显示顶部浮窗；开启后，Cloud Code 在后台继续运行时遇到错误会发送本地系统通知，只包含用户可见的错误摘要。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -1539,6 +2228,10 @@ private struct SettingsView: View {
                 model.recordStartupBreadcrumb("settings.appear")
                 Task {
                     await model.reloadInteractionLearning()
+                    await model.reloadAppProviderPackages()
+                    if let package = model.selectedAppProviderPackage {
+                        await model.refreshAppProviderStatus(packageID: package.id)
+                    }
                     _ = await model.refreshSelectedProviderModelCatalog(showStatus: false)
                 }
             }
@@ -1556,10 +2249,40 @@ private struct SettingsView: View {
             .sheet(isPresented: $showCustomProvider) {
                 CustomProviderSheet(model: model, isPresented: $showCustomProvider)
             }
+            .sheet(isPresented: $showCustomAppProvider) {
+                CustomAppProviderSheet(model: model, isPresented: $showCustomAppProvider)
+            }
+            .sheet(item: $appProviderShareItem) { item in
+                DiagnosticActivityShareSheet(items: [item.url])
+            }
+            .confirmationDialog(
+                model.selectedProvider?.source == .custom ? "删除当前厂商？" : "隐藏当前内置厂商？",
+                isPresented: $showRemoveProviderConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button(model.selectedProvider?.source == .custom ? "删除厂商" : "隐藏厂商") {
+                    Task { _ = await model.removeOrHideSelectedProvider() }
+                }
+                Button("取消", role: .cancel) {}
+            } message: {
+                if let provider = model.selectedProvider {
+                    Text(provider.source == .custom
+                         ? "将删除 \(provider.displayName) 的本地配置、Keychain Key 和 Live Catalog 缓存。正在运行的任务会阻止删除。"
+                         : "\(provider.displayName) 只会从列表隐藏，安装包内置定义不会被物理删除。")
+                }
+            }
             .fileImporter(isPresented: $showBootstrapImporter, allowedContentTypes: [.json]) { result in
                 switch result {
                 case .success(let url): model.importProviderBootstrap(from: url)
                 case .failure(let error): model.lastError = String(describing: error)
+                }
+            }
+            .fileImporter(isPresented: $showAppProviderImporter, allowedContentTypes: [.zip]) { result in
+                switch result {
+                case .success(let url):
+                    Task { await model.importAppProvider(from: url) }
+                case .failure(let error):
+                    model.lastError = String(describing: error)
                 }
             }
         }
@@ -1648,6 +2371,9 @@ private struct CustomProviderSheet: View {
     @State private var label = ""
     @State private var baseURL = ""
     @State private var apiKey = ""
+    @State private var initialModel = ""
+    @State private var preferredProtocol: ProviderProtocol = .openAIChat
+    @State private var authMode: ProviderAuthMode = .bearer
 
     var body: some View {
         NavigationStack {
@@ -1660,9 +2386,22 @@ private struct CustomProviderSheet: View {
                     SecureField("API Key", text: $apiKey)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                    TextField("已知可用模型 ID（建议填写）", text: $initialModel)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Picker("协议", selection: $preferredProtocol) {
+                        Text("OpenAI Chat").tag(ProviderProtocol.openAIChat)
+                        Text("OpenAI Responses").tag(ProviderProtocol.openAIResponses)
+                        Text("Anthropic Messages").tag(ProviderProtocol.anthropic)
+                    }
+                    Picker("鉴权", selection: $authMode) {
+                        Text("Bearer").tag(ProviderAuthMode.bearer)
+                        Text("x-api-key").tag(ProviderAuthMode.xAPIKey)
+                        Text("Bearer + x-api-key").tag(ProviderAuthMode.both)
+                    }
                 }
                 Section {
-                    Text("Cloud Code 会发现 /v1/models，并使用最小请求验证 Anthropic Messages、OpenAI Chat 和 OpenAI Responses。Key 只保存到 Keychain。")
+                    Text("Cloud Code 会优先自动发现 /v1/models 并做最小推理验证。若中转站的模型目录不标准，只要你填写已知可用模型 ID、协议和鉴权方式，配置仍会保存为 NEEDS_VALIDATION，真实调用时继续验证；不会因为 /models 不兼容就删除中转站或 Key。Key 只保存到 Keychain。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -1674,7 +2413,14 @@ private struct CustomProviderSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("添加") {
-                        model.addCustomProvider(label: label, baseURLText: baseURL, apiKey: apiKey)
+                        model.addCustomProvider(
+                            label: label,
+                            baseURLText: baseURL,
+                            apiKey: apiKey,
+                            initialModel: initialModel,
+                            preferredProtocol: preferredProtocol,
+                            authMode: authMode
+                        )
                         apiKey = ""
                         isPresented = false
                     }
@@ -2032,7 +2778,9 @@ private func localizedCapabilityDetail(_ id: String, detail: String) -> String {
         if detail.contains("Verified on this runtime") { return "已在当前设备实际完成临时写入、读取和删除回验；Cloud Code 自身 Keychain 可用。" }
         return "正在按当前设备实际结果判断 Cloud Code 自身 Keychain，不再仅凭配置假定可用。"
     case "automation.url_scheme":
-        return detail.contains("disabled placeholder") ? "当前 URL Scheme 执行器只是禁用占位实现，因此现在不可用。" : "只有 URL 打开适配器真实接入并验证后才会启用。"
+        return detail.contains("self-validate") || detail.contains("validated at execution time")
+            ? "URL Scheme 执行器已接入；具体 URL 与目标 App 会在每次执行时验证系统接受结果和前台状态。"
+            : "URL Scheme 能力按具体调用自验证，不在启动阶段主动打开其他 App。"
     case "automation.xctest_wda":
         return detail.contains("No XCTest/WDA") ? "当前版本没有接入 XCTest / WDA 运行后端，因此不可用。" : "需要独立的 XCTest / WDA 运行后端。"
     case "automation.gui.open_app": return "由 bounded helper / LaunchServices 独立验证能否打开其他 App；不依赖完整 GUI backend。"
