@@ -268,6 +268,72 @@ static BOOL ApplicationPIDIsFrontmostViaSpringBoardInfo(pid_t pid)
     return [value respondsToSelector:@selector(boolValue)] && [value boolValue];
 }
 
+static BOOL ApplicationPIDHasForegroundRunningBoardState(pid_t expectedPID, NSString *bundleID)
+{
+    if (expectedPID <= 1 || bundleID.length == 0) { return NO; }
+    for (NSString *path in @[
+        @"/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices",
+        @"/rootfs/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices"
+    ]) {
+        if (dlopen(path.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL)) { break; }
+    }
+
+    Class predicateClass = NSClassFromString(@"RBSProcessPredicate");
+    Class handleClass = NSClassFromString(@"RBSProcessHandle");
+    SEL predicateSelector = NSSelectorFromString(@"predicateMatchingBundleIdentifier:");
+    SEL handleSelector = NSSelectorFromString(@"handleForPredicate:error:");
+    if (!predicateClass || !handleClass || ![predicateClass respondsToSelector:predicateSelector] || ![handleClass respondsToSelector:handleSelector]) {
+        return NO;
+    }
+
+    id predicate = nil;
+    id handle = nil;
+    NSError *error = nil;
+    @try {
+        id (*sendPredicate)(id, SEL, id) = (void *)objc_msgSend;
+        predicate = sendPredicate(predicateClass, predicateSelector, bundleID);
+        if (predicate) {
+            id (*sendHandle)(id, SEL, id, NSError **) = (void *)objc_msgSend;
+            handle = sendHandle(handleClass, handleSelector, predicate, &error);
+        }
+    } @catch (__unused NSException *exception) {
+        handle = nil;
+    }
+    if (!handle || error) { return NO; }
+
+    SEL pidSelector = NSSelectorFromString(@"rbs_pid");
+    if (![handle respondsToSelector:pidSelector]) { return NO; }
+    pid_t (*sendPID)(id, SEL) = (void *)objc_msgSend;
+    pid_t handlePID = 0;
+    @try { handlePID = sendPID(handle, pidSelector); }
+    @catch (__unused NSException *exception) { handlePID = 0; }
+    if (handlePID != expectedPID) { return NO; }
+
+    SEL currentStateSelector = NSSelectorFromString(@"currentState");
+    if (![handle respondsToSelector:currentStateSelector]) { return NO; }
+    id (*sendObject)(id, SEL) = (void *)objc_msgSend;
+    id state = nil;
+    @try { state = sendObject(handle, currentStateSelector); }
+    @catch (__unused NSException *exception) { state = nil; }
+    if (!state) { return NO; }
+
+    SEL runningSelector = NSSelectorFromString(@"isRunning");
+    SEL endowmentsSelector = NSSelectorFromString(@"endowmentNamespaces");
+    if (![state respondsToSelector:runningSelector] || ![state respondsToSelector:endowmentsSelector]) { return NO; }
+    BOOL (*sendBool)(id, SEL) = (void *)objc_msgSend;
+    BOOL running = NO;
+    id endowments = nil;
+    @try {
+        running = sendBool(state, runningSelector);
+        endowments = sendObject(state, endowmentsSelector);
+    } @catch (__unused NSException *exception) {
+        running = NO;
+        endowments = nil;
+    }
+    if (!running || ![endowments respondsToSelector:@selector(containsObject:)]) { return NO; }
+    return [endowments containsObject:@"com.apple.frontboard.visibility"];
+}
+
 static BOOL ApplicationHasForegroundBoardState(NSString *bundleID)
 {
     pid_t boardPID = ApplicationPIDForBundleIDViaBoardServices(bundleID);
@@ -282,7 +348,16 @@ static BOOL ApplicationHasForegroundBoardState(NSString *bundleID)
     // available before falling back to the legacy BKS monitor below. A live process alone never
     // counts as foreground proof.
     for (NSNumber *value in candidatePIDs) {
-        if (ApplicationPIDIsFrontmostViaSpringBoardInfo((pid_t)value.intValue)) {
+        pid_t pid = (pid_t)value.intValue;
+        if (ApplicationPIDIsFrontmostViaSpringBoardInfo(pid)) {
+            return YES;
+        }
+        // Root-persona SBS/BKS state is empty on the iOS 16.6 TrollStore device even when
+        // SpringBoard has already granted the exact target ForegroundFocal visibility. RunningBoard
+        // exposes that state behind com.apple.runningboard.process-state. Require both the exact
+        // bundle's PID and the FrontBoard visibility endowment so a merely alive/background process
+        // can never satisfy the foreground postcondition.
+        if (ApplicationPIDHasForegroundRunningBoardState(pid, bundleID)) {
             return YES;
         }
     }

@@ -13,7 +13,8 @@ ROOT_HELPER_SOURCE_ENTITLEMENTS="Entitlements/CloudCodeRootHelper.entitlements"
 for key in \
   'com.apple.springboard.launchapplications' \
   'com.apple.frontboard.launchapplications' \
-  'com.apple.backboardd.launchapplications'; do
+  'com.apple.backboardd.launchapplications' \
+  'com.apple.runningboard.process-state'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$ROOT_HELPER_SOURCE_ENTITLEMENTS" 2>/dev/null || true)"
   if [[ "$value" != "true" ]]; then
     echo "FAIL: RootHelper source entitlement missing or false: $key" >&2
@@ -127,7 +128,8 @@ for helper_only in \
   'com.apple.backboard.client' \
   'com.apple.springboard.launchapplications' \
   'com.apple.frontboard.launchapplications' \
-  'com.apple.backboardd.launchapplications'; do
+  'com.apple.backboardd.launchapplications' \
+  'com.apple.runningboard.process-state'; do
   if /usr/libexec/PlistBuddy -c "Print :$helper_only" "$ENTITLEMENTS" >/dev/null 2>&1; then
     echo "FAIL: GUI-only entitlement leaked onto SwiftUI host: $helper_only" >&2
     exit 11
@@ -268,7 +270,8 @@ for key in \
   'com.apple.backboard.client' \
   'com.apple.springboard.launchapplications' \
   'com.apple.frontboard.launchapplications' \
-  'com.apple.backboardd.launchapplications'; do
+  'com.apple.backboardd.launchapplications' \
+  'com.apple.runningboard.process-state'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$HELPER_ENTITLEMENTS" 2>/dev/null || true)"
   if [[ "$value" != "true" ]]; then
     echo "FAIL: root helper entitlement missing or false: $key" >&2
@@ -287,7 +290,8 @@ for key in \
   'com.apple.private.IOSurface.protected-access' \
   'com.apple.springboard.launchapplications' \
   'com.apple.frontboard.launchapplications' \
-  'com.apple.backboardd.launchapplications'; do
+  'com.apple.backboardd.launchapplications' \
+  'com.apple.runningboard.process-state'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$HELPER_CODESIGN_ENTITLEMENTS" 2>/dev/null || true)"
   if [[ "$value" != "true" ]]; then
     echo "FAIL: final root helper code signature entitlement missing or false: $key" >&2

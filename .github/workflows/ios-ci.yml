@@ -373,7 +373,8 @@ jobs:
             '<key>com.apple.backboard.client</key>' \
             '<key>com.apple.springboard.launchapplications</key>' \
             '<key>com.apple.frontboard.launchapplications</key>' \
-            '<key>com.apple.backboardd.launchapplications</key>'; do
+            '<key>com.apple.backboardd.launchapplications</key>' \
+            '<key>com.apple.runningboard.process-state</key>'; do
             if grep -F "$gui_only_entitlement" Entitlements/TrollStore.entitlements >/dev/null; then
               echo "FAIL: GUI-only entitlement leaked onto SwiftUI host: $gui_only_entitlement" >&2
               exit 1
@@ -408,6 +409,7 @@ jobs:
             '<key>com.apple.springboard.launchapplications</key>' \
             '<key>com.apple.frontboard.launchapplications</key>' \
             '<key>com.apple.backboardd.launchapplications</key>' \
+            '<key>com.apple.runningboard.process-state</key>' \
             '<string>UninstallForLaunchServices</string>' \
             '<string>Uninstall</string>' \
             '<key>com.apple.security.iokit-user-client-class</key>' \
