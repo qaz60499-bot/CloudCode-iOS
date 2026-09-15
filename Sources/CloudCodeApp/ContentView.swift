@@ -332,6 +332,19 @@ private struct PasteSafeComposerTextView: UIViewRepresentable {
         view.keyboardDismissMode = .interactive
         view.accessibilityIdentifier = "CloudCodeComposer"
         view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let accessory = UIToolbar(frame: CGRect(x: 0, y: 0, width: 0, height: 44))
+        accessory.autoresizingMask = [.flexibleWidth]
+        let dismissButton = UIButton(type: .system)
+        dismissButton.setTitle("收起", for: .normal)
+        dismissButton.accessibilityIdentifier = "CloudCodeDismissKeyboard"
+        dismissButton.addTarget(context.coordinator, action: #selector(Coordinator.dismissKeyboard), for: .touchUpInside)
+        accessory.items = [
+            UIBarButtonItem(systemItem: .flexibleSpace),
+            UIBarButtonItem(customView: dismissButton)
+        ]
+        view.inputAccessoryView = accessory
+        context.coordinator.activeTextView = view
         return view
     }
 
@@ -354,10 +367,16 @@ private struct PasteSafeComposerTextView: UIViewRepresentable {
     final class Coordinator: NSObject, UITextViewDelegate {
         @Binding private var text: String
         @Binding private var isFocused: Bool
+        weak var activeTextView: UITextView?
 
         init(text: Binding<String>, isFocused: Binding<Bool>) {
             _text = text
             _isFocused = isFocused
+        }
+
+        @objc func dismissKeyboard() {
+            activeTextView?.resignFirstResponder()
+            if isFocused { isFocused = false }
         }
 
         func textViewDidBeginEditing(_ textView: UITextView) {
@@ -794,11 +813,6 @@ private struct ChatView: View {
             Button(action: createNewConversation) {
                 Label("新建对话", systemImage: "square.and.pencil")
             }
-        }
-        ToolbarItemGroup(placement: .keyboard) {
-            Spacer()
-            Button("收起") { isComposerFocused = false }
-                .accessibilityIdentifier("CloudCodeDismissKeyboard")
         }
     }
 
