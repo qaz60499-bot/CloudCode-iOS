@@ -174,6 +174,66 @@ static NSString *FrontmostApplicationBundleID(void)
     return CFBridgingRelease(raw);
 }
 
+static pid_t ApplicationPIDForBundleIDViaBoardServices(NSString *bundleID)
+{
+    if (bundleID.length == 0) { return 0; }
+    NSArray<NSArray<NSString *> *> *candidates = @[
+        @[@"FBSSystemService", @"/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices"],
+        @[@"BKSSystemService", @"/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices"]
+    ];
+    for (NSArray<NSString *> *candidate in candidates) {
+        NSString *className = candidate[0];
+        NSString *frameworkPath = candidate[1];
+        dlopen(frameworkPath.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL);
+        Class cls = NSClassFromString(className);
+        if (!cls) { continue; }
+        id service = nil;
+        SEL sharedSelector = NSSelectorFromString(@"sharedService");
+        if ([cls respondsToSelector:sharedSelector]) {
+            id (*sendObject)(id, SEL) = (void *)objc_msgSend;
+            service = sendObject(cls, sharedSelector);
+        }
+        if (!service) { service = [[cls alloc] init]; }
+        SEL pidSelector = NSSelectorFromString(@"pidForApplication:");
+        if (!service || ![service respondsToSelector:pidSelector]) { continue; }
+        int (*sendPID)(id, SEL, id) = (void *)objc_msgSend;
+        int pid = sendPID(service, pidSelector, bundleID);
+        if (pid > 0) { return (pid_t)pid; }
+    }
+    return 0;
+}
+
+static BOOL ApplicationHasForegroundBoardState(NSString *bundleID)
+{
+    pid_t pid = ApplicationPIDForBundleIDViaBoardServices(bundleID);
+    if (pid <= 0) { return NO; }
+    for (NSString *path in @[
+        @"/System/Library/PrivateFrameworks/AssertionServices.framework/AssertionServices",
+        @"/rootfs/System/Library/PrivateFrameworks/AssertionServices.framework/AssertionServices"
+    ]) {
+        if (dlopen(path.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL)) { break; }
+    }
+    Class monitorClass = NSClassFromString(@"BKSApplicationStateMonitor");
+    SEL stateSelector = NSSelectorFromString(@"mostElevatedApplicationStateForPID:");
+    if (!monitorClass || ![monitorClass instancesRespondToSelector:stateSelector]) { return NO; }
+    id monitor = [[monitorClass alloc] init];
+    if (!monitor || ![monitor respondsToSelector:stateSelector]) { return NO; }
+    uint32_t (*sendState)(id, SEL, pid_t) = (void *)objc_msgSend;
+    uint32_t state = sendState(monitor, stateSelector, pid);
+    SEL invalidateSelector = NSSelectorFromString(@"invalidate");
+    if ([monitor respondsToSelector:invalidateSelector]) {
+        void (*sendVoid)(id, SEL) = (void *)objc_msgSend;
+        sendVoid(monitor, invalidateSelector);
+    }
+    // AssertionServices uses stable bit flags for foreground-running and
+    // foreground-running-obscured. Either is stronger process-state evidence than a missing/stale
+    // SBSCopyFrontmostApplicationDisplayIdentifier result; subsequent App Provider readiness checks
+    // still reject an obscuring surface before any composer action.
+    const uint32_t foregroundRunning = (1u << 3);
+    const uint32_t foregroundRunningObscured = (1u << 5);
+    return (state & (foregroundRunning | foregroundRunningObscured)) != 0;
+}
+
 static BOOL WaitForFrontmostApplication(NSString *bundleID, useconds_t timeoutMicroseconds)
 {
     if (bundleID.length == 0) { return NO; }
@@ -186,6 +246,10 @@ static BOOL WaitForFrontmostApplication(NSString *bundleID, useconds_t timeoutMi
         usleep(interval);
         elapsed += interval;
     } while (YES);
+    if (ApplicationHasForegroundBoardState(bundleID)) {
+        fprintf(stderr, "frontmost: SBS unavailable/stale; AssertionServices foreground state verified target pid\n");
+        return YES;
+    }
     return NO;
 }
 
