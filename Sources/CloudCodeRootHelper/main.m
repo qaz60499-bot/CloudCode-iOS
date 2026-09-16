@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
+#import <dispatch/dispatch.h>
 #import <errno.h>
 #import <fcntl.h>
 #import <poll.h>
@@ -147,6 +148,7 @@ static id Workspace(void)
 }
 
 typedef CFStringRef (*CloudCodeCopyFrontmostApplicationDisplayIdentifierFn)(void);
+typedef CFDictionaryRef (*CloudCodeCopyInfoForApplicationWithProcessIDFn)(pid_t);
 
 static void *SpringBoardServicesHandle(void)
 {
@@ -175,6 +177,7 @@ static NSString *FrontmostApplicationBundleID(void)
 }
 
 static NSString *BundlePathForIdentifierFromFilesystem(NSString *bundleID);
+static id ApplicationProxy(NSString *bundleID);
 static CloudCodeProcPidPathFn ProcPidPath(void);
 static NSArray<NSNumber *> *ProcessesUnderBundlePath(NSString *bundlePath);
 
@@ -243,6 +246,27 @@ static pid_t ApplicationPIDForBundleIDViaProcessInspection(NSString *bundleID)
     return candidates.count == 1 ? (pid_t)candidates.firstObject.intValue : 0;
 }
 
+static BOOL ApplicationPIDIsFrontmostViaSpringBoardInfo(pid_t pid)
+{
+    if (pid <= 1) { return NO; }
+    void *handle = SpringBoardServicesHandle();
+    if (!handle) { return NO; }
+    CloudCodeCopyInfoForApplicationWithProcessIDFn copyInfo =
+        (CloudCodeCopyInfoForApplicationWithProcessIDFn)dlsym(handle, "SBSCopyInfoForApplicationWithProcessID");
+    if (!copyInfo) { return NO; }
+
+    CFDictionaryRef raw = NULL;
+    @try {
+        raw = copyInfo(pid);
+    } @catch (__unused NSException *exception) {
+        raw = NULL;
+    }
+    if (!raw) { return NO; }
+    NSDictionary *info = CFBridgingRelease(raw);
+    id value = info[@"BKSApplicationStateAppIsFrontmost"];
+    return [value respondsToSelector:@selector(boolValue)] && [value boolValue];
+}
+
 static BOOL ApplicationHasForegroundBoardState(NSString *bundleID)
 {
     pid_t boardPID = ApplicationPIDForBundleIDViaBoardServices(bundleID);
@@ -251,6 +275,16 @@ static BOOL ApplicationHasForegroundBoardState(NSString *bundleID)
     if (boardPID > 0) { [candidatePIDs addObject:@(boardPID)]; }
     if (inspectedPID > 0) { [candidatePIDs addObject:@(inspectedPID)]; }
     if (candidatePIDs.count == 0) { return NO; }
+
+    // SpringBoardServices already exposes exact per-process frontmost state through the same
+    // application-info dictionary used by current device tooling. Prefer that bounded boolean when
+    // available before falling back to the legacy BKS monitor below. A live process alone never
+    // counts as foreground proof.
+    for (NSNumber *value in candidatePIDs) {
+        if (ApplicationPIDIsFrontmostViaSpringBoardInfo((pid_t)value.intValue)) {
+            return YES;
+        }
+    }
 
     // BKSApplicationStateMonitor is declared by BackBoardServices on the iOS versions where this
     // legacy state query exists. Load it explicitly instead of assuming AssertionServices happens to
@@ -298,6 +332,148 @@ static BOOL ApplicationHasForegroundBoardState(NSString *bundleID)
     return foreground;
 }
 
+static int WriteForegroundDiagnosticsFile(NSString *bundleID)
+{
+    if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0 || bundleID.length > 255) { return 10; }
+    NSString *bundlePath = BundlePathForIdentifierFromFilesystem(bundleID) ?: @"";
+    pid_t boardPID = ApplicationPIDForBundleIDViaBoardServices(bundleID);
+    pid_t inspectedPID = ApplicationPIDForBundleIDViaProcessInspection(bundleID);
+    NSArray<NSNumber *> *bundlePIDs = bundlePath.length > 0 ? ProcessesUnderBundlePath(bundlePath) : @[];
+    NSMutableOrderedSet<NSNumber *> *candidatePIDs = [NSMutableOrderedSet orderedSetWithArray:bundlePIDs];
+    if (boardPID > 0) { [candidatePIDs addObject:@(boardPID)]; }
+    if (inspectedPID > 0) { [candidatePIDs addObject:@(inspectedPID)]; }
+
+    CloudCodeProcPidPathFn pidPath = ProcPidPath();
+    NSMutableArray *processes = [NSMutableArray array];
+    for (NSNumber *value in candidatePIDs) {
+        pid_t pid = (pid_t)value.intValue;
+        NSString *path = @"";
+        if (pidPath && pid > 1) {
+            char pathBuffer[CLOUDCODE_PROC_PATH_MAX] = {0};
+            int length = pidPath(pid, pathBuffer, sizeof(pathBuffer));
+            if (length > 0) { path = CanonicalVarProcessPath([NSString stringWithUTF8String:pathBuffer]) ?: @""; }
+        }
+        [processes addObject:@{
+            @"pid": @(pid),
+            @"path": path,
+            @"sbsFrontmost": @(ApplicationPIDIsFrontmostViaSpringBoardInfo(pid))
+        }];
+    }
+
+    for (NSString *path in @[
+        @"/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices",
+        @"/rootfs/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices",
+        @"/System/Library/PrivateFrameworks/AssertionServices.framework/AssertionServices",
+        @"/rootfs/System/Library/PrivateFrameworks/AssertionServices.framework/AssertionServices"
+    ]) {
+        (void)dlopen(path.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL);
+    }
+    Class monitorClass = NSClassFromString(@"BKSApplicationStateMonitor");
+    SEL stateSelector = NSSelectorFromString(@"mostElevatedApplicationStateForPID:");
+    id monitor = monitorClass && [monitorClass instancesRespondToSelector:stateSelector] ? [[monitorClass alloc] init] : nil;
+    NSMutableArray *states = [NSMutableArray array];
+    if (monitor && [monitor respondsToSelector:stateSelector]) {
+        uint32_t (*sendState)(id, SEL, pid_t) = (void *)objc_msgSend;
+        for (NSNumber *value in candidatePIDs) {
+            uint32_t state = 0;
+            @try { state = sendState(monitor, stateSelector, (pid_t)value.intValue); }
+            @catch (__unused NSException *exception) { state = 0; }
+            [states addObject:@{
+                @"pid": value,
+                @"state": @(state),
+                @"foregroundBits": @((state & ((1u << 3) | (1u << 5))) != 0)
+            }];
+        }
+        SEL invalidateSelector = NSSelectorFromString(@"invalidate");
+        if ([monitor respondsToSelector:invalidateSelector]) {
+            void (*sendVoid)(id, SEL) = (void *)objc_msgSend;
+            sendVoid(monitor, invalidateSelector);
+        }
+    }
+
+    for (NSString *path in @[
+        @"/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices",
+        @"/rootfs/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices"
+    ]) {
+        if (dlopen(path.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL)) { break; }
+    }
+    Class predicateClass = NSClassFromString(@"RBSProcessPredicate");
+    Class handleClass = NSClassFromString(@"RBSProcessHandle");
+    SEL predicateSelector = NSSelectorFromString(@"predicateMatchingBundleIdentifier:");
+    SEL handleSelector = NSSelectorFromString(@"handleForPredicate:error:");
+    id predicate = nil;
+    id rbsHandle = nil;
+    NSError *rbsError = nil;
+    @try {
+        if (predicateClass && [predicateClass respondsToSelector:predicateSelector]) {
+            id (*sendPredicate)(id, SEL, id) = (void *)objc_msgSend;
+            predicate = sendPredicate(predicateClass, predicateSelector, bundleID);
+        }
+        if (predicate && handleClass && [handleClass respondsToSelector:handleSelector]) {
+            id (*sendHandle)(id, SEL, id, NSError **) = (void *)objc_msgSend;
+            rbsHandle = sendHandle(handleClass, handleSelector, predicate, &rbsError);
+        }
+    } @catch (NSException *exception) {
+        rbsError = [NSError errorWithDomain:@"CloudCode.ForegroundDiagnostics" code:1 userInfo:@{
+            NSLocalizedDescriptionKey: exception.reason ?: exception.name ?: @"RunningBoard lookup exception"
+        }];
+        rbsHandle = nil;
+    }
+    pid_t rbsPID = 0;
+    id rbsState = nil;
+    if (rbsHandle) {
+        SEL pidSelector = NSSelectorFromString(@"rbs_pid");
+        if ([rbsHandle respondsToSelector:pidSelector]) {
+            pid_t (*sendPID)(id, SEL) = (void *)objc_msgSend;
+            @try { rbsPID = sendPID(rbsHandle, pidSelector); }
+            @catch (__unused NSException *exception) { rbsPID = 0; }
+        }
+        SEL currentStateSelector = NSSelectorFromString(@"currentState");
+        if ([rbsHandle respondsToSelector:currentStateSelector]) {
+            id (*sendObject)(id, SEL) = (void *)objc_msgSend;
+            @try { rbsState = sendObject(rbsHandle, currentStateSelector); }
+            @catch (__unused NSException *exception) { rbsState = nil; }
+        }
+    }
+    NSMutableDictionary *rbsStateSelectors = [NSMutableDictionary dictionary];
+    for (NSString *selectorName in @[@"isRunning", @"taskState", @"role", @"effectiveRole", @"visibility", @"activationState"]) {
+        rbsStateSelectors[selectorName] = @(rbsState && [rbsState respondsToSelector:NSSelectorFromString(selectorName)]);
+    }
+    NSDictionary *runningBoard = @{
+        @"predicateClassAvailable": @(predicateClass != nil),
+        @"predicateSelectorAvailable": @(predicateClass && [predicateClass respondsToSelector:predicateSelector]),
+        @"handleClassAvailable": @(handleClass != nil),
+        @"handleSelectorAvailable": @(handleClass && [handleClass respondsToSelector:handleSelector]),
+        @"handleAvailable": @(rbsHandle != nil),
+        @"pid": @(rbsPID),
+        @"handleDescription": rbsHandle ? ([rbsHandle description] ?: @"") : @"",
+        @"stateClass": rbsState ? (NSStringFromClass([rbsState class]) ?: @"") : @"",
+        @"stateDescription": rbsState ? ([rbsState description] ?: @"") : @"",
+        @"stateSelectors": rbsStateSelectors,
+        @"error": rbsError.localizedDescription ?: @""
+    };
+
+    NSDictionary *payload = @{
+        @"bundleID": bundleID,
+        @"frontmostSBS": FrontmostApplicationBundleID() ?: @"",
+        @"bundlePath": bundlePath,
+        @"boardPID": @(boardPID),
+        @"inspectedPID": @(inspectedPID),
+        @"processes": processes,
+        @"monitorClassAvailable": @(monitorClass != nil),
+        @"stateSelectorAvailable": @(monitorClass && [monitorClass instancesRespondToSelector:stateSelector]),
+        @"states": states,
+        @"runningBoard": runningBoard
+    };
+    NSError *jsonError = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:NSJSONWritingPrettyPrinted error:&jsonError];
+    if (!data || jsonError) { return 41; }
+    NSString *outputPath = @"/var/mobile/Media/Downloads/CloudCode-Foreground-Diagnostics.json";
+    NSError *writeError = nil;
+    if (![data writeToFile:outputPath options:NSDataWritingAtomic error:&writeError]) { return 41; }
+    return 0;
+}
+
 static BOOL WaitForFrontmostApplication(NSString *bundleID, useconds_t timeoutMicroseconds)
 {
     if (bundleID.length == 0) { return NO; }
@@ -323,15 +499,69 @@ static int VerifyFrontmostApplication(NSString *bundleID)
     return WaitForFrontmostApplication(bundleID, 1200000) ? 0 : 80;
 }
 
-static void LoadBoardFramework(NSString *frameworkName)
+static void *LoadBoardFrameworkHandle(NSString *frameworkName)
 {
-    if (frameworkName.length == 0) { return; }
+    if (frameworkName.length == 0) { return NULL; }
     NSString *binary = [NSString stringWithFormat:@"%@.framework/%@", frameworkName, frameworkName];
     for (NSString *root in @[@"/System/Library/PrivateFrameworks", @"/rootfs/System/Library/PrivateFrameworks"]) {
         NSString *path = [root stringByAppendingPathComponent:binary];
         void *handle = dlopen(path.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL);
-        if (handle) { return; }
+        if (handle) { return handle; }
     }
+    return NULL;
+}
+
+static void LoadBoardFramework(NSString *frameworkName)
+{
+    (void)LoadBoardFrameworkHandle(frameworkName);
+}
+
+static NSString *CloudCodeBoardOptionKey(NSString *frameworkName, NSString *symbolName)
+{
+    void *handle = LoadBoardFrameworkHandle(frameworkName);
+    if (!handle || symbolName.length == 0) { return nil; }
+    void *symbol = dlsym(handle, symbolName.UTF8String);
+    if (!symbol) { return nil; }
+    NSString * __unsafe_unretained *value = (NSString * __unsafe_unretained *)symbol;
+    NSString *key = value ? *value : nil;
+    return [key isKindOfClass:NSString.class] && key.length > 0 ? key : nil;
+}
+
+static NSMutableDictionary *CloudCodeBoardLaunchOptions(NSString *bundleID, NSString *frameworkName)
+{
+    NSMutableDictionary *options = [NSMutableDictionary dictionary];
+    NSString *prefix = [frameworkName isEqualToString:@"FrontBoardServices"] ? @"FBS" : @"BKS";
+    for (NSString *suffix in @[@"OpenApplicationOptionKeyUnlockDevice", @"OpenApplicationOptionKeyPromptUnlockDevice"]) {
+        NSString *key = CloudCodeBoardOptionKey(frameworkName, [prefix stringByAppendingString:suffix]);
+        if (key.length > 0) { options[key] = @YES; }
+    }
+
+    if ([frameworkName isEqualToString:@"FrontBoardServices"]) {
+        id proxy = ApplicationProxy(bundleID);
+        NSNumber *sequence = nil;
+        id cacheGUID = nil;
+        @try {
+            id rawSequence = [proxy valueForKey:@"sequenceNumber"];
+            if ([rawSequence isKindOfClass:NSNumber.class]) { sequence = rawSequence; }
+            cacheGUID = [proxy valueForKey:@"cacheGUID"];
+        } @catch (__unused NSException *exception) {
+            sequence = nil;
+            cacheGUID = nil;
+        }
+        NSString *sequenceKey = CloudCodeBoardOptionKey(frameworkName, @"FBSOpenApplicationOptionKeyLSSequenceNumber");
+        NSString *cacheGUIDKey = CloudCodeBoardOptionKey(frameworkName, @"FBSOpenApplicationOptionKeyLSCacheGUID");
+        if (sequence && sequenceKey.length > 0) { options[sequenceKey] = sequence; }
+        NSString *cacheGUIDString = nil;
+        if ([cacheGUID isKindOfClass:NSString.class]) {
+            cacheGUIDString = cacheGUID;
+        } else if ([cacheGUID respondsToSelector:NSSelectorFromString(@"UUIDString")]) {
+            id (*sendObject)(id, SEL) = (void *)objc_msgSend;
+            id value = sendObject(cacheGUID, NSSelectorFromString(@"UUIDString"));
+            if ([value isKindOfClass:NSString.class]) { cacheGUIDString = value; }
+        }
+        if (cacheGUIDString.length > 0 && cacheGUIDKey.length > 0) { options[cacheGUIDKey] = cacheGUIDString; }
+    }
+    return options;
 }
 
 static BOOL LaunchViaBoardSystemService(NSString *bundleID, NSString *className, NSString *frameworkName, NSString **diagnostic)
@@ -343,38 +573,43 @@ static BOOL LaunchViaBoardSystemService(NSString *bundleID, NSString *className,
         return NO;
     }
 
-    id service = nil;
-    SEL sharedSelector = NSSelectorFromString(@"sharedService");
-    if ([cls respondsToSelector:sharedSelector]) {
-        id (*sendObject)(id, SEL) = (void *)objc_msgSend;
-        service = sendObject(cls, sharedSelector);
+    id service = [[cls alloc] init];
+    if (!service) {
+        SEL sharedSelector = NSSelectorFromString(@"sharedService");
+        if ([cls respondsToSelector:sharedSelector]) {
+            id (*sendObject)(id, SEL) = (void *)objc_msgSend;
+            service = sendObject(cls, sharedSelector);
+        }
     }
-    if (!service) { service = [[cls alloc] init]; }
     if (!service) {
         if (diagnostic) { *diagnostic = [NSString stringWithFormat:@"%@ service unavailable", className]; }
         return NO;
     }
 
+    NSMutableDictionary *options = CloudCodeBoardLaunchOptions(bundleID, frameworkName);
     __block NSError *reportedError = nil;
+    __block BOOL completionCalled = NO;
+    dispatch_semaphore_t completionSemaphore = dispatch_semaphore_create(0);
     void (^completion)(NSError *) = ^(NSError *error) {
         reportedError = error;
+        completionCalled = YES;
+        dispatch_semaphore_signal(completionSemaphore);
     };
     @try {
+        SEL createPortSelector = NSSelectorFromString(@"createClientPort");
+        SEL clientSelector = NSSelectorFromString(@"openApplication:options:clientPort:withResult:");
         SEL simpleSelector = NSSelectorFromString(@"openApplication:options:withResult:");
-        if ([service respondsToSelector:simpleSelector]) {
-            void (*sendOpen)(id, SEL, id, id, void (^)(NSError *)) = (void *)objc_msgSend;
-            sendOpen(service, simpleSelector, bundleID, @{}, completion);
-        } else {
-            SEL createPortSelector = NSSelectorFromString(@"createClientPort");
-            SEL clientSelector = NSSelectorFromString(@"openApplication:options:clientPort:withResult:");
-            if (![service respondsToSelector:createPortSelector] || ![service respondsToSelector:clientSelector]) {
-                if (diagnostic) { *diagnostic = [NSString stringWithFormat:@"%@ openApplication selector unavailable", className]; }
-                return NO;
-            }
+        if ([service respondsToSelector:createPortSelector] && [service respondsToSelector:clientSelector]) {
             unsigned int (*sendPort)(id, SEL) = (void *)objc_msgSend;
             unsigned int port = sendPort(service, createPortSelector);
             void (*sendOpenWithPort)(id, SEL, id, id, unsigned int, void (^)(NSError *)) = (void *)objc_msgSend;
-            sendOpenWithPort(service, clientSelector, bundleID, @{}, port, completion);
+            sendOpenWithPort(service, clientSelector, bundleID, options, port, completion);
+        } else if ([service respondsToSelector:simpleSelector]) {
+            void (*sendOpen)(id, SEL, id, id, void (^)(NSError *)) = (void *)objc_msgSend;
+            sendOpen(service, simpleSelector, bundleID, options, completion);
+        } else {
+            if (diagnostic) { *diagnostic = [NSString stringWithFormat:@"%@ openApplication selector unavailable", className]; }
+            return NO;
         }
     } @catch (NSException *exception) {
         if (diagnostic) {
@@ -383,14 +618,29 @@ static BOOL LaunchViaBoardSystemService(NSString *bundleID, NSString *className,
         return NO;
     }
 
+    long completionWait = dispatch_semaphore_wait(
+        completionSemaphore,
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC))
+    );
+    BOOL completionObserved = completionWait == 0 || completionCalled;
+    if (completionObserved && reportedError) {
+        if (diagnostic) {
+            *diagnostic = [NSString stringWithFormat:@"%@ launch rejected: %@ options=%lu", className,
+                           reportedError.localizedDescription ?: @"error", (unsigned long)options.count];
+        }
+        return NO;
+    }
+
     if (WaitForFrontmostApplication(bundleID, 1500000)) {
-        if (diagnostic) { *diagnostic = [NSString stringWithFormat:@"%@ foreground verification passed", className]; }
+        if (diagnostic) {
+            *diagnostic = [NSString stringWithFormat:@"%@ foreground verification passed completion=%s options=%lu",
+                           className, completionObserved ? "observed" : "timeout", (unsigned long)options.count];
+        }
         return YES;
     }
     if (diagnostic) {
-        *diagnostic = reportedError
-            ? [NSString stringWithFormat:@"%@ launch rejected: %@", className, reportedError.localizedDescription ?: @"error"]
-            : [NSString stringWithFormat:@"%@ did not establish target foreground", className];
+        *diagnostic = [NSString stringWithFormat:@"%@ did not establish target foreground completion=%s options=%lu",
+                       className, completionObserved ? "observed" : "timeout", (unsigned long)options.count];
     }
     return NO;
 }
@@ -1532,6 +1782,11 @@ static int CloudCodeRunOneShotCommand(int argc, const char *argv[])
             if (argc < 3) { return 10; }
             NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
             return VerifyFrontmostApplication(bundleID);
+        }
+        if ([command isEqualToString:@"foreground-diagnostics-file"]) {
+            if (argc < 3) { return 10; }
+            NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
+            return WriteForegroundDiagnosticsFile(bundleID);
         }
         if ([command isEqualToString:@"gui-probe-json"]) {
             return CloudCodeGUIProbeJSON();

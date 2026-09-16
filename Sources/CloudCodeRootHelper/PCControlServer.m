@@ -28,6 +28,7 @@ extern char **environ;
 #define CLOUDCODE_PC_CONTROL_TOKEN_BYTES 32
 #define CLOUDCODE_PC_CONTROL_MAX_REQUEST_BYTES (64 * 1024)
 #define CLOUDCODE_PC_CONTROL_CHILD_TIMEOUT_MS 5000
+#define CLOUDCODE_PC_CONTROL_LAUNCH_TIMEOUT_MS 12000
 #define CLOUDCODE_PC_CONTROL_INSTALL_TIMEOUT_MS 110000
 
 static NSString * const CloudCodePCControlTokenPath = @"/var/mobile/Media/Downloads/CloudCode-PC-Control.json";
@@ -302,12 +303,13 @@ static NSDictionary *CloudCodePCActionResponse(const char *executablePath, NSDic
         NSData *textData = [text dataUsingEncoding:NSUTF8StringEncoding];
         NSString *encoded = [textData base64EncodedStringWithOptions:0];
         arguments = @[@"gui-type-base64", encoded];
-    } else if ([operation isEqualToString:@"launch"] || [operation isEqualToString:@"is-frontmost"]) {
+    } else if ([operation isEqualToString:@"launch"] || [operation isEqualToString:@"is-frontmost"] || [operation isEqualToString:@"foreground-diagnostics"]) {
         NSString *bundleID = [request[@"bundleID"] isKindOfClass:NSString.class] ? request[@"bundleID"] : nil;
         if (!CloudCodePCIsSafeBundleID(bundleID)) {
             return @{@"ok": @NO, @"op": operation, @"error": @"invalid-bundle-id"};
         }
-        arguments = @[operation, bundleID];
+        NSString *command = [operation isEqualToString:@"foreground-diagnostics"] ? @"foreground-diagnostics-file" : operation;
+        arguments = @[command, bundleID];
     } else if ([operation isEqualToString:@"install-ipa"]) {
         NSString *path = [request[@"path"] isKindOfClass:NSString.class] ? request[@"path"] : nil;
         NSString *bundleID = [request[@"bundleID"] isKindOfClass:NSString.class] ? request[@"bundleID"] : nil;
@@ -320,9 +322,14 @@ static NSDictionary *CloudCodePCActionResponse(const char *executablePath, NSDic
         return @{@"ok": @NO, @"op": operation, @"error": @"unsupported-op"};
     }
 
-    int code = [operation isEqualToString:@"install-ipa"]
-        ? CloudCodePCRunOneShotWithTimeout(executablePath, arguments, CLOUDCODE_PC_CONTROL_INSTALL_TIMEOUT_MS)
-        : CloudCodePCRunOneShot(executablePath, arguments);
+    int code = 0;
+    if ([operation isEqualToString:@"install-ipa"]) {
+        code = CloudCodePCRunOneShotWithTimeout(executablePath, arguments, CLOUDCODE_PC_CONTROL_INSTALL_TIMEOUT_MS);
+    } else if ([operation isEqualToString:@"launch"]) {
+        code = CloudCodePCRunOneShotWithTimeout(executablePath, arguments, CLOUDCODE_PC_CONTROL_LAUNCH_TIMEOUT_MS);
+    } else {
+        code = CloudCodePCRunOneShot(executablePath, arguments);
+    }
     return @{
         @"ok": @(code == 0),
         @"op": operation,
