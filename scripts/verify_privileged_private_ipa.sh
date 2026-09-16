@@ -9,6 +9,18 @@ fi
 
 bash scripts/verify_ipa.sh "$IPA_PATH"
 
+ROOT_HELPER_SOURCE_ENTITLEMENTS="Entitlements/CloudCodeRootHelper.entitlements"
+for key in \
+  'com.apple.springboard.launchapplications' \
+  'com.apple.frontboard.launchapplications' \
+  'com.apple.backboardd.launchapplications'; do
+  value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$ROOT_HELPER_SOURCE_ENTITLEMENTS" 2>/dev/null || true)"
+  if [[ "$value" != "true" ]]; then
+    echo "FAIL: RootHelper source entitlement missing or false: $key" >&2
+    exit 12
+  fi
+done
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 unzip -q "$IPA_PATH" -d "$TMP_DIR"
@@ -96,6 +108,7 @@ for vision_iokit_key in \
     fi
   done
 done
+
 for helper_only in \
   'com.apple.multitasking.unlimitedassertions' \
   'com.apple.hid.system.server-access' \
@@ -112,6 +125,7 @@ for helper_only in \
   'com.apple.QuartzCore.system-layers' \
   'com.apple.private.IOSurface.protected-access' \
   'com.apple.backboard.client' \
+  'com.apple.springboard.launchapplications' \
   'com.apple.frontboard.launchapplications' \
   'com.apple.backboardd.launchapplications'; do
   if /usr/libexec/PlistBuddy -c "Print :$helper_only" "$ENTITLEMENTS" >/dev/null 2>&1; then
@@ -252,6 +266,7 @@ for key in \
   'com.apple.QuartzCore.system-layers' \
   'com.apple.private.IOSurface.protected-access' \
   'com.apple.backboard.client' \
+  'com.apple.springboard.launchapplications' \
   'com.apple.frontboard.launchapplications' \
   'com.apple.backboardd.launchapplications'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$HELPER_ENTITLEMENTS" 2>/dev/null || true)"
@@ -270,6 +285,7 @@ for key in \
   'com.apple.private.hid.manager.client' \
   'com.apple.QuartzCore.global-capture' \
   'com.apple.private.IOSurface.protected-access' \
+  'com.apple.springboard.launchapplications' \
   'com.apple.frontboard.launchapplications' \
   'com.apple.backboardd.launchapplications'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$HELPER_CODESIGN_ENTITLEMENTS" 2>/dev/null || true)"

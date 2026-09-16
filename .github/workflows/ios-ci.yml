@@ -371,6 +371,7 @@ jobs:
             '<key>com.apple.QuartzCore.system-layers</key>' \
             '<key>com.apple.private.IOSurface.protected-access</key>' \
             '<key>com.apple.backboard.client</key>' \
+            '<key>com.apple.springboard.launchapplications</key>' \
             '<key>com.apple.frontboard.launchapplications</key>' \
             '<key>com.apple.backboardd.launchapplications</key>'; do
             if grep -F "$gui_only_entitlement" Entitlements/TrollStore.entitlements >/dev/null; then
@@ -404,6 +405,7 @@ jobs:
             '<key>com.apple.private.MobileInstallationHelperService.allowed</key>' \
             '<key>com.apple.private.uninstall.deletion</key>' \
             '<key>com.apple.private.mobileinstall.allowedSPI</key>' \
+            '<key>com.apple.springboard.launchapplications</key>' \
             '<key>com.apple.frontboard.launchapplications</key>' \
             '<key>com.apple.backboardd.launchapplications</key>' \
             '<string>UninstallForLaunchServices</string>' \

@@ -479,6 +479,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         defer { activePackageID = nil }
 
         let package = try await packageStore.package(id: configuration.packageID)
+        await recordExecutionPhase("provider_start", package: package, detail: "开始 App-backed Provider 请求")
         guard package.summary.enabled else {
             throw AppBackedProviderRuntimeError.needsAuthorization("Provider Package 已停用")
         }
@@ -504,27 +505,45 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             throw AppBackedProviderRuntimeError.pluginUpdateRequired(introspection.version)
         }
 
-        try await transition(.launchApp, state: .busy, detail: "启动 \(package.summary.manifest.displayName)", package: package, appVersion: introspection.version)
         try Task.checkCancellation()
+        let bundleID = package.summary.manifest.bundleID
+        let alreadyFrontmost = await Task.detached(priority: .utility) {
+            EmbeddedRootHelper.verifyFrontmost(bundleID: bundleID)
+        }.value
         let launch: GUIOpenAppOutcome
-        do {
-            launch = try await gui.openApp(bundleID: package.summary.manifest.bundleID)
-        } catch {
-            // A static installation false-negative is only a discovery hint on the TrollStore/root
-            // persona. If the exact launch also fails, do not promote that stale hint into a
-            // definitive `notInstalled` error: doing so hides the real LaunchServices/FrontBoard
-            // failure and makes an installed provider appear missing. Keep the launch failure as the
-            // authoritative runtime result and attach the static discovery detail for diagnostics.
-            let launchFailure = "精确 Bundle 启动失败：\(String(describing: error))"
-            let detail = discoveryDetail.map { "\(launchFailure)；静态发现信息：\($0)" } ?? launchFailure
+        if alreadyFrontmost.verified {
+            // Reuse the existing authenticated foreground session. Do not issue another launch for
+            // an App that is already frontmost: repeated activation is unnecessary and can disturb
+            // the exact composer/generation UI state we are about to verify.
+            launch = GUIOpenAppOutcome(
+                accepted: true,
+                foregroundVerified: true,
+                detail: "target_already_frontmost; \(alreadyFrontmost.detail)"
+            )
+        } else {
+            try await transition(.launchApp, state: .busy, detail: "目标 App 当前非前台；执行一次可靠 foreground activation：\(package.summary.manifest.displayName)", package: package, appVersion: introspection.version)
+            do {
+                launch = try await gui.openApp(bundleID: bundleID)
+            } catch {
+                // A static installation false-negative is only a discovery hint on the TrollStore/root
+                // persona. If the exact launch also fails, do not promote that stale hint into a
+                // definitive `notInstalled` error: doing so hides the real LaunchServices/FrontBoard
+                // failure and makes an installed provider appear missing. Keep the launch failure as the
+                // authoritative runtime result and attach the static discovery detail for diagnostics.
+                let launchFailure = "failure=foreground_failed; 精确 Bundle 启动失败：\(String(describing: error))"
+                let detail = discoveryDetail.map { "\(launchFailure)；静态发现信息：\($0)" } ?? launchFailure
+                try await transition(.classify, state: .degraded, detail: detail, package: package, appVersion: introspection.version)
+                throw AppBackedProviderRuntimeError.foregroundVerificationFailed(detail)
+            }
+        }
+        guard launch.accepted, launch.foregroundVerified else {
+            let detail = "failure=foreground_failed; \(launch.detail)"
             try await transition(.classify, state: .degraded, detail: detail, package: package, appVersion: introspection.version)
             throw AppBackedProviderRuntimeError.foregroundVerificationFailed(detail)
         }
-        guard launch.accepted, launch.foregroundVerified else {
-            try await transition(.classify, state: .degraded, detail: launch.detail, package: package, appVersion: introspection.version)
-            throw AppBackedProviderRuntimeError.foregroundVerificationFailed(launch.detail)
-        }
+        await recordExecutionPhase("app_available", package: package, detail: launch.detail, appVersion: introspection.version)
         try await transition(.verifyForeground, state: .busy, detail: launch.detail, package: package, appVersion: introspection.version)
+        await recordExecutionPhase("foreground_verified", package: package, detail: launch.detail, appVersion: introspection.version)
 
         var observation = try await observe(appVersion: introspection.version)
         try await transition(.verifyLogin, state: .busy, detail: "验证登录/可用状态", package: package, appVersion: introspection.version)
@@ -576,9 +595,10 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             appVersion: introspection.version,
             testedCoordinateAppVersion: package.summary.manifest.compatibility.testedAppVersion
         ) else {
-            try await transition(.classify, state: .needsPluginUpdate, detail: "composer selector 未匹配", package: package, appVersion: introspection.version)
-            throw AppBackedProviderRuntimeError.composerUnavailable("没有高置信 composer selector")
+            try await transition(.classify, state: .needsPluginUpdate, detail: "failure=composer_not_found; composer selector 未匹配", package: package, appVersion: introspection.version)
+            throw AppBackedProviderRuntimeError.composerUnavailable("composer_not_found: 没有高置信 composer selector")
         }
+        await recordExecutionPhase("composer_verified", package: package, detail: "composer selector 已命中", appVersion: introspection.version)
         try Task.checkCancellation()
         try await gui.tap(x: composer.element.centerX, y: composer.element.centerY)
         try await Self.sleep(seconds: 0.25)
@@ -624,9 +644,10 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         try await Self.sleep(seconds: 0.30)
         observation = try await observe(appVersion: introspection.version)
         guard await inputProbeVerified(inputProbe, observation: observation, composer: composer.element) else {
-            try await transition(.classify, state: .degraded, detail: "文本输入 helper 已派发，但当前 composer 没有出现本轮输入探针；拒绝继续点 Send", package: package, appVersion: introspection.version)
-            throw AppBackedProviderRuntimeError.submissionFailed("Prompt 输入未通过本地回读验证")
+            try await transition(.classify, state: .degraded, detail: "failure=input_not_verified; 文本输入 helper 已派发，但当前 composer 没有出现本轮输入探针；拒绝继续点 Send", package: package, appVersion: introspection.version)
+            throw AppBackedProviderRuntimeError.submissionFailed("input_not_verified: Prompt 输入未通过本地回读验证")
         }
+        await recordExecutionPhase("prompt_inserted", package: package, detail: "request-unique input probe 已从 composer 本地回读", appVersion: introspection.version)
         guard let send = await resolve(
             package.selectors.send,
             observation: observation,
@@ -634,23 +655,64 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             appVersion: introspection.version,
             testedCoordinateAppVersion: package.summary.manifest.compatibility.testedAppVersion
         ) else {
-            try await transition(.classify, state: .needsPluginUpdate, detail: "send selector 未匹配；不会使用未绑定坐标盲点", package: package, appVersion: introspection.version)
-            throw AppBackedProviderRuntimeError.submissionFailed("send selector 未匹配")
+            try await transition(.classify, state: .needsPluginUpdate, detail: "failure=submit_unverified; send selector 未匹配；不会使用未绑定坐标盲点", package: package, appVersion: introspection.version)
+            throw AppBackedProviderRuntimeError.submissionFailed("submit_unverified: send selector 未匹配")
         }
         try Task.checkCancellation()
         try await requireProviderForeground(package: package, stage: .verifySubmission, appVersion: introspection.version)
-        try await gui.tap(x: send.element.centerX, y: send.element.centerY)
-        try await transition(.verifySubmission, state: .busy, detail: "Prompt 已派发；等待 generation 状态变化", package: package, appVersion: introspection.version)
-
+        let preSendText = Self.visibleText(observation)
         let generationStartedAt = Date()
+        try await gui.tap(x: send.element.centerX, y: send.element.centerY)
+        try await transition(.verifySubmission, state: .busy, detail: "Send 已派发；先验证 composer 清空或 generation-start 信号，未验证前不得进入 generation 阶段", package: package, appVersion: introspection.version)
+
+        let submissionDeadline = Date().addingTimeInterval(min(4.0, max(1.5, package.workflow.generationStartTimeoutSeconds)))
+        var submissionObservation = observation
+        var submitVerified = false
+        var absentComposerProbeSamples = 0
+        while Date() < submissionDeadline {
+            try Task.checkCancellation()
+            try await requireProviderForeground(package: package, stage: .verifySubmission, appVersion: introspection.version)
+            let current = try await observe(appVersion: introspection.version)
+            try await rejectProviderError(current, package: package, stage: .verifySubmission)
+            submissionObservation = current
+            let generationSignal = matchesAny(package.selectors.generationStart, observation: current, packageID: package.summary.id)
+            if generationSignal {
+                submitVerified = true
+                break
+            }
+            if await inputProbePresentInComposerArea(inputProbe, observation: current) {
+                absentComposerProbeSamples = 0
+            } else {
+                absentComposerProbeSamples += 1
+                if absentComposerProbeSamples >= 2 {
+                    submitVerified = true
+                    break
+                }
+            }
+            try await Self.sleep(seconds: 0.20)
+        }
+        guard submitVerified else {
+            let detail = "failure=submit_unverified; Send tap 已派发，但没有观察到 generation-start，也没有连续确认 composer 清除本轮 input probe"
+            try await transition(.classify, state: .degraded, detail: detail, package: package, appVersion: introspection.version)
+            throw AppBackedProviderRuntimeError.submissionFailed("submit_unverified: 未取得提交后的物理 UI 证据")
+        }
+        observation = submissionObservation
+        await recordExecutionPhase("submit_verified", package: package, detail: "Send 后已取得物理 UI 状态变化证据", appVersion: introspection.version)
+
         continuation.yield(.status("App Provider 正在生成…"))
-        try await transition(.waitGenerationStart, state: .busy, detail: "等待 generation start", package: package, appVersion: introspection.version)
+        try await transition(.waitGenerationStart, state: .busy, detail: "提交已验证；等待 generation start", package: package, appVersion: introspection.version)
         let startDeadline = Date().addingTimeInterval(package.workflow.generationStartTimeoutSeconds)
-        // Compare against the verified pre-send page. Its first nonempty snapshot
-        // is not evidence that the provider started generating a response.
+        // Compare against the verified pre-send page. Its first nonempty snapshot is not sufficient;
+        // generation starts only after a declared signal or a further post-submit page mutation.
         var lastObservedText = Self.visibleText(observation)
-        var sawGenerationSignal = package.selectors.generationStart.isEmpty
-        while Date() < startDeadline {
+        var sawGenerationSignal = matchesAny(package.selectors.generationStart, observation: observation, packageID: package.summary.id)
+        if !sawGenerationSignal, Self.visibleText(observation) != preSendText, !Self.visibleText(observation).isEmpty {
+            // The submit gate already proved the composer cleared across consecutive observations;
+            // an additional page mutation at this point is valid generation evidence for packages
+            // whose UI does not expose a stable Stop label.
+            sawGenerationSignal = package.selectors.generationStart.isEmpty
+        }
+        while Date() < startDeadline, !sawGenerationSignal {
             try Task.checkCancellation()
             try await requireProviderForeground(package: package, stage: .waitGenerationStart, appVersion: introspection.version)
             observation = try await observe(appVersion: introspection.version)
@@ -668,9 +730,10 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             try await Self.sleep(seconds: package.workflow.pollIntervalSeconds)
         }
         guard sawGenerationSignal else {
-            try await transition(.classify, state: .timeout, detail: "generation start timeout", package: package, appVersion: introspection.version)
-            throw AppBackedProviderRuntimeError.generationTimeout("generation start timeout")
+            try await transition(.classify, state: .timeout, detail: "failure=generation_not_started; generation start timeout", package: package, appVersion: introspection.version)
+            throw AppBackedProviderRuntimeError.generationTimeout("generation_not_started: generation start timeout")
         }
+        await recordExecutionPhase("generation_started", package: package, detail: "已观察到 generation-start 信号或提交后的进一步页面变化", appVersion: introspection.version)
 
         try await transition(.waitGeneration, state: .busy, detail: "等待 bounded stable window", package: package, appVersion: introspection.version)
         let generationDeadline = Date().addingTimeInterval(package.workflow.generationTimeoutSeconds)
@@ -696,19 +759,32 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             try await Self.sleep(seconds: package.workflow.pollIntervalSeconds)
         }
         guard let stableSince, Date().timeIntervalSince(stableSince) >= package.workflow.stableWindowSeconds else {
-            try await transition(.classify, state: .timeout, detail: "generation completion timeout", package: package, appVersion: introspection.version)
-            throw AppBackedProviderRuntimeError.generationTimeout("generation completion timeout")
+            try await transition(.classify, state: .timeout, detail: "failure=generation_timeout; generation completion timeout", package: package, appVersion: introspection.version)
+            throw AppBackedProviderRuntimeError.generationTimeout("generation_timeout: generation completion timeout")
         }
+        await recordExecutionPhase("generation_completed", package: package, detail: "generation 已达到声明 completion signal / bounded stable window", appVersion: introspection.version)
 
         try await transition(.extractResponse, state: .busy, detail: "按 AX → Copy/Clipboard → OCR 顺序提取回答", package: package, appVersion: introspection.version)
         try await requireProviderForeground(package: package, stage: .extractResponse, appVersion: introspection.version)
-        let extraction = try await extractResponse(package: package, observation: finalObservation, expectedTag: expectedTag, appVersion: introspection.version)
+        let extraction: (text: String, route: String)
+        do {
+            extraction = try await extractResponse(package: package, observation: finalObservation, expectedTag: expectedTag, appVersion: introspection.version)
+        } catch let error as AppBackedProviderRuntimeError {
+            try await transition(.classify, state: .degraded, detail: "failure=response_extraction_failed; \(error.description)", package: package, appVersion: introspection.version)
+            throw error
+        }
         let latencyMS = max(0, Int(Date().timeIntervalSince(generationStartedAt) * 1_000))
         try await transition(.validateResponse, state: .busy, detail: "验证本轮响应标签，防止把输入回显或旧回答误当成本轮结果", package: package, appVersion: introspection.version, extractionRoute: extraction.route, latencyMS: latencyMS)
         guard let boundedText = Self.boundText(extraction.text, expectedTag: expectedTag) else {
-            try await transition(.classify, state: .degraded, detail: "当前回答未包含本轮响应标签", package: package, appVersion: introspection.version, extractionRoute: extraction.route, latencyMS: latencyMS)
-            throw AppBackedProviderRuntimeError.responseValidationFailed("当前回答无法绑定本轮响应")
+            try await transition(.classify, state: .degraded, detail: "failure=response_extraction_failed; 当前回答未包含本轮响应标签", package: package, appVersion: introspection.version, extractionRoute: extraction.route, latencyMS: latencyMS)
+            throw AppBackedProviderRuntimeError.responseValidationFailed("response_extraction_failed: 当前回答无法绑定本轮响应")
         }
+        let responsePayload = String(boundedText.dropFirst(expectedTag.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !responsePayload.isEmpty else {
+            try await transition(.classify, state: .degraded, detail: "failure=response_empty; 已提取到本轮 response tag，但回答正文为空", package: package, appVersion: introspection.version, extractionRoute: extraction.route, latencyMS: latencyMS)
+            throw AppBackedProviderRuntimeError.responseValidationFailed("response_empty: 本轮回答正文为空")
+        }
+        await recordExecutionPhase("response_extracted", package: package, detail: "已提取并绑定本轮非空回答；route=\(extraction.route)", appVersion: introspection.version, extractionRoute: extraction.route, latencyMS: latencyMS)
 
         let parsed = Self.parseResponse(boundedText, expectedTag: expectedTag, tools: tools)
         var completionDetail = "App-backed Provider inference 完成"
@@ -743,6 +819,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             )
         }
         try await transition(.done, state: .ready, detail: completionDetail, package: package, appVersion: introspection.version, extractionRoute: extraction.route, latencyMS: latencyMS)
+        await recordExecutionPhase("provider_completed", package: package, detail: completionDetail, appVersion: introspection.version, extractionRoute: extraction.route, latencyMS: latencyMS)
         return parsed
     }
 
@@ -765,7 +842,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         }.value
         try Task.checkCancellation()
         guard second.verified else {
-            let detail = "failure_stage=\(stage.rawValue); first=\(first.detail); retry=\(second.detail)"
+            let detail = "failure=foreground_failed; failure_stage=\(stage.rawValue); first=\(first.detail); retry=\(second.detail)"
             try await transition(.classify, state: .degraded, detail: detail, package: package, appVersion: appVersion)
             // A changed foreground after a request begins must not use the initial-launch retry:
             // the prompt may already have been submitted, and repeating it would duplicate work.
@@ -870,6 +947,28 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             height: observation.screenHeight * 0.70
         )
         return await inputProbeVisiblePrecisely(probe, observation: observation, region: interactiveRegion)
+    }
+
+    private func inputProbePresentInComposerArea(_ probe: String, observation: Observation) async -> Bool {
+        // Post-Send verification must inspect the live composer region rather than treating a
+        // successful HID tap as submission proof. Keep this check OCR-local: a sent prompt may still
+        // be present elsewhere in the AX/tree as a user message and must not make the composer look
+        // uncleared. Two consecutive misses are required by the caller; a declared generation-start
+        // indicator can satisfy the same gate immediately.
+        let composerRegion = CGRect(
+            x: 0,
+            y: observation.screenHeight * 0.45,
+            width: observation.screenWidth,
+            height: observation.screenHeight * 0.55
+        )
+        let precise = await LocalVisionTextObservation.observe(
+            for: observation.screenshot,
+            maximumElements: 96,
+            regionInScreenPoints: composerRegion,
+            requiresText: true,
+            forcePrecise: true
+        )
+        return Self.inputProbeVisible(probe, text: precise.elements.map(\.text).joined(separator: "\n"))
     }
 
     private func inputProbeVisiblePrecisely(
@@ -1108,6 +1207,31 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         }
     }
 
+    private func recordExecutionPhase(
+        _ phase: String,
+        package: AppProviderPackage,
+        detail: String,
+        appVersion: String? = nil,
+        extractionRoute: String? = nil,
+        latencyMS: Int? = nil
+    ) async {
+        try? await diagnosticLogger?.log(
+            level: .info,
+            subsystem: "app-provider-phase",
+            action: phase,
+            result: phase,
+            diagnostic: detail,
+            metadata: [
+                "phase": phase,
+                "packageID": package.summary.id,
+                "bundleID": package.summary.manifest.bundleID,
+                "appVersion": appVersion ?? "",
+                "responseExtractionRoute": extractionRoute ?? "",
+                "generationLatencyMS": latencyMS.map(String.init) ?? ""
+            ]
+        )
+    }
+
     private func transition(
         _ hostState: AppBackedProviderHostState,
         state: AppBackedProviderAvailabilityState,
@@ -1226,6 +1350,10 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
     }
 
     private static func inputProbeVisible(_ probe: String, observation: Observation) -> Bool {
+        inputProbeVisible(probe, text: visibleText(observation))
+    }
+
+    private static func inputProbeVisible(_ probe: String, text: String) -> Bool {
         func normalized(_ value: String) -> String {
             value.uppercased().unicodeScalars.compactMap { scalar -> Character? in
                 let value = scalar.value
@@ -1234,7 +1362,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             }.reduce(into: "") { $0.append($1) }
         }
         let expected = normalized(probe)
-        let observed = normalized(visibleText(observation))
+        let observed = normalized(text)
         guard expected.count >= 8, observed.contains("CCINPUT") else { return false }
         let suffix = String(expected.dropFirst("CCINPUT".count))
         let bindingPrefix = String(suffix.prefix(4))

@@ -149,6 +149,7 @@ static id Workspace(void)
 
 typedef CFStringRef (*CloudCodeCopyFrontmostApplicationDisplayIdentifierFn)(void);
 typedef CFDictionaryRef (*CloudCodeCopyInfoForApplicationWithProcessIDFn)(pid_t);
+typedef uint32_t (*CloudCodeLaunchApplicationWithIdentifierAndLaunchOptionsFn)(NSString *, NSDictionary *, BOOL);
 
 static void *SpringBoardServicesHandle(void)
 {
@@ -976,6 +977,42 @@ static int ProbeLaunchCapability(void)
     CloudCodeExitOneShot([workspace respondsToSelector:NSSelectorFromString(@"openApplicationWithBundleID:")] ? 0 : 42);
 }
 
+static BOOL LaunchViaSpringBoardServices(NSString *bundleID, NSString **diagnostic)
+{
+    void *handle = SpringBoardServicesHandle();
+    if (!handle) {
+        if (diagnostic) { *diagnostic = @"SpringBoardServices framework unavailable"; }
+        return NO;
+    }
+    CloudCodeLaunchApplicationWithIdentifierAndLaunchOptionsFn launch =
+        (CloudCodeLaunchApplicationWithIdentifierAndLaunchOptionsFn)dlsym(handle, "SBSLaunchApplicationWithIdentifierAndLaunchOptions");
+    if (!launch) {
+        if (diagnostic) { *diagnostic = @"SBSLaunchApplicationWithIdentifierAndLaunchOptions unavailable"; }
+        return NO;
+    }
+
+    uint32_t rawResult = 0;
+    @try {
+        // Modern SpringBoardServices uses the three-argument ABI also used by current Frida:
+        // identifier, launch options, suspended. Do not request implicit device unlock here.
+        // Success is never inferred from the raw return value; the requested Bundle ID must become
+        // physically frontmost through the existing bounded verification path below.
+        rawResult = launch(bundleID, @{}, NO);
+    } @catch (NSException *exception) {
+        if (diagnostic) {
+            *diagnostic = [NSString stringWithFormat:@"SBS launch raised %@", exception.name ?: @"exception"];
+        }
+        return NO;
+    }
+
+    BOOL foregroundVerified = WaitForFrontmostApplication(bundleID, 1500000);
+    if (diagnostic) {
+        *diagnostic = [NSString stringWithFormat:@"SBS rawResult=%u foreground=%s",
+                       rawResult, foregroundVerified ? "verified" : "unverified"];
+    }
+    return foregroundVerified;
+}
+
 static int LaunchApplication(NSString *bundleID)
 {
     if (bundleID.length == 0 || [bundleID isEqualToString:@"com.cloudcode.ios"]) { CloudCodeExitOneShot(10); }
@@ -1027,6 +1064,12 @@ static int LaunchApplication(NSString *bundleID)
         CloudCodeExitOneShot([workspace respondsToSelector:selector] ? 46 : 42);
     }
 
+    NSString *springBoardDiagnostic = nil;
+    if (LaunchViaSpringBoardServices(bundleID, &springBoardDiagnostic)) {
+        fprintf(stderr, "launch: route=springboard-services %s\n", springBoardDiagnostic.UTF8String ?: "verified");
+        CloudCodeExitOneShot(0);
+    }
+
     NSString *frontBoardDiagnostic = nil;
     if (LaunchViaBoardSystemService(bundleID, @"FBSSystemService", @"FrontBoardServices", &frontBoardDiagnostic)) {
         fprintf(stderr, "launch: route=frontboard %s\n", frontBoardDiagnostic.UTF8String ?: "verified");
@@ -1040,8 +1083,9 @@ static int LaunchApplication(NSString *bundleID)
     }
 
     fprintf(stderr,
-            "launch: route=launchservices+frontboard+backboard rejected lsSelector=%s fbs=%s bks=%s\n",
+            "launch: route=launchservices+springboard+frontboard+backboard rejected lsSelector=%s sbs=%s fbs=%s bks=%s\n",
             [workspace respondsToSelector:selector] ? "available" : "unavailable",
+            springBoardDiagnostic.UTF8String ?: "unavailable",
             frontBoardDiagnostic.UTF8String ?: "unavailable",
             backBoardDiagnostic.UTF8String ?: "unavailable");
     CloudCodeExitOneShot([workspace respondsToSelector:selector] ? 46 : 42);
