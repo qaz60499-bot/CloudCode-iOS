@@ -174,6 +174,19 @@ static NSString *FrontmostApplicationBundleID(void)
     return CFBridgingRelease(raw);
 }
 
+static NSString *BundlePathForIdentifierFromFilesystem(NSString *bundleID);
+static CloudCodeProcPidPathFn ProcPidPath(void);
+static NSArray<NSNumber *> *ProcessesUnderBundlePath(NSString *bundlePath);
+
+static NSString *CanonicalVarProcessPath(NSString *path)
+{
+    NSString *normalized = NormalizePath(path);
+    if ([normalized hasPrefix:@"/private/var/"]) {
+        return [normalized substringFromIndex:@"/private".length];
+    }
+    return normalized;
+}
+
 static pid_t ApplicationPIDForBundleIDViaBoardServices(NSString *bundleID)
 {
     if (bundleID.length == 0) { return 0; }
@@ -203,10 +216,51 @@ static pid_t ApplicationPIDForBundleIDViaBoardServices(NSString *bundleID)
     return 0;
 }
 
+static pid_t ApplicationPIDForBundleIDViaProcessInspection(NSString *bundleID)
+{
+    NSString *bundlePath = BundlePathForIdentifierFromFilesystem(bundleID);
+    if (bundlePath.length == 0) { return 0; }
+    NSArray<NSNumber *> *candidates = ProcessesUnderBundlePath(bundlePath);
+    if (candidates.count == 0) { return 0; }
+
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"Info.plist"]];
+    NSString *executable = [info[@"CFBundleExecutable"] isKindOfClass:NSString.class] ? info[@"CFBundleExecutable"] : nil;
+    NSString *expectedPath = executable.length > 0
+        ? CanonicalVarProcessPath([bundlePath stringByAppendingPathComponent:executable])
+        : nil;
+    CloudCodeProcPidPathFn pidPath = ProcPidPath();
+    if (expectedPath.length > 0 && pidPath) {
+        for (NSNumber *value in candidates) {
+            pid_t pid = (pid_t)value.intValue;
+            if (pid <= 1) { continue; }
+            char pathBuffer[CLOUDCODE_PROC_PATH_MAX] = {0};
+            int length = pidPath(pid, pathBuffer, sizeof(pathBuffer));
+            if (length <= 0) { continue; }
+            NSString *processPath = CanonicalVarProcessPath([NSString stringWithUTF8String:pathBuffer]);
+            if ([processPath isEqualToString:expectedPath]) { return pid; }
+        }
+    }
+    return candidates.count == 1 ? (pid_t)candidates.firstObject.intValue : 0;
+}
+
 static BOOL ApplicationHasForegroundBoardState(NSString *bundleID)
 {
-    pid_t pid = ApplicationPIDForBundleIDViaBoardServices(bundleID);
-    if (pid <= 0) { return NO; }
+    pid_t boardPID = ApplicationPIDForBundleIDViaBoardServices(bundleID);
+    pid_t inspectedPID = ApplicationPIDForBundleIDViaProcessInspection(bundleID);
+    NSMutableOrderedSet<NSNumber *> *candidatePIDs = [NSMutableOrderedSet orderedSet];
+    if (boardPID > 0) { [candidatePIDs addObject:@(boardPID)]; }
+    if (inspectedPID > 0) { [candidatePIDs addObject:@(inspectedPID)]; }
+    if (candidatePIDs.count == 0) { return NO; }
+
+    // BKSApplicationStateMonitor is declared by BackBoardServices on the iOS versions where this
+    // legacy state query exists. Load it explicitly instead of assuming AssertionServices happens to
+    // pull the class in as a transitive dependency.
+    for (NSString *path in @[
+        @"/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices",
+        @"/rootfs/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices"
+    ]) {
+        if (dlopen(path.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL)) { break; }
+    }
     for (NSString *path in @[
         @"/System/Library/PrivateFrameworks/AssertionServices.framework/AssertionServices",
         @"/rootfs/System/Library/PrivateFrameworks/AssertionServices.framework/AssertionServices"
@@ -219,19 +273,29 @@ static BOOL ApplicationHasForegroundBoardState(NSString *bundleID)
     id monitor = [[monitorClass alloc] init];
     if (!monitor || ![monitor respondsToSelector:stateSelector]) { return NO; }
     uint32_t (*sendState)(id, SEL, pid_t) = (void *)objc_msgSend;
-    uint32_t state = sendState(monitor, stateSelector, pid);
+    const uint32_t foregroundRunning = (1u << 3);
+    const uint32_t foregroundRunningObscured = (1u << 5);
+    BOOL foreground = NO;
+    for (NSNumber *value in candidatePIDs) {
+        uint32_t state = 0;
+        @try {
+            state = sendState(monitor, stateSelector, (pid_t)value.intValue);
+        } @catch (__unused NSException *exception) {
+            state = 0;
+        }
+        if ((state & (foregroundRunning | foregroundRunningObscured)) != 0) {
+            foreground = YES;
+            break;
+        }
+    }
     SEL invalidateSelector = NSSelectorFromString(@"invalidate");
     if ([monitor respondsToSelector:invalidateSelector]) {
         void (*sendVoid)(id, SEL) = (void *)objc_msgSend;
         sendVoid(monitor, invalidateSelector);
     }
-    // AssertionServices uses stable bit flags for foreground-running and
-    // foreground-running-obscured. Either is stronger process-state evidence than a missing/stale
-    // SBSCopyFrontmostApplicationDisplayIdentifier result; subsequent App Provider readiness checks
-    // still reject an obscuring surface before any composer action.
-    const uint32_t foregroundRunning = (1u << 3);
-    const uint32_t foregroundRunningObscured = (1u << 5);
-    return (state & (foregroundRunning | foregroundRunningObscured)) != 0;
+    // Only the documented BKS foreground-running bits are accepted. A merely alive/background
+    // process is not sufficient proof that the Provider UI owns the foreground.
+    return foreground;
 }
 
 static BOOL WaitForFrontmostApplication(NSString *bundleID, useconds_t timeoutMicroseconds)
@@ -1078,8 +1142,9 @@ static BOOL HasProcessInspectionBackend(void)
 
 static NSArray<NSNumber *> *ProcessesUnderBundlePath(NSString *bundlePath)
 {
-    NSString *normalized = NormalizePath(bundlePath);
-    if (!IsSafeBundlePath(normalized)) { return @[]; }
+    NSString *original = NormalizePath(bundlePath);
+    if (!IsSafeBundlePath(original)) { return @[]; }
+    NSString *normalized = CanonicalVarProcessPath(original);
     CloudCodeProcListAllPidsFn listAllPids = ProcListAllPids();
     CloudCodeProcPidPathFn pidPath = ProcPidPath();
     if (!listAllPids || !pidPath) { return @[]; }
@@ -1096,7 +1161,7 @@ static NSArray<NSNumber *> *ProcessesUnderBundlePath(NSString *bundlePath)
         char pathBuffer[CLOUDCODE_PROC_PATH_MAX] = {0};
         int length = pidPath(pid, pathBuffer, sizeof(pathBuffer));
         if (length <= 0) { continue; }
-        NSString *processPath = [NSString stringWithUTF8String:pathBuffer];
+        NSString *processPath = CanonicalVarProcessPath([NSString stringWithUTF8String:pathBuffer]);
         if ([processPath isEqualToString:normalized] || [processPath hasPrefix:prefix]) {
             [matches addObject:@(pid)];
         }
