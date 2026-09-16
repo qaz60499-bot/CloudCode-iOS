@@ -1982,7 +1982,7 @@ private struct SettingsView: View {
                         LabeledContent("当前 Key", value: model.selectedKeyIsInstalled ? "本次已确认" : "启动未扫描")
                     }
                     LabeledContent("配置规模", value: "\(model.providerProfiles.filter(\.enabled).count) 个厂商 · \(model.providerProfiles.filter(\.enabled).reduce(0) { $0 + $1.keySlots.count }) 个 Key")
-                    Text("此区只配置 Network Provider；切到 App Provider 后仍可预先维护这里的 API 配置，但不会参与当前推理。")
+                    Text("此区用于 Network Provider。显式选择厂商、Key 或模型会立即切回 Network Provider，避免已选中中转 API 时仍误走 App Provider；若要继续使用 App Provider，请在上方后端选择器重新切换。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

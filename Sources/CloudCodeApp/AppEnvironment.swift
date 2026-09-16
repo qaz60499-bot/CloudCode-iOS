@@ -1267,6 +1267,12 @@ public final class CloudCodeViewModel: ObservableObject {
 
     public func selectProvider(_ providerID: String) {
         providerKeyCheckMessage = nil
+        // A direct interaction with the Network Provider picker is an explicit routing choice.
+        // Previously the provider/key/model fields could all change while `selectedProviderBackend`
+        // stayed `.appBacked`, so Send still launched Gemini/DeepSeek and never reached URLSession.
+        // Keep background catalog reconciliation side-effect free, but switch the active backend for
+        // these user-facing selection methods before persisting the new network selection.
+        selectedProviderBackend = .network
         let state = ProviderSelectionResolver.reconcile(
             ProviderSelectionState(providerID: providerID, keySlotID: "", model: ""),
             profiles: providerProfiles
@@ -1280,6 +1286,7 @@ public final class CloudCodeViewModel: ObservableObject {
 
     public func selectKey(_ keySlotID: String) {
         providerKeyCheckMessage = nil
+        selectedProviderBackend = .network
         let state = ProviderSelectionResolver.reconcile(
             ProviderSelectionState(providerID: selectedProviderID, keySlotID: keySlotID, model: selectedModel),
             profiles: providerProfiles
@@ -1543,6 +1550,7 @@ public final class CloudCodeViewModel: ObservableObject {
             overrides.insert(identity)
         }
         UserDefaults.standard.set(overrides.sorted(), forKey: Self.explicitCustomModelOverridesDefaultsKey)
+        selectedProviderBackend = .network
         selectedModel = normalized
         persistProviderSelection()
     }
@@ -1884,6 +1892,18 @@ public final class CloudCodeViewModel: ObservableObject {
                 syncVisibleSessionState(sessionID)
 
                 let requestText = trimmed.isEmpty && !attachments.isEmpty ? "请处理这张图片。" : trimmed
+                if case .appBacked = config {
+                    // App-backed inference deliberately foregrounds another iOS app. Pre-arm the
+                    // existing Cloud Code background lease while we are still foreground and wait
+                    // for the detached root-helper acquisition attempt to settle before openApp can
+                    // run. Relying only on scenePhase(.inactive/.background) leaves a race where the
+                    // provider app becomes foreground first and suspends this task before composer
+                    // tap/type/send can execute.
+                    beginBackgroundExecutionIfNeeded()
+                    if let acquireTask = backgroundAssertionAcquireTask {
+                        await acquireTask.value
+                    }
+                }
                 recordStartupBreadcrumb("runtime.agent.stream.attach")
                 let stream = await agentCore.send(
                     text: requestText,

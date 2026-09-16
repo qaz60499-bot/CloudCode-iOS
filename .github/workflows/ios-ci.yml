@@ -944,6 +944,16 @@ jobs:
           for marker in ('func hasAuthorization(packageID: String)', 'Self.isFirstPartyPackage(package)', 'await authorizationStore.hasAuthorization(packageID: package.summary.id)', 'await authorizationStore.setAuthorized(true, identity: identity, packageID: package.summary.id)'):
               if marker not in app_provider_runtime:
                   raise SystemExit(f'FAIL: first-party App Provider authorization no longer migrates across selector/package maintenance revisions: {marker}')
+          runtime_run = app_provider_runtime.split('private func run(', 1)[1].split('private func requireProviderForeground', 1)[0]
+          if 'installationProbe(bundleID:' in runtime_run:
+              raise SystemExit('FAIL: App Provider inference regressed to blocking on non-authoritative TrollStore static installation metadata before exact launch')
+          preflight = app_provider_runtime.split('func preflightStatus(packageID:', 1)[1].split('func setupProbe(packageID:', 1)[0]
+          if preflight.index('if !requireVerifiedExecution') > preflight.index('let installation = await installationProbe'):
+              raise SystemExit('FAIL: harmless App Provider execution preflight waits on static installation metadata before the fast explicit-launch path')
+          for method_name in ('selectProvider(_ providerID:', 'selectKey(_ keySlotID:', 'selectModel(_ model:'):
+              selection = app.split(f'public func {method_name}', 1)[1].split('public func ', 1)[0]
+              if 'selectedProviderBackend = .network' not in selection:
+                  raise SystemExit(f'FAIL: explicit Network Provider selection can leave App Provider routing active: {method_name}')
           coordinate_match = app_provider_runtime.split('case .coordinateFallback:', 1)[1].split('if selector.strategy == .axRole', 1)[0]
           for marker in ('coordinate.deviceClass.caseInsensitiveCompare(observation.deviceClass)', 'coordinate.orientation.caseInsensitiveCompare(observation.orientation)', 'coordinate.appVersion == observation.appVersion', 'abs(coordinate.screenWidth - observation.screenWidth) <= 1', 'abs(coordinate.screenHeight - observation.screenHeight) <= 1'):
               if marker not in coordinate_match:

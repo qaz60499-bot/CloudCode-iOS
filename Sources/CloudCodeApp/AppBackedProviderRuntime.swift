@@ -272,6 +272,32 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
                 generationLatencyMS: nil
             )
         }
+        // An explicit harmless execution probe must not spend its launch-critical window waiting on
+        // TrollStore LaunchServices metadata. The root helper's app-introspection and exact install
+        // lookup can each consume several seconds and are advisory on this persona anyway. Let the
+        // explicit test reach the authoritative exact Bundle launch + frontmost proof immediately;
+        // the ordinary status-refresh path below still performs full static diagnostics.
+        if !requireVerifiedExecution {
+            guard await ensureAuthorization(for: package) else {
+                return StatusSnapshot(
+                    state: .needsAuthorization,
+                    hostState: .checkAuthorization,
+                    detail: "尚未授权 Cloud Code 使用该 Provider Package。",
+                    appVersion: nil,
+                    responseExtractionRoute: nil,
+                    generationLatencyMS: nil
+                )
+            }
+            return StatusSnapshot(
+                state: .ready,
+                hostState: .checkCompatibility,
+                detail: "本地使用授权已通过；无副作用测试将跳过非权威静态安装 metadata，直接进入精确 Bundle 启动 + 前台验证。",
+                appVersion: nil,
+                responseExtractionRoute: nil,
+                generationLatencyMS: nil
+            )
+        }
+
         let installation = await installationProbe(bundleID: package.summary.manifest.bundleID)
         let introspection: AppStaticIntrospection
         let discoveryDetail: String?
@@ -305,16 +331,6 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
                 hostState: .checkCompatibility,
                 detail: "已授权，但当前 App 版本 \(introspection.version) 超出 Provider Package 声明兼容范围",
                 appVersion: introspection.version,
-                responseExtractionRoute: nil,
-                generationLatencyMS: nil
-            )
-        }
-        if !requireVerifiedExecution {
-            return StatusSnapshot(
-                state: .ready,
-                hostState: .checkCompatibility,
-                detail: discoveryDetail.map { "本地授权已通过；静态发现暂不可靠（\($0)），允许进入精确 Bundle 启动 + 前台验证的 harmless marker 测试。" } ?? "本地使用授权、安装状态与版本兼容检查通过；允许开始端到端 harmless marker 验证",
-                appVersion: introspection.version == Self.runtimeUnverifiedAppVersion ? nil : introspection.version,
                 responseExtractionRoute: nil,
                 generationLatencyMS: nil
             )
@@ -466,21 +482,15 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         guard package.summary.enabled else {
             throw AppBackedProviderRuntimeError.needsAuthorization("Provider Package 已停用")
         }
-        try await transition(.checkInstalled, state: .busy, detail: "检查目标 App 安装状态", package: package)
-        let installation = await installationProbe(bundleID: package.summary.manifest.bundleID)
-        let introspection: AppStaticIntrospection
-        let discoveryDetail: String?
-        switch installation {
-        case .installed(let value):
-            introspection = value
-            discoveryDetail = nil
-        case .notInstalled(let detail):
-            introspection = Self.runtimeFallbackIntrospection(for: package)
-            discoveryDetail = "静态安装索引返回未安装；将以精确启动 + 前台 Bundle 验证作为最终证据。\(detail)"
-        case .metadataUnavailable(let detail):
-            introspection = Self.runtimeFallbackIntrospection(for: package)
-            discoveryDetail = detail
-        }
+        // Static LaunchServices metadata is intentionally not a correctness gate for inference on
+        // TrollStore. It is both slow (multiple bounded helper calls in series) and has reproduced
+        // false negatives on this device. Start from the already-bounded runtime-unverified profile
+        // and let exact Bundle launch + fresh frontmost verification be the authoritative install
+        // proof. Coordinate fallback remains constrained by the package's tested app version plus
+        // exact device/orientation/geometry checks in resolve(), so this does not enable free taps.
+        try await transition(.checkInstalled, state: .busy, detail: "跳过非权威静态安装索引；转入精确 Bundle 启动验证", package: package)
+        let introspection = Self.runtimeFallbackIntrospection(for: package)
+        let discoveryDetail: String? = "推理关键路径不等待 TrollStore 静态 metadata；精确启动与前台 Bundle 验证作为权威证据。"
 
         try await transition(.checkAuthorization, state: .busy, detail: "检查 Cloud Code Provider 授权", package: package, appVersion: introspection.version)
         guard await ensureAuthorization(for: package) else {
