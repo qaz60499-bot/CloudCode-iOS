@@ -4467,6 +4467,12 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private func applySelection(_ state: ProviderSelectionState) {
+        // ProviderSelectionState is exclusively the Network Provider selection model. Any path that
+        // applies one (picker changes, bootstrap reconciliation, provider deletion fallback, or
+        // session restoration) is therefore an explicit network-routing decision. Keeping a stale
+        // `.appBacked` backend here makes the UI show a network provider/key/model while Send still
+        // foregrounds Gemini/DeepSeek instead of reaching URLSession.
+        selectedProviderBackend = .network
         selectedProviderID = state.providerID
         selectedKeySlotID = state.keySlotID
         selectedModel = state.model
@@ -4675,16 +4681,30 @@ public final class CloudCodeViewModel: ObservableObject {
             streamingAssistantMessageIDs.removeValue(forKey: visible.id)
         }
         permissionMode = visible.permissionMode
-        let desired = ProviderSelectionState(
-            providerID: visible.providerID ?? selectedProviderID,
-            keySlotID: visible.keySlotID ?? selectedKeySlotID,
-            model: visible.model ?? selectedModel
-        )
-        let reconciled = ProviderSelectionResolver.reconcile(desired, profiles: providerProfiles)
-        applySelection(reconciled)
-        session.providerID = reconciled.providerID
-        session.keySlotID = reconciled.keySlotID
-        session.model = reconciled.model
+        if let providerID = visible.providerID,
+           (visible.keySlotID ?? "").isEmpty,
+           let package = appProviderPackages.first(where: { $0.id == providerID && $0.enabled }) {
+            // App-backed sessions intentionally carry no network Key slot. Packages are loaded before
+            // normal session restoration, so this exact package-ID match is enough to restore the
+            // backend without guessing from display text or model labels.
+            selectedAppProviderPackageID = package.id
+            selectedProviderBackend = .appBacked
+            persistProviderSelection()
+            session.providerID = package.id
+            session.keySlotID = ""
+            session.model = package.manifest.modelLabel
+        } else {
+            let desired = ProviderSelectionState(
+                providerID: visible.providerID ?? selectedProviderID,
+                keySlotID: visible.keySlotID ?? selectedKeySlotID,
+                model: visible.model ?? selectedModel
+            )
+            let reconciled = ProviderSelectionResolver.reconcile(desired, profiles: providerProfiles)
+            applySelection(reconciled)
+            session.providerID = reconciled.providerID
+            session.keySlotID = reconciled.keySlotID
+            session.model = reconciled.model
+        }
         activityLines = sessionActivityLines[visible.id] ?? []
         lastError = sessionErrors[visible.id]
         UserDefaults.standard.set(session.id.uuidString, forKey: "session.current.id")

@@ -563,7 +563,7 @@ jobs:
           for marker in ('enumerate-json', 'probe-filesystem-json', 'probe-launch', 'probe-uninstall', 'probe-ipa-install', 'install-ipa', 'trollstorehelper', 'trollstore-install: verified', 'is-installed', 'launch', 'uninstall', 'cleanup-unregistered', 'MCMMetadataIdentifier', 'BundleFilesystem(read-only-discovery)', 'BundlePathForIdentifierFromFilesystem', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-screenshot-file', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-navigate-back', 'gui-type-base64', 'background-assert-worker', 'background-assert-start', 'background-assert-status', 'background-assert-stop', 'BKSProcessAssertion', 'CloudCode.BackgroundAgent'):
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: root helper command missing: {marker}')
-          for marker in ('@"%@.framework/%@"', '@"FBSSystemService", @"FrontBoardServices"', '@"BKSSystemService", @"BackBoardServices"', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'BKSApplicationStateMonitor', 'mostElevatedApplicationStateForPID:', 'foregroundRunningObscured', 'geteuid() != 0', 'foreground verification passed', 'launchservices+frontboard+backboard'):
+          for marker in ('@"%@.framework/%@"', '@"FBSSystemService", @"FrontBoardServices"', '@"BKSSystemService", @"BackBoardServices"', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'BKSApplicationStateMonitor', 'mostElevatedApplicationStateForPID:', 'foregroundRunningObscured', 'ApplicationPIDForBundleIDViaProcessInspection', 'CanonicalVarProcessPath', 'ProcessesUnderBundlePath', 'BackBoardServices.framework/BackBoardServices', 'geteuid() != 0', 'foreground verification passed', 'launchservices+frontboard+backboard'):
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: app launch lost bounded board-service fallback/foreground verification marker: {marker}')
           bridge = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
@@ -954,6 +954,13 @@ jobs:
               selection = app.split(f'public func {method_name}', 1)[1].split('public func ', 1)[0]
               if 'selectedProviderBackend = .network' not in selection:
                   raise SystemExit(f'FAIL: explicit Network Provider selection can leave App Provider routing active: {method_name}')
+          apply_selection = app.split('private func applySelection(_ state: ProviderSelectionState)', 1)[1].split('private func persistProviderSelection()', 1)[0]
+          if 'selectedProviderBackend = .network' not in apply_selection:
+              raise SystemExit('FAIL: reconciled/restored Network Provider selection can leave stale App Provider routing active')
+          adopt_session = app.split('private func adoptSession(_ loaded: AgentSession)', 1)[1].split('private static func sessionTitle', 1)[0]
+          for marker in ('(visible.keySlotID ?? "").isEmpty', 'appProviderPackages.first(where:', 'selectedProviderBackend = .appBacked', 'applySelection(reconciled)'):
+              if marker not in adopt_session:
+                  raise SystemExit(f'FAIL: session restoration lost deterministic Network/App Provider backend restoration: {marker}')
           coordinate_match = app_provider_runtime.split('case .coordinateFallback:', 1)[1].split('if selector.strategy == .axRole', 1)[0]
           for marker in ('coordinate.deviceClass.caseInsensitiveCompare(observation.deviceClass)', 'coordinate.orientation.caseInsensitiveCompare(observation.orientation)', 'coordinate.appVersion == observation.appVersion', 'abs(coordinate.screenWidth - observation.screenWidth) <= 1', 'abs(coordinate.screenHeight - observation.screenHeight) <= 1'):
               if marker not in coordinate_match:
