@@ -1259,6 +1259,34 @@ final class ProviderDiscoveryTests: XCTestCase {
         XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.probeBody()?["model"] as? String, "gemini-3.8-flash")
     }
 
+    func testOfficialGeminiProfileNormalizationForcesCompatibleProtocolAndAuth() {
+        let profile = ProviderProfile(
+            id: "custom-google",
+            displayName: "Google Gemini",
+            baseURL: URL(string: "https://generativelanguage.googleapis.com")!,
+            protocols: [.anthropic, .openAIResponses],
+            preferredProtocol: .anthropic,
+            authMode: .xAPIKey,
+            models: ["gemini-3.8-flash"],
+            keySlots: [ProviderKeySlot(
+                id: "slot-1",
+                label: "Key 1",
+                fingerprint: "abc",
+                models: ["gemini-3.8-flash"],
+                protocols: [.anthropic],
+                modelProtocols: ["gemini-3.8-flash": [.anthropic]]
+            )],
+            source: .custom,
+            customModelAllowed: true
+        ).normalizedForOfficialCompatibilityEndpoint()
+
+        XCTAssertEqual(profile.protocols, [.openAIChat])
+        XCTAssertEqual(profile.preferredProtocol, .openAIChat)
+        XCTAssertEqual(profile.authMode, .bearer)
+        XCTAssertEqual(profile.keySlots.first?.protocols, [.openAIChat])
+        XCTAssertEqual(profile.keySlots.first?.modelProtocols["gemini-3.8-flash"], [.openAIChat])
+    }
+
     func testGeminiInferenceCandidateRankingPullsChatModelIntoBoundedProbeWindow() {
         let specialized = (0..<12).map { "text-embedding-\($0)" }
         let candidates = ProviderDiscoveryClient.inferenceCandidates(

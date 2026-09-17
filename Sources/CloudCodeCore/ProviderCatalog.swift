@@ -164,6 +164,21 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
         self.autoRotateKeys = autoRotateKeys
     }
 
+    public func normalizedForOfficialCompatibilityEndpoint() -> ProviderProfile {
+        guard baseURL.host?.lowercased() == "generativelanguage.googleapis.com" else { return self }
+        var normalized = self
+        normalized.protocols = [.openAIChat]
+        normalized.preferredProtocol = .openAIChat
+        normalized.authMode = .bearer
+        for index in normalized.keySlots.indices {
+            normalized.keySlots[index].protocols = [.openAIChat]
+            normalized.keySlots[index].modelProtocols = Dictionary(uniqueKeysWithValues:
+                normalized.keySlots[index].models.map { ($0, [.openAIChat]) }
+            )
+        }
+        return normalized
+    }
+
     public func selectableModels(for keySlotID: String?) -> [String] {
         guard let keySlotID,
               let slot = keySlots.first(where: { $0.id == keySlotID }) else {

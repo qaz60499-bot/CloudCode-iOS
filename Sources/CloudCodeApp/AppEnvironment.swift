@@ -3953,7 +3953,7 @@ public final class CloudCodeViewModel: ObservableObject {
                     readiness: readiness,
                     source: .custom,
                     customModelAllowed: true
-                )
+                ).normalizedForOfficialCompatibilityEndpoint()
                 try keyVault.set(apiKey, for: reference)
                 let stored = try await keyVault.key(for: reference)
                 guard stored == apiKey else { throw ProviderKeyProvisioningError.verificationFailed(reference) }
@@ -4544,7 +4544,9 @@ public final class CloudCodeViewModel: ObservableObject {
               size.int64Value <= 2 * 1024 * 1024,
               let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
               let profiles = try? JSONDecoder().decode([ProviderProfile].self, from: data) else { return [] }
-        return profiles.filter { $0.enabled && $0.source == .custom }
+        return profiles
+            .filter { $0.enabled && $0.source == .custom }
+            .map { $0.normalizedForOfficialCompatibilityEndpoint() }
     }
 
     private func importProviderBootstrapNow(
