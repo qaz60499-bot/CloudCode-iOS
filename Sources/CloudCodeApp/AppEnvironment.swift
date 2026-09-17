@@ -514,11 +514,28 @@ public final class CloudCodeViewModel: ObservableObject {
 
     public func selectProviderBackend(_ backend: ProviderBackend) {
         guard backend != .localModel else { return }
-        if backend == .appBacked && selectedAppProviderPackage == nil {
-            lastError = "当前没有可用的 App Provider Package。"
-            return
+        if backend == .appBacked {
+            guard let package = selectedAppProviderPackage else {
+                lastError = "当前没有可用的 App Provider Package。"
+                return
+            }
+            selectedProviderBackend = .appBacked
+            // Backend selection is explicit routing intent. Keep the visible session identity aligned
+            // immediately so a stale network/app session cannot be mistaken for an App Provider run
+            // (or vice versa) when Send validates the transport a moment later.
+            if !isCurrentSessionRunning {
+                session.providerID = package.id
+                session.keySlotID = ""
+                session.model = package.manifest.modelLabel
+            }
+        } else {
+            selectedProviderBackend = .network
+            if !isCurrentSessionRunning {
+                session.providerID = selectedProviderID
+                session.keySlotID = selectedKeySlotID
+                session.model = selectedModel
+            }
         }
-        selectedProviderBackend = backend
         persistProviderSelection()
     }
 
@@ -1699,13 +1716,25 @@ public final class CloudCodeViewModel: ObservableObject {
                 lastError = "请先选择可用的 App Provider。"
                 return false
             }
-            persistProviderSelection()
-            UserDefaults.standard.set(permissionMode.rawValue, forKey: "permission.mode")
-            session.permissionMode = permissionMode
-            session.providerID = package.id
-            session.keySlotID = ""
-            session.model = package.manifest.modelLabel
-            return true
+            let sessionExplicitlyOwnsAppRoute = session.providerID == package.id && (session.keySlotID ?? "").isEmpty
+            if sessionExplicitlyOwnsAppRoute {
+                persistProviderSelection()
+                UserDefaults.standard.set(permissionMode.rawValue, forKey: "permission.mode")
+                session.permissionMode = permissionMode
+                session.providerID = package.id
+                session.keySlotID = ""
+                session.model = package.manifest.modelLabel
+                return true
+            }
+            // A persisted/stale appBacked bit must not override a concrete Network Provider session.
+            // This is especially important after upgrading from older builds where merely opening or
+            // authorizing an App Provider could leave the backend latched to appBacked.
+            if currentProviderConfiguration() != nil {
+                selectedProviderBackend = .network
+            } else {
+                lastError = "App Provider 后端状态与当前会话不一致；请重新选择 App Provider 后再发送。"
+                return false
+            }
         }
 
         guard let provider = selectedProvider,
@@ -1855,6 +1884,15 @@ public final class CloudCodeViewModel: ObservableObject {
         }
 
         if isCurrentSessionRunning {
+            if let active = activeConfigurations[session.id], active.backend != selectedProviderBackend {
+                // Never steer a newly selected Network Provider message into an older App-backed run
+                // (or the reverse). That was the last path where a valid Gemini API selection could
+                // still foreground Gemini/DeepSeek because the prior task owned the session.
+                lastError = active.backend == .appBacked && selectedProviderBackend == .network
+                    ? "当前对话仍有旧 App Provider 任务在运行；已拒绝把新消息继续发送给旧 App。请先停止该任务，再发送一次，新请求会走当前 Network Provider / API Key。"
+                    : "当前对话仍有使用旧 Provider 后端的任务在运行；请先停止该任务，再按当前后端发送。"
+                return
+            }
             submitSteering(
                 trimmed,
                 imageData: imageData,
@@ -2361,7 +2399,16 @@ public final class CloudCodeViewModel: ObservableObject {
         }
         guard UserDefaults.standard.bool(forKey: Self.autoResumeTaskDefaultsKey) else { return }
         let automaticCandidates = interruptedTasks.filter {
-            !runningSessionIDs.contains($0.sessionID) && $0.payload["resume.mode"] != "manual_provider_failure"
+            guard !runningSessionIDs.contains($0.sessionID),
+                  $0.payload["resume.mode"] != "manual_provider_failure" else { return false }
+            // Do not cold/same-process auto-resume an App-backed checkpoint after the user has
+            // switched the active backend to Network Provider. Manual resume remains available,
+            // but automatic recovery must never re-foreground an AI App behind a valid API choice.
+            if $0.payload["provider.backend"] == ProviderBackend.appBacked.rawValue,
+               selectedProviderBackend != .appBacked {
+                return false
+            }
+            return true
         }
         guard let checkpoint = automaticCandidates.first else {
             if runningSessionIDs.isEmpty {
