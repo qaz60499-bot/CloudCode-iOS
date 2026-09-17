@@ -1405,6 +1405,7 @@ public final class CloudCodeViewModel: ObservableObject {
             let baseURLs = await orderedProviderBaseURLs(provider: provider, keySlotID: keySlotID, apiKey: apiKey)
             var discoveredModels: [String]?
             var acceptedBaseURL: URL?
+            var sawReachableEmptyCatalog = false
             var routeErrors: [Error] = []
             for (index, candidateBaseURL) in baseURLs.enumerated() {
                 try? await diagnosticLogStore.log(
@@ -1425,9 +1426,28 @@ public final class CloudCodeViewModel: ObservableObject {
                         apiKey: apiKey,
                         authMode: provider.authMode
                     )
-                    // Empty is still an authoritative successful catalog response. A thrown request
-                    // is failure and must retain last-known-good; an HTTP 2xx catalog containing zero
-                    // rows is not the same thing as a timeout/401/429/5xx.
+                    // A reachable HTTP 2xx /models response with zero rows proves only that this
+                    // catalog route is reachable; it does NOT prove that inference is unavailable.
+                    // Compatible relays commonly expose incomplete/empty catalogs while accepting
+                    // explicitly configured model IDs. Never erase Last Known Good solely from an
+                    // empty catalog response, otherwise a healthy relay is rendered as "unavailable"
+                    // before the actual inference path has been tested.
+                    if candidateModels.isEmpty {
+                        sawReachableEmptyCatalog = true
+                        try? await diagnosticLogStore.log(
+                            level: .warning,
+                            subsystem: "provider-discovery",
+                            action: "catalog-route.attempt",
+                            result: "empty-catalog-preserved-lkg",
+                            metadata: [
+                                "providerID": provider.id,
+                                "keySlotID": keySlotID,
+                                "host": candidateBaseURL.host ?? "",
+                                "candidateIndex": String(index)
+                            ]
+                        )
+                        continue
+                    }
                     discoveredModels = candidateModels
                     acceptedBaseURL = candidateBaseURL
                     try? await diagnosticLogStore.log(
@@ -1467,21 +1487,31 @@ public final class CloudCodeViewModel: ObservableObject {
                 }
             }
             guard let models = discoveredModels, let acceptedBaseURL else {
+                if sawReachableEmptyCatalog {
+                    if showStatus {
+                        providerKeyCheckMessage = "实时模型目录返回空列表；已保留 Last Known Good。空目录不代表推理不可用，可继续使用已知模型或执行当前 Key 的上游验证。"
+                    }
+                    try? await diagnosticLogStore.log(
+                        level: .warning,
+                        subsystem: "provider-discovery",
+                        action: "catalog-refresh",
+                        result: "empty-catalog-last-known-good-preserved",
+                        metadata: ["providerID": provider.id, "keySlotID": keySlotID]
+                    )
+                    return false
+                }
                 throw ProviderRouteFailureAggregator.preferredFailure(routeErrors)
             }
             await rememberVerifiedProviderBaseURL(acceptedBaseURL, provider: provider, keySlotID: keySlotID, apiKey: apiKey)
             guard let providerIndex = providerProfiles.firstIndex(where: { $0.id == provider.id }) else { return false }
             providerProfiles[providerIndex].applyLiveModelCatalog(models, keySlotID: keySlotID, authoritative: true)
-            // Persist only non-empty catalogs as Last Known Good. If upstream deliberately returns an
-            // empty live catalog, keep that empty Live view for this process while retaining the older
-            // non-empty LKG as the offline fallback for a later launch.
-            if !models.isEmpty {
-                try? ProviderLiveModelCatalogCache.persist(
+            // Only non-empty catalogs reach this point. Persist them as Last Known Good; reachable
+            // empty catalogs are handled above without mutating the current usable model set.
+            try? ProviderLiveModelCatalogCache.persist(
                     provider: providerProfiles[providerIndex],
                     keySlotID: keySlotID,
                     to: liveProviderCatalogFileURL
                 )
-            }
             let selectedStillListed = selectedModel.isEmpty || models.contains(selectedModel)
             if selectedStillListed, selectedModelIsExplicitCustomOverride {
                 var overrides = explicitCustomModelOverrides()
