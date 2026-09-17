@@ -4723,15 +4723,18 @@ public final class CloudCodeViewModel: ObservableObject {
         if let providerID = visible.providerID,
            (visible.keySlotID ?? "").isEmpty,
            let package = appProviderPackages.first(where: { $0.id == providerID && $0.enabled }) {
-            // App-backed sessions intentionally carry no network Key slot. Packages are loaded before
-            // normal session restoration, so this exact package-ID match is enough to restore the
-            // backend without guessing from display text or model labels.
+            // Remember which App Provider package this historical session used, but do not let
+            // session restoration silently change the active inference transport. The backend picker
+            // is the sole authority for switching into the foreground UI-backed App Provider route.
+            // Otherwise merely reopening an old DeepSeek/Gemini App Provider session hijacks a
+            // currently selected Network Provider and the next Send unexpectedly foregrounds that App.
             selectedAppProviderPackageID = package.id
-            selectedProviderBackend = .appBacked
+            if selectedProviderBackend == .appBacked {
+                session.providerID = package.id
+                session.keySlotID = ""
+                session.model = package.manifest.modelLabel
+            }
             persistProviderSelection()
-            session.providerID = package.id
-            session.keySlotID = ""
-            session.model = package.manifest.modelLabel
         } else {
             let desired = ProviderSelectionState(
                 providerID: visible.providerID ?? selectedProviderID,
