@@ -43,12 +43,19 @@ public struct ProviderDiscoveryClient: Sendable {
         var sawAuthoritativeEmptyCatalog = false
         var sawReachableUnparseableCatalog = false
         var authModes = [ProviderAuthMode.bearer, .xAPIKey, .both]
-        if let preferredAuthMode {
-            authModes.removeAll { $0.rawValue == preferredAuthMode.rawValue }
-            authModes.insert(preferredAuthMode, at: 0)
-        }
-        if !allowAlternateAuthModes {
-            authModes = [preferredAuthMode ?? .bearer]
+        if ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL) {
+            // The official Gemini OpenAI-compatible surface uses Authorization: Bearer. Historical
+            // custom-provider records may still contain x-api-key/both from older probing logic;
+            // never let that stale preference invalidate an otherwise working Gemini API key.
+            authModes = [.bearer]
+        } else {
+            if let preferredAuthMode {
+                authModes.removeAll { $0.rawValue == preferredAuthMode.rawValue }
+                authModes.insert(preferredAuthMode, at: 0)
+            }
+            if !allowAlternateAuthModes {
+                authModes = [preferredAuthMode ?? .bearer]
+            }
         }
 
         // Catalog auth and inference auth are deliberately independent. Some compatible
@@ -262,7 +269,8 @@ public struct ProviderDiscoveryClient: Sendable {
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         ProviderCompatibilityHeaders.apply(to: &request)
-        applyAuth(apiKey, mode: authMode, request: &request)
+        let effectiveAuthMode: ProviderAuthMode = ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL) ? .bearer : authMode
+        applyAuth(apiKey, mode: effectiveAuthMode, request: &request)
         request.timeoutInterval = 30
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("缺少 HTTP 响应") }

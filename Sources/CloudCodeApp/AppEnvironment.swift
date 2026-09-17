@@ -3955,6 +3955,9 @@ public final class CloudCodeViewModel: ObservableObject {
             return
         }
         let manualModel = initialModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isOfficialGeminiAPI = ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL)
+        let effectivePreferredProtocol: ProviderProtocol = isOfficialGeminiAPI ? .openAIChat : preferredProtocol
+        let effectiveAuthMode: ProviderAuthMode = isOfficialGeminiAPI ? .bearer : authMode
         let providerID = "custom-\(UUID().uuidString.lowercased())"
         let slotID = "slot-1"
         let reference = ProviderCatalog.keyReference(providerID: providerID, keySlotID: slotID)
@@ -3972,9 +3975,9 @@ public final class CloudCodeViewModel: ObservableObject {
                     discovery = try await ProviderDiscoveryClient().discover(
                         baseURL: baseURL,
                         apiKey: apiKey,
-                        preferredAuthMode: authMode,
+                        preferredAuthMode: effectiveAuthMode,
                         fallbackInferenceCandidates: manualModel.isEmpty ? [] : [manualModel],
-                        inferenceProtocols: [preferredProtocol],
+                        inferenceProtocols: [effectivePreferredProtocol],
                         allowAlternateAuthModes: false
                     )
                 } catch {
@@ -3989,9 +3992,9 @@ public final class CloudCodeViewModel: ObservableObject {
                 }
 
                 let models = discoveryReady ? discoveredModels : [manualModel]
-                let protocols = discoveryReady ? discoveredProtocols : [preferredProtocol]
-                let resolvedPreferred = protocols.first ?? preferredProtocol
-                let resolvedAuth = discoveryReady ? (discovery?.authMode ?? authMode) : authMode
+                let protocols = discoveryReady ? discoveredProtocols : [effectivePreferredProtocol]
+                let resolvedPreferred = protocols.first ?? effectivePreferredProtocol
+                let resolvedAuth = discoveryReady ? (discovery?.authMode ?? effectiveAuthMode) : effectiveAuthMode
                 let readiness: ProviderReadiness = discoveryReady ? .ready : .needsValidation
                 let keyStatus: ProviderKeyStatus = discoveryReady ? .verified : .needsValidation
                 let slot = ProviderKeySlot(
@@ -4001,7 +4004,7 @@ public final class CloudCodeViewModel: ObservableObject {
                     status: keyStatus,
                     models: models,
                     protocols: protocols,
-                    modelProtocols: discoveryReady ? [models[0]: protocols] : [manualModel: [preferredProtocol]]
+                    modelProtocols: discoveryReady ? [models[0]: protocols] : [manualModel: [effectivePreferredProtocol]]
                 )
                 let profile = ProviderProfile(
                     id: providerID,
@@ -4262,8 +4265,9 @@ public final class CloudCodeViewModel: ObservableObject {
             return ProviderLiveMetadataRefreshResult(catalogApplied: false, state: .failed, readiness: .needsValidation, modelCount: 0, diagnostic: "厂商、Key 槽位或 Key 内容缺失。")
         }
         let profile = providerProfiles[providerIndex]
-        let preferredAuthMode = profile.authMode
-        let inferenceProtocols = profile.protocols
+        let isOfficialGeminiAPI = ProviderEndpointPolicy.isOfficialGeminiAPI(profile.baseURL)
+        let preferredAuthMode: ProviderAuthMode = isOfficialGeminiAPI ? .bearer : profile.authMode
+        let inferenceProtocols: [ProviderProtocol] = isOfficialGeminiAPI ? [.openAIChat] : profile.protocols
         var fallbackInferenceCandidates = profile.models(for: keySlotID)
         if let snapshot = ProviderCatalog.desktopSnapshot.first(where: { $0.id == providerID }) {
             for model in snapshot.models(for: keySlotID) where !fallbackInferenceCandidates.contains(model) {
@@ -4531,18 +4535,25 @@ public final class CloudCodeViewModel: ObservableObject {
         guard provider.selectableModels(for: slot.id).contains(selectedModel) || selectedModelIsExplicitCustomOverride else {
             return nil
         }
-        let protocolCandidates = provider.protocolCandidates(for: selectedModel, keySlotID: slot.id)
-        let protocolName = protocolCandidates.first ?? provider.preferredProtocol
+        let isOfficialGeminiAPI = ProviderEndpointPolicy.isOfficialGeminiAPI(provider.baseURL)
+        let protocolCandidates: [ProviderProtocol] = isOfficialGeminiAPI
+            ? [.openAIChat]
+            : provider.protocolCandidates(for: selectedModel, keySlotID: slot.id)
+        let protocolName = protocolCandidates.first ?? (isOfficialGeminiAPI ? .openAIChat : provider.preferredProtocol)
         let references = provider.orderedKeyReferences(selectedKeySlotID: slot.id, model: selectedModel)
         guard let primary = references.first else { return nil }
         let protocolNamesByKeyReference = Dictionary(uniqueKeysWithValues: provider.keySlots.map { candidateSlot in
             let reference = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: candidateSlot.id)
-            let names = provider.protocolCandidates(for: selectedModel, keySlotID: candidateSlot.id).map(\.rawValue)
+            let names = (isOfficialGeminiAPI
+                ? [ProviderProtocol.openAIChat]
+                : provider.protocolCandidates(for: selectedModel, keySlotID: candidateSlot.id)).map(\.rawValue)
             return (reference, names)
         })
         let safeProtocolNamesByKeyReference = Dictionary(uniqueKeysWithValues: provider.keySlots.map { candidateSlot in
             let reference = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: candidateSlot.id)
-            let names = provider.safeProtocolCandidates(for: selectedModel, keySlotID: candidateSlot.id).map(\.rawValue)
+            let names = (isOfficialGeminiAPI
+                ? [ProviderProtocol.openAIChat]
+                : provider.safeProtocolCandidates(for: selectedModel, keySlotID: candidateSlot.id)).map(\.rawValue)
             return (reference, names)
         })
         let keyFingerprintsByReference = Dictionary(uniqueKeysWithValues: provider.keySlots.map { candidateSlot in
@@ -4556,7 +4567,7 @@ public final class CloudCodeViewModel: ObservableObject {
             apiKeyReference: primary,
             providerID: provider.id,
             protocolName: protocolName.rawValue,
-            authModeName: provider.authMode.rawValue,
+            authModeName: (isOfficialGeminiAPI ? ProviderAuthMode.bearer : provider.authMode).rawValue,
             fallbackAPIKeyReferences: provider.autoRotateKeys ? Array(references.dropFirst()) : [],
             fallbackProtocolNames: Array(protocolCandidates.dropFirst()).map(\.rawValue),
             protocolNamesByKeyReference: protocolNamesByKeyReference,

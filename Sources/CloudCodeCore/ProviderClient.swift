@@ -5,6 +5,10 @@ import FoundationNetworking
 #endif
 
 public enum ProviderEndpointPolicy {
+    public static func isOfficialGeminiAPI(_ url: URL) -> Bool {
+        url.host?.lowercased() == "generativelanguage.googleapis.com"
+    }
+
     public static func allowsBaseURL(_ url: URL) -> Bool {
         guard url.scheme?.lowercased() == "https",
               let host = url.host?.lowercased(),
@@ -2898,12 +2902,13 @@ enum ProviderEndpoint {
         // convenience base URL so a valid Gemini API key is not rejected only because the
         // compatibility prefix was omitted in UI configuration.
         let host = baseURL.host?.lowercased()
-        if host == "generativelanguage.googleapis.com" {
-            if baseComponents.isEmpty {
-                baseComponents = ["v1beta", "openai"]
-            } else if baseComponents == ["v1beta"] {
-                baseComponents.append("openai")
-            }
+        if ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL) {
+            // Treat every path on the official Gemini API host as input configuration, not as a
+            // trusted endpoint prefix. Users commonly paste the native REST root (/v1beta), a
+            // native models/generateContent URL, or the documented OpenAI compatibility root.
+            // Cloud Code's Network Provider speaks the OpenAI-compatible protocol, so normalize all
+            // of those historical/user-entered forms onto the one documented compatibility root.
+            baseComponents = ["v1beta", "openai"]
         }
 
         if baseComponents.suffix(requestedComponents.count).elementsEqual(requestedComponents) {
@@ -2952,7 +2957,11 @@ enum ProviderCompatibilityHeaders {
 
 private enum ProviderRequestFactory {
     static func authMode(_ configuration: ProviderConfiguration) -> ProviderAuthMode {
-        ProviderAuthMode(rawValue: configuration.authModeName ?? "") ?? .bearer
+        // Google's official OpenAI-compatible Gemini endpoint documents Bearer authentication.
+        // Force that wire shape even when an older custom-provider record persisted x-api-key/both;
+        // a stale UI preference must not make a known-good Gemini API key look invalid.
+        if ProviderEndpointPolicy.isOfficialGeminiAPI(configuration.baseURL) { return .bearer }
+        return ProviderAuthMode(rawValue: configuration.authModeName ?? "") ?? .bearer
     }
 
     static func jsonPOST(url: URL, apiKey: String, authMode: ProviderAuthMode, body: [String: Any]) throws -> URLRequest {

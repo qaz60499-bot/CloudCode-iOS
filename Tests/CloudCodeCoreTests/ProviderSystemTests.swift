@@ -1238,6 +1238,28 @@ final class ProviderDiscoveryTests: XCTestCase {
         XCTAssertNil(probe["max_tokens"], "Gemini validation must not add a field absent from the real compatible request path")
     }
 
+    func testGeminiOfficialDiscoveryOverridesStaleXAPIKeyAuthWithBearer() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProviderGeminiDiscoveryURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let result = try await ProviderDiscoveryClient(session: session).discover(
+            baseURL: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent")!,
+            apiKey: "test-secret",
+            preferredAuthMode: .xAPIKey,
+            fallbackInferenceCandidates: ["gemini-3.8-flash"],
+            inferenceProtocols: [.openAIChat],
+            allowAlternateAuthModes: false
+        )
+
+        XCTAssertEqual(result.readiness, .ready)
+        XCTAssertEqual(result.authMode, .bearer)
+        XCTAssertEqual(result.protocols, [.openAIChat])
+        XCTAssertEqual(result.models.first, "gemini-3.8-flash")
+        XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.requestCount(), 2)
+    }
+
     func testGeminiOfficialDiscoveryPrioritizesChatCapableCatalogModelWithoutManualModel() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ProviderGeminiDiscoveryURLProtocol.self]
@@ -1280,6 +1302,7 @@ final class ProviderDiscoveryTests: XCTestCase {
             customModelAllowed: true
         ).normalizedForOfficialCompatibilityEndpoint()
 
+        XCTAssertEqual(profile.baseURL.absoluteString, "https://generativelanguage.googleapis.com/v1beta/openai/")
         XCTAssertEqual(profile.protocols, [.openAIChat])
         XCTAssertEqual(profile.preferredProtocol, .openAIChat)
         XCTAssertEqual(profile.authMode, .bearer)
@@ -1798,6 +1821,14 @@ final class ProviderProtocolClientTests: XCTestCase {
         geminiRootConfiguration.baseURL = URL(string: "https://generativelanguage.googleapis.com")!
         for try await _ in chat.stream(configuration: geminiRootConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
         XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+
+        var geminiLegacyNativeConfiguration = geminiCompatibilityConfiguration
+        geminiLegacyNativeConfiguration.baseURL = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent")!
+        geminiLegacyNativeConfiguration.authModeName = ProviderAuthMode.xAPIKey.rawValue
+        for try await _ in chat.stream(configuration: geminiLegacyNativeConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.value(forHTTPHeaderField: "Authorization"), "Bearer secret")
+        XCTAssertNil(ProviderTestURLProtocol.lastRequest()?.value(forHTTPHeaderField: "x-api-key"))
     }
 
     func testResponsesStreamingTextAndToolCall() async throws {
