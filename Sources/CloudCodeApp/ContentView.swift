@@ -1918,8 +1918,8 @@ private struct SettingsView: View {
                         Text("App Provider").tag(ProviderBackend.appBacked)
                     }
                     Text(model.selectedProviderBackend == .appBacked
-                         ? "当前由已安装 AI App 提供推理；设备观察、ToolRouter、PolicyEngine、AX/OCR/HID 与文件能力仍由 Cloud Code 控制。"
-                         : "当前使用 API / Network Provider。App Provider Package 与 API Key 配置彼此独立。")
+                         ? "当前使用 App Provider：Cloud Code 会前台打开目标 AI App，通过 UI 输入并回收回答；这不是无界面 API 直连。若要只调用算力、不切换 App，请使用 Network Provider。"
+                         : "当前使用 API / Network Provider：请求通过网络接口直接调用模型，不会因为 App Provider 的授权、测试或 Package 选择而自动切换到目标 App。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -2105,7 +2105,7 @@ private struct SettingsView: View {
                         Label("管理 / 制作 App Provider", systemImage: "puzzlepiece.extension")
                     }
                     Button("导入 Provider Package") { showAppProviderImporter = true }
-                    Text("Provider Package 只包含 declarative JSON/Markdown；不加载 Swift、dylib、shell 或 root executable。Package 与 Skills 分库存储。")
+                    Text("Provider Package 只包含 declarative JSON/Markdown；不加载 Swift、dylib、shell 或 root executable。App Provider 是前台 UI 编排通道，不复用目标 App 的登录 Cookie / Session Token；授权或测试不会再自动替换当前 Network Provider。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

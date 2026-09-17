@@ -527,8 +527,12 @@ public final class CloudCodeViewModel: ObservableObject {
             lastError = "所选 App Provider Package 不存在或已停用。"
             return
         }
+        // Choosing which App Provider package to inspect/configure must not silently change the
+        // active inference transport. The backend picker is the sole authority for switching from
+        // Network Provider to the foreground UI-backed App Provider route. Otherwise merely opening
+        // Settings or selecting DeepSeek/Gemini here can hijack a valid relay/API configuration and
+        // make the next Send foreground the target App instead of using URLSession.
         selectedAppProviderPackageID = packageID
-        selectedProviderBackend = .appBacked
         persistProviderSelection()
     }
 
@@ -550,12 +554,16 @@ public final class CloudCodeViewModel: ObservableObject {
         if persisted {
             if enabled,
                let package = appProviderPackages.first(where: { $0.id == packageID && $0.enabled }) {
+                // Consent is permission to use this UI-backed package, not an instruction to replace
+                // the user's currently selected Network Provider. Only update the live session when
+                // App Provider is already the explicitly selected backend.
                 selectedAppProviderPackageID = packageID
-                selectedProviderBackend = .appBacked
+                if selectedProviderBackend == .appBacked {
+                    session.providerID = packageID
+                    session.keySlotID = ""
+                    session.model = package.manifest.modelLabel
+                }
                 persistProviderSelection()
-                session.providerID = packageID
-                session.keySlotID = ""
-                session.model = package.manifest.modelLabel
             }
             lastError = nil
         } else {
@@ -652,7 +660,8 @@ public final class CloudCodeViewModel: ObservableObject {
             )
             await reloadAppProviderPackages()
             selectedAppProviderPackageID = packageID
-            selectedProviderBackend = .appBacked
+            // Creating/configuring an App Provider must not hijack the active inference backend.
+            // The user can explicitly switch the backend picker to App Provider after validation.
             persistProviderSelection()
             appProviderStatusMessages[packageID] = "自定义 App Provider Template 已创建。"
             return true
