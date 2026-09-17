@@ -1374,6 +1374,13 @@ public final class CloudCodeViewModel: ObservableObject {
 
     @discardableResult
     public func refreshSelectedProviderModelCatalog(showStatus: Bool = true) async -> Bool {
+        if showStatus {
+            // This method is invoked from the Network Provider section's explicit "refresh models"
+            // action. Treat that user action as a routing choice, just like changing provider/key/model.
+            // Background refreshes pass showStatus=false and therefore remain side-effect free.
+            selectedProviderBackend = .network
+            persistProviderSelection()
+        }
         guard let provider = selectedProvider,
               !selectedKeySlotID.isEmpty else {
             if showStatus { providerKeyCheckMessage = "请先选择厂商和 Key。" }
@@ -1595,6 +1602,7 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     public func selectReasoningEffort(_ effort: ModelReasoningEffort) {
+        selectedProviderBackend = .network
         selectedReasoningEffort = effort
         persistProviderSelection()
     }
@@ -1609,6 +1617,13 @@ public final class CloudCodeViewModel: ObservableObject {
             return false
         }
         let reference = ProviderCatalog.keyReference(providerID: providerID, keySlotID: keySlotID)
+        if providerID == selectedProviderID, keySlotID == selectedKeySlotID {
+            // Replacing the selected API key is an explicit Network Provider action. Previously a
+            // stale App Provider backend could survive this write, so a successfully stored Gemini
+            // key was followed by a foreground Gemini/DeepSeek launch instead of an HTTPS request.
+            selectedProviderBackend = .network
+            persistProviderSelection()
+        }
         guard !isProviderKeyReferenceInUse(reference) else {
             lastError = "当前仍有任务正在使用这个 Key。请等待任务完成或先停止任务，再替换 Key，避免同一任务中途切换凭据。"
             return false
