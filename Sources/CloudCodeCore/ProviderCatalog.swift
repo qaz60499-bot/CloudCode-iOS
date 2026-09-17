@@ -167,6 +167,7 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
     public func normalizedForOfficialCompatibilityEndpoint() -> ProviderProfile {
         guard baseURL.host?.lowercased() == "generativelanguage.googleapis.com" else { return self }
         var normalized = self
+        normalized.baseURL = URL(string: "https://generativelanguage.googleapis.com/v1beta/openai/")!
         normalized.protocols = [.openAIChat]
         normalized.preferredProtocol = .openAIChat
         normalized.authMode = .bearer
