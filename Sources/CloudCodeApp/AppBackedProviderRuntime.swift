@@ -479,6 +479,8 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         defer { activePackageID = nil }
 
         let package = try await packageStore.package(id: configuration.packageID)
+        var providerRetryAttempts = 0
+        let providerRetryLimit = min(1, max(0, package.workflow.retryBudget))
         await recordExecutionPhase("provider_start", package: package, detail: "开始 App-backed Provider 请求")
         guard package.summary.enabled else {
             throw AppBackedProviderRuntimeError.needsAuthorization("Provider Package 已停用")
@@ -665,7 +667,8 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         try await gui.tap(x: send.element.centerX, y: send.element.centerY)
         try await transition(.verifySubmission, state: .busy, detail: "Send 已派发；先验证 composer 清空或 generation-start 信号，未验证前不得进入 generation 阶段", package: package, appVersion: introspection.version)
 
-        let submissionDeadline = Date().addingTimeInterval(min(4.0, max(1.5, package.workflow.generationStartTimeoutSeconds)))
+        let submissionWindowSeconds = min(4.0, max(1.5, package.workflow.generationStartTimeoutSeconds))
+        var submissionDeadline = Date().addingTimeInterval(submissionWindowSeconds)
         var submissionObservation = observation
         var submitVerified = false
         var absentComposerProbeSamples = 0
@@ -673,7 +676,18 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             try Task.checkCancellation()
             try await requireProviderForeground(package: package, stage: .verifySubmission, appVersion: introspection.version)
             let current = try await observe(appVersion: introspection.version)
-            try await rejectProviderError(current, package: package, stage: .verifySubmission)
+            if try await handleProviderError(
+                current,
+                package: package,
+                stage: .verifySubmission,
+                allowRetry: providerRetryAttempts < providerRetryLimit
+            ) {
+                providerRetryAttempts += 1
+                submissionDeadline = Date().addingTimeInterval(submissionWindowSeconds)
+                continuation.yield(.status("App Provider 报告可重试失败；已对原请求执行一次有界 Retry…"))
+                try await Self.sleep(seconds: 0.35)
+                continue
+            }
             submissionObservation = current
             let generationSignal = matchesAny(package.selectors.generationStart, observation: current, packageID: package.summary.id)
             if generationSignal {
@@ -701,7 +715,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
 
         continuation.yield(.status("App Provider 正在生成…"))
         try await transition(.waitGenerationStart, state: .busy, detail: "提交已验证；等待 generation start", package: package, appVersion: introspection.version)
-        let startDeadline = Date().addingTimeInterval(package.workflow.generationStartTimeoutSeconds)
+        var startDeadline = Date().addingTimeInterval(package.workflow.generationStartTimeoutSeconds)
         // Compare against the verified pre-send page. Its first nonempty snapshot is not sufficient;
         // generation starts only after a declared signal or a further post-submit page mutation.
         var lastObservedText = Self.visibleText(observation)
@@ -716,7 +730,19 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             try Task.checkCancellation()
             try await requireProviderForeground(package: package, stage: .waitGenerationStart, appVersion: introspection.version)
             observation = try await observe(appVersion: introspection.version)
-            try await rejectProviderError(observation, package: package, stage: .waitGenerationStart)
+            if try await handleProviderError(
+                observation,
+                package: package,
+                stage: .waitGenerationStart,
+                allowRetry: providerRetryAttempts < providerRetryLimit
+            ) {
+                providerRetryAttempts += 1
+                startDeadline = Date().addingTimeInterval(package.workflow.generationStartTimeoutSeconds)
+                lastObservedText = Self.visibleText(observation)
+                continuation.yield(.status("App Provider 报告可重试失败；已对原请求执行一次有界 Retry…"))
+                try await Self.sleep(seconds: 0.35)
+                continue
+            }
             if matchesAny(package.selectors.generationStart, observation: observation, packageID: package.summary.id) {
                 sawGenerationSignal = true
                 break
@@ -736,7 +762,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         await recordExecutionPhase("generation_started", package: package, detail: "已观察到 generation-start 信号或提交后的进一步页面变化", appVersion: introspection.version)
 
         try await transition(.waitGeneration, state: .busy, detail: "等待 bounded stable window", package: package, appVersion: introspection.version)
-        let generationDeadline = Date().addingTimeInterval(package.workflow.generationTimeoutSeconds)
+        var generationDeadline = Date().addingTimeInterval(package.workflow.generationTimeoutSeconds)
         var stableSince: Date?
         var previousSignature = ""
         var finalObservation = observation
@@ -744,7 +770,20 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             try Task.checkCancellation()
             try await requireProviderForeground(package: package, stage: .waitGeneration, appVersion: introspection.version)
             let current = try await observe(appVersion: introspection.version)
-            try await rejectProviderError(current, package: package, stage: .waitGeneration)
+            if try await handleProviderError(
+                current,
+                package: package,
+                stage: .waitGeneration,
+                allowRetry: providerRetryAttempts < providerRetryLimit
+            ) {
+                providerRetryAttempts += 1
+                generationDeadline = Date().addingTimeInterval(package.workflow.generationTimeoutSeconds)
+                stableSince = nil
+                previousSignature = ""
+                continuation.yield(.status("App Provider 报告可重试失败；已对原请求执行一次有界 Retry…"))
+                try await Self.sleep(seconds: 0.35)
+                continue
+            }
             finalObservation = current
             let signature = Self.visibleText(current)
             let completionSignal = package.selectors.generationComplete.isEmpty
@@ -850,9 +889,32 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         }
     }
 
-    private func rejectProviderError(_ observation: Observation, package: AppProviderPackage, stage: AppBackedProviderHostState) async throws {
-        guard let indicator = package.selectors.errorIndicators.first(where: { Self.match($0, observation: observation) != nil }) else { return }
-        let detail = "failure_stage=\(stage.rawValue); provider_error=\(indicator.value ?? "declared error indicator")"
+    private func handleProviderError(
+        _ observation: Observation,
+        package: AppProviderPackage,
+        stage: AppBackedProviderHostState,
+        allowRetry: Bool
+    ) async throws -> Bool {
+        guard let resolved = package.selectors.errorIndicators.compactMap({ selector in
+            Self.match(selector, observation: observation)
+        }).first else { return false }
+        let indicator = resolved.selector.value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "declared error indicator"
+        let normalized = indicator.lowercased()
+        if allowRetry, indicator == "重试" || normalized == "retry" {
+            // DeepSeek 2.5.1 can expose a bare Retry action after a transient generation failure.
+            // Re-activate that exact failed request once instead of retyping/resubmitting the prompt,
+            // which could duplicate a request that the provider actually accepted. The caller owns
+            // the one-shot retry budget; a second Retry observation is classified as a real failure.
+            try await gui.tap(x: resolved.element.centerX, y: resolved.element.centerY)
+            await recordExecutionPhase(
+                "provider_retry_tapped",
+                package: package,
+                detail: "检测到明确 Retry 控件；已对原请求执行一次有界重试",
+                appVersion: observation.appVersion
+            )
+            return true
+        }
+        let detail = "failure_stage=\(stage.rawValue); provider_error=\(indicator)"
         try await transition(.classify, state: .degraded, detail: detail, package: package, appVersion: observation.appVersion)
         throw AppBackedProviderRuntimeError.providerReportedError(detail)
     }
