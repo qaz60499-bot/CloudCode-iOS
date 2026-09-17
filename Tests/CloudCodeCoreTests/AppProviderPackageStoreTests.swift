@@ -13,7 +13,7 @@ final class AppProviderPackageStoreTests: XCTestCase {
         XCTAssertEqual(Set(packages.map(\.id)), Set(["ai.gemini.app", "ai.deepseek.app", "ai.chatgpt.app", "ai.chatgpt.webcompat.app"]))
         XCTAssertEqual(packages.first(where: { $0.id == "ai.gemini.app" })?.manifest.bundleID, "com.google.gemini")
         XCTAssertEqual(packages.first(where: { $0.id == "ai.gemini.app" })?.manifest.revision, "first-party-4")
-        XCTAssertEqual(packages.first(where: { $0.id == "ai.deepseek.app" })?.manifest.revision, "first-party-6")
+        XCTAssertEqual(packages.first(where: { $0.id == "ai.deepseek.app" })?.manifest.revision, "first-party-7")
         XCTAssertEqual(packages.first(where: { $0.id == "ai.deepseek.app" })?.manifest.compatibility.testedAppVersion, "2.5.1")
         XCTAssertEqual(packages.first(where: { $0.id == "ai.chatgpt.app" })?.manifest.compatibility.testedAppVersion, "1.2024.348")
         XCTAssertEqual(packages.first(where: { $0.id == "ai.chatgpt.webcompat.app" })?.manifest.bundleID, "com.cloudcode.chatgptwebcompat")
@@ -41,7 +41,7 @@ final class AppProviderPackageStoreTests: XCTestCase {
         let store = AppProviderPackageStore(rootURL: root)
         try await store.seedFirstPartyIfMissing()
         let before = try await store.package(id: "ai.deepseek.app")
-        XCTAssertEqual(before.summary.manifest.revision, "first-party-6")
+        XCTAssertEqual(before.summary.manifest.revision, "first-party-7")
 
         let staleSelectors = AppProviderSelectorSet(
             composer: [.init(strategy: .visibleText, value: "STALE COMPOSER", minimumConfidence: 0.8)],
@@ -56,8 +56,8 @@ final class AppProviderPackageStoreTests: XCTestCase {
 
         try await store.seedFirstPartyIfMissing()
         let after = try await store.package(id: "ai.deepseek.app")
-        XCTAssertEqual(after.summary.manifest.revision, "first-party-6")
-        XCTAssertEqual(after.summary.manifest.compatibility.selectorRevision, "6")
+        XCTAssertEqual(after.summary.manifest.revision, "first-party-7")
+        XCTAssertEqual(after.summary.manifest.compatibility.selectorRevision, "7")
         XCTAssertNotEqual(after.selectors, staleSelectors)
         XCTAssertFalse(after.summary.enabled)
     }
@@ -116,6 +116,8 @@ final class AppProviderPackageStoreTests: XCTestCase {
                 && selector.coordinate?.screenHeight == 852
         })
         XCTAssertTrue(deepseek.selectors.errorIndicators.contains { $0.value == "服务器繁忙" })
+        XCTAssertTrue(deepseek.selectors.errorIndicators.contains { $0.value == "重试" })
+        XCTAssertTrue(deepseek.selectors.errorIndicators.contains { $0.value == "Retry" })
     }
 
     func testCustomTemplateCanBeCreatedBeforeGuidedSelectorLearning() async throws {

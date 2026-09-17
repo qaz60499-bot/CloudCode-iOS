@@ -962,9 +962,11 @@ jobs:
           if 'selectedProviderBackend = .network' not in apply_selection:
               raise SystemExit('FAIL: reconciled/restored Network Provider selection can leave stale App Provider routing active')
           adopt_session = app.split('private func adoptSession(_ loaded: AgentSession)', 1)[1].split('private static func sessionTitle', 1)[0]
-          for marker in ('(visible.keySlotID ?? "").isEmpty', 'appProviderPackages.first(where:', 'selectedProviderBackend = .appBacked', 'applySelection(reconciled)'):
+          for marker in ('(visible.keySlotID ?? "").isEmpty', 'appProviderPackages.first(where:', 'selectedAppProviderPackageID = package.id', 'applySelection(reconciled)'):
               if marker not in adopt_session:
-                  raise SystemExit(f'FAIL: session restoration lost deterministic Network/App Provider backend restoration: {marker}')
+                  raise SystemExit(f'FAIL: session restoration lost deterministic Network/App Provider package restoration: {marker}')
+          if 'selectedProviderBackend = .appBacked' in adopt_session:
+              raise SystemExit('FAIL: reopening a historical App Provider session must not hijack the globally selected inference backend')
           coordinate_match = app_provider_runtime.split('case .coordinateFallback:', 1)[1].split('if selector.strategy == .axRole', 1)[0]
           for marker in ('coordinate.deviceClass.caseInsensitiveCompare(observation.deviceClass)', 'coordinate.orientation.caseInsensitiveCompare(observation.orientation)', 'coordinate.appVersion == observation.appVersion', 'abs(coordinate.screenWidth - observation.screenWidth) <= 1', 'abs(coordinate.screenHeight - observation.screenHeight) <= 1'):
               if marker not in coordinate_match:

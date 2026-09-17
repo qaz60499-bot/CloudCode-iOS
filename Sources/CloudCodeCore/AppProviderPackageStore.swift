@@ -1190,13 +1190,13 @@ public actor AppProviderPackageStore {
             errorIndicators: [text("抱歉，无法连接到服务器")]
         )
         let deepseek = AppProviderPackageManifest(
-            revision: "first-party-6",
+            revision: "first-party-7",
             id: "ai.deepseek.app",
             displayName: "DeepSeek App",
             bundleID: "com.deepseek.chat",
             launchSchemes: ["deepseek", "dpsk"],
             declaredCapabilities: capabilities,
-            compatibility: .init(testedAppVersion: "2.5.1", selectorRevision: "6"),
+            compatibility: .init(testedAppVersion: "2.5.1", selectorRevision: "7"),
             responseExtractors: extractors
         )
         let deepseekSelectors = AppProviderSelectorSet(
@@ -1252,7 +1252,12 @@ public actor AppProviderPackageStore {
             needsLoginIndicators: [text("登录"), text("Sign in")],
             errorIndicators: [
                 text("服务器繁忙"), text("网络连接失败"), text("请求失败"),
-                text("出了点问题"), text("Something went wrong")
+                text("出了点问题"), text("Something went wrong"),
+                // DeepSeek 2.5.1 can collapse a failed generation into a bare Retry action
+                // without keeping the underlying error sentence visible. Treat that button as
+                // authoritative provider-failure evidence so App-backed inference fails fast
+                // instead of appearing frozen until the full generation timeout expires.
+                text("重试"), text("Retry")
             ]
         )
         let chatgpt = AppProviderPackageManifest(
