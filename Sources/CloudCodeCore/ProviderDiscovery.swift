@@ -385,6 +385,7 @@ public struct ProviderDiscoveryClient: Sendable {
         func score(_ model: String) -> Int {
             let value = model.lowercased()
             var result = 0
+            if value.contains("gemini-3-flash-preview") { result += 600 }
             if value.contains("gemini-3.8-flash") { result += 500 }
             if value.contains("gemini") { result += 180 }
             if value.contains("flash") { result += 60 }

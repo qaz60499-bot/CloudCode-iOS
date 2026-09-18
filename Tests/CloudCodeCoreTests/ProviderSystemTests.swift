@@ -1275,10 +1275,10 @@ final class ProviderDiscoveryTests: XCTestCase {
         )
 
         XCTAssertEqual(result.readiness, .ready)
-        XCTAssertEqual(result.models.first, "gemini-3.8-flash")
+        XCTAssertEqual(result.models.first, "gemini-3-flash-preview")
         XCTAssertEqual(result.protocols, [.openAIChat])
         XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.requestCount(), 2, "a live chat-capable Gemini model outside the first 12 catalog rows must be ranked into the bounded probe set")
-        XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.probeBody()?["model"] as? String, "gemini-3.8-flash")
+        XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.probeBody()?["model"] as? String, "gemini-3-flash-preview")
     }
 
     func testOfficialGeminiProfileNormalizationForcesCompatibleProtocolAndAuth() {
@@ -3474,7 +3474,7 @@ private final class ProviderGeminiDiscoveryURLProtocol: URLProtocol, @unchecked 
         let body: Data
         if url.path == "/v1beta/openai/models" {
             let rows = (0..<12).map { "{\"id\":\"catalog-model-\($0)\"}" }.joined(separator: ",")
-            body = Data("{\"data\":[\(rows),{\"id\":\"models/gemini-3.8-flash\"}]}".utf8)
+            body = Data("{\"data\":[\(rows),{\"id\":\"models/gemini-3.8-flash\"},{\"id\":\"models/gemini-3-flash-preview\"}]}".utf8)
             status = 200
         } else if url.path == "/v1beta/openai/chat/completions" {
             var raw = request.httpBody
@@ -3495,8 +3495,9 @@ private final class ProviderGeminiDiscoveryURLProtocol: URLProtocol, @unchecked 
             Self.lock.lock()
             Self.probeBodyValue = object
             Self.lock.unlock()
+            let requestedModel = object?["model"] as? String
             let valid = request.value(forHTTPHeaderField: "Authorization") == "Bearer test-secret"
-                && object?["model"] as? String == "gemini-3.8-flash"
+                && (requestedModel == "gemini-3.8-flash" || requestedModel == "gemini-3-flash-preview")
                 && object?["max_tokens"] == nil
             status = valid ? 200 : 400
             body = valid
