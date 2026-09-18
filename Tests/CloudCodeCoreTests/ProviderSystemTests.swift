@@ -1278,7 +1278,7 @@ final class ProviderDiscoveryTests: XCTestCase {
         XCTAssertEqual(result.models.first, "gemini-3-flash-preview")
         XCTAssertEqual(result.protocols, [.openAIChat])
         XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.requestCount(), 2, "a live chat-capable Gemini model outside the first 12 catalog rows must be ranked into the bounded probe set")
-        XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.probeBody()?["model"] as? String, "gemini-3-flash-preview")
+        XCTAssertNotNil(ProviderGeminiDiscoveryURLProtocol.probeBody()?["contents"], "native Gemini probe carries the model in the URL and contents in the JSON body")
     }
 
     func testOfficialGeminiProfileNormalizationForcesCompatibleProtocolAndAuth() {
