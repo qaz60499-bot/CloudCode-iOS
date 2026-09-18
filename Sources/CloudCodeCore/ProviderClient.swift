@@ -9,6 +9,12 @@ public enum ProviderEndpointPolicy {
         url.host?.lowercased() == "generativelanguage.googleapis.com"
     }
 
+    public static func normalizedModelID(_ model: String, for url: URL) -> String {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isOfficialGeminiAPI(url), trimmed.hasPrefix("models/") else { return trimmed }
+        return String(trimmed.dropFirst("models/".count))
+    }
+
     public static func allowsBaseURL(_ url: URL) -> Bool {
         guard url.scheme?.lowercased() == "https",
               let host = url.host?.lowercased(),

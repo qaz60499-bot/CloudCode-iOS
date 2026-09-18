@@ -3968,8 +3968,8 @@ public final class CloudCodeViewModel: ObservableObject {
             lastError = "自定义厂商需要名称、安全 HTTPS Base URL 和 API Key。"
             return
         }
-        let manualModel = initialModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let isOfficialGeminiAPI = ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL)
+        let manualModel = ProviderEndpointPolicy.normalizedModelID(initialModel, for: baseURL)
         let effectivePreferredProtocol: ProviderProtocol = isOfficialGeminiAPI ? .openAIChat : preferredProtocol
         let effectiveAuthMode: ProviderAuthMode = isOfficialGeminiAPI ? .bearer : authMode
         let providerID = "custom-\(UUID().uuidString.lowercased())"
@@ -4114,10 +4114,7 @@ public final class CloudCodeViewModel: ObservableObject {
         }
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let isOfficialGeminiAPI = ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL)
-        let rawManualModel = initialModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        let manualModel = isOfficialGeminiAPI && rawManualModel.hasPrefix("models/")
-            ? String(rawManualModel.dropFirst(7))
-            : rawManualModel
+        let manualModel = ProviderEndpointPolicy.normalizedModelID(initialModel, for: baseURL)
         let effectivePreferredProtocol: ProviderProtocol = isOfficialGeminiAPI ? .openAIChat : preferredProtocol
         let effectiveAuthMode: ProviderAuthMode = isOfficialGeminiAPI ? .bearer : authMode
         var provider = providerProfiles[providerIndex]

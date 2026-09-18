@@ -2696,6 +2696,14 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertFalse(ProviderEndpointPolicy.allowsBaseURL(URL(string: "https://api.example.com#fragment")!))
     }
 
+    func testProviderEndpointPolicyNormalizesOfficialGeminiModelIDs() {
+        let official = URL(string: "https://generativelanguage.googleapis.com/v1beta/openai/")!
+        let relay = URL(string: "https://api.example.com/v1")!
+        XCTAssertEqual(ProviderEndpointPolicy.normalizedModelID(" models/gemini-3-flash-preview ", for: official), "gemini-3-flash-preview")
+        XCTAssertEqual(ProviderEndpointPolicy.normalizedModelID("gemini-3-flash-preview", for: official), "gemini-3-flash-preview")
+        XCTAssertEqual(ProviderEndpointPolicy.normalizedModelID(" models/gemini-3-flash-preview ", for: relay), "models/gemini-3-flash-preview")
+    }
+
     func testProviderRedirectPolicyAllowsOnlySameOrigin() {
         let original = URL(string: "https://api.example.com/v1/messages")!
         XCTAssertTrue(ProviderRedirectPolicy.allows(
