@@ -1837,7 +1837,7 @@ final class ProviderProtocolClientTests: XCTestCase {
         let sampleTool = ProviderToolSchema(name: "files_read", description: "read file", properties: ["path": "string"], required: ["path"])
         for try await _ in chat.stream(configuration: geminiCompatibilityConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: [sampleTool]) {}
         let toolRequest = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
-        let toolBodyData = try XCTUnwrap(toolRequest.httpBody)
+        let toolBodyData = try XCTUnwrap(ProviderTestURLProtocol.lastRequestBody())
         let toolBody = try XCTUnwrap(try JSONSerialization.jsonObject(with: toolBodyData) as? [String: Any])
         let toolsList = try XCTUnwrap(toolBody["tools"] as? [[String: Any]])
         let decls = try XCTUnwrap(toolsList.first?["functionDeclarations"] as? [[String: Any]])
