@@ -167,10 +167,10 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
     public func normalizedForOfficialCompatibilityEndpoint() -> ProviderProfile {
         guard baseURL.host?.lowercased() == "generativelanguage.googleapis.com" else { return self }
         var normalized = self
-        normalized.baseURL = URL(string: "https://generativelanguage.googleapis.com/v1beta/openai/")!
+        normalized.baseURL = URL(string: "https://generativelanguage.googleapis.com/v1beta/")!
         normalized.protocols = [.openAIChat]
         normalized.preferredProtocol = .openAIChat
-        normalized.authMode = .bearer
+        normalized.authMode = .xAPIKey
         let cleanModels = normalized.models.map { $0.hasPrefix("models/") ? String($0.dropFirst(7)) : $0 }
         normalized.models = cleanModels.isEmpty ? ["gemini-3-flash-preview"] : cleanModels
         for index in normalized.keySlots.indices {

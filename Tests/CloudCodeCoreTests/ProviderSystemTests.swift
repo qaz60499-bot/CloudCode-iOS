@@ -1228,14 +1228,14 @@ final class ProviderDiscoveryTests: XCTestCase {
         )
 
         XCTAssertEqual(result.readiness, .ready)
-        XCTAssertEqual(result.authMode, .bearer)
+        XCTAssertEqual(result.authMode, .xAPIKey)
         XCTAssertEqual(result.protocols, [.openAIChat])
         XCTAssertEqual(result.models.first, "gemini-3.8-flash")
-        XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.requestCount(), 2, "official Gemini discovery should need one catalog GET and one explicit-model inference probe")
+        XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.requestCount(), 2, "official Gemini discovery should need one native catalog GET and one native explicit-model inference probe")
         let probe = try XCTUnwrap(ProviderGeminiDiscoveryURLProtocol.probeBody())
-        XCTAssertEqual(probe["model"] as? String, "gemini-3.8-flash")
-        XCTAssertEqual(probe["stream"] as? Bool, false)
-        XCTAssertNil(probe["max_tokens"], "Gemini validation must not add a field absent from the real compatible request path")
+        XCTAssertNotNil(probe["contents"])
+        XCTAssertNil(probe["model"], "Gemini native model id belongs in the request path, not the JSON body")
+        XCTAssertNil(probe["stream"], "Gemini native validation uses the non-streaming generateContent method")
     }
 
     func testGeminiOfficialDiscoveryOverridesStaleXAPIKeyAuthWithBearer() async throws {
@@ -1254,7 +1254,7 @@ final class ProviderDiscoveryTests: XCTestCase {
         )
 
         XCTAssertEqual(result.readiness, .ready)
-        XCTAssertEqual(result.authMode, .bearer)
+        XCTAssertEqual(result.authMode, .xAPIKey)
         XCTAssertEqual(result.protocols, [.openAIChat])
         XCTAssertEqual(result.models.first, "gemini-3.8-flash")
         XCTAssertEqual(ProviderGeminiDiscoveryURLProtocol.requestCount(), 2)
@@ -1302,10 +1302,10 @@ final class ProviderDiscoveryTests: XCTestCase {
             customModelAllowed: true
         ).normalizedForOfficialCompatibilityEndpoint()
 
-        XCTAssertEqual(profile.baseURL.absoluteString, "https://generativelanguage.googleapis.com/v1beta/openai/")
+        XCTAssertEqual(profile.baseURL.absoluteString, "https://generativelanguage.googleapis.com/v1beta/")
         XCTAssertEqual(profile.protocols, [.openAIChat])
         XCTAssertEqual(profile.preferredProtocol, .openAIChat)
-        XCTAssertEqual(profile.authMode, .bearer)
+        XCTAssertEqual(profile.authMode, .xAPIKey)
         XCTAssertEqual(profile.models, ["gemini-3.8-flash"])
         XCTAssertEqual(profile.keySlots.first?.protocols, [.openAIChat])
         XCTAssertEqual(profile.keySlots.first?.models, ["gemini-3.8-flash"])
@@ -1806,9 +1806,10 @@ final class ProviderProtocolClientTests: XCTestCase {
         for try await _ in anthropic.stream(configuration: anthropicConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
         XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://example.com/v1/messages")
 
-        ProviderTestURLProtocol.install(status: 200, body: Data("data: [DONE]\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let geminiStream = Data("data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"OK\"}]},\"finishReason\":\"STOP\"}]}\n\n".utf8)
+        ProviderTestURLProtocol.install(status: 200, body: geminiStream, headers: ["Content-Type": "text/event-stream"])
         let geminiCompatibilityConfiguration = ProviderConfiguration(
-            name: "Gemini OpenAI Compatibility",
+            name: "Gemini Native",
             baseURL: URL(string: "https://generativelanguage.googleapis.com/v1beta/openai/")!,
             model: "gemini-2.5-flash",
             apiKeyReference: "key",
@@ -1816,21 +1817,22 @@ final class ProviderProtocolClientTests: XCTestCase {
             authModeName: ProviderAuthMode.bearer.rawValue
         )
         for try await _ in chat.stream(configuration: geminiCompatibilityConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
-        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
-        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.value(forHTTPHeaderField: "Authorization"), "Bearer secret")
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse")
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.value(forHTTPHeaderField: "x-goog-api-key"), "secret")
+        XCTAssertNil(ProviderTestURLProtocol.lastRequest()?.value(forHTTPHeaderField: "Authorization"))
 
         var geminiRootConfiguration = geminiCompatibilityConfiguration
         geminiRootConfiguration.baseURL = URL(string: "https://generativelanguage.googleapis.com")!
         for try await _ in chat.stream(configuration: geminiRootConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
-        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse")
 
         var geminiLegacyNativeConfiguration = geminiCompatibilityConfiguration
         geminiLegacyNativeConfiguration.baseURL = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent")!
         geminiLegacyNativeConfiguration.authModeName = ProviderAuthMode.xAPIKey.rawValue
         for try await _ in chat.stream(configuration: geminiLegacyNativeConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
-        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
-        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.value(forHTTPHeaderField: "Authorization"), "Bearer secret")
-        XCTAssertNil(ProviderTestURLProtocol.lastRequest()?.value(forHTTPHeaderField: "x-api-key"))
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse")
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.value(forHTTPHeaderField: "x-goog-api-key"), "secret")
+        XCTAssertNil(ProviderTestURLProtocol.lastRequest()?.value(forHTTPHeaderField: "Authorization"))
     }
 
     func testResponsesStreamingTextAndToolCall() async throws {
@@ -3480,11 +3482,14 @@ private final class ProviderGeminiDiscoveryURLProtocol: URLProtocol, @unchecked 
 
         let status: Int
         let body: Data
-        if url.path == "/v1beta/openai/models" {
-            let rows = (0..<12).map { "{\"id\":\"catalog-model-\($0)\"}" }.joined(separator: ",")
-            body = Data("{\"data\":[\(rows),{\"id\":\"models/gemini-3.8-flash\"},{\"id\":\"models/gemini-3-flash-preview\"}]}".utf8)
-            status = 200
-        } else if url.path == "/v1beta/openai/chat/completions" {
+        if url.path == "/v1beta/models" {
+            let rows = (0..<12).map { "{\"name\":\"models/catalog-model-\($0)\"}" }.joined(separator: ",")
+            let valid = request.value(forHTTPHeaderField: "x-goog-api-key") == "test-secret"
+            body = valid
+                ? Data("{\"models\":[\(rows),{\"name\":\"models/gemini-3.8-flash\"},{\"name\":\"models/gemini-3-flash-preview\"}]}".utf8)
+                : Data(#"{"error":{"message":"missing native key"}}"#.utf8)
+            status = valid ? 200 : 401
+        } else if url.path.hasPrefix("/v1beta/models/") && url.path.hasSuffix(":generateContent") {
             var raw = request.httpBody
             if raw == nil, let stream = request.httpBodyStream {
                 stream.open()
@@ -3503,14 +3508,16 @@ private final class ProviderGeminiDiscoveryURLProtocol: URLProtocol, @unchecked 
             Self.lock.lock()
             Self.probeBodyValue = object
             Self.lock.unlock()
-            let requestedModel = object?["model"] as? String
-            let valid = request.value(forHTTPHeaderField: "Authorization") == "Bearer test-secret"
-                && (requestedModel == "gemini-3.8-flash" || requestedModel == "gemini-3-flash-preview")
-                && object?["max_tokens"] == nil
+            let model = url.path
+                .replacingOccurrences(of: "/v1beta/models/", with: "")
+                .replacingOccurrences(of: ":generateContent", with: "")
+            let valid = request.value(forHTTPHeaderField: "x-goog-api-key") == "test-secret"
+                && (model == "gemini-3.8-flash" || model == "gemini-3-flash-preview")
+                && object?["contents"] is [Any]
             status = valid ? 200 : 400
             body = valid
-                ? Data(#"{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}"#.utf8)
-                : Data(#"{"error":{"message":"invalid compatibility probe"}}"#.utf8)
+                ? Data(#"{"candidates":[{"content":{"role":"model","parts":[{"text":"OK"}]},"finishReason":"STOP"}]}"#.utf8)
+                : Data(#"{"error":{"message":"invalid native probe"}}"#.utf8)
         } else {
             status = 404
             body = Data(#"{"error":{"message":"unsupported path"}}"#.utf8)

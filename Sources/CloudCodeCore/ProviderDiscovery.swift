@@ -44,10 +44,10 @@ public struct ProviderDiscoveryClient: Sendable {
         var sawReachableUnparseableCatalog = false
         var authModes = [ProviderAuthMode.bearer, .xAPIKey, .both]
         if ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL) {
-            // The official Gemini OpenAI-compatible surface uses Authorization: Bearer. Historical
-            // custom-provider records may still contain x-api-key/both from older probing logic;
-            // never let that stale preference invalidate an otherwise working Gemini API key.
-            authModes = [.bearer]
+            // The official Gemini native API uses x-goog-api-key. Keep discovery on the same wire
+            // contract as runtime so a valid key is not rejected only because the compatibility
+            // endpoint happens to behave differently.
+            authModes = [.xAPIKey]
         } else {
             if let preferredAuthMode {
                 authModes.removeAll { $0.rawValue == preferredAuthMode.rawValue }
@@ -264,13 +264,22 @@ public struct ProviderDiscoveryClient: Sendable {
     }
 
     public func discoverModels(baseURL: URL, apiKey: String, authMode: ProviderAuthMode = .bearer) async throws -> [String] {
-        let url = try ProviderEndpoint.endpoint(baseURL: baseURL, path: "models")
+        let isOfficialGemini = ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL)
+        let url: URL
+        if isOfficialGemini {
+            url = ProviderEndpointPolicy.geminiNativeModelsURL()
+        } else {
+            url = try ProviderEndpoint.endpoint(baseURL: baseURL, path: "models")
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        ProviderCompatibilityHeaders.apply(to: &request)
-        let effectiveAuthMode: ProviderAuthMode = ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL) ? .bearer : authMode
-        applyAuth(apiKey, mode: effectiveAuthMode, request: &request)
+        if isOfficialGemini {
+            request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        } else {
+            ProviderCompatibilityHeaders.apply(to: &request)
+            applyAuth(apiKey, mode: authMode, request: &request)
+        }
         request.timeoutInterval = 30
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("缺少 HTTP 响应") }
@@ -477,32 +486,40 @@ public struct ProviderDiscoveryClient: Sendable {
     private func probe(_ protocolName: ProviderProtocol, baseURL: URL, apiKey: String, authMode: ProviderAuthMode, model: String) async throws -> ProbeOutcome {
         let path: String
         let body: [String: Any]
+        let isOfficialGemini = ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL)
         switch protocolName {
         case .anthropic:
             path = "messages"
             body = ["model": model, "max_tokens": 1, "stream": false, "messages": [["role": "user", "content": "Reply OK"]]]
         case .openAIChat:
-            path = "chat/completions"
-            var chatBody: [String: Any] = ["model": model, "stream": false, "messages": [["role": "user", "content": "Reply OK"]]]
-            // Google's official Gemini OpenAI compatibility endpoint accepts the same minimal body
-            // used by our real OpenAI-compatible runtime. Do not make discovery stricter than the
-            // request path by injecting a legacy max_tokens field only during validation.
-            if baseURL.host?.lowercased() != "generativelanguage.googleapis.com" {
-                chatBody["max_tokens"] = 1
+            if isOfficialGemini {
+                path = ""
+                body = ["contents": [["role": "user", "parts": [["text": "Reply OK"]]]]]
+            } else {
+                path = "chat/completions"
+                body = ["model": model, "max_tokens": 1, "stream": false, "messages": [["role": "user", "content": "Reply OK"]]]
             }
-            body = chatBody
         case .openAIResponses:
             path = "responses"
             body = ["model": model, "max_output_tokens": 1, "stream": false, "input": "Reply OK"]
         }
-        let url = try ProviderEndpoint.endpoint(baseURL: baseURL, path: path)
+        let url: URL
+        if isOfficialGemini && protocolName == .openAIChat {
+            url = try ProviderEndpointPolicy.geminiNativeGenerateURL(model: model, streaming: false)
+        } else {
+            url = try ProviderEndpoint.endpoint(baseURL: baseURL, path: path)
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        ProviderCompatibilityHeaders.apply(to: &request)
-        if protocolName == .anthropic { request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version") }
-        applyAuth(apiKey, mode: authMode, request: &request)
+        if isOfficialGemini && protocolName == .openAIChat {
+            request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        } else {
+            ProviderCompatibilityHeaders.apply(to: &request)
+            if protocolName == .anthropic { request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version") }
+            applyAuth(apiKey, mode: authMode, request: &request)
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         request.timeoutInterval = 30
         do {
@@ -552,7 +569,7 @@ public struct ProviderDiscoveryClient: Sendable {
             }
             return false
         case .openAIChat:
-            return dictionary["choices"] is [Any]
+            return dictionary["choices"] is [Any] || dictionary["candidates"] is [Any]
         case .openAIResponses:
             if dictionary["output"] is [Any] || dictionary["output_text"] is String { return true }
             if let type = dictionary["type"] as? String { return type.hasPrefix("response.") || type == "response" }

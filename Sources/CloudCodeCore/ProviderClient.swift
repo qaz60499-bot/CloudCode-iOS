@@ -15,6 +15,26 @@ public enum ProviderEndpointPolicy {
         return String(trimmed.dropFirst("models/".count))
     }
 
+    public static func geminiNativeModelsURL() -> URL {
+        URL(string: "https://generativelanguage.googleapis.com/v1beta/models")!
+    }
+
+    public static func geminiNativeGenerateURL(model: String, streaming: Bool) throws -> URL {
+        let normalized = model.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "^models/", with: "", options: .regularExpression)
+        guard !normalized.isEmpty else { throw ProviderError.invalidEndpoint }
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._"))
+        guard normalized.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { throw ProviderError.invalidEndpoint }
+        let method = streaming ? "streamGenerateContent" : "generateContent"
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "generativelanguage.googleapis.com"
+        components.path = "/v1beta/models/\(normalized):\(method)"
+        if streaming { components.queryItems = [URLQueryItem(name: "alt", value: "sse")] }
+        guard let url = components.url else { throw ProviderError.invalidEndpoint }
+        return url
+    }
+
     public static func allowsBaseURL(_ url: URL) -> Bool {
         guard url.scheme?.lowercased() == "https",
               let host = url.host?.lowercased(),
@@ -761,7 +781,7 @@ private enum ProviderImageProbeClassifier {
             // inference completion/stream envelope from the exact API endpoint before promoting
             // this route to image-supported.
             let successMarkers = [
-                "\"choices\"", "\"message_start\"", "\"message_stop\"", "\"content_block_",
+                "\"choices\"", "\"candidates\"", "\"message_start\"", "\"message_stop\"", "\"content_block_",
                 "\"response.completed\"", "\"response.output_", "data: [done]"
             ]
             let errorMarkers = ["\"error\"", "event: error", "\"type\":\"error\""]
@@ -798,12 +818,22 @@ private extension ProviderRequestBuilding {
         if cached.source != "unprobed" { return cached }
 
         do {
-            let modelsURL = try ProviderEndpoint.endpoint(baseURL: configuration.baseURL, path: "models")
+            let isOfficialGemini = ProviderEndpointPolicy.isOfficialGeminiAPI(configuration.baseURL)
+            let modelsURL: URL
+            if isOfficialGemini {
+                modelsURL = ProviderEndpointPolicy.geminiNativeModelsURL()
+            } else {
+                modelsURL = try ProviderEndpoint.endpoint(baseURL: configuration.baseURL, path: "models")
+            }
             var request = URLRequest(url: modelsURL)
             request.httpMethod = "GET"
             request.setValue("application/json", forHTTPHeaderField: "Accept")
-            ProviderCompatibilityHeaders.apply(to: &request)
-            applyProviderProbeAuth(apiKey, configuration: configuration, request: &request)
+            if isOfficialGemini {
+                request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+            } else {
+                ProviderCompatibilityHeaders.apply(to: &request)
+                applyProviderProbeAuth(apiKey, configuration: configuration, request: &request)
+            }
             request.timeoutInterval = 6
             let (data, response) = try await session.data(for: request)
             if let http = response as? HTTPURLResponse,
@@ -1314,6 +1344,28 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
     }
 
     fileprivate func makeRequest(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) throws -> URLRequest {
+        if ProviderEndpointPolicy.isOfficialGeminiAPI(configuration.baseURL) {
+            let url = try ProviderEndpointPolicy.geminiNativeGenerateURL(model: configuration.model, streaming: true)
+            var body: [String: Any] = ["contents": try geminiNativeContents(messages)]
+            let systemText = messages.filter { $0.role == .system }.map(\.content).filter { !$0.isEmpty }.joined(separator: "\n\n")
+            if !systemText.isEmpty {
+                body["systemInstruction"] = ["parts": [["text": systemText]]]
+            }
+            if !tools.isEmpty {
+                body["tools"] = [["functionDeclarations": tools.map { tool in
+                    ["name": tool.name, "description": tool.description, "parameters": tool.parametersObject]
+                }]]
+            }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("text/event-stream, application/json", forHTTPHeaderField: "Accept")
+            request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            request.timeoutInterval = 120
+            return request
+        }
+
         let url = try ProviderEndpoint.endpoint(baseURL: configuration.baseURL, path: "chat/completions")
         var body: [String: Any] = [
             "model": configuration.model,
@@ -1345,8 +1397,49 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
                     break
                 }
                 guard let data = payload.data(using: .utf8),
-                      let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let choices = object["choices"] as? [[String: Any]],
+                      let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+
+                if let errorObject = object["error"] {
+                    if outputStarted { throw ProviderError.streamInterrupted }
+                    let detail = providerErrorDetail(from: errorObject) ?? "Gemini 原生接口返回错误"
+                    throw ProviderError.protocolIncompatible(detail)
+                }
+
+                if let candidates = object["candidates"] as? [[String: Any]], let candidate = candidates.first {
+                    sawEvent = true
+                    if let content = candidate["content"] as? [String: Any],
+                       let parts = content["parts"] as? [[String: Any]] {
+                        for part in parts {
+                            if let text = part["text"] as? String, !text.isEmpty {
+                                outputStarted = true
+                                continuation.yield(.token(text))
+                            }
+                            if let functionCall = part["functionCall"] as? [String: Any],
+                               let name = functionCall["name"] as? String,
+                               !name.isEmpty {
+                                let index = toolCallState.count
+                                var accumulator = ToolCallAccumulator()
+                                accumulator.id = (functionCall["id"] as? String) ?? "gemini-call-\(index)"
+                                accumulator.name = name
+                                if let args = functionCall["args"], JSONSerialization.isValidJSONObject(args),
+                                   let argsData = try? JSONSerialization.data(withJSONObject: args),
+                                   let argsJSON = String(data: argsData, encoding: .utf8) {
+                                    accumulator.arguments = argsJSON
+                                } else {
+                                    accumulator.arguments = "{}"
+                                }
+                                toolCallState[index] = accumulator
+                                outputStarted = true
+                            }
+                        }
+                    }
+                    if let finishReason = candidate["finishReason"] as? String, !finishReason.isEmpty {
+                        terminal = true
+                    }
+                    continue
+                }
+
+                guard let choices = object["choices"] as? [[String: Any]],
                       let choice = choices.first else { continue }
                 sawEvent = true
 
@@ -2963,10 +3056,10 @@ enum ProviderCompatibilityHeaders {
 
 private enum ProviderRequestFactory {
     static func authMode(_ configuration: ProviderConfiguration) -> ProviderAuthMode {
-        // Google's official OpenAI-compatible Gemini endpoint documents Bearer authentication.
-        // Force that wire shape even when an older custom-provider record persisted x-api-key/both;
-        // a stale UI preference must not make a known-good Gemini API key look invalid.
-        if ProviderEndpointPolicy.isOfficialGeminiAPI(configuration.baseURL) { return .bearer }
+        // Google's official native Gemini API uses x-goog-api-key. The dedicated native request
+        // path sets that header directly; keep metadata/auth-state aligned so validation and UI do
+        // not preserve the old OpenAI-compatibility Bearer assumption.
+        if ProviderEndpointPolicy.isOfficialGeminiAPI(configuration.baseURL) { return .xAPIKey }
         return ProviderAuthMode(rawValue: configuration.authModeName ?? "") ?? .bearer
     }
 
@@ -3083,6 +3176,72 @@ private func responsesImageContent(_ message: ChatMessage, attachments: [Provide
     }
     content.append(contentsOf: attachments.map { ["type": "input_image", "image_url": $0.dataURL] })
     return content
+}
+
+private func geminiNativeContents(_ messages: [ChatMessage]) throws -> [[String: Any]] {
+    var result: [[String: Any]] = []
+
+    func append(role: String, parts: [[String: Any]]) {
+        guard !parts.isEmpty else { return }
+        if let lastIndex = result.indices.last,
+           result[lastIndex]["role"] as? String == role,
+           var existing = result[lastIndex]["parts"] as? [[String: Any]] {
+            existing.append(contentsOf: parts)
+            result[lastIndex]["parts"] = existing
+            return
+        }
+        result.append(["role": role, "parts": parts])
+    }
+
+    for message in messages where message.role != .system {
+        if message.role == .tool,
+           let name = providerVisibleToolName(message) {
+            var responseObject: [String: Any] = ["result": message.content]
+            if let data = message.content.data(using: .utf8),
+               let parsed = try? JSONSerialization.jsonObject(with: data),
+               let dictionary = parsed as? [String: Any] {
+                responseObject = dictionary
+            }
+            var functionResponse: [String: Any] = [
+                "name": name,
+                "response": responseObject
+            ]
+            if let callID = message.providerMetadata["tool_call_id"], !callID.isEmpty {
+                functionResponse["id"] = callID
+            }
+            append(role: "user", parts: [["functionResponse": functionResponse]])
+            continue
+        }
+
+        if message.role == .assistant,
+           let name = providerVisibleToolName(message) {
+            let arguments = message.providerMetadata["tool_arguments"] ?? "{}"
+            let args: [String: Any]
+            if let data = arguments.data(using: .utf8),
+               let parsed = try? JSONSerialization.jsonObject(with: data),
+               let dictionary = parsed as? [String: Any] {
+                args = dictionary
+            } else {
+                args = [:]
+            }
+            var functionCall: [String: Any] = ["name": name, "args": args]
+            if let callID = message.providerMetadata["tool_call_id"], !callID.isEmpty {
+                functionCall["id"] = callID
+            }
+            append(role: "model", parts: [["functionCall": functionCall]])
+            continue
+        }
+
+        let role = message.role == .assistant ? "model" : "user"
+        let attachments = try providerImageAttachments(message)
+        var parts: [[String: Any]] = []
+        if !message.content.isEmpty { parts.append(["text": message.content]) }
+        parts.append(contentsOf: attachments.map { attachment in
+            ["inlineData": ["mimeType": attachment.mimeType, "data": attachment.base64]]
+        })
+        append(role: role, parts: parts)
+    }
+    return result
 }
 
 private func openAIMessageObject(_ message: ChatMessage) throws -> [String: Any] {

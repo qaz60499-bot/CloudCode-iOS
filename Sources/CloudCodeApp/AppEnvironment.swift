@@ -3971,7 +3971,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let isOfficialGeminiAPI = ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL)
         let manualModel = ProviderEndpointPolicy.normalizedModelID(initialModel, for: baseURL)
         let effectivePreferredProtocol: ProviderProtocol = isOfficialGeminiAPI ? .openAIChat : preferredProtocol
-        let effectiveAuthMode: ProviderAuthMode = isOfficialGeminiAPI ? .bearer : authMode
+        let effectiveAuthMode: ProviderAuthMode = isOfficialGeminiAPI ? .xAPIKey : authMode
         let providerID = "custom-\(UUID().uuidString.lowercased())"
         let slotID = "slot-1"
         let reference = ProviderCatalog.keyReference(providerID: providerID, keySlotID: slotID)
@@ -4116,7 +4116,7 @@ public final class CloudCodeViewModel: ObservableObject {
         let isOfficialGeminiAPI = ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL)
         let manualModel = ProviderEndpointPolicy.normalizedModelID(initialModel, for: baseURL)
         let effectivePreferredProtocol: ProviderProtocol = isOfficialGeminiAPI ? .openAIChat : preferredProtocol
-        let effectiveAuthMode: ProviderAuthMode = isOfficialGeminiAPI ? .bearer : authMode
+        let effectiveAuthMode: ProviderAuthMode = isOfficialGeminiAPI ? .xAPIKey : authMode
         var provider = providerProfiles[providerIndex]
         let slotID = provider.keySlots.first?.id ?? "slot-1"
         let reference = ProviderCatalog.keyReference(providerID: id, keySlotID: slotID)
@@ -4395,7 +4395,7 @@ public final class CloudCodeViewModel: ObservableObject {
         }
         let profile = providerProfiles[providerIndex]
         let isOfficialGeminiAPI = ProviderEndpointPolicy.isOfficialGeminiAPI(profile.baseURL)
-        let preferredAuthMode: ProviderAuthMode = isOfficialGeminiAPI ? .bearer : profile.authMode
+        let preferredAuthMode: ProviderAuthMode = isOfficialGeminiAPI ? .xAPIKey : profile.authMode
         let inferenceProtocols: [ProviderProtocol] = isOfficialGeminiAPI ? [.openAIChat] : profile.protocols
         var fallbackInferenceCandidates = profile.models(for: keySlotID)
         if let snapshot = ProviderCatalog.desktopSnapshot.first(where: { $0.id == providerID }) {
@@ -4696,7 +4696,7 @@ public final class CloudCodeViewModel: ObservableObject {
             apiKeyReference: primary,
             providerID: provider.id,
             protocolName: protocolName.rawValue,
-            authModeName: (isOfficialGeminiAPI ? ProviderAuthMode.bearer : provider.authMode).rawValue,
+            authModeName: (isOfficialGeminiAPI ? ProviderAuthMode.xAPIKey : provider.authMode).rawValue,
             fallbackAPIKeyReferences: provider.autoRotateKeys ? Array(references.dropFirst()) : [],
             fallbackProtocolNames: Array(protocolCandidates.dropFirst()).map(\.rawValue),
             protocolNamesByKeyReference: protocolNamesByKeyReference,
