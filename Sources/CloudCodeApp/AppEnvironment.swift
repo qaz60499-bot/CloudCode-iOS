@@ -4397,7 +4397,16 @@ public final class CloudCodeViewModel: ObservableObject {
         let isOfficialGeminiAPI = ProviderEndpointPolicy.isOfficialGeminiAPI(profile.baseURL)
         let preferredAuthMode: ProviderAuthMode = isOfficialGeminiAPI ? .xAPIKey : profile.authMode
         let inferenceProtocols: [ProviderProtocol] = isOfficialGeminiAPI ? [.openAIChat] : profile.protocols
-        var fallbackInferenceCandidates = profile.models(for: keySlotID)
+        var fallbackInferenceCandidates: [String] = []
+        if providerID == selectedProviderID, keySlotID == selectedKeySlotID {
+            let selectedCandidate = ProviderEndpointPolicy.normalizedModelID(selectedModel, for: profile.baseURL)
+            if !selectedCandidate.isEmpty {
+                fallbackInferenceCandidates.append(selectedCandidate)
+            }
+        }
+        for model in profile.models(for: keySlotID) where !fallbackInferenceCandidates.contains(model) {
+            fallbackInferenceCandidates.append(model)
+        }
         if let snapshot = ProviderCatalog.desktopSnapshot.first(where: { $0.id == providerID }) {
             for model in snapshot.models(for: keySlotID) where !fallbackInferenceCandidates.contains(model) {
                 fallbackInferenceCandidates.append(model)
