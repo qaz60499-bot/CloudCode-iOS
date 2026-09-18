@@ -1898,6 +1898,7 @@ private struct SettingsView: View {
     @State private var selectedKeyInput = ""
     @State private var customModelInput = ""
     @State private var showCustomProvider = false
+    @State private var showEditProvider = false
     @State private var showCustomAppProvider = false
     @State private var showBootstrapImporter = false
     @State private var showAppProviderImporter = false
@@ -2130,6 +2131,9 @@ private struct SettingsView: View {
                         .disabled(model.isProviderKeyMutationInFlight)
 
                     if let provider = model.selectedProvider {
+                        Button("修改当前厂商") { showEditProvider = true }
+                            .disabled(model.isProviderKeyMutationInFlight)
+
                         Button(provider.source == .custom ? "删除当前厂商" : "从列表隐藏当前内置厂商") {
                             showRemoveProviderConfirmation = true
                         }
@@ -2248,6 +2252,11 @@ private struct SettingsView: View {
             }
             .sheet(isPresented: $showCustomProvider) {
                 CustomProviderSheet(model: model, isPresented: $showCustomProvider)
+            }
+            .sheet(isPresented: $showEditProvider) {
+                if let provider = model.selectedProvider {
+                    EditProviderSheet(model: model, provider: provider, isPresented: $showEditProvider)
+                }
             }
             .sheet(isPresented: $showCustomAppProvider) {
                 CustomAppProviderSheet(model: model, isPresented: $showCustomAppProvider)
@@ -2425,6 +2434,86 @@ private struct CustomProviderSheet: View {
                         isPresented = false
                     }
                     .disabled(label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || baseURL.isEmpty || apiKey.isEmpty || model.isProviderKeyMutationInFlight)
+                }
+            }
+        }
+    }
+}
+
+private struct EditProviderSheet: View {
+    @ObservedObject var model: CloudCodeViewModel
+    let provider: ProviderProfile
+    @Binding var isPresented: Bool
+
+    @State private var label: String
+    @State private var baseURL: String
+    @State private var apiKey: String = ""
+    @State private var initialModel: String
+    @State private var preferredProtocol: ProviderProtocol
+    @State private var authMode: ProviderAuthMode
+
+    init(model: CloudCodeViewModel, provider: ProviderProfile, isPresented: Binding<Bool>) {
+        self.model = model
+        self.provider = provider
+        self._isPresented = isPresented
+        _label = State(initialValue: provider.displayName)
+        _baseURL = State(initialValue: provider.baseURL.absoluteString)
+        _initialModel = State(initialValue: provider.models.first ?? "")
+        _preferredProtocol = State(initialValue: provider.preferredProtocol)
+        _authMode = State(initialValue: provider.authMode)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("厂商基本信息") {
+                    TextField("名称", text: $label)
+                    TextField("Base URL", text: $baseURL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    SecureField("API Key（留空保留原 Key）", text: $apiKey)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    TextField("默认模型 ID（建议填写）", text: $initialModel)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Picker("协议", selection: $preferredProtocol) {
+                        Text("OpenAI Chat").tag(ProviderProtocol.openAIChat)
+                        Text("OpenAI Responses").tag(ProviderProtocol.openAIResponses)
+                        Text("Anthropic Messages").tag(ProviderProtocol.anthropic)
+                    }
+                    Picker("鉴权", selection: $authMode) {
+                        Text("Bearer").tag(ProviderAuthMode.bearer)
+                        Text("x-api-key").tag(ProviderAuthMode.xAPIKey)
+                        Text("Bearer + x-api-key").tag(ProviderAuthMode.both)
+                    }
+                }
+                Section {
+                    Text("修改后会更新本地厂商配置；若填入新 API Key 将覆盖 Keychain 中的 Key。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("修改厂商")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { isPresented = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") {
+                        model.updateCustomProvider(
+                            id: provider.id,
+                            label: label,
+                            baseURLText: baseURL,
+                            apiKey: apiKey,
+                            initialModel: initialModel,
+                            preferredProtocol: preferredProtocol,
+                            authMode: authMode
+                        )
+                        apiKey = ""
+                        isPresented = false
+                    }
+                    .disabled(label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || baseURL.isEmpty || model.isProviderKeyMutationInFlight)
                 }
             }
         }

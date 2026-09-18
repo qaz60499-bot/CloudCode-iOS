@@ -1289,14 +1289,14 @@ final class ProviderDiscoveryTests: XCTestCase {
             protocols: [.anthropic, .openAIResponses],
             preferredProtocol: .anthropic,
             authMode: .xAPIKey,
-            models: ["gemini-3.8-flash"],
+            models: ["models/gemini-3.8-flash"],
             keySlots: [ProviderKeySlot(
                 id: "slot-1",
                 label: "Key 1",
                 fingerprint: "abc",
-                models: ["gemini-3.8-flash"],
+                models: ["models/gemini-3.8-flash"],
                 protocols: [.anthropic],
-                modelProtocols: ["gemini-3.8-flash": [.anthropic]]
+                modelProtocols: ["models/gemini-3.8-flash": [.anthropic]]
             )],
             source: .custom,
             customModelAllowed: true
@@ -1306,7 +1306,9 @@ final class ProviderDiscoveryTests: XCTestCase {
         XCTAssertEqual(profile.protocols, [.openAIChat])
         XCTAssertEqual(profile.preferredProtocol, .openAIChat)
         XCTAssertEqual(profile.authMode, .bearer)
+        XCTAssertEqual(profile.models, ["gemini-3.8-flash"])
         XCTAssertEqual(profile.keySlots.first?.protocols, [.openAIChat])
+        XCTAssertEqual(profile.keySlots.first?.models, ["gemini-3.8-flash"])
         XCTAssertEqual(profile.keySlots.first?.modelProtocols["gemini-3.8-flash"], [.openAIChat])
     }
 
@@ -3472,7 +3474,7 @@ private final class ProviderGeminiDiscoveryURLProtocol: URLProtocol, @unchecked 
         let body: Data
         if url.path == "/v1beta/openai/models" {
             let rows = (0..<12).map { "{\"id\":\"catalog-model-\($0)\"}" }.joined(separator: ",")
-            body = Data("{\"data\":[\(rows),{\"id\":\"gemini-3.8-flash\"}]}".utf8)
+            body = Data("{\"data\":[\(rows),{\"id\":\"models/gemini-3.8-flash\"}]}".utf8)
             status = 200
         } else if url.path == "/v1beta/openai/chat/completions" {
             var raw = request.httpBody

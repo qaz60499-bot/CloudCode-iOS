@@ -402,11 +402,22 @@ public final class CloudCodeViewModel: ObservableObject {
             if hiddenProviderIDsAtLaunch.contains(profile.id) { resolved.enabled = false }
             return resolved
         }
-        let storedSelection = ProviderSelectionState(
+        let rawStoredSelection = ProviderSelectionState(
             providerID: defaults.string(forKey: "provider.selected.id") ?? "",
             keySlotID: defaults.string(forKey: "provider.selected.keySlot") ?? "",
             model: defaults.string(forKey: "provider.selected.model") ?? ""
         )
+        var storedSelection = rawStoredSelection
+        if let persistedProvider = allProfiles.first(where: { $0.id == rawStoredSelection.providerID }),
+           ProviderEndpointPolicy.isOfficialGeminiAPI(persistedProvider.baseURL),
+           rawStoredSelection.model.hasPrefix("models/") {
+            storedSelection = ProviderSelectionState(
+                providerID: rawStoredSelection.providerID,
+                keySlotID: rawStoredSelection.keySlotID,
+                model: String(rawStoredSelection.model.dropFirst(7))
+            )
+            defaults.set(storedSelection.model, forKey: "provider.selected.model")
+        }
         var selection = ProviderSelectionResolver.reconcile(storedSelection, profiles: allProfiles)
         // Preserve an exact persisted Provider/Key/model selection across restart even when the
         // last-known-good live catalog says that model disappeared. The picker must surface the
@@ -1597,7 +1608,10 @@ public final class CloudCodeViewModel: ObservableObject {
 
     public func selectModel(_ model: String) {
         guard let provider = selectedProvider else { return }
-        let normalized = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        var normalized = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if ProviderEndpointPolicy.isOfficialGeminiAPI(provider.baseURL), normalized.hasPrefix("models/") {
+            normalized = String(normalized.dropFirst(7))
+        }
         guard !normalized.isEmpty else { return }
         let allowed = provider.selectableModels(for: selectedKeySlotID)
         let identity = Self.customModelOverrideIdentity(
@@ -4071,6 +4085,124 @@ public final class CloudCodeViewModel: ObservableObject {
         }
     }
 
+    public func updateCustomProvider(
+        id: String,
+        label: String,
+        baseURLText: String,
+        apiKey: String,
+        initialModel: String = "",
+        preferredProtocol: ProviderProtocol = .openAIChat,
+        authMode: ProviderAuthMode = .bearer
+    ) {
+        let operationKey = Self.providerKeyMutationOperationKey
+        guard beginExclusiveOperation(operationKey) else {
+            lastError = "另一个厂商 Key 操作正在进行中。"
+            return
+        }
+        guard let providerIndex = providerProfiles.firstIndex(where: { $0.id == id }) else {
+            endExclusiveOperation(operationKey)
+            lastError = "目标厂商不存在。"
+            return
+        }
+        let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedLabel.isEmpty,
+              let baseURL = URL(string: baseURLText.trimmingCharacters(in: .whitespacesAndNewlines)),
+              ProviderEndpointPolicy.allowsBaseURL(baseURL) else {
+            endExclusiveOperation(operationKey)
+            lastError = "厂商需要有效名称与安全 HTTPS Base URL。"
+            return
+        }
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isOfficialGeminiAPI = ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL)
+        let rawManualModel = initialModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let manualModel = isOfficialGeminiAPI && rawManualModel.hasPrefix("models/")
+            ? String(rawManualModel.dropFirst(7))
+            : rawManualModel
+        let effectivePreferredProtocol: ProviderProtocol = isOfficialGeminiAPI ? .openAIChat : preferredProtocol
+        let effectiveAuthMode: ProviderAuthMode = isOfficialGeminiAPI ? .bearer : authMode
+        var provider = providerProfiles[providerIndex]
+        let slotID = provider.keySlots.first?.id ?? "slot-1"
+        let reference = ProviderCatalog.keyReference(providerID: id, keySlotID: slotID)
+
+        activityLines.append("正在更新 \(trimmedLabel) 配置…")
+        Task {
+            defer { endExclusiveOperation(operationKey) }
+            do {
+                var newFingerprint: String?
+                if !trimmedKey.isEmpty {
+                    try keyVault.set(trimmedKey, for: reference)
+                    let stored = try await keyVault.key(for: reference)
+                    guard stored == trimmedKey else { throw ProviderKeyProvisioningError.verificationFailed(reference) }
+                    installedKeyReferences.insert(reference)
+                    updateManualProviderKeyOverrides { overrides in
+                        _ = overrides.insert(reference)
+                    }
+                    newFingerprint = ProviderFingerprint.sha256(trimmedKey)
+                }
+
+                provider.displayName = trimmedLabel
+                provider.baseURL = baseURL
+                provider.preferredProtocol = effectivePreferredProtocol
+                provider.protocols = [effectivePreferredProtocol]
+                provider.authMode = effectiveAuthMode
+
+                var models = provider.models
+                if !manualModel.isEmpty {
+                    if !models.contains(manualModel) {
+                        models.insert(manualModel, at: 0)
+                    }
+                    provider.models = models
+                }
+
+                if provider.keySlots.isEmpty {
+                    let slot = ProviderKeySlot(
+                        id: slotID,
+                        label: "Key 1",
+                        fingerprint: newFingerprint ?? "",
+                        status: .needsValidation,
+                        models: models,
+                        protocols: [effectivePreferredProtocol],
+                        modelProtocols: manualModel.isEmpty ? [:] : [manualModel: [effectivePreferredProtocol]]
+                    )
+                    provider.keySlots = [slot]
+                } else {
+                    if let newFingerprint {
+                        provider.keySlots[0].fingerprint = newFingerprint
+                    }
+                    provider.keySlots[0].protocols = [effectivePreferredProtocol]
+                    if !manualModel.isEmpty {
+                        var slotModels = provider.keySlots[0].models
+                        if !slotModels.contains(manualModel) {
+                            slotModels.insert(manualModel, at: 0)
+                        }
+                        provider.keySlots[0].models = slotModels
+                        provider.keySlots[0].modelProtocols[manualModel] = [effectivePreferredProtocol]
+                    }
+                }
+
+                provider = provider.normalizedForOfficialCompatibilityEndpoint()
+                providerProfiles[providerIndex] = provider
+
+                if provider.source == .custom {
+                    try persistCustomProviders()
+                }
+
+                if selectedProviderID == id {
+                    selectProvider(id)
+                    if !manualModel.isEmpty {
+                        selectModel(manualModel)
+                    }
+                }
+
+                providerKeyCheckMessage = "已成功更新厂商 \(trimmedLabel)。"
+                activityLines.append("已更新厂商配置：\(trimmedLabel)。")
+                lastError = nil
+            } catch {
+                lastError = "更新厂商失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
     public var hiddenProviderCount: Int {
         providerProfiles.filter { !$0.enabled && $0.source != .custom }.count
     }
@@ -4584,10 +4716,16 @@ public final class CloudCodeViewModel: ObservableObject {
         // session restoration) is therefore an explicit network-routing decision. Keeping a stale
         // `.appBacked` backend here makes the UI show a network provider/key/model while Send still
         // foregrounds Gemini/DeepSeek instead of reaching URLSession.
+        var normalizedModel = state.model
+        if let provider = providerProfiles.first(where: { $0.id == state.providerID }),
+           ProviderEndpointPolicy.isOfficialGeminiAPI(provider.baseURL),
+           normalizedModel.hasPrefix("models/") {
+            normalizedModel = String(normalizedModel.dropFirst(7))
+        }
         selectedProviderBackend = .network
         selectedProviderID = state.providerID
         selectedKeySlotID = state.keySlotID
-        selectedModel = state.model
+        selectedModel = normalizedModel
         persistProviderSelection()
     }
 

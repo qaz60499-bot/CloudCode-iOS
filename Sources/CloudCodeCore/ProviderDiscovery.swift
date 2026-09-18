@@ -278,7 +278,11 @@ public struct ProviderDiscoveryClient: Sendable {
         guard let rawObject = try? JSONSerialization.jsonObject(with: data),
               let object = rawObject as? [String: Any],
               let catalog = object["data"] ?? object["models"] else { throw ProviderError.malformedEvent }
-        return Self.extractModelIdentifiers(from: catalog)
+        var models = Self.extractModelIdentifiers(from: catalog)
+        if ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL) {
+            models = models.map { $0.hasPrefix("models/") ? String($0.dropFirst(7)) : $0 }
+        }
+        return models
     }
 
     private func discoverModelsFromPricing(

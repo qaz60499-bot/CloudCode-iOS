@@ -171,8 +171,12 @@ public struct ProviderProfile: Codable, Equatable, Identifiable, Sendable {
         normalized.protocols = [.openAIChat]
         normalized.preferredProtocol = .openAIChat
         normalized.authMode = .bearer
+        let cleanModels = normalized.models.map { $0.hasPrefix("models/") ? String($0.dropFirst(7)) : $0 }
+        normalized.models = cleanModels.isEmpty ? ["gemini-3-flash-preview"] : cleanModels
         for index in normalized.keySlots.indices {
             normalized.keySlots[index].protocols = [.openAIChat]
+            let slotModels = normalized.keySlots[index].models.map { $0.hasPrefix("models/") ? String($0.dropFirst(7)) : $0 }
+            normalized.keySlots[index].models = slotModels.isEmpty ? normalized.models : slotModels
             normalized.keySlots[index].modelProtocols = Dictionary(uniqueKeysWithValues:
                 normalized.keySlots[index].models.map { ($0, [.openAIChat]) }
             )
