@@ -1242,7 +1242,7 @@ public actor AgentCore {
                             continuation.yield(.status(round == 0 ? "正在使用工具优先路由规划…" : "正在根据工具结果继续…"))
                         }
                         var assistantText = ""
-                        var providerToolCalls: [(String, String, String)] = []
+                        var providerToolCalls: [(String, String, String, [String: String])] = []
                         var providerToolCallIDs = Set<String>()
                         var steeringInterruptedProviderStream = false
 
@@ -1509,7 +1509,7 @@ public actor AgentCore {
                             }
                             let localCallID = "semantic-local-\(round + 1)-\(deterministicTaskOperation.toolName)"
                             providerToolCallIDs.insert(localCallID)
-                            providerToolCalls.append((localCallID, providerToolName, argumentsJSON))
+                            providerToolCalls.append((localCallID, providerToolName, argumentsJSON, [:]))
                             runtimeBreadcrumb?("runtime.agent.semantic.localDispatch")
                             continuation.yield(.status("Semantic Runtime 已确定下一本地步骤，跳过本轮 Provider。"))
                             try? await diagnosticLogger?.log(
@@ -1582,7 +1582,12 @@ public actor AgentCore {
                                     guard !id.isEmpty, providerToolCallIDs.insert(id).inserted else {
                                         throw ToolArgumentValidationError.duplicateToolCallID(id)
                                     }
-                                    providerToolCalls.append((id, name, argumentsJSON))
+                                    providerToolCalls.append((id, name, argumentsJSON, [:]))
+                                case .toolCallWithMetadata(let id, let name, let argumentsJSON, let metadata):
+                                    guard !id.isEmpty, providerToolCallIDs.insert(id).inserted else {
+                                        throw ToolArgumentValidationError.duplicateToolCallID(id)
+                                    }
+                                    providerToolCalls.append((id, name, argumentsJSON, metadata))
                                 case .finished:
                                     break
                                 }
@@ -1848,20 +1853,20 @@ public actor AgentCore {
 
                         var shouldReplanForSteering = false
                         var providerPlanGUIWriteClaimed = false
-                        for (providerCallID, providerToolName, argumentsJSON) in providerToolCalls {
+                        for (providerCallID, providerToolName, argumentsJSON, providerMetadata) in providerToolCalls {
                             try Task.checkCancellation()
                             guard let name = toolNameMap.internalName(forProviderName: providerToolName) else {
                                 throw ToolArgumentValidationError.unknownProviderTool(providerToolName)
                             }
+                            var callMetadata = providerMetadata
+                            callMetadata["tool_call_id"] = providerCallID
+                            callMetadata["tool_name"] = name
+                            callMetadata["provider_tool_name"] = providerToolName
+                            callMetadata["tool_arguments"] = argumentsJSON
                             session.messages.append(ChatMessage(
                                 role: .assistant,
                                 content: "",
-                                providerMetadata: [
-                                    "tool_call_id": providerCallID,
-                                    "tool_name": name,
-                                    "provider_tool_name": providerToolName,
-                                    "tool_arguments": argumentsJSON
-                                ]
+                                providerMetadata: callMetadata
                             ))
                             session.updatedAt = Date()
                             try await sessionStore.save(session)

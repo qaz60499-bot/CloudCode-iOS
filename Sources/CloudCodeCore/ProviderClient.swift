@@ -382,6 +382,7 @@ public enum ProviderEvent: Sendable, Equatable {
     case status(String)
     case token(String)
     case toolCall(id: String, name: String, argumentsJSON: String)
+    case toolCallWithMetadata(id: String, name: String, argumentsJSON: String, metadata: [String: String])
     case finished
 }
 
@@ -1346,7 +1347,7 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
     fileprivate func makeRequest(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) throws -> URLRequest {
         if ProviderEndpointPolicy.isOfficialGeminiAPI(configuration.baseURL) {
             let url = try ProviderEndpointPolicy.geminiNativeGenerateURL(model: configuration.model, streaming: true)
-            var body: [String: Any] = ["contents": try geminiNativeContents(messages)]
+            var body: [String: Any] = ["contents": try geminiNativeContents(messages, model: configuration.model)]
             let systemText = messages.filter { $0.role == .system }.map(\.content).filter { !$0.isEmpty }.joined(separator: "\n\n")
             if !systemText.isEmpty {
                 body["systemInstruction"] = ["parts": [["text": systemText]]]
@@ -1384,6 +1385,7 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
 
     fileprivate func consume(lines: AsyncThrowingStream<String, Error>, continuation: AsyncThrowingStream<ProviderEvent, Error>.Continuation) async throws -> Bool {
         var toolCallState: [Int: ToolCallAccumulator] = [:]
+        var geminiToolCallGroupID: String?
         var sawEvent = false
         var terminal = false
         var outputStarted = false
@@ -1419,8 +1421,14 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
                                !name.isEmpty {
                                 let index = toolCallState.count
                                 var accumulator = ToolCallAccumulator()
-                                accumulator.id = (functionCall["id"] as? String) ?? "gemini-call-\(index)"
+                                if let apiCallID = functionCall["id"] as? String, !apiCallID.isEmpty {
+                                    accumulator.id = apiCallID
+                                    accumulator.apiCallIDPresent = true
+                                } else {
+                                    accumulator.id = "gemini-call-\(index)"
+                                }
                                 accumulator.name = name
+                                accumulator.thoughtSignature = part["thoughtSignature"] as? String
                                 if let args = functionCall["args"], JSONSerialization.isValidJSONObject(args),
                                    let argsData = try? JSONSerialization.data(withJSONObject: args),
                                    let argsJSON = String(data: argsData, encoding: .utf8) {
@@ -1429,6 +1437,7 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
                                     accumulator.arguments = "{}"
                                 }
                                 toolCallState[index] = accumulator
+                                if geminiToolCallGroupID == nil { geminiToolCallGroupID = UUID().uuidString.lowercased() }
                                 outputStarted = true
                             }
                         }
@@ -1496,7 +1505,19 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
         for index in toolCallState.keys.sorted() {
             if let call = toolCallState[index], !call.name.isEmpty {
                 guard !call.id.isEmpty else { throw ProviderError.malformedEvent }
-                continuation.yield(.toolCall(id: call.id, name: call.name, argumentsJSON: call.arguments.isEmpty ? "{}" : call.arguments))
+                let argumentsJSON = call.arguments.isEmpty ? "{}" : call.arguments
+                if let groupID = geminiToolCallGroupID {
+                    var metadata = [
+                        "gemini_call_group": groupID,
+                        "gemini_api_call_id_present": call.apiCallIDPresent ? "true" : "false"
+                    ]
+                    if let signature = call.thoughtSignature, !signature.isEmpty {
+                        metadata["gemini_thought_signature"] = signature
+                    }
+                    continuation.yield(.toolCallWithMetadata(id: call.id, name: call.name, argumentsJSON: argumentsJSON, metadata: metadata))
+                } else {
+                    continuation.yield(.toolCall(id: call.id, name: call.name, argumentsJSON: argumentsJSON))
+                }
             }
         }
         return outputStarted || !toolCallState.isEmpty
@@ -2361,7 +2382,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                                 case .token:
                                     emittedOutput = true
                                     emittedToken = true
-                                case .toolCall:
+                                case .toolCall, .toolCallWithMetadata:
                                     emittedOutput = true
                                     emittedToolCall = true
                                 case .finished:
@@ -3178,8 +3199,9 @@ private func responsesImageContent(_ message: ChatMessage, attachments: [Provide
     return content
 }
 
-private func geminiNativeContents(_ messages: [ChatMessage]) throws -> [[String: Any]] {
+private func geminiNativeContents(_ messages: [ChatMessage], model: String) throws -> [[String: Any]] {
     var result: [[String: Any]] = []
+    let requiresThoughtSignature = model.lowercased().contains("gemini-3")
 
     func append(role: String, parts: [[String: Any]]) {
         guard !parts.isEmpty else { return }
@@ -3193,42 +3215,103 @@ private func geminiNativeContents(_ messages: [ChatMessage]) throws -> [[String:
         result.append(["role": role, "parts": parts])
     }
 
+    func functionCallPart(_ message: ChatMessage, allowDummySignature: Bool) -> [String: Any]? {
+        guard message.role == .assistant,
+              let name = providerVisibleToolName(message) else { return nil }
+        let arguments = message.providerMetadata["tool_arguments"] ?? "{}"
+        let args: [String: Any]
+        if let data = arguments.data(using: .utf8),
+           let parsed = try? JSONSerialization.jsonObject(with: data),
+           let dictionary = parsed as? [String: Any] {
+            args = dictionary
+        } else {
+            args = [:]
+        }
+        var functionCall: [String: Any] = ["name": name, "args": args]
+        if message.providerMetadata["gemini_api_call_id_present"] == "true",
+           let callID = message.providerMetadata["tool_call_id"], !callID.isEmpty {
+            functionCall["id"] = callID
+        }
+        var part: [String: Any] = ["functionCall": functionCall]
+        if let signature = message.providerMetadata["gemini_thought_signature"], !signature.isEmpty {
+            part["thoughtSignature"] = signature
+        } else if requiresThoughtSignature && allowDummySignature {
+            // Existing sessions can contain tool-call history created before native Gemini routing,
+            // so no authentic Gemini signature exists for those injected blocks. Google's REST API
+            // explicitly documents this sentinel for transferred/manually constructed history.
+            part["thoughtSignature"] = "skip_thought_signature_validator"
+        }
+        return part
+    }
+
+    func functionResponsePart(_ message: ChatMessage, apiCallIDPresent: Bool) -> [String: Any]? {
+        guard message.role == .tool,
+              let name = providerVisibleToolName(message) else { return nil }
+        var responseObject: [String: Any] = ["result": message.content]
+        if let data = message.content.data(using: .utf8),
+           let parsed = try? JSONSerialization.jsonObject(with: data),
+           let dictionary = parsed as? [String: Any] {
+            responseObject = dictionary
+        }
+        var functionResponse: [String: Any] = ["name": name, "response": responseObject]
+        if apiCallIDPresent,
+           let callID = message.providerMetadata["tool_call_id"], !callID.isEmpty {
+            functionResponse["id"] = callID
+        }
+        return ["functionResponse": functionResponse]
+    }
+
+    var groupedCallIDs = Set<String>()
+    for message in messages where message.role == .assistant {
+        guard message.providerMetadata["gemini_call_group"] != nil,
+              let callID = message.providerMetadata["tool_call_id"], !callID.isEmpty else { continue }
+        groupedCallIDs.insert(callID)
+    }
+    var emittedGroups = Set<String>()
+
     for message in messages where message.role != .system {
-        if message.role == .tool,
-           let name = providerVisibleToolName(message) {
-            var responseObject: [String: Any] = ["result": message.content]
-            if let data = message.content.data(using: .utf8),
-               let parsed = try? JSONSerialization.jsonObject(with: data),
-               let dictionary = parsed as? [String: Any] {
-                responseObject = dictionary
+        if message.role == .assistant,
+           let groupID = message.providerMetadata["gemini_call_group"], !groupID.isEmpty {
+            guard emittedGroups.insert(groupID).inserted else { continue }
+            let groupedCalls = messages.filter {
+                $0.role == .assistant && $0.providerMetadata["gemini_call_group"] == groupID
             }
-            var functionResponse: [String: Any] = [
-                "name": name,
-                "response": responseObject
-            ]
-            if let callID = message.providerMetadata["tool_call_id"], !callID.isEmpty {
-                functionResponse["id"] = callID
+            var callParts: [[String: Any]] = []
+            var responseParts: [[String: Any]] = []
+            var apiIDByCallID: [String: Bool] = [:]
+            for call in groupedCalls {
+                if let part = functionCallPart(call, allowDummySignature: false) { callParts.append(part) }
+                if let callID = call.providerMetadata["tool_call_id"] {
+                    apiIDByCallID[callID] = call.providerMetadata["gemini_api_call_id_present"] == "true"
+                }
             }
-            append(role: "user", parts: [["functionResponse": functionResponse]])
+            for candidate in messages where candidate.role == .tool {
+                guard let callID = candidate.providerMetadata["tool_call_id"],
+                      let apiIDPresent = apiIDByCallID[callID] else { continue }
+                if let part = functionResponsePart(candidate, apiCallIDPresent: apiIDPresent) {
+                    responseParts.append(part)
+                }
+            }
+            append(role: "model", parts: callParts)
+            append(role: "user", parts: responseParts)
             continue
         }
 
-        if message.role == .assistant,
-           let name = providerVisibleToolName(message) {
-            let arguments = message.providerMetadata["tool_arguments"] ?? "{}"
-            let args: [String: Any]
-            if let data = arguments.data(using: .utf8),
-               let parsed = try? JSONSerialization.jsonObject(with: data),
-               let dictionary = parsed as? [String: Any] {
-                args = dictionary
-            } else {
-                args = [:]
+        if message.role == .tool,
+           let callID = message.providerMetadata["tool_call_id"],
+           groupedCallIDs.contains(callID) {
+            continue
+        }
+
+        if message.role == .tool {
+            if let part = functionResponsePart(message, apiCallIDPresent: false) {
+                append(role: "user", parts: [part])
             }
-            var functionCall: [String: Any] = ["name": name, "args": args]
-            if let callID = message.providerMetadata["tool_call_id"], !callID.isEmpty {
-                functionCall["id"] = callID
-            }
-            append(role: "model", parts: [["functionCall": functionCall]])
+            continue
+        }
+
+        if message.role == .assistant, providerVisibleToolName(message) != nil {
+            if let part = functionCallPart(message, allowDummySignature: true) { append(role: "model", parts: [part]) }
             continue
         }
 
@@ -3357,4 +3440,6 @@ private struct ToolCallAccumulator: Sendable {
     var id = ""
     var name = ""
     var arguments = ""
+    var thoughtSignature: String?
+    var apiCallIDPresent = false
 }
