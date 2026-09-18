@@ -4351,7 +4351,7 @@ public final class CloudCodeViewModel: ObservableObject {
             defer { data.resetBytes(in: 0..<data.count) }
             let payload = try ProviderBootstrapPayload.decodeBootstrap(from: data)
             guard payload.schemaVersion == 1,
-                  let providerKeys = payload.providers.first(where: { $0.providerID == provider.id }),
+                  let providerKeys = bootstrapProviderKeys(for: provider, in: payload),
                   let key = providerKeys.keys.first(where: { $0.slotID == selectedKeySlotID }),
                   !key.secret.isEmpty else {
                 throw ProviderError.missingAPIKey
@@ -4784,7 +4784,8 @@ public final class CloudCodeViewModel: ObservableObject {
         var pending: [(providerID: String, keySlotID: String, reference: String, secret: String)] = []
         var plannedReferences = Set<String>()
         for providerKeys in payload.providers {
-            guard let profile = providerProfiles.first(where: { $0.id == providerKeys.providerID && $0.enabled }) else { continue }
+            guard let providerIndex = providerProfileIndex(forBootstrapProviderID: providerKeys.providerID) else { continue }
+            let profile = providerProfiles[providerIndex]
             for key in providerKeys.keys {
                 guard let slot = profile.keySlots.first(where: { $0.id == key.slotID }), !key.secret.isEmpty else { continue }
                 let fingerprint = ProviderFingerprint.sha256(key.secret)
@@ -4862,7 +4863,7 @@ public final class CloudCodeViewModel: ObservableObject {
     ) throws {
         var customProviderChanged = false
         for providerKeys in payload.providers {
-            guard let providerIndex = providerProfiles.firstIndex(where: { $0.id == providerKeys.providerID && $0.enabled }) else { continue }
+            guard let providerIndex = providerProfileIndex(forBootstrapProviderID: providerKeys.providerID) else { continue }
             for key in providerKeys.keys where !key.secret.isEmpty {
                 guard let slotIndex = providerProfiles[providerIndex].keySlots.firstIndex(where: { $0.id == key.slotID }) else { continue }
                 let reference = ProviderCatalog.keyReference(providerID: providerProfiles[providerIndex].id, keySlotID: key.slotID)
@@ -4880,6 +4881,31 @@ public final class CloudCodeViewModel: ObservableObject {
             }
         }
         if customProviderChanged { try? persistCustomProviders() }
+    }
+
+    private func providerProfileIndex(forBootstrapProviderID bootstrapProviderID: String) -> Int? {
+        if let exact = providerProfiles.firstIndex(where: { $0.enabled && $0.id == bootstrapProviderID }) {
+            return exact
+        }
+        guard bootstrapProviderID == "https-aistudio-google-com" else { return nil }
+        let geminiIndices = providerProfiles.indices.filter {
+            providerProfiles[$0].enabled && ProviderEndpointPolicy.isOfficialGeminiAPI(providerProfiles[$0].baseURL)
+        }
+        if let selected = geminiIndices.first(where: { providerProfiles[$0].id == selectedProviderID }) {
+            return selected
+        }
+        return geminiIndices.count == 1 ? geminiIndices[0] : nil
+    }
+
+    private func bootstrapProviderKeys(
+        for provider: ProviderProfile,
+        in payload: ProviderBootstrapPayload
+    ) -> ProviderBootstrapPayload.ProviderKeys? {
+        if let exact = payload.providers.first(where: { $0.providerID == provider.id }) {
+            return exact
+        }
+        guard ProviderEndpointPolicy.isOfficialGeminiAPI(provider.baseURL) else { return nil }
+        return payload.providers.first(where: { $0.providerID == "https-aistudio-google-com" })
     }
 
     private func restoreSessionState() async throws {
