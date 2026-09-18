@@ -4752,9 +4752,17 @@ public final class CloudCodeViewModel: ObservableObject {
               size.int64Value <= 2 * 1024 * 1024,
               let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
               let profiles = try? JSONDecoder().decode([ProviderProfile].self, from: data) else { return [] }
-        return profiles
-            .filter { $0.enabled && $0.source == .custom }
-            .map { $0.normalizedForOfficialCompatibilityEndpoint() }
+
+        let normalizedProfiles = profiles.map { $0.normalizedForOfficialCompatibilityEndpoint() }
+        if normalizedProfiles != profiles {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            if let migrated = try? encoder.encode(normalizedProfiles) {
+                try? migrated.write(to: url, options: .atomic)
+            }
+        }
+
+        return normalizedProfiles.filter { $0.enabled && $0.source == .custom }
     }
 
     private func importProviderBootstrapNow(
