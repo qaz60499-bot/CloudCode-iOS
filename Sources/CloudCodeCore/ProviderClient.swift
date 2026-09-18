@@ -412,6 +412,21 @@ public struct ProviderToolSchema: Sendable, Equatable {
         ]
     }
 
+    fileprivate var geminiParametersObject: [String: Any] {
+        var propertyObject: [String: Any] = [:]
+        for (name, type) in properties {
+            propertyObject[name] = ["type": type]
+        }
+        var result: [String: Any] = [
+            "type": "object",
+            "properties": propertyObject
+        ]
+        if !required.isEmpty {
+            result["required"] = required
+        }
+        return result
+    }
+
     fileprivate var openAIChatObject: [String: Any] {
         [
             "type": "function",
@@ -1354,7 +1369,7 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
             }
             if !tools.isEmpty {
                 body["tools"] = [["functionDeclarations": tools.map { tool in
-                    ["name": tool.name, "description": tool.description, "parameters": tool.parametersObject]
+                    ["name": tool.name, "description": tool.description, "parameters": tool.geminiParametersObject]
                 }]]
             }
             var request = URLRequest(url: url)

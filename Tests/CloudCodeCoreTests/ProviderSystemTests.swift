@@ -1833,6 +1833,23 @@ final class ProviderProtocolClientTests: XCTestCase {
         XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse")
         XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.value(forHTTPHeaderField: "x-goog-api-key"), "secret")
         XCTAssertNil(ProviderTestURLProtocol.lastRequest()?.value(forHTTPHeaderField: "Authorization"))
+
+        let sampleTool = ProviderToolSchema(name: "files_read", description: "read file", properties: ["path": "string"], required: ["path"])
+        for try await _ in chat.stream(configuration: geminiCompatibilityConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: [sampleTool]) {}
+        let toolRequest = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
+        let toolBodyData = try XCTUnwrap(toolRequest.httpBody)
+        let toolBody = try XCTUnwrap(try JSONSerialization.jsonObject(with: toolBodyData) as? [String: Any])
+        let toolsList = try XCTUnwrap(toolBody["tools"] as? [[String: Any]])
+        let decls = try XCTUnwrap(toolsList.first?["functionDeclarations"] as? [[String: Any]])
+        let firstDecl = try XCTUnwrap(decls.first)
+        XCTAssertEqual(firstDecl["name"] as? String, "files_read")
+        XCTAssertEqual(firstDecl["description"] as? String, "read file")
+        let params = try XCTUnwrap(firstDecl["parameters"] as? [String: Any])
+        XCTAssertEqual(params["type"] as? String, "object")
+        let props = try XCTUnwrap(params["properties"] as? [String: Any])
+        XCTAssertEqual((props["path"] as? [String: Any])?["type"] as? String, "string")
+        XCTAssertEqual(params["required"] as? [String], ["path"])
+        XCTAssertNil(params["additionalProperties"])
     }
 
     func testResponsesStreamingTextAndToolCall() async throws {
