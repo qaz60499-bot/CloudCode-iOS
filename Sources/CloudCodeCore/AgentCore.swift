@@ -14,6 +14,7 @@ public enum AgentEvent: Sendable, Equatable {
 public enum AgentRunError: Error, Equatable, CustomStringConvertible {
     case sessionAlreadyRunning(UUID)
     case selectedSkillUnavailable(String)
+    case orchestrationStopped(String)
 
     public var description: String {
         switch self {
@@ -21,6 +22,8 @@ public enum AgentRunError: Error, Equatable, CustomStringConvertible {
             return "Session \(id) already has an active Agent run; submit steering instead of starting a concurrent run"
         case .selectedSkillUnavailable(let id):
             return "Selected semantic skill is unavailable or failed integrity validation: \(id)"
+        case .orchestrationStopped(let detail):
+            return detail
         }
     }
 }
@@ -1802,7 +1805,7 @@ public actor AgentCore {
                                 session.updatedAt = Date()
                                 try await sessionStore.save(session)
                                 try await checkpointStore.upsert(checkpoint)
-                                throw ProviderError.transport("Agent 未完成用户明确要求的 GUI 操作，completion guard 已达到 2 次自动恢复上限并写入最终诊断：\(completionBlockReason)")
+                                throw AgentRunError.orchestrationStopped("Agent 未完成用户明确要求的 GUI 操作，completion guard 已达到 2 次自动恢复上限并写入最终诊断：\(completionBlockReason)")
                             }
                             try await sessionStore.save(session)
                             try? await memoryProvider.recordCompletedTurn(
@@ -3251,7 +3254,7 @@ public actor AgentCore {
                                 session.updatedAt = Date()
                                 try await sessionStore.save(session)
                                 if let exhaustedDiagnosticFailureSignature {
-                                    throw ProviderError.transport(
+                                    throw AgentRunError.orchestrationStopped(
                                         "Automatic recovery budget exhausted for failure signature \(exhaustedDiagnosticFailureSignature). Existing redacted diagnostics require developer resolution; no further automatic re-plan will run for this repeated failure."
                                     )
                                 }
@@ -3285,11 +3288,11 @@ public actor AgentCore {
                             repeatedToolPlanCount = 1
                         }
                         if repeatedToolPlanCount >= 4 {
-                            throw ProviderError.transport("Agent 连续 4 轮产生完全相同的工具计划和结果，已停止以避免无进展死循环。可追加纠偏指令后继续。")
+                            throw AgentRunError.orchestrationStopped("Agent 连续 4 轮产生完全相同的工具计划和结果，已停止以避免无进展死循环。可追加纠偏指令后继续。")
                         }
                     }
 
-                    throw ProviderError.transport("Agent 已达到单任务安全工具轮次上限：\(maxToolRounds)。这不是消息数量限制；任务已保留检查点，可继续或追加指令。")
+                    throw AgentRunError.orchestrationStopped("Agent 已达到单任务安全工具轮次上限：\(maxToolRounds)。这不是消息数量限制；任务已保留检查点，可继续或追加指令。")
                 } catch is CancellationError {
                     runtimeBreadcrumb?("runtime.agent.cancelled")
                     try? await diagnosticLogger?.log(

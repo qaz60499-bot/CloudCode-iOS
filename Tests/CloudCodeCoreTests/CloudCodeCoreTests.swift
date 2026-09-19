@@ -1838,7 +1838,9 @@ final class CloudCodeCoreTests: XCTestCase {
         }
 
         XCTAssertNotNil(exhaustedError, "the third same-signature failure must hard-stop automatic re-planning")
-        XCTAssertTrue(String(describing: exhaustedError ?? ProviderError.transport("")).contains("Automatic recovery budget exhausted"))
+        XCTAssertTrue(exhaustedError is AgentRunError, "local orchestration exhaustion must not be mislabeled as a Provider transport failure")
+        XCTAssertFalse(exhaustedError is ProviderError, "local tool/diagnostic exhaustion must not trigger Provider-failure UI")
+        XCTAssertTrue(String(describing: exhaustedError ?? AgentRunError.orchestrationStopped("")).contains("Automatic recovery budget exhausted"))
         let saved = try await sessions.load(session.id)
         let diagnoses = saved.messages.filter { $0.providerMetadata["context_layer"] == "automatic_failure_diagnosis" }
         XCTAssertEqual(diagnoses.count, 3)

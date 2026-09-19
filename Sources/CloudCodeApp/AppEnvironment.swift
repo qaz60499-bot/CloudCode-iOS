@@ -5073,6 +5073,8 @@ public final class CloudCodeViewModel: ObservableObject {
                 return "这个对话已经有任务在运行；请使用追加指令或先停止当前任务。"
             case .selectedSkillUnavailable(let skillID):
                 return "所选技能无法载入或完整性校验失败：\(skillID)。已停止本轮执行，避免绕过技能约束。"
+            case .orchestrationStopped(let detail):
+                return "本地执行已停止：\(detail)"
             }
         }
         if let providerError = error as? ProviderError {
@@ -5167,6 +5169,11 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     private func recordProviderFailure(_ error: Error, configuration: ProviderExecutionConfiguration, sessionID: UUID) {
+        guard Self.isProviderRuntimeFailure(error, configuration: configuration) else {
+            providerFailureSessionIDs.remove(sessionID)
+            retryableProviderFailureSessionIDs.remove(sessionID)
+            return
+        }
         switch configuration {
         case .network(let network):
             recordProviderFailure(error, configuration: network, sessionID: sessionID)
@@ -5190,6 +5197,13 @@ public final class CloudCodeViewModel: ObservableObject {
                 )
             }
         }
+    }
+
+    private static func isProviderRuntimeFailure(_ error: Error, configuration: ProviderExecutionConfiguration) -> Bool {
+        if error is ProviderError { return true }
+        if (error as NSError).domain == NSURLErrorDomain { return true }
+        if case .appBacked = configuration, error is AppBackedProviderRuntimeError { return true }
+        return false
     }
 
     private func recordProviderFailure(_ error: Error, configuration: ProviderConfiguration, sessionID: UUID) {
