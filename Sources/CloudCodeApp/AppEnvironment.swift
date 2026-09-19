@@ -1971,6 +1971,7 @@ public final class CloudCodeViewModel: ObservableObject {
         recordStartupBreadcrumb("runtime.agent.request.scheduled")
 
         let task = Task {
+            var shouldAutoResumeStreamInterruption = false
             do {
                 recordStartupBreadcrumb("runtime.agent.request.prepare")
                 var requestSession = initialSession
@@ -2044,13 +2045,38 @@ public final class CloudCodeViewModel: ObservableObject {
                 recordStartupBreadcrumb("runtime.agent.request.failed")
                 if activeRunTokens[sessionID] == runToken {
                     recordProviderFailure(error, configuration: config, sessionID: sessionID)
-                    sessionErrors[sessionID] = Self.userFacingRunError(error)
+                    if (error as? ProviderError) == .streamInterrupted {
+                        shouldAutoResumeStreamInterruption = true
+                        sessionErrors.removeValue(forKey: sessionID)
+                        sessionActivityLines[sessionID, default: []].append(
+                            "Provider SSE 在完成事件前中断；不会重放已开始的流，正在尝试从持久化检查点安全继续一次…"
+                        )
+                    } else {
+                        sessionErrors[sessionID] = Self.userFacingRunError(error)
+                    }
                     syncVisibleSessionState(sessionID)
                 }
             }
 
             finishSessionRun(sessionID: sessionID, runToken: runToken)
             await reloadActivity()
+            if shouldAutoResumeStreamInterruption,
+               let recoveryCheckpoint = interruptedTasks
+                   .filter({
+                       $0.sessionID == sessionID
+                           && $0.payload["resume.mode"] == "auto_provider_stream_interruption_once"
+                   })
+                   .max(by: { $0.updatedAt < $1.updatedAt }) {
+                providerFailureSessionIDs.remove(sessionID)
+                retryableProviderFailureSessionIDs.remove(sessionID)
+                sessionErrors.removeValue(forKey: sessionID)
+                sessionActivityLines[sessionID, default: []].append(
+                    "已释放失败流并从检查点继续；这是本任务唯一一次自动 SSE 中断恢复。"
+                )
+                syncVisibleSessionState(sessionID)
+                resumeTask(recoveryCheckpoint)
+                return
+            }
             clearAutoResumeIntentIfNoPendingTask()
             try? await reloadSessionHistoryMergingLiveSessions()
             refreshFilesFromDisk()

@@ -3335,6 +3335,24 @@ public actor AgentCore {
                         // Preserve the checkpoint for an explicit Continue/steering action, but
                         // never cold-launch it again automatically and recreate the same loop.
                         checkpoint.payload["resume.mode"] = "manual_orchestration_stop"
+                    } else if (error as? ProviderError) == .streamInterrupted {
+                        // ProviderClient deliberately never replays an HTTP/SSE request once model
+                        // output has started. AgentCore also does not dispatch incomplete tool-call
+                        // material: tool calls are yielded only after a terminal provider event.
+                        // That makes one checkpoint-level continuation safe: it starts a fresh
+                        // planning round from persisted session/tool results instead of replaying
+                        // the interrupted stream. Keep the budget task-scoped and bounded so a
+                        // flaky upstream cannot create an automatic recovery loop.
+                        let used = max(
+                            0,
+                            Int(checkpoint.payload["provider.streamInterruptionAutoResumeCount"] ?? "0") ?? 0
+                        )
+                        if used == 0 {
+                            checkpoint.payload["provider.streamInterruptionAutoResumeCount"] = "1"
+                            checkpoint.payload["resume.mode"] = "auto_provider_stream_interruption_once"
+                        } else {
+                            checkpoint.payload["resume.mode"] = "manual_provider_stream_interruption"
+                        }
                     } else if ProviderEndpointHealthClassifier.shouldMarkDegraded(error) {
                         checkpoint.payload["resume.mode"] = "manual_provider_failure"
                     }

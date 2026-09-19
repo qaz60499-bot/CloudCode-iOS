@@ -5707,6 +5707,72 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(saved.messages.last(where: { $0.role == .assistant })?.content, "resumed-ok")
     }
 
+    func testAgentCoreStreamInterruptionArmsOneCheckpointContinuationWithoutPersistingPartialOutput() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = ToolRegistry(descriptors: [])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let checkpoints = TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json"))
+        let provider = StreamInterruptedTwiceProvider()
+        let agent = AgentCore(
+            provider: provider,
+            keyVault: MemoryKeyVault(keys: ["test-key": "secret"]),
+            toolRouter: ToolRouter(registry: registry, executors: []),
+            registry: registry,
+            capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: checkpoints,
+            maxToolRounds: 2
+        )
+        let initial = AgentSession(permissionMode: .safe)
+        let config = ProviderConfiguration(
+            name: "test",
+            baseURL: URL(string: "https://example.com/v1")!,
+            model: "test",
+            apiKeyReference: "test-key"
+        )
+
+        let first = await agent.send(text: "resume-stream-safely", session: initial, providerConfiguration: config)
+        do {
+            _ = try await collectAgentTokenText(first)
+            XCTFail("First stream must interrupt after partial output")
+        } catch {
+            XCTAssertEqual(error as? ProviderError, .streamInterrupted)
+        }
+
+        var interrupted = await checkpoints.interrupted()
+        let firstCheckpoint = try XCTUnwrap(interrupted.first(where: { $0.sessionID == initial.id }))
+        XCTAssertEqual(firstCheckpoint.payload["provider.streamInterruptionAutoResumeCount"], "1")
+        XCTAssertEqual(firstCheckpoint.payload["resume.mode"], "auto_provider_stream_interruption_once")
+        let persistedAfterFirst = try await sessions.load(initial.id)
+        XCTAssertEqual(persistedAfterFirst.messages.filter { $0.role == .user && $0.content == "resume-stream-safely" }.count, 1)
+        XCTAssertFalse(persistedAfterFirst.messages.contains { $0.role == .assistant && $0.content.contains("partial-") })
+
+        let second = await agent.send(
+            text: "resume-stream-safely",
+            session: persistedAfterFirst,
+            providerConfiguration: config,
+            appendUserMessage: false,
+            resumeCheckpoint: firstCheckpoint
+        )
+        do {
+            _ = try await collectAgentTokenText(second)
+            XCTFail("Second stream interruption must exhaust the one-shot automatic continuation budget")
+        } catch {
+            XCTAssertEqual(error as? ProviderError, .streamInterrupted)
+        }
+
+        interrupted = await checkpoints.interrupted()
+        let secondCheckpoint = try XCTUnwrap(interrupted.first(where: { $0.sessionID == initial.id }))
+        XCTAssertEqual(secondCheckpoint.payload["provider.streamInterruptionAutoResumeCount"], "1")
+        XCTAssertEqual(secondCheckpoint.payload["resume.mode"], "manual_provider_stream_interruption")
+        let persistedAfterSecond = try await sessions.load(initial.id)
+        XCTAssertEqual(persistedAfterSecond.messages.filter { $0.role == .user && $0.content == "resume-stream-safely" }.count, 1)
+        XCTAssertFalse(persistedAfterSecond.messages.contains { $0.role == .assistant && $0.content.contains("partial-") })
+        let attemptCount = await provider.attemptCount()
+        XCTAssertEqual(attemptCount, 2)
+    }
+
     func testAgentCoreProviderFailureIsIsolatedBetweenConcurrentSessions() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -8721,6 +8787,32 @@ private actor FailOnceThenFinishProvider: ProviderStreaming {
             }
         }
     }
+
+    private func nextAttempt() -> Int {
+        attempts += 1
+        return attempts
+    }
+}
+
+private actor StreamInterruptedTwiceProvider: ProviderStreaming {
+    private var attempts = 0
+
+    nonisolated func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                let attempt = await nextAttempt()
+                continuation.yield(.token("partial-\(attempt)"))
+                continuation.finish(throwing: ProviderError.streamInterrupted)
+            }
+        }
+    }
+
+    func attemptCount() -> Int { attempts }
 
     private func nextAttempt() -> Int {
         attempts += 1
