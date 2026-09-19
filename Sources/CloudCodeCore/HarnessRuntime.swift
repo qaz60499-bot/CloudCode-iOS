@@ -299,20 +299,32 @@ public enum HarnessContextManager {
         if requiresMessageSend(in: request) { return true }
         let normalized = request.lowercased()
         let actionMarkers = [
-            "刷", "滑", "滚动", "点赞", "点", "点击", "输入", "发送", "回复", "聊天", "搜索", "选择", "切换",
-            "swipe", "scroll", "tap", "type", "send", "reply", "like", "search", "select"
+            "刷", "滑", "滚动", "点赞", "点", "点击", "输入", "发送", "聊天", "搜索", "选择", "切换",
+            "swipe", "scroll", "tap", "type", "send", "like", "search", "select"
         ]
         return actionMarkers.contains(where: normalized.contains)
     }
 
     static func requiresMessageSend(in request: String) -> Bool {
         let normalized = request.lowercased()
-        let sendMarkers = [
-            "发消息", "发送消息", "发微信", "微信发", "给他发", "给她发", "给它发", "发一个", "发一条", "回复",
-            "send message", "send a message", "reply"
+        let explicitSendMarkers = [
+            "发消息", "发送消息", "发微信", "微信发", "给他发", "给她发", "给它发", "发一个", "发一条",
+            "send message", "send a message"
         ]
-        if sendMarkers.contains(where: normalized.contains) { return true }
-        let messagingContext = ["微信", "文件传输助手", "联系人", "朋友", "群聊", "聊天", "message", "wechat", "chat"]
+        if explicitSendMarkers.contains(where: normalized.contains) { return true }
+
+        let messagingContext = [
+            "微信", "文件传输助手", "联系人", "朋友", "群聊", "聊天", "消息",
+            "message", "wechat", "chat"
+        ]
+        if normalized.contains("回复") || normalized.contains("reply") {
+            let explicitReplyRecipient = [
+                "回复他", "回复她", "回复它", "回复对方",
+                "reply to him", "reply to her", "reply to them"
+            ]
+            return messagingContext.contains(where: normalized.contains)
+                || explicitReplyRecipient.contains(where: normalized.contains)
+        }
         return normalized.contains("发") && messagingContext.contains(where: normalized.contains)
     }
 
