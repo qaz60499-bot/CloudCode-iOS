@@ -1999,6 +1999,12 @@ public final class CloudCodeViewModel: ObservableObject {
                 syncVisibleSessionState(sessionID)
 
                 let requestText = trimmed.isEmpty && !attachments.isEmpty ? "请处理这张图片。" : trimmed
+                if case .network(let network) = config {
+                    try await ensureBundledProviderKeyAvailableForExecution(
+                        network,
+                        sessionID: sessionID
+                    )
+                }
                 if case .appBacked = config {
                     // App-backed inference deliberately foregrounds another iOS app. Pre-arm the
                     // existing Cloud Code background lease while we are still foreground and wait
@@ -2644,6 +2650,13 @@ public final class CloudCodeViewModel: ObservableObject {
                 liveSessions[sessionID] = resumedSession
                 upsertSessionHistory(resumedSession)
                 syncVisibleSessionState(sessionID)
+
+                if case .network(let network) = config {
+                    try await ensureBundledProviderKeyAvailableForExecution(
+                        network,
+                        sessionID: sessionID
+                    )
+                }
 
                 let allowedRoot: URL? = capabilities.isAvailable("filesystem.unrestricted") ? nil : URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
                 let source = InputSource(rawValue: checkpoint.payload["inputSource"] ?? "text") ?? .text
@@ -4651,6 +4664,108 @@ public final class CloudCodeViewModel: ObservableObject {
             activityLines.append("\(profile.displayName) 实时模型/协议验证失败；已保留现有 Key 与模型配置，不会把该失败扩散到其他厂商。")
             return ProviderLiveMetadataRefreshResult(catalogApplied: false, state: state, readiness: readiness, modelCount: 0, diagnostic: diagnostic)
         }
+    }
+
+    private func ensureBundledProviderKeyAvailableForExecution(
+        _ configuration: ProviderConfiguration,
+        sessionID: UUID
+    ) async throws {
+        let reference = configuration.apiKeyReference
+        do {
+            let existing = try await keyVault.key(for: reference)
+            guard !existing.isEmpty else { throw ProviderError.missingAPIKey }
+            installedKeyReferences.insert(reference)
+            return
+        } catch {
+            guard (error as? ProviderError) == .missingAPIKey else { throw error }
+        }
+
+        // Respect an explicit manual override. If the user previously replaced this slot and the
+        // Keychain item is now missing, silently falling back to the IPA's bundled value would be
+        // surprising and could route a request with different credentials.
+        guard !manualProviderKeyOverrides().contains(reference) else {
+            try? await diagnosticLogStore.log(
+                level: .warning,
+                subsystem: "provider-key",
+                action: "on-demand-restore",
+                result: "manual-override-missing",
+                sessionID: sessionID,
+                metadata: ["reference": reference]
+            )
+            throw ProviderError.missingAPIKey
+        }
+
+        guard let providerID = configuration.providerID,
+              let provider = providerProfiles.first(where: { $0.id == providerID }),
+              let slotID = keySlotID(for: configuration),
+              let url = Bundle.main.url(forResource: "CloudCode-Provider-Bootstrap", withExtension: "json") else {
+            throw ProviderError.missingAPIKey
+        }
+
+        let operationKey = Self.providerKeyMutationOperationKey
+        guard beginExclusiveOperation(operationKey) else {
+            // Another explicit Key operation may have completed between the initial read and this
+            // point. Re-read once, but do not race a second Keychain mutation.
+            if let existing = try? await keyVault.key(for: reference), !existing.isEmpty {
+                installedKeyReferences.insert(reference)
+                return
+            }
+            throw ProviderError.missingAPIKey
+        }
+        defer { endExclusiveOperation(operationKey) }
+
+        // Re-check after acquiring the mutation slot so two near-simultaneous sends never rewrite
+        // the same Key unnecessarily.
+        if let existing = try? await keyVault.key(for: reference), !existing.isEmpty {
+            installedKeyReferences.insert(reference)
+            return
+        }
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let byteSize = (attributes[.size] as? NSNumber)?.intValue ?? 0
+        guard byteSize > 0, byteSize <= 1_048_576 else { throw CocoaError(.fileReadCorruptFile) }
+        var data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        defer { data.resetBytes(in: 0..<data.count) }
+        let payload = try ProviderBootstrapPayload.decodeBootstrap(from: data)
+        guard payload.schemaVersion == 1,
+              let providerKeys = bootstrapProviderKeys(for: provider, in: payload),
+              let key = providerKeys.keys.first(where: { $0.slotID == slotID }),
+              !key.secret.isEmpty else {
+            throw ProviderError.missingAPIKey
+        }
+
+        let fingerprint = ProviderFingerprint.sha256(key.secret)
+        if let declared = key.fingerprint, !declared.isEmpty, declared != fingerprint {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+
+        _ = try await ProviderKeyProvisioner.apply(
+            [ProviderKeyMutation(reference: reference, secret: key.secret)],
+            vault: keyVault
+        )
+        installedKeyReferences.insert(reference)
+        if let providerIndex = providerProfiles.firstIndex(where: { $0.id == provider.id }) {
+            providerProfiles[providerIndex].updateKeyFingerprint(
+                fingerprint,
+                keySlotID: slotID,
+                status: .needsValidation
+            )
+        }
+        sessionActivityLines[sessionID, default: []].append(
+            "当前请求发现所选 Provider Keychain 项缺失；已从此 IPA 的预配置 Key 恢复当前槽位，并继续同一次 Network Provider 请求。"
+        )
+        try? await diagnosticLogStore.log(
+            level: .info,
+            subsystem: "provider-key",
+            action: "on-demand-restore",
+            result: "restored",
+            sessionID: sessionID,
+            metadata: [
+                "providerID": provider.id,
+                "keySlotID": slotID,
+                "reference": reference
+            ]
+        )
     }
 
     private func keySlotID(for configuration: ProviderConfiguration) -> String? {
