@@ -1090,7 +1090,8 @@ static BOOL LaunchViaSpringBoardServices(NSString *bundleID, NSString **diagnost
 
 static int LaunchApplication(NSString *bundleID)
 {
-    if (bundleID.length == 0 || [bundleID isEqualToString:@"com.cloudcode.ios"]) { CloudCodeExitOneShot(10); }
+    if (bundleID.length == 0) { CloudCodeExitOneShot(10); }
+    // CloudCode itself is a valid restore target after an App-backed Provider run.
     id workspace = Workspace();
     if (!workspace) { CloudCodeExitOneShot(23); }
     BOOL known = NO;
