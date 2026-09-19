@@ -835,6 +835,12 @@ public actor AgentCore {
                         "skill.selected.id": effectiveSelectedSkillID ?? ""
                     ]
                 )
+                if resumeCheckpoint != nil {
+                    // A user-requested/manual resume starts a new active run. Any previous
+                    // manual-only marker must not survive into a later genuine lifecycle
+                    // interruption, otherwise background recovery would stay disabled forever.
+                    checkpoint.payload.removeValue(forKey: "resume.mode")
+                }
                 let checkpointStepBase = resumeCheckpoint?.stepIndex ?? 0
                 checkpoint.sessionID = session.id
                 checkpoint.stepIndex = checkpointStepBase
@@ -3323,7 +3329,13 @@ public actor AgentCore {
                     checkpoint.payload["error"] = Self.compactErrorSummary(error)
                     checkpoint.payload["error.domain"] = nsError.domain
                     checkpoint.payload["error.code"] = String(nsError.code)
-                    if ProviderEndpointHealthClassifier.shouldMarkDegraded(error) {
+                    if let agentError = error as? AgentRunError,
+                       case .orchestrationStopped = agentError {
+                        // A bounded orchestration stop is intentional, not a lifecycle crash.
+                        // Preserve the checkpoint for an explicit Continue/steering action, but
+                        // never cold-launch it again automatically and recreate the same loop.
+                        checkpoint.payload["resume.mode"] = "manual_orchestration_stop"
+                    } else if ProviderEndpointHealthClassifier.shouldMarkDegraded(error) {
                         checkpoint.payload["resume.mode"] = "manual_provider_failure"
                     }
                     checkpoint.updatedAt = Date()

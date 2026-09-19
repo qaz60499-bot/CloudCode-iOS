@@ -4281,6 +4281,7 @@ final class CloudCodeCoreTests: XCTestCase {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let checkpoints = TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json"))
         let logStore = DiagnosticLogStore(directory: root.appendingPathComponent("logs", isDirectory: true))
         let provider = PrematureGUICompletionProvider()
         let registry = ToolRegistry(descriptors: [
@@ -4301,7 +4302,7 @@ final class CloudCodeCoreTests: XCTestCase {
             registry: registry,
             capabilityProbe: FixedCapabilityProbe(profile: CapabilityProfile(records: [])),
             sessionStore: sessions,
-            checkpointStore: TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json")),
+            checkpointStore: checkpoints,
             diagnosticLogger: logStore,
             maxToolRounds: 5
         )
@@ -4337,6 +4338,9 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(diagnoses[2].providerMetadata["recovery_reason"], "recovery_budget_exhausted")
         let providerStreamCalls = await provider.streamCallCount()
         XCTAssertEqual(providerStreamCalls, 3, "typed deterministic launch bypasses Provider; exactly three premature completion attempts must exhaust the bounded recovery budget")
+        let interrupted = await checkpoints.interrupted()
+        let stoppedCheckpoint = try XCTUnwrap(interrupted.first(where: { $0.sessionID == session.id }))
+        XCTAssertEqual(stoppedCheckpoint.payload["resume.mode"], "manual_orchestration_stop")
     }
 
     func testMessagingRawTypeIsBlockedUntilComposerFocusIsLocallyVerified() async throws {

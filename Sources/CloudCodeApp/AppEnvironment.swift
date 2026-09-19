@@ -2413,8 +2413,9 @@ public final class CloudCodeViewModel: ObservableObject {
         }
         guard UserDefaults.standard.bool(forKey: Self.autoResumeTaskDefaultsKey) else { return }
         let automaticCandidates = interruptedTasks.filter {
+            let resumeMode = $0.payload["resume.mode"] ?? ""
             guard !runningSessionIDs.contains($0.sessionID),
-                  $0.payload["resume.mode"] != "manual_provider_failure" else { return false }
+                  !resumeMode.hasPrefix("manual_") else { return false }
             // Do not cold/same-process auto-resume an App-backed checkpoint after the user has
             // switched the active backend to Network Provider. Manual resume remains available,
             // but automatic recovery must never re-foreground an AI App behind a valid API choice.
