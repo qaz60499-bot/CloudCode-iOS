@@ -315,10 +315,17 @@ static int CloudCodeRunOneShotVisionCommand(int argc, char *argv[])
         return 64;
     }
     NSString *command = [NSString stringWithUTF8String:argv[1]];
+    BOOL hasPCControlRootOCRToken = NO;
+    for (int index = 5; index < argc; index++) {
+        if (strcmp(argv[index], "pc-control-root-ocr-ok") == 0) {
+            hasPCControlRootOCRToken = YES;
+            break;
+        }
+    }
     BOOL pcControlRootOCRFile = (getuid() == 0 || geteuid() == 0)
         && [command isEqualToString:@"ocr-file"]
         && argc >= 6
-        && strcmp(argv[argc - 1], "pc-control-root-ocr-ok") == 0
+        && hasPCControlRootOCRToken
         && CloudCodeIsBoundedTempJPEG([NSString stringWithUTF8String:argv[2]]);
     // OCR normally runs as the ordinary mobile user. Do not declare this binary in TSRootBinaries:
     // that list is reserved for helpers that need TrollStore's special root-helper permissions.
