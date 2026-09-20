@@ -4008,13 +4008,14 @@ public final class CloudCodeViewModel: ObservableObject {
         }
         let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedLabel.isEmpty,
-              let baseURL = URL(string: baseURLText.trimmingCharacters(in: .whitespacesAndNewlines)),
-              ProviderEndpointPolicy.allowsBaseURL(baseURL),
+              let rawBaseURL = URL(string: baseURLText.trimmingCharacters(in: .whitespacesAndNewlines)),
+              ProviderEndpointPolicy.allowsBaseURL(rawBaseURL),
               !apiKey.isEmpty else {
             endExclusiveOperation(operationKey)
             lastError = "自定义厂商需要名称、安全 HTTPS Base URL 和 API Key。"
             return
         }
+        let baseURL = ProviderEndpointPolicy.normalizedKnownProviderBaseURL(rawBaseURL)
         let isOfficialGeminiAPI = ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL)
         let manualModel = ProviderEndpointPolicy.normalizedModelID(initialModel, for: baseURL)
         let effectivePreferredProtocol: ProviderProtocol = isOfficialGeminiAPI ? .openAIChat : preferredProtocol
@@ -4153,12 +4154,13 @@ public final class CloudCodeViewModel: ObservableObject {
         }
         let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedLabel.isEmpty,
-              let baseURL = URL(string: baseURLText.trimmingCharacters(in: .whitespacesAndNewlines)),
-              ProviderEndpointPolicy.allowsBaseURL(baseURL) else {
+              let rawBaseURL = URL(string: baseURLText.trimmingCharacters(in: .whitespacesAndNewlines)),
+              ProviderEndpointPolicy.allowsBaseURL(rawBaseURL) else {
             endExclusiveOperation(operationKey)
             lastError = "厂商需要有效名称与安全 HTTPS Base URL。"
             return
         }
+        let baseURL = ProviderEndpointPolicy.normalizedKnownProviderBaseURL(rawBaseURL)
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let isOfficialGeminiAPI = ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL)
         let manualModel = ProviderEndpointPolicy.normalizedModelID(initialModel, for: baseURL)

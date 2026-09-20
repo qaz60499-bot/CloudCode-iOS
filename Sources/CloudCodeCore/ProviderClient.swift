@@ -46,6 +46,19 @@ public enum ProviderEndpointPolicy {
         let loopbackHosts: Set<String> = ["localhost", "127.0.0.1", "::1", "[::1]"]
         return !loopbackHosts.contains(host)
     }
+
+    public static func normalizedKnownProviderBaseURL(_ url: URL) -> URL {
+        guard allowsBaseURL(url),
+              let host = url.host?.lowercased(),
+              host == "app.cline.bot" || host == "api.cline.bot" else { return url }
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.scheme = "https"
+        components?.host = "api.cline.bot"
+        components?.path = "/api/v1"
+        components?.query = nil
+        components?.fragment = nil
+        return components?.url ?? URL(string: "https://api.cline.bot/api/v1")!
+    }
 }
 
 public enum ProviderEndpointRoutingPolicy {
@@ -3022,7 +3035,8 @@ enum ProviderEndpoint {
 
     static func endpoint(baseURL: URL, path: String) throws -> URL {
         guard ProviderEndpointPolicy.allowsBaseURL(baseURL) else { throw ProviderError.invalidEndpoint }
-        var baseComponents = baseURL.path
+        let routeBaseURL = ProviderEndpointPolicy.normalizedKnownProviderBaseURL(baseURL)
+        var baseComponents = routeBaseURL.path
             .split(separator: "/", omittingEmptySubsequences: true)
             .map(String.init)
         let requestedComponents = path
@@ -3036,8 +3050,8 @@ enum ProviderEndpoint {
         // /v1beta/openai/v1/... route). Also make the documented Google root usable as a
         // convenience base URL so a valid Gemini API key is not rejected only because the
         // compatibility prefix was omitted in UI configuration.
-        let host = baseURL.host?.lowercased()
-        if ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL) {
+        let host = routeBaseURL.host?.lowercased()
+        if ProviderEndpointPolicy.isOfficialGeminiAPI(routeBaseURL) {
             // Treat every path on the official Gemini API host as input configuration, not as a
             // trusted endpoint prefix. Users commonly paste the native REST root (/v1beta), a
             // native models/generateContent URL, or the documented OpenAI compatibility root.
@@ -3061,7 +3075,7 @@ enum ProviderEndpoint {
             baseComponents.append("v1")
         }
         baseComponents.append(contentsOf: requestedComponents)
-        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+        guard var components = URLComponents(url: routeBaseURL, resolvingAgainstBaseURL: false) else {
             throw ProviderError.invalidEndpoint
         }
         components.path = "/" + baseComponents.joined(separator: "/")

@@ -1212,6 +1212,30 @@ final class ProviderDiscoveryTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "x-app"), "cli")
     }
 
+    func testClineDashboardURLDiscoveryUsesDocumentedAPIRoot() async throws {
+        ProviderTestURLProtocol.install(
+            status: 200,
+            body: Data("{\"data\":[{\"id\":\"anthropic/claude-sonnet-4-6\"}]}".utf8),
+            headers: ["Content-Type": "application/json"]
+        )
+        defer { ProviderTestURLProtocol.reset() }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProviderTestURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let models = try await ProviderDiscoveryClient(session: session).discoverModels(
+            baseURL: URL(string: "https://app.cline.bot/")!,
+            apiKey: "test-secret",
+            authMode: .bearer
+        )
+
+        XCTAssertEqual(models, ["anthropic/claude-sonnet-4-6"])
+        let request = try XCTUnwrap(ProviderTestURLProtocol.lastRequest())
+        XCTAssertEqual(request.url?.absoluteString, "https://api.cline.bot/api/v1/models")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-secret")
+    }
+
     func testGeminiOfficialDiscoveryPrioritizesExplicitModelAndUsesRuntimeCompatibleProbeBody() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ProviderGeminiDiscoveryURLProtocol.self]
@@ -1805,6 +1829,19 @@ final class ProviderProtocolClientTests: XCTestCase {
         )
         for try await _ in anthropic.stream(configuration: anthropicConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
         XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://example.com/v1/messages")
+
+        ProviderTestURLProtocol.install(status: 200, body: Data("data: [DONE]\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        let clineDashboardConfiguration = ProviderConfiguration(
+            name: "Cline",
+            baseURL: URL(string: "https://app.cline.bot/")!,
+            model: "anthropic/claude-sonnet-4-6",
+            apiKeyReference: "key",
+            protocolName: ProviderProtocol.openAIChat.rawValue
+        )
+        for try await _ in chat.stream(configuration: clineDashboardConfiguration, apiKey: "secret", messages: [ChatMessage(role: .user, content: "hi")], tools: []) {}
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.url?.absoluteString, "https://api.cline.bot/api/v1/chat/completions")
+        XCTAssertEqual(ProviderTestURLProtocol.lastRequest()?.value(forHTTPHeaderField: "Authorization"), "Bearer secret")
+        XCTAssertNil(ProviderTestURLProtocol.lastRequest()?.value(forHTTPHeaderField: "x-api-key"))
 
         let geminiStream = Data("data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"OK\"}]},\"finishReason\":\"STOP\"}]}\n\n".utf8)
         ProviderTestURLProtocol.install(status: 200, body: geminiStream, headers: ["Content-Type": "text/event-stream"])
