@@ -97,10 +97,15 @@ int main(void)
         result = CloudCodeSpawnHelperWithSeparatedOutput(axHelper, @[@"gui-focused-text-input-json"], NO, 2, &standardOutput, &standardError);
         Require(result < 0 && [standardError containsString:@"serialized AX runtime"],
             @"different AX commands must share one admission key and never overlap the detached AX runtime context");
+        result = CloudCodeSpawnHelperWithSeparatedOutput(axHelper, @[@"gui-clear-stale-automation"], NO, 2, &standardOutput, &standardError);
+        Require(result < 0 && [standardError containsString:@"serialized AX runtime"],
+            @"legacy Automation cleanup must serialize with every detached AX runtime command");
         Require(dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)) == 0 && axConcurrentResult == 0,
             @"first serialized AX helper must finish and release the shared admission key");
         result = CloudCodeSpawnHelperWithSeparatedOutput(axHelper, @[@"gui-focused-text-input-json"], NO, 2, &standardOutput, &standardError);
         Require(result == 0, @"serialized AX admission key must be reusable after the prior helper exits");
+        result = CloudCodeSpawnHelperWithSeparatedOutput(axHelper, @[@"gui-clear-stale-automation"], NO, 2, &standardOutput, &standardError);
+        Require(result == 0, @"legacy Automation cleanup command must be admitted after the serialized AX runtime is idle");
 
         result = CloudCodeSpawnHelperWithSeparatedOutput(child, @[@"-c", @"kill -KILL $$"], NO, 2, &standardOutput, &standardError);
         Require(result == -5009, @"external/self SIGKILL must retain signal result, not parent timeout");

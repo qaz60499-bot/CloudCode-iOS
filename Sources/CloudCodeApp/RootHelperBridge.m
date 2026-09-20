@@ -296,7 +296,8 @@ static NSInteger CloudCodeSpawnHelperInternal(
     } else {
         NSString *command = arguments.firstObject ?: @"";
         NSSet<NSString *> *serializedAXCommands = [NSSet setWithArray:@[
-            @"gui-tree-json", @"gui-ax-probe-json", @"gui-focused-text-input-json", @"gui-type-base64"
+            @"gui-tree-json", @"gui-ax-probe-json", @"gui-focused-text-input-json", @"gui-type-base64",
+            @"gui-clear-stale-automation"
         ]];
         BOOL usesSerializedAXRuntime = [path.lastPathComponent isEqualToString:@"CloudCodeRootHelper"]
             && [serializedAXCommands containsObject:command];

@@ -8,6 +8,9 @@ int CloudCodeGUITreeJSON(void);
 int CloudCodeGUIAXProbeJSON(NSString *stage, NSString *seedKind, pid_t targetPID, NSString *preparation);
 int CloudCodeGUIScreenshotBase64(void);
 int CloudCodeGUIScreenshotFile(NSString *path);
+/// One-time migration repair for stale global Automation state leaked by historical CloudCode builds.
+/// Normal OCR/screenshot execution never invokes this command.
+int CloudCodeGUIClearStaleAXAutomationState(void);
 int CloudCodeGUITap(double x, double y);
 int CloudCodeGUISwipe(double fromX, double fromY, double toX, double toY, double durationSeconds);
 int CloudCodeGUIScroll(double deltaX, double deltaY);

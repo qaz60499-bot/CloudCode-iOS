@@ -596,6 +596,27 @@ enum EmbeddedRootHelper {
         return (nil, failureDetail(prefix: "隔离 GUI readiness 探测", code: result.code, diagnostic: diagnostic))
     }
 
+    static func clearLegacyGreenFrameIfNeeded() -> (success: Bool, detail: String) {
+        let migrationKey = "cloudcode.perception.clear-stale-automation.v1"
+        let defaults = UserDefaults.standard
+        if defaults.bool(forKey: migrationKey) {
+            return (true, "Legacy Accessibility Automation migration already completed.")
+        }
+        guard FileManager.default.isExecutableFile(atPath: executablePath) else {
+            return (false, "Embedded root helper is unavailable; stale Automation cleanup will retry on a later launch.")
+        }
+        let result = run(["gui-clear-stale-automation"], privilege: .root, timeout: 3)
+        guard result.code == 0 else {
+            return (false, failureDetail(prefix: "Legacy Accessibility Automation cleanup", code: result.code, diagnostic: result.diagnostic))
+        }
+        // Persist only after the helper verified the global bit is off. A failed/unavailable repair
+        // remains retryable on the next launch. Normal screenshot/OCR work never calls this command.
+        defaults.set(true, forKey: migrationKey)
+        return (true, result.diagnostic.isEmpty
+            ? "Legacy Accessibility Automation state is verified disabled."
+            : "Legacy Accessibility Automation state is verified disabled. \(result.diagnostic)")
+    }
+
     static func guiTree() -> (tree: String?, detail: String) {
         func validatedTree(_ result: (code: Int, stdout: String, stderr: String)) -> String? {
             guard !result.stdout.isEmpty, result.stdout.utf8.count <= 256 * 1024,
