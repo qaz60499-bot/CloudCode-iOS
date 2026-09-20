@@ -306,41 +306,41 @@ static NSDictionary *CloudCodePCRunCapturedWithTimeout(NSString *path, NSArray<N
     (void)posix_spawn_file_actions_addclose(&actions, stdoutPipe[1]);
     (void)posix_spawn_file_actions_addclose(&actions, stderrPipe[1]);
 
-    posix_spawnattr_t attributes;
-    int attrResult = posix_spawnattr_init(&attributes);
-    if (attrResult != 0) {
-        posix_spawn_file_actions_destroy(&actions);
-        close(stdoutPipe[0]); close(stdoutPipe[1]); close(stderrPipe[0]); close(stderrPipe[1]);
-        for (NSUInteger index = 0; index < count; index++) { free(argv[index]); }
-        free(argv);
-        return @{@"code": @(70), @"stdout": @"", @"stderr": @"spawn attributes failed"};
-    }
+    pid_t pid = 0;
+    int spawnResult = 0;
     if (runAsMobile && (getuid() == 0 || geteuid() == 0)) {
-        CloudCodePCPersonaSetFn setPersona = (CloudCodePCPersonaSetFn)dlsym(RTLD_DEFAULT, "posix_spawnattr_set_persona_np");
-        CloudCodePCPersonaUIDFn setPersonaUID = (CloudCodePCPersonaUIDFn)dlsym(RTLD_DEFAULT, "posix_spawnattr_set_persona_uid_np");
-        CloudCodePCPersonaGIDFn setPersonaGID = (CloudCodePCPersonaGIDFn)dlsym(RTLD_DEFAULT, "posix_spawnattr_set_persona_gid_np");
-        int personaError = 0;
-        if (!setPersona || !setPersonaUID || !setPersonaGID) {
-            personaError = 1900;
-        } else {
-            personaError = setPersona(&attributes, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
-            if (personaError == 0) { personaError = setPersonaUID(&attributes, 501); }
-            if (personaError == 0) { personaError = setPersonaGID(&attributes, 501); }
+        pid = fork();
+        if (pid == 0) {
+            int nullFD = open("/dev/null", O_RDONLY, 0);
+            if (nullFD >= 0) {
+                (void)dup2(nullFD, STDIN_FILENO);
+                if (nullFD > STDERR_FILENO) { close(nullFD); }
+            }
+            (void)dup2(stdoutPipe[1], STDOUT_FILENO);
+            (void)dup2(stderrPipe[1], STDERR_FILENO);
+            close(stdoutPipe[0]); close(stderrPipe[0]); close(stdoutPipe[1]); close(stderrPipe[1]);
+            if (setgid(501) != 0) { dprintf(STDERR_FILENO, "mobile setgid failed: %d\n", errno); _exit(76); }
+            if (setuid(501) != 0) { dprintf(STDERR_FILENO, "mobile setuid failed: %d\n", errno); _exit(76); }
+            execve(path.fileSystemRepresentation, argv, environ);
+            dprintf(STDERR_FILENO, "mobile exec failed: %d\n", errno);
+            _exit(71);
         }
-        if (personaError != 0) {
-            posix_spawnattr_destroy(&attributes);
+        if (pid < 0) { spawnResult = errno; }
+        posix_spawn_file_actions_destroy(&actions);
+    } else {
+        posix_spawnattr_t attributes;
+        int attrResult = posix_spawnattr_init(&attributes);
+        if (attrResult != 0) {
             posix_spawn_file_actions_destroy(&actions);
             close(stdoutPipe[0]); close(stdoutPipe[1]); close(stderrPipe[0]); close(stderrPipe[1]);
             for (NSUInteger index = 0; index < count; index++) { free(argv[index]); }
             free(argv);
-            return @{@"code": @75, @"stdout": @"", @"stderr": [NSString stringWithFormat:@"mobile persona setup failed: %d", personaError]};
+            return @{@"code": @(70), @"stdout": @"", @"stderr": @"spawn attributes failed"};
         }
+        spawnResult = posix_spawn(&pid, path.fileSystemRepresentation, &actions, &attributes, argv, environ);
+        posix_spawnattr_destroy(&attributes);
+        posix_spawn_file_actions_destroy(&actions);
     }
-
-    pid_t pid = 0;
-    int spawnResult = posix_spawn(&pid, path.fileSystemRepresentation, &actions, &attributes, argv, environ);
-    posix_spawnattr_destroy(&attributes);
-    posix_spawn_file_actions_destroy(&actions);
     close(stdoutPipe[1]); stdoutPipe[1] = -1;
     close(stderrPipe[1]); stderrPipe[1] = -1;
     for (NSUInteger index = 0; index < count; index++) { free(argv[index]); }
