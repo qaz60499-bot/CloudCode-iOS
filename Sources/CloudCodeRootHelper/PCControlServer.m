@@ -1,6 +1,7 @@
 #import "PCControlServer.h"
 
 #import <UIKit/UIKit.h>
+#import <dlfcn.h>
 #import <arpa/inet.h>
 #import <errno.h>
 #import <fcntl.h>
@@ -29,6 +30,7 @@ extern char **environ;
 #define CLOUDCODE_PC_CONTROL_MAX_REQUEST_BYTES (64 * 1024)
 #define CLOUDCODE_PC_CONTROL_CHILD_TIMEOUT_MS 5000
 #define CLOUDCODE_PC_CONTROL_LAUNCH_TIMEOUT_MS 12000
+#define CLOUDCODE_PC_CONTROL_OCR_TIMEOUT_MS 15000
 #define CLOUDCODE_PC_CONTROL_INSTALL_TIMEOUT_MS 110000
 
 static NSString * const CloudCodePCControlTokenPath = @"/var/mobile/Media/Downloads/CloudCode-PC-Control.json";
@@ -216,6 +218,238 @@ static int CloudCodePCRunOneShot(const char *executablePath, NSArray<NSString *>
     return CloudCodePCRunOneShotWithTimeout(executablePath, arguments, CLOUDCODE_PC_CONTROL_CHILD_TIMEOUT_MS);
 }
 
+typedef int (*CloudCodePCPersonaSetFn)(posix_spawnattr_t *, uid_t, uint32_t);
+typedef int (*CloudCodePCPersonaUIDFn)(posix_spawnattr_t *, uid_t);
+typedef int (*CloudCodePCPersonaGIDFn)(posix_spawnattr_t *, gid_t);
+
+static void CloudCodePCDrainFD(int *fd, NSMutableData *data, NSUInteger limit)
+{
+    if (!fd || *fd < 0 || !data) { return; }
+    uint8_t buffer[4096];
+    for (;;) {
+        ssize_t count = read(*fd, buffer, sizeof(buffer));
+        if (count > 0) {
+            if (data.length < limit) {
+                NSUInteger remaining = limit - data.length;
+                [data appendBytes:buffer length:MIN((NSUInteger)count, remaining)];
+            }
+            continue;
+        }
+        if (count == 0) {
+            close(*fd);
+            *fd = -1;
+            return;
+        }
+        if (errno == EINTR) { continue; }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) { return; }
+        close(*fd);
+        *fd = -1;
+        return;
+    }
+}
+
+static NSString *CloudCodePCTextFromData(NSData *data)
+{
+    if (!data.length) { return @""; }
+    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return text ?: @"";
+}
+
+static NSDictionary *CloudCodePCRunCapturedWithTimeout(NSString *path, NSArray<NSString *> *arguments, uint64_t timeoutMS, BOOL runAsMobile)
+{
+    if (path.length == 0 || arguments.count == 0 || timeoutMS == 0 || timeoutMS > 120000) {
+        return @{@"code": @10, @"stdout": @"", @"stderr": @""};
+    }
+    NSMutableArray<NSString *> *argvStrings = [NSMutableArray arrayWithObject:path];
+    [argvStrings addObjectsFromArray:arguments];
+    uint64_t watchdogMS = timeoutMS > 150 ? timeoutMS - 150 : timeoutMS;
+    [argvStrings addObject:[NSString stringWithFormat:@"--cloudcode-watchdog-ms=%llu", (unsigned long long)watchdogMS]];
+
+    NSUInteger count = argvStrings.count;
+    char **argv = calloc(count + 1, sizeof(char *));
+    if (!argv) { return @{@"code": @70, @"stdout": @"", @"stderr": @"argv allocation failed"}; }
+    for (NSUInteger index = 0; index < count; index++) {
+        argv[index] = strdup(argvStrings[index].UTF8String ?: "");
+        if (!argv[index]) {
+            for (NSUInteger cleanup = 0; cleanup < count; cleanup++) { if (argv[cleanup]) { free(argv[cleanup]); } }
+            free(argv);
+            return @{@"code": @70, @"stdout": @"", @"stderr": @"argv allocation failed"};
+        }
+    }
+
+    int stdoutPipe[2] = {-1, -1};
+    int stderrPipe[2] = {-1, -1};
+    if (pipe(stdoutPipe) != 0 || pipe(stderrPipe) != 0) {
+        if (stdoutPipe[0] >= 0) { close(stdoutPipe[0]); }
+        if (stdoutPipe[1] >= 0) { close(stdoutPipe[1]); }
+        if (stderrPipe[0] >= 0) { close(stderrPipe[0]); }
+        if (stderrPipe[1] >= 0) { close(stderrPipe[1]); }
+        for (NSUInteger index = 0; index < count; index++) { free(argv[index]); }
+        free(argv);
+        return @{@"code": @70, @"stdout": @"", @"stderr": @"pipe failed"};
+    }
+
+    posix_spawn_file_actions_t actions;
+    int actionsResult = posix_spawn_file_actions_init(&actions);
+    if (actionsResult != 0) {
+        close(stdoutPipe[0]); close(stdoutPipe[1]); close(stderrPipe[0]); close(stderrPipe[1]);
+        for (NSUInteger index = 0; index < count; index++) { free(argv[index]); }
+        free(argv);
+        return @{@"code": @(70), @"stdout": @"", @"stderr": @"spawn actions failed"};
+    }
+    (void)posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    (void)posix_spawn_file_actions_adddup2(&actions, stdoutPipe[1], STDOUT_FILENO);
+    (void)posix_spawn_file_actions_adddup2(&actions, stderrPipe[1], STDERR_FILENO);
+    (void)posix_spawn_file_actions_addclose(&actions, stdoutPipe[0]);
+    (void)posix_spawn_file_actions_addclose(&actions, stderrPipe[0]);
+    (void)posix_spawn_file_actions_addclose(&actions, stdoutPipe[1]);
+    (void)posix_spawn_file_actions_addclose(&actions, stderrPipe[1]);
+
+    posix_spawnattr_t attributes;
+    int attrResult = posix_spawnattr_init(&attributes);
+    if (attrResult != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        close(stdoutPipe[0]); close(stdoutPipe[1]); close(stderrPipe[0]); close(stderrPipe[1]);
+        for (NSUInteger index = 0; index < count; index++) { free(argv[index]); }
+        free(argv);
+        return @{@"code": @(70), @"stdout": @"", @"stderr": @"spawn attributes failed"};
+    }
+    if (runAsMobile && (getuid() == 0 || geteuid() == 0)) {
+        CloudCodePCPersonaSetFn setPersona = (CloudCodePCPersonaSetFn)dlsym(RTLD_DEFAULT, "posix_spawnattr_set_persona_np");
+        CloudCodePCPersonaUIDFn setPersonaUID = (CloudCodePCPersonaUIDFn)dlsym(RTLD_DEFAULT, "posix_spawnattr_set_persona_uid_np");
+        CloudCodePCPersonaGIDFn setPersonaGID = (CloudCodePCPersonaGIDFn)dlsym(RTLD_DEFAULT, "posix_spawnattr_set_persona_gid_np");
+        int personaError = 0;
+        if (!setPersona || !setPersonaUID || !setPersonaGID) {
+            personaError = 1900;
+        } else {
+            personaError = setPersona(&attributes, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+            if (personaError == 0) { personaError = setPersonaUID(&attributes, 501); }
+            if (personaError == 0) { personaError = setPersonaGID(&attributes, 501); }
+        }
+        if (personaError != 0) {
+            posix_spawnattr_destroy(&attributes);
+            posix_spawn_file_actions_destroy(&actions);
+            close(stdoutPipe[0]); close(stdoutPipe[1]); close(stderrPipe[0]); close(stderrPipe[1]);
+            for (NSUInteger index = 0; index < count; index++) { free(argv[index]); }
+            free(argv);
+            return @{@"code": @75, @"stdout": @"", @"stderr": [NSString stringWithFormat:@"mobile persona setup failed: %d", personaError]};
+        }
+    }
+
+    pid_t pid = 0;
+    int spawnResult = posix_spawn(&pid, path.fileSystemRepresentation, &actions, &attributes, argv, environ);
+    posix_spawnattr_destroy(&attributes);
+    posix_spawn_file_actions_destroy(&actions);
+    close(stdoutPipe[1]); stdoutPipe[1] = -1;
+    close(stderrPipe[1]); stderrPipe[1] = -1;
+    for (NSUInteger index = 0; index < count; index++) { free(argv[index]); }
+    free(argv);
+    if (spawnResult != 0 || pid <= 1) {
+        close(stdoutPipe[0]); close(stderrPipe[0]);
+        return @{@"code": @71, @"stdout": @"", @"stderr": [NSString stringWithFormat:@"spawn failed: %d", spawnResult]};
+    }
+    int flags = fcntl(stdoutPipe[0], F_GETFL, 0);
+    if (flags >= 0) { (void)fcntl(stdoutPipe[0], F_SETFL, flags | O_NONBLOCK); }
+    flags = fcntl(stderrPipe[0], F_GETFL, 0);
+    if (flags >= 0) { (void)fcntl(stderrPipe[0], F_SETFL, flags | O_NONBLOCK); }
+
+    NSMutableData *stdoutData = [NSMutableData data];
+    NSMutableData *stderrData = [NSMutableData data];
+    const NSUInteger captureLimit = 262144;
+    const double deadline = CloudCodePCMonotonicSeconds() + ((double)timeoutMS / 1000.0);
+    int status = 0;
+    int code = 124;
+    BOOL finished = NO;
+    while (!finished) {
+        CloudCodePCDrainFD(&stdoutPipe[0], stdoutData, captureLimit);
+        CloudCodePCDrainFD(&stderrPipe[0], stderrData, captureLimit);
+        pid_t waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid) {
+            if (WIFEXITED(status)) { code = WEXITSTATUS(status); }
+            else if (WIFSIGNALED(status)) { code = 128 + WTERMSIG(status); }
+            else { code = 72; }
+            finished = YES;
+            break;
+        }
+        if (waited < 0 && errno != EINTR) { code = 73; finished = YES; break; }
+        if (CloudCodePCMonotonicSeconds() >= deadline) {
+            (void)kill(pid, SIGKILL);
+            do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+            code = 124;
+            finished = YES;
+            break;
+        }
+        struct pollfd fds[2];
+        nfds_t nfds = 0;
+        if (stdoutPipe[0] >= 0) { fds[nfds++] = (struct pollfd){.fd = stdoutPipe[0], .events = POLLIN | POLLHUP, .revents = 0}; }
+        if (stderrPipe[0] >= 0) { fds[nfds++] = (struct pollfd){.fd = stderrPipe[0], .events = POLLIN | POLLHUP, .revents = 0}; }
+        (void)poll(fds, nfds, 25);
+    }
+    CloudCodePCDrainFD(&stdoutPipe[0], stdoutData, captureLimit);
+    CloudCodePCDrainFD(&stderrPipe[0], stderrData, captureLimit);
+    if (stdoutPipe[0] >= 0) { close(stdoutPipe[0]); }
+    if (stderrPipe[0] >= 0) { close(stderrPipe[0]); }
+    return @{
+        @"code": @(code),
+        @"stdout": CloudCodePCTextFromData(stdoutData),
+        @"stderr": CloudCodePCTextFromData(stderrData),
+        @"pid": @(pid)
+    };
+}
+
+static BOOL CloudCodePCIsSafeOCRPath(NSString *path)
+{
+    NSString *normalized = [path isKindOfClass:NSString.class] ? path.stringByStandardizingPath : nil;
+    if (normalized.length == 0 || normalized.length > 4096) { return NO; }
+    BOOL appContainer = [normalized hasPrefix:@"/var/mobile/Containers/Data/Application/"] || [normalized hasPrefix:@"/private/var/mobile/Containers/Data/Application/"];
+    NSString *parent = normalized.stringByDeletingLastPathComponent;
+    NSString *filename = normalized.lastPathComponent;
+    return appContainer
+        && [parent.lastPathComponent isEqualToString:@"tmp"]
+        && [filename hasPrefix:@"CloudCode-GUI-OCR-"]
+        && [filename.pathExtension.lowercaseString isEqualToString:@"jpg"]
+        && ![normalized containsString:@".."];
+}
+
+static NSDictionary *CloudCodePCOCRSmokeResponse(const char *executablePath, NSDictionary *request)
+{
+    NSString *container = [request[@"container"] isKindOfClass:NSString.class] ? request[@"container"] : nil;
+    if (container.length == 0 || container.length > 4096 || [container containsString:@".."] || !([container hasPrefix:@"/var/mobile/Containers/Data/Application/"] || [container hasPrefix:@"/private/var/mobile/Containers/Data/Application/"])) {
+        return @{@"ok": @NO, @"op": @"ocr-smoke", @"error": @"invalid-container"};
+    }
+    NSString *tmpDir = [container.stringByStandardizingPath stringByAppendingPathComponent:@"tmp"];
+    NSString *screenshotPath = [tmpDir stringByAppendingPathComponent:@"CloudCode-GUI-OCR-pc-smoke.jpg"];
+    if (!CloudCodePCIsSafeOCRPath(screenshotPath)) {
+        return @{@"ok": @NO, @"op": @"ocr-smoke", @"error": @"invalid-screenshot-path"};
+    }
+    NSString *rootHelperPath = [NSString stringWithUTF8String:executablePath ?: ""];
+    NSString *visionHelperPath = [rootHelperPath.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"CloudCodeVisionHelper"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:visionHelperPath]) {
+        return @{@"ok": @NO, @"op": @"ocr-smoke", @"error": @"missing-vision-helper"};
+    }
+    int screenshotCode = CloudCodePCRunOneShotWithTimeout(executablePath, @[@"gui-screenshot-file", screenshotPath], CLOUDCODE_PC_CONTROL_LAUNCH_TIMEOUT_MS);
+    NSDictionary *vision = screenshotCode == 0
+        ? CloudCodePCRunCapturedWithTimeout(visionHelperPath, @[@"ocr-file", screenshotPath, @"48", @"accurate"], CLOUDCODE_PC_CONTROL_OCR_TIMEOUT_MS, YES)
+        : @{@"code": @(-1), @"stdout": @"", @"stderr": @"screenshot failed"};
+    NSString *stdoutText = [vision[@"stdout"] isKindOfClass:NSString.class] ? vision[@"stdout"] : @"";
+    NSData *stdoutData = [stdoutText dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+    id parsed = stdoutData.length ? [NSJSONSerialization JSONObjectWithData:stdoutData options:0 error:nil] : nil;
+    BOOL parsedJSON = [parsed isKindOfClass:NSDictionary.class];
+    NSNumber *visionCode = [vision[@"code"] isKindOfClass:NSNumber.class] ? vision[@"code"] : @(-1);
+    NSMutableDictionary *response = [NSMutableDictionary dictionaryWithDictionary:@{
+        @"ok": @(screenshotCode == 0 && visionCode.integerValue == 0 && parsedJSON),
+        @"op": @"ocr-smoke",
+        @"screenshotCode": @(screenshotCode),
+        @"visionCode": visionCode,
+        @"screenshotPath": screenshotPath,
+        @"visionStdoutBytes": @(stdoutData.length),
+        @"visionStderr": [vision[@"stderr"] isKindOfClass:NSString.class] ? vision[@"stderr"] : @""
+    }];
+    if (parsedJSON) { response[@"ocr"] = parsed; }
+    else { response[@"visionStdoutPreview"] = stdoutText.length > 2000 ? [stdoutText substringToIndex:2000] : stdoutText; }
+    return response;
+}
+
 static BOOL CloudCodePCIsSafeBundleID(NSString *bundleID)
 {
     if (!bundleID.length || bundleID.length > 255) { return NO; }
@@ -262,6 +496,9 @@ static NSDictionary *CloudCodePCActionResponse(const char *executablePath, NSDic
     if ([operation isEqualToString:@"shutdown"]) {
         if (shutdown) { *shutdown = YES; }
         return @{@"ok": @YES, @"op": operation, @"pid": @(getpid())};
+    }
+    if ([operation isEqualToString:@"ocr-smoke"]) {
+        return CloudCodePCOCRSmokeResponse(executablePath, request);
     }
 
     NSArray<NSString *> *arguments = nil;
