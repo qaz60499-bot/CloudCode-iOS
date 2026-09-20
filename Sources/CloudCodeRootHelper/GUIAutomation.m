@@ -102,7 +102,6 @@ typedef void (*CloudCodeAXAddAssociatedPidFn)(pid_t, pid_t, int);
 typedef void (*CloudCodeAXSetRequestingClientFn)(uint32_t);
 typedef uint64_t (*CloudCodeAXOverrideRequestingClientTypeFn)(uint64_t);
 typedef int (*CloudCodeAXAutomationEnabledFn)(void);
-typedef void (*CloudCodeAXSetAutomationEnabledFn)(int);
 typedef int (*CloudCodeProcListAllPidsFn)(void *, int);
 typedef int (*CloudCodeProcPidPathFn)(int, void *, uint32_t);
 
@@ -237,58 +236,6 @@ static CFStringRef CloudCodeResolveCFStringAcrossFrameworks(NSArray<NSString *> 
     if (!symbol) { return fallback; }
     CFStringRef value = *(CFStringRef *)symbol;
     return value ?: fallback;
-}
-
-int CloudCodeGUIClearStaleAXAutomationState(void)
-{
-    // Migration-only repair for builds <= 128. Those builds could temporarily enable the global
-    // Accessibility Automation bit for detached AX reads; a watchdog/SIGKILL could prevent the
-    // matching restore and leave iOS rendering the green automation indicator indefinitely.
-    // Production OCR never calls this path and never enables Automation. Run this bounded repair
-    // only from the app's one-time migration gate, and do not touch AXManualAccessibility or any
-    // per-app accessibility preference.
-    NSArray<NSString *> *paths = @[
-        @"/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime",
-        @"/System/Library/Frameworks/Accessibility.framework/Accessibility",
-        @"/System/Library/PrivateFrameworks/Accessibility.framework/Accessibility",
-        @"/usr/lib/libAccessibility.dylib",
-        @"/rootfs/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime",
-        @"/rootfs/System/Library/Frameworks/Accessibility.framework/Accessibility",
-        @"/rootfs/usr/lib/libAccessibility.dylib"
-    ];
-    CloudCodeAXAutomationEnabledFn getter =
-        (CloudCodeAXAutomationEnabledFn)CloudCodeResolveAcrossFrameworks(paths, "_AXSAutomationEnabled");
-    CloudCodeAXSetAutomationEnabledFn setter =
-        (CloudCodeAXSetAutomationEnabledFn)CloudCodeResolveAcrossFrameworks(paths, "_AXSSetAutomationEnabled");
-    if (!getter || !setter) {
-        fprintf(stderr, "gui-clear-stale-automation: symbols unavailable getter=%d setter=%d\n", getter != NULL, setter != NULL);
-        return 61;
-    }
-
-    int before = -1;
-    @try { before = getter(); } @catch (__unused NSException *exception) { before = -1; }
-    if (before < 0) {
-        fprintf(stderr, "gui-clear-stale-automation: unable to read current state\n");
-        return 62;
-    }
-    if (before == 0) {
-        fprintf(stderr, "gui-clear-stale-automation: already-disabled before=0 after=0\n");
-        return 0;
-    }
-
-    @try { setter(0); } @catch (__unused NSException *exception) {
-        fprintf(stderr, "gui-clear-stale-automation: setter threw while clearing stale state\n");
-        return 63;
-    }
-    usleep(20000);
-    int after = -1;
-    @try { after = getter(); } @catch (__unused NSException *exception) { after = -1; }
-    if (after != 0) {
-        fprintf(stderr, "gui-clear-stale-automation: verification failed before=%d after=%d\n", before, after);
-        return 63;
-    }
-    fprintf(stderr, "gui-clear-stale-automation: cleared legacy CloudCode automation state before=%d after=0\n", before);
-    return 0;
 }
 
 static CloudCodeHIDRuntime CloudCodeResolveHID(void)

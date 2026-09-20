@@ -1845,6 +1845,71 @@ static int BackgroundAssertionWorkerStatus(pid_t workerPID)
     return kill(workerPID, 0) == 0 ? 0 : 77;
 }
 
+typedef int (*CloudCodeLegacyAXAutomationEnabledFn)(void);
+typedef void (*CloudCodeLegacyAXSetAutomationEnabledFn)(int);
+
+static void *CloudCodeResolveLegacyAXSymbol(const char *name)
+{
+    void *symbol = dlsym(RTLD_DEFAULT, name);
+    if (symbol) { return symbol; }
+    NSArray<NSString *> *paths = @[
+        @"/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime",
+        @"/System/Library/Frameworks/Accessibility.framework/Accessibility",
+        @"/System/Library/PrivateFrameworks/Accessibility.framework/Accessibility",
+        @"/usr/lib/libAccessibility.dylib",
+        @"/rootfs/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime",
+        @"/rootfs/System/Library/Frameworks/Accessibility.framework/Accessibility",
+        @"/rootfs/usr/lib/libAccessibility.dylib"
+    ];
+    for (NSString *path in paths) {
+        void *handle = dlopen(path.UTF8String, RTLD_NOW | RTLD_GLOBAL);
+        if (!handle) { continue; }
+        symbol = dlsym(handle, name);
+        if (symbol) { return symbol; }
+    }
+    return NULL;
+}
+
+static int ClearLegacyCloudCodeAXAutomationState(void)
+{
+    // Migration-only repair for builds <= 128. Those builds could temporarily enable the global
+    // Accessibility Automation bit for detached AX reads; a watchdog/SIGKILL could prevent the
+    // matching restore and leave iOS rendering the green automation indicator indefinitely.
+    // This command is intentionally isolated from GUIAutomation.m so production OCR/AX perception
+    // remains mechanically read-only. It never touches AXManualAccessibility or per-app settings.
+    CloudCodeLegacyAXAutomationEnabledFn getter =
+        (CloudCodeLegacyAXAutomationEnabledFn)CloudCodeResolveLegacyAXSymbol("_AXSAutomationEnabled");
+    CloudCodeLegacyAXSetAutomationEnabledFn setter =
+        (CloudCodeLegacyAXSetAutomationEnabledFn)CloudCodeResolveLegacyAXSymbol("_AXSSetAutomationEnabled");
+    if (!getter || !setter) {
+        fprintf(stderr, "gui-clear-stale-automation: symbols unavailable getter=%d setter=%d\n", getter != NULL, setter != NULL);
+        return 61;
+    }
+    int before = -1;
+    @try { before = getter(); } @catch (__unused NSException *exception) { before = -1; }
+    if (before < 0) {
+        fprintf(stderr, "gui-clear-stale-automation: unable to read current state\n");
+        return 62;
+    }
+    if (before == 0) {
+        fprintf(stderr, "gui-clear-stale-automation: already-disabled before=0 after=0\n");
+        return 0;
+    }
+    @try { setter(0); } @catch (__unused NSException *exception) {
+        fprintf(stderr, "gui-clear-stale-automation: setter threw while clearing stale state\n");
+        return 63;
+    }
+    usleep(20000);
+    int after = -1;
+    @try { after = getter(); } @catch (__unused NSException *exception) { after = -1; }
+    if (after != 0) {
+        fprintf(stderr, "gui-clear-stale-automation: verification failed before=%d after=%d\n", before, after);
+        return 63;
+    }
+    fprintf(stderr, "gui-clear-stale-automation: cleared legacy CloudCode automation state before=%d after=0\n", before);
+    return 0;
+}
+
 static int CloudCodeRunOneShotCommand(int argc, const char *argv[])
 {
         if (argc < 2) { return 10; }
@@ -1928,7 +1993,7 @@ static int CloudCodeRunOneShotCommand(int argc, const char *argv[])
             return CloudCodeGUIScreenshotFile(outputPath);
         }
         if ([command isEqualToString:@"gui-clear-stale-automation"]) {
-            return CloudCodeGUIClearStaleAXAutomationState();
+            return ClearLegacyCloudCodeAXAutomationState();
         }
         if ([command isEqualToString:@"gui-tap"]) {
             if (argc < 4) { return 10; }
