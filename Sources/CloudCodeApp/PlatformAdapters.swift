@@ -597,7 +597,7 @@ enum EmbeddedRootHelper {
     }
 
     static func clearLegacyGreenFrameIfNeeded() -> (success: Bool, detail: String) {
-        let migrationKey = "cloudcode.perception.clear-stale-automation.v1"
+        let migrationKey = "cloudcode.perception.clear-stale-automation.v2-isolated"
         let defaults = UserDefaults.standard
         if defaults.bool(forKey: migrationKey) {
             return (true, "Legacy Accessibility Automation migration already completed.")
