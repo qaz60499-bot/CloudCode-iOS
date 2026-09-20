@@ -748,6 +748,13 @@ jobs:
               raise SystemExit('FAIL: background OCR must attempt the independent mobile helper')
           if 'EmbeddedRootHelper.guiOCR' in local_vision:
               raise SystemExit('FAIL: local OCR routing regressed back into the privileged/root GUI helper')
+          if 'AccessibilityAutomationGreenFrameGuard.shared.verifyBeforePerception()' not in local_vision:
+              raise SystemExit('FAIL: every real OCR pass must re-verify stale Accessibility Automation state before perception')
+          for marker in ('actor AccessibilityAutomationGreenFrameGuard', 'EmbeddedRootHelper.enforceNoLegacyGreenFrameState()', 'run(["gui-clear-stale-automation"], privilege: .root, timeout: 3)'):
+              if marker not in adapters:
+                  raise SystemExit(f'FAIL: green-frame prevention guard lost required marker: {marker}')
+          if 'verifiedInactive' in adapters:
+              raise SystemExit('FAIL: green-frame prevention must not cache a clean Accessibility Automation state for the lifetime of the app')
           vision_overlay_surface = local_vision + '\n' + vision_text
           for visible_overlay_marker in ('CAShapeLayer', 'UIWindow(', 'strokeColor', 'borderColor', 'systemGreen', 'UIColor.green'):
               if visible_overlay_marker in vision_overlay_surface:

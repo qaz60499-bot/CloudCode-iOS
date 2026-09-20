@@ -1872,17 +1872,16 @@ static void *CloudCodeResolveLegacyAXSymbol(const char *name)
 
 static int ClearLegacyCloudCodeAXAutomationState(void)
 {
-    // Migration-only repair for builds <= 128. Those builds could temporarily enable the global
-    // Accessibility Automation bit for detached AX reads; a watchdog/SIGKILL could prevent the
-    // matching restore and leave iOS rendering the green automation indicator indefinitely.
-    // This command is intentionally isolated from GUIAutomation.m so production OCR/AX perception
-    // remains mechanically read-only. It never touches AXManualAccessibility or per-app settings.
+    // Permanent process guard for the state legacy builds <= 128 could leave behind. Those builds
+    // temporarily enabled the global Accessibility Automation bit for detached AX reads; a watchdog
+    // or SIGKILL could prevent restore and leave iOS rendering the green automation indicator.
+    // The common path is read-only and returns immediately when the bit is already off. A write is
+    // resolved only when an active stale state is observed. Keep this isolated from GUIAutomation.m
+    // so production screenshot/OCR perception cannot acquire Automation authority itself.
     CloudCodeLegacyAXAutomationEnabledFn getter =
         (CloudCodeLegacyAXAutomationEnabledFn)CloudCodeResolveLegacyAXSymbol("_AXSAutomationEnabled");
-    CloudCodeLegacyAXSetAutomationEnabledFn setter =
-        (CloudCodeLegacyAXSetAutomationEnabledFn)CloudCodeResolveLegacyAXSymbol("_AXSSetAutomationEnabled");
-    if (!getter || !setter) {
-        fprintf(stderr, "gui-clear-stale-automation: symbols unavailable getter=%d setter=%d\n", getter != NULL, setter != NULL);
+    if (!getter) {
+        fprintf(stderr, "gui-clear-stale-automation: getter unavailable\n");
         return 61;
     }
     int before = -1;
@@ -1892,8 +1891,14 @@ static int ClearLegacyCloudCodeAXAutomationState(void)
         return 62;
     }
     if (before == 0) {
-        fprintf(stderr, "gui-clear-stale-automation: already-disabled before=0 after=0\n");
+        fprintf(stderr, "gui-clear-stale-automation: verified-disabled before=0 after=0 write=none\n");
         return 0;
+    }
+    CloudCodeLegacyAXSetAutomationEnabledFn setter =
+        (CloudCodeLegacyAXSetAutomationEnabledFn)CloudCodeResolveLegacyAXSymbol("_AXSSetAutomationEnabled");
+    if (!setter) {
+        fprintf(stderr, "gui-clear-stale-automation: active-state detected but setter unavailable before=%d\n", before);
+        return 61;
     }
     @try { setter(0); } @catch (__unused NSException *exception) {
         fprintf(stderr, "gui-clear-stale-automation: setter threw while clearing stale state\n");

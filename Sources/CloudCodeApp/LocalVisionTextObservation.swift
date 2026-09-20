@@ -222,6 +222,10 @@ enum LocalVisionTextObservation {
         requiresText: Bool = false,
         forcePrecise: Bool = false
     ) async -> Observation {
+        // The OCR engine itself is overlay-free, but older Cloud Code builds could leave the
+        // system Accessibility Automation bit active after a helper crash. Share the process guard
+        // with bootstrap so a failed startup verification is retried before the first real OCR pass.
+        _ = await AccessibilityAutomationGreenFrameGuard.shared.verifyBeforePerception()
         let boundedMaximum = min(max(maximumElements, 1), 48)
         let digest = SHA256.hash(data: jpegData).map { String(format: "%02x", $0) }.joined()
         let regionKey = regionInScreenPoints.map { "\($0.minX),\($0.minY),\($0.width),\($0.height)" } ?? "full"

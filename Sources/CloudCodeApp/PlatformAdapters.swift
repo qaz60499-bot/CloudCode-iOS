@@ -96,6 +96,18 @@ enum EmbeddedVisionHelper {
     }
 }
 
+actor AccessibilityAutomationGreenFrameGuard {
+    static let shared = AccessibilityAutomationGreenFrameGuard()
+
+    func verifyBeforePerception() -> (success: Bool, detail: String) {
+        // Do not cache a successful result for the lifetime of the app. AX/Accessibility Inspector
+        // state is process-external and can be changed later by a helper, USB diagnostic session, or
+        // an interrupted probe. Re-verify immediately before each real OCR pass so a stale green
+        // automation indicator cannot survive just because bootstrap observed a clean state.
+        EmbeddedRootHelper.enforceNoLegacyGreenFrameState()
+    }
+}
+
 enum EmbeddedRootHelper {
     struct EnumeratedApp: Decodable {
         var bundleID: String
@@ -596,25 +608,17 @@ enum EmbeddedRootHelper {
         return (nil, failureDetail(prefix: "隔离 GUI readiness 探测", code: result.code, diagnostic: diagnostic))
     }
 
-    static func clearLegacyGreenFrameIfNeeded() -> (success: Bool, detail: String) {
-        let migrationKey = "cloudcode.perception.clear-stale-automation.v2-isolated"
-        let defaults = UserDefaults.standard
-        if defaults.bool(forKey: migrationKey) {
-            return (true, "Legacy Accessibility Automation migration already completed.")
-        }
+    static func enforceNoLegacyGreenFrameState() -> (success: Bool, detail: String) {
         guard FileManager.default.isExecutableFile(atPath: executablePath) else {
-            return (false, "Embedded root helper is unavailable; stale Automation cleanup will retry on a later launch.")
+            return (false, "Embedded root helper is unavailable; Accessibility Automation state will be verified again before the next OCR request.")
         }
         let result = run(["gui-clear-stale-automation"], privilege: .root, timeout: 3)
         guard result.code == 0 else {
-            return (false, failureDetail(prefix: "Legacy Accessibility Automation cleanup", code: result.code, diagnostic: result.diagnostic))
+            return (false, failureDetail(prefix: "Accessibility Automation green-frame guard", code: result.code, diagnostic: result.diagnostic))
         }
-        // Persist only after the helper verified the global bit is off. A failed/unavailable repair
-        // remains retryable on the next launch. Normal screenshot/OCR work never calls this command.
-        defaults.set(true, forKey: migrationKey)
         return (true, result.diagnostic.isEmpty
-            ? "Legacy Accessibility Automation state is verified disabled."
-            : "Legacy Accessibility Automation state is verified disabled. \(result.diagnostic)")
+            ? "Accessibility Automation state is verified disabled."
+            : "Accessibility Automation state is verified disabled. \(result.diagnostic)")
     }
 
     static func guiTree() -> (tree: String?, detail: String) {

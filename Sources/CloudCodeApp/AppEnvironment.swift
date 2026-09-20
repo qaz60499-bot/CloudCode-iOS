@@ -1046,12 +1046,13 @@ public final class CloudCodeViewModel: ObservableObject {
             capabilityRefreshMessage = Self.capabilitySummary(capabilities) + " · 特权/私有 API 检测已延后"
             capabilityGraph = CapabilityGraphBuilder().build(profile: capabilities, tools: await toolRegistry.all())
             recordStartupBreadcrumb("bootstrap.safe.end")
-            // Repair the one historical Cloud Code state that could survive an older helper crash:
-            // builds <= 128 temporarily enabled the global Accessibility Automation bit for AX.
-            // The migration is verified and persisted once; normal OCR never writes that bit.
-            // Then bind OCR capability initialization to this process without capturing the screen.
+            // Keep the production OCR path independent from Accessibility Automation. Older
+            // builds could leave the global Automation bit active after a helper crash, which makes
+            // iOS render the green status/accessibility frame. Verify that state once per process at
+            // bootstrap; the first real OCR request shares the same guard and retries if this check
+            // could not complete. OCR initialization itself still performs no screen capture.
             Task.detached(priority: .utility) {
-                _ = EmbeddedRootHelper.clearLegacyGreenFrameIfNeeded()
+                _ = await AccessibilityAutomationGreenFrameGuard.shared.verifyBeforePerception()
                 LocalVisionTextObservation.prepare()
             }
             await seedKnowledgeIfNeeded(apps)
