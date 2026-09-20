@@ -310,18 +310,24 @@ static int CloudCodeOCRFile(NSString *path, NSUInteger maximumElements, BOOL for
 
 static int CloudCodeRunOneShotVisionCommand(int argc, char *argv[])
 {
-    // OCR must run as the ordinary mobile user. Do not declare this binary in TSRootBinaries:
-    // that list is reserved for helpers that need TrollStore's special root-helper permissions.
-    // Root/persona-99 Vision was proven unstable on iOS 16.6, so fail closed on elevation.
-    if (getuid() == 0 || geteuid() == 0) {
-        fprintf(stderr, "vision-helper: root execution is forbidden\n");
-        return 77;
-    }
     if (argc < 2) {
         fprintf(stderr, "vision-helper: missing command\n");
         return 64;
     }
     NSString *command = [NSString stringWithUTF8String:argv[1]];
+    BOOL pcControlRootOCRFile = (getuid() == 0 || geteuid() == 0)
+        && [command isEqualToString:@"ocr-file"]
+        && argc >= 6
+        && strcmp(argv[argc - 1], "pc-control-root-ocr-ok") == 0
+        && CloudCodeIsBoundedTempJPEG([NSString stringWithUTF8String:argv[2]]);
+    // OCR normally runs as the ordinary mobile user. Do not declare this binary in TSRootBinaries:
+    // that list is reserved for helpers that need TrollStore's special root-helper permissions.
+    // PC Control's smoke route is a bounded exception: it runs offline OCR on a freshly captured
+    // app-container tmp JPEG and never touches live screen/AX surfaces, avoiding unsafe root fork.
+    if ((getuid() == 0 || geteuid() == 0) && !pcControlRootOCRFile) {
+        fprintf(stderr, "vision-helper: root execution is forbidden\n");
+        return 77;
+    }
     if ([command isEqualToString:@"probe-ocr-file"]) {
         if (argc != 8) { return 64; }
         NSString *path = [NSString stringWithUTF8String:argv[2]];
