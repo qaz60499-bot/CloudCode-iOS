@@ -96,18 +96,6 @@ enum EmbeddedVisionHelper {
     }
 }
 
-actor AccessibilityAutomationGreenFrameGuard {
-    static let shared = AccessibilityAutomationGreenFrameGuard()
-
-    func verifyBeforePerception() -> (success: Bool, detail: String) {
-        // Do not cache a successful result for the lifetime of the app. AX/Accessibility Inspector
-        // state is process-external and can be changed later by a helper, USB diagnostic session, or
-        // an interrupted probe. Re-verify immediately before each real OCR pass so a stale green
-        // automation indicator cannot survive just because bootstrap observed a clean state.
-        EmbeddedRootHelper.enforceNoLegacyGreenFrameState()
-    }
-}
-
 enum EmbeddedRootHelper {
     struct EnumeratedApp: Decodable {
         var bundleID: String
@@ -606,19 +594,6 @@ enum EmbeddedRootHelper {
         }
         let diagnostic = result.stderr.isEmpty ? result.stdout : result.stderr
         return (nil, failureDetail(prefix: "隔离 GUI readiness 探测", code: result.code, diagnostic: diagnostic))
-    }
-
-    static func enforceNoLegacyGreenFrameState() -> (success: Bool, detail: String) {
-        guard FileManager.default.isExecutableFile(atPath: executablePath) else {
-            return (false, "Embedded root helper is unavailable; Accessibility Automation state will be verified again before the next OCR request.")
-        }
-        let result = run(["gui-clear-stale-automation"], privilege: .root, timeout: 3)
-        guard result.code == 0 else {
-            return (false, failureDetail(prefix: "Accessibility Automation green-frame guard", code: result.code, diagnostic: result.diagnostic))
-        }
-        return (true, result.diagnostic.isEmpty
-            ? "Accessibility Automation state is verified disabled."
-            : "Accessibility Automation state is verified disabled. \(result.diagnostic)")
     }
 
     static func guiTree() -> (tree: String?, detail: String) {

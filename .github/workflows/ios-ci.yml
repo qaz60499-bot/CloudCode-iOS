@@ -748,13 +748,14 @@ jobs:
               raise SystemExit('FAIL: background OCR must attempt the independent mobile helper')
           if 'EmbeddedRootHelper.guiOCR' in local_vision:
               raise SystemExit('FAIL: local OCR routing regressed back into the privileged/root GUI helper')
-          if 'AccessibilityAutomationGreenFrameGuard.shared.verifyBeforePerception()' not in local_vision:
-              raise SystemExit('FAIL: every real OCR pass must re-verify stale Accessibility Automation state before perception')
-          for marker in ('actor AccessibilityAutomationGreenFrameGuard', 'EmbeddedRootHelper.enforceNoLegacyGreenFrameState()', 'run(["gui-clear-stale-automation"], privilege: .root, timeout: 3)'):
-              if marker not in adapters:
-                  raise SystemExit(f'FAIL: green-frame prevention guard lost required marker: {marker}')
-          if 'verifiedInactive' in adapters:
-              raise SystemExit('FAIL: green-frame prevention must not cache a clean Accessibility Automation state for the lifetime of the app')
+          app_environment = Path('Sources/CloudCodeApp/AppEnvironment.swift').read_text(encoding='utf-8')
+          production_ocr_surface = local_vision + '\n' + app_environment + '\n' + adapters
+          for forbidden_marker in ('AccessibilityAutomationGreenFrameGuard', 'enforceNoLegacyGreenFrameState', 'gui-clear-stale-automation', '_AXSAutomationEnabled', '_AXSSetAutomationEnabled'):
+              if forbidden_marker in production_ocr_surface:
+                  raise SystemExit(f'FAIL: production OCR/bootstrap must not touch private Accessibility Automation state: {forbidden_marker}')
+          root_main = Path('Sources/CloudCodeRootHelper/main.m').read_text(encoding='utf-8')
+          if 'gui-clear-stale-automation' not in root_main or 'Explicit maintenance repair' not in root_main:
+              raise SystemExit('FAIL: legacy green-frame cleanup must remain available only as an explicit one-shot root-helper repair')
           vision_overlay_surface = local_vision + '\n' + vision_text
           for visible_overlay_marker in ('CAShapeLayer', 'UIWindow(', 'strokeColor', 'borderColor', 'systemGreen', 'UIColor.green'):
               if visible_overlay_marker in vision_overlay_surface:

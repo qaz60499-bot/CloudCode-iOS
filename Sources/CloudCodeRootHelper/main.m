@@ -1872,12 +1872,11 @@ static void *CloudCodeResolveLegacyAXSymbol(const char *name)
 
 static int ClearLegacyCloudCodeAXAutomationState(void)
 {
-    // Permanent process guard for the state legacy builds <= 128 could leave behind. Those builds
-    // temporarily enabled the global Accessibility Automation bit for detached AX reads; a watchdog
-    // or SIGKILL could prevent restore and leave iOS rendering the green automation indicator.
-    // The common path is read-only and returns immediately when the bit is already off. A write is
-    // resolved only when an active stale state is observed. Keep this isolated from GUIAutomation.m
-    // so production screenshot/OCR perception cannot acquire Automation authority itself.
+    // Explicit maintenance repair for state that legacy builds <= 128 could leave behind. Those
+    // builds temporarily enabled the global Accessibility Automation bit for detached AX reads; a
+    // watchdog or SIGKILL could prevent restore and leave iOS rendering the green automation
+    // indicator. Normal app bootstrap/OCR must never call this command. Invoke it only as a bounded
+    // one-shot repair when an already-stale device state needs to be cleared.
     CloudCodeLegacyAXAutomationEnabledFn getter =
         (CloudCodeLegacyAXAutomationEnabledFn)CloudCodeResolveLegacyAXSymbol("_AXSAutomationEnabled");
     if (!getter) {

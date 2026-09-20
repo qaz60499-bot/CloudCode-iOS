@@ -1046,13 +1046,11 @@ public final class CloudCodeViewModel: ObservableObject {
             capabilityRefreshMessage = Self.capabilitySummary(capabilities) + " · 特权/私有 API 检测已延后"
             capabilityGraph = CapabilityGraphBuilder().build(profile: capabilities, tools: await toolRegistry.all())
             recordStartupBreadcrumb("bootstrap.safe.end")
-            // Keep the production OCR path independent from Accessibility Automation. Older
-            // builds could leave the global Automation bit active after a helper crash, which makes
-            // iOS render the green status/accessibility frame. Verify that state once per process at
-            // bootstrap; the first real OCR request shares the same guard and retries if this check
-            // could not complete. OCR initialization itself still performs no screen capture.
+            // Production OCR must remain completely independent from private Accessibility/
+            // Automation state. Do not probe or repair AX state during bootstrap: even a read-only
+            // private AXRuntime touch can surface the iOS 16.6 green accessibility indicator.
+            // Legacy stale-state repair remains an explicit maintenance command outside normal OCR.
             Task.detached(priority: .utility) {
-                _ = await AccessibilityAutomationGreenFrameGuard.shared.verifyBeforePerception()
                 LocalVisionTextObservation.prepare()
             }
             await seedKnowledgeIfNeeded(apps)
