@@ -11,7 +11,11 @@ import Foundation
 /// system accessibility frame across launch, foreground/background, timeout, crash and recovery.
 enum ProductionPerceptionPolicy {
     static let accessibilityRuntimeAllowed = false
+    static let backgroundProcessAssertionAllowed = false
 
     static let accessibilityDisabledReason =
         "Production AX/AXAudit is quarantined because iOS 16.6 can surface the visible green Accessibility frame without an explicit Automation-state write. Use screenshot/local OCR/native/HID paths; AX remains available only in explicit diagnostics."
+
+    static let backgroundProcessAssertionDisabledReason =
+        "Production BKSProcessAssertion is quarantined because a detached background-assert worker can keep the visible green status indicator active while OCR itself is already overlay-free. Use the ordinary bounded UIKit background window plus checkpoint recovery; detached PC-control/OCR helpers must not acquire this assertion."
 }

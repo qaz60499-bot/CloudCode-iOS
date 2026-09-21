@@ -553,9 +553,12 @@ jobs:
                   raise SystemExit(f'FAIL: background assertion worker can outlive an invalid BKS assertion: {marker}')
 
           pc_control = Path('Sources/CloudCodeRootHelper/PCControlServer.m').read_text(encoding='utf-8')
-          for marker in ('CloudCodePCStartBackgroundGuardian', 'background-assert-worker', 'CloudCodePCStartBackgroundGuardian(executablePath, getpid())', 'signal(SIGHUP, SIG_IGN)', 'setsid()', 'poll(&pollFD, 1, 5000)', 'CloudCodePCStopBackgroundGuardian(guardianPID)'):
+          for marker in ('signal(SIGHUP, SIG_IGN)', 'setsid()', 'poll(&pollFD, 1, 5000)', 'Keep the detached PC-control worker free of BKSProcessAssertion', 'CloudCodePCWriteTokenRecord(token)'):
               if marker not in pc_control:
-                  raise SystemExit(f'FAIL: PC-control server lost detached background-survival guardrail: {marker}')
+                  raise SystemExit(f'FAIL: PC-control server lost detached guardian-free lifecycle marker: {marker}')
+          for forbidden_pc_guardian in ('CloudCodePCStartBackgroundGuardian', 'CloudCodePCStopBackgroundGuardian', 'CloudCodePCStartBackgroundGuardian(executablePath, getpid())'):
+              if forbidden_pc_guardian in pc_control:
+                  raise SystemExit(f'FAIL: PC-control must not hold a BKSProcessAssertion guardian that can surface the green status indicator: {forbidden_pc_guardian}')
           for marker in ('#define CLOUDCODE_PC_CONTROL_PROTOCOL 2', 'CloudCodePCReadTokenRecordRaw', 'CloudCodePCExistingTransportAbsent', 'connectError == ECONNREFUSED', 'memchr(responseBytes', 'completeFrame', 'responseDeadline = CloudCodePCMonotonicSeconds() + 1.0', 'poll(&responsePoll, 1, waitMS)', 'existingProtocol != 1', 'CloudCodePCShutdownExisting(existingToken)', 'CloudCodePCAcquireServerMigrationLock', 'flock(fd, LOCK_EX)', 'FD_CLOEXEC', 'stale authenticated worker refused shutdown', 'stale authenticated worker kept the control port after shutdown', 'CLOUDCODE_PC_CONTROL_LAUNCH_TIMEOUT_MS', 'CloudCodePCRunOneShotWithTimeout(executablePath, arguments, CLOUDCODE_PC_CONTROL_LAUNCH_TIMEOUT_MS)'):
               if marker not in pc_control:
                   raise SystemExit(f'FAIL: PC-control stale-worker replacement guard missing: {marker}')
@@ -749,6 +752,12 @@ jobs:
           if 'EmbeddedRootHelper.guiOCR' in local_vision:
               raise SystemExit('FAIL: local OCR routing regressed back into the privileged/root GUI helper')
           app_environment = Path('Sources/CloudCodeApp/AppEnvironment.swift').read_text(encoding='utf-8')
+          production_policy = Path('Sources/CloudCodeApp/ProductionPerceptionPolicy.swift').read_text(encoding='utf-8')
+          for marker in ('static let backgroundProcessAssertionAllowed = false', 'backgroundProcessAssertionDisabledReason'):
+              if marker not in production_policy:
+                  raise SystemExit(f'FAIL: production green-indicator quarantine lost background assertion policy marker: {marker}')
+          if 'if !ProductionPerceptionPolicy.backgroundProcessAssertionAllowed' not in app_environment:
+              raise SystemExit('FAIL: production background execution can bypass the green-indicator BKS assertion quarantine')
           production_ocr_surface = local_vision + '\n' + app_environment + '\n' + adapters
           for forbidden_marker in ('AccessibilityAutomationGreenFrameGuard', 'enforceNoLegacyGreenFrameState', 'gui-clear-stale-automation', '_AXSAutomationEnabled', '_AXSSetAutomationEnabled'):
               if forbidden_marker in production_ocr_surface:

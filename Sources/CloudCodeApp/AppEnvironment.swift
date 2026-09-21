@@ -2264,6 +2264,38 @@ public final class CloudCodeViewModel: ObservableObject {
             }
         }
 
+        if !ProductionPerceptionPolicy.backgroundProcessAssertionAllowed {
+            if let workerPID = backgroundAssertionWorkerPID {
+                _ = await Task.detached(priority: .utility) {
+                    EmbeddedRootHelper.stopBackgroundAssertion(workerPID: workerPID)
+                }.value
+                if backgroundAssertionWorkerPID == workerPID {
+                    backgroundAssertionWorkerPID = nil
+                }
+            }
+            if hasBackgroundCriticalActivity {
+                backgroundWindowTask?.cancel()
+                backgroundWindowTask = Task { [weak self] in
+                    guard let self else { return }
+                    do {
+                        try await Task.sleep(nanoseconds: UInt64(Self.backgroundContinuationWindow * 1_000_000_000))
+                    } catch {
+                        return
+                    }
+                    guard !Task.isCancelled else { return }
+                    self.backgroundContinuationWindowDidElapse()
+                }
+            }
+            try? await diagnosticLogStore.log(
+                level: .info,
+                subsystem: "app",
+                action: "background.assertion",
+                result: "quarantined-visible-indicator",
+                diagnostic: ProductionPerceptionPolicy.backgroundProcessAssertionDisabledReason
+            )
+            return
+        }
+
         if let workerPID = backgroundAssertionWorkerPID {
             let alive = await Task.detached(priority: .utility) {
                 EmbeddedRootHelper.backgroundAssertionIsAlive(workerPID: workerPID)
