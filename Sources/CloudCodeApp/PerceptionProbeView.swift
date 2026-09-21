@@ -7,7 +7,10 @@ import CloudCodeCore
 // device test, never a persisted startup task or an Agent/provider execution path.
 extension CloudCodeViewModel {
     @MainActor func runExplicitPerceptionRegressionIfRequested() {
-        guard ProcessInfo.processInfo.arguments.contains("--cloudcode-perception-regression") else { return }
+        let arguments = ProcessInfo.processInfo.arguments
+        guard arguments.contains("--cloudcode-perception-regression") else { return }
+        let axDiagnosticsRequested = arguments.contains("--cloudcode-ax-matrix")
+        let allowAXDiagnostics = axDiagnosticsRequested && ProductionPerceptionPolicy.explicitAccessibilityDiagnosticsAllowed
         let runID = UUID().uuidString
         // TrollStore registers this bundle as a System app, so house_arrest refuses its container.
         // USB AFC can retrieve this explicit diagnostic export without changing pairing or data.
@@ -29,7 +32,12 @@ extension CloudCodeViewModel {
                 await recordPerceptionProbe(id: runID, stage: stage, json: String(data: data, encoding: .utf8) ?? "{}")
             }
             await record("begin", ["build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "", "pid": getpid()])
-            let assertion = await Task.detached { EmbeddedRootHelper.startBackgroundAssertion(targetPID: getpid()) }.value
+            let assertion: (workerPID: Int32?, detail: String)
+            if ProductionPerceptionPolicy.backgroundProcessAssertionAllowed {
+                assertion = await Task.detached { EmbeddedRootHelper.startBackgroundAssertion(targetPID: getpid()) }.value
+            } else {
+                assertion = (nil, ProductionPerceptionPolicy.backgroundProcessAssertionDisabledReason)
+            }
             await record("assertion", ["workerPID": assertion.workerPID ?? 0, "detail": assertion.detail])
             let launch = await Task.detached { EmbeddedRootHelper.launch(bundleID: "com.tencent.xin") }.value
             await record("launch", ["accepted": launch.accepted, "foregroundVerified": launch.foregroundVerified, "detail": launch.detail])
@@ -56,15 +64,23 @@ extension CloudCodeViewModel {
                     }
                     await record(stage, body)
                 case 3:
-                    let tree = await Task.detached { EmbeddedRootHelper.guiTree() }.value
-                    await record(stage, ["command": "gui-tree", "tree": tree.tree ?? "", "detail": tree.detail])
+                    if allowAXDiagnostics {
+                        let tree = await Task.detached { EmbeddedRootHelper.guiTree() }.value
+                        await record(stage, ["command": "gui-tree", "tree": tree.tree ?? "", "detail": tree.detail])
+                    } else {
+                        await record(stage, ["command": "ax-quarantined", "detail": ProductionPerceptionPolicy.accessibilityDisabledReason])
+                    }
                 default:
-                    let focus = await Task.detached { EmbeddedRootHelper.focusedTextInput() }.value
-                    await record(stage, ["command": "focused-text-input", "detail": focus.detail, "focusedTextInput": focus.payload?.focusedTextInput ?? false])
+                    if allowAXDiagnostics {
+                        let focus = await Task.detached { EmbeddedRootHelper.focusedTextInput() }.value
+                        await record(stage, ["command": "focused-text-input", "detail": focus.detail, "focusedTextInput": focus.payload?.focusedTextInput ?? false])
+                    } else {
+                        await record(stage, ["command": "ax-quarantined", "detail": ProductionPerceptionPolicy.accessibilityDisabledReason])
+                    }
                 }
                 try? await Task.sleep(nanoseconds: 300_000_000)
             }
-            if ProcessInfo.processInfo.arguments.contains("--cloudcode-ax-matrix") {
+            if allowAXDiagnostics {
                 // Build 122 already exhausted the old 2 identities × 4 seeds × 3 preparations
                 // detached-helper matrix. Build 123 uses this switch for the new evidence that can
                 // change the decision: one bounded System-app host probe plus two detached ios-mcp
@@ -118,6 +134,13 @@ extension CloudCodeViewModel {
                     ])
                 }
             }
+            if axDiagnosticsRequested && !allowAXDiagnostics {
+                await record("ax-quarantined", [
+                    "requested": true,
+                    "status": "disabled",
+                    "detail": ProductionPerceptionPolicy.accessibilityDisabledReason
+                ])
+            }
             if let pid = assertion.workerPID {
                 let stopped = await Task.detached { EmbeddedRootHelper.stopBackgroundAssertion(workerPID: pid) }.value
                 await record("assertion-stop", ["success": stopped.success, "detail": stopped.detail])
@@ -153,7 +176,9 @@ struct PerceptionProbeView: View {
             Section("最小真机探针") {
                 Picker("类型", selection: $kind) {
                     Text("Vision OCR").tag("Vision")
-                    Text("AX 单阶段").tag("AX")
+                    if ProductionPerceptionPolicy.explicitAccessibilityDiagnosticsAllowed {
+                        Text("AX 单阶段").tag("AX")
+                    }
                 }
                 Toggle("延迟 5 秒运行（用于切到其他 App）", isOn: $delay)
                 Text("先在电脑启动 USB 日志。延迟测试会记录实际 App 状态；若仍在前台，不计为后台测试。")
@@ -181,7 +206,7 @@ struct PerceptionProbeView: View {
                     Text("固定 accurate、单次识别，记录文字、置信度、坐标与错误链。英文 fixture 应含 CLOUD CODE 123；中文应含 文件传输助手。")
                         .font(.footnote)
                 }
-            } else {
+            } else if ProductionPerceptionPolicy.explicitAccessibilityDiagnosticsAllowed {
                 Section("AX 隔离变量") {
                     Picker("阶段", selection: $axStage) {
                         ForEach(["symbols", "frontmost", "root", "attributes", "hit-test", "application-at-point", "context-at-point", "iosmcp-delta"], id: \.self) { Text($0).tag($0) }
@@ -240,6 +265,12 @@ struct PerceptionProbeView: View {
             let scale = UIScreen.main.scale, nativeScale = UIScreen.main.nativeScale
             let result = await Task.detached(priority: .utility) { () -> String in
                 if selectedKind == "AX" {
+                    guard ProductionPerceptionPolicy.explicitAccessibilityDiagnosticsAllowed else {
+                        return Self.json([
+                            "status": "ax_quarantined",
+                            "detail": ProductionPerceptionPolicy.accessibilityDisabledReason
+                        ])
+                    }
                     return Self.spawn(executable: EmbeddedRootHelper.executablePath,
                         arguments: ["gui-ax-probe-json", selectedStage, selectedSeed, String(pid), selectedPreparation], asRoot: selectedRoot)
                 }

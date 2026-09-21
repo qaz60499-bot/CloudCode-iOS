@@ -753,11 +753,15 @@ jobs:
               raise SystemExit('FAIL: local OCR routing regressed back into the privileged/root GUI helper')
           app_environment = Path('Sources/CloudCodeApp/AppEnvironment.swift').read_text(encoding='utf-8')
           production_policy = Path('Sources/CloudCodeApp/ProductionPerceptionPolicy.swift').read_text(encoding='utf-8')
-          for marker in ('static let backgroundProcessAssertionAllowed = false', 'backgroundProcessAssertionDisabledReason'):
+          for marker in ('static let backgroundProcessAssertionAllowed = false', 'backgroundProcessAssertionDisabledReason', 'static let explicitAccessibilityDiagnosticsAllowed = false'):
               if marker not in production_policy:
-                  raise SystemExit(f'FAIL: production green-indicator quarantine lost background assertion policy marker: {marker}')
+                  raise SystemExit(f'FAIL: production green-indicator quarantine lost policy marker: {marker}')
           if 'if !ProductionPerceptionPolicy.backgroundProcessAssertionAllowed' not in app_environment:
               raise SystemExit('FAIL: production background execution can bypass the green-indicator BKS assertion quarantine')
+          perception_probe = Path('Sources/CloudCodeApp/PerceptionProbeView.swift').read_text(encoding='utf-8')
+          for marker in ('if ProductionPerceptionPolicy.backgroundProcessAssertionAllowed', 'let allowAXDiagnostics = axDiagnosticsRequested && ProductionPerceptionPolicy.explicitAccessibilityDiagnosticsAllowed', 'if ProductionPerceptionPolicy.explicitAccessibilityDiagnosticsAllowed'):
+              if marker not in perception_probe:
+                  raise SystemExit(f'FAIL: explicit perception diagnostics can bypass the green-indicator quarantine: {marker}')
           production_ocr_surface = local_vision + '\n' + app_environment + '\n' + adapters
           for forbidden_marker in ('AccessibilityAutomationGreenFrameGuard', 'enforceNoLegacyGreenFrameState', 'gui-clear-stale-automation', '_AXSAutomationEnabled', '_AXSSetAutomationEnabled'):
               if forbidden_marker in production_ocr_surface:
