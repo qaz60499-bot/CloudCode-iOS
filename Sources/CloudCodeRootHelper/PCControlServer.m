@@ -527,6 +527,13 @@ static NSDictionary *CloudCodePCActionResponse(const char *executablePath, NSDic
         }
         NSString *command = [operation isEqualToString:@"foreground-diagnostics"] ? @"foreground-diagnostics-file" : operation;
         arguments = @[command, bundleID];
+    } else if ([operation isEqualToString:@"clear-stale-automation"]) {
+        // Bounded maintenance-only repair for the global Accessibility Automation bit that
+        // legacy CloudCode builds could leave enabled after an interrupted AX diagnostic.
+        // Production OCR/perception never calls this operation; it is exposed only through
+        // the authenticated localhost PC-control channel so a stale device can be repaired
+        // without re-enabling AX diagnostics or a visible foreground overlay.
+        arguments = @[@"gui-clear-stale-automation"];
     } else if ([operation isEqualToString:@"install-ipa"]) {
         NSString *path = [request[@"path"] isKindOfClass:NSString.class] ? request[@"path"] : nil;
         NSString *bundleID = [request[@"bundleID"] isKindOfClass:NSString.class] ? request[@"bundleID"] : nil;
