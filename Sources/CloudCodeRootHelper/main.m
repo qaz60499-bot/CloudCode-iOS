@@ -1848,7 +1848,7 @@ static int BackgroundAssertionWorkerStatus(pid_t workerPID)
 
 static int ClearLegacyCloudCodeAXAutomationState(void)
 {
-    // Maintenance-only repair for the persistent global Accessibility Automation preference that
+    // Explicit maintenance repair for the persistent global Accessibility Automation preference that
     // legacy builds could leave enabled after an interrupted AX diagnostic. Do not call AXRuntime
     // here: on iOS 16.6 the legacy getter/setter can itself wedge or recreate the visible green
     // automation indicator. Instead, update only the persisted AutomationEnabled key as root,
