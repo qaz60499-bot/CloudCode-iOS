@@ -12,6 +12,7 @@
 #import <signal.h>
 #import <spawn.h>
 #import <sys/wait.h>
+#import <sys/stat.h>
 #import <time.h>
 #import <stdlib.h>
 #import <string.h>
@@ -1845,72 +1846,121 @@ static int BackgroundAssertionWorkerStatus(pid_t workerPID)
     return kill(workerPID, 0) == 0 ? 0 : 77;
 }
 
-typedef int (*CloudCodeLegacyAXAutomationEnabledFn)(void);
-typedef void (*CloudCodeLegacyAXSetAutomationEnabledFn)(int);
-
-static void *CloudCodeResolveLegacyAXSymbol(const char *name)
-{
-    void *symbol = dlsym(RTLD_DEFAULT, name);
-    if (symbol) { return symbol; }
-    NSArray<NSString *> *paths = @[
-        @"/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime",
-        @"/System/Library/Frameworks/Accessibility.framework/Accessibility",
-        @"/System/Library/PrivateFrameworks/Accessibility.framework/Accessibility",
-        @"/usr/lib/libAccessibility.dylib",
-        @"/rootfs/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime",
-        @"/rootfs/System/Library/Frameworks/Accessibility.framework/Accessibility",
-        @"/rootfs/usr/lib/libAccessibility.dylib"
-    ];
-    for (NSString *path in paths) {
-        void *handle = dlopen(path.UTF8String, RTLD_NOW | RTLD_GLOBAL);
-        if (!handle) { continue; }
-        symbol = dlsym(handle, name);
-        if (symbol) { return symbol; }
-    }
-    return NULL;
-}
-
 static int ClearLegacyCloudCodeAXAutomationState(void)
 {
-    // Explicit maintenance repair for state that legacy builds <= 128 could leave behind. Those
-    // builds temporarily enabled the global Accessibility Automation bit for detached AX reads; a
-    // watchdog or SIGKILL could prevent restore and leave iOS rendering the green automation
-    // indicator. Normal app bootstrap/OCR must never call this command. Invoke it only as a bounded
-    // one-shot repair when an already-stale device state needs to be cleared.
-    CloudCodeLegacyAXAutomationEnabledFn getter =
-        (CloudCodeLegacyAXAutomationEnabledFn)CloudCodeResolveLegacyAXSymbol("_AXSAutomationEnabled");
-    if (!getter) {
-        fprintf(stderr, "gui-clear-stale-automation: getter unavailable\n");
+    // Maintenance-only repair for the persistent global Accessibility Automation preference that
+    // legacy builds could leave enabled after an interrupted AX diagnostic. Do not call AXRuntime
+    // here: on iOS 16.6 the legacy getter/setter can itself wedge or recreate the visible green
+    // automation indicator. Instead, update only the persisted AutomationEnabled key as root,
+    // preserve the preference file metadata, verify the on-disk value, then let the caller restart
+    // system services/device so cfprefsd and SpringBoard reload the repaired preference.
+    if (getuid() != 0 || geteuid() != 0) {
+        fprintf(stderr, "gui-clear-stale-automation: root-required\n");
+        return 11;
+    }
+
+    NSString *preferencePath = @"/var/mobile/Library/Preferences/com.apple.Accessibility.plist";
+    const char *preferenceFSPath = preferencePath.fileSystemRepresentation;
+    struct stat originalStat = {0};
+    if (!preferenceFSPath || stat(preferenceFSPath, &originalStat) != 0) {
+        fprintf(stderr, "gui-clear-stale-automation: preference-stat-failed errno=%d\n", errno);
         return 61;
     }
-    int before = -1;
-    @try { before = getter(); } @catch (__unused NSException *exception) { before = -1; }
-    if (before < 0) {
-        fprintf(stderr, "gui-clear-stale-automation: unable to read current state\n");
+
+    NSError *error = nil;
+    NSData *data = [NSData dataWithContentsOfFile:preferencePath options:0 error:&error];
+    if (!data.length) {
+        fprintf(stderr, "gui-clear-stale-automation: preference-read-failed error=%s\n",
+            error.localizedDescription.UTF8String ?: "unknown");
+        return 61;
+    }
+
+    NSPropertyListFormat format = NSPropertyListBinaryFormat_v1_0;
+    id parsed = [NSPropertyListSerialization propertyListWithData:data
+                                                           options:NSPropertyListMutableContainersAndLeaves
+                                                            format:&format
+                                                             error:&error];
+    if (![parsed isKindOfClass:NSMutableDictionary.class]) {
+        fprintf(stderr, "gui-clear-stale-automation: preference-parse-failed error=%s\n",
+            error.localizedDescription.UTF8String ?: "invalid-root");
         return 62;
     }
-    if (before == 0) {
+
+    NSMutableDictionary *preferences = (NSMutableDictionary *)parsed;
+    id beforeValue = preferences[@"AutomationEnabled"];
+    BOOL beforePresent = [beforeValue respondsToSelector:@selector(boolValue)];
+    BOOL beforeEnabled = beforePresent ? [beforeValue boolValue] : NO;
+    if (beforePresent && !beforeEnabled) {
         fprintf(stderr, "gui-clear-stale-automation: verified-disabled before=0 after=0 write=none\n");
         return 0;
     }
-    CloudCodeLegacyAXSetAutomationEnabledFn setter =
-        (CloudCodeLegacyAXSetAutomationEnabledFn)CloudCodeResolveLegacyAXSymbol("_AXSSetAutomationEnabled");
-    if (!setter) {
-        fprintf(stderr, "gui-clear-stale-automation: active-state detected but setter unavailable before=%d\n", before);
-        return 61;
-    }
-    @try { setter(0); } @catch (__unused NSException *exception) {
-        fprintf(stderr, "gui-clear-stale-automation: setter threw while clearing stale state\n");
+
+    preferences[@"AutomationEnabled"] = @NO;
+    NSData *updated = [NSPropertyListSerialization dataWithPropertyList:preferences
+                                                                 format:format
+                                                                options:0
+                                                                  error:&error];
+    if (!updated.length) {
+        fprintf(stderr, "gui-clear-stale-automation: preference-serialize-failed error=%s\n",
+            error.localizedDescription.UTF8String ?: "unknown");
         return 63;
     }
-    usleep(20000);
-    int after = -1;
-    @try { after = getter(); } @catch (__unused NSException *exception) { after = -1; }
-    if (after != 0) {
-        fprintf(stderr, "gui-clear-stale-automation: verification failed before=%d after=%d\n", before, after);
+
+    NSString *temporaryPath = [preferencePath stringByAppendingFormat:@".cloudcode-%d.tmp", getpid()];
+    const char *temporaryFSPath = temporaryPath.fileSystemRepresentation;
+    (void)unlink(temporaryFSPath);
+    if (![updated writeToFile:temporaryPath options:0 error:&error]) {
+        fprintf(stderr, "gui-clear-stale-automation: preference-temp-write-failed error=%s\n",
+            error.localizedDescription.UTF8String ?: "unknown");
         return 63;
     }
-    fprintf(stderr, "gui-clear-stale-automation: cleared legacy CloudCode automation state before=%d after=0\n", before);
+
+    BOOL metadataOK = chown(temporaryFSPath, originalStat.st_uid, originalStat.st_gid) == 0
+        && chmod(temporaryFSPath, originalStat.st_mode & 07777) == 0;
+    int temporaryFD = open(temporaryFSPath, O_RDONLY);
+    if (temporaryFD >= 0) {
+        if (fsync(temporaryFD) != 0) { metadataOK = NO; }
+        close(temporaryFD);
+    } else {
+        metadataOK = NO;
+    }
+    if (!metadataOK) {
+        int savedErrno = errno;
+        (void)unlink(temporaryFSPath);
+        fprintf(stderr, "gui-clear-stale-automation: preference-metadata-sync-failed errno=%d\n", savedErrno);
+        return 63;
+    }
+
+    if (rename(temporaryFSPath, preferenceFSPath) != 0) {
+        int savedErrno = errno;
+        (void)unlink(temporaryFSPath);
+        fprintf(stderr, "gui-clear-stale-automation: preference-replace-failed errno=%d\n", savedErrno);
+        return 63;
+    }
+
+    int directoryFD = open("/var/mobile/Library/Preferences", O_RDONLY);
+    if (directoryFD >= 0) {
+        (void)fsync(directoryFD);
+        close(directoryFD);
+    }
+
+    NSError *verifyError = nil;
+    NSData *verifyData = [NSData dataWithContentsOfFile:preferencePath options:0 error:&verifyError];
+    id verifyParsed = verifyData.length
+        ? [NSPropertyListSerialization propertyListWithData:verifyData options:0 format:NULL error:&verifyError]
+        : nil;
+    id afterValue = [verifyParsed isKindOfClass:NSDictionary.class]
+        ? ((NSDictionary *)verifyParsed)[@"AutomationEnabled"]
+        : nil;
+    if (![afterValue respondsToSelector:@selector(boolValue)] || [afterValue boolValue]) {
+        fprintf(stderr, "gui-clear-stale-automation: preference-verify-failed error=%s\n",
+            verifyError.localizedDescription.UTF8String ?: "unexpected-value");
+        return 64;
+    }
+
+    fprintf(stderr, "gui-clear-stale-automation: persisted preference cleared before=%s after=0 path=%s\n",
+        beforePresent ? (beforeEnabled ? "1" : "0") : "missing",
+        preferenceFSPath);
     return 0;
 }
 
