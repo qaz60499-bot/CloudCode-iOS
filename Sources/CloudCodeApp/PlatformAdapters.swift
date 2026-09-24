@@ -3159,6 +3159,10 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
 
         let baseline = try await captureSample()
         let baselineHash = baseline.hash
+        let baselineVisibleText = localElementSamples.last?.map(\.text).joined(separator: "\n") ?? ""
+        if Self.isProtectedSystemConfirmationSurfaceText(baselineVisibleText) {
+            throw ToolRouterError.noExecutionRoute("protected/system-confirmation surface is blocking feed sampling; user action is required before GUI automation may continue")
+        }
         var previousIdentity = baseline.identity
         if previousIdentity == nil {
             stoppedReason = "baseline_semantic_identity_unavailable"
@@ -3988,6 +3992,24 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
 
     private static func isProtectedElement(_ match: GUIElementMatch) -> Bool {
         isProtectedLocalVisionText(match.searchableText)
+    }
+
+    private static func isProtectedSystemConfirmationSurfaceText(_ text: String) -> Bool {
+        let haystack = text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        let strongMarkers = [
+            "要求 app 不跟踪",
+            "跟踪你在其他公司",
+            "ask app not to track",
+            "allow tracking",
+            "face id",
+            "touch id",
+            "apple pay",
+            "enter passcode",
+            "系统权限",
+            "密码确认",
+            "支付确认"
+        ]
+        return strongMarkers.contains(where: { haystack.contains($0) })
     }
 
     private static func isProtectedLocalVisionText(_ text: String) -> Bool {
