@@ -3104,6 +3104,11 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             var axStatus = "skipped_local_sufficient"
             if localSufficient {
                 axSkippedLocalSufficientSamples += 1
+            } else if !ProductionPerceptionPolicy.accessibilityRuntimeAllowed {
+                // Production AX is intentionally quarantined on this device. Do not call tree()
+                // merely to rediscover that policy failure: feed sampling must continue through
+                // screenshot + local OCR without surfacing a synthetic GUI/AX failure to the Agent.
+                axStatus = "skipped_production_policy"
             } else {
                 // Full AX trees are the most expensive/fragile perception source on custom-drawn
                 // video surfaces. Ask for one only after local OCR cannot prove this exact sample.
@@ -3354,14 +3359,14 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                         screenSize: returnedScreenSize
                     )
                 }
-                if !returnedSufficient {
+                if !returnedSufficient, ProductionPerceptionPolicy.accessibilityRuntimeAllowed {
                     axAttemptedSamples += 1
                     if let tree = try? await backend.tree() {
                         let returnedAX = LocalAXTreeTextExtractor.extract(from: tree, maximumElements: 96)
                         if !returnedAX.isEmpty { axSucceededSamples += 1 }
                         returnedElements = LocalPerceptionFusion.merge(ax: returnedAX, ocr: returnedElements)
                     }
-                } else {
+                } else if returnedSufficient {
                     axSkippedLocalSufficientSamples += 1
                 }
 
