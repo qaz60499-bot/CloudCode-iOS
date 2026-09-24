@@ -360,6 +360,26 @@ static BOOL CloudCodeHIDReady(CloudCodeHIDRuntime runtime, CGPoint point, CloudC
     return CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route);
 }
 
+static BOOL CloudCodeHIDGestureReady(CloudCodeHIDRuntime runtime, CGPoint point, CloudCodeHIDRoute *route)
+{
+    if (!route || !runtime.createDigitizer || !runtime.createFinger || !runtime.append || !runtime.setInteger || !runtime.setFloat) {
+        return NO;
+    }
+    *route = (CloudCodeHIDRoute){0};
+
+    // A swipe/scroll is a sustained gesture and must stay owned by the current foreground App.
+    // Physical-device evidence on iOS 16.6 showed that the global IOHID system-client route can
+    // hand a mid-screen scroll to SpringBoard, causing a feed task to leave the target App and land
+    // on Home. Require a BackBoard bundle/context connection for gestures instead of falling back
+    // to a global system client. Single taps and Unicode input keep their existing compatibility
+    // routes because they do not carry the same system-gesture takeover risk.
+    if (CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route)) {
+        return YES;
+    }
+    fprintf(stderr, "gui-hid-route: profile=modern-trollstore purpose=gesture result=targeted-route-required\n");
+    return NO;
+}
+
 static BOOL CloudCodeHIDTextReady(CloudCodeHIDRuntime runtime, CGPoint point, CloudCodeHIDRoute *route)
 {
     // Unicode input does not require the digitizer/finger/append/setFloat symbols used by touch.
@@ -566,7 +586,7 @@ static BOOL CloudCodePerformSwipe(double fromX, double fromY, double toX, double
     if (!CloudCodeValidPoint(fromX, fromY, size) || !CloudCodeValidPoint(toX, toY, size) || !isfinite(durationSeconds) || durationSeconds < 0.05 || durationSeconds > 5.0) { return NO; }
     CloudCodeHIDRuntime runtime = CloudCodeResolveHID();
     CloudCodeHIDRoute route = {0};
-    if (!CloudCodeHIDReady(runtime, CGPointMake(fromX, fromY), &route)) { return NO; }
+    if (!CloudCodeHIDGestureReady(runtime, CGPointMake(fromX, fromY), &route)) { return NO; }
     const int steps = 20;
     useconds_t delay = (useconds_t)((durationSeconds * 1000000.0) / steps);
     BOOL ok = CloudCodeDispatchTouch(runtime, route, fromX, fromY, CLOUDCODE_HID_DIGITIZER_RANGE | CLOUDCODE_HID_DIGITIZER_TOUCH, YES, YES);
