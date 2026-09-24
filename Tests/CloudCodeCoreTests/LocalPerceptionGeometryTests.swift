@@ -33,6 +33,50 @@ final class LocalPerceptionGeometryTests: XCTestCase {
         XCTAssertEqual(rect.height, 160, accuracy: 0.0001)
     }
 
+    func testVisionBoundingBoxAsymmetricUprightProjectionDoesNotMirrorOrDoubleFlip() throws {
+        // Screenshot capture guarantees display-upright point-space pixels before Vision runs.
+        // Use an asymmetric box so accidental X mirroring or a second Y flip is immediately visible.
+        let rect = try XCTUnwrap(LocalPerceptionGeometry.topLeftScreenRect(
+            normalizedLowerLeftX: 0.10,
+            y: 0.20,
+            width: 0.20,
+            height: 0.10,
+            screenWidth: 400,
+            screenHeight: 800
+        ))
+
+        XCTAssertEqual(rect.x, 40, accuracy: 0.0001)
+        XCTAssertEqual(rect.y, 560, accuracy: 0.0001)
+        XCTAssertEqual(rect.width, 80, accuracy: 0.0001)
+        XCTAssertEqual(rect.height, 80, accuracy: 0.0001)
+        XCTAssertEqual(rect.x + rect.width / 2, 80, accuracy: 0.0001)
+        XCTAssertEqual(rect.y + rect.height / 2, 600, accuracy: 0.0001)
+    }
+
+    func testVisionBoundingBoxUprightCornerProjectionStaysInBounds() throws {
+        let topLeft = try XCTUnwrap(LocalPerceptionGeometry.topLeftScreenRect(
+            normalizedLowerLeftX: 0.0,
+            y: 0.9,
+            width: 0.1,
+            height: 0.1,
+            screenWidth: 390,
+            screenHeight: 844
+        ))
+        XCTAssertEqual(topLeft.x, 0, accuracy: 0.0001)
+        XCTAssertEqual(topLeft.y, 0, accuracy: 0.0001)
+
+        let bottomRight = try XCTUnwrap(LocalPerceptionGeometry.topLeftScreenRect(
+            normalizedLowerLeftX: 0.9,
+            y: 0.0,
+            width: 0.1,
+            height: 0.1,
+            screenWidth: 390,
+            screenHeight: 844
+        ))
+        XCTAssertEqual(bottomRight.x + bottomRight.width, 390, accuracy: 0.0001)
+        XCTAssertEqual(bottomRight.y + bottomRight.height, 844, accuracy: 0.0001)
+    }
+
     func testVisibleTextMatcherFindsUniqueWeChatTransferAssistantIncludingLineFragment() throws {
         let elements = [
             LocalPerceptionTextElement(text: "微信 文件传输助手", confidence: 0.94, x: 24, y: 180, width: 180, height: 30),

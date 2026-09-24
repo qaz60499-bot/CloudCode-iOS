@@ -263,8 +263,15 @@ public struct LocalPerceptionScreenRect: Equatable, Sendable {
 
 public enum LocalPerceptionGeometry {
     /// Converts a normalized Vision-style lower-left rectangle into the top-left screen-point
-    /// coordinate space used by GUI automation. The input is intersected with the normalized unit
-    /// image bounds so tiny detector overshoots cannot produce off-screen coordinates.
+    /// coordinate space used by GUI automation.
+    ///
+    /// Contract: the screenshot producer must already provide a display-upright, point-sized image.
+    /// Vision therefore consumes the image as `.up`, and this projection performs only the single
+    /// lower-left -> upper-left Y conversion. Do not apply device/interface orientation here again;
+    /// doing so would rotate an already-upright screenshot a second time.
+    ///
+    /// The input is intersected with normalized unit-image bounds so tiny detector overshoots cannot
+    /// produce off-screen coordinates.
     public static func topLeftScreenRect(
         normalizedLowerLeftX x: Double,
         y: Double,
