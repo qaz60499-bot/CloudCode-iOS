@@ -123,6 +123,7 @@ typedef size_t (*CloudCodeIOSurfaceGetBytesPerRowFn)(CloudCodeIOSurfaceRef);
 typedef CGImageRef (*CloudCodeCreateCGImageFromIOSurfaceFn)(CFTypeRef);
 typedef void (*CloudCodeRenderServerRenderDisplayFn)(uint32_t, CFStringRef, CloudCodeIOSurfaceRef, int, int);
 typedef CFStringRef (*CloudCodeCopyFrontmostBundleIDFn)(void);
+typedef CFDictionaryRef (*CloudCodeCopyInfoForApplicationWithProcessIDFn)(pid_t);
 typedef CFStringRef (*CloudCodeCopyBundleIDForPidFn)(pid_t);
 typedef CFTypeRef (*CloudCodeMGCopyAnswerFn)(CFStringRef);
 
@@ -1120,17 +1121,65 @@ static NSString *CloudCodeFrontmostBundleID(void)
 {
     void *handle = CloudCodeOpenSpringBoardServices();
     CloudCodeCopyFrontmostBundleIDFn copyBundleID = (CloudCodeCopyFrontmostBundleIDFn)CloudCodeResolve(handle, "SBSCopyFrontmostApplicationDisplayIdentifier");
-    if (!copyBundleID) { return nil; }
-    CFStringRef value = NULL;
-    @try {
-        value = copyBundleID();
-    } @catch (__unused NSException *exception) {
-        value = NULL;
+    if (copyBundleID) {
+        CFStringRef value = NULL;
+        @try {
+            value = copyBundleID();
+        } @catch (__unused NSException *exception) {
+            value = NULL;
+        }
+        if (value) {
+            NSString *bundleID = [(__bridge NSString *)value copy];
+            CFRelease(value);
+            if (bundleID.length > 0) { return bundleID; }
+        }
     }
-    if (!value) { return nil; }
-    NSString *bundleID = [(__bridge NSString *)value copy];
-    CFRelease(value);
-    return bundleID.length > 0 ? bundleID : nil;
+
+    // On the iOS 16.6 TrollStore/root persona the global SBS frontmost accessor can be empty even
+    // while a normal App is physically foreground. Reuse the per-process SpringBoard information
+    // signal that the launch verifier already trusts: enumerate live PIDs, require the exact
+    // BKSApplicationStateAppIsFrontmost flag, then resolve that PID back to its display identifier.
+    // This path is read-only and does not initialize Accessibility/AX, so gesture routing can recover
+    // the foreground owner without reintroducing the visible green automation frame.
+    CloudCodeCopyInfoForApplicationWithProcessIDFn copyInfo =
+        (CloudCodeCopyInfoForApplicationWithProcessIDFn)CloudCodeResolve(handle, "SBSCopyInfoForApplicationWithProcessID");
+    CloudCodeCopyBundleIDForPidFn copyBundleForPID =
+        (CloudCodeCopyBundleIDForPidFn)CloudCodeResolve(handle, "SBSCopyDisplayIdentifierForProcessID");
+    CloudCodeProcListAllPidsFn listPids = (CloudCodeProcListAllPidsFn)dlsym(RTLD_DEFAULT, "proc_listallpids");
+    if (!copyInfo || !copyBundleForPID || !listPids) { return nil; }
+
+    pid_t pids[4096] = {0};
+    int count = listPids(pids, sizeof(pids));
+    for (int index = 0; index < count && index < 4096; index++) {
+        pid_t pid = pids[index];
+        if (pid <= 1 || pid == getpid()) { continue; }
+
+        CFDictionaryRef rawInfo = NULL;
+        @try {
+            rawInfo = copyInfo(pid);
+        } @catch (__unused NSException *exception) {
+            rawInfo = NULL;
+        }
+        if (!rawInfo) { continue; }
+        NSDictionary *info = CFBridgingRelease(rawInfo);
+        id frontmost = info[@"BKSApplicationStateAppIsFrontmost"];
+        if (![frontmost respondsToSelector:@selector(boolValue)] || ![frontmost boolValue]) { continue; }
+
+        CFStringRef rawBundleID = NULL;
+        @try {
+            rawBundleID = copyBundleForPID(pid);
+        } @catch (__unused NSException *exception) {
+            rawBundleID = NULL;
+        }
+        if (!rawBundleID) { continue; }
+        NSString *bundleID = [(__bridge NSString *)rawBundleID copy];
+        CFRelease(rawBundleID);
+        if (bundleID.length > 0) {
+            fprintf(stderr, "gui-foreground: route=sbs-process-info pid=%d bundle=%s\n", pid, bundleID.UTF8String ?: "");
+            return bundleID;
+        }
+    }
+    return nil;
 }
 
 static NSString *CloudCodeBundleIDForPID(pid_t pid)
