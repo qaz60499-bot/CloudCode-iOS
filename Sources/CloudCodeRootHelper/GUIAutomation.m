@@ -377,6 +377,18 @@ static BOOL CloudCodeHIDGestureReady(CloudCodeHIDRuntime runtime, CGPoint point,
     if (CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route)) {
         return YES;
     }
+
+    // On iOS 16.6 TrollStore detached root helper, BackBoard connection manager cannot be acquired
+    // in this persona. Fall back to the IOHID system client so gestures (swipe/scroll/feed) can still
+    // be dispatched to the device rather than failing closed with code 66.
+    if (runtime.createClient && runtime.dispatch) {
+        route->systemClient = runtime.createClient(kCFAllocatorDefault);
+        if (route->systemClient) {
+            fprintf(stderr, "gui-hid-route: profile=modern-trollstore route=system-client purpose=gesture\n");
+            return YES;
+        }
+    }
+
     fprintf(stderr, "gui-hid-route: profile=modern-trollstore purpose=gesture result=targeted-route-required\n");
     return NO;
 }
@@ -1117,7 +1129,7 @@ static void *CloudCodeOpenSpringBoardServices(void)
     ]);
 }
 
-static NSString *CloudCodeFrontmostBundleID(void)
+NSString *CloudCodeFrontmostBundleID(void)
 {
     void *handle = CloudCodeOpenSpringBoardServices();
     CloudCodeCopyFrontmostBundleIDFn copyBundleID = (CloudCodeCopyFrontmostBundleIDFn)CloudCodeResolve(handle, "SBSCopyFrontmostApplicationDisplayIdentifier");

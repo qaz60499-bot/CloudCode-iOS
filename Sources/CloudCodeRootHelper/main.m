@@ -168,14 +168,7 @@ static void *SpringBoardServicesHandle(void)
 
 static NSString *FrontmostApplicationBundleID(void)
 {
-    void *handle = SpringBoardServicesHandle();
-    if (!handle) { return nil; }
-    CloudCodeCopyFrontmostApplicationDisplayIdentifierFn copyFrontmost =
-        (CloudCodeCopyFrontmostApplicationDisplayIdentifierFn)dlsym(handle, "SBSCopyFrontmostApplicationDisplayIdentifier");
-    if (!copyFrontmost) { return nil; }
-    CFStringRef raw = copyFrontmost();
-    if (!raw) { return nil; }
-    return CFBridgingRelease(raw);
+    return CloudCodeFrontmostBundleID();
 }
 
 static NSString *BundlePathForIdentifierFromFilesystem(NSString *bundleID);

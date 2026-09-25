@@ -14,6 +14,7 @@ int CloudCodeGUIScroll(double deltaX, double deltaY);
 int CloudCodeGUINavigateBack(NSString *strategy);
 int CloudCodeGUIFocusedTextInputJSON(void);
 int CloudCodeGUITypeBase64(NSString *base64Text);
+NSString * _Nullable CloudCodeFrontmostBundleID(void);
 /// Compatibility no-op kept for one-shot exit paths. Production AX/OCR perception never mutates
 /// the system-wide Accessibility Automation bit or AXManualAccessibility.
 void CloudCodeGUIRestoreAXAutomationForProcessExit(void);
