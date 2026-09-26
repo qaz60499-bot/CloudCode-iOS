@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>pwd</key>
+    <array><string>shell.framework/shell</string><string>pwd_main</string><string>LP</string><string>no</string></array>
+    <key>echo</key>
+    <array><string>shell.framework/shell</string><string>echo_main</string><string>n</string><string>no</string></array>
+    <key>find</key>
+    <array><string>shell.framework/shell</string><string>find_main</string><string>EHLPXdf:sx</string><string>directory</string></array>
+
+    <key>ls</key>
+    <array><string>files.framework/files</string><string>ls_main</string><string>1@ABCFGHLOPRSTUWabcdefghiklmnopqrstuvwx</string><string>file</string></array>
+    <key>cp</key>
+    <array><string>files.framework/files</string><string>cp_main</string><string>cHLPRXafinprv</string><string>file</string></array>
+    <key>mv</key>
+    <array><string>files.framework/files</string><string>mv_main</string><string>finv</string><string>file</string></array>
+    <key>mkdir</key>
+    <array><string>files.framework/files</string><string>mkdir_main</string><string>m:pv</string><string>directory</string></array>
+    <key>rm</key>
+    <array><string>files.framework/files</string><string>rm_main</string><string>dfiPRrvW</string><string>file</string></array>
+    <key>stat</key>
+    <array><string>files.framework/files</string><string>stat_main</string><string>f:FlLnqrst:x</string><string>file</string></array>
+
+    <key>cat</key>
+    <array><string>text.framework/text</string><string>cat_main</string><string>benstuv</string><string>file</string></array>
+    <key>grep</key>
+    <array><string>text.framework/text</string><string>grep_main</string><string>0123456789A:B:C:D:EFGHIJMLOPSRUVZabcd:e:f:hilm:nopqrsuvwxXy</string><string>file</string></array>
+    <key>head</key>
+    <array><string>text.framework/text</string><string>head_main</string><string>n:c:</string><string>file</string></array>
+    <key>tail</key>
+    <array><string>text.framework/text</string><string>tail_main</string><string>Fb:c:fn:qr</string><string>file</string></array>
+    <key>wc</key>
+    <array><string>text.framework/text</string><string>wc_main</string><string>dhiflM:N:nsuw</string><string>file</string></array>
+    <key>sort</key>
+    <array><string>text.framework/text</string><string>sort_main</string><string>bcCdfghik:Mmno:RrsS:t:T:uVz</string><string>file</string></array>
+    <key>uniq</key>
+    <array><string>text.framework/text</string><string>uniq_main</string><string>cdif:s:u</string><string>file</string></array>
+</dict>
+</plist>

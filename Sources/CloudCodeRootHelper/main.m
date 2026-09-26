@@ -1,22 +1,85 @@
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
+#import <dispatch/dispatch.h>
 #import <errno.h>
 #import <fcntl.h>
 #import <poll.h>
+#import <pthread.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <stdio.h>
 #import <unistd.h>
 #import <signal.h>
 #import <spawn.h>
+#import <sys/wait.h>
+#import <sys/stat.h>
+#import <time.h>
 #import <stdlib.h>
+#import <string.h>
 #import "GUIAutomation.h"
+#import "PCControlServer.h"
 
 #define CLOUDCODE_PROC_PATH_MAX 4096
 #define CLOUDCODE_ROOT_HELPER_PROTOCOL_MARKER "cloudcode-root-helper-protocol=1"
 typedef int (*CloudCodeProcListAllPidsFn)(void *, int);
 typedef int (*CloudCodeProcPidPathFn)(int, void *, uint32_t);
 extern char **environ;
+extern void *objc_autoreleasePoolPush(void);
+
+typedef struct {
+    uint64_t milliseconds;
+} CloudCodeOneShotWatchdogContext;
+
+static void *CloudCodeOneShotWatchdogMain(void *rawContext)
+{
+    CloudCodeOneShotWatchdogContext *context = (CloudCodeOneShotWatchdogContext *)rawContext;
+    uint64_t milliseconds = context ? context->milliseconds : 0;
+    if (context) { free(context); }
+    if (milliseconds == 0) { return NULL; }
+    struct timespec delay = {
+        .tv_sec = (time_t)(milliseconds / 1000),
+        .tv_nsec = (long)((milliseconds % 1000) * 1000000ULL)
+    };
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+    static const char marker[] = "cloudcode-root-helper: self-watchdog deadline reached; restoring AX automation lease and hard-exiting one-shot helper\n";
+    (void)write(STDERR_FILENO, marker, sizeof(marker) - 1);
+    CloudCodeGUIRestoreAXAutomationForProcessExit();
+    _exit(124);
+}
+
+static void CloudCodeArmOneShotWatchdog(int argc, const char *argv[])
+{
+    static const char prefix[] = "--cloudcode-watchdog-ms=";
+    uint64_t milliseconds = 0;
+    for (int index = 2; index < argc; index++) {
+        const char *argument = argv[index];
+        if (!argument || strncmp(argument, prefix, sizeof(prefix) - 1) != 0) { continue; }
+        unsigned long long parsed = strtoull(argument + sizeof(prefix) - 1, NULL, 10);
+        if (parsed >= 100 && parsed <= 120000) { milliseconds = (uint64_t)parsed; }
+        break;
+    }
+    if (milliseconds == 0) { return; }
+    CloudCodeOneShotWatchdogContext *context = calloc(1, sizeof(*context));
+    if (!context) { return; }
+    context->milliseconds = milliseconds;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, CloudCodeOneShotWatchdogMain, context) == 0) {
+        (void)pthread_detach(thread);
+    } else {
+        free(context);
+    }
+}
+
+static __attribute__((noreturn)) void CloudCodeExitOneShot(int code)
+{
+    CloudCodeGUIRestoreAXAutomationForProcessExit();
+    // stdout/stderr are switched to unbuffered mode at process entry before any helper I/O occurs.
+    // Build 108 real-device evidence showed that even an explicit stdout/stderr flush could wedge after a
+    // private framework had already produced the final observable result, turning successful app
+    // launch, screenshot and background-assert handshakes into false parent timeouts. Do not enter
+    // stdio teardown/flush paths here: every write is already delivered synchronously to the bridge.
+    _exit(code);
+}
 
 static NSString *NormalizePath(NSString *path)
 {
@@ -86,6 +149,8 @@ static id Workspace(void)
 }
 
 typedef CFStringRef (*CloudCodeCopyFrontmostApplicationDisplayIdentifierFn)(void);
+typedef CFDictionaryRef (*CloudCodeCopyInfoForApplicationWithProcessIDFn)(pid_t);
+typedef uint32_t (*CloudCodeLaunchApplicationWithIdentifierAndLaunchOptionsFn)(NSString *, NSDictionary *, BOOL);
 
 static void *SpringBoardServicesHandle(void)
 {
@@ -103,14 +168,380 @@ static void *SpringBoardServicesHandle(void)
 
 static NSString *FrontmostApplicationBundleID(void)
 {
+    return CloudCodeFrontmostBundleID();
+}
+
+static NSString *BundlePathForIdentifierFromFilesystem(NSString *bundleID);
+static id ApplicationProxy(NSString *bundleID);
+static CloudCodeProcPidPathFn ProcPidPath(void);
+static NSArray<NSNumber *> *ProcessesUnderBundlePath(NSString *bundlePath);
+
+static NSString *CanonicalVarProcessPath(NSString *path)
+{
+    NSString *normalized = NormalizePath(path);
+    if ([normalized hasPrefix:@"/private/var/"]) {
+        return [normalized substringFromIndex:@"/private".length];
+    }
+    return normalized;
+}
+
+static pid_t ApplicationPIDForBundleIDViaBoardServices(NSString *bundleID)
+{
+    if (bundleID.length == 0) { return 0; }
+    NSArray<NSArray<NSString *> *> *candidates = @[
+        @[@"FBSSystemService", @"/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices"],
+        @[@"BKSSystemService", @"/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices"]
+    ];
+    for (NSArray<NSString *> *candidate in candidates) {
+        NSString *className = candidate[0];
+        NSString *frameworkPath = candidate[1];
+        dlopen(frameworkPath.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL);
+        Class cls = NSClassFromString(className);
+        if (!cls) { continue; }
+        id service = nil;
+        SEL sharedSelector = NSSelectorFromString(@"sharedService");
+        if ([cls respondsToSelector:sharedSelector]) {
+            id (*sendObject)(id, SEL) = (void *)objc_msgSend;
+            service = sendObject(cls, sharedSelector);
+        }
+        if (!service) { service = [[cls alloc] init]; }
+        SEL pidSelector = NSSelectorFromString(@"pidForApplication:");
+        if (!service || ![service respondsToSelector:pidSelector]) { continue; }
+        int (*sendPID)(id, SEL, id) = (void *)objc_msgSend;
+        int pid = sendPID(service, pidSelector, bundleID);
+        if (pid > 0) { return (pid_t)pid; }
+    }
+    return 0;
+}
+
+static pid_t ApplicationPIDForBundleIDViaProcessInspection(NSString *bundleID)
+{
+    NSString *bundlePath = BundlePathForIdentifierFromFilesystem(bundleID);
+    if (bundlePath.length == 0) { return 0; }
+    NSArray<NSNumber *> *candidates = ProcessesUnderBundlePath(bundlePath);
+    if (candidates.count == 0) { return 0; }
+
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"Info.plist"]];
+    NSString *executable = [info[@"CFBundleExecutable"] isKindOfClass:NSString.class] ? info[@"CFBundleExecutable"] : nil;
+    NSString *expectedPath = executable.length > 0
+        ? CanonicalVarProcessPath([bundlePath stringByAppendingPathComponent:executable])
+        : nil;
+    CloudCodeProcPidPathFn pidPath = ProcPidPath();
+    if (expectedPath.length > 0 && pidPath) {
+        for (NSNumber *value in candidates) {
+            pid_t pid = (pid_t)value.intValue;
+            if (pid <= 1) { continue; }
+            char pathBuffer[CLOUDCODE_PROC_PATH_MAX] = {0};
+            int length = pidPath(pid, pathBuffer, sizeof(pathBuffer));
+            if (length <= 0) { continue; }
+            NSString *processPath = CanonicalVarProcessPath([NSString stringWithUTF8String:pathBuffer]);
+            if ([processPath isEqualToString:expectedPath]) { return pid; }
+        }
+    }
+    return candidates.count == 1 ? (pid_t)candidates.firstObject.intValue : 0;
+}
+
+static BOOL ApplicationPIDIsFrontmostViaSpringBoardInfo(pid_t pid)
+{
+    if (pid <= 1) { return NO; }
     void *handle = SpringBoardServicesHandle();
-    if (!handle) { return nil; }
-    CloudCodeCopyFrontmostApplicationDisplayIdentifierFn copyFrontmost =
-        (CloudCodeCopyFrontmostApplicationDisplayIdentifierFn)dlsym(handle, "SBSCopyFrontmostApplicationDisplayIdentifier");
-    if (!copyFrontmost) { return nil; }
-    CFStringRef raw = copyFrontmost();
-    if (!raw) { return nil; }
-    return CFBridgingRelease(raw);
+    if (!handle) { return NO; }
+    CloudCodeCopyInfoForApplicationWithProcessIDFn copyInfo =
+        (CloudCodeCopyInfoForApplicationWithProcessIDFn)dlsym(handle, "SBSCopyInfoForApplicationWithProcessID");
+    if (!copyInfo) { return NO; }
+
+    CFDictionaryRef raw = NULL;
+    @try {
+        raw = copyInfo(pid);
+    } @catch (__unused NSException *exception) {
+        raw = NULL;
+    }
+    if (!raw) { return NO; }
+    NSDictionary *info = CFBridgingRelease(raw);
+    id value = info[@"BKSApplicationStateAppIsFrontmost"];
+    return [value respondsToSelector:@selector(boolValue)] && [value boolValue];
+}
+
+static BOOL ApplicationPIDHasForegroundRunningBoardState(pid_t expectedPID, NSString *bundleID)
+{
+    if (expectedPID <= 1 || bundleID.length == 0) { return NO; }
+    for (NSString *path in @[
+        @"/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices",
+        @"/rootfs/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices"
+    ]) {
+        if (dlopen(path.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL)) { break; }
+    }
+
+    Class predicateClass = NSClassFromString(@"RBSProcessPredicate");
+    Class handleClass = NSClassFromString(@"RBSProcessHandle");
+    SEL predicateSelector = NSSelectorFromString(@"predicateMatchingBundleIdentifier:");
+    SEL handleSelector = NSSelectorFromString(@"handleForPredicate:error:");
+    if (!predicateClass || !handleClass || ![predicateClass respondsToSelector:predicateSelector] || ![handleClass respondsToSelector:handleSelector]) {
+        return NO;
+    }
+
+    id predicate = nil;
+    id handle = nil;
+    NSError *error = nil;
+    @try {
+        id (*sendPredicate)(id, SEL, id) = (void *)objc_msgSend;
+        predicate = sendPredicate(predicateClass, predicateSelector, bundleID);
+        if (predicate) {
+            id (*sendHandle)(id, SEL, id, NSError **) = (void *)objc_msgSend;
+            handle = sendHandle(handleClass, handleSelector, predicate, &error);
+        }
+    } @catch (__unused NSException *exception) {
+        handle = nil;
+    }
+    if (!handle || error) { return NO; }
+
+    SEL pidSelector = NSSelectorFromString(@"rbs_pid");
+    if (![handle respondsToSelector:pidSelector]) { return NO; }
+    pid_t (*sendPID)(id, SEL) = (void *)objc_msgSend;
+    pid_t handlePID = 0;
+    @try { handlePID = sendPID(handle, pidSelector); }
+    @catch (__unused NSException *exception) { handlePID = 0; }
+    if (handlePID != expectedPID) { return NO; }
+
+    SEL currentStateSelector = NSSelectorFromString(@"currentState");
+    if (![handle respondsToSelector:currentStateSelector]) { return NO; }
+    id (*sendObject)(id, SEL) = (void *)objc_msgSend;
+    id state = nil;
+    @try { state = sendObject(handle, currentStateSelector); }
+    @catch (__unused NSException *exception) { state = nil; }
+    if (!state) { return NO; }
+
+    SEL runningSelector = NSSelectorFromString(@"isRunning");
+    SEL endowmentsSelector = NSSelectorFromString(@"endowmentNamespaces");
+    if (![state respondsToSelector:runningSelector] || ![state respondsToSelector:endowmentsSelector]) { return NO; }
+    BOOL (*sendBool)(id, SEL) = (void *)objc_msgSend;
+    BOOL running = NO;
+    id endowments = nil;
+    @try {
+        running = sendBool(state, runningSelector);
+        endowments = sendObject(state, endowmentsSelector);
+    } @catch (__unused NSException *exception) {
+        running = NO;
+        endowments = nil;
+    }
+    if (!running || ![endowments respondsToSelector:@selector(containsObject:)]) { return NO; }
+    return [endowments containsObject:@"com.apple.frontboard.visibility"];
+}
+
+static BOOL ApplicationHasForegroundBoardState(NSString *bundleID)
+{
+    pid_t boardPID = ApplicationPIDForBundleIDViaBoardServices(bundleID);
+    pid_t inspectedPID = ApplicationPIDForBundleIDViaProcessInspection(bundleID);
+    NSMutableOrderedSet<NSNumber *> *candidatePIDs = [NSMutableOrderedSet orderedSet];
+    if (boardPID > 0) { [candidatePIDs addObject:@(boardPID)]; }
+    if (inspectedPID > 0) { [candidatePIDs addObject:@(inspectedPID)]; }
+    if (candidatePIDs.count == 0) { return NO; }
+
+    // SpringBoardServices already exposes exact per-process frontmost state through the same
+    // application-info dictionary used by current device tooling. Prefer that bounded boolean when
+    // available before falling back to the legacy BKS monitor below. A live process alone never
+    // counts as foreground proof.
+    for (NSNumber *value in candidatePIDs) {
+        pid_t pid = (pid_t)value.intValue;
+        if (ApplicationPIDIsFrontmostViaSpringBoardInfo(pid)) {
+            return YES;
+        }
+        // Root-persona SBS/BKS state is empty on the iOS 16.6 TrollStore device even when
+        // SpringBoard has already granted the exact target ForegroundFocal visibility. RunningBoard
+        // exposes that state behind com.apple.runningboard.process-state. Require both the exact
+        // bundle's PID and the FrontBoard visibility endowment so a merely alive/background process
+        // can never satisfy the foreground postcondition.
+        if (ApplicationPIDHasForegroundRunningBoardState(pid, bundleID)) {
+            return YES;
+        }
+    }
+
+    // BKSApplicationStateMonitor is declared by BackBoardServices on the iOS versions where this
+    // legacy state query exists. Load it explicitly instead of assuming AssertionServices happens to
+    // pull the class in as a transitive dependency.
+    for (NSString *path in @[
+        @"/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices",
+        @"/rootfs/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices"
+    ]) {
+        if (dlopen(path.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL)) { break; }
+    }
+    for (NSString *path in @[
+        @"/System/Library/PrivateFrameworks/AssertionServices.framework/AssertionServices",
+        @"/rootfs/System/Library/PrivateFrameworks/AssertionServices.framework/AssertionServices"
+    ]) {
+        if (dlopen(path.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL)) { break; }
+    }
+    Class monitorClass = NSClassFromString(@"BKSApplicationStateMonitor");
+    SEL stateSelector = NSSelectorFromString(@"mostElevatedApplicationStateForPID:");
+    if (!monitorClass || ![monitorClass instancesRespondToSelector:stateSelector]) { return NO; }
+    id monitor = [[monitorClass alloc] init];
+    if (!monitor || ![monitor respondsToSelector:stateSelector]) { return NO; }
+    uint32_t (*sendState)(id, SEL, pid_t) = (void *)objc_msgSend;
+    const uint32_t foregroundRunning = (1u << 3);
+    const uint32_t foregroundRunningObscured = (1u << 5);
+    BOOL foreground = NO;
+    for (NSNumber *value in candidatePIDs) {
+        uint32_t state = 0;
+        @try {
+            state = sendState(monitor, stateSelector, (pid_t)value.intValue);
+        } @catch (__unused NSException *exception) {
+            state = 0;
+        }
+        if ((state & (foregroundRunning | foregroundRunningObscured)) != 0) {
+            foreground = YES;
+            break;
+        }
+    }
+    SEL invalidateSelector = NSSelectorFromString(@"invalidate");
+    if ([monitor respondsToSelector:invalidateSelector]) {
+        void (*sendVoid)(id, SEL) = (void *)objc_msgSend;
+        sendVoid(monitor, invalidateSelector);
+    }
+    // Only the documented BKS foreground-running bits are accepted. A merely alive/background
+    // process is not sufficient proof that the Provider UI owns the foreground.
+    return foreground;
+}
+
+static int WriteForegroundDiagnosticsFile(NSString *bundleID)
+{
+    if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0 || bundleID.length > 255) { return 10; }
+    NSString *bundlePath = BundlePathForIdentifierFromFilesystem(bundleID) ?: @"";
+    pid_t boardPID = ApplicationPIDForBundleIDViaBoardServices(bundleID);
+    pid_t inspectedPID = ApplicationPIDForBundleIDViaProcessInspection(bundleID);
+    NSArray<NSNumber *> *bundlePIDs = bundlePath.length > 0 ? ProcessesUnderBundlePath(bundlePath) : @[];
+    NSMutableOrderedSet<NSNumber *> *candidatePIDs = [NSMutableOrderedSet orderedSetWithArray:bundlePIDs];
+    if (boardPID > 0) { [candidatePIDs addObject:@(boardPID)]; }
+    if (inspectedPID > 0) { [candidatePIDs addObject:@(inspectedPID)]; }
+
+    CloudCodeProcPidPathFn pidPath = ProcPidPath();
+    NSMutableArray *processes = [NSMutableArray array];
+    for (NSNumber *value in candidatePIDs) {
+        pid_t pid = (pid_t)value.intValue;
+        NSString *path = @"";
+        if (pidPath && pid > 1) {
+            char pathBuffer[CLOUDCODE_PROC_PATH_MAX] = {0};
+            int length = pidPath(pid, pathBuffer, sizeof(pathBuffer));
+            if (length > 0) { path = CanonicalVarProcessPath([NSString stringWithUTF8String:pathBuffer]) ?: @""; }
+        }
+        [processes addObject:@{
+            @"pid": @(pid),
+            @"path": path,
+            @"sbsFrontmost": @(ApplicationPIDIsFrontmostViaSpringBoardInfo(pid))
+        }];
+    }
+
+    for (NSString *path in @[
+        @"/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices",
+        @"/rootfs/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices",
+        @"/System/Library/PrivateFrameworks/AssertionServices.framework/AssertionServices",
+        @"/rootfs/System/Library/PrivateFrameworks/AssertionServices.framework/AssertionServices"
+    ]) {
+        (void)dlopen(path.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL);
+    }
+    Class monitorClass = NSClassFromString(@"BKSApplicationStateMonitor");
+    SEL stateSelector = NSSelectorFromString(@"mostElevatedApplicationStateForPID:");
+    id monitor = monitorClass && [monitorClass instancesRespondToSelector:stateSelector] ? [[monitorClass alloc] init] : nil;
+    NSMutableArray *states = [NSMutableArray array];
+    if (monitor && [monitor respondsToSelector:stateSelector]) {
+        uint32_t (*sendState)(id, SEL, pid_t) = (void *)objc_msgSend;
+        for (NSNumber *value in candidatePIDs) {
+            uint32_t state = 0;
+            @try { state = sendState(monitor, stateSelector, (pid_t)value.intValue); }
+            @catch (__unused NSException *exception) { state = 0; }
+            [states addObject:@{
+                @"pid": value,
+                @"state": @(state),
+                @"foregroundBits": @((state & ((1u << 3) | (1u << 5))) != 0)
+            }];
+        }
+        SEL invalidateSelector = NSSelectorFromString(@"invalidate");
+        if ([monitor respondsToSelector:invalidateSelector]) {
+            void (*sendVoid)(id, SEL) = (void *)objc_msgSend;
+            sendVoid(monitor, invalidateSelector);
+        }
+    }
+
+    for (NSString *path in @[
+        @"/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices",
+        @"/rootfs/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices"
+    ]) {
+        if (dlopen(path.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL)) { break; }
+    }
+    Class predicateClass = NSClassFromString(@"RBSProcessPredicate");
+    Class handleClass = NSClassFromString(@"RBSProcessHandle");
+    SEL predicateSelector = NSSelectorFromString(@"predicateMatchingBundleIdentifier:");
+    SEL handleSelector = NSSelectorFromString(@"handleForPredicate:error:");
+    id predicate = nil;
+    id rbsHandle = nil;
+    NSError *rbsError = nil;
+    @try {
+        if (predicateClass && [predicateClass respondsToSelector:predicateSelector]) {
+            id (*sendPredicate)(id, SEL, id) = (void *)objc_msgSend;
+            predicate = sendPredicate(predicateClass, predicateSelector, bundleID);
+        }
+        if (predicate && handleClass && [handleClass respondsToSelector:handleSelector]) {
+            id (*sendHandle)(id, SEL, id, NSError **) = (void *)objc_msgSend;
+            rbsHandle = sendHandle(handleClass, handleSelector, predicate, &rbsError);
+        }
+    } @catch (NSException *exception) {
+        rbsError = [NSError errorWithDomain:@"CloudCode.ForegroundDiagnostics" code:1 userInfo:@{
+            NSLocalizedDescriptionKey: exception.reason ?: exception.name ?: @"RunningBoard lookup exception"
+        }];
+        rbsHandle = nil;
+    }
+    pid_t rbsPID = 0;
+    id rbsState = nil;
+    if (rbsHandle) {
+        SEL pidSelector = NSSelectorFromString(@"rbs_pid");
+        if ([rbsHandle respondsToSelector:pidSelector]) {
+            pid_t (*sendPID)(id, SEL) = (void *)objc_msgSend;
+            @try { rbsPID = sendPID(rbsHandle, pidSelector); }
+            @catch (__unused NSException *exception) { rbsPID = 0; }
+        }
+        SEL currentStateSelector = NSSelectorFromString(@"currentState");
+        if ([rbsHandle respondsToSelector:currentStateSelector]) {
+            id (*sendObject)(id, SEL) = (void *)objc_msgSend;
+            @try { rbsState = sendObject(rbsHandle, currentStateSelector); }
+            @catch (__unused NSException *exception) { rbsState = nil; }
+        }
+    }
+    NSMutableDictionary *rbsStateSelectors = [NSMutableDictionary dictionary];
+    for (NSString *selectorName in @[@"isRunning", @"taskState", @"role", @"effectiveRole", @"visibility", @"activationState"]) {
+        rbsStateSelectors[selectorName] = @(rbsState && [rbsState respondsToSelector:NSSelectorFromString(selectorName)]);
+    }
+    NSDictionary *runningBoard = @{
+        @"predicateClassAvailable": @(predicateClass != nil),
+        @"predicateSelectorAvailable": @(predicateClass && [predicateClass respondsToSelector:predicateSelector]),
+        @"handleClassAvailable": @(handleClass != nil),
+        @"handleSelectorAvailable": @(handleClass && [handleClass respondsToSelector:handleSelector]),
+        @"handleAvailable": @(rbsHandle != nil),
+        @"pid": @(rbsPID),
+        @"handleDescription": rbsHandle ? ([rbsHandle description] ?: @"") : @"",
+        @"stateClass": rbsState ? (NSStringFromClass([rbsState class]) ?: @"") : @"",
+        @"stateDescription": rbsState ? ([rbsState description] ?: @"") : @"",
+        @"stateSelectors": rbsStateSelectors,
+        @"error": rbsError.localizedDescription ?: @""
+    };
+
+    NSDictionary *payload = @{
+        @"bundleID": bundleID,
+        @"frontmostSBS": FrontmostApplicationBundleID() ?: @"",
+        @"bundlePath": bundlePath,
+        @"boardPID": @(boardPID),
+        @"inspectedPID": @(inspectedPID),
+        @"processes": processes,
+        @"monitorClassAvailable": @(monitorClass != nil),
+        @"stateSelectorAvailable": @(monitorClass && [monitorClass instancesRespondToSelector:stateSelector]),
+        @"states": states,
+        @"runningBoard": runningBoard
+    };
+    NSError *jsonError = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:NSJSONWritingPrettyPrinted error:&jsonError];
+    if (!data || jsonError) { return 41; }
+    NSString *outputPath = @"/var/mobile/Media/Downloads/CloudCode-Foreground-Diagnostics.json";
+    NSError *writeError = nil;
+    if (![data writeToFile:outputPath options:NSDataWritingAtomic error:&writeError]) { return 41; }
+    return 0;
 }
 
 static BOOL WaitForFrontmostApplication(NSString *bundleID, useconds_t timeoutMicroseconds)
@@ -125,6 +556,10 @@ static BOOL WaitForFrontmostApplication(NSString *bundleID, useconds_t timeoutMi
         usleep(interval);
         elapsed += interval;
     } while (YES);
+    if (ApplicationHasForegroundBoardState(bundleID)) {
+        fprintf(stderr, "frontmost: SBS unavailable/stale; AssertionServices foreground state verified target pid\n");
+        return YES;
+    }
     return NO;
 }
 
@@ -134,15 +569,69 @@ static int VerifyFrontmostApplication(NSString *bundleID)
     return WaitForFrontmostApplication(bundleID, 1200000) ? 0 : 80;
 }
 
-static void LoadBoardFramework(NSString *frameworkName)
+static void *LoadBoardFrameworkHandle(NSString *frameworkName)
 {
-    if (frameworkName.length == 0) { return; }
+    if (frameworkName.length == 0) { return NULL; }
     NSString *binary = [NSString stringWithFormat:@"%@.framework/%@", frameworkName, frameworkName];
     for (NSString *root in @[@"/System/Library/PrivateFrameworks", @"/rootfs/System/Library/PrivateFrameworks"]) {
         NSString *path = [root stringByAppendingPathComponent:binary];
         void *handle = dlopen(path.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL);
-        if (handle) { return; }
+        if (handle) { return handle; }
     }
+    return NULL;
+}
+
+static void LoadBoardFramework(NSString *frameworkName)
+{
+    (void)LoadBoardFrameworkHandle(frameworkName);
+}
+
+static NSString *CloudCodeBoardOptionKey(NSString *frameworkName, NSString *symbolName)
+{
+    void *handle = LoadBoardFrameworkHandle(frameworkName);
+    if (!handle || symbolName.length == 0) { return nil; }
+    void *symbol = dlsym(handle, symbolName.UTF8String);
+    if (!symbol) { return nil; }
+    NSString * __unsafe_unretained *value = (NSString * __unsafe_unretained *)symbol;
+    NSString *key = value ? *value : nil;
+    return [key isKindOfClass:NSString.class] && key.length > 0 ? key : nil;
+}
+
+static NSMutableDictionary *CloudCodeBoardLaunchOptions(NSString *bundleID, NSString *frameworkName)
+{
+    NSMutableDictionary *options = [NSMutableDictionary dictionary];
+    NSString *prefix = [frameworkName isEqualToString:@"FrontBoardServices"] ? @"FBS" : @"BKS";
+    for (NSString *suffix in @[@"OpenApplicationOptionKeyUnlockDevice", @"OpenApplicationOptionKeyPromptUnlockDevice"]) {
+        NSString *key = CloudCodeBoardOptionKey(frameworkName, [prefix stringByAppendingString:suffix]);
+        if (key.length > 0) { options[key] = @YES; }
+    }
+
+    if ([frameworkName isEqualToString:@"FrontBoardServices"]) {
+        id proxy = ApplicationProxy(bundleID);
+        NSNumber *sequence = nil;
+        id cacheGUID = nil;
+        @try {
+            id rawSequence = [proxy valueForKey:@"sequenceNumber"];
+            if ([rawSequence isKindOfClass:NSNumber.class]) { sequence = rawSequence; }
+            cacheGUID = [proxy valueForKey:@"cacheGUID"];
+        } @catch (__unused NSException *exception) {
+            sequence = nil;
+            cacheGUID = nil;
+        }
+        NSString *sequenceKey = CloudCodeBoardOptionKey(frameworkName, @"FBSOpenApplicationOptionKeyLSSequenceNumber");
+        NSString *cacheGUIDKey = CloudCodeBoardOptionKey(frameworkName, @"FBSOpenApplicationOptionKeyLSCacheGUID");
+        if (sequence && sequenceKey.length > 0) { options[sequenceKey] = sequence; }
+        NSString *cacheGUIDString = nil;
+        if ([cacheGUID isKindOfClass:NSString.class]) {
+            cacheGUIDString = cacheGUID;
+        } else if ([cacheGUID respondsToSelector:NSSelectorFromString(@"UUIDString")]) {
+            id (*sendObject)(id, SEL) = (void *)objc_msgSend;
+            id value = sendObject(cacheGUID, NSSelectorFromString(@"UUIDString"));
+            if ([value isKindOfClass:NSString.class]) { cacheGUIDString = value; }
+        }
+        if (cacheGUIDString.length > 0 && cacheGUIDKey.length > 0) { options[cacheGUIDKey] = cacheGUIDString; }
+    }
+    return options;
 }
 
 static BOOL LaunchViaBoardSystemService(NSString *bundleID, NSString *className, NSString *frameworkName, NSString **diagnostic)
@@ -154,38 +643,43 @@ static BOOL LaunchViaBoardSystemService(NSString *bundleID, NSString *className,
         return NO;
     }
 
-    id service = nil;
-    SEL sharedSelector = NSSelectorFromString(@"sharedService");
-    if ([cls respondsToSelector:sharedSelector]) {
-        id (*sendObject)(id, SEL) = (void *)objc_msgSend;
-        service = sendObject(cls, sharedSelector);
+    id service = [[cls alloc] init];
+    if (!service) {
+        SEL sharedSelector = NSSelectorFromString(@"sharedService");
+        if ([cls respondsToSelector:sharedSelector]) {
+            id (*sendObject)(id, SEL) = (void *)objc_msgSend;
+            service = sendObject(cls, sharedSelector);
+        }
     }
-    if (!service) { service = [[cls alloc] init]; }
     if (!service) {
         if (diagnostic) { *diagnostic = [NSString stringWithFormat:@"%@ service unavailable", className]; }
         return NO;
     }
 
+    NSMutableDictionary *options = CloudCodeBoardLaunchOptions(bundleID, frameworkName);
     __block NSError *reportedError = nil;
+    __block BOOL completionCalled = NO;
+    dispatch_semaphore_t completionSemaphore = dispatch_semaphore_create(0);
     void (^completion)(NSError *) = ^(NSError *error) {
         reportedError = error;
+        completionCalled = YES;
+        dispatch_semaphore_signal(completionSemaphore);
     };
     @try {
+        SEL createPortSelector = NSSelectorFromString(@"createClientPort");
+        SEL clientSelector = NSSelectorFromString(@"openApplication:options:clientPort:withResult:");
         SEL simpleSelector = NSSelectorFromString(@"openApplication:options:withResult:");
-        if ([service respondsToSelector:simpleSelector]) {
-            void (*sendOpen)(id, SEL, id, id, void (^)(NSError *)) = (void *)objc_msgSend;
-            sendOpen(service, simpleSelector, bundleID, @{}, completion);
-        } else {
-            SEL createPortSelector = NSSelectorFromString(@"createClientPort");
-            SEL clientSelector = NSSelectorFromString(@"openApplication:options:clientPort:withResult:");
-            if (![service respondsToSelector:createPortSelector] || ![service respondsToSelector:clientSelector]) {
-                if (diagnostic) { *diagnostic = [NSString stringWithFormat:@"%@ openApplication selector unavailable", className]; }
-                return NO;
-            }
+        if ([service respondsToSelector:createPortSelector] && [service respondsToSelector:clientSelector]) {
             unsigned int (*sendPort)(id, SEL) = (void *)objc_msgSend;
             unsigned int port = sendPort(service, createPortSelector);
             void (*sendOpenWithPort)(id, SEL, id, id, unsigned int, void (^)(NSError *)) = (void *)objc_msgSend;
-            sendOpenWithPort(service, clientSelector, bundleID, @{}, port, completion);
+            sendOpenWithPort(service, clientSelector, bundleID, options, port, completion);
+        } else if ([service respondsToSelector:simpleSelector]) {
+            void (*sendOpen)(id, SEL, id, id, void (^)(NSError *)) = (void *)objc_msgSend;
+            sendOpen(service, simpleSelector, bundleID, options, completion);
+        } else {
+            if (diagnostic) { *diagnostic = [NSString stringWithFormat:@"%@ openApplication selector unavailable", className]; }
+            return NO;
         }
     } @catch (NSException *exception) {
         if (diagnostic) {
@@ -194,14 +688,29 @@ static BOOL LaunchViaBoardSystemService(NSString *bundleID, NSString *className,
         return NO;
     }
 
+    long completionWait = dispatch_semaphore_wait(
+        completionSemaphore,
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC))
+    );
+    BOOL completionObserved = completionWait == 0 || completionCalled;
+    if (completionObserved && reportedError) {
+        if (diagnostic) {
+            *diagnostic = [NSString stringWithFormat:@"%@ launch rejected: %@ options=%lu", className,
+                           reportedError.localizedDescription ?: @"error", (unsigned long)options.count];
+        }
+        return NO;
+    }
+
     if (WaitForFrontmostApplication(bundleID, 1500000)) {
-        if (diagnostic) { *diagnostic = [NSString stringWithFormat:@"%@ foreground verification passed", className]; }
+        if (diagnostic) {
+            *diagnostic = [NSString stringWithFormat:@"%@ foreground verification passed completion=%s options=%lu",
+                           className, completionObserved ? "observed" : "timeout", (unsigned long)options.count];
+        }
         return YES;
     }
     if (diagnostic) {
-        *diagnostic = reportedError
-            ? [NSString stringWithFormat:@"%@ launch rejected: %@", className, reportedError.localizedDescription ?: @"error"]
-            : [NSString stringWithFormat:@"%@ did not establish target foreground", className];
+        *diagnostic = [NSString stringWithFormat:@"%@ did not establish target foreground completion=%s options=%lu",
+                       className, completionObserved ? "observed" : "timeout", (unsigned long)options.count];
     }
     return NO;
 }
@@ -248,10 +757,54 @@ static NSArray *InstalledApplicationProxies(id workspace, NSString **backend)
 }
 
 static BOOL ApplicationIsInstalled(id workspace, NSString *bundleID, BOOL *known);
+static id ApplicationProxy(NSString *bundleID);
+
+static NSString *BundlePathForIdentifierFromFilesystem(NSString *bundleID)
+{
+    if (bundleID.length == 0 || bundleID.length > 255) { return nil; }
+    NSString *bundleRoot = @"/var/containers/Bundle/Application";
+    NSArray<NSString *> *containers = [NSFileManager.defaultManager contentsOfDirectoryAtPath:bundleRoot error:nil] ?: @[];
+    for (NSString *containerName in containers) {
+        NSString *containerPath = [bundleRoot stringByAppendingPathComponent:containerName];
+        if (!IsSafeBundleContainerPath(containerPath)) { continue; }
+        NSArray<NSString *> *entries = [NSFileManager.defaultManager contentsOfDirectoryAtPath:containerPath error:nil] ?: @[];
+        for (NSString *entry in entries) {
+            if (![entry.pathExtension.lowercaseString isEqualToString:@"app"]) { continue; }
+            NSString *bundlePath = [containerPath stringByAppendingPathComponent:entry];
+            if (!IsSafeBundlePath(bundlePath)) { continue; }
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"Info.plist"]];
+            NSString *candidate = [info[@"CFBundleIdentifier"] isKindOfClass:NSString.class] ? info[@"CFBundleIdentifier"] : nil;
+            if ([candidate isEqualToString:bundleID]) { return bundlePath.stringByStandardizingPath; }
+        }
+    }
+    return nil;
+}
 
 static NSString *InstalledBundlePath(id workspace, NSString *bundleID)
 {
-    if (!workspace || bundleID.length == 0) { return nil; }
+    NSString *filesystemPath = BundlePathForIdentifierFromFilesystem(bundleID);
+    if (filesystemPath.length > 0) { return filesystemPath; }
+    if (bundleID.length == 0) { return nil; }
+
+    // Exact Bundle-ID lookup is materially cheaper and more reliable than broad LaunchServices
+    // enumeration on the iOS 16.6 TrollStore device. Use it as the first fallback when the
+    // privileged filesystem view is temporarily incomplete (for example during container/index
+    // churn after install/update). This keeps App Provider installation checks exact without
+    // paying an allInstalledApplications watchdog.
+    id exactProxy = ApplicationProxy(bundleID);
+    if (exactProxy) {
+        NSString *candidate = SafeValue(exactProxy, @"applicationIdentifier");
+        if (![candidate isKindOfClass:NSString.class] || candidate.length == 0) {
+            candidate = SafeValue(exactProxy, @"bundleIdentifier");
+        }
+        if ([candidate isEqualToString:bundleID]) {
+            NSURL *bundleURL = SafeValue(exactProxy, @"bundleURL");
+            NSString *path = [bundleURL isKindOfClass:NSURL.class] ? bundleURL.path.stringByStandardizingPath : nil;
+            if (IsSafeBundlePath(path)) { return path; }
+        }
+    }
+
+    if (!workspace) { return nil; }
     NSArray *proxies = InstalledApplicationProxies(workspace, NULL);
     for (id proxy in proxies) {
         NSString *candidate = SafeValue(proxy, @"applicationIdentifier");
@@ -265,6 +818,115 @@ static NSString *InstalledBundlePath(id workspace, NSString *bundleID)
         return IsSafeBundlePath(path) ? path : nil;
     }
     return nil;
+}
+
+static BOOL IsSafeIPAPath(NSString *path)
+{
+    NSString *normalized = NormalizePath(path);
+    NSString *extension = normalized.pathExtension.lowercaseString;
+    if (!normalized || (![extension isEqualToString:@"ipa"] && ![extension isEqualToString:@"tipa"])) { return NO; }
+    if (!HasAnyPrefix(normalized, @[
+        @"/var/mobile/",
+        @"/private/var/mobile/"
+    ])) { return NO; }
+    NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:normalized error:nil];
+    if (![attributes[NSFileType] isEqualToString:NSFileTypeRegular]) { return NO; }
+    unsigned long long size = [attributes[NSFileSize] unsignedLongLongValue];
+    return size > 0 && size <= (4ULL * 1024ULL * 1024ULL * 1024ULL);
+}
+
+static NSString *TrollStoreHelperPathFromFilesystem(void)
+{
+    NSString *bundleRoot = @"/var/containers/Bundle/Application";
+    NSArray<NSString *> *containers = [NSFileManager.defaultManager contentsOfDirectoryAtPath:bundleRoot error:nil] ?: @[];
+    for (NSString *containerName in containers) {
+        NSString *containerPath = [bundleRoot stringByAppendingPathComponent:containerName];
+        if (!IsSafeBundleContainerPath(containerPath)) { continue; }
+        NSArray<NSString *> *entries = [NSFileManager.defaultManager contentsOfDirectoryAtPath:containerPath error:nil] ?: @[];
+        for (NSString *entry in entries) {
+            if (![entry.pathExtension.lowercaseString isEqualToString:@"app"]) { continue; }
+            NSString *bundlePath = [containerPath stringByAppendingPathComponent:entry];
+            if (!IsSafeBundlePath(bundlePath)) { continue; }
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"Info.plist"]];
+            NSString *bundleID = [info[@"CFBundleIdentifier"] isKindOfClass:NSString.class] ? [info[@"CFBundleIdentifier"] lowercaseString] : @"";
+            // Current TrollStore uses com.opa334.TrollStore; stealth builds keep that namespace and
+            // append a randomized TS suffix. Never execute an arbitrary app-provided helper merely
+            // because it happens to be named trollstorehelper.
+            if (![bundleID hasPrefix:@"com.opa334.trollstore"]) { continue; }
+            NSString *helper = [bundlePath stringByAppendingPathComponent:@"trollstorehelper"];
+            if ([NSFileManager.defaultManager fileExistsAtPath:helper] && [NSFileManager.defaultManager isExecutableFileAtPath:helper]) {
+                return helper.stringByStandardizingPath;
+            }
+        }
+    }
+    return nil;
+}
+
+static int ProbeIPAInstallCapability(void)
+{
+    if (getuid() != 0 || geteuid() != 0) { CloudCodeExitOneShot(11); }
+    NSString *helper = TrollStoreHelperPathFromFilesystem();
+    if (helper.length == 0) { CloudCodeExitOneShot(83); }
+    fputs("trollstore-install-backend=available\n", stdout);
+    CloudCodeExitOneShot(0);
+}
+
+static int InstallIPAThroughTrollStore(NSString *ipaPath, NSString *expectedBundleID, NSString *expectedBuild)
+{
+    if (getuid() != 0 || geteuid() != 0) { CloudCodeExitOneShot(11); }
+    NSString *normalized = NormalizePath(ipaPath);
+    if (!IsSafeIPAPath(normalized) || expectedBundleID.length == 0 || expectedBundleID.length > 255 || expectedBuild.length > 128) {
+        CloudCodeExitOneShot(82);
+    }
+    NSString *helper = TrollStoreHelperPathFromFilesystem();
+    if (helper.length == 0) { CloudCodeExitOneShot(83); }
+
+    const char *helperPath = helper.fileSystemRepresentation;
+    const char *command = "install";
+    const char *mode = "custom";
+    const char *archive = normalized.fileSystemRepresentation;
+    char *const childArgv[] = {(char *)helperPath, (char *)command, (char *)mode, (char *)archive, NULL};
+    pid_t child = 0;
+    int spawnError = posix_spawn(&child, helperPath, NULL, NULL, childArgv, environ);
+    if (spawnError != 0 || child <= 1) {
+        fprintf(stderr, "trollstore-install: spawn failed error=%d\n", spawnError);
+        CloudCodeExitOneShot(84);
+    }
+
+    int status = 0;
+    BOOL reaped = NO;
+    for (int attempt = 0; attempt < 900; attempt++) {
+        pid_t waited = waitpid(child, &status, WNOHANG);
+        if (waited == child) { reaped = YES; break; }
+        if (waited == -1 && errno != EINTR) { break; }
+        usleep(100000);
+    }
+    if (!reaped) {
+        (void)kill(child, SIGKILL);
+        do { } while (waitpid(child, &status, 0) == -1 && errno == EINTR);
+        fprintf(stderr, "trollstore-install: timed out after 90 seconds\n");
+        CloudCodeExitOneShot(84);
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        fprintf(stderr, "trollstore-install: helper returned %d\n", code);
+        CloudCodeExitOneShot(84);
+    }
+
+    NSString *installedBundlePath = BundlePathForIdentifierFromFilesystem(expectedBundleID);
+    NSDictionary *installedInfo = installedBundlePath.length > 0
+        ? [NSDictionary dictionaryWithContentsOfFile:[installedBundlePath stringByAppendingPathComponent:@"Info.plist"]]
+        : nil;
+    NSString *installedBundleID = [installedInfo[@"CFBundleIdentifier"] isKindOfClass:NSString.class] ? installedInfo[@"CFBundleIdentifier"] : @"";
+    NSString *installedBuild = [installedInfo[@"CFBundleVersion"] isKindOfClass:NSString.class] ? installedInfo[@"CFBundleVersion"] : @"";
+    if (![installedBundleID isEqualToString:expectedBundleID] || (expectedBuild.length > 0 && ![installedBuild isEqualToString:expectedBuild])) {
+        fprintf(stderr, "trollstore-install: postcondition mismatch expectedBundle=%s expectedBuild=%s actualBundle=%s actualBuild=%s\n",
+                expectedBundleID.UTF8String ?: "", expectedBuild.UTF8String ?: "",
+                installedBundleID.UTF8String ?: "", installedBuild.UTF8String ?: "");
+        CloudCodeExitOneShot(85);
+    }
+    fprintf(stdout, "trollstore-install: verified bundle=%s build=%s\n", installedBundleID.UTF8String ?: "", installedBuild.UTF8String ?: "");
+    CloudCodeExitOneShot(0);
 }
 
 static NSDictionary<NSString *, NSString *> *DataContainerPathsByBundleID(void)
@@ -285,45 +947,13 @@ static NSDictionary<NSString *, NSString *> *DataContainerPathsByBundleID(void)
 
 static int PrintInstalledApplicationsJSON(void)
 {
-    id workspace = Workspace();
-    if (!workspace) { return 23; }
-    NSString *backend = @"LaunchServices";
-    NSArray *proxies = InstalledApplicationProxies(workspace, &backend);
-    if (proxies.count == 0) { return 40; }
-
+    // Read-only discovery must not depend on LaunchServices. On the TrollStore iOS 16.6 device,
+    // allInstalledApplications/allApplications can block until the parent watchdog while the same
+    // app bundles and MCM metadata are immediately readable through the privileged filesystem view.
+    // Treat physical presence as discovery evidence only; exact launch/uninstall still revalidate
+    // installation state through their own bounded system routes.
     NSMutableDictionary<NSString *, NSDictionary *> *byBundleID = [NSMutableDictionary dictionary];
     NSDictionary<NSString *, NSString *> *dataPathsByBundleID = DataContainerPathsByBundleID();
-    for (id proxy in proxies) {
-        NSString *bundleID = SafeValue(proxy, @"applicationIdentifier");
-        if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0) {
-            bundleID = SafeValue(proxy, @"bundleIdentifier");
-        }
-        if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0) { continue; }
-        NSString *name = SafeValue(proxy, @"localizedName");
-        if (![name isKindOfClass:NSString.class] || name.length == 0) { name = SafeValue(proxy, @"itemName"); }
-        if (![name isKindOfClass:NSString.class] || name.length == 0) { name = bundleID; }
-        NSString *version = SafeValue(proxy, @"shortVersionString");
-        if (![version isKindOfClass:NSString.class]) { version = @""; }
-        NSURL *bundleURL = SafeValue(proxy, @"bundleURL");
-        NSURL *dataURL = SafeValue(proxy, @"dataContainerURL");
-        NSString *bundlePath = [bundleURL isKindOfClass:NSURL.class] ? bundleURL.path : @"";
-        NSString *dataPath = [dataURL isKindOfClass:NSURL.class] ? dataURL.path : @"";
-        if (dataPath.length == 0) { dataPath = dataPathsByBundleID[bundleID] ?: @""; }
-        byBundleID[bundleID] = @{
-            @"bundleID": bundleID,
-            @"name": name,
-            @"version": version,
-            @"bundlePath": bundlePath ?: @"",
-            @"dataContainerPath": dataPath ?: @"",
-            @"registered": @YES
-        };
-    }
-
-    // LaunchServices can lose registration before a failed uninstall has actually removed the
-    // bundle container. Merge only physically present, one-level user .app bundles that LS did
-    // not report so a later explicit apps.uninstall can reconcile that orphan instead of losing
-    // its path forever. This is read-only discovery and never deletes or registers anything.
-    NSUInteger orphanCount = 0;
     NSString *bundleRoot = @"/var/containers/Bundle/Application";
     NSArray<NSString *> *containers = [NSFileManager.defaultManager contentsOfDirectoryAtPath:bundleRoot error:nil] ?: @[];
     for (NSString *containerName in containers) {
@@ -347,23 +977,21 @@ static int PrintInstalledApplicationsJSON(void)
                 @"version": version ?: @"",
                 @"bundlePath": bundlePath,
                 @"dataContainerPath": dataPathsByBundleID[bundleID] ?: @"",
-                @"registered": @NO
+                @"registered": @YES
             };
-            orphanCount++;
         }
     }
-    if (byBundleID.count == 0) { return 40; }
-    if (orphanCount > 0) { backend = [backend stringByAppendingString:@"+BundleFilesystemOrphans"]; }
+    if (byBundleID.count == 0) { CloudCodeExitOneShot(40); }
     NSArray *apps = [[byBundleID allValues] sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *lhs, NSDictionary *rhs) {
         return [lhs[@"name"] localizedCaseInsensitiveCompare:rhs[@"name"]];
     }];
-    NSDictionary *payload = @{@"backend": backend ?: @"LaunchServices", @"apps": apps};
+    NSDictionary *payload = @{@"backend": @"BundleFilesystem(read-only-discovery)", @"apps": apps};
     NSError *error = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
-    if (!data || error) { return 41; }
+    if (!data || error) { CloudCodeExitOneShot(41); }
     fwrite(data.bytes, 1, data.length, stdout);
     fputc('\n', stdout);
-    return 0;
+    CloudCodeExitOneShot(0);
 }
 
 static int ProbePrivilegedFilesystemJSON(void)
@@ -405,32 +1033,76 @@ static int ProbePrivilegedFilesystemJSON(void)
     };
     NSError *error = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
-    if (!data || error) { return 41; }
+    if (!data || error) { CloudCodeExitOneShot(41); }
     fwrite(data.bytes, 1, data.length, stdout);
     fputc('\n', stdout);
-    return 0;
+    CloudCodeExitOneShot(0);
 }
 
 static int ProbeLaunchCapability(void)
 {
     id workspace = Workspace();
-    if (!workspace) { return 23; }
-    return [workspace respondsToSelector:NSSelectorFromString(@"openApplicationWithBundleID:")] ? 0 : 42;
+    if (!workspace) { CloudCodeExitOneShot(23); }
+    CloudCodeExitOneShot([workspace respondsToSelector:NSSelectorFromString(@"openApplicationWithBundleID:")] ? 0 : 42);
+}
+
+static BOOL LaunchViaSpringBoardServices(NSString *bundleID, NSString **diagnostic)
+{
+    void *handle = SpringBoardServicesHandle();
+    if (!handle) {
+        if (diagnostic) { *diagnostic = @"SpringBoardServices framework unavailable"; }
+        return NO;
+    }
+    CloudCodeLaunchApplicationWithIdentifierAndLaunchOptionsFn launch =
+        (CloudCodeLaunchApplicationWithIdentifierAndLaunchOptionsFn)dlsym(handle, "SBSLaunchApplicationWithIdentifierAndLaunchOptions");
+    if (!launch) {
+        if (diagnostic) { *diagnostic = @"SBSLaunchApplicationWithIdentifierAndLaunchOptions unavailable"; }
+        return NO;
+    }
+
+    uint32_t rawResult = 0;
+    @try {
+        // Modern SpringBoardServices uses the three-argument ABI also used by current Frida:
+        // identifier, launch options, suspended. Do not request implicit device unlock here.
+        // Success is never inferred from the raw return value; the requested Bundle ID must become
+        // physically frontmost through the existing bounded verification path below.
+        rawResult = launch(bundleID, @{}, NO);
+    } @catch (NSException *exception) {
+        if (diagnostic) {
+            *diagnostic = [NSString stringWithFormat:@"SBS launch raised %@", exception.name ?: @"exception"];
+        }
+        return NO;
+    }
+
+    BOOL foregroundVerified = WaitForFrontmostApplication(bundleID, 1500000);
+    if (diagnostic) {
+        *diagnostic = [NSString stringWithFormat:@"SBS rawResult=%u foreground=%s",
+                       rawResult, foregroundVerified ? "verified" : "unverified"];
+    }
+    return foregroundVerified;
 }
 
 static int LaunchApplication(NSString *bundleID)
 {
-    if (bundleID.length == 0 || [bundleID isEqualToString:@"com.cloudcode.ios"]) { return 10; }
+    if (bundleID.length == 0) { CloudCodeExitOneShot(10); }
+    // CloudCode itself is a valid restore target after an App-backed Provider run.
     id workspace = Workspace();
-    if (!workspace) { return 23; }
+    if (!workspace) { CloudCodeExitOneShot(23); }
     BOOL known = NO;
     BOOL installed = ApplicationIsInstalled(workspace, bundleID, &known);
-    if (!known) { return 43; }
-    if (!installed) { return 47; }
+    if (known && !installed) {
+        // On the iOS 16.6 TrollStore/root persona this API can return a false negative for an
+        // actually installed App. Do not turn that hint into a launch gate: the bounded launch
+        // below is itself exact to one Bundle ID and success still requires that same Bundle ID to
+        // become the verified frontmost application.
+        fprintf(stderr, "launch: applicationIsInstalled returned false; continuing with exact launch verification\n");
+    } else if (!known) {
+        fprintf(stderr, "launch: installation state unavailable; continuing with exact launch verification\n");
+    }
 
     if ([[FrontmostApplicationBundleID() lowercaseString] isEqualToString:bundleID.lowercaseString]) {
         fprintf(stderr, "launch: target already foreground route=springboard-frontmost\n");
-        return 0;
+        CloudCodeExitOneShot(0);
     }
 
     SEL selector = NSSelectorFromString(@"openApplicationWithBundleID:");
@@ -445,11 +1117,11 @@ static int LaunchApplication(NSString *bundleID)
         if (launchServicesAccepted) {
             BOOL foregroundVerified = WaitForFrontmostApplication(bundleID, 750000);
             fprintf(stderr, "launch: route=launchservices accepted=1 foreground=%s\n", foregroundVerified ? "verified" : "unverified");
-            if (foregroundVerified) { return 0; }
+            if (foregroundVerified) { CloudCodeExitOneShot(0); }
         }
         if (WaitForFrontmostApplication(bundleID, 150000)) {
             fprintf(stderr, "launch: route=launchservices accepted=0 but target is foreground\n");
-            return 0;
+            CloudCodeExitOneShot(0);
         }
     }
 
@@ -459,27 +1131,34 @@ static int LaunchApplication(NSString *bundleID)
     // and success requires the requested App to become the actual frontmost application.
     if (geteuid() != 0) {
         fprintf(stderr, "launch: isolated LaunchServices path did not establish target foreground; privileged board fallback required\n");
-        return [workspace respondsToSelector:selector] ? 46 : 42;
+        CloudCodeExitOneShot([workspace respondsToSelector:selector] ? 46 : 42);
+    }
+
+    NSString *springBoardDiagnostic = nil;
+    if (LaunchViaSpringBoardServices(bundleID, &springBoardDiagnostic)) {
+        fprintf(stderr, "launch: route=springboard-services %s\n", springBoardDiagnostic.UTF8String ?: "verified");
+        CloudCodeExitOneShot(0);
     }
 
     NSString *frontBoardDiagnostic = nil;
     if (LaunchViaBoardSystemService(bundleID, @"FBSSystemService", @"FrontBoardServices", &frontBoardDiagnostic)) {
         fprintf(stderr, "launch: route=frontboard %s\n", frontBoardDiagnostic.UTF8String ?: "verified");
-        return 0;
+        CloudCodeExitOneShot(0);
     }
 
     NSString *backBoardDiagnostic = nil;
     if (LaunchViaBoardSystemService(bundleID, @"BKSSystemService", @"BackBoardServices", &backBoardDiagnostic)) {
         fprintf(stderr, "launch: route=backboard %s\n", backBoardDiagnostic.UTF8String ?: "verified");
-        return 0;
+        CloudCodeExitOneShot(0);
     }
 
     fprintf(stderr,
-            "launch: route=launchservices+frontboard+backboard rejected lsSelector=%s fbs=%s bks=%s\n",
+            "launch: route=launchservices+springboard+frontboard+backboard rejected lsSelector=%s sbs=%s fbs=%s bks=%s\n",
             [workspace respondsToSelector:selector] ? "available" : "unavailable",
+            springBoardDiagnostic.UTF8String ?: "unavailable",
             frontBoardDiagnostic.UTF8String ?: "unavailable",
             backBoardDiagnostic.UTF8String ?: "unavailable");
-    return [workspace respondsToSelector:selector] ? 46 : 42;
+    CloudCodeExitOneShot([workspace respondsToSelector:selector] ? 46 : 42);
 }
 
 static int ProbeUninstallCapability(NSString *bundleID)
@@ -533,13 +1212,37 @@ static BOOL ApplicationIsInstalled(id workspace, NSString *bundleID, BOOL *known
 
 static int InstalledState(NSString *bundleID)
 {
-    if (bundleID.length == 0) { return 10; }
+    if (bundleID.length == 0) { CloudCodeExitOneShot(10); }
+
+    // `LSApplicationWorkspace applicationIsInstalled:` is not authoritative on the iOS 16.6
+    // TrollStore/root persona used by Cloud Code. Physical-device evidence shows it can return a
+    // false negative while InstallationProxy still reports the target App and its bundle is present.
+    // Treat a positive answer as sufficient, but require corroborating exact evidence before a
+    // negative answer becomes `not installed`. This prevents App-backed Providers from being blocked
+    // at preflight while preserving fail-closed launch/foreground verification later in the flow.
     id workspace = Workspace();
-    if (!workspace) { return 23; }
     BOOL known = NO;
     BOOL installed = ApplicationIsInstalled(workspace, bundleID, &known);
-    if (!known) { return 43; }
-    return installed ? 0 : 47;
+    if (known && installed) { CloudCodeExitOneShot(0); }
+
+    id proxy = ApplicationProxy(bundleID);
+    if (proxy) {
+        NSString *candidate = SafeValue(proxy, @"applicationIdentifier");
+        if (![candidate isKindOfClass:NSString.class] || candidate.length == 0) {
+            candidate = SafeValue(proxy, @"bundleIdentifier");
+        }
+        NSURL *bundleURL = SafeValue(proxy, @"bundleURL");
+        NSString *bundlePath = [bundleURL isKindOfClass:NSURL.class] ? bundleURL.path.stringByStandardizingPath : nil;
+        if ([candidate isEqualToString:bundleID] && IsSafeBundlePath(bundlePath)) {
+            CloudCodeExitOneShot(0);
+        }
+    }
+
+    NSString *filesystemPath = BundlePathForIdentifierFromFilesystem(bundleID);
+    if (IsSafeBundlePath(filesystemPath)) { CloudCodeExitOneShot(0); }
+
+    if (known) { CloudCodeExitOneShot(47); }
+    CloudCodeExitOneShot(43);
 }
 
 static BOOL UnregisterApplication(id workspace, NSString *appPath)
@@ -645,18 +1348,25 @@ static NSArray<NSString *> *CloudCodeBoundedStringArray(id value, NSUInteger lim
 
 static int PrintAppIntrospectionJSON(NSString *bundleID)
 {
-    if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0 || bundleID.length > 255) { return 10; }
-    id proxy = ApplicationProxy(bundleID);
-    if (!proxy) { return 44; }
-    NSURL *bundleURL = SafeValue(proxy, @"bundleURL");
-    NSURL *dataURL = SafeValue(proxy, @"dataContainerURL");
-    NSString *bundlePath = [bundleURL isKindOfClass:NSURL.class] ? bundleURL.path : nil;
-    NSString *dataPath = [dataURL isKindOfClass:NSURL.class] ? dataURL.path : nil;
-    if (!IsSafeBundlePath(bundlePath)) { return 20; }
+    if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0 || bundleID.length > 255) { CloudCodeExitOneShot(10); }
+    // Prefer the bounded filesystem view, but do not equate a transient filesystem miss with
+    // "not installed". InstalledBundlePath performs a single exact LSApplicationProxy lookup
+    // before considering the legacy broad enumeration fallback.
+    id workspace = Workspace();
+    NSString *bundlePath = InstalledBundlePath(workspace, bundleID);
+    NSString *dataPath = DataContainerPathsByBundleID()[bundleID];
+    id exactProxy = nil;
+    if (!IsSafeDataPath(dataPath)) {
+        exactProxy = ApplicationProxy(bundleID);
+        NSURL *dataURL = SafeValue(exactProxy, @"dataContainerURL");
+        NSString *candidateDataPath = [dataURL isKindOfClass:NSURL.class] ? dataURL.path.stringByStandardizingPath : nil;
+        if (IsSafeDataPath(candidateDataPath)) { dataPath = candidateDataPath; }
+    }
+    if (!IsSafeBundlePath(bundlePath)) { CloudCodeExitOneShot(44); }
     NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"Info.plist"]];
-    if (![info isKindOfClass:NSDictionary.class]) { return 78; }
+    if (![info isKindOfClass:NSDictionary.class]) { CloudCodeExitOneShot(78); }
     NSString *actualBundleID = [info[@"CFBundleIdentifier"] isKindOfClass:NSString.class] ? info[@"CFBundleIdentifier"] : nil;
-    if (![actualBundleID isEqualToString:bundleID]) { return 78; }
+    if (![actualBundleID isEqualToString:bundleID]) { CloudCodeExitOneShot(78); }
 
     NSMutableOrderedSet<NSString *> *schemes = [NSMutableOrderedSet orderedSet];
     for (id rawType in ([info[@"CFBundleURLTypes"] isKindOfClass:NSArray.class] ? info[@"CFBundleURLTypes"] : @[])) {
@@ -701,14 +1411,10 @@ static int PrintAppIntrospectionJSON(NSString *bundleID)
         }
     }
 
+    // App-group container discovery is a secondary hint and previously forced LSApplicationProxy
+    // back into this otherwise filesystem-only metadata path. Keep it empty when not available from
+    // bounded static metadata; the runtime does not require app groups for app launch or GUI control.
     NSMutableOrderedSet<NSString *> *appGroups = [NSMutableOrderedSet orderedSet];
-    id rawGroups = SafeValue(proxy, @"groupContainerURLs");
-    if ([rawGroups isKindOfClass:NSDictionary.class]) {
-        for (id key in [(NSDictionary *)rawGroups allKeys]) {
-            if (appGroups.count >= 48) { break; }
-            if ([key isKindOfClass:NSString.class] && [(NSString *)key length] <= 512) { [appGroups addObject:key]; }
-        }
-    }
 
     NSMutableDictionary<NSString *, NSString *> *localData = [NSMutableDictionary dictionary];
     if (IsSafeDataPath(dataPath)) {
@@ -748,10 +1454,12 @@ static int PrintAppIntrospectionJSON(NSString *bundleID)
     };
     NSError *error = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
-    if (!data || error || data.length == 0 || data.length > (256 * 1024)) { return 79; }
+    if (!data || error || data.length == 0 || data.length > (256 * 1024)) { CloudCodeExitOneShot(79); }
     fwrite(data.bytes, 1, data.length, stdout);
     fputc('\n', stdout);
-    return 0;
+    // Do not return through ARC cleanup after touching app-container metadata. On-device evidence
+    // shows private helper teardown can outlive the parent watchdog after the payload is complete.
+    CloudCodeExitOneShot(0);
 }
 
 static BOOL RemovePath(NSString *path, BOOL required)
@@ -798,8 +1506,9 @@ static BOOL HasProcessInspectionBackend(void)
 
 static NSArray<NSNumber *> *ProcessesUnderBundlePath(NSString *bundlePath)
 {
-    NSString *normalized = NormalizePath(bundlePath);
-    if (!IsSafeBundlePath(normalized)) { return @[]; }
+    NSString *original = NormalizePath(bundlePath);
+    if (!IsSafeBundlePath(original)) { return @[]; }
+    NSString *normalized = CanonicalVarProcessPath(original);
     CloudCodeProcListAllPidsFn listAllPids = ProcListAllPids();
     CloudCodeProcPidPathFn pidPath = ProcPidPath();
     if (!listAllPids || !pidPath) { return @[]; }
@@ -816,7 +1525,7 @@ static NSArray<NSNumber *> *ProcessesUnderBundlePath(NSString *bundlePath)
         char pathBuffer[CLOUDCODE_PROC_PATH_MAX] = {0};
         int length = pidPath(pid, pathBuffer, sizeof(pathBuffer));
         if (length <= 0) { continue; }
-        NSString *processPath = [NSString stringWithUTF8String:pathBuffer];
+        NSString *processPath = CanonicalVarProcessPath([NSString stringWithUTF8String:pathBuffer]);
         if ([processPath isEqualToString:normalized] || [processPath hasPrefix:prefix]) {
             [matches addObject:@(pid)];
         }
@@ -1104,12 +1813,15 @@ static int StartDetachedBackgroundAssertion(pid_t targetPID, const char *helperE
     close(handshake[0]);
     if (count == sizeof(acquired) && acquired == 1) {
         fprintf(stderr, "background-assert: acquired targetPID=%d workerPID=%d spawn=posix_spawn flags=1 reason=10004\n", targetPID, workerPID);
-        return 0;
+        // This command's only observable result is the detached worker PID written above. Build 110
+        // repeatedly reached this line and then still hit the parent watchdog. Cross the one-shot
+        // boundary here instead of unwinding through any process-global Foundation/private state.
+        CloudCodeExitOneShot(0);
     }
 
     (void)kill(workerPID, SIGKILL);
     fprintf(stderr, "background-assert: acquisition failed targetPID=%d workerPID=%d poll=%d errno=%d\n", targetPID, workerPID, pollResult, errno);
-    return 75;
+    CloudCodeExitOneShot(75);
 }
 
 static int StopDetachedBackgroundAssertion(pid_t workerPID)
@@ -1127,9 +1839,126 @@ static int BackgroundAssertionWorkerStatus(pid_t workerPID)
     return kill(workerPID, 0) == 0 ? 0 : 77;
 }
 
-int main(int argc, const char *argv[])
+static int ClearLegacyCloudCodeAXAutomationState(void)
 {
-    @autoreleasepool {
+    // Explicit maintenance repair for the persistent global Accessibility Automation preference that
+    // legacy builds could leave enabled after an interrupted AX diagnostic. Do not call AXRuntime
+    // here: on iOS 16.6 the legacy getter/setter can itself wedge or recreate the visible green
+    // automation indicator. Instead, update only the persisted AutomationEnabled key as root,
+    // preserve the preference file metadata, verify the on-disk value, then let the caller restart
+    // system services/device so cfprefsd and SpringBoard reload the repaired preference.
+    if (getuid() != 0 || geteuid() != 0) {
+        fprintf(stderr, "gui-clear-stale-automation: root-required\n");
+        return 11;
+    }
+
+    NSString *preferencePath = @"/var/mobile/Library/Preferences/com.apple.Accessibility.plist";
+    const char *preferenceFSPath = preferencePath.fileSystemRepresentation;
+    struct stat originalStat = {0};
+    if (!preferenceFSPath || stat(preferenceFSPath, &originalStat) != 0) {
+        fprintf(stderr, "gui-clear-stale-automation: preference-stat-failed errno=%d\n", errno);
+        return 61;
+    }
+
+    NSError *error = nil;
+    NSData *data = [NSData dataWithContentsOfFile:preferencePath options:0 error:&error];
+    if (!data.length) {
+        fprintf(stderr, "gui-clear-stale-automation: preference-read-failed error=%s\n",
+            error.localizedDescription.UTF8String ?: "unknown");
+        return 61;
+    }
+
+    NSPropertyListFormat format = NSPropertyListBinaryFormat_v1_0;
+    id parsed = [NSPropertyListSerialization propertyListWithData:data
+                                                           options:NSPropertyListMutableContainersAndLeaves
+                                                            format:&format
+                                                             error:&error];
+    if (![parsed isKindOfClass:NSMutableDictionary.class]) {
+        fprintf(stderr, "gui-clear-stale-automation: preference-parse-failed error=%s\n",
+            error.localizedDescription.UTF8String ?: "invalid-root");
+        return 62;
+    }
+
+    NSMutableDictionary *preferences = (NSMutableDictionary *)parsed;
+    id beforeValue = preferences[@"AutomationEnabled"];
+    BOOL beforePresent = [beforeValue respondsToSelector:@selector(boolValue)];
+    BOOL beforeEnabled = beforePresent ? [beforeValue boolValue] : NO;
+    if (beforePresent && !beforeEnabled) {
+        fprintf(stderr, "gui-clear-stale-automation: verified-disabled before=0 after=0 write=none\n");
+        return 0;
+    }
+
+    preferences[@"AutomationEnabled"] = @NO;
+    NSData *updated = [NSPropertyListSerialization dataWithPropertyList:preferences
+                                                                 format:format
+                                                                options:0
+                                                                  error:&error];
+    if (!updated.length) {
+        fprintf(stderr, "gui-clear-stale-automation: preference-serialize-failed error=%s\n",
+            error.localizedDescription.UTF8String ?: "unknown");
+        return 63;
+    }
+
+    NSString *temporaryPath = [preferencePath stringByAppendingFormat:@".cloudcode-%d.tmp", getpid()];
+    const char *temporaryFSPath = temporaryPath.fileSystemRepresentation;
+    (void)unlink(temporaryFSPath);
+    if (![updated writeToFile:temporaryPath options:0 error:&error]) {
+        fprintf(stderr, "gui-clear-stale-automation: preference-temp-write-failed error=%s\n",
+            error.localizedDescription.UTF8String ?: "unknown");
+        return 63;
+    }
+
+    BOOL metadataOK = chown(temporaryFSPath, originalStat.st_uid, originalStat.st_gid) == 0
+        && chmod(temporaryFSPath, originalStat.st_mode & 07777) == 0;
+    int temporaryFD = open(temporaryFSPath, O_RDONLY);
+    if (temporaryFD >= 0) {
+        if (fsync(temporaryFD) != 0) { metadataOK = NO; }
+        close(temporaryFD);
+    } else {
+        metadataOK = NO;
+    }
+    if (!metadataOK) {
+        int savedErrno = errno;
+        (void)unlink(temporaryFSPath);
+        fprintf(stderr, "gui-clear-stale-automation: preference-metadata-sync-failed errno=%d\n", savedErrno);
+        return 63;
+    }
+
+    if (rename(temporaryFSPath, preferenceFSPath) != 0) {
+        int savedErrno = errno;
+        (void)unlink(temporaryFSPath);
+        fprintf(stderr, "gui-clear-stale-automation: preference-replace-failed errno=%d\n", savedErrno);
+        return 63;
+    }
+
+    int directoryFD = open("/var/mobile/Library/Preferences", O_RDONLY);
+    if (directoryFD >= 0) {
+        (void)fsync(directoryFD);
+        close(directoryFD);
+    }
+
+    NSError *verifyError = nil;
+    NSData *verifyData = [NSData dataWithContentsOfFile:preferencePath options:0 error:&verifyError];
+    id verifyParsed = verifyData.length
+        ? [NSPropertyListSerialization propertyListWithData:verifyData options:0 format:NULL error:&verifyError]
+        : nil;
+    id afterValue = [verifyParsed isKindOfClass:NSDictionary.class]
+        ? ((NSDictionary *)verifyParsed)[@"AutomationEnabled"]
+        : nil;
+    if (![afterValue respondsToSelector:@selector(boolValue)] || [afterValue boolValue]) {
+        fprintf(stderr, "gui-clear-stale-automation: preference-verify-failed error=%s\n",
+            verifyError.localizedDescription.UTF8String ?: "unexpected-value");
+        return 64;
+    }
+
+    fprintf(stderr, "gui-clear-stale-automation: persisted preference cleared before=%s after=0 path=%s\n",
+        beforePresent ? (beforeEnabled ? "1" : "0") : "missing",
+        preferenceFSPath);
+    return 0;
+}
+
+static int CloudCodeRunOneShotCommand(int argc, const char *argv[])
+{
         if (argc < 2) { return 10; }
         NSString *command = [NSString stringWithUTF8String:argv[1]];
         if ([command isEqualToString:@"probe"]) {
@@ -1161,6 +1990,16 @@ int main(int argc, const char *argv[])
             NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
             return ProbeUninstallCapability(bundleID);
         }
+        if ([command isEqualToString:@"probe-ipa-install"]) {
+            return ProbeIPAInstallCapability();
+        }
+        if ([command isEqualToString:@"install-ipa"]) {
+            if (argc < 5) { return 10; }
+            NSString *ipaPath = [NSString stringWithUTF8String:argv[2]];
+            NSString *bundleID = [NSString stringWithUTF8String:argv[3]];
+            NSString *build = [NSString stringWithUTF8String:argv[4]];
+            return InstallIPAThroughTrollStore(ipaPath, bundleID, build);
+        }
         if ([command isEqualToString:@"is-installed"]) {
             if (getuid() != 0 || geteuid() != 0 || argc < 3) { return 11; }
             NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
@@ -1176,11 +2015,21 @@ int main(int argc, const char *argv[])
             NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
             return VerifyFrontmostApplication(bundleID);
         }
+        if ([command isEqualToString:@"foreground-diagnostics-file"]) {
+            if (argc < 3) { return 10; }
+            NSString *bundleID = [NSString stringWithUTF8String:argv[2]];
+            return WriteForegroundDiagnosticsFile(bundleID);
+        }
         if ([command isEqualToString:@"gui-probe-json"]) {
             return CloudCodeGUIProbeJSON();
         }
         if ([command isEqualToString:@"gui-tree-json"]) {
             return CloudCodeGUITreeJSON();
+        }
+        if ([command isEqualToString:@"gui-ax-probe-json"]) {
+            if (argc < 6) { return 10; }
+            return CloudCodeGUIAXProbeJSON([NSString stringWithUTF8String:argv[2]], [NSString stringWithUTF8String:argv[3]],
+                (pid_t)strtol(argv[4], NULL, 10), [NSString stringWithUTF8String:argv[5]]);
         }
         if ([command isEqualToString:@"gui-screenshot-base64"]) {
             return CloudCodeGUIScreenshotBase64();
@@ -1189,6 +2038,9 @@ int main(int argc, const char *argv[])
             if (argc < 3) { return 10; }
             NSString *outputPath = [NSString stringWithUTF8String:argv[2]];
             return CloudCodeGUIScreenshotFile(outputPath);
+        }
+        if ([command isEqualToString:@"gui-clear-stale-automation"]) {
+            return ClearLegacyCloudCodeAXAutomationState();
         }
         if ([command isEqualToString:@"gui-tap"]) {
             if (argc < 4) { return 10; }
@@ -1207,10 +2059,22 @@ int main(int argc, const char *argv[])
             NSString *strategy = [NSString stringWithUTF8String:argv[2]];
             return CloudCodeGUINavigateBack(strategy);
         }
+        if ([command isEqualToString:@"gui-focused-text-input-json"]) {
+            return CloudCodeGUIFocusedTextInputJSON();
+        }
         if ([command isEqualToString:@"gui-type-base64"]) {
             if (argc < 3) { return 10; }
             NSString *encoded = [NSString stringWithUTF8String:argv[2]];
             return CloudCodeGUITypeBase64(encoded);
+        }
+        if ([command isEqualToString:@"pc-control-server-start"]) {
+            return CloudCodePCControlServerStart(argv[0]);
+        }
+        if ([command isEqualToString:@"pc-control-server-worker"]) {
+            if (argc < 4) { return 10; }
+            NSString *token = [NSString stringWithUTF8String:argv[2]];
+            int handshakeFD = (int)strtol(argv[3], NULL, 10);
+            return CloudCodePCControlServerWorker(argv[0], token, handshakeFD);
         }
         if ([command isEqualToString:@"background-assert-worker"]) {
             if (argc < 4) { return 10; }
@@ -1252,5 +2116,40 @@ int main(int argc, const char *argv[])
             return TerminateApplication(bundlePath);
         }
         return 10;
+}
+
+int main(int argc, const char *argv[])
+{
+    // Make bridge-owned stdout/stderr synchronous before any Foundation/private-framework work.
+    // This lets all one-shot commands hard-exit after their final write without calling fflush on
+    // process-global stdio state that can wedge on-device after LaunchServices/BackBoard/AX use.
+    (void)setvbuf(stdout, NULL, _IONBF, 0);
+    (void)setvbuf(stderr, NULL, _IONBF, 0);
+
+    // The background assertion worker and PC-control worker are deliberately long-lived and are
+    // not observed by the one-shot parent bridge after their handshakes. Preserve normal
+    // Objective-C cleanup for them instead of arming the one-shot watchdog.
+    if (argc > 1 && (strcmp(argv[1], "background-assert-worker") == 0 || strcmp(argv[1], "pc-control-server-worker") == 0)) {
+        @autoreleasepool {
+            return CloudCodeRunOneShotCommand(argc, argv);
+        }
     }
+
+    // Every other command is a one-shot helper. Persona-99 children may no longer be signalable by
+    // the mobile parent after credential override, so arm an in-process watchdog before entering any
+    // private framework call. This prevents a wedged AX/LaunchServices helper from surviving the
+    // parent deadline and accumulating across requests.
+    CloudCodeArmOneShotWatchdog(argc, argv);
+
+    // Some private iOS frameworks retain process-global
+    // objects whose autorelease teardown can block after the command has already emitted its final
+    // result. Build 98 therefore paid the full parent watchdog (5–6s) for successful work. Keep one
+    // process-lifetime pool, flush observable output, and terminate without teardown after dispatch.
+    // The kernel reclaims all helper memory immediately; no state is shared with the host process.
+    (void)objc_autoreleasePoolPush();
+    int result = CloudCodeRunOneShotCommand(argc, argv);
+    // Streams are unbuffered from process entry, so returning commands can hard-exit without any
+    // stdio flush/teardown. This is the same post-result boundary used by CloudCodeExitOneShot.
+    CloudCodeGUIRestoreAXAutomationForProcessExit();
+    _exit(result);
 }

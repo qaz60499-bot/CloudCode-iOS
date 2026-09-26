@@ -16,7 +16,7 @@ concurrency:
 jobs:
   build-test-ipa:
     runs-on: macos-15
-    timeout-minutes: 35
+    timeout-minutes: 70
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -47,9 +47,11 @@ jobs:
           xcrun clang \
             -fobjc-arc \
             -framework Foundation \
+            -framework CoreGraphics \
             -I Sources/CloudCodeApp \
             Tests/RootHelperBridgeTests/RootHelperBridgeHarness.m \
             Sources/CloudCodeApp/RootHelperBridge.m \
+            Sources/CloudCodeApp/HostAXBridge.m \
             -o "$TEST_BINARY"
           "$TEST_BINARY"
 
@@ -74,6 +76,13 @@ jobs:
           set -euo pipefail
           APP_PATH="build/SimulatorDerivedData/Build/Products/Release-iphonesimulator/CloudCode.app"
           test -d "$APP_PATH"
+          for fixture in perception-english.jpg perception-chinese.jpg; do
+            if [[ ! -f "$APP_PATH/$fixture" ]]; then
+              echo "FAIL: perception fixture missing from app bundle root: $fixture" >&2
+              find "$APP_PATH" -maxdepth 3 -name 'perception-*.jpg' -print >&2 || true
+              exit 1
+            fi
+          done
           UDID="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ { print $2; exit }')"
           test -n "$UDID"
           xcrun simctl boot "$UDID" >/dev/null 2>&1 || true
@@ -82,6 +91,26 @@ jobs:
             local timeout_seconds="$1"
             shift
             python3 -c 'import subprocess,sys; p=subprocess.run(["xcrun","simctl"]+sys.argv[2:], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=float(sys.argv[1])); sys.stdout.write(p.stdout); sys.stderr.write(p.stderr); raise SystemExit(p.returncode)' "$timeout_seconds" "$@"
+          }
+          simctl_launch_with_retry() {
+            local phase="$1"
+            local launch_result=""
+            for attempt in 1 2; do
+              if launch_result="$(simctl_bounded 90 launch "$UDID" com.cloudcode.ios)"; then
+                printf '%s' "$launch_result"
+                return 0
+              fi
+              echo "WARN: simctl launch for $phase attempt $attempt failed or timed out; terminating any partial launch before one bounded retry" >&2
+              simctl_bounded 30 terminate "$UDID" com.cloudcode.ios >/dev/null 2>&1 || true
+              sleep 3
+            done
+            mkdir -p build/launch-diagnostics
+            if [[ -d "${breadcrumb_root:-}" ]]; then
+              cp -R "$breadcrumb_root" build/launch-diagnostics/StartupBreadcrumbs
+            fi
+            simctl_bounded 30 spawn "$UDID" log show --last 5m --style compact --predicate 'process == "CloudCode"' > build/launch-diagnostics/cloudcode.log 2>&1 || true
+            simctl_bounded 15 list devices --json > build/launch-diagnostics/simulator-state.json 2>&1 || true
+            return 1
           }
           simctl_bounded 120 install "$UDID" "$APP_PATH"
           data_container=""
@@ -98,7 +127,7 @@ jobs:
           verify_stable_launch() {
             local phase="$1"
             local launch_result pid latest_run
-            launch_result="$(simctl_bounded 90 launch "$UDID" com.cloudcode.ios)"
+            launch_result="$(simctl_launch_with_retry "$phase")"
             echo "$phase: $launch_result"
             pid="${launch_result##*: }"
             test -n "$pid"
@@ -133,7 +162,7 @@ jobs:
           seed_run="$breadcrumb_root/run-11111111-1111-1111-1111-111111111111.jsonl"
           python3 -c 'import datetime,json,sys; ts=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z"); print(json.dumps({"runID":"11111111-1111-1111-1111-111111111111","timestamp":ts,"stage":"bootstrap.safe.begin"}), file=open(sys.argv[1],"w",encoding="utf-8"))' "$seed_run"
           sleep 1
-          recovery_launch="$(simctl_bounded 90 launch "$UDID" com.cloudcode.ios)"
+          recovery_launch="$(simctl_launch_with_retry 'recovery-launch')"
           echo "recovery-launch: $recovery_launch"
           sleep 8
           latest_run="$(find "$breadcrumb_root" -type f -name 'run-*.jsonl' -print 2>/dev/null | while IFS= read -r file; do stat -f '%m %N' "$file"; done | sort -rn | head -1 | cut -d' ' -f2-)"
@@ -158,7 +187,7 @@ jobs:
           checkpoint_file="$tasks_root/checkpoints.json"
           CHECKPOINT_FILE="$checkpoint_file" swift -e 'import Foundation; struct C: Codable { var id: UUID; var sessionID: UUID; var taskName: String; var stepIndex: Int; var stepName: String; var totalSteps: Int; var state: String; var updatedAt: Date; var payload: [String:String] }; let id = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!; let sid = UUID(uuidString: "33333333-3333-3333-3333-333333333333")!; let c = C(id: id, sessionID: sid, taskName: "cold-launch crash-loop regression", stepIndex: 1, stepName: "provider request", totalSteps: 34, state: "running", updatedAt: Date(), payload: ["request":"do-not-replay-on-cold-launch"]); let e = JSONEncoder(); e.dateEncodingStrategy = .iso8601; e.outputFormatting = [.prettyPrinted, .sortedKeys]; let url = URL(fileURLWithPath: ProcessInfo.processInfo.environment["CHECKPOINT_FILE"]!); try e.encode([id:c]).write(to: url, options: .atomic)'
           simctl_bounded 30 spawn "$UDID" defaults write com.cloudcode.ios task.autoResumeUnlessStopped -bool YES
-          crashloop_launch="$(simctl_bounded 90 launch "$UDID" com.cloudcode.ios)"
+          crashloop_launch="$(simctl_launch_with_retry 'post-send-crash-recovery')"
           echo "post-send-crash recovery launch: $crashloop_launch"
           sleep 12
           latest_run="$(find "$breadcrumb_root" -type f -name 'run-*.jsonl' -print 2>/dev/null | while IFS= read -r file; do stat -f '%m %N' "$file"; done | sort -rn | head -1 | cut -d' ' -f2-)"
@@ -194,6 +223,7 @@ jobs:
             -configuration Release \
             -destination "platform=iOS Simulator,id=$UDID" \
             -derivedDataPath build/UITestDerivedData \
+            -resultBundlePath build/UITests.xcresult \
             CODE_SIGNING_ALLOWED=NO \
             test \
             -only-testing:CloudCodeIOSUITests
@@ -245,9 +275,14 @@ jobs:
           fi
           grep -F 'simctl_bounded()' .github/workflows/ios-ci.yml >/dev/null
           grep -F 'simctl_bounded 120 install' .github/workflows/ios-ci.yml >/dev/null
+          grep -F 'simctl_launch_with_retry()' .github/workflows/ios-ci.yml >/dev/null
+          grep -F 'for attempt in 1 2' .github/workflows/ios-ci.yml >/dev/null
           grep -F 'simctl_bounded 90 launch' .github/workflows/ios-ci.yml >/dev/null
           grep -F 'revision: "22787ffb59de99e5dc1fbfe80b19c97a904ad48d"' Package.swift >/dev/null
           grep -F 'revision: 22787ffb59de99e5dc1fbfe80b19c97a904ad48d' project.yml >/dev/null
+          grep -F 'device_vision_teardown_crash_guard' Sources/CloudCodeApp/LocalVisionTextObservation.swift >/dev/null
+          grep -F 'CloudCodeDispatchSystemEventAsync' Sources/CloudCodeRootHelper/GUIAutomation.m >/dev/null
+          test "$(grep -c 'runExplicitPerceptionRegressionIfRequested()' Sources/CloudCodeApp/AppEnvironment.swift)" -ge 2
           grep -F 'case interaction = "homeos.interaction"' Sources/CloudCodeCore/HomeOSCapability.swift >/dev/null
           grep -F 'ToolDescriptor(name: "gui.tapObserve"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
           grep -F 'ToolDescriptor(name: "gui.typeObserve"' Sources/CloudCodeCore/ToolRouter.swift >/dev/null
@@ -273,14 +308,53 @@ jobs:
             '<key>com.apple.private.security.no-sandbox</key>' \
             '<key>platform-application</key>' \
             '<key>com.apple.private.security.storage.AppDataContainers</key>' \
-            '<key>com.apple.private.persona-mgmt</key>'; do
+            '<key>com.apple.private.persona-mgmt</key>' \
+            '<key>com.apple.accessibility.api</key>'; do
             grep -F "$required_trollstore_host_entitlement" Entitlements/TrollStore.entitlements >/dev/null
           done
+          for vision_iokit_key in \
+            '<key>com.apple.security.iokit-user-client-class</key>' \
+            '<key>com.apple.security.exception.iokit-user-client-class</key>'; do
+            grep -F "$vision_iokit_key" Entitlements/TrollStore.entitlements >/dev/null
+            grep -F "$vision_iokit_key" Entitlements/CloudCodeVisionHelper.entitlements >/dev/null
+          done
+          for vision_iokit_class in AppleJPEGDriverUserClient IOSurfaceRootUserClient AGXDeviceUserClient; do
+            grep -F "<string>$vision_iokit_class</string>" Entitlements/TrollStore.entitlements >/dev/null
+            grep -F "<string>$vision_iokit_class</string>" Entitlements/CloudCodeVisionHelper.entitlements >/dev/null
+          done
+          # Build 121 device syslog proved Vision enters main()/performRequests, then MACF denies these
+          # exact user clients before TextRecognition aborts inside AppleNeuralEngine teardown.
+          for vision_helper_runtime_iokit_class in IOSurfaceAcceleratorClient H11ANEInDirectPathClient; do
+            grep -F "<string>$vision_helper_runtime_iokit_class</string>" Entitlements/CloudCodeVisionHelper.entitlements >/dev/null
+          done
+          for vision_system_identity in \
+            '<key>application-identifier</key>' \
+            '<string>TROLLTROLL.*</string>' \
+            '<key>com.apple.developer.team-identifier</key>' \
+            '<key>get-task-allow</key>' \
+            '<key>com.apple.private.security.no-sandbox</key>' \
+            '<key>com.apple.private.security.container-required</key>' \
+            '<key>platform-application</key>' \
+            '<key>com.apple.private.security.storage.AppDataContainers</key>'; do
+            grep -F "$vision_system_identity" Entitlements/CloudCodeVisionHelper.entitlements >/dev/null
+          done
+          for vision_forbidden in \
+            '<key>com.apple.private.persona-mgmt</key>' \
+            '<key>com.apple.accessibility.api</key>' \
+            '<key>com.apple.private.hid.client.event-dispatch</key>'; do
+            if grep -F "$vision_forbidden" Entitlements/CloudCodeVisionHelper.entitlements >/dev/null; then
+              echo "FAIL: Vision helper unexpectedly carries root/AX/HID entitlement: $vision_forbidden" >&2
+              exit 1
+            fi
+          done
+          grep -F 'ldid -SEntitlements/CloudCodeVisionHelper.entitlements "$VISION_HELPER"' .github/workflows/private-trollstore-privileged-ipa.yml >/dev/null
+          grep -F 'codesign --force --sign - --entitlements Entitlements/CloudCodeVisionHelper.entitlements "$VISION_HELPER"' .github/workflows/private-trollstore-privileged-ipa.yml >/dev/null
           if grep -F '<key>com.apple.multitasking.unlimitedassertions</key>' Entitlements/TrollStore.entitlements >/dev/null; then
             echo "FAIL: unlimited background assertion entitlement must remain isolated to the root helper" >&2
             exit 1
           fi
           grep -F '<key>com.apple.multitasking.unlimitedassertions</key>' Entitlements/CloudCodeRootHelper.entitlements >/dev/null
+          grep -F '<key>com.apple.accessibility.api</key>' Entitlements/CloudCodeRootHelper.entitlements >/dev/null
           for gui_only_entitlement in \
             '<key>com.apple.hid.system.server-access</key>' \
             '<key>com.apple.hid.system.user-access-service</key>' \
@@ -289,7 +363,6 @@ jobs:
             '<key>com.apple.private.hid.client.event-monitor</key>' \
             '<key>com.apple.private.hid.client.service-protected</key>' \
             '<key>com.apple.private.hid.manager.client</key>' \
-            '<key>com.apple.accessibility.api</key>' \
             '<key>com.apple.QuartzCore.cache-asynchronous</key>' \
             '<key>com.apple.QuartzCore.displayable-context</key>' \
             '<key>com.apple.QuartzCore.global-capture</key>' \
@@ -298,8 +371,10 @@ jobs:
             '<key>com.apple.QuartzCore.system-layers</key>' \
             '<key>com.apple.private.IOSurface.protected-access</key>' \
             '<key>com.apple.backboard.client</key>' \
+            '<key>com.apple.springboard.launchapplications</key>' \
             '<key>com.apple.frontboard.launchapplications</key>' \
-            '<key>com.apple.backboardd.launchapplications</key>'; do
+            '<key>com.apple.backboardd.launchapplications</key>' \
+            '<key>com.apple.runningboard.process-state</key>'; do
             if grep -F "$gui_only_entitlement" Entitlements/TrollStore.entitlements >/dev/null; then
               echo "FAIL: GUI-only entitlement leaked onto SwiftUI host: $gui_only_entitlement" >&2
               exit 1
@@ -331,8 +406,10 @@ jobs:
             '<key>com.apple.private.MobileInstallationHelperService.allowed</key>' \
             '<key>com.apple.private.uninstall.deletion</key>' \
             '<key>com.apple.private.mobileinstall.allowedSPI</key>' \
+            '<key>com.apple.springboard.launchapplications</key>' \
             '<key>com.apple.frontboard.launchapplications</key>' \
             '<key>com.apple.backboardd.launchapplications</key>' \
+            '<key>com.apple.runningboard.process-state</key>' \
             '<string>UninstallForLaunchServices</string>' \
             '<string>Uninstall</string>' \
             '<key>com.apple.security.iokit-user-client-class</key>' \
@@ -347,6 +424,13 @@ jobs:
           grep -F 'codesign -d --entitlements :- "$ROOT_HELPER"' .github/workflows/private-trollstore-privileged-ipa.yml >/dev/null
           grep -F 'codesign -d --entitlements :- "$HELPER"' scripts/verify_privileged_private_ipa.sh >/dev/null
           grep -F 'CODE_SIGN_ENTITLEMENTS: Entitlements/CloudCode.entitlements' project.yml >/dev/null
+          grep -F 'CloudCodeShareExtension:' project.yml >/dev/null
+          grep -F 'PRODUCT_BUNDLE_IDENTIFIER: com.cloudcode.ios.share' project.yml >/dev/null
+          grep -F '<string>group.com.cloudcode.ios.share</string>' Entitlements/CloudCode.entitlements >/dev/null
+          grep -F '<string>group.com.cloudcode.ios.share</string>' Entitlements/TrollStore.entitlements >/dev/null
+          grep -F '<string>group.com.cloudcode.ios.share</string>' Entitlements/TrollStoreFallback.entitlements >/dev/null
+          grep -F 'CloudCodeShareExtension.appex' scripts/verify_ipa.sh >/dev/null
+          grep -F 'codesign --force --sign - --entitlements Entitlements/TrollStoreFallback.entitlements "$SHARE_APPEX"' .github/workflows/private-trollstore-privileged-ipa.yml >/dev/null
           grep -F 'kSecAttrAccessibleWhenUnlockedThisDeviceOnly' Sources/CloudCodeCore/KeychainAPIKeyVault.swift >/dev/null
           if grep -F 'kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly' Sources/CloudCodeCore/KeychainAPIKeyVault.swift; then
             echo "FAIL: Provider Keys must not remain readable while the device is locked" >&2
@@ -357,7 +441,14 @@ jobs:
             exit 1
           fi
           grep -F 'probeOwnKeychain()' Sources/CloudCodeCore/CapabilityProbe.swift >/dev/null
+          APP_EXECUTABLE="build/DerivedData/Build/Products/Release-iphoneos/CloudCode.app/CloudCode"
+          test -f "$APP_EXECUTABLE"
+          if nm -u "$APP_EXECUTABLE" | grep -E '(^|[[:space:]])_waitpid$'; then
+            echo "FAIL: final CloudCode binary directly binds _waitpid; ios_system.framework can interpose that symbol and spin helper reaping" >&2
+            exit 1
+          fi
           python3 - <<'PY'
+          import re
           from pathlib import Path
 
           capability = Path('Sources/CloudCodeCore/CapabilityProbe.swift').read_text(encoding='utf-8')
@@ -373,8 +464,16 @@ jobs:
                   raise SystemExit(f'FAIL: automatic bootstrap contains privileged/full probe: {forbidden}')
           if 'capabilityProbe.probeStartupSafe()' not in bootstrap:
               raise SystemExit('FAIL: automatic bootstrap must use startup-safe capability probe')
-          if 'TrollStoreGUIBackend(diagnosticLogger: diagnosticLogStore)' not in app or 'GUIFallbackExecutor(backend: guiBackend' not in app:
-              raise SystemExit('FAIL: AppEnvironment is not wired to the runtime GUI backend with diagnostics')
+          for marker in (
+              'let guiBackend = TrollStoreGUIBackend(diagnosticLogger: diagnosticLogStore)',
+              'guiCapabilityProvider: guiBackend',
+              'let gui = GUIFallbackExecutor(',
+              'backend: guiBackend',
+              'executors: [structured, fileShare, interactionLearning, cli, privateApps, urlScheme, gui]',
+              'diagnosticLogger: diagnosticLogStore',
+          ):
+              if marker not in app:
+                  raise SystemExit(f'FAIL: AppEnvironment is not wired to the runtime GUI backend with diagnostics: {marker}')
           if 'GUIFallbackExecutor(backend: UnavailableGUIBackend()' in app:
               raise SystemExit('FAIL: AppEnvironment regressed to the unavailable GUI placeholder')
           refresh = app.split('public func refreshCapabilities()', 1)[1].split('public func refreshFiles()', 1)[0]
@@ -410,6 +509,29 @@ jobs:
           launch = resolver.split('public func launchApplication(bundleID:', 1)[1].split('public func terminateApplication', 1)[0]
           if 'EmbeddedRootHelper.launch(bundleID: bundleID)' not in launch:
               raise SystemExit('FAIL: app launch must execute through the isolated root helper')
+          embedded_launch = adapters.split('static func launch(bundleID:', 1)[1].split('static func probe()', 1)[0]
+          root_launch_marker = 'let privileged = run(["launch", bundleID], privilege: .root, timeout: 6)'
+          accepted_unverified_marker = 'acceptedButUnverified(privileged) || acceptedButUnverified(isolated)'
+          if root_launch_marker not in embedded_launch or accepted_unverified_marker not in embedded_launch:
+              raise SystemExit('FAIL: accepted-but-unverified app launch lost its bounded root/FrontBoard/BackBoard fallback')
+          if embedded_launch.index(root_launch_marker) > embedded_launch.index(accepted_unverified_marker):
+              raise SystemExit('FAIL: app launch can report accepted-unverified before attempting the required root activation fallback')
+          if 'return accepted-unverified immediately' in embedded_launch or '立即交给下一次 fresh screenshot/AX/OCR observation' in embedded_launch:
+              raise SystemExit('FAIL: app launch regressed to the Build127 early-return path that can leave Cloud Code frontmost')
+
+          models = Path('Sources/CloudCodeCore/Models.swift').read_text(encoding='utf-8')
+          if 'public var specializedSkillID: String?' not in models:
+              raise SystemExit('FAIL: specialist skill binding must persist on AgentSession instead of global UI state')
+          app_environment = Path('Sources/CloudCodeApp/AppEnvironment.swift').read_text(encoding='utf-8')
+          for marker in ('openSpecializedConversation(skillID:', 'specializedSkillID: normalized', 'let activeSkillID = initialSession.specializedSkillID', 'selectedSemanticSkillID = visible.specializedSkillID'):
+              if marker not in app_environment:
+                  raise SystemExit(f'FAIL: specialist conversation binding lost marker: {marker}')
+          content_view = Path('Sources/CloudCodeApp/ContentView.swift').read_text(encoding='utf-8')
+          if 'model.selectSemanticSkill(' in content_view or 'private var skillPickerRow' in content_view:
+              raise SystemExit('FAIL: manual per-message skill picker must not return to ordinary chat UI')
+          for marker in ('Section("专项对话")', 'model.openSpecializedConversation(skillID: skill.id)', 'Section("自动能力")', '专项对话 ·'):
+              if marker not in content_view:
+                  raise SystemExit(f'FAIL: specialist conversation/automatic skill UI lost marker: {marker}')
           uninstall = resolver.split('public func uninstallApplication(bundleID:', 1)[1].split('private enum UninstallReconciliation', 1)[0]
           if 'EmbeddedRootHelper.uninstall(bundleID: bundleID' not in uninstall or 'EmbeddedRootHelper.installationState(bundleID: bundleID)' not in uninstall:
               raise SystemExit('FAIL: app uninstall and registration verification must execute through the isolated root helper')
@@ -429,32 +551,59 @@ jobs:
           for marker in ('assertionStillValid', 'sendBool0(assertion, validSelector)', 'if (!assertionStillValid) { break; }'):
               if marker not in background_section:
                   raise SystemExit(f'FAIL: background assertion worker can outlive an invalid BKS assertion: {marker}')
-          for marker in ('enumerate-json', 'probe-filesystem-json', 'probe-launch', 'probe-uninstall', 'is-installed', 'launch', 'uninstall', 'cleanup-unregistered', 'MCMMetadataIdentifier', 'BundleFilesystemOrphans', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-screenshot-file', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-navigate-back', 'gui-type-base64', 'background-assert-worker', 'background-assert-start', 'background-assert-status', 'background-assert-stop', 'BKSProcessAssertion', 'CloudCode.BackgroundAgent'):
+
+          pc_control = Path('Sources/CloudCodeRootHelper/PCControlServer.m').read_text(encoding='utf-8')
+          for marker in ('signal(SIGHUP, SIG_IGN)', 'setsid()', 'poll(&pollFD, 1, 5000)', 'Keep the detached PC-control worker free of BKSProcessAssertion', 'CloudCodePCWriteTokenRecord(token)'):
+              if marker not in pc_control:
+                  raise SystemExit(f'FAIL: PC-control server lost detached guardian-free lifecycle marker: {marker}')
+          for forbidden_pc_guardian in ('CloudCodePCStartBackgroundGuardian', 'CloudCodePCStopBackgroundGuardian', 'CloudCodePCStartBackgroundGuardian(executablePath, getpid())'):
+              if forbidden_pc_guardian in pc_control:
+                  raise SystemExit(f'FAIL: PC-control must not hold a BKSProcessAssertion guardian that can surface the green status indicator: {forbidden_pc_guardian}')
+          for marker in ('#define CLOUDCODE_PC_CONTROL_PROTOCOL 2', 'CloudCodePCReadTokenRecordRaw', 'CloudCodePCExistingTransportAbsent', 'connectError == ECONNREFUSED', 'memchr(responseBytes', 'completeFrame', 'responseDeadline = CloudCodePCMonotonicSeconds() + 1.0', 'poll(&responsePoll, 1, waitMS)', 'existingProtocol != 1', 'CloudCodePCShutdownExisting(existingToken)', 'CloudCodePCAcquireServerMigrationLock', 'flock(fd, LOCK_EX)', 'FD_CLOEXEC', 'stale authenticated worker refused shutdown', 'stale authenticated worker kept the control port after shutdown', 'CLOUDCODE_PC_CONTROL_LAUNCH_TIMEOUT_MS', 'CloudCodePCRunOneShotWithTimeout(executablePath, arguments, CLOUDCODE_PC_CONTROL_LAUNCH_TIMEOUT_MS)'):
+              if marker not in pc_control:
+                  raise SystemExit(f'FAIL: PC-control stale-worker replacement guard missing: {marker}')
+          pc_control_bootstrap = Path('Sources/CloudCodeApp/PCControlBootstrap.swift').read_text(encoding='utf-8')
+          if 'FileManager.default.fileExists(atPath: helperURL.path)' not in pc_control_bootstrap:
+              raise SystemExit('FAIL: PC-control bootstrap no longer accepts TrollStore/System-app helper existence as the bounded spawn preflight')
+          if 'isExecutableFile(atPath: helperURL.path)' in pc_control_bootstrap:
+              raise SystemExit('FAIL: PC-control bootstrap reintroduced Foundation executable-bit gating that false-negatives on TrollStore/System-app installs')
+          for marker in ('enumerate-json', 'probe-filesystem-json', 'probe-launch', 'probe-uninstall', 'probe-ipa-install', 'install-ipa', 'trollstorehelper', 'trollstore-install: verified', 'is-installed', 'launch', 'foreground-diagnostics-file', 'uninstall', 'cleanup-unregistered', 'MCMMetadataIdentifier', 'BundleFilesystem(read-only-discovery)', 'BundlePathForIdentifierFromFilesystem', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-screenshot-file', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-navigate-back', 'gui-type-base64', 'background-assert-worker', 'background-assert-start', 'background-assert-status', 'background-assert-stop', 'BKSProcessAssertion', 'CloudCode.BackgroundAgent'):
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: root helper command missing: {marker}')
-          for marker in ('@"%@.framework/%@"', '@"FBSSystemService", @"FrontBoardServices"', '@"BKSSystemService", @"BackBoardServices"', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'geteuid() != 0', 'foreground verification passed', 'launchservices+frontboard+backboard'):
+          for marker in ('@"%@.framework/%@"', 'SBSLaunchApplicationWithIdentifierAndLaunchOptions', '@"FBSSystemService", @"FrontBoardServices"', '@"BKSSystemService", @"BackBoardServices"', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'BKSApplicationStateMonitor', 'mostElevatedApplicationStateForPID:', 'foregroundRunningObscured', 'ApplicationPIDForBundleIDViaProcessInspection', 'CanonicalVarProcessPath', 'ProcessesUnderBundlePath', 'BackBoardServices.framework/BackBoardServices', 'OpenApplicationOptionKeyUnlockDevice', 'FBSOpenApplicationOptionKeyLSSequenceNumber', 'FBSOpenApplicationOptionKeyLSCacheGUID', 'dispatch_semaphore_wait', 'geteuid() != 0', 'foreground verification passed', 'launchservices+springboard+frontboard+backboard'):
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: app launch lost bounded board-service fallback/foreground verification marker: {marker}')
           bridge = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
-          for marker in ('CLOUDCODE_HELPER_CAPTURE_LIMIT (1024 * 1024)', 'WIFSIGNALED(status)', 'WNOHANG', 'O_NONBLOCK', 'ETIMEDOUT', 'kill(pid, SIGKILL)', 'process reap deferred', 'dispatch_async', 'CloudCodeSpawnHelperInternal', 'stdoutPipe', 'stderrPipe', 'CloudCodeSpawnHelperWithSeparatedOutput', 'helper %@ capture truncated', 'EOVERFLOW'):
+          for marker in ('CLOUDCODE_HELPER_CAPTURE_LIMIT (1024 * 1024)', 'WIFSIGNALED(status)', 'WNOHANG', 'O_NONBLOCK', 'ETIMEDOUT', 'kill(pid, SIGKILL)', 'process reap deferred', 'dispatch_async', 'CloudCodeSpawnHelperInternal', 'stdoutPipe', 'stderrPipe', 'CloudCodeSpawnHelperWithSeparatedOutput', 'helper %@ capture truncated', 'EOVERFLOW', 'CloudCodeDarwinWaitPidFunction', '/usr/lib/libSystem.B.dylib', 'dlsym(handle, "waitpid")', 'dladdr(symbol, &info)', 'ios_system.framework', 'CloudCodeDarwinWaitPid(pid, &status, WNOHANG)', 'CloudCodeDarwinWaitPid(timedOutPID, &reaperStatus, 0)', '--cloudcode-watchdog-ms=', 'CloudCodeRootHelper'):
               if marker not in bridge:
-                  raise SystemExit(f'FAIL: root helper bridge lost timeout/isolation marker: {marker}')
+                  raise SystemExit(f'FAIL: root helper bridge lost timeout/isolation/system-waitpid marker: {marker}')
+          if re.search(r'(?<![A-Za-z0-9_])waitpid\s*\(', bridge):
+              raise SystemExit('FAIL: RootHelperBridge must never bind a direct waitpid call because ios_system.framework exports an incompatible virtual-process waitpid')
           bridge_header = Path('Sources/CloudCodeApp/RootHelperBridge.h').read_text(encoding='utf-8')
           for marker in ('CloudCodeSpawnHelperWithOutput', 'CloudCodeSpawnHelperWithSeparatedOutput'):
               if marker not in bridge_header:
                   raise SystemExit(f'FAIL: bounded helper bridge API is missing: {marker}')
-          if 'run(["enumerate-json"], privilege: .isolatedUser' not in adapters or 'run(["probe-launch"], privilege: .isolatedUser' not in adapters or 'run(["launch", bundleID], privilege: .isolatedUser' not in adapters:
-              raise SystemExit('FAIL: app discovery/launch must use the bounded non-root isolated helper path')
+          if 'runSeparated(["enumerate-json"], privilege: .isolatedUser' not in adapters or 'run(["launch", bundleID], privilege: .isolatedUser' not in adapters:
+              raise SystemExit('FAIL: app discovery/exact launch must use bounded isolated helper paths')
+          if 'run(["probe-launch"], privilege:' in adapters:
+              raise SystemExit('FAIL: no-target LaunchServices capability probe was reintroduced; build 110 proved it can consume the full helper watchdog')
           if 'if isolated.code == 46' not in adapters or 'run(["launch", bundleID], privilege: .root' not in adapters:
               raise SystemExit('FAIL: exact app-launch rejection lost its bounded privileged board-service fallback')
-          if 'cachedLaunchCapability' not in resolver or 'if let cachedLaunchCapability, cachedLaunchCapability.available' not in resolver:
-              raise SystemExit('FAIL: app launch capability lost process-local success caching and may re-probe on every route check')
+          if 'case "apps.launch": return capabilityID == "apps.launch"' not in adapters or 'Launch capability uses exact-operation self-validation' not in resolver:
+              raise SystemExit('FAIL: app launch must stay device-validation-deferred until the exact bundle-scoped operation executes')
           if 'shouldRefreshIndex()' not in resolver or 'failedIndexRetryAfter' not in resolver or 'negativeBundleIDs' not in resolver:
               raise SystemExit('FAIL: installed-app discovery lost cached-index/bounded-refresh guards')
+          for status_signature in ('public func canEnumerateInstalledApps() async -> Bool {', 'public func canUseInstalledAppIndex() async -> Bool {', 'public func installedAppEnumerationDetail() async -> String {'):
+              status_body = resolver.split(status_signature, 1)[1].split('\n    }', 1)[0]
+              if 'refresh()' in status_body:
+                  raise SystemExit(f'FAIL: installed-app capability/status read can trigger a second broad refresh: {status_signature}')
           if 'timeIntervalSince(lastRefresh)' in resolver:
               raise SystemExit('FAIL: installed-app discovery reintroduced the old 30-second full-rescan TTL')
           if 'run(["probe-uninstall", bundleID], privilege: .root' not in adapters or 'run(["terminate", bundlePath], privilege: .root' not in adapters:
               raise SystemExit('FAIL: destructive/root-required app operations lost root helper gating')
+          for marker in ('run(["probe-ipa-install"], privilege: .root', 'run(["install-ipa", path, bundleID, build], privilege: .root', 'case "ipa.install": return capabilityID == "ipa.install"', 'ipaService.inspect(target, allowedRoot: context.allowedRoot)', '安装后 Bundle ID 与 CFBundleVersion 和 IPA 完全匹配'):
+              if marker not in adapters:
+                  raise SystemExit(f'FAIL: TrollStore-backed IPA install/self-update route lost safety marker: {marker}')
           gui_helper = Path('Sources/CloudCodeRootHelper/GUIAutomation.m')
           if not gui_helper.exists():
               raise SystemExit('FAIL: TrollStore GUI helper source is missing')
@@ -466,17 +615,29 @@ jobs:
               raise SystemExit('FAIL: privileged root helper must not expose the retired OCR command')
           if '#import <IOSurface/IOSurface.h>' in gui_text or '-framework IOSurface' in Path('project.yml').read_text(encoding='utf-8'):
               raise SystemExit('FAIL: GUI helper must resolve IOSurface at runtime because the iPhoneOS SDK does not expose IOSurface headers')
-          for marker in ('CLOUDCODE_GUI_MAX_TREE_NODES', 'CLOUDCODE_GUI_MAX_TREE_BYTES', 'CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES', 'CLOUDCODE_GUI_PARENT_INDEX 0u', 'CLOUDCODE_GUI_PARENT_IDENTITY 0u', 'CLOUDCODE_GUI_FINGER_INDEX 2u', 'CLOUDCODE_GUI_FINGER_IDENTITY 2u', 'CLOUDCODE_GUI_SENDER_ID 0x8000000817319371ULL', 'CLOUDCODE_HID_DIGITIZER_ATTRIBUTE', 'CLOUDCODE_HID_FIELD_IS_BUILT_IN 0x4u', 'CLOUDCODE_HID_FIELD_DIGITIZER_DISPLAY_INTEGRATED 0xB0019u', 'eventMask = CLOUDCODE_HID_DIGITIZER_POSITION | CLOUDCODE_HID_DIGITIZER_ATTRIBUTE', 'eventMask = CLOUDCODE_HID_DIGITIZER_TOUCH | CLOUDCODE_HID_DIGITIZER_IDENTITY', 'uint64_t machTime = mach_absolute_time()', 'kCFAllocatorDefault, machTime, 3', 'kCFAllocatorDefault, machTime,', '90.0, range && touching', 'IOHIDEventSystemClientCreate', 'IOHIDEventSystemClientDispatchEvent', 'IOHIDEventSystemConnectionDispatchEvent', 'BKSHIDEventSetDigitizerInfo', '_eventRoutingClientConnectionManager', 'clientForBundleID:', 'clientForTaskPort:', 'contextIdAtPosition:', 'taskPortOfContextId:', 'profile=modern-trollstore route=system-client', 'profile=modern-trollstore route=backboard-bundle', 'profile=modern-trollstore route=backboard-context', 'result=dispatched-unverified', 'return CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route);', 'CloudCodeScreenshotLooksInformative', 'CloudCodeGUIScreenshotFile', 'CloudCode-GUI-', 'writeToFile:normalized options:0', 'rejected low-information frame', '_UICreateScreenUIImage', 'createScreenIOSurface', 'UICreateCGImageFromIOSurface', 'CARenderServerRenderDisplay', 'IOSurfaceCreate', 'IOSurfaceAlignProperty', 'alignProperty(CFSTR("IOSurfaceBytesPerRow"), rawBytesPerRow)', 'alignProperty(CFSTR("IOSurfaceAllocSize"), rawAllocationSize)', 'IOSurfaceAcceleratorCreate', 'IOSurfaceAcceleratorTransferSurface', 'transferSurface(accelerator, renderSurface, copiedSurface, NULL, NULL, NULL, NULL)', 'route=iosurface-accelerator transfer=success', 'IOSurfaceLock', 'IOSurfaceUnlock', 'IOSurfaceGetBaseAddress', 'IOSurfaceGetBytesPerRow', 'CloudCodeResolveAcrossFrameworks', 'ApplicationServices.framework/Frameworks/HIServices.framework/HIServices', 'RTLD_GLOBAL', 'AXUIElementCopyAttributeValue', 'AXUIElementSetAttributeValue', 'AXUIElementCreateSystemWide', '_AXUIElementCreateAppElementWithPid', 'AXUIElementCopyElementAtPosition', 'AXUIElementCopyApplicationAtPosition', 'AXUIElementCopyApplicationAndContextAtPosition', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'SBSCopyDisplayIdentifierForProcessID', 'AXFocusedApplication', 'AXFocusedUIElement', 'AXFocusedElement', 'route=ax-focused-value result=verified', 'route=ax-focused-value result=write-unverified', 'route=hid-unicode result=no-observed-change', 'gui-navigate-back: strategy=%s result=dispatched-semantic-unverified', '[strategy isEqualToString:@"edge"]', '[strategy isEqualToString:@"dismissDown"]', 'AXHitTestSnapshot', 'sampled-topmost-pid-unavailable', 'main-screen-width', 'stage=standalone-sampled-semantics', 'gui-screenshot/render-server:', 'gui-screenshot/uiwindow-iosurface:', 'Keep explicit capability refresh lightweight'):
+          for marker in ('CLOUDCODE_GUI_MAX_TREE_NODES', 'CLOUDCODE_GUI_MAX_TREE_BYTES', 'CLOUDCODE_GUI_MAX_SCREENSHOT_BYTES', 'CLOUDCODE_GUI_PARENT_INDEX 0u', 'CLOUDCODE_GUI_PARENT_IDENTITY 0u', 'CLOUDCODE_GUI_FINGER_INDEX 2u', 'CLOUDCODE_GUI_FINGER_IDENTITY 2u', 'CLOUDCODE_GUI_SENDER_ID 0x8000000817319371ULL', 'CLOUDCODE_HID_DIGITIZER_ATTRIBUTE', 'CLOUDCODE_HID_FIELD_IS_BUILT_IN 0x4u', 'CLOUDCODE_HID_FIELD_DIGITIZER_DISPLAY_INTEGRATED 0xB0019u', 'eventMask = CLOUDCODE_HID_DIGITIZER_POSITION | CLOUDCODE_HID_DIGITIZER_ATTRIBUTE', 'eventMask = CLOUDCODE_HID_DIGITIZER_TOUCH | CLOUDCODE_HID_DIGITIZER_IDENTITY', 'uint64_t machTime = mach_absolute_time()', 'kCFAllocatorDefault, machTime, 3', 'kCFAllocatorDefault, machTime,', '90.0, range && touching', 'IOHIDEventSystemClientCreate', 'IOHIDEventSystemClientDispatchEvent', 'IOHIDEventSystemConnectionDispatchEvent', 'BKSHIDEventSetDigitizerInfo', '_eventRoutingClientConnectionManager', 'clientForBundleID:', 'clientForTaskPort:', 'contextIdAtPosition:', 'taskPortOfContextId:', 'profile=modern-trollstore route=system-client', 'profile=modern-trollstore route=backboard-bundle', 'profile=modern-trollstore route=backboard-context', 'result=dispatched-unverified', 'return CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route);', 'CloudCodeScreenshotLooksInformative', 'CloudCodeGUIScreenshotFile', 'CloudCode-GUI-', 'CloudCodeRenderServerScreenshotAndExit(normalized, NO)', 'CGImageDestinationCreateWithData', 'gui-screenshot/direct: readable-lock success', 'rejected low-information frame', '_UICreateScreenUIImage', 'createScreenIOSurface', 'UICreateCGImageFromIOSurface', 'CARenderServerRenderDisplay', 'IOSurfaceCreate', 'IOSurfaceAlignProperty', 'alignProperty(CFSTR("IOSurfaceBytesPerRow"), rawBytesPerRow)', 'alignProperty(CFSTR("IOSurfaceAllocSize"), rawAllocationSize)', 'IOSurfaceAcceleratorCreate', 'IOSurfaceAcceleratorTransferSurface', 'transferSurface(accelerator, renderSurface, copiedSurface, NULL, NULL, NULL, NULL)', 'route=iosurface-accelerator transfer=success', 'IOSurfaceLock', 'IOSurfaceUnlock', 'IOSurfaceGetBaseAddress', 'IOSurfaceGetBytesPerRow', 'CloudCodeResolveAcrossFrameworks', 'ApplicationServices.framework/Frameworks/HIServices.framework/HIServices', 'RTLD_GLOBAL', 'AXUIElementCopyAttributeValue', 'AXUIElementSetAttributeValue', 'AXUIElementCreateSystemWide', '_AXUIElementCreateAppElementWithPid', 'AXUIElementCopyElementAtPosition', 'AXUIElementCopyApplicationAtPosition', 'AXUIElementCopyApplicationAndContextAtPosition', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'SBSCopyDisplayIdentifierForProcessID', 'AXFocusedApplication', 'AXFocusedUIElement', 'AXFocusedElement', 'gui-type: route=hid-unicode result=dispatched-unverified-no-ax', 'gui-navigate-back: strategy=%s result=dispatched-semantic-unverified', '[strategy isEqualToString:@"edge"]', '[strategy isEqualToString:@"dismissDown"]', 'AXHitTestSnapshot', 'sampled-topmost-pid-unavailable', 'main-screen-width', 'stage=standalone-sampled-semantics', 'gui-screenshot/render-server:', 'gui-screenshot/uiwindow-iosurface:', 'Keep explicit capability refresh lightweight'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: GUI helper lost bounded/runtime marker: {marker}')
-          hid_ready = gui_text.split('static BOOL CloudCodeHIDReady', 1)[1].split('static void CloudCodeReleaseHIDRoute', 1)[0]
+          type_body = gui_text.split('int CloudCodeGUITypeBase64(NSString *base64Text)', 1)[1]
+          for forbidden_type_ax in ('CloudCodeResolveAX(', 'CloudCodeAXCopyFocusedElement(', 'AXUIElementSetAttributeValue', 'AXFocusedUIElement'):
+              if forbidden_type_ax in type_body:
+                  raise SystemExit(f'FAIL: production gui.type escaped AX green-frame quarantine: {forbidden_type_ax}')
+          hid_ready = gui_text.split('static BOOL CloudCodeHIDReady', 1)[1].split('static BOOL CloudCodeHIDTextReady', 1)[0]
           if hid_ready.index('runtime.createClient') > hid_ready.index('CloudCodeResolveBackBoardRouteAtPoint'):
               raise SystemExit('FAIL: modern TrollStore GUI routing must prefer the global IOHID system client before BackBoard fallback')
+          hid_text_ready = gui_text.split('static BOOL CloudCodeHIDTextReady', 1)[1].split('static void CloudCodeReleaseHIDRoute', 1)[0]
+          if 'if (!route || !runtime.createUnicode || !runtime.setInteger) { return NO; }' not in hid_text_ready:
+              raise SystemExit('FAIL: Unicode text HID readiness must be independent of digitizer-only primitives')
+          if 'CloudCodeHIDTextReady(runtime, routingPoint, &route)' not in gui_text or 'BOOL textSymbolsReady = hid.createClient && hid.dispatch && hid.createUnicode && hid.setInteger;' not in gui_text:
+              raise SystemExit('FAIL: gui.type/probe no longer use the text-specific IOHID readiness path')
           if '0x8000000817319375ULL' in gui_text or 'CLOUDCODE_GUI_FALLBACK_SENDER_ID' in gui_text:
               raise SystemExit('FAIL: build53 legacy IOHID sender/profile leaked into build54 GUI helper')
-          for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'run(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'CloudCodeSpawnHelperWithSeparatedOutput', 'runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)', 'runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)', 'result.stdout', 'result.stderr', 'run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)', 'EmbeddedVisionHelper', '["ocr-file", inputURL.path, String(boundedMaximum)]', '全局截图已通过独立 tmp JPEG 通道返回', 'run(["gui-navigate-back", strategy], privilege: .root, timeout: 4)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
+          for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'runSeparated(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'CloudCodeSpawnHelperWithSeparatedOutput', 'runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)', 'runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 1.25)', 'result.stdout', 'result.stderr', 'run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)', 'EmbeddedVisionHelper', '["ocr-file", inputURL.path, String(boundedMaximum), forcePrecise ? "accurate" : "fast"]', '全局截图已通过独立 tmp JPEG 通道返回', 'run(["gui-navigate-back", strategy], privilege: .root, timeout: 4)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
               if marker not in adapters:
                   raise SystemExit(f'FAIL: GUI adapter lost bounded helper marker: {marker}')
+          for marker in ('mayAcceptValidatedReadOnlyPayloadAfterParentTimeout', '已返回精确 helper 协议指纹', 'runSeparated(["probe-filesystem-json"], privilege: .root, timeout: 5)', '不授予共享文件或 unrestricted 写/删权限', '已返回完整可解码的只读 readiness payload', 'AXRuntime tree 已由 non-root AX 路径返回完整可解析 JSON', 'AX focused-text probe 已由 non-root AX 路径返回完整可解码 payload', '全局截图 JPEG 已完整写入并通过格式/大小校验'):
+              if marker not in adapters:
+                  raise SystemExit(f'FAIL: validated read-only helper payload can regress to false failure after parent exit timeout: {marker}')
           gui_executor = adapters.split('public struct GUIFallbackExecutor', 1)[1]
           gui_routing = gui_executor.split('public func execute(', 1)[0]
           if 'DeferredCapabilitySelfValidatingToolExecutor' not in gui_executor or 'allowsDeferredCapabilityAttempt' not in gui_routing:
@@ -497,40 +658,140 @@ jobs:
           for marker in ('GUIElementLookupCache', 'GUIElementResolver.find', 'treeSHA256', 'tree_signature_hit', 'structured element query is ambiguous', 'protected/system-confirmation element cannot be automated', 'gui.openAppObserve', 'gui.findElement', 'gui.waitForElement', 'gui.tapElementObserve', 'gui.typeElementObserve'):
               if marker not in adapters and marker not in Path('Sources/CloudCodeCore/ToolRouter.swift').read_text(encoding='utf-8'):
                   raise SystemExit(f'FAIL: structured UI-tree fast path/cache lost safety marker: {marker}')
-          for marker in ('gui.runStructuredPlan', 'executeStructuredPlan', '1...8 steps', 'every state-changing structured step requires expectQuery', 'structured plan stopped at protected', 'structured plan stopped before a commit/irreversible element', 'replanRequired', 'local_structured_validators_passed_final_semantic_review_required'):
+          for marker in ('gui.runStructuredPlan', 'executeStructuredPlan', '1...8 steps', 'every state-changing structured step requires expectQuery', 'resolveSemanticTarget', 'waitForSemanticTarget', 'forcePrecise: true', 'structured plan stopped at protected', 'structured plan stopped before a commit/irreversible element', 'replanRequired', 'local_structured_validators_passed_final_semantic_review_required'):
               if marker not in gui_executor:
-                  raise SystemExit(f'FAIL: bounded local structured plan lost validation/replan marker: {marker}')
-          if 'let result = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 2.0)' not in adapters:
-              raise SystemExit('FAIL: structured UI-tree must use the bounded mobile AX client path instead of persona-99/root')
+                  raise SystemExit(f'FAIL: bounded local structured plan lost semantic validation/replan marker: {marker}')
+          tool_router_text = Path('Sources/CloudCodeCore/ToolRouter.swift').read_text(encoding='utf-8')
+          structured_descriptor = tool_router_text.split('ToolDescriptor(name: "gui.runStructuredPlan"', 1)[1].split('ToolDescriptor(name: "gui.screenshot"', 1)[0]
+          if 'GUIAutomationFeature.tree.capabilityID' in structured_descriptor:
+              raise SystemExit('FAIL: gui.runStructuredPlan regressed to an AX-tree hard capability dependency')
+          if 'let isolated = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 1.25)' not in adapters or 'let privileged = runSeparated(["gui-tree-json"], privilege: .root, timeout: 0.7)' not in adapters:
+              raise SystemExit('FAIL: structured UI-tree must preserve the bounded mobile AX call plus one passive persona-99 fallback')
+          for marker in ('CloudCodeHostAXTreeJSON(&hostDiagnostic)', 'gui-focused-text-input-json', 'AccessibilityUI/AXAudit', 'isolated helper', 'persona-99 fallback'):
+              if marker not in bridge:
+                  raise SystemExit(f'FAIL: non-root AX bridge lost host -> AXAudit broker -> persona-99 fallback ordering marker: {marker}')
+          host_ax = Path('Sources/CloudCodeApp/HostAXBridge.m').read_text(encoding='utf-8')
+          for marker in ('AXRuntime.host-system-app', 'CLOUDCODE_HOST_AX_TIMEOUT_SECONDS 0.25f', 'CLOUDCODE_HOST_AX_TOTAL_BUDGET_SECONDS 1.20', 'CLOUDCODE_HOST_AX_MAX_NODES 220', 'semanticNodeCount', 'actionableNodeCount', 'AXUIElementCreateApplication', 'AXUIElementCreateSystemWide', '_AXSetRequestingClient', '_AXSAutomationEnabled', 'CloudCodeHostAXObserveAutomationState', 'CloudCodeHostAXAcquireCallLease', 'os_unfair_lock_trylock', 'runtime.setTimeout(element, CLOUDCODE_HOST_AX_TIMEOUT_SECONDS)', 'fail-fast to bounded fallback', 'fail-fast to AXAudit fallback'):
+              if marker not in host_ax:
+                  raise SystemExit(f'FAIL: host AX semantic fast path lost required marker: {marker}')
+          for marker in ('CloudCodeHostAXProbeJSON', 'CCPerceptionProcessEvidence(@"cloudcode_system_app_host_ax_probe")', 'AXFrontBoardFocusedAppPID', 'abi_unverified_after_build122_physical_probe', 'FBSWorkspace', 'numericAttributes', 'userTestingSnapshot', 'contextPidMatchesForeground', 'remoteViewBridgeMarker', 'axRemoteElementMarker', 'axManualAccessibilityTouched'):
+              if marker not in host_ax:
+                  raise SystemExit(f'FAIL: Build123 host-context AX evidence probe lost required marker: {marker}')
+          perception_probe = Path('Sources/CloudCodeApp/PerceptionProbeView.swift').read_text(encoding='utf-8')
+          for marker in ('CloudCodeHostAXProbeJSON', 'withCheckedContinuation', 'DispatchQueue.main.async', 'Thread.isMainThread', 'ax-host', 'ax-detached-control', 'Do not mechanically rerun the 24 old'):
+              if marker not in perception_probe:
+                  raise SystemExit(f'FAIL: physical AX regression no longer forces host-context evidence onto the OS main thread: {marker}')
+          if 'let hostBody = await Task.detached' in perception_probe or 'let hostBody = await MainActor.run' in perception_probe:
+              raise SystemExit('FAIL: AXFrontBoard host probe must use DispatchQueue.main plus Thread.isMainThread; iOS 16.6 traps FrontBoard when MainActor executes off the physical main thread')
+          if 'for seed in ["systemWide", "application", "pid0", "springboard"]' in perception_probe:
+              raise SystemExit('FAIL: physical AX regression reintroduced the already-exhausted 24-group detached matrix')
+          if 'case ocr' not in tool_router_text or 'local OCR must remain independently reportable when AX tree is unavailable' not in Path('Tests/CloudCodeCoreTests/CloudCodeCoreTests.swift').read_text(encoding='utf-8'):
+              raise SystemExit('FAIL: local Vision/OCR capability is no longer independently represented from AX tree')
           if '#define CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS 0.25f' not in gui_text:
               raise SystemExit('FAIL: AX per-request timeout budget must remain fail-fast for detached/mobile AX clients')
-          for marker in ('AXUIElementCopyMultipleAttributeValues', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic', 'CloudCodeAXNodeLimited', 'CloudCodeAXNodeLimited(runtime, candidate, 0, 0, nodeCount)'):
+          for marker in ('AXUIElementCopyMultipleAttributeValues', 'AXUIElementCopyElementWithParameters', 'typedef CloudCodeAXError (*CloudCodeAXCopyElementAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, float, float);', 'runtime.copyElementAtPosition(systemWide, &candidate, (float)points[index].x, (float)points[index].y)', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic', 'CloudCodeAXApplicationAtScreenPointRoot', 'CloudCodeAXParameterizedElementAtPoint', 'CloudCodeAXNodeLimited', 'CloudCodeAXNodeLimited(runtime, candidate, 0, 0, &localNodeCount)', 'semanticNodeCount', 'AccessibilityUI.AXAudit.AXElement', 'initWithIdentifier:serviceBundleName:', 'AXAuditAXUIClientIdentifier', 'AXAuditAXUIService', 'primaryApp', 'explorerElements', 'CloudCodeAXAuditEditingTextElement', 'CLOUDCODE_AX_TRAIT_IS_EDITING', 'CLOUDCODE_AX_TRAIT_SECURE_TEXT_FIELD', 'CFSTR("AXFocused")', 'focusSource=%@', 'Never treat a merely unique text-like element as focused', 'CloudCodePIDForBundleIdentifier'):
               if marker not in gui_text:
-                  raise SystemExit(f'FAIL: AX runtime lost bounded standalone-capability marker: {marker}')
-          if '_AXSSetAutomationEnabled' in gui_text or 'CloudCodeEnableAXAutomationForRequest' in gui_text:
-              raise SystemExit('FAIL: detached AX helper must not mutate the global automation switch; SIGKILL timeout cannot guarantee restoration')
+                  raise SystemExit(f'FAIL: AX runtime lost bounded standalone/context-bound capability marker: {marker}')
+          for forbidden_ax_text_write_marker in ('AccessibilityUI.AXAudit.editing.insertText', 'route=ax-focused-value result=verified', 'route=ax-focused-value result=write-unverified'):
+              if forbidden_ax_text_write_marker in gui_text:
+                  raise SystemExit(f'FAIL: production text input reintroduced AX write path: {forbidden_ax_text_write_marker}')
+          if 'gui-type: route=hid-unicode result=dispatched-unverified-no-ax' not in gui_text:
+              raise SystemExit('FAIL: production gui.type no longer reports unverified no-AX HID dispatch')
+          if '文本输入已通过无 AX 的受控 HID 路径派发；语义结果必须由后续截图/OCR 验证。' not in adapters:
+              raise SystemExit('FAIL: GUI adapter no longer preserves screenshot/OCR postcondition after no-AX HID text dispatch')
+          action_observe = adapters.split('private func executeActionObserve(_ call: ToolCall)', 1)[1].split('private func executeStructuredPlan(_ call: ToolCall)', 1)[0]
+          for marker in ('case "gui.typeObserve":', 'let observed = try await backend.screenshot()', '"effectVerification": "semantic_required"', 'await enrichWithLocalVision(&payload, screenshot: observed)'):
+              if marker not in action_observe:
+                  raise SystemExit(f'FAIL: gui.typeObserve lost local screenshot/OCR semantic postcondition: {marker}')
+          for marker in ('_AXSAutomationEnabled', 'CloudCodeGUIRestoreAXAutomationForProcessExit();', 'automation_lease=%d', 'automation_write=disabled'):
+              if marker not in gui_text:
+                  raise SystemExit(f'FAIL: passive AX automation-state observation path missing required marker: {marker}')
+          if '_AXSSetAutomationEnabled' in gui_text or '_AXSSetAutomationEnabled' in host_ax or 'setAutomationEnabled(' in gui_text or 'setAutomationEnabled(' in host_ax:
+              raise SystemExit('FAIL: foreground-visible system Accessibility Automation writes are forbidden; AX/OCR perception must remain background-only and read-only')
+          for marker in ('CloudCodeResolveAcrossFrameworks(paths, "__AXSetRequestingClient")', 'CloudCodeResolveAcrossFrameworks(paths, "_AXSetRequestingClient")', 'CloudCodeResolveAcrossFrameworks(paths, "AXSetRequestingClient")', '_AXOverrideRequestingClientType', 'requesting_client_prepared=%d', 'requesting_client_write=disabled'):
+              if marker not in gui_text:
+                  raise SystemExit(f'FAIL: passive AX requesting-client diagnostic path missing required marker: {marker}')
+          if 'runtime.setRequestingClient(2)' in gui_text or 'runtime.overrideRequestingClientType(2)' in gui_text or 'runtime.setRequestingClient(2)' in host_ax:
+              raise SystemExit('FAIL: production AX must not actively promote the requesting-client identity; use passive AX or screenshot/OCR fallback')
+          import re
+          if 'AXManualAccessibility' not in gui_text or 'none_passive_read_only' not in gui_text:
+              raise SystemExit('FAIL: passive AX policy marker is missing')
+          if re.search(r'setAttribute\([^;]{0,200}AXManualAccessibility|AXManualAccessibility[^;]{0,200}setAttribute', gui_text, flags=re.S):
+              raise SystemExit('FAIL: AX observation must never mutate AXManualAccessibility in either direction; visible green-frame cleanup must not suppress target semantics')
+          if '@autoreleasepool' in gui_text:
+              raise SystemExit('FAIL: one-shot GUI command reintroduced an inner autorelease teardown before the hard-exit boundary')
+          for visible_overlay_marker in ('CAShapeLayer', 'UIWindow(', 'strokeColor', 'borderColor', 'systemGreen', 'UIColor.green'):
+              if visible_overlay_marker in gui_text:
+                  raise SystemExit(f'FAIL: root GUI perception helper must not draw a visible scan/highlight overlay: {visible_overlay_marker}')
           for marker in ('CloudCodePointSizedScreenshot', 'CGImageGetWidth(backing)', 'CGImageGetHeight(backing)', 'normalize-backing-pixels', 'UIGraphicsBeginImageContextWithOptions(target, YES, 1.0)'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: screenshot backing pixels are no longer normalized into logical GUI point coordinates: {marker}')
+          direct_screenshot = gui_text.split('static __attribute__((noreturn)) void CloudCodeRenderServerScreenshotAndExit', 1)[1].split('static UIImage *CloudCodeScreenshotImageFromRenderServer', 1)[0]
+          if 'pixel-orientation=display-upright-no-extra-flip' not in direct_screenshot:
+              raise SystemExit('FAIL: direct RenderServer screenshot lost its explicit display-upright orientation contract')
+          for forbidden_flip in ('CGContextTranslateCTM(bitmap', 'CGContextScaleCTM(bitmap, 1, -1)'):
+              if forbidden_flip in direct_screenshot:
+                  raise SystemExit(f'FAIL: direct RenderServer screenshot reintroduced an extra vertical flip: {forbidden_flip}')
           vision_helper = Path('Sources/CloudCodeVisionHelper/main.m')
           if not vision_helper.exists():
               raise SystemExit('FAIL: lightweight public Vision OCR helper source is missing')
           vision_text = vision_helper.read_text(encoding='utf-8')
-          for marker in ('cloudcode-vision-helper-protocol=1', 'VNRecognizeTextRequest', 'VNImageRequestHandler', 'usesCPUOnly = cpuOnly', 'preferBackgroundProcessing = YES', 'CloudCodePerformOCR(image, &request, YES', 'vision_helper_public_api', 'CloudCodePerformFastFallbackOCR', 'kCGImageSourceThumbnailMaxPixelSize', 'vision_helper_public_api_fast_thumbnail_fallback', 'ocr-file'):
+          for marker in ('cloudcode-vision-helper-protocol=1', 'VNRecognizeTextRequest', 'VNImageRequestHandler', 'usesCPUOnly = cpuOnly', 'preferBackgroundProcessing = NO', 'CloudCodePerformOCR(primaryImage, &request, YES', 'kCGImageSourceThumbnailMaxPixelSize: @960', 'vision_helper_public_api_fast_thumbnail', 'CloudCodePerformFastFallbackOCR', 'kCGImageSourceThumbnailMaxPixelSize', 'vision_helper_public_api_fast_thumbnail_fallback', 'inputOrientation', 'averageConfidencePercent', 'minimumConfidence', 'maximumConfidence', 'ocr-file', 'CloudCodeRunOneShotVisionCommand', 'objc_autoreleasePoolPush', 'setvbuf(stdout, NULL, _IONBF, 0)', 'setvbuf(stderr, NULL, _IONBF, 0)', '_exit(result)'):
               if marker not in vision_text:
-                  raise SystemExit(f'FAIL: lightweight Vision helper lost public OCR isolation marker: {marker}')
+                  raise SystemExit(f'FAIL: lightweight Vision helper lost public OCR isolation/one-shot marker: {marker}')
+          if '@autoreleasepool' in vision_text or re.search(r'fflush\s*\(', vision_text):
+              raise SystemExit('FAIL: one-shot Vision helper must not enter autorelease/stdout teardown after final OCR output')
           local_vision = Path('Sources/CloudCodeApp/LocalVisionTextObservation.swift').read_text(encoding='utf-8')
-          for marker in ('EmbeddedVisionHelper.guiOCR', 'request.usesCPUOnly = true', 'request.preferBackgroundProcessing = true', 'app_process_vision_cpu_only', 'app_process_vision_fast_thumbnail_fallback', 'kCGImageSourceThumbnailMaxPixelSize'):
+          for marker in ('EmbeddedVisionHelper.guiOCR', 'request.usesCPUOnly = true', 'request.preferBackgroundProcessing = true', 'app_process_vision_cpu_only', 'app_process_vision_cpu_only_thumbnail', 'app_process_vision_fast_thumbnail_fallback', 'primaryMaxDimension', 'kCGImageSourceThumbnailMaxPixelSize', 'UIApplication.shared.applicationState == .active', 'localVisionHostState', 'localVisionInvoked', 'bypassCoreVideoCircuit: true', 'private actor Coordinator', 'localVisionCacheHit', 'localVisionRequestCoalesced', 'forcePrecise', 'precise ? 0.011', 'level == .fast ? 0.020 : 0.018'):
               if marker not in local_vision:
-                  raise SystemExit(f'FAIL: local OCR routing lost background-safe public Vision marker: {marker}')
+                  raise SystemExit(f'FAIL: local OCR routing lost progressive/single-flight/background-safe Vision marker: {marker}')
+          if 'request.minimumTextHeight = 0.009' in local_vision or 'request.minimumTextHeight = 0.009f' in vision_text:
+              raise SystemExit('FAIL: OCR regressed to unconditional full-screen tiny-text recognition')
+          if 'not_invoked_host_not_active' in local_vision:
+              raise SystemExit('FAIL: background OCR must attempt the independent mobile helper')
           if 'EmbeddedRootHelper.guiOCR' in local_vision:
               raise SystemExit('FAIL: local OCR routing regressed back into the privileged/root GUI helper')
+          app_environment = Path('Sources/CloudCodeApp/AppEnvironment.swift').read_text(encoding='utf-8')
+          production_policy = Path('Sources/CloudCodeApp/ProductionPerceptionPolicy.swift').read_text(encoding='utf-8')
+          for marker in ('static let backgroundProcessAssertionAllowed = false', 'backgroundProcessAssertionDisabledReason', 'static let explicitAccessibilityDiagnosticsAllowed = false'):
+              if marker not in production_policy:
+                  raise SystemExit(f'FAIL: production green-indicator quarantine lost policy marker: {marker}')
+          if 'if !ProductionPerceptionPolicy.backgroundProcessAssertionAllowed' not in app_environment:
+              raise SystemExit('FAIL: production background execution can bypass the green-indicator BKS assertion quarantine')
+          perception_probe = Path('Sources/CloudCodeApp/PerceptionProbeView.swift').read_text(encoding='utf-8')
+          for marker in ('if ProductionPerceptionPolicy.backgroundProcessAssertionAllowed', 'let allowAXDiagnostics = axDiagnosticsRequested && ProductionPerceptionPolicy.explicitAccessibilityDiagnosticsAllowed', 'if ProductionPerceptionPolicy.explicitAccessibilityDiagnosticsAllowed'):
+              if marker not in perception_probe:
+                  raise SystemExit(f'FAIL: explicit perception diagnostics can bypass the green-indicator quarantine: {marker}')
+          production_ocr_surface = local_vision + '\n' + app_environment + '\n' + adapters
+          for forbidden_marker in ('AccessibilityAutomationGreenFrameGuard', 'enforceNoLegacyGreenFrameState', 'gui-clear-stale-automation', '_AXSAutomationEnabled', '_AXSSetAutomationEnabled'):
+              if forbidden_marker in production_ocr_surface:
+                  raise SystemExit(f'FAIL: production OCR/bootstrap must not touch private Accessibility Automation state: {forbidden_marker}')
+          root_main = Path('Sources/CloudCodeRootHelper/main.m').read_text(encoding='utf-8')
+          if 'gui-clear-stale-automation' not in root_main or 'Explicit maintenance repair' not in root_main:
+              raise SystemExit('FAIL: legacy green-frame cleanup must remain available only as an explicit one-shot root-helper repair')
+          vision_overlay_surface = local_vision + '\n' + vision_text
+          for visible_overlay_marker in ('CAShapeLayer', 'UIWindow(', 'strokeColor', 'borderColor', 'systemGreen', 'UIColor.green'):
+              if visible_overlay_marker in vision_overlay_surface:
+                  raise SystemExit(f'FAIL: OCR must remain data-only/background-capable and must not render a visible scan box: {visible_overlay_marker}')
+          root_main = Path('Sources/CloudCodeRootHelper/main.m').read_text(encoding='utf-8')
+          for marker in ('CloudCodeRunOneShotCommand', 'objc_autoreleasePoolPush', 'setvbuf(stdout, NULL, _IONBF, 0)', 'setvbuf(stderr, NULL, _IONBF, 0)', '_exit(result)', 'CloudCodeArmOneShotWatchdog', 'self-watchdog deadline reached'):
+              if marker not in root_main:
+                  raise SystemExit(f'FAIL: one-shot root helper can regress to post-result teardown/watchdog latency: {marker}')
+          if re.search(r'fflush\s*\(', root_main + '\n' + gui_text):
+              raise SystemExit('FAIL: one-shot helper must not enter stdio flush paths after private-framework work; build 108 showed even stdout/stderr flush can hang after the final result')
           project_text = Path('project.yml').read_text(encoding='utf-8')
           for marker in ('CloudCodeVisionHelper', 'Sources/CloudCodeVisionHelper/main.m', '-framework ImageIO'):
               if marker not in project_text:
                   raise SystemExit(f'FAIL: lightweight Vision helper is not embedded in the iOS app build: {marker}')
           if 'TSRootBinaries:1 string CloudCodeVisionHelper' in project_text:
-              raise SystemExit('FAIL: public Vision helper must never be declared as a TrollStore root binary')
+              raise SystemExit('FAIL: CloudCodeVisionHelper must not be declared as a TrollStore root binary; it runs as the ordinary mobile user')
+          if "Add :TSRootBinaries:0 string CloudCodeRootHelper" not in project_text:
+              raise SystemExit('FAIL: CloudCodeRootHelper must remain the sole declared TrollStore root binary')
+          if 'root execution is forbidden' not in vision_text:
+              raise SystemExit('FAIL: Vision helper must continue to fail closed under uid/euid 0')
+          bridge_text = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
+          if 'asRoot && [path.lastPathComponent isEqualToString:@"CloudCodeVisionHelper"]' not in bridge_text or 'return -1911;' not in bridge_text:
+              raise SystemExit('FAIL: host bridge must reject root-persona Vision helper spawning')
           provider_client = Path('Sources/CloudCodeCore/ProviderClient.swift').read_text(encoding='utf-8')
           for marker in ('ProviderImageCapability', 'case textOnly = "text_only"', 'providerTinyImageProbeBase64', 'internal_image_capability_probe', 'models_metadata', 'tiny_image_probe', 'providerMessagesWithoutImages', 'providerToolsWithoutFreeCoordinates', 'image_omitted_before_provider_request', 'preferredCapabilityRoute', 'router_preferred_exact_route', 'case status(String)', '厂商正在等待上游 API', '厂商请求过多/触发限流'):
               if marker not in provider_client:
@@ -558,9 +819,13 @@ jobs:
               if marker not in local_perception:
                   raise SystemExit(f'FAIL: local semantic OCR text matcher lost bounded uniqueness marker: {marker}')
           diagnostic_problem = Path('Sources/CloudCodeCore/DiagnosticProblemPackage.swift').read_text(encoding='utf-8')
-          for marker in ('DiagnosticFailureExplanation', 'explainFailure(', 'provider_text_only_local_fallback_missing', 'previousFailureSignature', 'progressObserved', 'recovery_budget_exhausted'):
+          for marker in ('DiagnosticFailureExplanation', 'explainFailure(', 'provider_text_only_local_fallback_missing', 'previousFailureSignature', 'progressObserved', 'recovery_budget_exhausted', 'empty-semantic-tree', 'record.metadata["parentTimeout"] == "true"', 'primaryText.contains("screenshot") && primaryText.contains("failed")', 'corevideo_allocation_failed'):
               if marker not in diagnostic_problem:
                   raise SystemExit(f'FAIL: bounded Agent-facing failure diagnosis lost required marker: {marker}')
+          corevideo_exact = diagnostic_problem.index('record.metadata["localVisionErrorDomain"] == NSOSStatusErrorDomain')
+          generic_ocr_class = diagnostic_problem.index('record.metadata["localVisionFailureClass"]?.isEmpty == false', corevideo_exact)
+          if corevideo_exact > generic_ocr_class:
+              raise SystemExit('FAIL: exact CoreVideo -6662 evidence must outrank generic OCR failure labels')
           tool_router_text = Path('Sources/CloudCodeCore/ToolRouter.swift').read_text(encoding='utf-8')
           for marker in ('diagnostics.explainFailure', 'local_read_only_diagnostics', 'executeFailureExplanation', 'relevantCapabilitiesJSON', 'probableCausesJSON', 'evidenceSummaryJSON'):
               if marker not in tool_router_text:
@@ -577,7 +842,7 @@ jobs:
           for marker in ('automatic_failure_diagnosis', 'diagnosticRecoveryBudgetKey', 'usedRecovery >= 2', 'Automatic recovery budget exhausted', 'name != "diagnostics.explainFailure"', 'localVisionFailureClass', 'localMetricExtraction'):
               if marker not in agent_core:
                   raise SystemExit(f'FAIL: bounded automatic diagnosis/recovery guard lost required marker: {marker}')
-          for marker in ('localVisionFailureClass', 'LocalPerceptionTextMatcher.resolve', 'ocr_target_not_recognized', 'ocr_unique_match_ambiguous', 'requiresText: requestedMetric != nil', 'maximumElements: requestedMetric == nil ? 32 : 48'):
+          for marker in ('localVisionFailureClass', 'LocalPerceptionTextMatcher.resolve', 'ocr_target_not_recognized', 'ocr_unique_match_ambiguous', 'requiresText: requestedMetric != nil', 'maximumElements: requestedMetric == nil ? 32 : 24', 'maximumElements: 48'):
               if marker not in adapters:
                   raise SystemExit(f'FAIL: local OCR semantic failure evidence is no longer preserved: {marker}')
           core_tests = Path('Tests/CloudCodeCoreTests/CloudCodeCoreTests.swift').read_text(encoding='utf-8')
@@ -595,9 +860,9 @@ jobs:
           trollstore_gui = Path('Sources/CloudCodeApp/TrollStoreGUIBackend.swift').read_text(encoding='utf-8')
           if trollstore_gui.count('dispatched-unverified') < 3:
               raise SystemExit('FAIL: TrollStore GUI backend diagnostics reverted to claiming submitted actions as verified success')
-          for marker in ('treeRetryAfter', 'treeFailureCooldown', 'AX tree recently timed out'):
+          for marker in ('treeRetryAfter', 'treeFailureCooldown', 'unknownClientCooldown', 'lastTreeFailureClass', 'if let treeRetryAfter, treeRetryAfter > Date()', 'failureClass == .unknownClient ? unknownClientCooldown : treeFailureCooldown', 'if outcome.foregroundVerified {'):
               if marker not in trollstore_gui:
-                  raise SystemExit(f'FAIL: repeated AX timeout suppression missing: {marker}')
+                  raise SystemExit(f'FAIL: repeated AX failure cooldown/foreground-reset guard missing: {marker}')
           screenshot_adapter = adapters.split('static func guiScreenshot()', 1)[1].split('static func guiTap(', 1)[0]
           for marker in ('gui-screenshot-file', 'FileManager.default.temporaryDirectory', 'CloudCode-GUI-', 'FileManager.default.createFile(atPath: outputURL.path, contents: Data())', 'GUIAutomationPayloadPolicy.isValidScreenshotJPEG(data)'):
               if marker not in screenshot_adapter:
@@ -613,10 +878,10 @@ jobs:
           agent_core = Path('Sources/CloudCodeCore/AgentCore.swift').read_text(encoding='utf-8')
           harness_runtime = Path('Sources/CloudCodeCore/HarnessRuntime.swift').read_text(encoding='utf-8')
           interaction_framework = Path('Sources/CloudCodeCore/Interaction/IOSInteractionFramework.swift').read_text(encoding='utf-8')
-          for marker in ('harness_execution', 'bounded_repeated_swipe', 'gui.swipeSequence', 'boundedRepeatedSwipeCount', 'Never turn this hint into an unbounded loop', 'transient_navigation_return', 'return obligation', 'gui.navigateBack', 'strategy=dismissDown', 'Never treat ordinary video-frame changes as proof that navigation succeeded', 'before locating a text field or typing'):
+          for marker in ('harness_execution', 'bounded_repeated_swipe', 'gui.swipeSequence', 'boundedRepeatedSwipeCount', 'finiteRepeatCompletedCount', 'finite_repeat_complete', 'repeat_remaining', 'must never restart the original full batch', 'device_native_first', 'ipa_native_pipeline', 'apps/container/files/data/plist/json/sqlite', 'ipa.inspect → ipa.extract', 'transient_navigation_return', 'return obligation', 'gui.navigateBack', 'strategy=dismissDown', 'Never treat ordinary video-frame changes as proof that navigation succeeded', 'before locating a text field or typing'):
               if marker not in harness_runtime:
-                  raise SystemExit(f'FAIL: Harness lost bounded GUI execution/navigation compilation marker: {marker}')
-          for marker in ('IOSInteractionFramework', 'IOSInteractionExperienceStore', 'return obligation', 'tabs as peer roots', 'performance hint only', 'Never learn or persist passwords', 'permanent screen coordinates', 'HID constants', 'retentionInterval: TimeInterval = 30 * 24 * 60 * 60', 'attempts >= 3', 'native/system lifecycle', 'accessibility can add certainty', 'remote Vision reasoning', 'gui.runStructuredPlan', 'local accessibility expectation', 'extremeSingleFailure'):
+                  raise SystemExit(f'FAIL: Harness lost bounded GUI/device-native execution compilation marker: {marker}')
+          for marker in ('IOSInteractionFramework', 'IOSInteractionExperienceStore', 'return obligation', 'tabs as peer roots', 'performance hint only', 'Never learn or persist passwords', 'permanent screen coordinates', 'HID constants', 'retentionInterval: TimeInterval = 30 * 24 * 60 * 60', 'attempts >= 3', 'native/system lifecycle', 'localOCR', 'Local OCR is a first-class observation backend', 'accessibility can add certainty', 'remote Vision reasoning', 'gui.runStructuredPlan', 'local semantic expectation', 'extremeSingleFailure'):
               if marker not in interaction_framework:
                   raise SystemExit(f'FAIL: embedded iOS Interaction Framework lost core semantics/learning boundary: {marker}')
           for marker in ('tool.lastGUIScreenshotSHA256', 'tool.guiBeforeStateChangeSHA256', 'tool.lastGUIEffectBeforeSHA256', 'tool.lastGUIEffectAfterSHA256', 'tool.lastGUIEffectScreenChanged', 'guiScreenshotChanged', 'byte-identical to the pre-action screenshot'):
@@ -627,7 +892,7 @@ jobs:
                   raise SystemExit(f'FAIL: Agent lost bounded GUI fast-path/batching/input/navigation policy: {marker}')
           if 'gui-screenshot-base64' in screenshot_adapter or 'Data(base64Encoded:' in screenshot_adapter:
               raise SystemExit('FAIL: screenshot adapter regressed to mixed stdout/stderr base64 transport')
-          approval = adapters.split('public final class ApprovalCenter', 1)[1].split('public struct IOSSystemExecutor', 1)[0]
+          approval = adapters.split('public final class ApprovalCenter', 1)[1].split('public struct IOSPrivateAppExecutor', 1)[0]
           for marker in ('withTaskCancellationHandler', 'continuationID', 'cancelPendingApproval(requestID:', 'finishPendingApproval(returning:'):
               if marker not in approval:
                   raise SystemExit(f'FAIL: approval cancellation-safety marker missing: {marker}')
@@ -690,6 +955,47 @@ jobs:
           for marker in ('lifecycleInterruptedSessionIDs', 'settleLifecycleInterruptedRunsBeforeResume()', 'await agentCore.waitUntilSessionIdle(sessionID)', 'foreground.lifecycle-settle', 'backgroundAssertionWorkerPID', 'prepareForBackgroundTransition()', 'background.assertion.prearm', 'EmbeddedRootHelper.startBackgroundAssertion', 'backgroundAssertionIsAlive', 'background.assertion.continue', 'endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: false)'):
               if marker not in app:
                   raise SystemExit(f'FAIL: same-process background resume synchronization missing: {marker}')
+          for marker in ('appProviderSelfTestTask', 'appProviderSelfTestPackageID', 'hasBackgroundCriticalActivity', 'cancelAppProviderSelfTestForBackground(reason:', '阶段=background_execution'):
+              if marker not in app:
+                  raise SystemExit(f'FAIL: App Provider harmless self-test lost lifecycle/background integration: {marker}')
+          self_test = app.split('public func testAppProvider(packageID:', 1)[1].split('public var selectableSemanticSkills', 1)[0]
+          for marker in ('appProviderSelfTestPackageID = packageID', 'beginBackgroundExecutionIfNeeded()', 'appProviderSelfTestTask = selfTestTask', 'let text = try await selfTestTask.value'):
+              if marker not in self_test:
+                  raise SystemExit(f'FAIL: App Provider harmless self-test lost cancellable execution marker: {marker}')
+          for forbidden in ('runningSessionIDs.insert', 'autoResumeArmedInCurrentProcess = true', 'task.autoResumeUnlessStopped'):
+              if forbidden in self_test:
+                  raise SystemExit(f'FAIL: App Provider harmless self-test must not masquerade as a checkpoint-backed Agent run: {forbidden}')
+          app_provider_runtime = Path('Sources/CloudCodeApp/AppBackedProviderRuntime.swift').read_text(encoding='utf-8')
+          for marker in ('func hasAuthorization(packageID: String)', 'Self.isFirstPartyPackage(package)', 'await authorizationStore.hasAuthorization(packageID: package.summary.id)', 'await authorizationStore.setAuthorized(true, identity: identity, packageID: package.summary.id)'):
+              if marker not in app_provider_runtime:
+                  raise SystemExit(f'FAIL: first-party App Provider authorization no longer migrates across selector/package maintenance revisions: {marker}')
+          runtime_run = app_provider_runtime.split('private func run(', 1)[1].split('private func requireProviderForeground', 1)[0]
+          if 'installationProbe(bundleID:' in runtime_run:
+              raise SystemExit('FAIL: App Provider inference regressed to blocking on non-authoritative TrollStore static installation metadata before exact launch')
+          preflight = app_provider_runtime.split('func preflightStatus(packageID:', 1)[1].split('func setupProbe(packageID:', 1)[0]
+          if preflight.index('if !requireVerifiedExecution') > preflight.index('let installation = await installationProbe'):
+              raise SystemExit('FAIL: harmless App Provider execution preflight waits on static installation metadata before the fast explicit-launch path')
+          for method_name in ('selectProvider(_ providerID:', 'selectKey(_ keySlotID:', 'selectModel(_ model:'):
+              selection = app.split(f'public func {method_name}', 1)[1].split('public func ', 1)[0]
+              if 'selectedProviderBackend = .network' not in selection:
+                  raise SystemExit(f'FAIL: explicit Network Provider selection can leave App Provider routing active: {method_name}')
+          apply_selection = app.split('private func applySelection(_ state: ProviderSelectionState)', 1)[1].split('private func persistProviderSelection()', 1)[0]
+          if 'selectedProviderBackend = .network' not in apply_selection:
+              raise SystemExit('FAIL: reconciled/restored Network Provider selection can leave stale App Provider routing active')
+          adopt_session = app.split('private func adoptSession(_ loaded: AgentSession)', 1)[1].split('private static func sessionTitle', 1)[0]
+          for marker in ('(visible.keySlotID ?? "").isEmpty', 'appProviderPackages.first(where:', 'selectedAppProviderPackageID = package.id', 'applySelection(reconciled)'):
+              if marker not in adopt_session:
+                  raise SystemExit(f'FAIL: session restoration lost deterministic Network/App Provider package restoration: {marker}')
+          if 'selectedProviderBackend = .appBacked' in adopt_session:
+              raise SystemExit('FAIL: reopening a historical App Provider session must not hijack the globally selected inference backend')
+          coordinate_match = app_provider_runtime.split('case .coordinateFallback:', 1)[1].split('if selector.strategy == .axRole', 1)[0]
+          for marker in ('coordinate.deviceClass.caseInsensitiveCompare(observation.deviceClass)', 'coordinate.orientation.caseInsensitiveCompare(observation.orientation)', 'coordinate.appVersion == observation.appVersion', 'abs(coordinate.screenWidth - observation.screenWidth) <= 1', 'abs(coordinate.screenHeight - observation.screenHeight) <= 1'):
+              if marker not in coordinate_match:
+                  raise SystemExit(f'FAIL: App Provider coordinate fallback lost strict runtime applicability guard: {marker}')
+          selector_key = app_provider_runtime.split('private static func selectorKey(_ selector:', 1)[1].split('private static func versionCompatible', 1)[0]
+          for marker in ('coordinate.deviceClass.lowercased()', 'coordinate.orientation.lowercased()', 'coordinate.appVersion', 'String(coordinate.screenWidth)', 'String(coordinate.screenHeight)', 'String(coordinate.x)', 'String(coordinate.y)'):
+              if marker not in selector_key:
+                  raise SystemExit(f'FAIL: coordinate fallback reliability key can collide across maintained selectors: {marker}')
           background_interrupt = app.split('private func interruptActiveRunForBackground(reason:', 1)[1].split('private func settleLifecycleInterruptedRunsBeforeResume()', 1)[0]
           for forbidden in ('activeTasks.removeValue(forKey: sessionID)', 'activeRunTokens.removeValue(forKey: sessionID)', 'runningSessionIDs.remove(sessionID)'):
               if forbidden in background_interrupt:
@@ -714,7 +1020,7 @@ jobs:
           root_tabs = content.split('private struct MoreView', 1)[0]
           if root_tabs.count('.tabItem { Label(') != 5:
               raise SystemExit('FAIL: iPhone root TabView must contain exactly five tabs to avoid UIKit automatic More remapping')
-          for required in ('SettingsView(model: model)', 'MoreView(model: model)', '.tag(RootTab.settings)', '.tag(RootTab.more)'):
+          for required in ('SettingsView(model: model)', 'MoreView(model: model', '.tag(RootTab.settings)', '.tag(RootTab.more)'):
               if required not in root_tabs:
                   raise SystemExit(f'FAIL: stable root navigation marker missing: {required}')
           for forbidden in ('AppsView(model: model)', 'FilesView(model: model)', 'HermesVaultView(model: model)', 'ActivityView(model: model)', 'TrashView(model: model)'):
@@ -736,7 +1042,7 @@ jobs:
                   raise SystemExit(f'FAIL: AgentRouter legacy-Key compatibility seed regressed: {marker}')
           harness = Path('Sources/CloudCodeCore/HarnessRuntime.swift').read_text(encoding='utf-8')
           agent_core = Path('Sources/CloudCodeCore/AgentCore.swift').read_text(encoding='utf-8')
-          for marker in ('currentRequest: String? = nil', 'providerPolicy(for request: String)', 'maxCharacters: 48_000, maxMessages: 40'):
+          for marker in ('currentRequest: String? = nil', 'providerPolicy(for request: String)', 'maxCharacters: 32_000, maxMessages: 24', 'latestExternalUserIndex', 'isCurrentRunMessage'):
               if marker not in harness:
                   raise SystemExit(f'FAIL: current-request GUI harness compression marker missing: {marker}')
           for marker in ('var activeRequest = text.trimmingCharacters', 'func rescopeAfterSteering()', 'policy: HarnessContextManager.providerPolicy(for: activeRequest)'):
@@ -795,6 +1101,15 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Upload UI test evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: CloudCode-iOS-ui-test-evidence
+          path: build/UITests.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Upload test/build diagnostics
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -803,5 +1118,8 @@ jobs:
           path: |
             .build/debug.yaml
             build/DerivedData/Logs
+            build/SimulatorDerivedData/Logs
+            build/UITestDerivedData/Logs
+            build/launch-diagnostics
           if-no-files-found: ignore
           retention-days: 7

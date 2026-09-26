@@ -69,7 +69,7 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
     public func supports(_ tool: ToolDescriptor, capabilities: CapabilityProfile) async -> Bool {
         let supported: Set<String> = [
             "capability.probe", "apps.list", "apps.inspect", "container.resolve", "container.list", "container.search",
-            "files.list", "files.search", "files.read", "files.stat", "files.metadata", "files.hash", "files.diff", "files.copy", "files.move",
+            "files.list", "files.search", "files.read", "files.inspectDocument", "files.stat", "files.metadata", "files.hash", "files.diff", "files.copy", "files.move",
             "plist.read", "plist.query", "plist.metadata",
             "json.read", "json.query", "json.filter", "json.aggregate",
             "sqlite.discover", "sqlite.tables", "sqlite.schema", "sqlite.query", "sqlite.filter", "sqlite.aggregate", "sqlite.sample",
@@ -95,6 +95,25 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
 
         case "apps.list":
             let apps = await appResolver.installedApps()
+            var enumerationFreshness = "fresh"
+            if let enumerationProvider = appResolver as? any AppEnumerationCapabilityProviding {
+                guard await enumerationProvider.canUseInstalledAppIndex() else {
+                    let detail = await enumerationProvider.installedAppEnumerationDetail()
+                    return ToolResult(
+                        toolCallID: call.id,
+                        success: false,
+                        summary: "跨 App 应用索引当前不可用；未将 Cloud Code 自身视为完整安装列表。",
+                        payload: [
+                            "enumeration": "unavailable",
+                            "detail": String(detail.prefix(2_048)),
+                            "ownAppFallbackSuppressed": "true"
+                        ]
+                    )
+                }
+                if !(await enumerationProvider.canEnumerateInstalledApps()) {
+                    enumerationFreshness = "stale_last_known_good"
+                }
+            }
             let query = call.arguments["query"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let filtered: [ResourceNode]
             if query.isEmpty {
@@ -109,6 +128,41 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             let limit = min(50, max(1, Int(call.arguments["limit"] ?? "24") ?? 24))
             let boundedOffset = min(offset, filtered.count)
             let page = filtered.dropFirst(boundedOffset).prefix(limit)
+
+            // A successful installed-App lookup is already enough evidence to establish the target's
+            // stable identity. Persist a minimal AppKnowledge record for the returned page so a later
+            // GUI/native step does not fall back to Cloud Code-only knowledge simply because the model
+            // has not paid for apps.inspect yet. Static metadata/deep links remain lazy and are filled
+            // by apps.inspect; this seed never trusts or persists container UUID paths.
+            if let appKnowledgeRegistry {
+                for app in page {
+                    guard let bundleID = app.ownerBundleID, !bundleID.isEmpty else { continue }
+                    if var existing = await appKnowledgeRegistry.knowledge(for: bundleID) {
+                        var changed = false
+                        if existing.appName != app.displayName {
+                            existing.appName = app.displayName
+                            changed = true
+                        }
+                        let version = app.metadata["version"]
+                        if version?.isEmpty == false, existing.appVersion != version {
+                            existing.appVersion = version
+                            changed = true
+                        }
+                        if changed { try? await appKnowledgeRegistry.upsert(existing) }
+                    } else {
+                        let knowledge = AppKnowledge(
+                            appName: app.displayName,
+                            bundleID: bundleID,
+                            preferredRoutes: [.structuredTool, .privateFramework, .guiFallback],
+                            successRate: 0.5,
+                            estimatedCost: 0.5,
+                            appVersion: app.metadata["version"]
+                        )
+                        try? await appKnowledgeRegistry.upsert(knowledge)
+                    }
+                }
+            }
+
             // apps.list is a discovery/index tool, not a container dump. Return a bounded page and
             // keep bundle/data paths behind apps.inspect/container.resolve. This prevents a device
             // with hundreds of apps from repeatedly injecting the entire inventory into the Agent
@@ -135,16 +189,29 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
                     "matchedCount": String(filtered.count),
                     "offset": String(boundedOffset),
                     "limit": String(limit),
-                    "hasMore": String(hasMore)
+                    "hasMore": String(hasMore),
+                    "enumeration": enumerationFreshness
                 ]
             )
 
         case "apps.inspect":
             guard let bundleID = call.arguments["bundleId"] else { throw ToolRouterError.noExecutionRoute("bundleId missing") }
-            let node = try await resourceResolver.resolve(ResourceID("app://\(bundleID)"))
+            // Prefer the already-indexed identity before paying for another exact helper lookup.
+            // This is especially important after a transient refresh failure: a retained
+            // last-known-good entry still proves that the read-only target is known, even though
+            // fresh enumeration authority is unavailable for destructive operations.
+            let indexedApps = await appResolver.installedApps()
+            let indexedNode = indexedApps.first(where: { $0.ownerBundleID == bundleID })
+            let node: ResourceNode
+            if let indexedNode, indexedNode.resolvedPath != nil {
+                node = indexedNode
+            } else {
+                node = try await resourceResolver.resolve(ResourceID("app://\(bundleID)"))
+            }
             let dataContainer = await appResolver.dataContainerPath(for: bundleID)
             var payload = node.metadata
             payload["bundleId"] = bundleID
+            payload["displayName"] = node.displayName
             payload["bundlePath"] = node.resolvedPath ?? ""
             payload["dataContainer"] = dataContainer ?? ""
 
@@ -208,6 +275,11 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
                     }
                     if !localNodes.isEmpty { try? await resourceIndex.add(localNodes, source: "app_introspection") }
                 }
+            } else {
+                // Metadata enrichment is optional for read-only inspection. Do not translate an
+                // introspection helper timeout/unavailability into "App does not exist" when the
+                // installed-App index already supplied a valid identity/path/version baseline.
+                payload["introspection"] = "degraded_unavailable"
             }
             return try untrustedResult(call.id, summary: "已解析 \(bundleID) 并按需更新 AppKnowledge", key: "app", value: payload, source: "apps.inspect")
 
@@ -283,6 +355,17 @@ public struct StructuredToolExecutor: ToolExecuting, Sendable {
             let text = try fileService.readText(url, allowedRoot: context.allowedRoot)
             let envelope = ToolOutputEnvelope(trust: .untrustedData, source: url.path, content: text)
             return ToolResult(toolCallID: call.id, success: true, summary: "已读取 \(url.lastPathComponent)", payload: ["content": envelope.promptSafeRepresentation])
+
+        case "files.inspectDocument":
+            let url = try requiredURL(call, key: "path")
+            let inspection = try DocumentInspectionService().inspect(url, allowedRoot: context.allowedRoot)
+            return try untrustedResult(
+                call.id,
+                summary: "已在本机解析 \(url.lastPathComponent)（\(inspection.kind)）",
+                key: "document",
+                value: inspection,
+                source: "files.inspectDocument"
+            )
 
         case "files.stat", "files.metadata":
             let url = try requiredURL(call, key: "path")

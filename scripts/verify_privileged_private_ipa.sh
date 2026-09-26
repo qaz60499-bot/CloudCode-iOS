@@ -9,6 +9,19 @@ fi
 
 bash scripts/verify_ipa.sh "$IPA_PATH"
 
+ROOT_HELPER_SOURCE_ENTITLEMENTS="Entitlements/CloudCodeRootHelper.entitlements"
+for key in \
+  'com.apple.springboard.launchapplications' \
+  'com.apple.frontboard.launchapplications' \
+  'com.apple.backboardd.launchapplications' \
+  'com.apple.runningboard.process-state'; do
+  value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$ROOT_HELPER_SOURCE_ENTITLEMENTS" 2>/dev/null || true)"
+  if [[ "$value" != "true" ]]; then
+    echo "FAIL: RootHelper source entitlement missing or false: $key" >&2
+    exit 12
+  fi
+done
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 unzip -q "$IPA_PATH" -d "$TMP_DIR"
@@ -75,13 +88,28 @@ for key in \
   'com.apple.private.security.no-sandbox' \
   'platform-application' \
   'com.apple.private.security.storage.AppDataContainers' \
-  'com.apple.private.persona-mgmt'; do
+  'com.apple.private.persona-mgmt' \
+  'com.apple.accessibility.api'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$ENTITLEMENTS" 2>/dev/null || true)"
   if [[ "$value" != "true" ]]; then
     echo "FAIL: privileged entitlement missing or false: $key" >&2
     exit 11
   fi
 done
+for vision_iokit_key in \
+  'com.apple.security.iokit-user-client-class' \
+  'com.apple.security.exception.iokit-user-client-class'; do
+  for vision_iokit_class in \
+    'AppleJPEGDriverUserClient' \
+    'IOSurfaceRootUserClient' \
+    'AGXDeviceUserClient'; do
+    if ! /usr/libexec/PlistBuddy -c "Print :$vision_iokit_key" "$ENTITLEMENTS" 2>/dev/null | grep -F "$vision_iokit_class" >/dev/null; then
+      echo "FAIL: privileged host is missing local-Vision IOKit entitlement $vision_iokit_key: $vision_iokit_class" >&2
+      exit 11
+    fi
+  done
+done
+
 for helper_only in \
   'com.apple.multitasking.unlimitedassertions' \
   'com.apple.hid.system.server-access' \
@@ -90,7 +118,6 @@ for helper_only in \
   'com.apple.private.hid.client.event-monitor' \
   'com.apple.private.hid.client.service-protected' \
   'com.apple.private.hid.manager.client' \
-  'com.apple.accessibility.api' \
   'com.apple.QuartzCore.cache-asynchronous' \
   'com.apple.QuartzCore.displayable-context' \
   'com.apple.QuartzCore.global-capture' \
@@ -99,8 +126,10 @@ for helper_only in \
   'com.apple.QuartzCore.system-layers' \
   'com.apple.private.IOSurface.protected-access' \
   'com.apple.backboard.client' \
+  'com.apple.springboard.launchapplications' \
   'com.apple.frontboard.launchapplications' \
-  'com.apple.backboardd.launchapplications'; do
+  'com.apple.backboardd.launchapplications' \
+  'com.apple.runningboard.process-state'; do
   if /usr/libexec/PlistBuddy -c "Print :$helper_only" "$ENTITLEMENTS" >/dev/null 2>&1; then
     echo "FAIL: GUI-only entitlement leaked onto SwiftUI host: $helper_only" >&2
     exit 11
@@ -119,6 +148,19 @@ done
 test "$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$ENTITLEMENTS")" = 'TROLLTROLL.*'
 test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$ENTITLEMENTS")" = 'TROLLTROLL'
 /usr/libexec/PlistBuddy -c 'Print :keychain-access-groups:0' "$ENTITLEMENTS" | grep -F 'TROLLTROLL.*' >/dev/null
+/usr/libexec/PlistBuddy -c 'Print :com.apple.security.application-groups' "$ENTITLEMENTS" | grep -F 'group.com.cloudcode.ios.share' >/dev/null
+
+SHARE_APPEX="$APP_PATH/PlugIns/CloudCodeShareExtension.appex"
+SHARE_INFO="$SHARE_APPEX/Info.plist"
+SHARE_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$SHARE_INFO")"
+test -f "$SHARE_APPEX/$SHARE_EXECUTABLE"
+codesign --verify "$SHARE_APPEX"
+SHARE_ENTITLEMENTS="$TMP_DIR/share-extension-entitlements.plist"
+codesign -d --entitlements :- "$SHARE_APPEX" > "$SHARE_ENTITLEMENTS" 2>/dev/null
+plutil -lint "$SHARE_ENTITLEMENTS" >/dev/null
+test "$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$SHARE_ENTITLEMENTS")" = 'TROLLTROLL.*'
+test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$SHARE_ENTITLEMENTS")" = 'TROLLTROLL'
+/usr/libexec/PlistBuddy -c 'Print :com.apple.security.application-groups' "$SHARE_ENTITLEMENTS" | grep -F 'group.com.cloudcode.ios.share' >/dev/null
 
 HELPER="$APP_PATH/CloudCodeRootHelper"
 VISION_HELPER="$APP_PATH/CloudCodeVisionHelper"
@@ -132,22 +174,69 @@ if ! strings "$VISION_HELPER" | grep -Fq 'cloudcode-vision-helper-protocol=1'; t
   echo "FAIL: CloudCodeVisionHelper protocol marker missing" >&2
   exit 12
 fi
-VISION_ENTITLEMENTS="$(ldid -e "$VISION_HELPER" 2>/dev/null || true)"
-for forbidden_vision_entitlement in 'platform-application' 'com.apple.private.persona-mgmt' 'com.apple.accessibility.api' 'com.apple.private.hid.client.event-dispatch'; do
-  if grep -Fq "$forbidden_vision_entitlement" <<<"$VISION_ENTITLEMENTS"; then
-    echo "FAIL: lightweight Vision helper unexpectedly carries privileged entitlement: $forbidden_vision_entitlement" >&2
+VISION_ENTITLEMENTS="$TMP_DIR/vision-helper-entitlements.plist"
+ldid -e "$VISION_HELPER" > "$VISION_ENTITLEMENTS"
+plutil -lint "$VISION_ENTITLEMENTS" >/dev/null
+for required_vision_entitlement in \
+  'get-task-allow' \
+  'com.apple.private.security.no-sandbox' \
+  'platform-application' \
+  'com.apple.private.security.storage.AppDataContainers'; do
+  value="$(/usr/libexec/PlistBuddy -c "Print :$required_vision_entitlement" "$VISION_ENTITLEMENTS" 2>/dev/null || true)"
+  if [[ "$value" != "true" ]]; then
+    echo "FAIL: Vision helper System-app execution entitlement missing or false: $required_vision_entitlement" >&2
     exit 12
   fi
 done
+test "$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$VISION_ENTITLEMENTS")" = 'TROLLTROLL.*'
+test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$VISION_ENTITLEMENTS")" = 'TROLLTROLL'
+vision_container_required="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.private.security.container-required' "$VISION_ENTITLEMENTS" 2>/dev/null || true)"
+if [[ "$vision_container_required" != "false" ]]; then
+  echo "FAIL: Vision helper must remain a no-container mobile child" >&2
+  exit 12
+fi
+for forbidden_vision_entitlement in 'com.apple.private.persona-mgmt' 'com.apple.accessibility.api' 'com.apple.private.hid.client.event-dispatch'; do
+  if /usr/libexec/PlistBuddy -c "Print :$forbidden_vision_entitlement" "$VISION_ENTITLEMENTS" >/dev/null 2>&1; then
+    echo "FAIL: Vision helper unexpectedly carries root/AX/HID entitlement: $forbidden_vision_entitlement" >&2
+    exit 12
+  fi
+done
+for vision_iokit_key in 'com.apple.security.iokit-user-client-class' 'com.apple.security.exception.iokit-user-client-class'; do
+  for vision_iokit_class in 'AppleJPEGDriverUserClient' 'IOSurfaceRootUserClient' 'AGXDeviceUserClient'; do
+    if ! /usr/libexec/PlistBuddy -c "Print :$vision_iokit_key" "$VISION_ENTITLEMENTS" 2>/dev/null | grep -F "$vision_iokit_class" >/dev/null; then
+      echo "FAIL: lightweight Vision helper is missing IOKit client $vision_iokit_key: $vision_iokit_class" >&2
+      exit 12
+    fi
+  done
+done
 codesign --verify "$VISION_HELPER"
+VISION_CODESIGN_ENTITLEMENTS="$TMP_DIR/vision-helper-codesign-entitlements.plist"
+codesign -d --entitlements :- "$VISION_HELPER" > "$VISION_CODESIGN_ENTITLEMENTS" 2>/dev/null
+plutil -lint "$VISION_CODESIGN_ENTITLEMENTS" >/dev/null
+for required_vision_entitlement in 'get-task-allow' 'com.apple.private.security.no-sandbox' 'platform-application' 'com.apple.private.security.storage.AppDataContainers'; do
+  value="$(/usr/libexec/PlistBuddy -c "Print :$required_vision_entitlement" "$VISION_CODESIGN_ENTITLEMENTS" 2>/dev/null || true)"
+  if [[ "$value" != "true" ]]; then
+    echo "FAIL: final Vision helper code signature entitlement missing or false: $required_vision_entitlement" >&2
+    exit 12
+  fi
+done
+for vision_iokit_key in 'com.apple.security.iokit-user-client-class' 'com.apple.security.exception.iokit-user-client-class'; do
+  for vision_iokit_class in 'AppleJPEGDriverUserClient' 'IOSurfaceRootUserClient' 'AGXDeviceUserClient'; do
+    if ! /usr/libexec/PlistBuddy -c "Print :$vision_iokit_key" "$VISION_CODESIGN_ENTITLEMENTS" 2>/dev/null | grep -F "$vision_iokit_class" >/dev/null; then
+      echo "FAIL: final Vision helper code signature is missing IOKit client $vision_iokit_key: $vision_iokit_class" >&2
+      exit 12
+    fi
+  done
+done
 HELPER_ENTITLEMENTS="$TMP_DIR/root-helper-entitlements.plist"
 ldid -e "$HELPER" > "$HELPER_ENTITLEMENTS"
 plutil -lint "$HELPER_ENTITLEMENTS" >/dev/null
 HELPER_CODESIGN_ENTITLEMENTS="$TMP_DIR/root-helper-codesign-entitlements.plist"
 codesign -d --entitlements :- "$HELPER" > "$HELPER_CODESIGN_ENTITLEMENTS" 2>/dev/null
 plutil -lint "$HELPER_CODESIGN_ENTITLEMENTS" >/dev/null
-# The helper has a dedicated privilege profile: keep GUI-only accessibility/capture
-# entitlements off the SwiftUI host and verify them only on the crash-isolated root helper.
+# The helper keeps HID/capture privileges isolated. Build 121 intentionally shares only
+# com.apple.accessibility.api with the System-app host so semantic AX reads do not depend on an
+# anonymous one-shot helper identity.
 for key in \
   'com.apple.private.security.no-sandbox' \
   'platform-application' \
@@ -179,8 +268,10 @@ for key in \
   'com.apple.QuartzCore.system-layers' \
   'com.apple.private.IOSurface.protected-access' \
   'com.apple.backboard.client' \
+  'com.apple.springboard.launchapplications' \
   'com.apple.frontboard.launchapplications' \
-  'com.apple.backboardd.launchapplications'; do
+  'com.apple.backboardd.launchapplications' \
+  'com.apple.runningboard.process-state'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$HELPER_ENTITLEMENTS" 2>/dev/null || true)"
   if [[ "$value" != "true" ]]; then
     echo "FAIL: root helper entitlement missing or false: $key" >&2
@@ -197,8 +288,10 @@ for key in \
   'com.apple.private.hid.manager.client' \
   'com.apple.QuartzCore.global-capture' \
   'com.apple.private.IOSurface.protected-access' \
+  'com.apple.springboard.launchapplications' \
   'com.apple.frontboard.launchapplications' \
-  'com.apple.backboardd.launchapplications'; do
+  'com.apple.backboardd.launchapplications' \
+  'com.apple.runningboard.process-state'; do
   value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$HELPER_CODESIGN_ENTITLEMENTS" 2>/dev/null || true)"
   if [[ "$value" != "true" ]]; then
     echo "FAIL: final root helper code signature entitlement missing or false: $key" >&2

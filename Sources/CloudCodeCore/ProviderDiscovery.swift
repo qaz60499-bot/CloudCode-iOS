@@ -43,12 +43,19 @@ public struct ProviderDiscoveryClient: Sendable {
         var sawAuthoritativeEmptyCatalog = false
         var sawReachableUnparseableCatalog = false
         var authModes = [ProviderAuthMode.bearer, .xAPIKey, .both]
-        if let preferredAuthMode {
-            authModes.removeAll { $0.rawValue == preferredAuthMode.rawValue }
-            authModes.insert(preferredAuthMode, at: 0)
-        }
-        if !allowAlternateAuthModes {
-            authModes = [preferredAuthMode ?? .bearer]
+        if ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL) {
+            // The official Gemini native API uses x-goog-api-key. Keep discovery on the same wire
+            // contract as runtime so a valid key is not rejected only because the compatibility
+            // endpoint happens to behave differently.
+            authModes = [.xAPIKey]
+        } else {
+            if let preferredAuthMode {
+                authModes.removeAll { $0.rawValue == preferredAuthMode.rawValue }
+                authModes.insert(preferredAuthMode, at: 0)
+            }
+            if !allowAlternateAuthModes {
+                authModes = [preferredAuthMode ?? .bearer]
+            }
         }
 
         // Catalog auth and inference auth are deliberately independent. Some compatible
@@ -202,13 +209,20 @@ public struct ProviderDiscoveryClient: Sendable {
         let models = discoveredCatalog.models
         let protocolsToProbe = Self.uniqueProtocols(inferenceProtocols)
 
-        // Model catalogs from compatible gateways can mix chat, image, embedding,
-        // and legacy entries. Do not assume the first row is inference-compatible.
-        // Probe a bounded prefix under each inference auth mode and only the protocols
-        // this profile actually advertises, keeping validation bounded and fast.
+        // A user-supplied model is stronger inference-routing evidence than catalog order. Official
+        // catalogs can mix chat, image, embedding, and legacy entries, so probing only the first
+        // catalog rows can falsely reject a known-good manually configured model. Keep the work
+        // bounded, but try explicit candidates first and then fill the same 12-model budget from
+        // the live catalog. A candidate is still accepted only after a real inference response.
+        let inferenceCandidates = Self.inferenceCandidates(
+            fallbackInferenceCandidates: fallbackInferenceCandidates,
+            catalogModels: models,
+            baseURL: baseURL,
+            limit: 12
+        )
         var capacityBlockedAuthMode: ProviderAuthMode?
         for inferenceAuthMode in authModes {
-            for model in models.prefix(12) {
+            for model in inferenceCandidates {
                 var supported: [ProviderProtocol] = []
                 for protocolName in protocolsToProbe {
                     switch try await probe(protocolName, baseURL: baseURL, apiKey: apiKey, authMode: inferenceAuthMode, model: model) {
@@ -250,12 +264,22 @@ public struct ProviderDiscoveryClient: Sendable {
     }
 
     public func discoverModels(baseURL: URL, apiKey: String, authMode: ProviderAuthMode = .bearer) async throws -> [String] {
-        let url = try ProviderEndpoint.endpoint(baseURL: baseURL, path: "models")
+        let isOfficialGemini = ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL)
+        let url: URL
+        if isOfficialGemini {
+            url = ProviderEndpointPolicy.geminiNativeModelsURL()
+        } else {
+            url = try ProviderEndpoint.endpoint(baseURL: baseURL, path: "models")
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        ProviderCompatibilityHeaders.apply(to: &request)
-        applyAuth(apiKey, mode: authMode, request: &request)
+        if isOfficialGemini {
+            request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        } else {
+            ProviderCompatibilityHeaders.apply(to: &request)
+            applyAuth(apiKey, mode: authMode, request: &request)
+        }
         request.timeoutInterval = 30
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw ProviderError.transport("缺少 HTTP 响应") }
@@ -263,7 +287,11 @@ public struct ProviderDiscoveryClient: Sendable {
         guard let rawObject = try? JSONSerialization.jsonObject(with: data),
               let object = rawObject as? [String: Any],
               let catalog = object["data"] ?? object["models"] else { throw ProviderError.malformedEvent }
-        return Self.extractModelIdentifiers(from: catalog)
+        var models = Self.extractModelIdentifiers(from: catalog)
+        if ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL) {
+            models = models.map { $0.hasPrefix("models/") ? String($0.dropFirst(7)) : $0 }
+        }
+        return models
     }
 
     private func discoverModelsFromPricing(
@@ -343,6 +371,53 @@ public struct ProviderDiscoveryClient: Sendable {
         return values.filter { !$0.isEmpty && seen.insert($0).inserted }
     }
 
+    static func inferenceCandidates(
+        fallbackInferenceCandidates: [String],
+        catalogModels: [String],
+        baseURL: URL,
+        limit: Int
+    ) -> [String] {
+        let boundedLimit = max(1, limit)
+        let explicit = unique(fallbackInferenceCandidates)
+        let explicitSet = Set(explicit)
+        let catalog = unique(catalogModels).filter { !explicitSet.contains($0) }
+        guard baseURL.host?.lowercased() == "generativelanguage.googleapis.com" else {
+            return Array((explicit + catalog).prefix(boundedLimit))
+        }
+
+        // Google's OpenAI-compatible /models catalog contains text-generation models alongside
+        // embeddings, image/video generation, TTS/audio and other specialized endpoints. Probing
+        // only the first catalog rows can therefore reject a perfectly valid Gemini API key before
+        // reaching a chat-capable model. Preserve any user-supplied model at the front, then rank
+        // the live Google catalog toward Gemini text-generation models. The catalog remains the
+        // authority: this never invents a model id that Google did not return.
+        func score(_ model: String) -> Int {
+            let value = model.lowercased()
+            var result = 0
+            if value.contains("gemini-3-flash-preview") { result += 600 }
+            if value.contains("gemini-3.8-flash") { result += 500 }
+            if value.contains("gemini") { result += 180 }
+            if value.contains("flash") { result += 60 }
+            if value.contains("pro") { result += 35 }
+            if value.contains("lite") { result += 10 }
+
+            let nonChatMarkers = [
+                "embedding", "embed", "imagen", "image-generation", "image_generation",
+                "veo", "tts", "text-to-speech", "audio", "aqa", "robotics", "computer-use"
+            ]
+            if nonChatMarkers.contains(where: { value.contains($0) }) { result -= 400 }
+            return result
+        }
+
+        let rankedCatalog = catalog.enumerated().sorted { lhs, rhs in
+            let leftScore = score(lhs.element)
+            let rightScore = score(rhs.element)
+            if leftScore != rightScore { return leftScore > rightScore }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+        return Array((explicit + rankedCatalog).prefix(boundedLimit))
+    }
+
     private static func uniqueProtocols(_ values: [ProviderProtocol]) -> [ProviderProtocol] {
         var seen = Set<String>()
         return values.filter { seen.insert($0.rawValue).inserted }
@@ -411,25 +486,40 @@ public struct ProviderDiscoveryClient: Sendable {
     private func probe(_ protocolName: ProviderProtocol, baseURL: URL, apiKey: String, authMode: ProviderAuthMode, model: String) async throws -> ProbeOutcome {
         let path: String
         let body: [String: Any]
+        let isOfficialGemini = ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL)
         switch protocolName {
         case .anthropic:
             path = "messages"
             body = ["model": model, "max_tokens": 1, "stream": false, "messages": [["role": "user", "content": "Reply OK"]]]
         case .openAIChat:
-            path = "chat/completions"
-            body = ["model": model, "max_tokens": 1, "stream": false, "messages": [["role": "user", "content": "Reply OK"]]]
+            if isOfficialGemini {
+                path = ""
+                body = ["contents": [["role": "user", "parts": [["text": "Reply OK"]]]]]
+            } else {
+                path = "chat/completions"
+                body = ["model": model, "max_tokens": 1, "stream": false, "messages": [["role": "user", "content": "Reply OK"]]]
+            }
         case .openAIResponses:
             path = "responses"
             body = ["model": model, "max_output_tokens": 1, "stream": false, "input": "Reply OK"]
         }
-        let url = try ProviderEndpoint.endpoint(baseURL: baseURL, path: path)
+        let url: URL
+        if isOfficialGemini && protocolName == .openAIChat {
+            url = try ProviderEndpointPolicy.geminiNativeGenerateURL(model: model, streaming: false)
+        } else {
+            url = try ProviderEndpoint.endpoint(baseURL: baseURL, path: path)
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        ProviderCompatibilityHeaders.apply(to: &request)
-        if protocolName == .anthropic { request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version") }
-        applyAuth(apiKey, mode: authMode, request: &request)
+        if isOfficialGemini && protocolName == .openAIChat {
+            request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        } else {
+            ProviderCompatibilityHeaders.apply(to: &request)
+            if protocolName == .anthropic { request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version") }
+            applyAuth(apiKey, mode: authMode, request: &request)
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         request.timeoutInterval = 30
         do {
@@ -479,7 +569,7 @@ public struct ProviderDiscoveryClient: Sendable {
             }
             return false
         case .openAIChat:
-            return dictionary["choices"] is [Any]
+            return dictionary["choices"] is [Any] || dictionary["candidates"] is [Any]
         case .openAIResponses:
             if dictionary["output"] is [Any] || dictionary["output_text"] is String { return true }
             if let type = dictionary["type"] as? String { return type.hasPrefix("response.") || type == "response" }
