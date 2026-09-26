@@ -151,7 +151,7 @@ typedef struct {
     BOOL usesBundleRoute;
 } CloudCodeHIDRoute;
 
-static NSString *CloudCodeFrontmostBundleID(void);
+NSString *CloudCodeFrontmostBundleID(void);
 
 typedef struct {
     void *handle;
