@@ -32,12 +32,13 @@ extension CloudCodeViewModel {
                 await recordPerceptionProbe(id: runID, stage: stage, json: String(data: data, encoding: .utf8) ?? "{}")
             }
             await record("begin", ["build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "", "pid": getpid()])
-            let assertion: (workerPID: Int32?, detail: String)
-            if ProductionPerceptionPolicy.backgroundProcessAssertionAllowed {
-                assertion = await Task.detached { EmbeddedRootHelper.startBackgroundAssertion(targetPID: getpid()) }.value
-            } else {
-                assertion = (nil, ProductionPerceptionPolicy.backgroundProcessAssertionDisabledReason)
-            }
+            // Explicit perception/OCR diagnostics must never borrow the Agent-only background
+            // assertion. The old diagnostic guardian was one of the paths that could leave the
+            // user-visible green system indicator behind on this iOS 16.6 device.
+            let assertion: (workerPID: Int32?, detail: String) = (
+                nil,
+                "Privileged background assertion is reserved for a real checkpoint-backed Agent run."
+            )
             await record("assertion", ["workerPID": assertion.workerPID ?? 0, "detail": assertion.detail])
             let launch = await Task.detached { EmbeddedRootHelper.launch(bundleID: "com.tencent.xin") }.value
             await record("launch", ["accepted": launch.accepted, "foregroundVerified": launch.foregroundVerified, "detail": launch.detail])

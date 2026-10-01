@@ -570,7 +570,7 @@ jobs:
           for marker in ('enumerate-json', 'probe-filesystem-json', 'probe-launch', 'probe-uninstall', 'probe-ipa-install', 'install-ipa', 'trollstorehelper', 'trollstore-install: verified', 'is-installed', 'launch', 'foreground-diagnostics-file', 'uninstall', 'cleanup-unregistered', 'MCMMetadataIdentifier', 'BundleFilesystem(read-only-discovery)', 'BundlePathForIdentifierFromFilesystem', 'gui-probe-json', 'gui-tree-json', 'gui-screenshot-base64', 'gui-screenshot-file', 'gui-tap', 'gui-swipe', 'gui-scroll', 'gui-navigate-back', 'gui-type-base64', 'background-assert-worker', 'background-assert-start', 'background-assert-status', 'background-assert-stop', 'BKSProcessAssertion', 'CloudCode.BackgroundAgent'):
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: root helper command missing: {marker}')
-          for marker in ('@"%@.framework/%@"', 'SBSLaunchApplicationWithIdentifierAndLaunchOptions', '@"FBSSystemService", @"FrontBoardServices"', '@"BKSSystemService", @"BackBoardServices"', 'SBSCopyFrontmostApplicationDisplayIdentifier', 'BKSApplicationStateMonitor', 'mostElevatedApplicationStateForPID:', 'foregroundRunningObscured', 'ApplicationPIDForBundleIDViaProcessInspection', 'CanonicalVarProcessPath', 'ProcessesUnderBundlePath', 'BackBoardServices.framework/BackBoardServices', 'OpenApplicationOptionKeyUnlockDevice', 'FBSOpenApplicationOptionKeyLSSequenceNumber', 'FBSOpenApplicationOptionKeyLSCacheGUID', 'dispatch_semaphore_wait', 'geteuid() != 0', 'foreground verification passed', 'launchservices+springboard+frontboard+backboard'):
+          for marker in ('@"%@.framework/%@"', 'SBSLaunchApplicationWithIdentifierAndLaunchOptions', '@"FBSSystemService", @"FrontBoardServices"', '@"BKSSystemService", @"BackBoardServices"', 'CloudCodeFrontmostBundleID', 'BKSApplicationStateMonitor', 'mostElevatedApplicationStateForPID:', 'foregroundRunningObscured', 'ApplicationPIDForBundleIDViaProcessInspection', 'CanonicalVarProcessPath', 'ProcessesUnderBundlePath', 'BackBoardServices.framework/BackBoardServices', 'OpenApplicationOptionKeyUnlockDevice', 'FBSOpenApplicationOptionKeyLSSequenceNumber', 'FBSOpenApplicationOptionKeyLSCacheGUID', 'dispatch_semaphore_wait', 'geteuid() != 0', 'foreground verification passed', 'launchservices+springboard+frontboard+backboard'):
               if marker not in helper_text:
                   raise SystemExit(f'FAIL: app launch lost bounded board-service fallback/foreground verification marker: {marker}')
           bridge = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
@@ -753,15 +753,18 @@ jobs:
               raise SystemExit('FAIL: local OCR routing regressed back into the privileged/root GUI helper')
           app_environment = Path('Sources/CloudCodeApp/AppEnvironment.swift').read_text(encoding='utf-8')
           production_policy = Path('Sources/CloudCodeApp/ProductionPerceptionPolicy.swift').read_text(encoding='utf-8')
-          for marker in ('static let backgroundProcessAssertionAllowed = false', 'backgroundProcessAssertionDisabledReason', 'static let explicitAccessibilityDiagnosticsAllowed = false'):
+          for marker in ('static let backgroundProcessAssertionAllowed = true', 'backgroundProcessAssertionDisabledReason', 'static let explicitAccessibilityDiagnosticsAllowed = false'):
               if marker not in production_policy:
-                  raise SystemExit(f'FAIL: production green-indicator quarantine lost policy marker: {marker}')
-          if 'if !ProductionPerceptionPolicy.backgroundProcessAssertionAllowed' not in app_environment:
-              raise SystemExit('FAIL: production background execution can bypass the green-indicator BKS assertion quarantine')
+                  raise SystemExit(f'FAIL: production Agent/background or green-indicator policy marker missing: {marker}')
+          for marker in ('guard acquirePrivilegedAssertion, isRunning else { return }', 'beginBackgroundExecutionIfNeeded(acquirePrivilegedAssertion: false)', 'beginBackgroundExecutionIfNeeded(acquirePrivilegedAssertion: true)', 'endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: true)', 'if !ProductionPerceptionPolicy.backgroundProcessAssertionAllowed'):
+              if marker not in app_environment:
+                  raise SystemExit(f'FAIL: Agent-only bounded background assertion lifecycle marker missing: {marker}')
           perception_probe = Path('Sources/CloudCodeApp/PerceptionProbeView.swift').read_text(encoding='utf-8')
-          for marker in ('if ProductionPerceptionPolicy.backgroundProcessAssertionAllowed', 'let allowAXDiagnostics = axDiagnosticsRequested && ProductionPerceptionPolicy.explicitAccessibilityDiagnosticsAllowed', 'if ProductionPerceptionPolicy.explicitAccessibilityDiagnosticsAllowed'):
+          for marker in ('Privileged background assertion is reserved for a real checkpoint-backed Agent run.', 'let allowAXDiagnostics = axDiagnosticsRequested && ProductionPerceptionPolicy.explicitAccessibilityDiagnosticsAllowed', 'if ProductionPerceptionPolicy.explicitAccessibilityDiagnosticsAllowed'):
               if marker not in perception_probe:
-                  raise SystemExit(f'FAIL: explicit perception diagnostics can bypass the green-indicator quarantine: {marker}')
+                  raise SystemExit(f'FAIL: explicit perception diagnostics lost green-indicator quarantine marker: {marker}')
+          if 'EmbeddedRootHelper.startBackgroundAssertion' in perception_probe:
+              raise SystemExit('FAIL: explicit perception/OCR diagnostics must not acquire the Agent-only background assertion')
           production_ocr_surface = local_vision + '\n' + app_environment + '\n' + adapters
           for forbidden_marker in ('AccessibilityAutomationGreenFrameGuard', 'enforceNoLegacyGreenFrameState', 'gui-clear-stale-automation', '_AXSAutomationEnabled', '_AXSSetAutomationEnabled'):
               if forbidden_marker in production_ocr_surface:
@@ -959,7 +962,7 @@ jobs:
               if marker not in app:
                   raise SystemExit(f'FAIL: App Provider harmless self-test lost lifecycle/background integration: {marker}')
           self_test = app.split('public func testAppProvider(packageID:', 1)[1].split('public var selectableSemanticSkills', 1)[0]
-          for marker in ('appProviderSelfTestPackageID = packageID', 'beginBackgroundExecutionIfNeeded()', 'appProviderSelfTestTask = selfTestTask', 'let text = try await selfTestTask.value'):
+          for marker in ('appProviderSelfTestPackageID = packageID', 'beginBackgroundExecutionIfNeeded(acquirePrivilegedAssertion: false)', 'appProviderSelfTestTask = selfTestTask', 'let text = try await selfTestTask.value'):
               if marker not in self_test:
                   raise SystemExit(f'FAIL: App Provider harmless self-test lost cancellable execution marker: {marker}')
           for forbidden in ('runningSessionIDs.insert', 'autoResumeArmedInCurrentProcess = true', 'task.autoResumeUnlessStopped'):
