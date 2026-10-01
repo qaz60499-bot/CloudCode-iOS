@@ -17,11 +17,17 @@ enum ProductionPerceptionPolicy {
     // Keep explicit AX probes quarantined too; OCR/selection diagnostics must stay screenshot +
     // Vision-only until a device regression proves AX can enter and exit without visible state.
     static let explicitAccessibilityDiagnosticsAllowed = false
-    static let backgroundProcessAssertionAllowed = false
+
+    // A real Agent run may temporarily hold a process assertion while Cloud Code is actually
+    // backgrounded. PC-control/OCR helpers and standalone Provider self-tests are deliberately
+    // excluded by CloudCodeViewModel, and the assertion is released as soon as the App returns to
+    // the foreground. This keeps long Agent work alive without restoring the old always-on
+    // background guardian that could leave a visible system indicator behind.
+    static let backgroundProcessAssertionAllowed = true
 
     static let accessibilityDisabledReason =
         "AX/AXAudit is quarantined on this iOS 16.6 device because even read-only diagnostic sessions can leave a visible green Accessibility status indicator. Use screenshot/local OCR/native/HID paths only."
 
     static let backgroundProcessAssertionDisabledReason =
-        "Production BKSProcessAssertion is quarantined because a detached background-assert worker can keep the visible green status indicator active while OCR itself is already overlay-free. Use the ordinary bounded UIKit background window plus checkpoint recovery; detached PC-control/OCR helpers must not acquire this assertion."
+        "Long-lived process assertion is unavailable for this run. Use the bounded UIKit background window plus checkpoint recovery; PC-control/OCR helpers and standalone Provider self-tests must not acquire a privileged assertion."
 }

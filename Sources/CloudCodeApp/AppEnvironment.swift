@@ -866,11 +866,10 @@ public final class CloudCodeViewModel: ObservableObject {
                 return text
             }
             appProviderSelfTestTask = selfTestTask
-            // Pre-arm background execution after the cancellable task has been registered but before
-            // this MainActor method suspends and lets the Provider task launch another App. This closes
-            // both gaps: lifecycle expiry can cancel the task immediately, and scene callbacks do not
-            // have to race the first foreground transition to acquire execution time.
-            beginBackgroundExecutionIfNeeded()
+            // A standalone Provider self-test has no resumable Agent checkpoint and must not hold the
+            // privileged long-run assertion that is reserved for a real Agent run. Keep only UIKit's
+            // bounded background lease so the test fails closed if iOS suspends Cloud Code.
+            beginBackgroundExecutionIfNeeded(acquirePrivilegedAssertion: false)
             let text = try await selfTestTask.value
             guard text.localizedCaseInsensitiveContains(marker) else {
                 throw AppBackedProviderRuntimeError.responseValidationFailed("self-test marker missing")
@@ -2157,7 +2156,11 @@ public final class CloudCodeViewModel: ObservableObject {
 
     public func prepareForBackgroundTransition() {
         guard hasBackgroundCriticalActivity else { return }
-        beginBackgroundExecutionIfNeeded()
+        // `.inactive` is also used for transient system sheets. Do not acquire a privileged process
+        // assertion until the scene has actually entered `.background`; otherwise a short-lived
+        // prompt/app-switch can leave a visible system indicator even though Cloud Code never needed
+        // durable background execution.
+        beginBackgroundExecutionIfNeeded(acquirePrivilegedAssertion: false)
         Task {
             try? await diagnosticLogStore.log(
                 level: .info,
@@ -2200,7 +2203,7 @@ public final class CloudCodeViewModel: ObservableObject {
             sessionActivityLines[sessionID, default: []].append(message)
         }
         syncVisibleSessionState(session.id)
-        beginBackgroundExecutionIfNeeded()
+        beginBackgroundExecutionIfNeeded(acquirePrivilegedAssertion: true)
     }
 
     public func refreshAfterForeground() {
@@ -2214,11 +2217,11 @@ public final class CloudCodeViewModel: ObservableObject {
             backgroundAssertionAcquireTask = nil
             backgroundAssertionAcquireToken = nil
         }
-        // Returning to the foreground ends UIKit's temporary background task, but an active
-        // Agent run must keep an already-established detached privileged assertion worker alive.
-        // finishSessionRun remains the authoritative place that tears it down after the final
-        // active session finishes.
-        endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: !hasBackgroundCriticalActivity)
+        // A privileged assertion is needed only while Cloud Code is actually backgrounded. Always
+        // release it on foreground entry, even if the Agent run is still active; a later real
+        // background transition will acquire a fresh assertion. This bounds private RunningBoard
+        // state to the period that actually needs it and prevents stale visible-system indicators.
+        endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: true)
         Task {
             try? await diagnosticLogStore.log(level: .info, subsystem: "app", action: "foreground", result: "entered", metadata: ["runningSessions": String(runningSessionIDs.count), "lifecycleInterruptedSessions": String(lifecycleInterruptedSessionIDs.count)])
             await settleLifecycleInterruptedRunsBeforeResume()
@@ -2233,7 +2236,7 @@ public final class CloudCodeViewModel: ObservableObject {
         // user has an interactive UI. Explicit capability refresh remains available to the user.
     }
 
-    private func beginBackgroundExecutionIfNeeded() {
+    private func beginBackgroundExecutionIfNeeded(acquirePrivilegedAssertion: Bool = true) {
         #if canImport(UIKit)
         if backgroundTaskIdentifier == .invalid {
             backgroundTaskIdentifier = UIApplication.shared.beginBackgroundTask(withName: "CloudCode.ActiveRun") { [weak self] in
@@ -2243,6 +2246,11 @@ public final class CloudCodeViewModel: ObservableObject {
             }
         }
         #endif
+
+        // Only a real resumable Agent run may hold the private long-run assertion. Provider self-tests,
+        // PC-control and OCR helpers remain on bounded execution so they cannot recreate the old
+        // always-on guardian/green-indicator failure mode.
+        guard acquirePrivilegedAssertion, isRunning else { return }
 
         // Scene phase callbacks execute on the main actor and iOS gives them a strict watchdog
         // budget. Root-helper status/start commands can each block for seconds, so coalesce the
