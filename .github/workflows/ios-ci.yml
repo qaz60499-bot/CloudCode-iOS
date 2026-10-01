@@ -222,7 +222,7 @@ jobs:
             -scheme CloudCodeIOS \
             -configuration Release \
             -destination "platform=iOS Simulator,id=$UDID" \
-            -derivedDataPath build/UITestDerivedData \
+            -derivedDataPath build/SimulatorDerivedData \
             -resultBundlePath build/UITests.xcresult \
             CODE_SIGNING_ALLOWED=NO \
             test \
