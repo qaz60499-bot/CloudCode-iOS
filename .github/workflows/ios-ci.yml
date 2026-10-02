@@ -955,7 +955,7 @@ jobs:
           for marker in ('inheritedAutoResumeIntentAtLaunch', 'autoResumeArmedInCurrentProcess', 'runtime.autoresume.coldlaunch.suppressed'):
               if marker not in app:
                   raise SystemExit(f'FAIL: post-send cold-launch crash-loop guard missing: {marker}')
-          for marker in ('lifecycleInterruptedSessionIDs', 'settleLifecycleInterruptedRunsBeforeResume()', 'await agentCore.waitUntilSessionIdle(sessionID)', 'foreground.lifecycle-settle', 'backgroundAssertionWorkerPID', 'prepareForBackgroundTransition()', 'background.assertion.prearm', 'EmbeddedRootHelper.startBackgroundAssertion', 'backgroundAssertionIsAlive', 'background.assertion.continue', 'endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: false)'):
+          for marker in ('lifecycleInterruptedSessionIDs', 'settleLifecycleInterruptedRunsBeforeResume()', 'await agentCore.waitUntilSessionIdle(sessionID)', 'foreground.lifecycle-settle', 'backgroundAssertionWorkerPID', 'backgroundAssertionStopTask', 'backgroundAssertionStoppingPID', 'scheduleBackgroundAssertionTeardown(', 'await stopTask.value', 'prepareForBackgroundTransition()', 'background.assertion.prearm', 'EmbeddedRootHelper.startBackgroundAssertion', 'backgroundAssertionIsAlive', 'background.assertion.continue', 'endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: false)'):
               if marker not in app:
                   raise SystemExit(f'FAIL: same-process background resume synchronization missing: {marker}')
           for marker in ('appProviderSelfTestTask', 'appProviderSelfTestPackageID', 'hasBackgroundCriticalActivity', 'cancelAppProviderSelfTestForBackground(reason:', '阶段=background_execution'):

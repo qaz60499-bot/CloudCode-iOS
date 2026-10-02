@@ -205,6 +205,9 @@ public final class CloudCodeViewModel: ObservableObject {
     private var backgroundAssertionWorkerPID: Int32?
     private var backgroundAssertionAcquireTask: Task<Void, Never>?
     private var backgroundAssertionAcquireToken: UUID?
+    private var backgroundAssertionStopTask: Task<Void, Never>?
+    private var backgroundAssertionStoppingPID: Int32?
+    private var backgroundAssertionStopToken: UUID?
     private var appProviderSelfTestTask: Task<String, Error>?
     private var appProviderSelfTestPackageID: String?
     private var appProviderSelfTestLifecycleFailureReason: String?
@@ -2208,16 +2211,9 @@ public final class CloudCodeViewModel: ObservableObject {
 
     public func refreshAfterForeground() {
         UserDefaults.standard.set(false, forKey: Self.backgroundRunIntentDefaultsKey)
-        // If acquisition is still in flight and no worker has been established yet, the app no
-        // longer needs that background assertion. Cancel the waiter so a late helper failure cannot
-        // create a fallback timer while the app is already foreground again. A detached helper that
-        // finishes after cancellation is stopped by acquireBackgroundAssertionIfNeeded().
-        if backgroundAssertionWorkerPID == nil {
-            backgroundAssertionAcquireTask?.cancel()
-            backgroundAssertionAcquireTask = nil
-            backgroundAssertionAcquireToken = nil
-        }
-        // A privileged assertion is needed only while Cloud Code is actually backgrounded. Always
+        // A privileged assertion is needed only while Cloud Code is actually backgrounded. The
+        // teardown path below also cancels and serializes any in-flight acquisition so a late helper
+        // cannot overlap a subsequent background transition.
         // release it on foreground entry, even if the Agent run is still active; a later real
         // background transition will acquire a fresh assertion. This bounds private RunningBoard
         // state to the period that actually needs it and prevents stale visible-system indicators.
@@ -2270,6 +2266,46 @@ public final class CloudCodeViewModel: ObservableObject {
                 backgroundAssertionAcquireTask = nil
                 backgroundAssertionAcquireToken = nil
             }
+        }
+
+        // Foreground teardown sends SIGTERM to the detached assertion worker off the main actor.
+        // Do not create a replacement merely because backgroundAssertionWorkerPID was cleared:
+        // the previous worker can remain alive briefly while that asynchronous stop is settling.
+        // Serializing acquire behind the stop barrier prevents overlapping BKS assertions across
+        // rapid foreground/background transitions.
+        if let stopTask = backgroundAssertionStopTask {
+            await stopTask.value
+            guard !Task.isCancelled else { return }
+        }
+        if let stoppingPID = backgroundAssertionStoppingPID {
+            let stillAlive = await Task.detached(priority: .utility) {
+                EmbeddedRootHelper.backgroundAssertionIsAlive(workerPID: stoppingPID)
+            }.value
+            guard !Task.isCancelled else { return }
+            if stillAlive {
+                try? await diagnosticLogStore.log(
+                    level: .warning,
+                    subsystem: "app",
+                    action: "background.assertion",
+                    result: "stop-pending",
+                    metadata: ["workerPID": String(stoppingPID)]
+                )
+                if hasBackgroundCriticalActivity {
+                    backgroundWindowTask?.cancel()
+                    backgroundWindowTask = Task { [weak self] in
+                        guard let self else { return }
+                        do {
+                            try await Task.sleep(nanoseconds: UInt64(Self.backgroundContinuationWindow * 1_000_000_000))
+                        } catch {
+                            return
+                        }
+                        guard !Task.isCancelled else { return }
+                        self.backgroundContinuationWindowDidElapse()
+                    }
+                }
+                return
+            }
+            backgroundAssertionStoppingPID = nil
         }
 
         if !ProductionPerceptionPolicy.backgroundProcessAssertionAllowed {
@@ -2527,9 +2563,11 @@ public final class CloudCodeViewModel: ObservableObject {
         backgroundWindowTask?.cancel()
         backgroundWindowTask = nil
 
+        var acquireTaskToSettle: Task<Void, Never>?
         var workerToStop: Int32?
         if stopPrivilegedAssertion {
-            backgroundAssertionAcquireTask?.cancel()
+            acquireTaskToSettle = backgroundAssertionAcquireTask
+            acquireTaskToSettle?.cancel()
             backgroundAssertionAcquireTask = nil
             backgroundAssertionAcquireToken = nil
             workerToStop = backgroundAssertionWorkerPID
@@ -2544,19 +2582,82 @@ public final class CloudCodeViewModel: ObservableObject {
         }
         #endif
 
-        if let workerPID = workerToStop {
-            Task { [weak self] in
-                guard let self else { return }
-                let outcome = await Task.detached(priority: .utility) {
+        if stopPrivilegedAssertion {
+            // If a previous bounded stop timed out, preserve that PID as the teardown target while
+            // also settling any newly-cancelled acquire waiter. Never let an acquire-only teardown
+            // erase the identity of an older assertion worker that may still be alive.
+            let pendingWorkerToStop = workerToStop ?? backgroundAssertionStoppingPID
+            if acquireTaskToSettle != nil || pendingWorkerToStop != nil {
+                scheduleBackgroundAssertionTeardown(
+                    acquireTask: acquireTaskToSettle,
+                    workerPID: pendingWorkerToStop
+                )
+            }
+        }
+    }
+
+    private func scheduleBackgroundAssertionTeardown(
+        acquireTask: Task<Void, Never>?,
+        workerPID: Int32?
+    ) {
+        // A teardown already in flight is itself the serialization barrier. Any newly cancelled
+        // acquire task can only be waiting behind that barrier, so dropping this duplicate wrapper
+        // cannot create another privileged worker.
+        guard backgroundAssertionStopTask == nil else { return }
+        let token = UUID()
+        if let workerPID {
+            backgroundAssertionStoppingPID = workerPID
+        }
+        backgroundAssertionStopToken = token
+        backgroundAssertionStopTask = Task { [weak self] in
+            guard let self else { return }
+
+            // A cancelled acquire can still be inside the detached start helper. Wait until its own
+            // cancellation cleanup has stopped any late-created worker before allowing a new acquire.
+            if let acquireTask {
+                await acquireTask.value
+            }
+
+            var outcome: (success: Bool, detail: String)?
+            var stillAlive = false
+            if let workerPID {
+                outcome = await Task.detached(priority: .utility) {
                     EmbeddedRootHelper.stopBackgroundAssertion(workerPID: workerPID)
                 }.value
+
+                stillAlive = true
+                for _ in 0..<15 {
+                    stillAlive = await Task.detached(priority: .utility) {
+                        EmbeddedRootHelper.backgroundAssertionIsAlive(workerPID: workerPID)
+                    }.value
+                    if !stillAlive { break }
+                    do {
+                        try await Task.sleep(nanoseconds: 200_000_000)
+                    } catch {
+                        break
+                    }
+                }
+            }
+
+            guard self.backgroundAssertionStopToken == token else { return }
+            if !stillAlive, self.backgroundAssertionStoppingPID == workerPID {
+                self.backgroundAssertionStoppingPID = nil
+            }
+            self.backgroundAssertionStopTask = nil
+            self.backgroundAssertionStopToken = nil
+
+            if let workerPID {
+                let fullyStopped = !stillAlive
                 try? await self.diagnosticLogStore.log(
-                    level: outcome.success ? .info : .warning,
+                    level: fullyStopped ? .info : .warning,
                     subsystem: "app",
                     action: "background.assertion.stop",
-                    result: outcome.success ? "stopped" : "failed",
-                    diagnostic: outcome.detail,
-                    metadata: ["workerPID": String(workerPID)]
+                    result: fullyStopped ? "stopped" : "pending",
+                    diagnostic: outcome?.detail,
+                    metadata: [
+                        "workerPID": String(workerPID),
+                        "stillAlive": String(stillAlive)
+                    ]
                 )
             }
         }
@@ -3879,6 +3980,7 @@ public final class CloudCodeViewModel: ObservableObject {
             "activeSessionIDs": runningSessionIDs.map(\.uuidString).sorted(),
             "lifecycleInterruptedSessionIDs": lifecycleInterruptedSessionIDs.map(\.uuidString).sorted(),
             "backgroundAssertionWorkerPID": backgroundAssertionWorkerPID.map(Int.init) ?? 0,
+            "backgroundAssertionStoppingPID": backgroundAssertionStoppingPID.map(Int.init) ?? 0,
             "currentSessionID": session.id.uuidString,
             "providerID": selectedProviderID,
             "model": selectedModel,
