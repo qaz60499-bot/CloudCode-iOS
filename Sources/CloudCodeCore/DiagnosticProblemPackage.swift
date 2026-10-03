@@ -38,6 +38,11 @@ public enum DiagnosticRegressionStatus: String, Codable, Sendable {
 public struct DiagnosticPerformanceSnapshot: Codable, Equatable, Sendable {
     public var totalTaskLatencyMS: Int?
     public var providerRoundTrips: Int
+    public var providerTTFTMS: Int?
+    public var providerTotalMS: Int?
+    public var localTaskExecutionMS: Int?
+    public var axTotalMS: Int?
+    public var ocrTotalMS: Int?
     public var remoteVisionRoundTrips: Int
     public var screenshotCount: Int
     public var axObservationCount: Int
@@ -49,6 +54,11 @@ public struct DiagnosticPerformanceSnapshot: Codable, Equatable, Sendable {
     public init(
         totalTaskLatencyMS: Int? = nil,
         providerRoundTrips: Int = 0,
+        providerTTFTMS: Int? = nil,
+        providerTotalMS: Int? = nil,
+        localTaskExecutionMS: Int? = nil,
+        axTotalMS: Int? = nil,
+        ocrTotalMS: Int? = nil,
         remoteVisionRoundTrips: Int = 0,
         screenshotCount: Int = 0,
         axObservationCount: Int = 0,
@@ -59,6 +69,11 @@ public struct DiagnosticPerformanceSnapshot: Codable, Equatable, Sendable {
     ) {
         self.totalTaskLatencyMS = totalTaskLatencyMS
         self.providerRoundTrips = max(0, providerRoundTrips)
+        self.providerTTFTMS = providerTTFTMS.map { max(0, $0) }
+        self.providerTotalMS = providerTotalMS.map { max(0, $0) }
+        self.localTaskExecutionMS = localTaskExecutionMS.map { max(0, $0) }
+        self.axTotalMS = axTotalMS.map { max(0, $0) }
+        self.ocrTotalMS = ocrTotalMS.map { max(0, $0) }
         self.remoteVisionRoundTrips = max(0, remoteVisionRoundTrips)
         self.screenshotCount = max(0, screenshotCount)
         self.axObservationCount = max(0, axObservationCount)
@@ -198,6 +213,7 @@ public struct DiagnosticReplayEvidence: Codable, Equatable, Sendable {
     private static func replaySafeMetadata(_ metadata: [String: String]) -> [String: String] {
         let allowed = Set([
             "provider", "providerID", "providerId", "model", "modelID", "modelId", "protocol", "protocolClass",
+            "providerRoundTrips", "providerTTFTMS", "providerTotalMS", "providerRoundTripAvoided", "localTaskExecutionMS",
             "statusCode", "httpStatus", "errorClass", "retryReason", "fallbackReason", "fallbackDepth", "route", "routeCandidates",
             "authMode", "host", "endpointPath", "transportState", "responseStarted", "streamEstablished", "bodyDataReceived",
             "foregroundBundleID", "bundleID", "bundleId", "appVersion", "verification", "effectVerification",
@@ -205,11 +221,11 @@ public struct DiagnosticReplayEvidence: Codable, Equatable, Sendable {
             "perceptionOCRInvoked", "perceptionOCRSucceeded", "perceptionOCRLatencyMS", "perceptionLocalSufficient",
             "perceptionRemoteVisionRequired", "perceptionFallbackReason", "providerVisualRoundTripAvoided",
             "sha256", "screenPointWidth", "screenPointHeight", "localVisionOCR", "localVisionElementCount",
-            "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion", "localVisionRecognitionLevel", "localVisionFallbackUsed", "localVisionBackend",
+            "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion", "localVisionRegionExecution", "localVisionHelperInputWidth", "localVisionHelperInputHeight", "localVisionRecognitionLevel", "localVisionMinimumTextHeight", "localVisionPass", "localVisionAttemptSequence", "localVisionPrecisionRecommended", "localVisionPrecisionReason", "localVisionCacheHit", "localVisionRequestCoalesced", "localVisionFallbackUsed", "localVisionBackend",
             "localVisionFailureClass", "localVisionErrorDomain", "localVisionErrorCode", "localVisionPrimaryErrorDomain", "localVisionPrimaryErrorCode",
             "localVisionSecondaryBackend", "localVisionSecondaryStatus", "localVisionSecondaryErrorDomain", "localVisionSecondaryErrorCode", "treeHash",
             "coordinateSafety", "providerImageRoute", "keyboardLikely", "focusStrategy", "textInputSafety", "localMetric", "localMetricSelection", "localMetricExtraction", "cache", "idempotency",
-            "axBackend", "axStage", "axScope", "axNodeCount", "axErrorDomain", "axErrorCode", "axLatencyMS",
+            "axBackend", "axStage", "axScope", "axNodeCount", "axSemanticNodeCount", "axFailureClass", "axErrorDomain", "axErrorCode", "axLatencyMS",
             "providerVisionCapability", "providerVisionCapabilitySource", "selectedPerceptionRoute",
             "routeSelectionLatencyMS", "executionLatencyMS", "totalLatencyMS"
         ])
@@ -750,9 +766,27 @@ public enum DiagnosticProblemPackageBuilder {
         if record.level == .error { return true }
         let result = record.result.lowercased()
         let diagnostic = (record.diagnostic ?? "").lowercased()
+        let action = record.action.lowercased()
         let localVisionStatus = (record.metadata["localVisionOCR"] ?? "").lowercased()
-        let failureMarkers = ["failed", "failure", "exhausted", "timeout", "timed out", "interrupted", "insufficient", "unverified", "no_effect", "no effect", "premature"]
-        if failureMarkers.contains(where: { result.contains($0) || diagnostic.contains($0) }) { return true }
+
+        // Helper success diagnostics intentionally include bounded-execution evidence such as
+        // `timeoutSeconds` and `parentTimeout:false`. Treating the mere word "timeout" in an info
+        // diagnostic as a failure created dozens of fake tap/swipe/background/SQLite capsules in
+        // build 92. Result state is authoritative for info records; diagnostic prose is only used
+        // as a generic failure signal on warning/error records.
+        let hardResultMarkers = ["failed", "failure", "exhausted", "timeout", "timed out", "interrupted", "insufficient", "no_effect", "no effect", "premature"]
+        if hardResultMarkers.contains(where: { result.contains($0) }) { return true }
+        if record.level == .warning,
+           hardResultMarkers.contains(where: { diagnostic.contains($0) }) { return true }
+
+        // "dispatched-unverified" is the normal low-level helper contract: the enclosing tool must
+        // observe the postcondition. Do not turn every successful primitive into a bug capsule.
+        // Foreground launch uncertainty is different because subsequent target-specific actions can
+        // otherwise run against the wrong App; preserve that explicit top-level state.
+        if result.contains("unverified"), !action.hasSuffix(".helper") { return true }
+        if record.metadata["foregroundVerified"] == "false",
+           (action.contains("openapp") || action.contains("launch")) { return true }
+
         // A screenshot/action can succeed while a required perception sub-stage fails. Preserve that
         // partial failure as a capsule candidate instead of letting the outer tool success hide it.
         if localVisionStatus.hasPrefix("unavailable") { return true }
@@ -778,6 +812,25 @@ public enum DiagnosticProblemPackageBuilder {
         if subsystem.contains("provider") {
             if combined.contains("route") || action.contains("fallback") || action.contains("compatibility") || record.metadata["fallbackReason"] != nil { return .providerRoute }
             return .provider
+        }
+        // Multi-stage semantic tools can fail AX first and then fail the OCR fallback. When the
+        // record carries explicit OCR failure evidence, diagnose the last failing perception stage
+        // rather than letting the earlier AX attempt mask a concrete Vision/CoreVideo root cause.
+        let explicitLocalVisionFailure = record.metadata["perceptionOCRInvoked"] == "true" && (
+            record.metadata["perceptionOCRSucceeded"] == "false"
+                || record.metadata["localVisionFailureClass"]?.isEmpty == false
+                || (record.metadata["localVisionOCR"] ?? "").lowercased().hasPrefix("unavailable")
+        )
+        if explicitLocalVisionFailure { return .localVision }
+        // An AX observation executed through the privileged/root helper is still fundamentally an
+        // AX failure when the helper returned semantic-empty/AX evidence. Classify the failing
+        // subsystem before the transport implementation so timeout fields in helper diagnostics do
+        // not turn an AX semantic failure into privileged_helper.*.timeout.
+        if action == "gui.tree"
+            || combined.contains("empty-semantic-tree")
+            || combined.contains("no semantic/actionable foreground ui nodes")
+            || record.metadata["perceptionFallbackReason"] == "ax_transport_returned_semantically_empty_tree" {
+            return .axObservation
         }
         if combined.contains("privileged") || combined.contains("roothelper") || combined.contains("root helper") { return .privilegedHelper }
         if combined.contains("resolveapp") || combined.contains("app_resolution") || combined.contains("foreground") && action.contains("launch") { return .appResolution }
@@ -810,7 +863,11 @@ public enum DiagnosticProblemPackageBuilder {
         if action.contains("type") { return .guiTextInput }
         if action.contains("swipe") || action.contains("scroll") || action.contains("feedsample") || action.contains("tap") { return .guiGesture }
         if action.contains("navigate") || action.contains("openapp") || action.contains("openurl") { return .guiNavigation }
-        if subsystem == "tool" && record.metadata["route"] != nil { return .toolRouting }
+        // Route-selection records use the dedicated `tool-route` subsystem, while execution
+        // completion records use `tool`. Both carry the same bounded route/fallback evidence and
+        // must classify identically; otherwise async log ordering can turn a successful deep
+        // fallback into an unknown/manual-resolution failure.
+        if (subsystem == "tool" || subsystem == "tool-route") && record.metadata["route"] != nil { return .toolRouting }
         if combined.contains("native") || combined.contains("cli") { return .nativeExecution }
         if subsystem.contains("agent") || combined.contains("planner") || combined.contains("planning") { return .agentPlanning }
         return .unknown
@@ -831,7 +888,10 @@ public enum DiagnosticProblemPackageBuilder {
                 return "coordinate_normalization"
             }
             if failureClass.contains("region") || failureClass.contains("crop") { return "region_selection" }
-            if action.contains("screenshot") { return "screenshot_capture" }
+            let primaryText = [record.result, record.diagnostic ?? ""].joined(separator: " ").lowercased()
+            let screenshotFailed = action.contains("screenshot")
+                && (record.level == .error || (primaryText.contains("screenshot") && primaryText.contains("failed")))
+            if screenshotFailed { return "screenshot_capture" }
             if record.metadata["perceptionOCRInvoked"] == "false" { return "ocr_invocation" }
             let localStatus = (record.metadata["localVisionOCR"] ?? "").lowercased()
             if record.metadata["perceptionOCRSucceeded"] == "false"
@@ -839,6 +899,7 @@ public enum DiagnosticProblemPackageBuilder {
                 || localStatus.hasPrefix("unavailable") {
                 return "ocr_recognition"
             }
+            if action.contains("screenshot") { return "screenshot_capture" }
             if record.metadata["selectedPerceptionRoute"] == "local_only_provider_vision_unavailable" {
                 return "semantic_fallback"
             }
@@ -928,6 +989,15 @@ public enum DiagnosticProblemPackageBuilder {
         var totalLatency = 0
         var foundLatency = false
         var providerRoundTrips = 0
+        var providerTTFTTotalMS = 0
+        var providerTTFTObserved = false
+        var providerTotalMS = 0
+        var providerTotalObserved = false
+        var localTaskExecutionMS: Int?
+        var axTotalMS = 0
+        var axLatencyObserved = false
+        var ocrTotalMS = 0
+        var ocrLatencyObserved = false
         var remoteVisionRoundTrips = 0
         var screenshotCount = 0
         var axCount = 0
@@ -940,7 +1010,36 @@ public enum DiagnosticProblemPackageBuilder {
                 totalLatency += max(0, latency)
                 foundLatency = true
             }
-            if record.subsystem.lowercased().contains("provider") && record.action.lowercased().contains("request") { providerRoundTrips += 1 }
+            if record.subsystem.lowercased().contains("provider") {
+                let action = record.action.lowercased()
+                let result = record.result.lowercased()
+                if action.contains("request") || (action == "stream" && result == "started") {
+                    providerRoundTrips += 1
+                }
+                if let value = record.metadata["providerTTFTMS"].flatMap(Int.init), value >= 0 {
+                    providerTTFTTotalMS += value
+                    providerTTFTObserved = true
+                }
+                if let value = record.metadata["providerTotalMS"].flatMap(Int.init), value >= 0 {
+                    providerTotalMS += value
+                    providerTotalObserved = true
+                }
+            }
+            if let value = record.metadata["localTaskExecutionMS"].flatMap(Int.init), value >= 0 {
+                localTaskExecutionMS = max(localTaskExecutionMS ?? 0, value)
+            }
+            if let value = record.metadata["axLatencyMS"].flatMap(Int.init), value >= 0 {
+                axTotalMS += value
+                axLatencyObserved = true
+            }
+            let ocrLatency = [record.metadata["perceptionOCRLatencyMS"], record.metadata["localVisionLatencyMS"]]
+                .compactMap { $0.flatMap(Int.init) }
+                .filter { $0 >= 0 }
+                .max()
+            if let ocrLatency {
+                ocrTotalMS += ocrLatency
+                ocrLatencyObserved = true
+            }
             if record.metadata["perceptionRemoteVisionRequired"] == "true" { remoteVisionRoundTrips += 1 }
             if record.action.lowercased().contains("screenshot") || record.metadata["sha256"] != nil { screenshotCount += 1 }
             if record.metadata["perceptionAXAttempted"] == "true" { axCount += 1 }
@@ -952,6 +1051,11 @@ public enum DiagnosticProblemPackageBuilder {
         return DiagnosticPerformanceSnapshot(
             totalTaskLatencyMS: foundLatency ? totalLatency : nil,
             providerRoundTrips: providerRoundTrips,
+            providerTTFTMS: providerTTFTObserved ? providerTTFTTotalMS : nil,
+            providerTotalMS: providerTotalObserved ? providerTotalMS : nil,
+            localTaskExecutionMS: localTaskExecutionMS,
+            axTotalMS: axLatencyObserved ? axTotalMS : nil,
+            ocrTotalMS: ocrLatencyObserved ? ocrTotalMS : nil,
             remoteVisionRoundTrips: remoteVisionRoundTrips,
             screenshotCount: screenshotCount,
             axObservationCount: axCount,
@@ -1000,24 +1104,47 @@ public enum DiagnosticProblemPackageBuilder {
                 || combined.contains("structured plan local expectation did not become true before timeout") {
                 return "ax_target_absent"
             }
-            if combined.contains("no readable ui nodes") || combined.contains("empty tree") { return "ax_tree_empty" }
-            if combined.contains("timeout") || combined.contains("timed out") { return "ax_request_timeout" }
+            if combined.contains("no readable ui nodes")
+                || combined.contains("empty tree")
+                || combined.contains("empty-semantic-tree")
+                || combined.contains("no semantic/actionable foreground ui nodes")
+                || combined.contains("semantically empty tree")
+                || record.metadata["perceptionFallbackReason"] == "ax_transport_returned_semantically_empty_tree" {
+                return "ax_tree_empty"
+            }
+            let explicitAXTimeout = primaryText == "timeout"
+                || primaryText.contains("timed out")
+                || primaryText.contains("transport_timeout")
+                || primaryText.contains("transport timeout")
+                || primaryText.contains("helper timeout")
+                || combined.contains("\"parenttimeout\":true")
+                || combined.contains("parenttimeout=true")
+                || record.metadata["parentTimeout"] == "true"
+            if explicitAXTimeout { return "ax_request_timeout" }
             return "ax_request_failed"
         }
 
         if layer == .localVision || record.metadata["perceptionOCRInvoked"] != nil || record.metadata["localVisionOCR"] != nil {
             let ocrInvoked = boolMetadata(record, "perceptionOCRInvoked") ?? (record.metadata["localVisionOCR"] != nil)
             let localStatus = record.metadata["localVisionOCR"]?.lowercased() ?? ""
-            if record.action.lowercased().contains("screenshot") && (record.level == .error || combined.contains("screenshot") && combined.contains("failed")) {
+            // A successful gui.screenshot may still carry local OCR failure metadata. Only the
+            // screenshot operation's own result/diagnostic may classify capture failure; generic
+            // metadata such as localVisionSecondaryStatus=unavailable_helper_failed must not turn
+            // a valid JPEG into screenshot_capture_failed.
+            if record.action.lowercased().contains("screenshot")
+                && (record.level == .error || (primaryText.contains("screenshot") && primaryText.contains("failed"))) {
                 return "screenshot_capture_failed"
             }
             if !ocrInvoked { return "ocr_not_invoked" }
-            if record.metadata["localVisionFailureClass"]?.isEmpty == false {
-                return stableToken(record.metadata["localVisionFailureClass"] ?? "ocr_request_failed")
-            }
+            // Preserve the concrete CoreVideo status ahead of the generic tool-layer
+            // localVisionFailureClass=ocr_request_failed. This lets the recovery policy trip its
+            // non-retryable -6662 circuit breaker instead of spending recovery budget blindly.
             if record.metadata["localVisionErrorDomain"] == NSOSStatusErrorDomain,
                record.metadata["localVisionErrorCode"] == "-6662" {
                 return "corevideo_allocation_failed"
+            }
+            if record.metadata["localVisionFailureClass"]?.isEmpty == false {
+                return stableToken(record.metadata["localVisionFailureClass"] ?? "ocr_request_failed")
             }
             if (record.metadata["localVisionErrorDomain"] ?? "").localizedCaseInsensitiveContains("CoreML") {
                 return "coreml_runtime_failed"
@@ -1043,6 +1170,7 @@ public enum DiagnosticProblemPackageBuilder {
         }
 
         if record.result.lowercased().contains("route_failed") { return "route_selection_failed" }
+        if record.metadata["foregroundVerified"] == "false" { return "foreground_unverified" }
         if combined.contains("foreground") && (combined.contains("mismatch") || combined.contains("wrong app")) { return "foreground_target_mismatch" }
         if combined.contains("foreground") && combined.contains("verify") { return "foreground_unverified" }
         if combined.contains("no effect") || combined.contains("no_effect") { return "no_observed_effect" }
@@ -1086,7 +1214,11 @@ public enum DiagnosticProblemPackageBuilder {
     }
 
     private static func isAutomaticRecoverySafe(reason: String, layer: DiagnosticFailureLayer) -> Bool {
-        if ["unauthorized", "bad_request", "foreground_target_mismatch", "ax_backend_unavailable", "ax_tree_budget_truncated", "ocr_coordinate_normalization_failed", "deep_route_fallback"].contains(reason) {
+        if ["unauthorized", "bad_request", "foreground_target_mismatch", "ax_backend_unavailable", "ax_tree_budget_truncated", "corevideo_allocation_failed", "ocr_coordinate_normalization_failed", "deep_route_fallback"].contains(reason) {
+            // CoreVideo/Vision allocation failures are circuit-breaker events, not immediate
+            // self-repair opportunities. Retrying the same runtime context can reproduce the same
+            // entitlement/resource failure and amplify watchdog pressure; continue through an
+            // already-available screenshot/AX route and require a later fresh context for OCR.
             return false
         }
         switch layer {
@@ -1101,6 +1233,9 @@ public enum DiagnosticProblemPackageBuilder {
         if reason == "deep_route_fallback" {
             return "continue_with_successful_selected_route_and_record_degradation;do_not_replan_only_for_fallback_depth"
         }
+        if reason == "corevideo_allocation_failed" {
+            return "open_local_ocr_corevideo_circuit_breaker;avoid_same_context_vision_retry;continue_with_ax_or_fresh_screenshot_visual_fallback;require_fresh_runtime_or_developer_fix_before_local_ocr_retry"
+        }
         guard recoveryAllowed else {
             if reason == "recovery_budget_exhausted" { return "stop_automatic_retry_and_emit_developer_diagnosis" }
             return "stop_same_route_retry_and_escalate_with_existing_bug_capsule"
@@ -1108,7 +1243,9 @@ public enum DiagnosticProblemPackageBuilder {
         switch reason {
         case "ax_request_timeout", "ax_request_failed", "ax_tree_empty", "ax_target_absent", "ax_semantic_match_ambiguous":
             return "avoid_repeating_ax_for_same_foreground;use_fresh_screenshot_then_local_ocr_or_existing_visual_fallback"
-        case "corevideo_allocation_failed", "coreml_runtime_failed", "ocr_request_failed":
+        case "corevideo_allocation_failed":
+            return "open_local_ocr_corevideo_circuit_breaker;avoid_same_context_vision_retry;continue_with_ax_or_fresh_screenshot_visual_fallback"
+        case "coreml_runtime_failed", "ocr_request_failed":
             return "capture_one_fresh_screenshot;retry_local_ocr_once_in_non_privileged_cpu_only_context;then_escalate"
         case "ocr_not_invoked":
             return "invoke_existing_local_ocr_path_once_before_remote_vision"

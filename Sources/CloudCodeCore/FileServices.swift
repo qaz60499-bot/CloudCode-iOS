@@ -1,4 +1,8 @@
 import Foundation
+import ZIPFoundation
+#if canImport(PDFKit)
+import PDFKit
+#endif
 #if canImport(CryptoKit)
 import CryptoKit
 #endif
@@ -66,6 +70,7 @@ public actor AuditLogStore {
 public enum AppKnowledgeRegistryError: Error, Equatable, Sendable {
     case cacheTooLarge
     case invalidAction
+    case invalidSemanticKnowledge
     case missingApp(String)
 }
 
@@ -141,8 +146,13 @@ public actor AppKnowledgeRegistry {
             lines.append("Known local-data aliases: \(aliases.joined(separator: ", ")). Stored paths are candidates only: resolve the current container and revalidate before any read or mutation.")
         }
         if let environment {
-            let candidates = (knowledge.actionMap ?? [])
-                .map { hint in AppActionCandidate(hint: hint, requiresRevalidation: !hint.environment.matches(environment)) }
+            // Consume the existing actionCandidates() API in the production planning hint instead
+            // of maintaining a second sorter here. Learning remains performance/discovery only:
+            // capability/policy eligibility is still enforced later by ToolRouter.
+            let semanticActions = Set((knowledge.actionMap ?? []).map { Self.normalizedAction($0.semanticAction) })
+                .filter { !$0.isEmpty }
+            let candidates = semanticActions
+                .flatMap { actionCandidates(for: bundleID, semanticAction: $0, environment: environment) }
                 .sorted { lhs, rhs in
                     if lhs.requiresRevalidation != rhs.requiresRevalidation { return !lhs.requiresRevalidation }
                     if lhs.hint.reliability != rhs.hint.reliability { return lhs.hint.reliability > rhs.hint.reliability }
@@ -155,6 +165,28 @@ public actor AppKnowledgeRegistry {
                     return "\(candidate.hint.semanticAction)->\(candidate.hint.route.rawValue) rel=\(String(format: "%.2f", candidate.hint.reliability)) latency=\(candidate.hint.estimatedLatencyMS)ms \(stale)"
                 }
                 lines.append("ActionMap candidates: " + rendered.joined(separator: " | "))
+            }
+
+            let surfaces = semanticSurfaceCandidates(for: bundleID, environment: environment).prefix(6)
+            if !surfaces.isEmpty {
+                let rendered = surfaces.map { candidate in
+                    let stale = candidate.requiresRevalidation ? "stale/revalidate" : "current"
+                    let landmarks = candidate.knowledge.landmarks.prefix(4).joined(separator: "/")
+                    return "\(candidate.knowledge.semanticSurface)[\(candidate.knowledge.genericSurface.rawValue)] rel=\(String(format: "%.2f", candidate.knowledge.reliability)) evidence=\(candidate.knowledge.evidenceCount) \(stale) landmarks=\(landmarks)"
+                }
+                lines.append("Semantic surfaces: " + rendered.joined(separator: " | "))
+            }
+
+            let transitions = semanticTransitionCandidates(for: bundleID, environment: environment).prefix(6)
+            if !transitions.isEmpty {
+                let rendered = transitions.map { candidate in
+                    let stale = candidate.requiresRevalidation ? "stale/revalidate" : "current"
+                    return "\(candidate.knowledge.fromSurface)->\(candidate.knowledge.toSurface) action=\(candidate.knowledge.semanticAction) rel=\(String(format: "%.2f", candidate.knowledge.reliability)) latency=\(candidate.knowledge.estimatedLatencyMS)ms \(stale)"
+                }
+                lines.append("Semantic transitions: " + rendered.joined(separator: " | "))
+            }
+            if !surfaces.isEmpty || !transitions.isEmpty {
+                lines.append("Fresh ObservationFrame evidence always overrides cached semantic surfaces/transitions; ambiguity requires re-observation rather than cache-driven execution.")
             }
         }
         return lines.count > 1 ? lines.joined(separator: "\n") : nil
@@ -182,6 +214,207 @@ public actor AppKnowledgeRegistry {
                 }
                 return lhs.hint.estimatedLatencyMS < rhs.hint.estimatedLatencyMS
             }
+    }
+
+    public func semanticSurfaceCandidates(
+        for bundleID: String,
+        environment: AppActionEnvironment,
+        now: Date = Date()
+    ) -> [AppSemanticSurfaceCandidate] {
+        loadIfNeeded()
+        guard let knowledge = entries[bundleID] else { return [] }
+        return (knowledge.semanticSurfaces ?? [])
+            .filter { !Self.isInvalidated(lastValidatedAt: $0.lastValidatedAt, reliability: $0.reliability, now: now) }
+            .map { value in
+                AppSemanticSurfaceCandidate(
+                    knowledge: value,
+                    requiresRevalidation: !value.environment.matches(environment)
+                        || Self.isStale(lastValidatedAt: value.lastValidatedAt, now: now)
+                )
+            }
+            .sorted { lhs, rhs in
+                if lhs.requiresRevalidation != rhs.requiresRevalidation { return !lhs.requiresRevalidation }
+                if lhs.knowledge.reliability != rhs.knowledge.reliability { return lhs.knowledge.reliability > rhs.knowledge.reliability }
+                return lhs.knowledge.evidenceCount > rhs.knowledge.evidenceCount
+            }
+    }
+
+    public func semanticTransitionCandidates(
+        for bundleID: String,
+        fromSurface: String? = nil,
+        semanticAction: String? = nil,
+        environment: AppActionEnvironment,
+        now: Date = Date()
+    ) -> [AppSemanticTransitionCandidate] {
+        loadIfNeeded()
+        guard let knowledge = entries[bundleID] else { return [] }
+        let from = fromSurface.map(Self.normalizedSemanticToken)
+        let action = semanticAction.map(Self.normalizedAction)
+        return (knowledge.semanticTransitions ?? [])
+            .filter { transition in
+                (from == nil || Self.normalizedSemanticToken(transition.fromSurface) == from)
+                    && (action == nil || Self.normalizedAction(transition.semanticAction) == action)
+                    && !Self.isInvalidated(lastValidatedAt: transition.lastValidatedAt, reliability: transition.reliability, now: now)
+            }
+            .map { value in
+                AppSemanticTransitionCandidate(
+                    knowledge: value,
+                    requiresRevalidation: !value.environment.matches(environment)
+                        || Self.isStale(lastValidatedAt: value.lastValidatedAt, now: now)
+                )
+            }
+            .sorted { lhs, rhs in
+                if lhs.requiresRevalidation != rhs.requiresRevalidation { return !lhs.requiresRevalidation }
+                if lhs.knowledge.reliability != rhs.knowledge.reliability { return lhs.knowledge.reliability > rhs.knowledge.reliability }
+                return lhs.knowledge.estimatedLatencyMS < rhs.knowledge.estimatedLatencyMS
+            }
+    }
+
+    /// Record one high-confidence semantic surface observation into the existing AppKnowledge cache.
+    /// The cache remains subordinate to current ObservationFrame evidence and stores no coordinates.
+    public func recordSemanticSurface(
+        bundleID: String,
+        semanticSurface: String,
+        genericSurface: IOSInteractionSurface,
+        landmarks: [String],
+        environment: AppActionEnvironment,
+        confidence: Double,
+        at now: Date = Date()
+    ) throws {
+        loadIfNeeded()
+        let surface = Self.normalizedSemanticToken(semanticSurface)
+        guard !surface.isEmpty, surface.utf8.count <= 128,
+              confidence.isFinite, confidence >= 0.70, confidence <= 1.0,
+              var knowledge = entries[bundleID] else {
+            if entries[bundleID] == nil { throw AppKnowledgeRegistryError.missingApp(bundleID) }
+            throw AppKnowledgeRegistryError.invalidSemanticKnowledge
+        }
+        let boundedLandmarks = Self.boundedSemanticLandmarks(landmarks)
+        var values = knowledge.semanticSurfaces ?? []
+        if let index = values.firstIndex(where: {
+            Self.normalizedSemanticToken($0.semanticSurface) == surface && $0.environment.matches(environment)
+        }) {
+            var value = values[index]
+            value.genericSurface = genericSurface
+            value.landmarks = Self.mergeLandmarks(value.landmarks, boundedLandmarks)
+            value.evidenceCount += 1
+            value.reliability = min(0.99, value.reliability * 0.80 + confidence * 0.20)
+            value.lastValidatedAt = now
+            values[index] = value
+        } else {
+            values.append(AppSemanticSurfaceKnowledge(
+                semanticSurface: surface,
+                genericSurface: genericSurface,
+                landmarks: boundedLandmarks,
+                environment: environment,
+                reliability: min(0.95, max(0.50, confidence)),
+                evidenceCount: 1,
+                lastValidatedAt: now
+            ))
+        }
+        values = Array(values.sorted {
+            ($0.lastValidatedAt ?? .distantPast) > ($1.lastValidatedAt ?? .distantPast)
+        }.prefix(128))
+        knowledge.semanticSurfaces = values
+        try upsert(knowledge)
+    }
+
+    /// Record an explicitly semantically verified transition. A failed transition decays the edge;
+    /// pixel/hash movement alone must never call this method as success.
+    public func recordSemanticTransition(
+        bundleID: String,
+        fromSurface: String,
+        toSurface: String,
+        semanticAction: String,
+        landmarks: [String] = [],
+        environment: AppActionEnvironment,
+        success: Bool,
+        confidence: Double,
+        latencyMS: Int,
+        at now: Date = Date()
+    ) throws {
+        loadIfNeeded()
+        let from = Self.normalizedSemanticToken(fromSurface)
+        let to = Self.normalizedSemanticToken(toSurface)
+        let action = Self.normalizedAction(semanticAction)
+        guard !from.isEmpty, !to.isEmpty, !action.isEmpty,
+              from.utf8.count <= 128, to.utf8.count <= 128, action.utf8.count <= 128,
+              confidence.isFinite, confidence >= 0.70, confidence <= 1.0,
+              var knowledge = entries[bundleID] else {
+            if entries[bundleID] == nil { throw AppKnowledgeRegistryError.missingApp(bundleID) }
+            throw AppKnowledgeRegistryError.invalidSemanticKnowledge
+        }
+        let boundedLatency = min(max(latencyMS, 0), 10 * 60 * 1_000)
+        let boundedLandmarks = Self.boundedSemanticLandmarks(landmarks)
+        var values = knowledge.semanticTransitions ?? []
+        if let index = values.firstIndex(where: {
+            Self.normalizedSemanticToken($0.fromSurface) == from
+                && Self.normalizedSemanticToken($0.toSurface) == to
+                && Self.normalizedAction($0.semanticAction) == action
+                && $0.environment.matches(environment)
+        }) {
+            var value = values[index]
+            value.landmarks = Self.mergeLandmarks(value.landmarks, boundedLandmarks)
+            if success {
+                value.evidenceCount += 1
+                value.reliability = min(0.99, value.reliability * 0.75 + confidence * 0.25)
+                value.estimatedLatencyMS = value.estimatedLatencyMS == 0
+                    ? boundedLatency
+                    : Int((Double(value.estimatedLatencyMS) * 0.7 + Double(boundedLatency) * 0.3).rounded())
+                value.lastValidatedAt = now
+            } else {
+                value.reliability = max(0.02, value.reliability * 0.55)
+                value.lastFailureAt = now
+            }
+            values[index] = value
+        } else {
+            values.append(AppSemanticTransitionKnowledge(
+                fromSurface: from,
+                toSurface: to,
+                semanticAction: action,
+                landmarks: boundedLandmarks,
+                environment: environment,
+                reliability: success ? min(0.90, max(0.55, confidence)) : 0.20,
+                estimatedLatencyMS: boundedLatency,
+                evidenceCount: success ? 1 : 0,
+                lastValidatedAt: success ? now : nil,
+                lastFailureAt: success ? nil : now
+            ))
+        }
+        values = Array(values.sorted {
+            let lhsDate = max($0.lastValidatedAt ?? .distantPast, $0.lastFailureAt ?? .distantPast)
+            let rhsDate = max($1.lastValidatedAt ?? .distantPast, $1.lastFailureAt ?? .distantPast)
+            return lhsDate > rhsDate
+        }.prefix(256))
+        knowledge.semanticTransitions = values
+        if success {
+            var surfaces = knowledge.semanticSurfaces ?? []
+            for surface in [from, to] {
+                if let index = surfaces.firstIndex(where: {
+                    Self.normalizedSemanticToken($0.semanticSurface) == surface && $0.environment.matches(environment)
+                }) {
+                    var value = surfaces[index]
+                    value.evidenceCount += 1
+                    value.reliability = min(0.99, value.reliability * 0.80 + confidence * 0.20)
+                    value.lastValidatedAt = now
+                    surfaces[index] = value
+                } else {
+                    surfaces.append(AppSemanticSurfaceKnowledge(
+                        semanticSurface: surface,
+                        genericSurface: IOSInteractionSurface(rawValue: surface) ?? .unknown,
+                        landmarks: [],
+                        environment: environment,
+                        reliability: min(0.90, max(0.55, confidence)),
+                        evidenceCount: 1,
+                        lastValidatedAt: now
+                    ))
+                }
+            }
+            knowledge.semanticSurfaces = Array(surfaces.sorted {
+                ($0.lastValidatedAt ?? .distantPast) > ($1.lastValidatedAt ?? .distantPast)
+            }.prefix(128))
+        }
+        try upsert(knowledge)
     }
 
     /// Record only performance evidence for an already-known App. This never promotes a route into
@@ -244,8 +477,41 @@ public actor AppKnowledgeRegistry {
         try upsert(knowledge)
     }
 
+    private static let semanticRevalidationAge: TimeInterval = 30 * 24 * 60 * 60
+    private static let semanticInvalidationAge: TimeInterval = 180 * 24 * 60 * 60
+
     private static func normalizedAction(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func normalizedSemanticToken(_ value: String) -> String {
+        String(value.trimmingCharacters(in: .whitespacesAndNewlines).prefix(128))
+    }
+
+    private static func boundedSemanticLandmarks(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for raw in values {
+            let value = String(raw.trimmingCharacters(in: .whitespacesAndNewlines).prefix(128))
+            guard !value.isEmpty, seen.insert(value).inserted else { continue }
+            result.append(value)
+            if result.count >= 24 { break }
+        }
+        return result
+    }
+
+    private static func mergeLandmarks(_ lhs: [String], _ rhs: [String]) -> [String] {
+        boundedSemanticLandmarks(lhs + rhs)
+    }
+
+    private static func isStale(lastValidatedAt: Date?, now: Date) -> Bool {
+        guard let lastValidatedAt else { return true }
+        return now.timeIntervalSince(lastValidatedAt) > semanticRevalidationAge
+    }
+
+    private static func isInvalidated(lastValidatedAt: Date?, reliability: Double, now: Date) -> Bool {
+        guard reliability >= 0.10, let lastValidatedAt else { return true }
+        return now.timeIntervalSince(lastValidatedAt) > semanticInvalidationAge
     }
 
     private func loadIfNeeded() {
@@ -894,6 +1160,188 @@ public actor TrashService {
         #else
         return String(seed.hashValue)
         #endif
+    }
+}
+
+public enum DocumentInspectionError: Error, Equatable {
+    case notRegularFile
+    case unsupportedType(String)
+    case invalidArchive
+    case missingWordDocument
+    case entryTooLarge(String)
+    case fileTooLarge(Int64)
+}
+
+public struct DocumentInspection: Codable, Equatable, Sendable {
+    public var kind: String
+    public var filename: String
+    public var byteSize: Int64
+    public var text: String
+    public var entries: [String]
+    public var truncated: Bool
+    public var detail: String
+
+    public init(kind: String, filename: String, byteSize: Int64, text: String = "", entries: [String] = [], truncated: Bool = false, detail: String) {
+        self.kind = kind
+        self.filename = filename
+        self.byteSize = byteSize
+        self.text = text
+        self.entries = entries
+        self.truncated = truncated
+        self.detail = detail
+    }
+}
+
+/// Bounded local inspection for common user documents. Binary files are understood locally first;
+/// only extracted text or metadata is exposed to the Agent instead of uploading the whole file.
+public struct DocumentInspectionService: Sendable {
+    private let maxFileBytes: Int64 = 128 * 1024 * 1024
+    private let maxExtractedEntryBytes: UInt32 = 4 * 1024 * 1024
+    private let maxTextCharacters = 100_000
+    private let maxArchiveEntries = 400
+
+    public init() {}
+
+    public func inspect(_ url: URL, allowedRoot: URL? = nil) throws -> DocumentInspection {
+        let safe = try PathGuard().validate(target: url, allowedRoot: allowedRoot, rejectSymlink: true)
+        let values = try safe.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values.isRegularFile == true else { throw DocumentInspectionError.notRegularFile }
+        let size = Int64(values.fileSize ?? 0)
+        guard size <= maxFileBytes else { throw DocumentInspectionError.fileTooLarge(size) }
+        let ext = safe.pathExtension.lowercased()
+
+        switch ext {
+        case "docx": return try inspectDOCX(safe, size: size)
+        case "zip": return try inspectZIP(safe, size: size)
+        case "pdf": return try inspectPDF(safe, size: size)
+        case "txt", "md", "markdown", "csv", "json", "xml", "html", "htm", "log", "rtf":
+            return try inspectText(safe, size: size, kind: ext.isEmpty ? "text" : ext)
+        default:
+            throw DocumentInspectionError.unsupportedType(ext.isEmpty ? "unknown" : ext)
+        }
+    }
+
+    private func inspectText(_ url: URL, size: Int64, kind: String) throws -> DocumentInspection {
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        let prefix = data.prefix(2 * 1024 * 1024)
+        let decoded = String(data: prefix, encoding: .utf8)
+            ?? String(data: prefix, encoding: .utf16)
+            ?? ""
+        let bounded = boundedText(decoded)
+        return DocumentInspection(
+            kind: kind,
+            filename: url.lastPathComponent,
+            byteSize: size,
+            text: bounded.text,
+            truncated: bounded.truncated || data.count > 2 * 1024 * 1024,
+            detail: "Bounded local text inspection"
+        )
+    }
+
+    private func inspectZIP(_ url: URL, size: Int64) throws -> DocumentInspection {
+        let archive: Archive
+        do { archive = try Archive(url: url, accessMode: .read) }
+        catch { throw DocumentInspectionError.invalidArchive }
+        let entries = Array(archive.prefix(maxArchiveEntries + 1))
+        let truncated = entries.count > maxArchiveEntries
+        let names = entries.prefix(maxArchiveEntries).map { "\($0.path)\t\($0.uncompressedSize)" }
+        return DocumentInspection(
+            kind: "zip",
+            filename: url.lastPathComponent,
+            byteSize: size,
+            entries: names,
+            truncated: truncated,
+            detail: "ZIP directory inspected locally; entry paths and uncompressed sizes are bounded"
+        )
+    }
+
+    private func inspectDOCX(_ url: URL, size: Int64) throws -> DocumentInspection {
+        let archive: Archive
+        do { archive = try Archive(url: url, accessMode: .read) }
+        catch { throw DocumentInspectionError.invalidArchive }
+        guard let entry = archive["word/document.xml"] else { throw DocumentInspectionError.missingWordDocument }
+        guard entry.uncompressedSize <= maxExtractedEntryBytes else {
+            throw DocumentInspectionError.entryTooLarge(entry.path)
+        }
+        var xmlData = Data()
+        _ = try archive.extract(entry) { xmlData.append($0) }
+        let bounded = boundedText(extractWordXMLText(String(data: xmlData, encoding: .utf8) ?? ""))
+        return DocumentInspection(
+            kind: "docx",
+            filename: url.lastPathComponent,
+            byteSize: size,
+            text: bounded.text,
+            truncated: bounded.truncated,
+            detail: "DOCX word/document.xml extracted locally with ZIPFoundation"
+        )
+    }
+
+    private func inspectPDF(_ url: URL, size: Int64) throws -> DocumentInspection {
+#if canImport(PDFKit)
+        guard let document = PDFDocument(url: url) else {
+            throw DocumentInspectionError.unsupportedType("pdf_unreadable")
+        }
+        let pageLimit = min(document.pageCount, 30)
+        var parts: [String] = []
+        var count = 0
+        var truncated = document.pageCount > pageLimit
+        for index in 0..<pageLimit {
+            guard let pageText = document.page(at: index)?.string, !pageText.isEmpty else { continue }
+            let remaining = maxTextCharacters - count
+            if remaining <= 0 { truncated = true; break }
+            let boundedPage = String(pageText.prefix(remaining))
+            parts.append("[Page \(index + 1)]\n\(boundedPage)")
+            count += boundedPage.count
+            if boundedPage.count < pageText.count { truncated = true; break }
+        }
+        return DocumentInspection(
+            kind: "pdf",
+            filename: url.lastPathComponent,
+            byteSize: size,
+            text: parts.joined(separator: "\n\n"),
+            truncated: truncated,
+            detail: "PDFKit local text extraction; pages=\(document.pageCount), inspected=\(pageLimit)"
+        )
+#else
+        throw DocumentInspectionError.unsupportedType("pdf_runtime_unavailable")
+#endif
+    }
+
+    private func boundedText(_ text: String) -> (text: String, truncated: Bool) {
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let bounded = String(normalized.prefix(maxTextCharacters))
+        return (bounded, bounded.count < normalized.count)
+    }
+
+    private func extractWordXMLText(_ xml: String) -> String {
+        guard !xml.isEmpty else { return "" }
+        let normalized = xml
+            .replacingOccurrences(of: "</w:p>", with: "\n")
+            .replacingOccurrences(of: "<w:tab/>", with: "\t")
+            .replacingOccurrences(of: "<w:br/>", with: "\n")
+        let pattern = #"<w:t(?:\s[^>]*)?>(.*?)</w:t>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else { return "" }
+        let range = NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)
+        var pieces: [String] = []
+        for match in regex.matches(in: normalized, options: [], range: range) {
+            guard let capture = Range(match.range(at: 1), in: normalized) else { continue }
+            pieces.append(decodeXML(String(normalized[capture])))
+            if pieces.reduce(0, { $0 + $1.count }) >= maxTextCharacters { break }
+        }
+        return pieces.joined(separator: " ")
+            .replacingOccurrences(of: "  ", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func decodeXML(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&apos;", with: "'")
+            .replacingOccurrences(of: "&amp;", with: "&")
     }
 }
 

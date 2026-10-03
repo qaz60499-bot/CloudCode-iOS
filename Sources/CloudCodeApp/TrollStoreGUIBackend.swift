@@ -7,9 +7,13 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     public nonisolated let identifier = "trollstore-root-helper"
     private var cachedSnapshot: GUIAutomationCapabilitySnapshot?
     private var cachedSnapshotAt: Date?
+    private var exactRuntimeStatuses: [GUIAutomationFeature: CapabilityStatus] = [:]
+    private var exactRuntimeDetails: [GUIAutomationFeature: String] = [:]
     private var treeRetryAfter: Date?
-    private let snapshotTTL: TimeInterval = 2
+    private var lastTreeFailureClass: ObservationFrame.AXFailureClass?
+    private let snapshotTTL: TimeInterval = 30
     private let treeFailureCooldown: TimeInterval = 30
+    private let unknownClientCooldown: TimeInterval = 120
     private let diagnosticLogger: DiagnosticLogStore?
 
     public init(diagnosticLogger: DiagnosticLogStore? = nil) {
@@ -18,9 +22,12 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
 
     public func isAvailable() async -> Bool {
         // Never initiate a root/persona readiness probe from a generic availability check.
-        // Explicit privileged capability validation populates this cache; before that, GUI
-        // remains unavailable for ordinary Agent routing.
-        cachedSnapshot?.compositeStatus == .available
+        // Once an explicit capability refresh populated the cache, deviceValidationRequired is
+        // routable: every concrete GUI operation owns a bounded exact-operation self-validation
+        // path. Treating that state as backend-unavailable prevents those validators from ever
+        // running and can report OCR/screenshot as unavailable even after a physical success.
+        guard let status = cachedSnapshot?.compositeStatus else { return false }
+        return status == .available || status == .deviceValidationRequired
     }
 
     public func guiCapabilitySnapshot() async -> GUIAutomationCapabilitySnapshot {
@@ -28,47 +35,43 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
            Date().timeIntervalSince(cachedSnapshotAt) <= snapshotTTL {
             return cachedSnapshot
         }
-        let launch = EmbeddedRootHelper.launchCapability()
-        let probe = EmbeddedRootHelper.guiProbe()
+        // Generic GUI readiness probing is intentionally excluded from the hot path. On the
+        // physical TrollStore runtime the broad gui-probe helper can consume its watchdog even
+        // though exact operations (launch/tree/screenshot/tap/type/gesture) remain usable. Every
+        // concrete GUI tool below already owns bounded exact-operation self-validation, so a
+        // capability snapshot must stay side-effect-free and cheap instead of paying a multi-second
+        // helper round-trip before ordinary work can begin.
+        let localVisionEvidence = await LocalVisionTextObservation.capabilityEvidence()
         var statuses: [GUIAutomationFeature: CapabilityStatus] = [
-            .openApp: launch.available ? .available : .deviceValidationRequired,
-            .tree: .deviceValidationRequired,
+            .openApp: .deviceValidationRequired,
+            .tree: ProductionPerceptionPolicy.accessibilityRuntimeAllowed ? .deviceValidationRequired : .unavailable,
             .screenshot: .deviceValidationRequired,
+            .ocr: localVisionEvidence.status,
             .touch: .deviceValidationRequired,
             .textInput: .deviceValidationRequired,
             .gestures: .deviceValidationRequired,
             .verify: .deviceValidationRequired
         ]
         var details: [GUIAutomationFeature: String] = [
-            .openApp: launch.detail,
-            .tree: probe.detail,
-            .screenshot: probe.detail,
-            .touch: probe.detail,
-            .textInput: probe.detail,
-            .gestures: probe.detail,
-            .verify: probe.detail
+            .openApp: "App launch uses exact bundle-scoped self-validation; broad no-target readiness probing is intentionally disabled on this TrollStore runtime.",
+            .tree: ProductionPerceptionPolicy.accessibilityRuntimeAllowed
+                ? "AXRuntime tree probing is deferred to the exact gui.tree request."
+                : ProductionPerceptionPolicy.accessibilityDisabledReason,
+            .screenshot: "Global screenshot probing is deferred to the exact gui.screenshot request so ordinary routing never pays the broad GUI helper watchdog.",
+            .ocr: localVisionEvidence.detail,
+            .touch: "IOHID touch dispatch and coordinate-space validation are deferred to the exact gui.tap request.",
+            .textInput: "Text input remains deferred until an exact gui.type request proves a focused AX or HID Unicode route at runtime.",
+            .gestures: "IOHID gesture dispatch and coordinate-space validation are deferred to the exact gui.scroll/gui.swipe request.",
+            .verify: "Verification is deferred with fresh semantic observation and runs only for an exact gui.verify request."
         ]
 
-        if let payload = probe.payload {
-            // Explicit refresh intentionally performs only a lightweight helper handshake. The
-            // private observation and coordinate runtimes below stay deferred until the exact
-            // requested operation executes in its own bounded helper process.
-            statuses[.tree] = .deviceValidationRequired
-            statuses[.screenshot] = .deviceValidationRequired
-            statuses[.touch] = .deviceValidationRequired
-            statuses[.textInput] = .deviceValidationRequired
-            statuses[.gestures] = .deviceValidationRequired
-            statuses[.verify] = .deviceValidationRequired
-            details[.tree] = "AXRuntime tree probing is deferred to the exact gui.tree/gui.verify request to keep device refresh crash-isolated."
-            details[.screenshot] = "Global screenshot probing is deferred to the exact gui.screenshot request to keep device refresh crash-isolated."
-            details[.touch] = "IOHID touch dispatch and coordinate-space validation are deferred to the exact gui.tap request."
-            details[.textInput] = payload.textInput
-                ? "IOHID Unicode symbols are present, but symbol presence alone is not proof that the current focused field accepts text. Exact gui.type execution now prefers focused AX value injection with read-back verification, then falls back to HID Unicode with bounded postcondition checks when AX can observe the field."
-                : "Text input remains deferred until an exact gui.type request proves a focused AX or HID Unicode route at runtime."
-            details[.gestures] = "IOHID gesture dispatch and coordinate-space validation are deferred to the exact gui.scroll/gui.swipe request."
-            details[.verify] = "Verification is deferred with AX tree observation and runs only for an exact gui.verify request."
+        for (feature, status) in exactRuntimeStatuses {
+            if feature == .tree, !ProductionPerceptionPolicy.accessibilityRuntimeAllowed { continue }
+            statuses[feature] = status
         }
-
+        for (feature, detail) in exactRuntimeDetails {
+            details[feature] = detail
+        }
         let snapshot = GUIAutomationCapabilitySnapshot(
             backendIdentifier: identifier,
             statuses: statuses,
@@ -80,6 +83,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     }
 
     public func openApp(bundleID: String) async throws -> GUIOpenAppOutcome {
+        let startedAt = Date()
         let outcome = EmbeddedRootHelper.launch(bundleID: bundleID)
         guard outcome.accepted else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
         // Only a verified foreground transition invalidates the previous AX timeout state. An
@@ -87,7 +91,16 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
         // another expensive tree probe loop.
         if outcome.foregroundVerified {
             treeRetryAfter = nil
+            lastTreeFailureClass = nil
         }
+        try? await diagnosticLogger?.log(
+            level: outcome.foregroundVerified ? .info : .warning,
+            subsystem: "gui-timing",
+            action: "apps.launch",
+            result: outcome.foregroundVerified ? "verified" : "accepted-unverified",
+            diagnostic: outcome.detail,
+            metadata: ["durationMS": String(max(0, Int(Date().timeIntervalSince(startedAt) * 1_000)))]
+        )
         return GUIOpenAppOutcome(
             accepted: outcome.accepted,
             foregroundVerified: outcome.foregroundVerified,
@@ -96,15 +109,39 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     }
 
     public func tree() async throws -> String {
+        guard ProductionPerceptionPolicy.accessibilityRuntimeAllowed else {
+            lastTreeFailureClass = .unknownClient
+            treeRetryAfter = .distantFuture
+            try? await diagnosticLogger?.log(
+                level: .info,
+                subsystem: "gui",
+                action: "tree.production-policy",
+                result: "quarantined",
+                diagnostic: ProductionPerceptionPolicy.accessibilityDisabledReason,
+                metadata: [
+                    "axInvoked": "false",
+                    "greenFrameRisk": "true",
+                    "fallback": "screenshot_local_ocr"
+                ]
+            )
+            throw ToolRouterError.noExecutionRoute(ProductionPerceptionPolicy.accessibilityDisabledReason)
+        }
         if let treeRetryAfter, treeRetryAfter > Date() {
             let seconds = max(1, Int(treeRetryAfter.timeIntervalSinceNow.rounded(.up)))
-            throw ToolRouterError.noExecutionRoute("AX tree recently timed out for the current device; retry is suppressed for \(seconds)s so screenshot-driven computer use can continue.")
+            let failureClass = lastTreeFailureClass?.rawValue ?? "temporary_failure"
+            throw ToolRouterError.noExecutionRoute("AX tree circuit is open after \(failureClass); retry is suppressed for \(seconds)s so local OCR/screenshot execution can continue until foreground state changes.")
         }
         let startedAt = Date()
         let outcome = EmbeddedRootHelper.guiTree()
         let latencyMS = max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))
         guard let tree = outcome.tree else {
-            treeRetryAfter = Date().addingTimeInterval(treeFailureCooldown)
+            let failureClass = PerceptionBrokerFacade.classifyAXFailure(
+                attempted: true,
+                succeeded: false,
+                text: outcome.detail
+            )
+            lastTreeFailureClass = failureClass
+            treeRetryAfter = Date().addingTimeInterval(failureClass == .unknownClient ? unknownClientCooldown : treeFailureCooldown)
             try? await diagnosticLogger?.log(
                 level: .warning,
                 subsystem: "gui",
@@ -112,25 +149,32 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
                 result: "unavailable",
                 diagnostic: outcome.detail,
                 metadata: [
-                    "axBackend": "standalone_trollstore_axruntime",
-                    "axStage": "direct_root_then_sampled_hit_test",
+                    "axBackend": "host_system_app_then_persona99_fallback",
+                    "axStage": "host_semantic_tree_then_bounded_persona99_fallback",
                     "axScope": "unavailable",
-                    "axLatencyMS": String(latencyMS)
+                    "axLatencyMS": String(latencyMS),
+                    "axFailureClass": failureClass.rawValue
                 ]
             )
             throw ToolRouterError.noExecutionRoute(outcome.detail)
         }
         guard tree.utf8.count <= 256 * 1024 else {
+            lastTreeFailureClass = .temporaryFailure
             treeRetryAfter = Date().addingTimeInterval(treeFailureCooldown)
             throw ToolRouterError.noExecutionRoute("GUI tree exceeded the 256 KiB app-layer output limit")
         }
-        var axBackend = "standalone_trollstore_axruntime"
+        var axBackend = "host_system_app_then_persona99_fallback"
         var axScope = "unknown"
         if let data = tree.data(using: .utf8),
            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             axBackend = object["backend"] as? String ?? axBackend
             axScope = object["scope"] as? String ?? axScope
         }
+        treeRetryAfter = nil
+        lastTreeFailureClass = nil
+        exactRuntimeStatuses[.tree] = .available
+        exactRuntimeDetails[.tree] = "Exact host-first AX tree operation returned a bounded semantic tree on this runtime."
+        cachedSnapshotAt = nil
         try? await diagnosticLogger?.log(
             level: .info,
             subsystem: "gui",
@@ -138,7 +182,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             result: "observed",
             metadata: [
                 "axBackend": axBackend,
-                "axStage": "direct_root_then_sampled_hit_test",
+                "axStage": "host_semantic_tree_then_bounded_persona99_fallback",
                 "axScope": axScope,
                 "axLatencyMS": String(latencyMS)
             ]
@@ -148,15 +192,41 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     }
 
     public func screenshot() async throws -> Data {
+        let startedAt = Date()
         let outcome = EmbeddedRootHelper.guiScreenshot()
-        guard let data = outcome.data else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
+        guard let data = outcome.data else {
+            try? await diagnosticLogger?.log(
+                level: .error,
+                subsystem: "gui-timing",
+                action: "screenshot",
+                result: "failed",
+                diagnostic: outcome.detail,
+                metadata: ["durationMS": String(max(0, Int(Date().timeIntervalSince(startedAt) * 1_000)))]
+            )
+            throw ToolRouterError.noExecutionRoute(outcome.detail)
+        }
+        exactRuntimeStatuses[.screenshot] = .available
+        exactRuntimeDetails[.screenshot] = "Exact global screenshot capture returned a valid bounded JPEG on this runtime."
+        cachedSnapshotAt = nil
         // A working global screenshot is authoritative visual evidence for the current foreground
         // state. Keep any recent AX timeout cooldown in place; visually rich apps such as video
         // feeds do not become better automation targets by immediately retrying the same AX path.
+        try? await diagnosticLogger?.log(
+            level: .info,
+            subsystem: "gui-timing",
+            action: "screenshot",
+            result: "completed",
+            metadata: [
+                "durationMS": String(max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))),
+                "byteCount": String(data.count),
+                "axInvoked": "false"
+            ]
+        )
         return data
     }
 
     public func tap(x: Double, y: Double) async throws {
+        let startedAt = Date()
         guard x.isFinite, y.isFinite, x >= 0, y >= 0 else {
             throw ToolRouterError.noExecutionRoute("tap coordinates must be finite and non-negative")
         }
@@ -167,12 +237,16 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             action: "tap.helper",
             result: outcome.success ? "dispatched-unverified" : "failed",
             diagnostic: outcome.detail,
-            metadata: ["x": String(x), "y": String(y)]
+            metadata: [
+                "x": String(x), "y": String(y),
+                "durationMS": String(max(0, Int(Date().timeIntervalSince(startedAt) * 1_000)))
+            ]
         )
         guard outcome.success else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
     }
 
     public func type(_ text: String) async throws {
+        let startedAt = Date()
         guard !text.isEmpty else { throw ToolRouterError.noExecutionRoute("text must not be empty") }
         let outcome = EmbeddedRootHelper.guiType(text)
         try? await diagnosticLogger?.log(
@@ -181,7 +255,12 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             action: "type.helper",
             result: outcome.success ? "submitted" : "failed",
             diagnostic: outcome.detail,
-            metadata: ["characters": String(text.count), "utf8Bytes": String(text.utf8.count)]
+            metadata: [
+                "characters": String(text.count),
+                "utf8Bytes": String(text.utf8.count),
+                "durationMS": String(max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))),
+                "axInvoked": "false"
+            ]
         )
         guard outcome.success else { throw ToolRouterError.noExecutionRoute(outcome.detail) }
     }
@@ -242,7 +321,31 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     }
 
     public func verify(_ assertion: String) async throws -> VerificationResult {
-        let observedTree = try await tree()
-        return GUIVisibleTextVerifier.verify(tree: observedTree, assertion: assertion)
+        if ProductionPerceptionPolicy.accessibilityRuntimeAllowed {
+            let observedTree = try await tree()
+            return GUIVisibleTextVerifier.verify(tree: observedTree, assertion: assertion)
+        }
+        let startedAt = Date()
+        let data = try await screenshot()
+        let observation = await LocalVisionTextObservation.observe(
+            for: data,
+            maximumElements: 48,
+            requiresText: true
+        )
+        let text = observation.elements.map(\.text).joined(separator: "\n")
+        let result = GUIVisibleTextVerifier.verify(tree: text, assertion: assertion)
+        try? await diagnosticLogger?.log(
+            level: result.passed ? .info : .warning,
+            subsystem: "gui",
+            action: "verify.local-ocr",
+            result: result.passed ? "passed" : "failed",
+            metadata: [
+                "axInvoked": "false",
+                "ocrStatus": observation.payload["localVisionOCR"] ?? "unknown",
+                "ocrBackend": observation.payload["localVisionBackend"] ?? "unknown",
+                "verifyLatencyMS": String(max(0, Int(Date().timeIntervalSince(startedAt) * 1_000)))
+            ]
+        )
+        return result
     }
 }

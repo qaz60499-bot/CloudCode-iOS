@@ -1,6 +1,7 @@
 import Foundation
 import SQLite3
 import XCTest
+import ZIPFoundation
 @testable import CloudCodeCore
 
 final class NativeDataServicesTests: XCTestCase {
@@ -8,7 +9,7 @@ final class NativeDataServicesTests: XCTestCase {
         let registry = ToolRegistry()
         let names = Set(await registry.all().map(\.name))
         let expected: Set<String> = [
-            "files.stat", "files.metadata", "files.hash", "files.diff", "files.copy", "files.move",
+            "files.inspectDocument", "files.share", "files.stat", "files.metadata", "files.hash", "files.diff", "files.copy", "files.move",
             "plist.read", "plist.query", "plist.metadata",
             "json.read", "json.query", "json.filter", "json.aggregate",
             "sqlite.discover", "sqlite.tables", "sqlite.schema", "sqlite.query", "sqlite.filter", "sqlite.aggregate", "sqlite.sample",
@@ -17,9 +18,13 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertTrue(expected.isSubset(of: names), "missing native contracts: \(expected.subtracting(names).sorted())")
 
         let copyDescriptor = await registry.descriptor(named: "files.copy")
+        let shareDescriptor = await registry.descriptor(named: "files.share")
         let sqliteDescriptor = await registry.descriptor(named: "sqlite.query")
         let macroDescriptor = await registry.descriptor(named: "data.localQuery")
         XCTAssertEqual(copyDescriptor?.preferredRoute, .structuredTool)
+        XCTAssertEqual(shareDescriptor?.preferredRoute, .structuredTool)
+        XCTAssertEqual(shareDescriptor?.risk, .sensitiveWrite)
+        XCTAssertEqual(shareDescriptor?.requiredCapabilities, ["native.files"])
         XCTAssertEqual(sqliteDescriptor?.requiredCapabilities, ["native.sqlite"])
         XCTAssertEqual(macroDescriptor?.requiredCapabilities, ["native.data_macro"])
     }
@@ -445,6 +450,228 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertTrue(graph.nodes.contains(where: { $0.resolvedPath == jsonURL.path }))
     }
 
+    func testAppsListSeedsMinimalAppKnowledgeForMatchedTarget() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let app = ResourceNode(
+            id: ResourceID("app://com.tencent.xin"),
+            kind: .app,
+            displayName: "微信",
+            logicalLocation: "app://com.tencent.xin",
+            resolvedPath: "/var/containers/Bundle/Application/TEST/WeChat.app",
+            ownerBundleID: "com.tencent.xin",
+            metadata: ["version": "8.0.76"]
+        )
+        let resolver = StaticAppResolver(apps: [app], bundlePaths: ["com.tencent.xin": app.resolvedPath ?? ""])
+        let resourceIndex = ProgressiveResourceIndex(fileURL: root.appendingPathComponent("index/resource-graph.json"))
+        let knowledge = AppKnowledgeRegistry(fileURL: root.appendingPathComponent("index/app-knowledge.json"))
+        let executor = try makeStructuredExecutor(root: root, resolver: resolver, resourceIndex: resourceIndex, appKnowledgeRegistry: knowledge)
+        let descriptor = ToolDescriptor(name: "apps.list", summary: "", risk: .readOnly)
+        let call = ToolCall(name: "apps.list", arguments: ["query": "微信"], sessionID: UUID())
+
+        let result = try await executor.execute(
+            call,
+            descriptor: descriptor,
+            context: ToolExecutionContext(permissionMode: .safe, capabilityProfile: publicNativeProfile(), allowedRoot: root)
+        )
+
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.payload["matchedCount"], "1")
+        let seeded = await knowledge.knowledge(for: "com.tencent.xin")
+        XCTAssertEqual(seeded?.appName, "微信")
+        XCTAssertEqual(seeded?.appVersion, "8.0.76")
+        XCTAssertTrue(seeded?.preferredRoutes.contains(.privateFramework) == true)
+        XCTAssertTrue(seeded?.preferredRoutes.contains(.guiFallback) == true)
+    }
+
+    func testAppsListFailsClosedWhenCrossAppEnumerationIsUnverified() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let ownApp = ResourceNode(
+            id: ResourceID("app://com.cloudcode.ios"),
+            kind: .app,
+            displayName: "Cloud Code",
+            logicalLocation: "app://com.cloudcode.ios",
+            resolvedPath: "/var/containers/Bundle/Application/TEST/CloudCode.app",
+            ownerBundleID: "com.cloudcode.ios"
+        )
+        let resolver = UnverifiedEnumerationResolver(apps: [ownApp])
+        let resourceIndex = ProgressiveResourceIndex(fileURL: root.appendingPathComponent("index/resource-graph.json"))
+        let executor = try makeStructuredExecutor(root: root, resolver: resolver, resourceIndex: resourceIndex)
+        let descriptor = ToolDescriptor(name: "apps.list", summary: "", risk: .readOnly)
+        let call = ToolCall(name: "apps.list", arguments: ["query": "微信"], sessionID: UUID())
+
+        let result = try await executor.execute(
+            call,
+            descriptor: descriptor,
+            context: ToolExecutionContext(permissionMode: .safe, capabilityProfile: publicNativeProfile(), allowedRoot: root)
+        )
+
+        XCTAssertFalse(result.success)
+        XCTAssertEqual(result.payload["enumeration"], "unavailable")
+        XCTAssertEqual(result.payload["ownAppFallbackSuppressed"], "true")
+        XCTAssertTrue(result.summary.contains("未将 Cloud Code 自身视为完整安装列表"))
+    }
+
+    func testAppsListUsesLastKnownGoodIndexWhenFreshEnumerationTemporarilyFails() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let wechat = ResourceNode(
+            id: ResourceID("app://com.tencent.xin"),
+            kind: .app,
+            displayName: "微信",
+            logicalLocation: "app://com.tencent.xin",
+            resolvedPath: "/var/containers/Bundle/Application/TEST/WeChat.app",
+            ownerBundleID: "com.tencent.xin",
+            metadata: ["version": "8.0.76"]
+        )
+        let resolver = StaleEnumerationResolver(apps: [wechat])
+        let resourceIndex = ProgressiveResourceIndex(fileURL: root.appendingPathComponent("index/resource-graph.json"))
+        let executor = try makeStructuredExecutor(root: root, resolver: resolver, resourceIndex: resourceIndex)
+        let descriptor = ToolDescriptor(name: "apps.list", summary: "", risk: .readOnly)
+        let call = ToolCall(name: "apps.list", arguments: ["query": "微信"], sessionID: UUID())
+
+        let result = try await executor.execute(
+            call,
+            descriptor: descriptor,
+            context: ToolExecutionContext(permissionMode: .safe, capabilityProfile: publicNativeProfile(), allowedRoot: root)
+        )
+
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.payload["matchedCount"], "1")
+        XCTAssertEqual(result.payload["enumeration"], "stale_last_known_good")
+        XCTAssertTrue(result.payload["apps"]?.contains("com.tencent.xin") == true)
+        XCTAssertTrue(result.payload["apps"]?.contains("8.0.76") == true)
+    }
+
+    func testAppsInspectKeepsIndexedIdentityWhenIntrospectionIsUnavailable() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let wechat = ResourceNode(
+            id: ResourceID("app://com.tencent.xin"),
+            kind: .app,
+            displayName: "微信",
+            logicalLocation: "app://com.tencent.xin",
+            resolvedPath: "/var/containers/Bundle/Application/TEST/WeChat.app",
+            ownerBundleID: "com.tencent.xin",
+            metadata: ["version": "8.0.76"]
+        )
+        let resolver = DegradedIntrospectionResolver(
+            apps: [wechat],
+            bundlePaths: ["com.tencent.xin": wechat.resolvedPath ?? ""],
+            containerPaths: ["com.tencent.xin": "/var/mobile/Containers/Data/Application/TEST"]
+        )
+        let resourceIndex = ProgressiveResourceIndex(fileURL: root.appendingPathComponent("index/resource-graph.json"))
+        let executor = try makeStructuredExecutor(root: root, resolver: resolver, resourceIndex: resourceIndex)
+        let descriptor = ToolDescriptor(name: "apps.inspect", summary: "", risk: .readOnly)
+        let call = ToolCall(name: "apps.inspect", arguments: ["bundleId": "com.tencent.xin"], sessionID: UUID())
+
+        let result = try await executor.execute(
+            call,
+            descriptor: descriptor,
+            context: ToolExecutionContext(permissionMode: .safe, capabilityProfile: publicNativeProfile(), allowedRoot: root)
+        )
+
+        XCTAssertTrue(result.success)
+        XCTAssertTrue(result.payload["app"]?.contains("com.tencent.xin") == true)
+        XCTAssertTrue(result.payload["app"]?.contains("微信") == true)
+        XCTAssertTrue(result.payload["app"]?.contains("8.0.76") == true)
+        XCTAssertTrue(result.payload["app"]?.contains("degraded_unavailable") == true)
+    }
+
+    func testDocumentInspectionReadsTextZIPAndDOCXWithinBounds() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let service = DocumentInspectionService()
+
+        let textURL = root.appendingPathComponent("notes.txt")
+        try Data("第一行\nsecond line".utf8).write(to: textURL)
+        let text = try service.inspect(textURL, allowedRoot: root)
+        XCTAssertEqual(text.kind, "txt")
+        XCTAssertTrue(text.text.contains("第一行"))
+        XCTAssertFalse(text.truncated)
+
+        let zipURL = root.appendingPathComponent("bundle.zip")
+        let zip = try Archive(url: zipURL, accessMode: .create)
+        try addArchiveEntry("docs/readme.txt", data: Data("hello".utf8), to: zip)
+        try addArchiveEntry("assets/data.json", data: Data("{}".utf8), to: zip)
+        let zipInspection = try service.inspect(zipURL, allowedRoot: root)
+        XCTAssertEqual(zipInspection.kind, "zip")
+        XCTAssertTrue(zipInspection.entries.contains(where: { $0.hasPrefix("docs/readme.txt\t") }))
+        XCTAssertTrue(zipInspection.entries.contains(where: { $0.hasPrefix("assets/data.json\t") }))
+
+        let docxURL = root.appendingPathComponent("sample.docx")
+        let docx = try Archive(url: docxURL, accessMode: .create)
+        let documentXML = Data("""
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+        <w:p><w:r><w:t>Cloud Code</w:t></w:r></w:p><w:p><w:r><w:t>文件发送</w:t></w:r></w:p>
+        </w:body></w:document>
+        """.utf8)
+        try addArchiveEntry("word/document.xml", data: documentXML, to: docx)
+        let docxInspection = try service.inspect(docxURL, allowedRoot: root)
+        XCTAssertEqual(docxInspection.kind, "docx")
+        XCTAssertTrue(docxInspection.text.contains("Cloud Code"))
+        XCTAssertTrue(docxInspection.text.contains("文件发送"))
+    }
+
+    func testDocumentInspectionRejectsUnsupportedOversizedAndOutOfRootFiles() throws {
+        let root = try makeTempDirectory()
+        let outside = try makeTempDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        let service = DocumentInspectionService()
+
+        let unsupported = root.appendingPathComponent("payload.bin")
+        try Data([0x01, 0x02]).write(to: unsupported)
+        XCTAssertThrowsError(try service.inspect(unsupported, allowedRoot: root)) { error in
+            XCTAssertEqual(error as? DocumentInspectionError, .unsupportedType("bin"))
+        }
+
+        let oversized = root.appendingPathComponent("huge.txt")
+        FileManager.default.createFile(atPath: oversized.path, contents: Data())
+        let handle = try FileHandle(forWritingTo: oversized)
+        try handle.truncate(atOffset: 129 * 1024 * 1024)
+        try handle.close()
+        XCTAssertThrowsError(try service.inspect(oversized, allowedRoot: root)) { error in
+            guard let inspectionError = error as? DocumentInspectionError,
+                  case .fileTooLarge = inspectionError else {
+                XCTFail("expected fileTooLarge, got \(error)")
+                return
+            }
+        }
+
+        let outsideFile = outside.appendingPathComponent("outside.txt")
+        try Data("outside".utf8).write(to: outsideFile)
+        XCTAssertThrowsError(try service.inspect(outsideFile, allowedRoot: root))
+    }
+
+    func testInspectDocumentStructuredToolReturnsUntrustedEnvelope() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("document.txt")
+        try Data("hello local document".utf8).write(to: file)
+        let executor = try makeStructuredExecutor(
+            root: root,
+            resolver: StaticAppResolver(),
+            resourceIndex: ProgressiveResourceIndex(fileURL: root.appendingPathComponent("index/resource-graph.json"))
+        )
+        let result = try await executor.execute(
+            ToolCall(name: "files.inspectDocument", arguments: ["path": file.path], sessionID: UUID()),
+            descriptor: ToolDescriptor(name: "files.inspectDocument", summary: "", risk: .readOnly, requiredCapabilities: ["native.files"]),
+            context: ToolExecutionContext(permissionMode: .safe, capabilityProfile: publicNativeProfile(), allowedRoot: root)
+        )
+        XCTAssertTrue(result.success)
+        XCTAssertTrue(result.payload["document"]?.contains("hello local document") == true)
+        XCTAssertTrue(result.payload["document"]?.contains("untrusted") == true)
+    }
+
     func testToolRouterProviderSchemaEligibilityOmitsUnavailableCapabilities() async throws {
         let registry = ToolRegistry(descriptors: [
             ToolDescriptor(name: "test.routable", summary: "", risk: .readOnly),
@@ -478,7 +705,18 @@ final class NativeDataServicesTests: XCTestCase {
         XCTAssertEqual(metric.outcome, "completed")
     }
 
-    private func makeStructuredExecutor(root: URL, resolver: StaticAppResolver, resourceIndex: ProgressiveResourceIndex, appKnowledgeRegistry: AppKnowledgeRegistry? = nil) throws -> StructuredToolExecutor {
+    private func addArchiveEntry(_ path: String, data: Data, to archive: Archive) throws {
+        try archive.addEntry(
+            with: path,
+            type: .file,
+            uncompressedSize: Int64(data.count),
+            provider: { position, size in
+                data.subdata(in: Int(position)..<Int(position) + size)
+            }
+        )
+    }
+
+    private func makeStructuredExecutor(root: URL, resolver: any AppContainerResolving, resourceIndex: ProgressiveResourceIndex, appKnowledgeRegistry: AppKnowledgeRegistry? = nil) throws -> StructuredToolExecutor {
         let policy = PolicyEngine()
         let audit = AuditLogStore(fileURL: root.appendingPathComponent("audit/audit.jsonl"))
         let journal = TransactionJournal(fileURL: root.appendingPathComponent("transactions/transactions.json"))
@@ -526,6 +764,39 @@ final class NativeDataServicesTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root
     }
+}
+
+private struct UnverifiedEnumerationResolver: AppContainerResolving, AppEnumerationCapabilityProviding, Sendable {
+    let apps: [ResourceNode]
+
+    func installedApps() async -> [ResourceNode] { apps }
+    func bundlePath(for bundleID: String) async -> String? { nil }
+    func dataContainerPath(for bundleID: String) async -> String? { nil }
+    func canEnumerateInstalledApps() async -> Bool { false }
+    func canUseInstalledAppIndex() async -> Bool { false }
+    func installedAppEnumerationDetail() async -> String { "helper enumeration failed" }
+}
+
+private struct StaleEnumerationResolver: AppContainerResolving, AppEnumerationCapabilityProviding, Sendable {
+    let apps: [ResourceNode]
+
+    func installedApps() async -> [ResourceNode] { apps }
+    func bundlePath(for bundleID: String) async -> String? { apps.first(where: { $0.ownerBundleID == bundleID })?.resolvedPath }
+    func dataContainerPath(for bundleID: String) async -> String? { nil }
+    func canEnumerateInstalledApps() async -> Bool { false }
+    func canUseInstalledAppIndex() async -> Bool { true }
+    func installedAppEnumerationDetail() async -> String { "fresh helper failed; using last-known-good" }
+}
+
+private struct DegradedIntrospectionResolver: AppContainerResolving, AppIntrospectionProviding, Sendable {
+    let apps: [ResourceNode]
+    let bundlePaths: [String: String]
+    let containerPaths: [String: String]
+
+    func installedApps() async -> [ResourceNode] { apps }
+    func bundlePath(for bundleID: String) async -> String? { bundlePaths[bundleID] }
+    func dataContainerPath(for bundleID: String) async -> String? { containerPaths[bundleID] }
+    func appIntrospection(bundleID: String) async -> AppStaticIntrospection? { nil }
 }
 
 private struct TestCapabilityProbe: CapabilityProbing, Sendable {

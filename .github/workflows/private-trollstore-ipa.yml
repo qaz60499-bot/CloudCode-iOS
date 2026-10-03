@@ -128,17 +128,22 @@ jobs:
           APP_PATH="build/PrivateDerivedData/Build/Products/Release-iphoneos/CloudCode.app"
           VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Info.plist")"
           BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Info.plist")"
-          test "$VERSION" = '1.0.4'
-          test "$BUILD" = '5'
+          test -n "$VERSION"
+          test -n "$BUILD"
           mkdir -p build/private-ipa/Payload
           cp -R "$APP_PATH" build/private-ipa/Payload/
           (cd build/private-ipa && zip -qry "../CloudCode-iOS-TrollStore-STABLE-${VERSION}-build${BUILD}.ipa" Payload)
+          printf '%s' "$VERSION" > "$RUNNER_TEMP/cloudcode-stable-version.txt"
+          printf '%s' "$BUILD" > "$RUNNER_TEMP/cloudcode-stable-build.txt"
 
       - name: Verify private IPA and secret isolation
         run: |
           set -euo pipefail
-          bash scripts/verify_private_ipa.sh build/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa
-          bash scripts/test_verify_ipa_negative.sh build/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa
+          VERSION="$(cat "$RUNNER_TEMP/cloudcode-stable-version.txt")"
+          BUILD="$(cat "$RUNNER_TEMP/cloudcode-stable-build.txt")"
+          IPA="build/CloudCode-iOS-TrollStore-STABLE-${VERSION}-build${BUILD}.ipa"
+          bash scripts/verify_private_ipa.sh "$IPA"
+          bash scripts/test_verify_ipa_negative.sh "$IPA"
           if find . -path './.git' -prune -o -type f \( -name '*.ipa' -o -name '*Provider-Bootstrap*.json' \) -print | grep -vE '^\./build/' | grep -q .; then
             echo "FAIL: private build material escaped the build directory" >&2
             exit 1
@@ -157,18 +162,21 @@ jobs:
           CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD: ${{ secrets.CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD }}
         run: |
           set -euo pipefail
+          VERSION="$(cat "$RUNNER_TEMP/cloudcode-stable-version.txt")"
+          BUILD="$(cat "$RUNNER_TEMP/cloudcode-stable-build.txt")"
+          IPA="build/CloudCode-iOS-TrollStore-STABLE-${VERSION}-build${BUILD}.ipa"
           openssl enc -aes-256-cbc -pbkdf2 -salt \
-            -in build/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa \
-            -out build/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa.enc \
+            -in "$IPA" \
+            -out "${IPA}.enc" \
             -pass env:CLOUDCODE_PRIVATE_ARTIFACT_PASSWORD
-          rm -rf build/private-ipa build/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa build/PrivateDerivedData
-          test -s build/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa.enc
-          test ! -e build/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa
+          rm -rf build/private-ipa "$IPA" build/PrivateDerivedData
+          test -s "${IPA}.enc"
+          test ! -e "$IPA"
 
       - name: Upload encrypted private IPA
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: CloudCode-iOS-TrollStore-STABLE-1.0.4-build5-private-encrypted
-          path: build/CloudCode-iOS-TrollStore-STABLE-1.0.4-build5.ipa.enc
+          name: CloudCode-iOS-TrollStore-STABLE-private-encrypted
+          path: build/CloudCode-iOS-TrollStore-STABLE-*.ipa.enc
           if-no-files-found: error
           retention-days: 1
