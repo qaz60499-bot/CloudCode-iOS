@@ -55,6 +55,16 @@ jobs:
             -o "$TEST_BINARY"
           "$TEST_BINARY"
 
+      - name: Test detached assertion signal and teardown lifecycle
+        run: |
+          set -euo pipefail
+          TEST_BINARY="$RUNNER_TEMP/background-assertion-lifecycle-tests"
+          xcrun clang -std=c11 -Wall -Wextra -Werror -pthread \
+            -I Sources/CloudCodeRootHelper \
+            Tests/RootHelperBridgeTests/BackgroundAssertionLifecycleHarness.c \
+            -o "$TEST_BINARY"
+          "$TEST_BINARY"
+
       - name: Generate Xcode project
         run: xcodegen generate
 

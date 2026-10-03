@@ -18,6 +18,7 @@
 #import <string.h>
 #import "GUIAutomation.h"
 #import "PCControlServer.h"
+#import "BackgroundAssertionLifecycle.h"
 
 #define CLOUDCODE_PROC_PATH_MAX 4096
 #define CLOUDCODE_ROOT_HELPER_PROTOCOL_MARKER "cloudcode-root-helper-protocol=1"
@@ -1793,8 +1794,18 @@ static int StartDetachedBackgroundAssertion(pid_t targetPID, const char *helperE
         return 74;
     }
 
+    posix_spawnattr_t attributes;
+    int attributesError = CloudCodeBackgroundAssertionSpawnAttributes(&attributes);
+    if (attributesError != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        close(handshake[0]);
+        close(handshake[1]);
+        fprintf(stderr, "background-assert: signal policy failed error=%d\n", attributesError);
+        return 74;
+    }
     pid_t workerPID = 0;
-    int spawnError = posix_spawn(&workerPID, helperExecutablePath, &actions, NULL, workerArgv, environ);
+    int spawnError = posix_spawn(&workerPID, helperExecutablePath, &actions, &attributes, workerArgv, environ);
+    posix_spawnattr_destroy(&attributes);
     posix_spawn_file_actions_destroy(&actions);
     close(handshake[1]);
     if (spawnError != 0 || workerPID <= 1) {
@@ -1828,8 +1839,11 @@ static int StopDetachedBackgroundAssertion(pid_t workerPID)
 {
     if (getuid() != 0 || geteuid() != 0) { return 11; }
     if (workerPID <= 1) { return 10; }
-    if (kill(workerPID, SIGTERM) == 0 || errno == ESRCH) { return 0; }
-    return 76;
+    int result = CloudCodeStopBackgroundAssertionWorker(workerPID);
+    if (result != 0) {
+        fprintf(stderr, "background-assert: stop pending workerPID=%d; SIGTERM acceptance is not confirmed exit\n", workerPID);
+    }
+    return result;
 }
 
 static int BackgroundAssertionWorkerStatus(pid_t workerPID)
