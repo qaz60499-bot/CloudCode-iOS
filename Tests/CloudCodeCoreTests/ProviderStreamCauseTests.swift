@@ -6,7 +6,7 @@ final class ProviderStreamCauseTests: XCTestCase {
     func testTransportFailureAfterOutputLogsSafeNSErrorCauseAndNeverReplays() async throws {
         let attempt = try await perform(
             kind: .openAIChat,
-            body: event(.openAIChat.partialOutput),
+            body: event(ProviderStreamTestKind.openAIChat.partialOutput),
             failureCode: .networkConnectionLost
         )
 
@@ -27,7 +27,7 @@ final class ProviderStreamCauseTests: XCTestCase {
     func testParserFailureAfterOutputLogsSafeCauseAndNeverReplays() async throws {
         let attempt = try await perform(
             kind: .openAIChat,
-            body: event(.openAIChat.partialOutput) + Data("data: {invalid-json}\n\n".utf8)
+            body: event(ProviderStreamTestKind.openAIChat.partialOutput) + Data("data: {invalid-json}\n\n".utf8)
         )
 
         XCTAssertEqual(attempt.output, "partial")
