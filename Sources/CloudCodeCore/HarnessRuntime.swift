@@ -116,7 +116,7 @@ public enum HarnessContextManager {
         }
         var remaining = max(0, policy.maxCharacters - selectedCost() - supplementCost)
         var remainingSlots = max(0, policy.maxMessages - selected.count - supplements.count)
-        var systems: [ChatMessage] = []
+        var systems: [(Int, ChatMessage)] = []
         func systemPriority(_ message: ChatMessage) -> Int {
             switch message.providerMetadata["context_layer"] ?? "" {
             case "checkpoint_semantic_progress", "orchestration_circuit_breaker", "runtime_precedence": return 0
@@ -140,7 +140,7 @@ public enum HarnessContextManager {
             }
             let cost = estimatedCharacters(candidate)
             if cost <= remaining {
-                systems.append(candidate); remaining -= cost; remainingSlots -= 1
+                systems.append((entry.offset, candidate)); remaining -= cost; remainingSlots -= 1
             }
         }
         // Select whole history units, newest first. No current-run exemption remains.
@@ -152,7 +152,8 @@ public enum HarnessContextManager {
             selected.formUnion(group); remaining -= cost; remainingSlots -= group.count
         }
         if selected.count + systems.count < normalized.count { reasons.insert("history_budget") }
-        var output = systems + supplements
+        // Budget priority chooses what survives; original order retains instruction precedence.
+        var output = systems.sorted { $0.0 < $1.0 }.map { $0.1 } + supplements
         output += normalized.indices.filter(selected.contains).map { normalized[$0] }
         return HarnessProviderContext(messages: output, policy: policy, reasons: reasons.sorted())
     }

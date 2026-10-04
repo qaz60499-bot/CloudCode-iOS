@@ -161,7 +161,10 @@ final class ProviderStreamCauseTests: XCTestCase {
                 messages: messages,
                 tools: tools
             ) {
-                if case .token(let token) = event { output += token }
+                if case .token(let token) = event {
+                    output += token
+                    ProviderStreamCauseURLProtocol.acknowledgeOutput()
+                }
             }
         } catch {
             failure = error
@@ -253,6 +256,8 @@ private final class ProviderStreamCauseURLProtocol: URLProtocol, @unchecked Send
     private static var responseBody = Data()
     private static var responseStatusCode = 200
     private static var streamFailureCode: URLError.Code?
+    private static var pendingFailureProtocol: ProviderStreamCauseURLProtocol?
+    private static var pendingFailureCode: URLError.Code?
     private static var capturedRequestCount = 0
 
     static func install(body: Data, statusCode: Int = 200, failureCode: URLError.Code? = nil) {
@@ -260,8 +265,39 @@ private final class ProviderStreamCauseURLProtocol: URLProtocol, @unchecked Send
         responseBody = body
         responseStatusCode = statusCode
         streamFailureCode = failureCode
+        pendingFailureProtocol = nil
+        pendingFailureCode = nil
         capturedRequestCount = 0
         lock.unlock()
+    }
+
+    static func acknowledgeOutput() {
+        lock.lock()
+        let protocolInstance = pendingFailureProtocol
+        let failureCode = pendingFailureCode
+        pendingFailureProtocol = nil
+        pendingFailureCode = nil
+        lock.unlock()
+
+        if let protocolInstance, let failureCode {
+            protocolInstance.deliverFailure(failureCode)
+        }
+    }
+
+    private static func deliverPendingFailure(
+        for protocolInstance: ProviderStreamCauseURLProtocol,
+        code: URLError.Code
+    ) {
+        lock.lock()
+        guard pendingFailureProtocol === protocolInstance, pendingFailureCode == code else {
+            lock.unlock()
+            return
+        }
+        pendingFailureProtocol = nil
+        pendingFailureCode = nil
+        lock.unlock()
+
+        protocolInstance.deliverFailure(code)
     }
 
     static func requestCount() -> Int {
@@ -279,6 +315,10 @@ private final class ProviderStreamCauseURLProtocol: URLProtocol, @unchecked Send
         let statusCode = Self.responseStatusCode
         let failureCode = Self.streamFailureCode
         Self.capturedRequestCount += 1
+        if let failureCode {
+            Self.pendingFailureProtocol = self
+            Self.pendingFailureCode = failureCode
+        }
         Self.lock.unlock()
 
         guard let url = request.url,
@@ -297,10 +337,16 @@ private final class ProviderStreamCauseURLProtocol: URLProtocol, @unchecked Send
             client?.urlProtocol(self, didLoad: body)
         }
         if let failureCode {
-            client?.urlProtocol(self, didFailWithError: URLError(failureCode))
+            DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(2)) {
+                Self.deliverPendingFailure(for: self, code: failureCode)
+            }
         } else {
             client?.urlProtocolDidFinishLoading(self)
         }
+    }
+
+    private func deliverFailure(_ code: URLError.Code) {
+        client?.urlProtocol(self, didFailWithError: URLError(code))
     }
 
     override func stopLoading() {}

@@ -1118,7 +1118,8 @@ public actor AgentCore {
                     var lastPlanFiniteProgress = checkpoint.payload["orchestration.lastPlanFiniteProgress"] == "true"
                     var blockedPlanHashes = Set((checkpoint.payload["orchestration.blockedPlanHashes"] ?? "").split(separator: ",").map(String.init))
                     var blockedReadToolNames = Set((checkpoint.payload["orchestration.blockedReadToolNames"] ?? "").split(separator: ",").map(String.init))
-                    var circuitRequestFingerprint = TaskContract.fingerprint(for: activeRequest)
+                    var circuitRequestFingerprint = checkpoint.payload["orchestration.requestFingerprint"]
+                        ?? TaskContract.fingerprint(for: activeRequest)
                     var guiTreeFailedForCurrentForegroundState = false
                     var lastLocalVisionElementsJSON: String?
                     var lastObservationFrame: ObservationFrame?
@@ -1262,7 +1263,12 @@ public actor AgentCore {
                             blockedPlanHashes.removeAll()
                             blockedReadToolNames.removeAll()
                             circuitRequestFingerprint = roundRequestFingerprint
+                            for key in ["orchestration.lastPlanHash", "orchestration.lastPlanFiniteProgress",
+                                        "orchestration.blockedPlanHashes", "orchestration.blockedReadToolNames"] {
+                                checkpoint.payload.removeValue(forKey: key)
+                            }
                         }
+                        checkpoint.payload["orchestration.requestFingerprint"] = circuitRequestFingerprint
                         let completedRepeatedSwipeCountBeforeRound = completedRepeatedSwipeCount
                         var assistantText = ""
                         let partialAssistantMessageID = UUID()
