@@ -1467,8 +1467,6 @@ static NSDictionary *CloudCodeFrameDictionary(CloudCodeAXRuntime runtime, id val
     return @{@"x": @(frame.origin.x), @"y": @(frame.origin.y), @"width": @(frame.size.width), @"height": @(frame.size.height)};
 }
 
-static id CloudCodeAXAuditClientLease = nil;
-
 static id CloudCodeAXAuditSafeValue(id object, NSString *key)
 {
     if (!object || key.length == 0) { return nil; }
@@ -1478,42 +1476,11 @@ static id CloudCodeAXAuditSafeValue(id object, NSString *key)
 
 static id CloudCodeAXAuditPrimaryElement(NSString **detailOut)
 {
-    if (detailOut) { *detailOut = nil; }
-    void *accessibilityUI = CloudCodeOpenFramework(@[
-        @"/System/Library/PrivateFrameworks/AccessibilityUI.framework/AccessibilityUI",
-        @"/rootfs/System/Library/PrivateFrameworks/AccessibilityUI.framework/AccessibilityUI"
-    ]);
-    Class clientClass = NSClassFromString(@"AXUIClient");
-    Class elementClass = NSClassFromString(@"AXElement");
-    SEL initSelector = NSSelectorFromString(@"initWithIdentifier:serviceBundleName:");
-    SEL primarySelector = NSSelectorFromString(@"primaryApp");
-    if (!accessibilityUI || !clientClass || !elementClass
-        || ![clientClass instancesRespondToSelector:initSelector]
-        || ![elementClass respondsToSelector:primarySelector]) {
-        if (detailOut) { *detailOut = @"AccessibilityUI AXAudit broker classes/selectors unavailable"; }
-        return nil;
-    }
-    @try {
-        if (!CloudCodeAXAuditClientLease) {
-            id allocated = ((id (*)(id, SEL))objc_msgSend)(clientClass, sel_registerName("alloc"));
-            CloudCodeAXAuditClientLease = ((id (*)(id, SEL, id, id))objc_msgSend)(
-                allocated,
-                initSelector,
-                @"AXAuditAXUIClientIdentifier",
-                @"AXAuditAXUIService"
-            );
-        }
-        if (!CloudCodeAXAuditClientLease) {
-            if (detailOut) { *detailOut = @"AXAudit AXUIClient initialization returned nil"; }
-            return nil;
-        }
-        id primary = ((id (*)(id, SEL))objc_msgSend)(elementClass, primarySelector);
-        if (!primary && detailOut) { *detailOut = @"AXAudit AXElement.primaryApp returned nil"; }
-        return primary;
-    } @catch (NSException *exception) {
-        if (detailOut) { *detailOut = [NSString stringWithFormat:@"AXAudit broker exception=%@", exception.name]; }
-        return nil;
-    }
+    // There is no device-matched, acknowledged client/service teardown for this broker. Never
+    // allocate AXUIClient (formerly a static lease), even as a fallback: _exit/SIGKILL is not an
+    // acknowledgement that AXAudit visuals/monitoring/target state has been withdrawn.
+    if (detailOut) { *detailOut = @"AXAudit broker disabled: client/service teardown unverified; exact passive AXRuntime only"; }
+    return nil;
 }
 
 #define CLOUDCODE_AX_TRAIT_BUTTON                 0x1ULL
@@ -2120,7 +2087,7 @@ static NSDictionary *CloudCodeAXHitTestTree(CloudCodeAXRuntime runtime, NSUInteg
         {size.width * 0.88, size.height * 0.78}
     };
     NSMutableArray *hits = [NSMutableArray array];
-    pid_t foregroundPID = 0;
+    pid_t foregroundPID = pidOut ? *pidOut : 0;
     for (NSUInteger index = 0; index < sizeof(points) / sizeof(points[0]); index++) {
         if (*nodeCount >= CLOUDCODE_GUI_MAX_TREE_NODES) { break; }
         CloudCodeAXUIElementRef candidate = NULL;
@@ -2150,27 +2117,10 @@ static NSDictionary *CloudCodeAXHitTestTree(CloudCodeAXRuntime runtime, NSUInteg
         if (runtime.getPid) {
             @try { pidCode = runtime.getPid(candidate, &candidatePID); } @catch (__unused NSException *exception) { pidCode = -1; }
         }
-        // Detached TrollStore helpers can sometimes read the topmost AX element while PID lookup
-        // for that same element is denied/unavailable. PID is useful ownership evidence, but it
-        // must not erase otherwise readable system-wide hit-test semantics. When PID is known we
-        // still reject the helper itself and cross-PID mixing; when unknown, keep the node explicitly
-        // inside the sampled/unverified hit-test snapshot rather than pretending it is a full tree.
-        if (pidCode == 0 && candidatePID > 0) {
-            if (candidatePID == getpid()) {
-                CFRelease(candidate);
-                continue;
-            }
-            if (foregroundPID == 0) { foregroundPID = candidatePID; }
-            if (candidatePID != foregroundPID) {
-                CFRelease(candidate);
-                continue;
-            }
-            if (runtime.addAssociatedPid) {
-                runtime.addAssociatedPid(getpid(), candidatePID, 0);
-                runtime.addAssociatedPid(getpid(), candidatePID, 1);
-                runtime.addAssociatedPid(candidatePID, getpid(), 0);
-                runtime.addAssociatedPid(candidatePID, getpid(), 1);
-            }
+        // Exact foreground sampling cannot mix unknown or foreign PIDs into a known target.
+        if (pidCode != 0 || candidatePID <= 1 || foregroundPID <= 1 || candidatePID != foregroundPID) {
+            CFRelease(candidate);
+            continue;
         }
 
         // Sampled fallback is intentionally shallow. A detached mobile AX client can spend a full
@@ -2825,63 +2775,23 @@ static __attribute__((noreturn)) void CloudCodeFrontmostTreeData(void)
     // Do not call setRequestingClient/overrideRequestingClientType here. Production AX reads are
     // passive; screenshot/local OCR remains the fallback when the broker cannot expose semantics.
 
-    // Prefer the same AccessibilityUI/AXAudit broker used by working standalone iOS automation
-    // clients: AXUIClient establishes the service-side client identity, while AXElement.primaryApp
-    // and explorerElements expose the foreground semantic objects without requiring this helper to
-    // impersonate SpringBoard's raw AXUIElement transport context.
-    NSUInteger auditNodeCount = 0;
-    pid_t auditPID = 0;
-    NSString *auditBundleID = nil;
-    NSString *auditDetail = nil;
-    NSDictionary *auditTree = CloudCodeAXAuditBrokerTree(runtime, &auditNodeCount, &auditPID, &auditBundleID, &auditDetail);
-    NSUInteger auditSemanticCount = CloudCodeAXSemanticNodeCount(auditTree);
-    NSUInteger auditActionableCount = CloudCodeAXActionableNodeCount(auditTree);
-    // A semantic tree remains useful even on read-only/static screens with no actionable role.
-    // Keep actionableCount as evidence, not as a hard availability gate.
-    if (auditTree && auditNodeCount > 1 && auditSemanticCount > 0) {
-        NSDictionary *payload = @{
-            @"backend": @"AccessibilityUI.AXAudit.AXElement",
-            @"scope": @"foreground_explorer_elements",
-            @"bundleId": auditBundleID ?: @"",
-            @"pid": @(auditPID),
-            @"automationLeaseActive": @(runtime.automationLeaseActive),
-            @"nodeCount": @(auditNodeCount),
-            @"semanticNodeCount": @(auditSemanticCount),
-            @"actionableNodeCount": @(auditActionableCount),
-            @"tree": auditTree
-        };
-        NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
-        if (data.length > 0 && data.length <= CLOUDCODE_GUI_MAX_TREE_BYTES) {
-            fprintf(stderr, "gui-tree: %s\n", auditDetail.UTF8String ?: "AXAudit broker returned semantic tree");
-            fwrite(data.bytes, 1, data.length, stdout);
-            fputc('\n', stdout);
-            CloudCodeGUIExitOneShot(0);
-        }
-    } else if (auditDetail.length > 0) {
-        fprintf(stderr, "gui-tree: AXAudit broker fallback unavailable: %s\n", auditDetail.UTF8String);
+    const double readStartedAtMS = (CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970) * 1000.0;
+    // No AXAudit client/session is created. Bind the passive transaction to one native foreground
+    // identity, then resolve it again after traversal; a transition invalidates this observation.
+    NSString *expectedBundleID = CloudCodeFrontmostBundleID();
+    pid_t expectedPID = CloudCodePIDForBundleIdentifier(expectedBundleID);
+    if (expectedPID <= 1 && expectedBundleID.length > 0) {
+        NSString *path = CloudCodeBundlePathForIdentifier(expectedBundleID);
+        if (path.length > 0) { expectedPID = CloudCodePIDForBundlePath(path); }
     }
-
-    NSString *bundleID = CloudCodeFrontmostBundleID();
-    pid_t pid = 0;
+    if (expectedBundleID.length == 0 || expectedPID <= 1 || expectedPID == getpid()) {
+        fprintf(stderr, "gui-tree: native foreground identity unavailable; local OCR required\n");
+        CloudCodeGUIExitOneShot(62);
+    }
+    NSString *bundleID = expectedBundleID;
+    pid_t pid = expectedPID;
     NSString *backend = nil;
-    CloudCodeAXUIElementRef root = NULL;
-
-    if (bundleID.length > 0) {
-        pid = CloudCodePIDForBundleIdentifier(bundleID);
-        if (pid <= 0) {
-            NSString *bundlePath = CloudCodeBundlePathForIdentifier(bundleID);
-            if (bundlePath.length > 0) { pid = CloudCodePIDForBundlePath(bundlePath); }
-        }
-        if (pid > 0) {
-            if (runtime.addAssociatedPid) {
-                runtime.addAssociatedPid(getpid(), pid, 0);
-                runtime.addAssociatedPid(getpid(), pid, 1);
-                runtime.addAssociatedPid(pid, getpid(), 0);
-                runtime.addAssociatedPid(pid, getpid(), 1);
-            }
-            root = CloudCodeAXRootForPid(runtime, pid, &backend);
-        }
-    }
+    CloudCodeAXUIElementRef root = CloudCodeAXRootForPid(runtime, pid, &backend);
 
     // A detached TrollStore helper can fail AXUIElementCreateApplication(pid) while the same AX
     // runtime can still resolve the foreground application through its window/context at a screen
@@ -2919,24 +2829,33 @@ static __attribute__((noreturn)) void CloudCodeFrontmostTreeData(void)
     }
 
     if (root) {
+        pid_t rootPID = 0;
+        CloudCodeAXError pidError = -1;
+        @try { if (runtime.getPid) { pidError = runtime.getPid(root, &rootPID); } }
+        @catch (__unused NSException *exception) { pidError = -1; }
+        if (pidError != 0 || rootPID != expectedPID) {
+            CFRelease(root);
+            fprintf(stderr, "gui-tree: resolved root PID does not match native foreground; local OCR required\n");
+            CloudCodeGUIExitOneShot(62);
+        }
         rootNode = CloudCodeAXNode(runtime, root, 0, &nodeCount);
         CFRelease(root);
         root = NULL;
     }
     NSUInteger semanticNodeCount = CloudCodeAXSemanticNodeCount(rootNode);
     NSUInteger actionableNodeCount = CloudCodeAXActionableNodeCount(rootNode);
-    if (rootNode && (semanticNodeCount == 0 || actionableNodeCount == 0)) {
+    if (rootNode && semanticNodeCount == 0) {
         // A callable AXRuntime API is not the same as a usable accessibility tree. On iOS 16.6
         // the detached helper can receive one shell Application root with no foreground controls.
         // Do not report that as a complete tree; spend the already-bounded sampled hit-test fallback.
         fprintf(stderr, "gui-tree: direct AX root contained no semantic/actionable nodes; trying sampled foreground hit-test\n");
         nodeCount = 0;
-        pid_t sampledPID = 0;
+        pid_t sampledPID = expectedPID;
         NSString *sampledBackend = nil;
         NSDictionary *sampled = CloudCodeAXHitTestTree(runtime, &nodeCount, &sampledPID, &sampledBackend);
         NSUInteger sampledSemanticCount = CloudCodeAXSemanticNodeCount(sampled);
         NSUInteger sampledActionableCount = CloudCodeAXActionableNodeCount(sampled);
-        if (sampled && sampledSemanticCount > 0 && sampledActionableCount > 0) {
+        if (sampled && sampledSemanticCount > 0) {
             rootNode = sampled;
             semanticNodeCount = sampledSemanticCount;
             actionableNodeCount = sampledActionableCount;
@@ -2952,10 +2871,32 @@ static __attribute__((noreturn)) void CloudCodeFrontmostTreeData(void)
             actionableNodeCount = 0;
         }
     }
-    if (!rootNode || nodeCount == 0 || semanticNodeCount == 0 || actionableNodeCount == 0) {
+    if (!rootNode || nodeCount == 0 || semanticNodeCount == 0) {
         CloudCodePrintAXRuntimeDiagnostic(runtime, "empty-semantic-tree");
         fprintf(stderr, "gui-tree: AX transport responded but no semantic/actionable foreground UI nodes were returned\n");
         // Result is final. Exit before ARC/private AX object teardown can stall the one-shot helper.
+        CloudCodeGUIExitOneShot(62);
+    }
+    if ([NSProcessInfo.processInfo.arguments containsObject:@"--ax-acceptance-stall"]) {
+        // Fault only after real semantic work and local root release. The next independent
+        // screenshot can now check residual service state after this passive AX transaction.
+        BOOL hasWatchdog = NO;
+        for (NSString *argument in NSProcessInfo.processInfo.arguments) {
+            if ([argument hasPrefix:@"--cloudcode-watchdog-ms="]) { hasWatchdog = YES; break; }
+        }
+        if (!hasWatchdog) { CloudCodeGUIExitOneShot(64); }
+        fprintf(stderr, "gui-tree: acceptance-only stalled after passive semantic read; owned root released; watchdog cleanup required\n");
+        for (;;) { pause(); }
+    }
+    NSString *finishedBundleID = CloudCodeFrontmostBundleID();
+    pid_t finishedPID = CloudCodePIDForBundleIdentifier(finishedBundleID);
+    if (finishedPID <= 1 && finishedBundleID.length > 0) {
+        NSString *path = CloudCodeBundlePathForIdentifier(finishedBundleID);
+        if (path.length > 0) { finishedPID = CloudCodePIDForBundlePath(path); }
+    }
+    if (pid != expectedPID || finishedPID != expectedPID
+        || ![bundleID isEqualToString:expectedBundleID] || ![finishedBundleID isEqualToString:expectedBundleID]) {
+        fprintf(stderr, "gui-tree: foreground changed during exact semantic read; local OCR required\n");
         CloudCodeGUIExitOneShot(62);
     }
     NSString *scope = [rootNode[@"role"] isEqual:@"AXHitTestSnapshot"] ? @"sampled_semantics" : @"full_application_tree_opportunistic";
@@ -2964,10 +2905,19 @@ static __attribute__((noreturn)) void CloudCodeFrontmostTreeData(void)
         @"scope": scope,
         @"bundleId": bundleID ?: @"",
         @"pid": @(pid),
+        @"foregroundVerified": @YES,
+        @"readStartedAtMS": @(readStartedAtMS),
+        @"readFinishedAtMS": @((CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970) * 1000.0),
         @"automationLeaseActive": @(runtime.automationLeaseActive),
         @"nodeCount": @(nodeCount),
         @"semanticNodeCount": @(semanticNodeCount),
         @"actionableNodeCount": @(actionableNodeCount),
+        @"axLifecycle": @{
+            @"mode": @"one-shot-passive-no-audit-client",
+            @"auditClientCreated": @NO,
+            @"globalStateMutated": @NO,
+            @"ownedRootReferenceReleased": @YES
+        },
         @"tree": rootNode
     };
     NSError *error = nil;
@@ -3024,10 +2974,8 @@ int CloudCodeGUIProbeJSON(void)
 
 int CloudCodeGUITreeJSON(void)
 {
-        // ResolveAX acquires one process-scoped system Automation lease before reading the tree and
-        // CloudCodeGUIExitOneShot restores the prior bit before hard exit. Target-app
-        // AXManualAccessibility remains untouched, so this does not reintroduce the old green scan
-        // overlay path.
+        // One exact passive read, bounded by both parent and self watchdog. No Automation lease,
+        // AXAudit client, target monitor, or manual accessibility state is created.
         CloudCodeFrontmostTreeData();
 }
 
@@ -3197,6 +3145,8 @@ static CloudCodeAXUIElementRef CloudCodeAXCopyFocusedElement(CloudCodeAXRuntime 
 
 int CloudCodeGUIFocusedTextInputJSON(void)
 {
+        NSString *expectedBundleID = CloudCodeFrontmostBundleID();
+        pid_t expectedPID = CloudCodePIDForBundleIdentifier(expectedBundleID);
         CloudCodeAXRuntime ax = CloudCodeResolveAX();
         BOOL runtimeAvailable = ax.copyAttribute != NULL;
         BOOL focusedElementAvailable = NO;
@@ -3232,11 +3182,27 @@ int CloudCodeGUIFocusedTextInputJSON(void)
             }
         }
 
+        NSString *finishedBundleID = CloudCodeFrontmostBundleID();
+        pid_t finishedPID = CloudCodePIDForBundleIdentifier(finishedBundleID);
+        BOOL foregroundVerified = expectedPID > 1 && finishedPID == expectedPID
+            && [finishedBundleID isEqualToString:expectedBundleID];
+        if (!foregroundVerified || focusedPID != expectedPID) {
+            focusedElementAvailable = NO;
+            focusedTextInput = NO;
+        }
         NSDictionary *payload = @{
             @"runtimeAvailable": @(runtimeAvailable),
             @"focusedElementAvailable": @(focusedElementAvailable),
             @"focusedTextInput": @(focusedTextInput),
             @"automationLeaseActive": @(ax.automationLeaseActive),
+            @"foregroundVerified": @(foregroundVerified),
+            @"bundleId": expectedBundleID ?: @"",
+            @"axLifecycle": @{
+                @"mode": @"one-shot-passive-no-audit-client",
+                @"auditClientCreated": @NO,
+                @"globalStateMutated": @NO,
+                @"ownedRootReferenceReleased": @YES
+            },
             @"role": focusedRole ?: @"",
             @"backend": focusedBackend ?: @"",
             @"pid": @(focusedPID)

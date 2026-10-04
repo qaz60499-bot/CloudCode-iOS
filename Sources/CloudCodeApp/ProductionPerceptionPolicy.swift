@@ -5,12 +5,12 @@ import Foundation
 /// private AX/AXAudit client paths can surface the green system frame even after all explicit
 /// `_AXSSetAutomationEnabled` and requesting-client writes were removed.
 ///
-/// Keep AX code available only to the explicit Perception Probe diagnostics surface while normal
-/// Agent execution uses screenshot + bounded local OCR + HID/native routes. Re-enable production AX
-/// only after a device regression proves that the exact read/focus/type path cannot surface the
-/// system accessibility frame across launch, foreground/background, timeout, crash and recovery.
+/// Only exact semantic reads may enter a cancellable one-shot passive AXRuntime helper. AXAudit
+/// client initialization remains disabled because its service teardown is not verified. Screenshot
+/// and OCR never consult this policy or enter AX; text input remains HID-only.
 enum ProductionPerceptionPolicy {
     static let accessibilityRuntimeAllowed = false
+    static let boundedSemanticReadAllowed = true
 
     // Physical iOS 16.6 evidence shows that merely opening an AccessibilityAudit/AX diagnostic
     // session can leave axauditd holding the green status indicator after the read has finished.

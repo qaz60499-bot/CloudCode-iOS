@@ -155,6 +155,7 @@ public final class CloudCodeViewModel: ObservableObject {
     private let capabilityProbe: CapabilityProbe
     private let toolRegistry: ToolRegistry
     private let toolRouter: ToolRouter
+    private let productionAXAcceptance: ProductionAXAcceptance
     private let fileService: FileService
     private let propertyListService = NativePropertyListService()
     private let jsonService = NativeJSONService()
@@ -458,6 +459,7 @@ public final class CloudCodeViewModel: ObservableObject {
         self.capabilityProbe = probe
         self.toolRegistry = registry
         self.toolRouter = router
+        self.productionAXAcceptance = ProductionAXAcceptance(router: router, backend: guiBackend, cliRuntime: iosSystemRuntime, cliRoot: cliRuntimeRoot)
         self.fileService = fileService
         self.trashService = trash
         self.policyEngine = policy
@@ -1016,7 +1018,10 @@ public final class CloudCodeViewModel: ObservableObject {
                 didBootstrap = true
                 recordStartupBreadcrumb("bootstrap.recovery.ready")
                 recordStartupBreadcrumb("bootstrap.completed")
-                runExplicitPerceptionRegressionIfRequested()
+                if !ProcessInfo.processInfo.arguments.contains("--cloudcode-ax-exact-acceptance") {
+                    runExplicitPerceptionRegressionIfRequested()
+                }
+                productionAXAcceptance.runIfRequested(capabilities: capabilities)
                 return
             }
 

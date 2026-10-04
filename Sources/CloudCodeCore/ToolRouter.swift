@@ -214,6 +214,68 @@ public enum GUIElementMatchMode: String, Sendable {
 /// both the on-device TrollStore backend and an optional XCTest/WDA bridge can share identical
 /// query/ambiguity/stale-element rules without creating a second automation architecture.
 public enum GUIElementResolver {
+    /// Returns a bounded list of structured AX elements from the same tree format used by
+    /// `find`. Callers that need to make strategy-specific claims (for example, matching an
+    /// accessibility identifier or a role) can inspect the original fields without treating
+    /// labels and values as substitutes for those fields.
+    public static func elements(in tree: String, maximumElements: Int = 96) -> [GUIElementMatch] {
+        let limit = max(1, min(maximumElements, 256))
+        guard let data = tree.data(using: .utf8), data.count <= 512 * 1024,
+              let root = try? JSONSerialization.jsonObject(with: data) else { return [] }
+        var elements: [GUIElementMatch] = []
+        walkElements(root, path: "0", maximumElements: limit, elements: &elements)
+        return elements
+    }
+
+    /// Matches a package's exact semantic selector against the corresponding structured AX fields.
+    /// OCR cannot satisfy an identifier, role, trait, or relationship constraint.
+    public static func semanticMatch(selector: AppProviderSelector, elements: [GUIElementMatch]) -> GUIElementMatch? {
+        guard let matching = semanticMatches(selector: selector, elements: elements),
+              matching.count == 1 else { return nil }
+        return matching[0]
+    }
+
+    /// Returns exact structured matches, or nil when the AX candidate list/selector cannot be
+    /// evaluated safely. An empty list means AX supplied no matching evidence; multiple matches
+    /// remain distinguishable from that case so callers cannot use OCR to erase AX ambiguity.
+    public static func semanticMatches(selector: AppProviderSelector, elements: [GUIElementMatch]) -> [GUIElementMatch]? {
+        guard elements.count < 256,
+              selector.traits.isEmpty,
+              normalized(selector.relation ?? "").isEmpty else { return nil }
+
+        let requestedRole = selector.role.map { normalized($0) }.flatMap { $0.isEmpty ? nil : $0 }
+        let matching: [GUIElementMatch]
+        switch selector.strategy {
+        case .accessibilityIdentifier:
+            guard let value = normalized(selector.value), !value.isEmpty else { return nil }
+            matching = elements.filter { element in
+                normalized(element.identifier ?? "") == value
+                    && (requestedRole.map { normalized(element.role ?? "") == $0 } ?? true)
+            }
+        case .axRole:
+            guard let role = requestedRole else { return nil }
+            let value = selector.value.map { normalized($0) }.flatMap { $0.isEmpty ? nil : $0 }
+            matching = elements.filter { element in
+                guard normalized(element.role ?? "") == role else { return false }
+                guard let value else { return true }
+                return [element.identifier, element.label, element.title, element.placeholder, element.value]
+                    .compactMap { $0 }
+                    .contains { normalized($0) == value }
+            }
+        case .semanticLabel:
+            guard let value = normalized(selector.value), !value.isEmpty else { return nil }
+            matching = elements.filter { element in
+                (requestedRole.map { normalized(element.role ?? "") == $0 } ?? true)
+                    && [element.label, element.title, element.placeholder, element.value]
+                        .compactMap { $0 }
+                        .contains { normalized($0) == value }
+            }
+        case .visibleText, .relativeLayout, .ocrText, .coordinateFallback:
+            return nil
+        }
+        return matching
+    }
+
     public static func find(
         in tree: String,
         query: String,
@@ -274,6 +336,36 @@ public enum GUIElementResolver {
         }
     }
 
+    private static func walkElements(
+        _ raw: Any,
+        path: String,
+        maximumElements: Int,
+        elements: inout [GUIElementMatch]
+    ) {
+        guard elements.count < maximumElements else { return }
+        if let node = raw as? [String: Any] {
+            if let element = candidate(node, path: path) {
+                elements.append(element)
+                if elements.count >= maximumElements { return }
+            }
+            if let wrappedTree = node["tree"] {
+                walkElements(wrappedTree, path: "\(path).tree", maximumElements: maximumElements, elements: &elements)
+                if elements.count >= maximumElements { return }
+            }
+            if let children = node["children"] as? [Any] {
+                for (index, child) in children.enumerated() {
+                    walkElements(child, path: "\(path).\(index)", maximumElements: maximumElements, elements: &elements)
+                    if elements.count >= maximumElements { return }
+                }
+            }
+        } else if let array = raw as? [Any] {
+            for (index, child) in array.enumerated() {
+                walkElements(child, path: "\(path).\(index)", maximumElements: maximumElements, elements: &elements)
+                if elements.count >= maximumElements { return }
+            }
+        }
+    }
+
     private static func candidate(_ node: [String: Any], path: String) -> GUIElementMatch? {
         guard let rawFrame = node["frame"] as? [String: Any],
               let x = number(rawFrame["x"]), let y = number(rawFrame["y"]),
@@ -306,6 +398,12 @@ public enum GUIElementResolver {
 
     private static func normalized(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines).folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    private static func normalized(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let result = normalized(value)
+        return result.isEmpty ? nil : result
     }
 
     private static func string(_ raw: Any?) -> String? {
@@ -427,8 +525,8 @@ public actor ToolRegistry {
         ToolDescriptor(name: "gui.openApp", summary: "Open an app using the GUI automation fallback backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.openApp.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.openAppObserve", summary: "Open exactly one target app, verify the target became foreground in the bounded helper, then immediately capture one fresh screenshot locally. The screenshot is for semantic planning only and never substitutes for the target-foreground launch verification.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.openApp.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.tree", summary: "Read the GUI accessibility tree from the configured automation backend.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.findElement", summary: "Resolve a unique visible accessibility element locally by identifier/label/title/placeholder/value, with optional role and exact-or-contains matching. Returns only bounded structural metadata and coordinates; no screenshot or Vision call is needed.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.waitForElement", summary: "Poll the local accessibility tree for a unique element for a bounded time without calling the remote model between polls. Use for known delayed pages; ambiguity and timeouts fail closed.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.findElement", summary: "Resolve a unique visible element through one exact AX read. Query-only text can fall back to current-frame local OCR; role and identifier constraints require original AX fields. OCR results claim text and geometry only. Ambiguity fails closed.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.waitForElement", summary: "Wait locally for a unique element for a bounded time. Query-only text can use current-frame OCR after AX failure; role/identifier require AX. No remote model between polls; ambiguity and timeouts fail closed.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.tapElementObserve", summary: "Find one unique accessibility element locally, tap its current frame center, then immediately capture a fresh screenshot. This avoids Vision coordinate lookup while preserving post-action semantic re-planning.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.tapTextObserve", summary: "Capture the current screen, first try one bounded exact/contains accessibility-tree text lookup, then fall back to on-device OCR only if AX cannot resolve a unique visible target. Tap the resolved current-frame center and capture one fresh screenshot. This keeps named labels such as a contact/chat name usable when either AX or OCR is degraded, without guessing coordinates. Protected authentication/payment/system-confirmation labels fail closed.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.screenshot.capabilityID, GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.focusComposerObserve", summary: "For an explicit messaging task already on a chat surface, tap one bounded bottom-center composer candidate locally, capture a fresh screenshot, and accept focus when a privacy-preserving AX focused-text-input probe succeeds; if AX cannot prove focus, fall back to on-device OCR keyboard-like evidence. No coordinate is chosen by the Provider; failure does not permit raw typing.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.screenshot.capabilityID, GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback),

@@ -158,6 +158,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         var screenshot: Data
         var localVision: LocalVisionTextObservation.Observation
         var axElements: [LocalPerceptionTextElement]
+        var axMatches: [GUIElementMatch]
         var appVersion: String
         var deviceClass: String
         var orientation: String
@@ -547,7 +548,16 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         try await transition(.verifyForeground, state: .busy, detail: launch.detail, package: package, appVersion: introspection.version)
         await recordExecutionPhase("foreground_verified", package: package, detail: launch.detail, appVersion: introspection.version)
 
-        var observation = try await observe(appVersion: introspection.version)
+        var initialSelectors = package.selectors.composer
+        if package.workflow.preferNewConversation {
+            initialSelectors = package.selectors.newConversation + initialSelectors
+        }
+        if package.summary.manifest.requiresLogin {
+            initialSelectors = package.selectors.needsLoginIndicators
+                + package.selectors.readyIndicators
+                + initialSelectors
+        }
+        var observation = try await observe(appVersion: introspection.version, selectors: initialSelectors)
         try await transition(.verifyLogin, state: .busy, detail: "验证登录/可用状态", package: package, appVersion: introspection.version)
         if package.summary.manifest.requiresLogin,
            matchesAny(package.selectors.needsLoginIndicators, observation: observation, packageID: package.summary.id) {
@@ -575,7 +585,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             try Task.checkCancellation()
             try await gui.tap(x: newConversation.element.centerX, y: newConversation.element.centerY)
             try await Self.sleep(seconds: 0.35)
-            observation = try await observe(appVersion: introspection.version)
+            observation = try await observe(appVersion: introspection.version, selectors: package.selectors.composer)
         }
 
         let requestID = UUID().uuidString.uppercased()
@@ -609,7 +619,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         // physical-device evidence showed that raw HID text can otherwise be reported as dispatched
         // while the App Provider composer never changes. Keep production AX quarantined and require
         // bounded, same-screen keyboard evidence before injecting the prompt.
-        var focusObservation = try await observe(appVersion: introspection.version)
+        var focusObservation = try await observe(appVersion: introspection.version, selectors: package.selectors.composer, requireOCR: true)
         var keyboardLikely = await composerFocusVerified(in: focusObservation)
         if !keyboardLikely,
            let retryComposer = await resolve(
@@ -622,7 +632,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             try Task.checkCancellation()
             try await gui.tap(x: retryComposer.element.centerX, y: retryComposer.element.centerY)
             try await Self.sleep(seconds: 0.35)
-            focusObservation = try await observe(appVersion: introspection.version)
+            focusObservation = try await observe(appVersion: introspection.version, selectors: package.selectors.composer, requireOCR: true)
             keyboardLikely = await composerFocusVerified(in: focusObservation)
         }
         if !keyboardLikely {
@@ -644,7 +654,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         try await requireProviderForeground(package: package, stage: .submit, appVersion: introspection.version)
         try await gui.type(verifiedPrompt)
         try await Self.sleep(seconds: 0.30)
-        observation = try await observe(appVersion: introspection.version)
+        observation = try await observe(appVersion: introspection.version, selectors: package.selectors.send, requireOCR: true)
         guard await inputProbeVerified(inputProbe, observation: observation, composer: composer.element) else {
             try await transition(.classify, state: .degraded, detail: "failure=input_not_verified; 文本输入 helper 已派发，但当前 composer 没有出现本轮输入探针；拒绝继续点 Send", package: package, appVersion: introspection.version)
             throw AppBackedProviderRuntimeError.submissionFailed("input_not_verified: Prompt 输入未通过本地回读验证")
@@ -675,7 +685,11 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         while Date() < submissionDeadline {
             try Task.checkCancellation()
             try await requireProviderForeground(package: package, stage: .verifySubmission, appVersion: introspection.version)
-            let current = try await observe(appVersion: introspection.version)
+            let current = try await observe(
+                appVersion: introspection.version,
+                selectors: package.selectors.errorIndicators + package.selectors.generationStart,
+                requireOCR: true
+            )
             if try await handleProviderError(
                 current,
                 package: package,
@@ -729,7 +743,11 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         while Date() < startDeadline, !sawGenerationSignal {
             try Task.checkCancellation()
             try await requireProviderForeground(package: package, stage: .waitGenerationStart, appVersion: introspection.version)
-            observation = try await observe(appVersion: introspection.version)
+            observation = try await observe(
+                appVersion: introspection.version,
+                selectors: package.selectors.errorIndicators + package.selectors.generationStart,
+                requireOCR: true
+            )
             if try await handleProviderError(
                 observation,
                 package: package,
@@ -769,7 +787,11 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         while Date() < generationDeadline {
             try Task.checkCancellation()
             try await requireProviderForeground(package: package, stage: .waitGeneration, appVersion: introspection.version)
-            let current = try await observe(appVersion: introspection.version)
+            let current = try await observe(
+                appVersion: introspection.version,
+                selectors: package.selectors.errorIndicators + package.selectors.generationComplete,
+                requireOCR: true
+            )
             if try await handleProviderError(
                 current,
                 package: package,
@@ -919,13 +941,57 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         throw AppBackedProviderRuntimeError.providerReportedError(detail)
     }
 
-    private func observe(appVersion: String) async throws -> Observation {
+    /// A nil selector list means the ordinary screenshot/OCR observation path. Explicit selector
+    /// demands may add a bounded AX read, performed before any OCR work; OCR then runs only for
+    /// visible-text selectors, an explicit text consumer, or a semantic-label fallback that AX
+    /// could not satisfy.
+    private func observe(
+        appVersion: String,
+        selectors: [AppProviderSelector]? = nil,
+        requireAXText: Bool = false,
+        requireOCR: Bool = false
+    ) async throws -> Observation {
         let screenshot = try await gui.screenshot()
-        async let local = LocalVisionTextObservation.observe(for: screenshot, maximumElements: 48, requiresText: false)
-        var ax: [LocalPerceptionTextElement] = []
-        if ProductionPerceptionPolicy.accessibilityRuntimeAllowed,
-           let tree = try? await gui.tree() {
-            ax = LocalAXTreeTextExtractor.extract(from: tree, maximumElements: 96)
+        let capturedAt = Date()
+        let demandedSelectors = selectors ?? []
+        let hasSemanticSelector = demandedSelectors.contains { Self.isSemanticSelector($0) }
+        let shouldReadAX = ProductionPerceptionPolicy.boundedSemanticReadAllowed
+            && (hasSemanticSelector || requireAXText)
+        var axElements: [LocalPerceptionTextElement] = []
+        var axMatches: [GUIElementMatch] = []
+        if shouldReadAX {
+            do {
+                let tree = try await gui.tree()
+                axElements = LocalAXTreeTextExtractor.extract(from: tree, maximumElements: 96)
+                axMatches = GUIElementResolver.elements(in: tree, maximumElements: 256)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // AX may be unavailable for this particular observation. OCR fallback is decided
+                // below from each selector's actual evidence requirements.
+            }
+        }
+        try Task.checkCancellation()
+        let semanticLabelNeedsOCR = demandedSelectors.contains { selector in
+            selector.strategy == .semanticLabel
+                && Self.semanticLabelNeedsOCRFallback(selector, elements: axMatches)
+        }
+        let selectorNeedsOCR = demandedSelectors.contains { selector in
+            switch selector.strategy {
+            case .visibleText, .ocrText, .relativeLayout: return true
+            case .accessibilityIdentifier, .axRole, .semanticLabel, .coordinateFallback: return false
+            }
+        }
+        let shouldReadOCR = selectors == nil || requireOCR || selectorNeedsOCR || semanticLabelNeedsOCR
+        let local: LocalVisionTextObservation.Observation
+        if shouldReadOCR {
+            try Task.checkCancellation()
+            local = await LocalVisionTextObservation.observe(for: screenshot, maximumElements: 48, requiresText: false)
+        } else {
+            local = LocalVisionTextObservation.Observation(
+                payload: ["localVisionOCR": "not_requested"],
+                elements: []
+            )
         }
         let deviceContext = await MainActor.run { () -> (String, Double, Double) in
             let bounds = UIScreen.main.bounds
@@ -934,16 +1000,18 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         let deviceClass = deviceContext.0
         let width = deviceContext.1
         let height = deviceContext.2
+        try Task.checkCancellation()
         return Observation(
             screenshot: screenshot,
-            localVision: await local,
-            axElements: ax,
+            localVision: local,
+            axElements: axElements,
+            axMatches: axMatches,
             appVersion: appVersion,
             deviceClass: deviceClass,
             orientation: width > height ? "landscape" : "portrait",
             screenWidth: width,
             screenHeight: height,
-            capturedAt: Date()
+            capturedAt: capturedAt
         )
     }
 
@@ -1049,6 +1117,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             screenshot: observation.screenshot,
             localVision: precise,
             axElements: observation.axElements,
+            axMatches: observation.axMatches,
             appVersion: observation.appVersion,
             deviceClass: observation.deviceClass,
             orientation: observation.orientation,
@@ -1095,16 +1164,44 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         observation: Observation,
         testedCoordinateAppVersion: String? = nil
     ) -> ResolvedSelector? {
-        let candidates: [LocalPerceptionTextElement]
-        let source: String
         switch selector.strategy {
-        case .accessibilityIdentifier, .axRole, .semanticLabel:
-            guard ProductionPerceptionPolicy.accessibilityRuntimeAllowed else { return nil }
-            candidates = observation.axElements
-            source = "ax"
+        case .accessibilityIdentifier, .axRole:
+            guard let candidate = GUIElementResolver.semanticMatch(selector: selector, elements: observation.axMatches) else { return nil }
+            let text = selector.value ?? selector.role ?? "AX element"
+            let element = LocalPerceptionTextElement(
+                text: text,
+                confidence: 1,
+                x: candidate.frame.x,
+                y: candidate.frame.y,
+                width: candidate.frame.width,
+                height: candidate.frame.height
+            )
+            return ResolvedSelector(selector: selector, element: element, source: "ax", score: 1)
+        case .semanticLabel:
+            if let matches = GUIElementResolver.semanticMatches(selector: selector, elements: observation.axMatches),
+               matches.count == 1,
+               let candidate = matches.first {
+                let text = selector.value ?? candidate.label ?? candidate.title ?? "AX label"
+                let element = LocalPerceptionTextElement(
+                    text: text,
+                    confidence: 1,
+                    x: candidate.frame.x,
+                    y: candidate.frame.y,
+                    width: candidate.frame.width,
+                    height: candidate.frame.height
+                )
+                return ResolvedSelector(selector: selector, element: element, source: "ax", score: 1)
+            }
+            if GUIElementResolver.semanticMatches(selector: selector, elements: observation.axMatches)?.isEmpty == false
+                || observation.axMatches.count >= 256 {
+                return nil
+            }
+            // Semantic labels have an explicit visible-text fallback. Identifier and role selectors
+            // deliberately do not use OCR because pixels cannot prove either structured AX field.
+            guard semanticLabelAllowsOCRFallback(selector) else { return nil }
+            return matchText(selector, in: observation.localVision.elements, source: "ocr")
         case .visibleText, .ocrText, .relativeLayout:
-            candidates = observation.localVision.elements
-            source = "ocr"
+            return matchText(selector, in: observation.localVision.elements, source: "ocr")
         case .coordinateFallback:
             guard let coordinate = selector.coordinate else { return nil }
             let exactVersionMatch = coordinate.appVersion == observation.appVersion
@@ -1123,17 +1220,13 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             let element = LocalPerceptionTextElement(text: "coordinate-fallback", confidence: 0.5, x: coordinate.x, y: coordinate.y, width: 1, height: 1)
             return ResolvedSelector(selector: selector, element: element, source: "coordinate_fallback", score: 0.5)
         }
+    }
 
-        if selector.strategy == .axRole, let role = selector.role, !role.isEmpty {
-            // Current LocalPerceptionTextElement intentionally strips raw AX role. A role-only
-            // selector therefore cannot be considered high-confidence after extraction; packages
-            // should pair it with identifier/semantic text until the host exposes structured role.
-            if let value = selector.value, !value.isEmpty,
-               case .unique(let element) = LocalPerceptionTextMatcher.resolve(query: value, mode: .contains, elements: candidates) {
-                return ResolvedSelector(selector: selector, element: element, source: source, score: max(0.8, element.confidence))
-            }
-            return nil
-        }
+    private static func matchText(
+        _ selector: AppProviderSelector,
+        in candidates: [LocalPerceptionTextElement],
+        source: String
+    ) -> ResolvedSelector? {
         let value = selector.value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !value.isEmpty else { return nil }
         let mode: GUIElementMatchMode = selector.strategy == .visibleText || selector.strategy == .ocrText ? .contains : .exact
@@ -1145,28 +1238,77 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         }
     }
 
+    private static func isSemanticSelector(_ selector: AppProviderSelector) -> Bool {
+        switch selector.strategy {
+        case .accessibilityIdentifier, .axRole, .semanticLabel: return true
+        case .visibleText, .relativeLayout, .ocrText, .coordinateFallback: return false
+        }
+    }
+
+    private static func semanticLabelAllowsOCRFallback(_ selector: AppProviderSelector) -> Bool {
+        selector.role?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
+            && selector.traits.isEmpty
+            && selector.relation?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
+    }
+
+    private static func semanticLabelNeedsOCRFallback(_ selector: AppProviderSelector, elements: [GUIElementMatch]) -> Bool {
+        guard semanticLabelAllowsOCRFallback(selector), elements.count < 256,
+              let matches = GUIElementResolver.semanticMatches(selector: selector, elements: elements) else { return false }
+        return matches.isEmpty
+    }
+
     private func extractResponse(
         package: AppProviderPackage,
         observation: Observation,
         expectedTag: String,
         appVersion: String?
     ) async throws -> (text: String, route: String) {
-        for extractor in package.summary.manifest.responseExtractors {
+        let extractors = package.summary.manifest.responseExtractors
+        let extractionSelectors = package.selectors.copyButton + extractors.flatMap(\.selectors)
+        let requiresAXText = extractors.contains { $0.kind == .axText }
+        var extractionObservation: Observation
+        if requiresAXText || !extractionSelectors.isEmpty {
+            extractionObservation = try await observe(
+                appVersion: appVersion ?? observation.appVersion,
+                selectors: extractionSelectors,
+                requireAXText: requiresAXText
+            )
+        } else {
+            extractionObservation = observation
+        }
+        var observationNeedsRefresh = false
+        var copyInteractionAttempted = false
+        for (index, extractor) in extractors.enumerated() {
+            if observationNeedsRefresh {
+                let remainingExtractors = Array(extractors[index...])
+                let remainingSelectors = package.selectors.copyButton + remainingExtractors.flatMap(\.selectors)
+                extractionObservation = try await observe(
+                    appVersion: appVersion ?? observation.appVersion,
+                    selectors: remainingSelectors,
+                    requireAXText: remainingExtractors.contains { $0.kind == .axText }
+                )
+                observationNeedsRefresh = false
+            }
             let started = Date()
             switch extractor.kind {
             case .axText:
-                guard ProductionPerceptionPolicy.accessibilityRuntimeAllowed else { continue }
-                let text = observation.axElements.map(\.text).joined(separator: "\n")
+                guard ProductionPerceptionPolicy.boundedSemanticReadAllowed else { continue }
+                let text = extractionObservation.axElements.map(\.text).joined(separator: "\n")
                 if let bound = Self.boundText(text, expectedTag: expectedTag), bound.count >= extractor.minimumCharacters {
                     await learningStore.record(packageID: package.summary.id, selectorKey: "extractor.ax", success: true, appVersion: appVersion, latencyMS: Int(Date().timeIntervalSince(started) * 1_000))
                     return (bound, "ax_text")
                 }
                 await learningStore.record(packageID: package.summary.id, selectorKey: "extractor.ax", success: false, appVersion: appVersion, latencyMS: Int(Date().timeIntervalSince(started) * 1_000))
             case .copyClipboard:
-                guard let copy = await resolve(package.selectors.copyButton + extractor.selectors, observation: observation, packageID: package.summary.id, appVersion: appVersion) else { continue }
+                guard !copyInteractionAttempted else { continue }
+                guard let copy = await resolve(package.selectors.copyButton + extractor.selectors, observation: extractionObservation, packageID: package.summary.id, appVersion: appVersion) else { continue }
                 let beforeItems = await MainActor.run { UIPasteboard.general.items }
+                copyInteractionAttempted = true
                 do { try await gui.tap(x: copy.element.centerX, y: copy.element.centerY) }
-                catch { continue }
+                catch {
+                    observationNeedsRefresh = true
+                    continue
+                }
                 try? await Task.sleep(nanoseconds: 250_000_000)
                 let after = await MainActor.run { UIPasteboard.general.string }
                 await MainActor.run { UIPasteboard.general.items = beforeItems }
@@ -1175,10 +1317,11 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
                     return (bound, "copy_clipboard")
                 }
                 await learningStore.record(packageID: package.summary.id, selectorKey: "extractor.clipboard", success: false, appVersion: appVersion, latencyMS: Int(Date().timeIntervalSince(started) * 1_000))
+                observationNeedsRefresh = true
             case .ocrRegion:
                 let text: String
                 if let region = extractor.region,
-                   let image = UIImage(data: observation.screenshot) {
+                   let image = UIImage(data: extractionObservation.screenshot) {
                     let rect = CGRect(
                         x: region.x * image.size.width,
                         y: region.y * image.size.height,
@@ -1186,7 +1329,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
                         height: region.height * image.size.height
                     )
                     let regionObservation = await LocalVisionTextObservation.observe(
-                        for: observation.screenshot,
+                        for: extractionObservation.screenshot,
                         maximumElements: 48,
                         regionInScreenPoints: rect,
                         requiresText: true,
@@ -1194,7 +1337,17 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
                     )
                     text = regionObservation.elements.map(\.text).joined(separator: "\n")
                 } else {
-                    text = observation.localVision.elements.map(\.text).joined(separator: "\n")
+                    let localObservation: LocalVisionTextObservation.Observation
+                    if extractionObservation.localVision.payload["localVisionOCR"] == "not_requested" {
+                        localObservation = await LocalVisionTextObservation.observe(
+                            for: extractionObservation.screenshot,
+                            maximumElements: 48,
+                            requiresText: true
+                        )
+                    } else {
+                        localObservation = extractionObservation.localVision
+                    }
+                    text = localObservation.elements.map(\.text).joined(separator: "\n")
                 }
                 if let bound = Self.boundText(text, expectedTag: expectedTag), bound.count >= extractor.minimumCharacters {
                     await learningStore.record(packageID: package.summary.id, selectorKey: "extractor.ocr", success: true, appVersion: appVersion, latencyMS: Int(Date().timeIntervalSince(started) * 1_000))

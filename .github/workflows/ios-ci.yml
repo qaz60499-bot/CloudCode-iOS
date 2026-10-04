@@ -642,12 +642,19 @@ jobs:
               raise SystemExit('FAIL: gui.type/probe no longer use the text-specific IOHID readiness path')
           if '0x8000000817319375ULL' in gui_text or 'CLOUDCODE_GUI_FALLBACK_SENDER_ID' in gui_text:
               raise SystemExit('FAIL: build53 legacy IOHID sender/profile leaked into build54 GUI helper')
-          for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'runSeparated(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'CloudCodeSpawnHelperWithSeparatedOutput', 'runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)', 'runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 1.25)', 'result.stdout', 'result.stderr', 'run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)', 'EmbeddedVisionHelper', '["ocr-file", inputURL.path, String(boundedMaximum), forcePrecise ? "accurate" : "fast"]', '全局截图已通过独立 tmp JPEG 通道返回', 'run(["gui-navigate-back", strategy], privilege: .root, timeout: 4)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
+          for marker in ('startBackgroundAssertion(targetPID:', 'backgroundAssertionIsAlive(workerPID:', 'stopBackgroundAssertion(workerPID:', 'runSeparated(["background-assert-start", String(targetPID)], privilege: .root, timeout: 4)', '已派发，但尚未验证前台 UI 是否实际变化', 'guiProbe()', 'CloudCodeSpawnHelperWithSeparatedOutput', 'runSeparated(["gui-probe-json"], privilege: .root, timeout: 6)', 'result.stdout', 'result.stderr', 'run(["gui-screenshot-file", outputURL.path], privilege: .root, timeout: 6)', 'EmbeddedVisionHelper', '["ocr-file", inputURL.path, String(boundedMaximum), forcePrecise ? "accurate" : "fast"]', '全局截图已通过独立 tmp JPEG 通道返回', 'run(["gui-navigate-back", strategy], privilege: .root, timeout: 4)', 'run(["gui-type-base64", encoded], privilege: .root, timeout: 6)'):
               if marker not in adapters:
                   raise SystemExit(f'FAIL: GUI adapter lost bounded helper marker: {marker}')
-          for marker in ('mayAcceptValidatedReadOnlyPayloadAfterParentTimeout', '已返回精确 helper 协议指纹', 'runSeparated(["probe-filesystem-json"], privilege: .root, timeout: 5)', '不授予共享文件或 unrestricted 写/删权限', '已返回完整可解码的只读 readiness payload', 'AXRuntime tree 已由 non-root AX 路径返回完整可解析 JSON', 'AX focused-text probe 已由 non-root AX 路径返回完整可解码 payload', '全局截图 JPEG 已完整写入并通过格式/大小校验'):
+          for marker in ('mayAcceptValidatedReadOnlyPayloadAfterParentTimeout', '已返回精确 helper 协议指纹', 'runSeparated(["probe-filesystem-json"], privilege: .root, timeout: 5)', '不授予共享文件或 unrestricted 写/删权限', '已返回完整可解码的只读 readiness payload', '全局截图 JPEG 已完整写入并通过格式/大小校验'):
               if marker not in adapters:
                   raise SystemExit(f'FAIL: validated read-only helper payload can regress to false failure after parent exit timeout: {marker}')
+          for ax_method_start, ax_method_end in (
+              ('static func guiTree(forceTimeoutForAcceptance:', 'static func focusedTextInput()'),
+              ('static func focusedTextInput()', 'static func guiScreenshot()'),
+          ):
+              ax_method = adapters.split(ax_method_start, 1)[1].split(ax_method_end, 1)[0]
+              if 'mayAcceptValidatedReadOnlyPayloadAfterParentTimeout' in ax_method or 'CloudCodeHostAX' in ax_method:
+                  raise SystemExit(f'FAIL: exact AX read regressed to timeout-payload acceptance or synchronous HostAX routing: {ax_method_start}')
           gui_executor = adapters.split('public struct GUIFallbackExecutor', 1)[1]
           gui_routing = gui_executor.split('public func execute(', 1)[0]
           if 'DeferredCapabilitySelfValidatingToolExecutor' not in gui_executor or 'allowsDeferredCapabilityAttempt' not in gui_routing:
@@ -675,11 +682,109 @@ jobs:
           structured_descriptor = tool_router_text.split('ToolDescriptor(name: "gui.runStructuredPlan"', 1)[1].split('ToolDescriptor(name: "gui.screenshot"', 1)[0]
           if 'GUIAutomationFeature.tree.capabilityID' in structured_descriptor:
               raise SystemExit('FAIL: gui.runStructuredPlan regressed to an AX-tree hard capability dependency')
-          if 'let isolated = runSeparated(["gui-tree-json"], privilege: .isolatedUser, timeout: 1.25)' not in adapters or 'let privileged = runSeparated(["gui-tree-json"], privilege: .root, timeout: 0.7)' not in adapters:
-              raise SystemExit('FAIL: structured UI-tree must preserve the bounded mobile AX call plus one passive persona-99 fallback')
-          for marker in ('CloudCodeHostAXTreeJSON(&hostDiagnostic)', 'gui-focused-text-input-json', 'AccessibilityUI/AXAudit', 'isolated helper', 'persona-99 fallback'):
-              if marker not in bridge:
-                  raise SystemExit(f'FAIL: non-root AX bridge lost host -> AXAudit broker -> persona-99 fallback ordering marker: {marker}')
+          gui_tree_method = adapters.split('static func guiTree(forceTimeoutForAcceptance:', 1)[1].split('static func focusedTextInput()', 1)[0]
+          for marker in ('let arguments = forceTimeoutForAcceptance ? ["gui-tree-json", "--ax-acceptance-stall"] : ["gui-tree-json"]', 'runSeparated(arguments, privilege: .isolatedUser', 'cancellation: { Task.isCancelled }', 'GUIAXTransactionEvidence.validateTree(stdout: result.stdout, stderr: result.stderr, code: result.code)'):
+              if marker not in gui_tree_method:
+                  raise SystemExit(f'FAIL: GUI tree must use one cancellable isolated helper and consume transaction evidence: {marker}')
+          if gui_tree_method.count('runSeparated(') != 1 or 'CloudCodeHostAX' in gui_tree_method or 'privilege: .root' in gui_tree_method:
+              raise SystemExit('FAIL: GUI tree must spawn its sole isolated helper before any AX read; synchronous HostAX and persona retry are forbidden')
+          focused_method = adapters.split('static func focusedTextInput()', 1)[1].split('static func guiScreenshot()', 1)[0]
+          for marker in ('runSeparated(["gui-focused-text-input-json"]', 'privilege: .isolatedUser', 'cancellation: { Task.isCancelled }', 'GUIAXTransactionEvidence.hasVerifiedProcessExit(code: result.code, stderr: result.stderr)', 'GUIAXTransactionEvidence.hasPassiveCleanupPayload(object)'):
+              if marker not in focused_method:
+                  raise SystemExit(f'FAIL: focused AX read must consume the cancellable child clean-exit/passive-cleanup proof: {marker}')
+          if focused_method.count('runSeparated(') != 1 or 'CloudCodeHostAX' in focused_method or 'privilege: .root' in focused_method:
+              raise SystemExit('FAIL: focused AX read must use one isolated child with no synchronous HostAX or persona retry')
+          root_bridge = Path('Sources/CloudCodeApp/RootHelperBridge.m').read_text(encoding='utf-8')
+          root_bridge_header = Path('Sources/CloudCodeApp/RootHelperBridge.h').read_text(encoding='utf-8')
+          for marker in ('CloudCodeSpawnHelperWithSeparatedOutputCancellable', 'cancellationPredicate', 'poll(pollFDs, countFDs, 50)', 'kill(pid, SIGKILL)', 'waitStatusObserved', 'reapDeferred', 'parentTimeout', 'parentCancelled', 'helper-exit', '--cloudcode-watchdog-ms='):
+              if marker not in root_bridge:
+                  raise SystemExit(f'FAIL: cancellable helper transaction lost polling, kill/reap evidence, or self-watchdog: {marker}')
+          if 'CloudCodeSpawnHelperWithSeparatedOutputCancellable' not in root_bridge_header:
+              raise SystemExit('FAIL: cancellable helper API is not exported to exact semantic-read callers')
+          passive_ax_watchdog = root_bridge.split('BOOL isPassiveAXRead =', 1)[1].split('const NSUInteger count = argvStrings.count', 1)[0]
+          for marker in ('gui-tree-json', 'gui-focused-text-input-json', 'if (isCloudCodeRootHelper && (asRoot || isPassiveAXRead))', 'NSInteger watchdogMS = MAX(250, (NSInteger)(timeout * 1000.0) - 150)', '--cloudcode-watchdog-ms='):
+              if marker not in passive_ax_watchdog:
+                  raise SystemExit(f'FAIL: passive semantic child watchdog must be bounded by its exact parent deadline: {marker}')
+          cancellable_process = root_bridge.split('static NSInteger CloudCodeSpawnHelperInternal(', 1)[1].split('NSInteger CloudCodeSpawnHelperWithSeparatedOutput(', 1)[0]
+          for marker in ('cancellationPredicate()', 'CloudCodeDarwinWaitPid(pid, &status, WNOHANG)', 'kill(pid, SIGKILL)', 'dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0)', 'reapDeferred'):
+              if marker not in cancellable_process:
+                  raise SystemExit(f'FAIL: semantic helper cancellation must kill and account for child reaping: {marker}')
+          cancellable_api = root_bridge.split('NSInteger CloudCodeSpawnHelperWithSeparatedOutputCancellable(', 1)[1].split('\n}', 1)[0]
+          if 'cancellationPredicate)' not in cancellable_api:
+              raise SystemExit('FAIL: cancellable helper entry point must pass its cancellation predicate into the process monitor')
+          gui_tree_command = gui_text.split('int CloudCodeGUITreeJSON(void)', 1)[1].split('int CloudCodeGUIScreenshotBase64(void)', 1)[0]
+          if 'CloudCodeFrontmostTreeData();' not in gui_tree_command:
+              raise SystemExit('FAIL: exact tree command must enter the passive one-shot read')
+          tree_fault = gui_text.split('static __attribute__((noreturn)) void CloudCodeFrontmostTreeData(void)', 1)[1].split('int CloudCodeGUITreeJSON(void)', 1)[0]
+          for marker in ('--ax-acceptance-stall', '--cloudcode-watchdog-ms=', 'if (!hasWatchdog)', 'for (;;) { pause(); }'):
+              if marker not in tree_fault:
+                  raise SystemExit(f'FAIL: acceptance semantic-read fault must require a hard watchdog: {marker}')
+          if tree_fault.index('--ax-acceptance-stall') < tree_fault.index('CFRelease(root);'):
+              raise SystemExit('FAIL: timeout acceptance must stall after actual passive AX root work/release')
+          ts_backend = Path('Sources/CloudCodeApp/TrollStoreGUIBackend.swift').read_text(encoding='utf-8')
+          if 'forceNextTreeTimeoutForAcceptance' not in ts_backend or '--cloudcode-ax-exact-acceptance' not in ts_backend:
+              raise SystemExit('FAIL: fault injection must require explicit restricted acceptance launch argument')
+          transaction_evidence = Path('Sources/CloudCodeCore/GUIAXTransactionEvidence.swift').read_text(encoding='utf-8')
+          for marker in ('public static func hasVerifiedProcessExit(code: Int, stderr: String)', 'exit["waitStatusObserved"] as? Bool == true', 'exit["reapDeferred"] as? Bool == false', 'exit["parentTimeout"] as? Bool == false', 'exit["parentCancelled"] as? Bool == false', 'public static func hasPassiveCleanupPayload', 'public static func validateTree', 'hasVerifiedProcessExit(code: code, stderr: stderr)', 'hasPassiveCleanupPayload(payload)', 'ownedRootReferenceReleased', 'foregroundVerified', 'readStartedAtMS', 'readFinishedAtMS', 'semantic > 0'):
+              if marker not in transaction_evidence:
+                  raise SystemExit(f'FAIL: AX transaction evidence no longer requires a semantic payload and normally reaped exit: {marker}')
+          ax_evidence_tests = Path('Tests/CloudCodeCoreTests/GUIAXTransactionEvidenceTests.swift').read_text(encoding='utf-8')
+          for marker in ('testSemanticTreeRequiresObservedCleanPassiveExit', 'testCompleteJSONAfterTimeoutOrSignalIsRejected', 'parentTimeout', 'reapDeferred'):
+              if marker not in ax_evidence_tests:
+                  raise SystemExit(f'FAIL: AX transaction regression tests no longer reject timeout JSON or deferred reap: {marker}')
+          gui_tree_source = gui_text.split('static __attribute__((noreturn)) void CloudCodeFrontmostTreeData(void)', 1)[1].split('int CloudCodeGUIProbeJSON(void)', 1)[0]
+          gui_focus_source = gui_text.split('int CloudCodeGUIFocusedTextInputJSON(void)', 1)[1].split('int CloudCodeGUITypeBase64(', 1)[0]
+          audit_primary = gui_text.split('static id CloudCodeAXAuditPrimaryElement(NSString **detailOut)', 1)[1].split('#define CLOUDCODE_AX_TRAIT_BUTTON', 1)[0]
+          for marker in ('detailOut', 'return nil;'):
+              if marker not in audit_primary:
+                  raise SystemExit(f'FAIL: unproven AXAudit service teardown must keep the primary client acquisition fail-closed: {marker}')
+          if any(marker in audit_primary for marker in ('initWithIdentifier:', '[[AXUIClient alloc]', 'NSClassFromString')):
+              raise SystemExit('FAIL: fail-closed AXAudit primary-element function must return before any client lookup or initialization')
+          if 'CloudCodeAXAuditBrokerTree(' in gui_tree_source or 'AccessibilityUI.AXAudit.AXElement' in gui_tree_source:
+              raise SystemExit('FAIL: production tree command must emit only bounded passive AXRuntime semantics')
+          for payload_source, source_name in ((gui_tree_source, 'gui-tree-json'), (gui_focus_source, 'gui-focused-text-input-json')):
+              for marker in ('@"mode": @"one-shot-passive-no-audit-client"', '@"auditClientCreated": @NO', '@"globalStateMutated": @NO', '@"ownedRootReferenceReleased": @YES'):
+                  if marker not in payload_source:
+                      raise SystemExit(f'FAIL: {source_name} payload lost its passive AX lifecycle contract: {marker}')
+              if 'addAssociatedPid(' in payload_source or 'runtime.addAssociatedPid(' in payload_source:
+                  raise SystemExit(f'FAIL: production {source_name} must not mutate AX process associations')
+          diagnostic_ax_probe = gui_text.split('int CloudCodeGUIAXProbeJSON(', 1)[1].split('int CloudCodeGUIProbeJSON(', 1)[0]
+          if 'runtime.addAssociatedPid(' in gui_text and 'runtime.addAssociatedPid(' not in diagnostic_ax_probe:
+              raise SystemExit('FAIL: AX associated-PID mutation may only remain in the explicitly invoked diagnostic probe')
+          for marker in ('foregroundVerified', 'readStartedAtMS', 'readFinishedAtMS'):
+              if marker not in gui_tree_source:
+                  raise SystemExit(f'FAIL: passive AX tree must bind semantics to one bounded foreground read: {marker}')
+          if gui_tree_source.count('CloudCodeFrontmostBundleID(') < 2 or gui_tree_source.count('CloudCodePIDForBundlePath(') < 2:
+              raise SystemExit('FAIL: AX tree must resolve and compare the foreground bundle and PID before and after semantic reads')
+          sampled_hit_test = gui_text.split('static NSDictionary *CloudCodeAXHitTestTree(', 1)[1].split('static NSDictionary *CCAXSymbolEvidence(', 1)[0]
+          for marker in ('pidCode != 0', 'candidatePID <= 1', 'foregroundPID <= 1', 'candidatePID != foregroundPID'):
+              if marker not in sampled_hit_test:
+                  raise SystemExit(f'FAIL: sampled semantic AX nodes must reject unknown and mixed foreground PIDs: {marker}')
+          import re
+          if re.search(r'static\s+(?:id|AXUIClient\s*\*)\s+\w*AXUIClient', gui_text):
+              raise SystemExit('FAIL: GUIAutomation must not retain a process-static AXUIClient lease')
+          validation_workflow = Path('.github/workflows/ax-recovery-validation.yml').read_text(encoding='utf-8')
+          for marker in ('workflow_dispatch:', 'runs-on: macos-15', 'swift test --parallel', 'swift test --filter GUIAXTransactionEvidenceTests', 'swift test --filter AppProviderSemanticObservationTests', 'Tests/RootHelperBridgeTests/RootHelperBridgeHarness.m', 'Tests/RootHelperBridgeTests/BackgroundAssertionLifecycleHarness.c', 'generic/platform=iOS Simulator', 'generic/platform=iOS', 'CODE_SIGNING_ALLOWED=NO', 'CODE_SIGNING_REQUIRED=NO'):
+              if marker not in validation_workflow:
+                  raise SystemExit(f'FAIL: test-only AX validation workflow is missing a required test/unsigned compile step: {marker}')
+          for marker in ('\n  push:\n    branches: [ci/build123-host-ax-context-20260911]', '\n  workflow_dispatch:'):
+              if marker not in validation_workflow:
+                  raise SystemExit(f'FAIL: test workflow must be branch-scoped with manual dispatch available: {marker}')
+          for forbidden in ('\n  pull_request:', 'branches: [main]', 'actions/upload-artifact@', 'CloudCode-iOS-unsigned.ipa', '-exportArchive', 'CURRENT_PROJECT_VERSION', 'agvtool'):
+              if forbidden in validation_workflow:
+                  raise SystemExit(f'FAIL: AX recovery validation workflow must remain branch-scoped, test-only, unsigned, and version-neutral: {forbidden}')
+          provider_runtime = Path('Sources/CloudCodeApp/AppBackedProviderRuntime.swift').read_text(encoding='utf-8')
+          provider_observe = provider_runtime.split('private func observe(', 1)[1].split('private func composerFocusVerified(', 1)[0]
+          for marker in ('selectors: [AppProviderSelector]? = nil', 'requireAXText: Bool = false', 'let hasSemanticSelector = demandedSelectors.contains { Self.isSemanticSelector($0) }', 'ProductionPerceptionPolicy.boundedSemanticReadAllowed', '(hasSemanticSelector || requireAXText)', 'if shouldReadAX {', 'let tree = try await gui.tree()', 'catch is CancellationError', 'axMatches = GUIElementResolver.elements(in: tree, maximumElements: 256)'):
+              if marker not in provider_observe:
+                  raise SystemExit(f'FAIL: Provider AX must remain per-demand and bounded to semantic selectors/text extraction: {marker}')
+          element_resolver = tool_router_text.split('public enum GUIElementResolver', 1)[1].split('public struct GUIElementLookupCache', 1)[0]
+          for marker in ('string(node["role"])', 'string(node["identifier"])', 'role: string(node["role"])', 'identifier: string(node["identifier"])'):
+              if marker not in element_resolver:
+                  raise SystemExit(f'FAIL: structured AX parser must preserve true node role and identifier: {marker}')
+          provider_semantic_tests = Path('Tests/CloudCodeCoreTests/AppProviderSemanticObservationTests.swift').read_text(encoding='utf-8')
+          if 'testStructuredElementsPreserveRoleAndIdentifier' not in provider_semantic_tests:
+              raise SystemExit('FAIL: Provider semantic observation tests must cover parsed AX role and identifier')
           host_ax = Path('Sources/CloudCodeApp/HostAXBridge.m').read_text(encoding='utf-8')
           for marker in ('AXRuntime.host-system-app', 'CLOUDCODE_HOST_AX_TIMEOUT_SECONDS 0.25f', 'CLOUDCODE_HOST_AX_TOTAL_BUDGET_SECONDS 1.20', 'CLOUDCODE_HOST_AX_MAX_NODES 220', 'semanticNodeCount', 'actionableNodeCount', 'AXUIElementCreateApplication', 'AXUIElementCreateSystemWide', '_AXSetRequestingClient', '_AXSAutomationEnabled', 'CloudCodeHostAXObserveAutomationState', 'CloudCodeHostAXAcquireCallLease', 'os_unfair_lock_trylock', 'runtime.setTimeout(element, CLOUDCODE_HOST_AX_TIMEOUT_SECONDS)', 'fail-fast to bounded fallback', 'fail-fast to AXAudit fallback'):
               if marker not in host_ax:
@@ -699,7 +804,7 @@ jobs:
               raise SystemExit('FAIL: local Vision/OCR capability is no longer independently represented from AX tree')
           if '#define CLOUDCODE_GUI_AX_REQUEST_TIMEOUT_SECONDS 0.25f' not in gui_text:
               raise SystemExit('FAIL: AX per-request timeout budget must remain fail-fast for detached/mobile AX clients')
-          for marker in ('AXUIElementCopyMultipleAttributeValues', 'AXUIElementCopyElementWithParameters', 'typedef CloudCodeAXError (*CloudCodeAXCopyElementAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, float, float);', 'runtime.copyElementAtPosition(systemWide, &candidate, (float)points[index].x, (float)points[index].y)', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic', 'CloudCodeAXApplicationAtScreenPointRoot', 'CloudCodeAXParameterizedElementAtPoint', 'CloudCodeAXNodeLimited', 'CloudCodeAXNodeLimited(runtime, candidate, 0, 0, &localNodeCount)', 'semanticNodeCount', 'AccessibilityUI.AXAudit.AXElement', 'initWithIdentifier:serviceBundleName:', 'AXAuditAXUIClientIdentifier', 'AXAuditAXUIService', 'primaryApp', 'explorerElements', 'CloudCodeAXAuditEditingTextElement', 'CLOUDCODE_AX_TRAIT_IS_EDITING', 'CLOUDCODE_AX_TRAIT_SECURE_TEXT_FIELD', 'CFSTR("AXFocused")', 'focusSource=%@', 'Never treat a merely unique text-like element as focused', 'CloudCodePIDForBundleIdentifier'):
+          for marker in ('AXUIElementCopyMultipleAttributeValues', 'AXUIElementCopyElementWithParameters', 'typedef CloudCodeAXError (*CloudCodeAXCopyElementAtPositionFn)(CloudCodeAXUIElementRef, CloudCodeAXUIElementRef *, float, float);', 'runtime.copyElementAtPosition(systemWide, &candidate, (float)points[index].x, (float)points[index].y)', 'authority=standalone-trollstore-best-effort', 'sampled_semantics', 'full_application_tree_opportunistic', 'CloudCodeAXApplicationAtScreenPointRoot', 'CloudCodeAXParameterizedElementAtPoint', 'CloudCodeAXNodeLimited', 'CloudCodeAXNodeLimited(runtime, candidate, 0, 0, &localNodeCount)', 'semanticNodeCount', 'CloudCodeAXAuditPrimaryElement', 'CloudCodeAXAuditEditingTextElement', 'CLOUDCODE_AX_TRAIT_IS_EDITING', 'CLOUDCODE_AX_TRAIT_SECURE_TEXT_FIELD', 'CFSTR("AXFocused")', 'focusSource=%@', 'Never treat a merely unique text-like element as focused', 'CloudCodePIDForBundleIdentifier'):
               if marker not in gui_text:
                   raise SystemExit(f'FAIL: AX runtime lost bounded standalone/context-bound capability marker: {marker}')
           for forbidden_ax_text_write_marker in ('AccessibilityUI.AXAudit.editing.insertText', 'route=ax-focused-value result=verified', 'route=ax-focused-value result=write-unverified'):
@@ -763,9 +868,9 @@ jobs:
               raise SystemExit('FAIL: local OCR routing regressed back into the privileged/root GUI helper')
           app_environment = Path('Sources/CloudCodeApp/AppEnvironment.swift').read_text(encoding='utf-8')
           production_policy = Path('Sources/CloudCodeApp/ProductionPerceptionPolicy.swift').read_text(encoding='utf-8')
-          for marker in ('static let backgroundProcessAssertionAllowed = true', 'backgroundProcessAssertionDisabledReason', 'static let explicitAccessibilityDiagnosticsAllowed = false'):
+          for marker in ('static let backgroundProcessAssertionAllowed = true', 'backgroundProcessAssertionDisabledReason', 'static let explicitAccessibilityDiagnosticsAllowed = false', 'static let accessibilityRuntimeAllowed = false', 'static let boundedSemanticReadAllowed = true'):
               if marker not in production_policy:
-                  raise SystemExit(f'FAIL: production Agent/background or green-indicator policy marker missing: {marker}')
+                  raise SystemExit(f'FAIL: production Agent/background, explicit diagnostics, or bounded AX policy marker missing: {marker}')
           for marker in ('guard acquirePrivilegedAssertion, isRunning else { return }', 'beginBackgroundExecutionIfNeeded(acquirePrivilegedAssertion: false)', 'beginBackgroundExecutionIfNeeded(acquirePrivilegedAssertion: true)', 'endBackgroundExecutionIfNeeded(stopPrivilegedAssertion: true)', 'if !ProductionPerceptionPolicy.backgroundProcessAssertionAllowed'):
               if marker not in app_environment:
                   raise SystemExit(f'FAIL: Agent-only bounded background assertion lifecycle marker missing: {marker}')

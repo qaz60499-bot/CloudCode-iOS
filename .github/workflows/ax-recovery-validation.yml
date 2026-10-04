@@ -1,0 +1,133 @@
+name: AX Recovery Validation
+
+run-name: AX recovery validation on ${{ github.ref_name }}
+
+on:
+  push:
+    branches: [ci/build123-host-ax-context-20260911]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ax-recovery-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: macos-15
+    timeout-minutes: 70
+    steps:
+      - name: Checkout selected branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Show toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          swift --version
+
+      - name: Install pinned XcodeGen toolchain
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          xcodegen --version | grep -F '2.46.0'
+
+      - name: Run full core package tests and impacted AX/provider tests
+        run: |
+          set -euo pipefail
+          swift package resolve
+          test "$(git -C .build/checkouts/ZIPFoundation rev-parse HEAD)" = "22787ffb59de99e5dc1fbfe80b19c97a904ad48d"
+          swift test --parallel
+          swift test --filter GUIAXTransactionEvidenceTests
+          swift test --filter AppProviderSemanticObservationTests
+
+      - name: Test RootHelperBridge output and cancellable process evidence
+        run: |
+          set -euo pipefail
+          TEST_BINARY="$RUNNER_TEMP/root-helper-bridge-tests"
+          xcrun clang \
+            -fobjc-arc \
+            -framework Foundation \
+            -framework CoreGraphics \
+            -I Sources/CloudCodeApp \
+            Tests/RootHelperBridgeTests/RootHelperBridgeHarness.m \
+            Sources/CloudCodeApp/RootHelperBridge.m \
+            Sources/CloudCodeApp/HostAXBridge.m \
+            -o "$TEST_BINARY"
+          "$TEST_BINARY"
+
+      - name: Test helper lifecycle watchdog and reaping harness
+        run: |
+          set -euo pipefail
+          TEST_BINARY="$RUNNER_TEMP/background-assertion-lifecycle-tests"
+          xcrun clang -std=c11 -Wall -Wextra -Werror -pthread \
+            -I Sources/CloudCodeRootHelper \
+            Tests/RootHelperBridgeTests/BackgroundAssertionLifecycleHarness.c \
+            -o "$TEST_BINARY"
+          "$TEST_BINARY"
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Run ios-ci source safety checks from their delimited Python block
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lines = Path('.github/workflows/ios-ci.yml').read_text(encoding='utf-8').splitlines()
+          try:
+              step_start = lines.index('      - name: Static safety checks')
+          except ValueError as error:
+              raise SystemExit('FAIL: ios-ci Static safety checks step was not found') from error
+          step_end = next((index for index in range(step_start + 1, len(lines)) if lines[index].startswith('      - name: ')), len(lines))
+          step = lines[step_start:step_end]
+          opener = "          python3 - <<'PY'"
+          closer = '          PY'
+          if step.count(opener) != 1:
+              raise SystemExit('FAIL: expected exactly one source-safety Python heredoc in ios-ci')
+          python_start = step.index(opener)
+          python_end = next((index for index in range(python_start + 1, len(step)) if step[index] == closer), None)
+          if python_end is None:
+              raise SystemExit('FAIL: ios-ci source-safety Python heredoc has no matching delimiter')
+          source_lines = step[python_start + 1:python_end]
+          code_lines = []
+          for line in source_lines:
+              if line.startswith('          '):
+                  code_lines.append(line[10:])
+              elif not line.strip():
+                  code_lines.append('')
+              else:
+                  raise SystemExit('FAIL: source-safety Python block indentation no longer matches workflow delimiter')
+          code = '\n'.join(code_lines)
+          print('Running the complete ios-ci Static safety checks Python heredoc.')
+          exec(compile(code, '.github/workflows/ios-ci.yml:Static safety checks', 'exec'), {})
+          PY
+
+      - name: Compile release app for iOS Simulator without signing
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project CloudCodeIOS.xcodeproj \
+            -scheme CloudCodeIOS \
+            -destination 'generic/platform=iOS Simulator' \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/AXRecoverySimulatorDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Compile release app for iOS device without signing
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project CloudCodeIOS.xcodeproj \
+            -scheme CloudCodeIOS \
+            -destination 'generic/platform=iOS' \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/AXRecoveryDeviceDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build

@@ -11,6 +11,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     private var exactRuntimeDetails: [GUIAutomationFeature: String] = [:]
     private var treeRetryAfter: Date?
     private var lastTreeFailureClass: ObservationFrame.AXFailureClass?
+    private var acceptanceTimeoutPending = false
     private let snapshotTTL: TimeInterval = 30
     private let treeFailureCooldown: TimeInterval = 30
     private let unknownClientCooldown: TimeInterval = 120
@@ -44,7 +45,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
         let localVisionEvidence = await LocalVisionTextObservation.capabilityEvidence()
         var statuses: [GUIAutomationFeature: CapabilityStatus] = [
             .openApp: .deviceValidationRequired,
-            .tree: ProductionPerceptionPolicy.accessibilityRuntimeAllowed ? .deviceValidationRequired : .unavailable,
+            .tree: ProductionPerceptionPolicy.boundedSemanticReadAllowed ? .deviceValidationRequired : .unavailable,
             .screenshot: .deviceValidationRequired,
             .ocr: localVisionEvidence.status,
             .touch: .deviceValidationRequired,
@@ -54,8 +55,8 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
         ]
         var details: [GUIAutomationFeature: String] = [
             .openApp: "App launch uses exact bundle-scoped self-validation; broad no-target readiness probing is intentionally disabled on this TrollStore runtime.",
-            .tree: ProductionPerceptionPolicy.accessibilityRuntimeAllowed
-                ? "AXRuntime tree probing is deferred to the exact gui.tree request."
+            .tree: ProductionPerceptionPolicy.boundedSemanticReadAllowed
+                ? "Passive AXRuntime is admitted only for one exact semantic read with observed helper exit; AXAudit client creation stays disabled."
                 : ProductionPerceptionPolicy.accessibilityDisabledReason,
             .screenshot: "Global screenshot probing is deferred to the exact gui.screenshot request so ordinary routing never pays the broad GUI helper watchdog.",
             .ocr: localVisionEvidence.detail,
@@ -66,7 +67,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
         ]
 
         for (feature, status) in exactRuntimeStatuses {
-            if feature == .tree, !ProductionPerceptionPolicy.accessibilityRuntimeAllowed { continue }
+            if feature == .tree, !ProductionPerceptionPolicy.boundedSemanticReadAllowed { continue }
             statuses[feature] = status
         }
         for (feature, detail) in exactRuntimeDetails {
@@ -109,22 +110,9 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     }
 
     public func tree() async throws -> String {
-        guard ProductionPerceptionPolicy.accessibilityRuntimeAllowed else {
-            lastTreeFailureClass = .unknownClient
-            treeRetryAfter = .distantFuture
-            try? await diagnosticLogger?.log(
-                level: .info,
-                subsystem: "gui",
-                action: "tree.production-policy",
-                result: "quarantined",
-                diagnostic: ProductionPerceptionPolicy.accessibilityDisabledReason,
-                metadata: [
-                    "axInvoked": "false",
-                    "greenFrameRisk": "true",
-                    "fallback": "screenshot_local_ocr"
-                ]
-            )
-            throw ToolRouterError.noExecutionRoute(ProductionPerceptionPolicy.accessibilityDisabledReason)
+        try Task.checkCancellation()
+        guard ProductionPerceptionPolicy.boundedSemanticReadAllowed else {
+            throw ToolRouterError.noExecutionRoute("Exact bounded semantic reads are disabled; use local OCR for text evidence.")
         }
         if let treeRetryAfter, treeRetryAfter > Date() {
             let seconds = max(1, Int(treeRetryAfter.timeIntervalSinceNow.rounded(.up)))
@@ -132,7 +120,10 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             throw ToolRouterError.noExecutionRoute("AX tree circuit is open after \(failureClass); retry is suppressed for \(seconds)s so local OCR/screenshot execution can continue until foreground state changes.")
         }
         let startedAt = Date()
-        let outcome = EmbeddedRootHelper.guiTree()
+        let forceTimeout = acceptanceTimeoutPending
+        acceptanceTimeoutPending = false
+        let outcome = EmbeddedRootHelper.guiTree(forceTimeoutForAcceptance: forceTimeout)
+        try Task.checkCancellation()
         let latencyMS = max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))
         guard let tree = outcome.tree else {
             let failureClass = PerceptionBrokerFacade.classifyAXFailure(
@@ -140,6 +131,9 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
                 succeeded: false,
                 text: outcome.detail
             )
+            exactRuntimeStatuses[.tree] = .deviceValidationRequired
+            exactRuntimeDetails[.tree] = "Exact AX transaction failed; local OCR remains independent and a later exact operation can revalidate after cooldown."
+            cachedSnapshotAt = nil
             lastTreeFailureClass = failureClass
             treeRetryAfter = Date().addingTimeInterval(failureClass == .unknownClient ? unknownClientCooldown : treeFailureCooldown)
             try? await diagnosticLogger?.log(
@@ -149,8 +143,8 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
                 result: "unavailable",
                 diagnostic: outcome.detail,
                 metadata: [
-                    "axBackend": "host_system_app_then_persona99_fallback",
-                    "axStage": "host_semantic_tree_then_bounded_persona99_fallback",
+                    "axBackend": "one_shot_passive_axruntime",
+                    "axStage": "exact_semantic_read_verified_process_exit",
                     "axScope": "unavailable",
                     "axLatencyMS": String(latencyMS),
                     "axFailureClass": failureClass.rawValue
@@ -159,11 +153,13 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             throw ToolRouterError.noExecutionRoute(outcome.detail)
         }
         guard tree.utf8.count <= 256 * 1024 else {
+            exactRuntimeStatuses[.tree] = .deviceValidationRequired
+            cachedSnapshotAt = nil
             lastTreeFailureClass = .temporaryFailure
             treeRetryAfter = Date().addingTimeInterval(treeFailureCooldown)
             throw ToolRouterError.noExecutionRoute("GUI tree exceeded the 256 KiB app-layer output limit")
         }
-        var axBackend = "host_system_app_then_persona99_fallback"
+        var axBackend = "one_shot_passive_axruntime"
         var axScope = "unknown"
         if let data = tree.data(using: .utf8),
            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -173,7 +169,7 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
         treeRetryAfter = nil
         lastTreeFailureClass = nil
         exactRuntimeStatuses[.tree] = .available
-        exactRuntimeDetails[.tree] = "Exact host-first AX tree operation returned a bounded semantic tree on this runtime."
+        exactRuntimeDetails[.tree] = "Exact passive AX tree returned valid semantic nodes, released local references, and its helper was reaped. AXAudit is disabled."
         cachedSnapshotAt = nil
         try? await diagnosticLogger?.log(
             level: .info,
@@ -182,13 +178,23 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
             result: "observed",
             metadata: [
                 "axBackend": axBackend,
-                "axStage": "host_semantic_tree_then_bounded_persona99_fallback",
+                "axStage": "exact_semantic_read_verified_process_exit",
                 "axScope": axScope,
                 "axLatencyMS": String(latencyMS)
             ]
         )
         treeRetryAfter = nil
         return tree
+    }
+
+    /// Only the explicitly launched fixed-target acceptance runner may arm this one-shot fault.
+    /// Ordinary launches and generic PC-control requests cannot enable it.
+    public func forceNextTreeTimeoutForAcceptance() -> Bool {
+        guard ProcessInfo.processInfo.arguments.contains("--cloudcode-ax-exact-acceptance") else { return false }
+        acceptanceTimeoutPending = true
+        treeRetryAfter = nil
+        lastTreeFailureClass = nil
+        return true
     }
 
     public func screenshot() async throws -> Data {
@@ -321,31 +327,38 @@ public actor TrollStoreGUIBackend: GUIAutomationBackend {
     }
 
     public func verify(_ assertion: String) async throws -> VerificationResult {
-        if ProductionPerceptionPolicy.accessibilityRuntimeAllowed {
-            let observedTree = try await tree()
-            return GUIVisibleTextVerifier.verify(tree: observedTree, assertion: assertion)
-        }
+        return try await GUIVisibleTextVerifier.verifyWithLocalFallback(
+            assertion: assertion,
+            ax: {
+                guard ProductionPerceptionPolicy.boundedSemanticReadAllowed else { return nil }
+                return try await self.tree()
+            },
+            ocr: { try await self.verifyOCRText() }
+        )
+    }
+
+    private func verifyOCRText() async throws -> String {
         let startedAt = Date()
         let data = try await screenshot()
+        try Task.checkCancellation()
         let observation = await LocalVisionTextObservation.observe(
             for: data,
             maximumElements: 48,
             requiresText: true
         )
         let text = observation.elements.map(\.text).joined(separator: "\n")
-        let result = GUIVisibleTextVerifier.verify(tree: text, assertion: assertion)
         try? await diagnosticLogger?.log(
-            level: result.passed ? .info : .warning,
+            level: .info,
             subsystem: "gui",
             action: "verify.local-ocr",
-            result: result.passed ? "passed" : "failed",
+            result: "observed-fallback",
             metadata: [
-                "axInvoked": "false",
+                "axAttemptPermitted": String(ProductionPerceptionPolicy.boundedSemanticReadAllowed),
                 "ocrStatus": observation.payload["localVisionOCR"] ?? "unknown",
                 "ocrBackend": observation.payload["localVisionBackend"] ?? "unknown",
                 "verifyLatencyMS": String(max(0, Int(Date().timeIntervalSince(startedAt) * 1_000)))
             ]
         )
-        return result
+        return text
     }
 }
