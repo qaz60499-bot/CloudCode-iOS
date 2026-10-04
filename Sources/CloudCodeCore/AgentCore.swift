@@ -1939,8 +1939,9 @@ public actor AgentCore {
                         }.joined(separator: "\n")
                         let proposedPlanHash = ProviderFingerprint.sha256(circuitRequestFingerprint + "\n" + canonicalPlan)
                         let containsMutation = proposedNames.contains { descriptorsByName[$0]?.risk != .readOnly }
+                        let hasFiniteRepeatRemaining = requiredRepeatedSwipeCount.map { completedRepeatedSwipeCount < $0 } ?? false
                         let finiteRepeatCanContinue = lastPlanFiniteProgress
-                            && repeatedSwipeCount.map { completedRepeatedSwipeCount < $0 } == true
+                            && hasFiniteRepeatRemaining
                             && proposedNames.allSatisfy { ["gui.swipe", "gui.scroll", "gui.scrollObserve", "gui.swipeSequence", "gui.feedSample"].contains($0) }
                         let idempotentForegroundSelection = !proposedNames.isEmpty && proposedNames.allSatisfy(Self.allowsImmediateSemanticRepeat)
                         let protectsGUIPlan = proposedNames.contains { $0.hasPrefix("gui.") }
