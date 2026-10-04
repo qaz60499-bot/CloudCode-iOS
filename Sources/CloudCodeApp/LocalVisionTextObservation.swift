@@ -32,13 +32,21 @@ enum LocalVisionTextObservation {
         private struct CacheEntry: Sendable {
             var observation: Observation
             var createdAt: Date
+            var recognitionCapacity: Int
+            var completedRequiresTextPass: Bool
+            var sourceRequestedMaximum: Int
         }
 
         private var cache: [String: CacheEntry] = [:]
-        private var inFlight: [String: Task<Observation, Never>] = [:]
+        private var inFlight: [String: Task<CacheEntry, Never>] = [:]
         private var activeKey: String?
         private var coreVideoCircuitOpenUntil: Date?
         private var lastCapabilityEvidence: CapabilityEvidence?
+        private var recognitionInvocationCount = 0
+        private var helperInvocationCount = 0
+        private var cacheReuseCount = 0
+        private var cacheReuseRejectionCount = 0
+        private var requestCoalescedCount = 0
         private let retention: TimeInterval = 3
         // Once the App-process Vision stack reports kCVReturnAllocationFailed, repeated retries on
         // every fresh screenshot only reproduce the same entitlement/resource failure. The
@@ -73,6 +81,20 @@ enum LocalVisionTextObservation {
             }
         }
 
+        func noteHelperInvocation() {
+            helperInvocationCount += 1
+        }
+
+        func diagnosticCounters() -> [String: String] {
+            [
+                "localVisionRecognitionInvocationCount": String(recognitionInvocationCount),
+                "localVisionHelperInvocationCount": String(helperInvocationCount),
+                "localVisionCacheReuseCount": String(cacheReuseCount),
+                "localVisionCacheReuseRejectionCount": String(cacheReuseRejectionCount),
+                "localVisionRequestCoalescedCount": String(requestCoalescedCount)
+            ]
+        }
+
         func coreVideoCircuitRemainingMS() -> Int? {
             let now = Date()
             guard let until = coreVideoCircuitOpenUntil else { return nil }
@@ -85,6 +107,9 @@ enum LocalVisionTextObservation {
 
         func resolve(
             key: String,
+            flightKey: String,
+            requestedMaximum: Int,
+            requiresText: Bool,
             bypassCoreVideoCircuit: Bool = false,
             operation: @escaping @Sendable () async -> Observation
         ) async -> Observation {
@@ -103,36 +128,131 @@ enum LocalVisionTextObservation {
             if let until = coreVideoCircuitOpenUntil, until <= now {
                 coreVideoCircuitOpenUntil = nil
             }
-            if var cached = cache[key]?.observation {
-                cached.payload["localVisionCacheHit"] = "true"
-                cached.payload["localVisionRequestCoalesced"] = "false"
-                return cached
+            if let cached = cache[key] {
+                if Self.canReuse(cached, requestedMaximum: requestedMaximum, requiresText: requiresText) {
+                    cacheReuseCount += 1
+                    return Self.present(
+                        cached.observation,
+                        requestedMaximum: requestedMaximum,
+                        cacheHit: true,
+                        coalesced: false,
+                        reuseReason: "cached_frame_roi_precision_and_capacity_sufficient"
+                    )
+                }
+                cacheReuseRejectionCount += 1
             }
-            if let task = inFlight[key] {
-                var shared = await task.value
-                shared.payload["localVisionCacheHit"] = "false"
-                shared.payload["localVisionRequestCoalesced"] = "true"
-                return shared
+            if let task = inFlight[flightKey] {
+                let shared = await task.value
+                requestCoalescedCount += 1
+                return Self.present(
+                    shared.observation,
+                    requestedMaximum: requestedMaximum,
+                    cacheHit: false,
+                    coalesced: true,
+                    reuseReason: "same_frame_roi_precision_and_text_requirement_in_flight"
+                )
             }
             if let activeKey, let activeTask = inFlight[activeKey] {
                 _ = await activeTask.value
-                return await resolve(key: key, bypassCoreVideoCircuit: bypassCoreVideoCircuit, operation: operation)
+                return await resolve(
+                    key: key,
+                    flightKey: flightKey,
+                    requestedMaximum: requestedMaximum,
+                    requiresText: requiresText,
+                    bypassCoreVideoCircuit: bypassCoreVideoCircuit,
+                    operation: operation
+                )
             }
-            let task = Task { await operation() }
-            activeKey = key
-            inFlight[key] = task
-            var value = await task.value
-            inFlight[key] = nil
-            if activeKey == key { activeKey = nil }
+            recognitionInvocationCount += 1
+            let task = Task {
+                CacheEntry(
+                    observation: await operation(),
+                    createdAt: Date(),
+                    recognitionCapacity: 48,
+                    completedRequiresTextPass: requiresText,
+                    sourceRequestedMaximum: requestedMaximum
+                )
+            }
+            activeKey = flightKey
+            inFlight[flightKey] = task
+            let entry = await task.value
+            inFlight[flightKey] = nil
+            if activeKey == flightKey { activeKey = nil }
+            var value = entry.observation
             if Self.hasCoreVideoAllocationFailure(value) {
                 coreVideoCircuitOpenUntil = Date().addingTimeInterval(coreVideoCircuitDuration)
                 value.payload["localVisionCircuitOpened"] = "true"
                 value.payload["localVisionCircuitDurationMS"] = String(Int(coreVideoCircuitDuration * 1_000))
             }
-            cache[key] = CacheEntry(observation: value, createdAt: Date())
-            value.payload["localVisionCacheHit"] = "false"
-            value.payload["localVisionRequestCoalesced"] = "false"
-            return value
+            cache[key] = CacheEntry(
+                observation: value,
+                createdAt: entry.createdAt,
+                recognitionCapacity: entry.recognitionCapacity,
+                completedRequiresTextPass: entry.completedRequiresTextPass,
+                sourceRequestedMaximum: entry.sourceRequestedMaximum
+            )
+            return Self.present(
+                value,
+                requestedMaximum: requestedMaximum,
+                cacheHit: false,
+                coalesced: false,
+                reuseReason: "recognition_executed"
+            )
+        }
+
+        private static func canReuse(_ entry: CacheEntry, requestedMaximum: Int, requiresText: Bool) -> Bool {
+            let status = entry.observation.payload["localVisionOCR"] ?? ""
+            if requiresText, status == "available_empty", !entry.completedRequiresTextPass {
+                return false
+            }
+            guard status == "recognized" || status == "available_empty" else {
+                return requestedMaximum == entry.sourceRequestedMaximum
+                    && requiresText == entry.completedRequiresTextPass
+            }
+            let elementCount = entry.observation.elements.count
+            // Enough detected elements cover the requested prefix even if recognition hit its
+            // cap. A shorter result is safe for a larger request only when it proves no truncation.
+            let regionMayBeTruncated = entry.observation.payload["localVisionRegionExecution"] == "post_filter_fallback"
+            return elementCount >= requestedMaximum
+                || (!regionMayBeTruncated && elementCount < entry.recognitionCapacity)
+        }
+
+        private static func present(
+            _ source: Observation,
+            requestedMaximum: Int,
+            cacheHit: Bool,
+            coalesced: Bool,
+            reuseReason: String
+        ) -> Observation {
+            let elements = Array(source.elements.prefix(requestedMaximum))
+            let encodedElements: String
+            if let encoded = try? JSONEncoder().encode(elements), encoded.count <= 16 * 1024 {
+                encodedElements = String(data: encoded, encoding: .utf8) ?? "[]"
+            } else {
+                encodedElements = "[]"
+            }
+            var result = source
+            result.elements = elements
+            result.payload["localVisionElementCount"] = String(elements.count)
+            result.payload["localVisionRecognitionElementCount"] = String(source.elements.count)
+            result.payload["localVisionElements"] = encodedElements
+            result.payload["localVisionText"] = String(elements.map(\.text).joined(separator: " | ").prefix(4_096))
+            let confidences = elements.map(\.confidence)
+            if !confidences.isEmpty {
+                let average = confidences.reduce(0, +) / Double(confidences.count)
+                let roundedAverage = (average * 1_000).rounded() / 1_000
+                result.payload["localVisionAverageConfidence"] = String(roundedAverage)
+                result.payload["localVisionAverageConfidencePercent"] = String((average * 10_000).rounded() / 100)
+                result.payload["localVisionMinimumConfidence"] = String(((confidences.min() ?? 0) * 1_000).rounded() / 1_000)
+                result.payload["localVisionMaximumConfidence"] = String(((confidences.max() ?? 0) * 1_000).rounded() / 1_000)
+                if result.payload["localVisionOCR"] == "recognized" {
+                    result.payload["localVisionOutcomeClass"] = average < 0.35 ? "low_confidence" : "recognized"
+                }
+            }
+            result.payload["localVisionCacheHit"] = cacheHit ? "true" : "false"
+            result.payload["localVisionRequestCoalesced"] = coalesced ? "true" : "false"
+            result.payload["localVisionCacheReuseReason"] = reuseReason
+            return result
         }
 
         private static func hasCoreVideoAllocationFailure(_ observation: Observation) -> Bool {
@@ -225,19 +345,28 @@ enum LocalVisionTextObservation {
         // Keep the real OCR path data-only. It must never probe, enable, disable, or otherwise
         // touch private Accessibility/Automation state; on iOS 16.6 even a defensive AXRuntime
         // probe can surface the visible green system indicator.
-        let boundedMaximum = min(max(maximumElements, 1), 48)
+        let requestedMaximum = max(maximumElements, 1)
+        let boundedMaximum = min(requestedMaximum, 48)
         let digest = SHA256.hash(data: jpegData).map { String(format: "%02x", $0) }.joined()
         let regionKey = regionInScreenPoints.map { "\($0.minX),\($0.minY),\($0.width),\($0.height)" } ?? "full"
-        let key = "\(digest)|\(regionKey)|\(boundedMaximum)|\(requiresText ? 1 : 0)|\(forcePrecise ? 1 : 0)"
+        let key = "\(digest)|\(regionKey)|\(forcePrecise ? 1 : 0)"
+        let flightKey = "\(key)|requiresText:\(requiresText ? 1 : 0)"
         let hostActive = await MainActor.run {
             UIApplication.shared.applicationState == .active
         }
         // The circuit guards failed App-process allocations; it must not suppress the independent
         // mobile helper. Same-image requests coalesce and the bridge bounds outstanding children.
-        let observation = await coordinator.resolve(key: key, bypassCoreVideoCircuit: true) {
+        let requestStartedAt = Date()
+        var observation = await coordinator.resolve(
+            key: key,
+            flightKey: flightKey,
+            requestedMaximum: requestedMaximum,
+            requiresText: requiresText,
+            bypassCoreVideoCircuit: true
+        ) {
             await Task.detached(priority: .utility) {
             let started = Date()
-            let helper = recognizeWithHelper(jpegData, maximumElements: boundedMaximum,
+            let helper = await recognizeWithHelper(jpegData, maximumElements: 48,
                                              regionInScreenPoints: regionInScreenPoints,
                                              forcePrecise: forcePrecise)
             if var value = helper, Self.isUsable(value, requiresText: requiresText) {
@@ -261,7 +390,7 @@ enum LocalVisionTextObservation {
 #if targetEnvironment(simulator)
             var inProcess = recognizeInProcess(
                 jpegData,
-                maximumElements: boundedMaximum,
+                maximumElements: 48,
                 regionInScreenPoints: regionInScreenPoints,
                 forcePrecise: forcePrecise,
                 lowMemoryMode: !hostActive
@@ -296,6 +425,19 @@ enum LocalVisionTextObservation {
 #endif
             }.value
         }
+        observation.payload["localVisionFrameFingerprint"] = digest
+        observation.payload["localVisionFrameBytes"] = String(jpegData.count)
+        observation.payload["localVisionFrameWidth"] = observation.payload["screenPointWidth"] ?? "0"
+        observation.payload["localVisionFrameHeight"] = observation.payload["screenPointHeight"] ?? "0"
+        observation.payload["localVisionFrameRegion"] = regionKey
+        observation.payload["localVisionRecognitionCapacity"] = "48"
+        observation.payload["localVisionRequestedMaximumElements"] = String(maximumElements)
+        observation.payload["localVisionEffectiveMaximumElements"] = String(boundedMaximum)
+        observation.payload["localVisionMaximumElementsCapped"] = requestedMaximum > 48 ? "true" : "false"
+        observation.payload["localVisionRequestLatencyMS"] = String(max(0, Int(Date().timeIntervalSince(requestStartedAt) * 1_000)))
+        for (key, value) in await coordinator.diagnosticCounters() {
+            observation.payload[key] = value
+        }
         await coordinator.noteCapability(observation)
         return observation
     }
@@ -311,7 +453,7 @@ enum LocalVisionTextObservation {
         maximumElements: Int,
         regionInScreenPoints: CGRect?,
         forcePrecise: Bool
-    ) -> Observation? {
+    ) async -> Observation? {
         guard let source = CGImageSourceCreateWithData(jpegData as CFData, nil),
               let sourceImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             return Observation(payload: [
@@ -342,6 +484,7 @@ enum LocalVisionTextObservation {
             }
         }
 
+        await coordinator.noteHelperInvocation()
         let helper = EmbeddedVisionHelper.guiOCR(
             jpegData: helperInput,
             maximumElements: maximumElements,

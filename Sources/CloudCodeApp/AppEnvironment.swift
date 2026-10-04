@@ -21,6 +21,8 @@ private struct ProviderLiveMetadataRefreshResult {
     var readiness: ProviderReadiness
     var modelCount: Int
     var diagnostic: String
+    var authoritativeModels: [String]? = nil
+    var catalogBaseURL: URL? = nil
 
     var usable: Bool { state == .verified }
 }
@@ -192,8 +194,12 @@ public final class CloudCodeViewModel: ObservableObject {
     private var lifecycleInterruptedSessionIDs: Set<UUID> = []
     private var activeTasks: [UUID: Task<Void, Never>] = [:]
     private var activeRunTokens: [UUID: UUID] = [:]
+    private var providerConfigurationGenerations: [String: UUID] = [:]
     private var activeConfigurations: [UUID: ProviderExecutionConfiguration] = [:]
     private var liveSessions: [UUID: AgentSession] = [:]
+    private lazy var streamingUIFlushCoordinator = StreamingUIFlushCoordinator { [weak self] sessionID in
+        self?.publishStreamingUI(sessionID: sessionID)
+    }
     private var sessionActivityLines: [UUID: [String]] = [:]
     private var sessionErrors: [UUID: String] = [:]
     private var bootstrapTask: Task<Void, Never>?
@@ -1404,7 +1410,7 @@ public final class CloudCodeViewModel: ObservableObject {
     }
 
     @discardableResult
-    public func refreshSelectedProviderModelCatalog(showStatus: Bool = true) async -> Bool {
+    public func refreshSelectedProviderModelCatalog(showStatus: Bool = true, cachedModels: [String]? = nil, cachedBaseURL: URL? = nil, cachedKeyFingerprint: String? = nil) async -> Bool {
         if showStatus {
             // This method is invoked from the Network Provider section's explicit "refresh models"
             // action. Treat that user action as a routing choice, just like changing provider/key/model.
@@ -1423,10 +1429,12 @@ public final class CloudCodeViewModel: ObservableObject {
         // model (or through the explicit deep-check workflow), so a normal catalog refresh stays
         // cheap and does not burn quota across dozens of models.
         let keySlotID = selectedKeySlotID
+        let configurationGeneration = providerConfigurationGenerations[provider.id]
         let reference = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: keySlotID)
         do {
             let apiKey = try await keyVault.key(for: reference)
             guard !apiKey.isEmpty else { throw ProviderError.missingAPIKey }
+            let mayReuseCatalog = cachedKeyFingerprint == ProviderFingerprint.sha256(apiKey)
             let operationKey = "provider-refresh:\(provider.id):\(keySlotID):\(ProviderFingerprint.sha256(apiKey))"
             guard beginExclusiveOperation(operationKey) else {
                 try? await diagnosticLogStore.log(
@@ -1440,7 +1448,9 @@ public final class CloudCodeViewModel: ObservableObject {
             }
             defer { endExclusiveOperation(operationKey) }
             let discoveryClient = ProviderDiscoveryClient()
-            let baseURLs = await orderedProviderBaseURLs(provider: provider, keySlotID: keySlotID, apiKey: apiKey)
+            let baseURLs: [URL]
+            if mayReuseCatalog, cachedModels != nil, let cachedBaseURL { baseURLs = [cachedBaseURL] }
+            else { baseURLs = await orderedProviderBaseURLs(provider: provider, keySlotID: keySlotID, apiKey: apiKey) }
             var discoveredModels: [String]?
             var acceptedBaseURL: URL?
             var sawReachableEmptyCatalog = false
@@ -1459,11 +1469,14 @@ public final class CloudCodeViewModel: ObservableObject {
                     ]
                 )
                 do {
-                    let candidateModels = try await discoveryClient.discoverModels(
-                        baseURL: candidateBaseURL,
-                        apiKey: apiKey,
-                        authMode: provider.authMode
-                    )
+                    let candidateModels: [String]
+                    if mayReuseCatalog, let cachedModels, candidateBaseURL == cachedBaseURL {
+                        candidateModels = cachedModels
+                    } else {
+                        candidateModels = try await discoveryClient.discoverModels(
+                            baseURL: candidateBaseURL, apiKey: apiKey, authMode: provider.authMode
+                        )
+                    }
                     // A reachable HTTP 2xx /models response with zero rows proves only that this
                     // catalog route is reachable; it does NOT prove that inference is unavailable.
                     // Compatible relays commonly expose incomplete/empty catalogs while accepting
@@ -1541,7 +1554,11 @@ public final class CloudCodeViewModel: ObservableObject {
                 throw ProviderRouteFailureAggregator.preferredFailure(routeErrors)
             }
             await rememberVerifiedProviderBaseURL(acceptedBaseURL, provider: provider, keySlotID: keySlotID, apiKey: apiKey)
-            guard let providerIndex = providerProfiles.firstIndex(where: { $0.id == provider.id }) else { return false }
+            guard providerConfigurationGenerations[provider.id] == configurationGeneration,
+                  let providerIndex = providerProfiles.firstIndex(where: { $0.id == provider.id }),
+                  providerProfiles[providerIndex].baseURL == provider.baseURL,
+                  providerProfiles[providerIndex].keySlots.first(where: { $0.id == keySlotID })?.fingerprint
+                    == provider.keySlots.first(where: { $0.id == keySlotID })?.fingerprint else { return false }
             providerProfiles[providerIndex].applyLiveModelCatalog(models, keySlotID: keySlotID, authoritative: true)
             // Only non-empty catalogs reach this point. Persist them as Last Known Good; reachable
             // empty catalogs are handled above without mutating the current usable model set.
@@ -1551,7 +1568,8 @@ public final class CloudCodeViewModel: ObservableObject {
                     to: liveProviderCatalogFileURL
                 )
             let selectedStillListed = selectedModel.isEmpty || models.contains(selectedModel)
-            if selectedStillListed, selectedModelIsExplicitCustomOverride {
+            if selectedProviderID == provider.id, selectedKeySlotID == keySlotID,
+               selectedStillListed, selectedModelIsExplicitCustomOverride {
                 var overrides = explicitCustomModelOverrides()
                 overrides.remove(Self.customModelOverrideIdentity(
                     providerID: provider.id,
@@ -2067,7 +2085,7 @@ public final class CloudCodeViewModel: ObservableObject {
                 }
             }
 
-            finishSessionRun(sessionID: sessionID, runToken: runToken)
+            finishSessionRun(sessionID: sessionID, runToken: runToken, preserveForRecovery: shouldAutoResumeStreamInterruption)
             await reloadActivity()
             if shouldAutoResumeStreamInterruption,
                let recoveryCheckpoint = interruptedTasks
@@ -2085,6 +2103,13 @@ public final class CloudCodeViewModel: ObservableObject {
                 syncVisibleSessionState(sessionID)
                 resumeTask(recoveryCheckpoint)
                 return
+            }
+            if shouldAutoResumeStreamInterruption, !hasBackgroundCriticalActivity {
+                UserDefaults.standard.set(false, forKey: Self.backgroundRunIntentDefaultsKey)
+                if !lifecycleInterruptedSessionIDs.contains(sessionID) {
+                    autoResumeArmedInCurrentProcess = false
+                }
+                endBackgroundExecutionIfNeeded()
             }
             clearAutoResumeIntentIfNoPendingTask()
             try? await reloadSessionHistoryMergingLiveSessions()
@@ -2137,6 +2162,7 @@ public final class CloudCodeViewModel: ObservableObject {
     public func cancelCurrentTask() {
         let sessionID = session.id
         guard let task = activeTasks[sessionID] else { return }
+        flushStreamingUI(sessionID: sessionID)
         lifecycleInterruptedSessionIDs.remove(sessionID)
         autoResumeArmedInCurrentProcess = false
         UserDefaults.standard.set(false, forKey: Self.autoResumeTaskDefaultsKey)
@@ -2807,6 +2833,20 @@ public final class CloudCodeViewModel: ObservableObject {
                 guard await agentCore.waitUntilSessionIdle(sessionID) else {
                     throw AgentRunError.sessionAlreadyRunning(sessionID)
                 }
+                // A recovery can start while the scene is already backgrounded: no new scene
+                // transition will re-arm execution. Retain/reacquire the existing lease explicitly.
+                #if canImport(UIKit)
+                if UIApplication.shared.applicationState == .background {
+                    UserDefaults.standard.set(true, forKey: Self.backgroundRunIntentDefaultsKey)
+                    beginBackgroundExecutionIfNeeded()
+                    if let acquireTask = backgroundAssertionAcquireTask { await acquireTask.value }
+                }
+                #endif
+                if case .appBacked = config {
+                    beginBackgroundExecutionIfNeeded()
+                    if let acquireTask = backgroundAssertionAcquireTask { await acquireTask.value }
+                }
+                recordStartupBreadcrumb("runtime.agent.resume.provider.attach")
                 let stream = await agentCore.send(
                     text: request,
                     inputSource: source,
@@ -4302,88 +4342,100 @@ public final class CloudCodeViewModel: ObservableObject {
             lastError = "厂商需要有效名称与安全 HTTPS Base URL。"
             return
         }
+
         let baseURL = ProviderEndpointPolicy.normalizedKnownProviderBaseURL(rawBaseURL)
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let isOfficialGeminiAPI = ProviderEndpointPolicy.isOfficialGeminiAPI(baseURL)
         let manualModel = ProviderEndpointPolicy.normalizedModelID(initialModel, for: baseURL)
         let effectivePreferredProtocol: ProviderProtocol = isOfficialGeminiAPI ? .openAIChat : preferredProtocol
         let effectiveAuthMode: ProviderAuthMode = isOfficialGeminiAPI ? .xAPIKey : authMode
-        var provider = providerProfiles[providerIndex]
+        let provider = providerProfiles[providerIndex]
         let slotID = provider.keySlots.first?.id ?? "slot-1"
         let reference = ProviderCatalog.keyReference(providerID: id, keySlotID: slotID)
+        let wasSelected = selectedProviderID == id
+        let selectionAtSave = ProviderSelectionState(providerID: selectedProviderID, keySlotID: selectedKeySlotID, model: selectedModel)
 
         activityLines.append("正在更新 \(trimmedLabel) 配置…")
         Task {
             defer { endExclusiveOperation(operationKey) }
             do {
-                var newFingerprint: String?
+                let previousProvider = provider
+                let effectiveKey = !trimmedKey.isEmpty
+                    ? trimmedKey
+                    : ((try? await keyVault.key(for: reference)) ?? "")
+                let updatedProvider = CustomProviderUpdatePolicy.prepare(
+                    previous: previousProvider,
+                    label: trimmedLabel,
+                    baseURL: baseURL,
+                    manualModel: manualModel,
+                    preferredProtocol: effectivePreferredProtocol,
+                    authMode: effectiveAuthMode,
+                    effectiveKey: effectiveKey
+                )
                 if !trimmedKey.isEmpty {
-                    try keyVault.set(trimmedKey, for: reference)
-                    let stored = try await keyVault.key(for: reference)
-                    guard stored == trimmedKey else { throw ProviderKeyProvisioningError.verificationFailed(reference) }
-                    installedKeyReferences.insert(reference)
-                    updateManualProviderKeyOverrides { overrides in
-                        _ = overrides.insert(reference)
-                    }
-                    newFingerprint = ProviderFingerprint.sha256(trimmedKey)
-                }
-
-                provider.displayName = trimmedLabel
-                provider.baseURL = baseURL
-                provider.preferredProtocol = effectivePreferredProtocol
-                provider.protocols = [effectivePreferredProtocol]
-                provider.authMode = effectiveAuthMode
-
-                var models = provider.models
-                if !manualModel.isEmpty {
-                    if !models.contains(manualModel) {
-                        models.insert(manualModel, at: 0)
-                    }
-                    provider.models = models
-                }
-
-                if provider.keySlots.isEmpty {
-                    let slot = ProviderKeySlot(
-                        id: slotID,
-                        label: "Key 1",
-                        fingerprint: newFingerprint ?? "",
-                        status: .needsValidation,
-                        models: models,
-                        protocols: [effectivePreferredProtocol],
-                        modelProtocols: manualModel.isEmpty ? [:] : [manualModel: [effectivePreferredProtocol]]
-                    )
-                    provider.keySlots = [slot]
-                } else {
-                    if let newFingerprint {
-                        provider.keySlots[0].fingerprint = newFingerprint
-                    }
-                    provider.keySlots[0].protocols = [effectivePreferredProtocol]
-                    if !manualModel.isEmpty {
-                        var slotModels = provider.keySlots[0].models
-                        if !slotModels.contains(manualModel) {
-                            slotModels.insert(manualModel, at: 0)
+                    // The existing provisioner snapshots and verifies Keychain, then rolls it back
+                    // if the configuration's atomic save fails. Do not publish key overrides early.
+                    _ = try await ProviderKeyProvisioner.apply(
+                        [ProviderKeyMutation(reference: reference, secret: trimmedKey)],
+                        vault: keyVault,
+                        finalizer: { [self] in
+                            try await MainActor.run {
+                                try self.commitCustomProviderUpdate(updatedProvider, previous: previousProvider)
+                            }
                         }
-                        provider.keySlots[0].models = slotModels
-                        provider.keySlots[0].modelProtocols[manualModel] = [effectivePreferredProtocol]
-                    }
+                    )
+                    updateManualProviderKeyOverrides { _ = $0.insert(reference) }
+                } else {
+                    try commitCustomProviderUpdate(updatedProvider, previous: previousProvider)
+                }
+                if !effectiveKey.isEmpty { installedKeyReferences.insert(reference) }
+
+                if wasSelected, selectedProviderID == selectionAtSave.providerID,
+                   selectedKeySlotID == selectionAtSave.keySlotID, selectedModel == selectionAtSave.model {
+                    let desiredModel = manualModel.isEmpty || selectedKeySlotID != slotID ? selectedModel : manualModel
+                    let state = ProviderSelectionResolver.reconcile(
+                        ProviderSelectionState(
+                            providerID: id,
+                            keySlotID: selectedKeySlotID,
+                            model: desiredModel
+                        ),
+                        profiles: providerProfiles
+                    )
+                    applySelection(state)
                 }
 
-                provider = provider.normalizedForOfficialCompatibilityEndpoint()
-                providerProfiles[providerIndex] = provider
-
-                if provider.source == .custom {
-                    try persistCustomProviders()
+                guard !effectiveKey.isEmpty else {
+                    providerKeyCheckMessage = "已更新厂商 \(trimmedLabel)，但当前 Key 不可读取；已标记 NEEDS_VALIDATION，未伪造可用状态。"
+                    activityLines.append("已更新厂商配置：\(trimmedLabel)；当前 Key 不可读取，等待重新验证。")
+                    lastError = nil
+                    return
                 }
 
-                if selectedProviderID == id {
-                    selectProvider(id)
-                    if !manualModel.isEmpty {
-                        selectModel(manualModel)
-                    }
+                let refresh = await refreshLiveProviderMetadataIfNeeded(
+                    providerID: id,
+                    keySlotID: slotID,
+                    apiKey: effectiveKey
+                )
+                var catalogRefreshed = false
+                if wasSelected, selectedProviderID == id, selectedKeySlotID == slotID {
+                    catalogRefreshed = await refreshSelectedProviderModelCatalog(showStatus: false,
+                        cachedModels: refresh.authoritativeModels, cachedBaseURL: refresh.catalogBaseURL,
+                        cachedKeyFingerprint: ProviderFingerprint.sha256(effectiveKey))
+                }
+                if providerProfiles.first(where: { $0.id == id })?.source == .custom {
+                    // Validation is subsequent evidence; a failure here must not undo a committed
+                    // configuration or misreport its successful Keychain transaction as failed.
+                    try? persistCustomProviders()
                 }
 
-                providerKeyCheckMessage = "已成功更新厂商 \(trimmedLabel)。"
-                activityLines.append("已更新厂商配置：\(trimmedLabel)。")
+                providerKeyCheckMessage = refresh.usable
+                    ? "已更新并重新验证厂商 \(trimmedLabel)；模型目录\(catalogRefreshed ? "已刷新" : "保持现有结果")。"
+                    : "已更新厂商 \(trimmedLabel)；配置已保存，但实时验证尚未通过：\(refresh.diagnostic)"
+                activityLines.append(
+                    refresh.usable
+                        ? "已更新并重新验证厂商配置：\(trimmedLabel)。"
+                        : "已更新厂商配置：\(trimmedLabel)；实时验证未通过，保留现有可用模型/协议证据。"
+                )
                 lastError = nil
             } catch {
                 lastError = "更新厂商失败：\(error.localizedDescription)"
@@ -4585,6 +4637,7 @@ public final class CloudCodeViewModel: ObservableObject {
             return ProviderLiveMetadataRefreshResult(catalogApplied: false, state: .failed, readiness: .needsValidation, modelCount: 0, diagnostic: "厂商、Key 槽位或 Key 内容缺失。")
         }
         let profile = providerProfiles[providerIndex]
+        let configurationGeneration = providerConfigurationGenerations[providerID]
         let isOfficialGeminiAPI = ProviderEndpointPolicy.isOfficialGeminiAPI(profile.baseURL)
         let preferredAuthMode: ProviderAuthMode = isOfficialGeminiAPI ? .xAPIKey : profile.authMode
         let inferenceProtocols: [ProviderProtocol] = isOfficialGeminiAPI ? [.openAIChat] : profile.protocols
@@ -4709,6 +4762,14 @@ public final class CloudCodeViewModel: ObservableObject {
             if discovery.readiness == .ready {
                 await rememberVerifiedProviderBaseURL(acceptedBaseURL, provider: profile, keySlotID: keySlotID, apiKey: apiKey)
             }
+            guard providerConfigurationGenerations[providerID] == configurationGeneration,
+                  let providerIndex = providerProfiles.firstIndex(where: { $0.id == providerID }),
+                  providerProfiles[providerIndex].baseURL == profile.baseURL,
+                  providerProfiles[providerIndex].keySlots.first(where: { $0.id == keySlotID })?.fingerprint
+                    == profile.keySlots.first(where: { $0.id == keySlotID })?.fingerprint else {
+                return ProviderLiveMetadataRefreshResult(catalogApplied: false, state: .inconclusive,
+                    readiness: .needsValidation, modelCount: 0, diagnostic: "配置已改变，旧探测结果已丢弃。")
+            }
             let shouldApplyDiscovery = discovery.readiness == .ready && !discovery.models.isEmpty
             if shouldApplyDiscovery {
                 // This path validates Key/Host/protocol only. Catalog ownership belongs exclusively to
@@ -4773,7 +4834,9 @@ public final class CloudCodeViewModel: ObservableObject {
                 state: refreshState,
                 readiness: discovery.readiness,
                 modelCount: discovery.models.count,
-                diagnostic: diagnostic
+                diagnostic: diagnostic,
+                authoritativeModels: discovery.authoritativeModels,
+                catalogBaseURL: discovery.authoritativeModels == nil ? nil : acceptedBaseURL
             )
         } catch {
             let state: ProviderLiveVerificationState
@@ -5036,6 +5099,20 @@ public final class CloudCodeViewModel: ObservableObject {
         defaults.set(selectedKeySlotID, forKey: "provider.selected.keySlot")
         defaults.set(selectedModel, forKey: "provider.selected.model")
         defaults.set(selectedReasoningEffort.rawValue, forKey: "provider.selected.reasoningEffort")
+    }
+
+    private func commitCustomProviderUpdate(_ updated: ProviderProfile, previous: ProviderProfile) throws {
+        guard let index = providerProfiles.firstIndex(where: { $0.id == updated.id }) else {
+            throw CancellationError()
+        }
+        providerProfiles[index] = updated
+        do {
+            if updated.source == .custom { try persistCustomProviders() }
+            providerConfigurationGenerations[updated.id] = UUID()
+        } catch {
+            providerProfiles[index] = previous
+            throw error
+        }
     }
 
     private func persistCustomProviders() throws {
@@ -5623,6 +5700,20 @@ public final class CloudCodeViewModel: ObservableObject {
     private func checkpointOperationKey(_ id: UUID) -> String { "checkpoint:\(id.uuidString)" }
     private func sessionOperationKey(_ id: UUID) -> String { "session:\(id.uuidString)" }
 
+    private func scheduleStreamingUIFlush(sessionID: UUID) {
+        streamingUIFlushCoordinator.schedule(sessionID: sessionID)
+    }
+
+    private func flushStreamingUI(sessionID: UUID) {
+        streamingUIFlushCoordinator.flush(sessionID: sessionID)
+    }
+
+    private func publishStreamingUI(sessionID: UUID) {
+        guard let live = liveSessions[sessionID] else { return }
+        upsertSessionHistory(live)
+        syncVisibleSessionState(sessionID)
+    }
+
     private func handleAgentEvent(_ event: AgentEvent, sessionID: UUID) {
         var live = liveSessions[sessionID] ?? sessionHistory.first(where: { $0.id == sessionID }) ?? AgentSession(id: sessionID)
         switch event {
@@ -5640,32 +5731,38 @@ public final class CloudCodeViewModel: ObservableObject {
                 streamingAssistantMessageIDs[sessionID] = message.id
             }
             liveSessions[sessionID] = live
-            upsertSessionHistory(live)
+            scheduleStreamingUIFlush(sessionID: sessionID)
+            return
         case .toolStarted(let name, _):
+            flushStreamingUI(sessionID: sessionID)
             streamingAssistantMessageIDs.removeValue(forKey: sessionID)
             sessionActivityLines[sessionID, default: []].append("工具：\(name)")
         case .toolFinished(let result):
+            flushStreamingUI(sessionID: sessionID)
             streamingAssistantMessageIDs.removeValue(forKey: sessionID)
             sessionActivityLines[sessionID, default: []].append("\(result.success ? "✓" : "✗") \(result.summary)")
         case .approvalRequired:
             break
         case .error(let value):
+            flushStreamingUI(sessionID: sessionID)
             sessionErrors[sessionID] = value
         case .finished:
+            flushStreamingUI(sessionID: sessionID)
             streamingAssistantMessageIDs.removeValue(forKey: sessionID)
         }
         syncVisibleSessionState(sessionID)
     }
 
-    private func finishSessionRun(sessionID: UUID, runToken: UUID) {
+    private func finishSessionRun(sessionID: UUID, runToken: UUID, preserveForRecovery: Bool = false) {
         guard activeRunTokens[sessionID] == runToken else { return }
+        flushStreamingUI(sessionID: sessionID)
         let preserveLifecycleResume = lifecycleInterruptedSessionIDs.contains(sessionID)
         activeTasks.removeValue(forKey: sessionID)
         activeRunTokens.removeValue(forKey: sessionID)
         activeConfigurations.removeValue(forKey: sessionID)
         runningSessionIDs.remove(sessionID)
         streamingAssistantMessageIDs.removeValue(forKey: sessionID)
-        if runningSessionIDs.isEmpty {
+        if runningSessionIDs.isEmpty && !preserveForRecovery {
             UserDefaults.standard.set(false, forKey: Self.backgroundRunIntentDefaultsKey)
             if !preserveLifecycleResume {
                 autoResumeArmedInCurrentProcess = false

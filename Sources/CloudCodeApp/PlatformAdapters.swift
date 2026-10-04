@@ -2555,41 +2555,43 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             // bounded current-tree lookup first; TrollStoreGUIBackend already suppresses repeated AX
             // timeouts for the same foreground state. OCR remains the fallback and is not required for
             // the descriptor/capability gate, so devices without a usable AX backend still work.
-            do {
-                let axResolved = try await resolveElement(call)
-                guard !Self.isProtectedElement(axResolved.match) else {
-                    throw ToolRouterError.noExecutionRoute("protected/system-confirmation AX text cannot be automated")
+            if ProductionPerceptionPolicy.accessibilityRuntimeAllowed {
+                do {
+                    let axResolved = try await resolveElement(call)
+                    guard !Self.isProtectedElement(axResolved.match) else {
+                        throw ToolRouterError.noExecutionRoute("protected/system-confirmation AX text cannot be automated")
+                    }
+                    try await backend.tap(x: axResolved.match.frame.centerX, y: axResolved.match.frame.centerY)
+                    try await Task.sleep(nanoseconds: 250_000_000)
+                    try Task.checkCancellation()
+                    let data = try await backend.screenshot()
+                    let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
+                    var payload = elementPayload(axResolved.match, treeHash: axResolved.treeHash, cacheHit: axResolved.cacheHit)
+                    payload["baselineSHA256"] = baselineSHA256
+                    payload["sha256"] = GUIAutomationPayloadPolicy.sha256Hex(data)
+                    payload["effectVerification"] = "semantic_required"
+                    payload["localObservation"] = "final_screenshot_attached"
+                    payload["structuredPath"] = "ax_text_first"
+                    payload["perceptionClass"] = "ax_text_action"
+                    payload["perceptionAXAttempted"] = "true"
+                    payload["perceptionAXSucceeded"] = "true"
+                    payload["perceptionOCRInvoked"] = "false"
+                    payload["perceptionOCRSucceeded"] = "false"
+                    payload["perceptionLocalSufficient"] = "false"
+                    payload["perceptionRemoteVisionRequired"] = "true"
+                    payload["perceptionFallbackReason"] = "fresh_ax_unique_text_match_post_action_semantics_need_fresh_observation"
+                    payload["providerVisualRoundTripAvoided"] = "0"
+                    return ToolResult(
+                        toolCallID: call.id,
+                        success: true,
+                        summary: "Unique visible text was resolved through the current accessibility tree and tapped locally; final screenshot attached for semantic verification.",
+                        payload: payload,
+                        attachments: attachment.map { [$0] }
+                    )
+                } catch {
+                    // AX failure is expected on some third-party surfaces. Do not retry it here; continue
+                    // immediately to one OCR pass from the already-captured current frame.
                 }
-                try await backend.tap(x: axResolved.match.frame.centerX, y: axResolved.match.frame.centerY)
-                try await Task.sleep(nanoseconds: 250_000_000)
-                try Task.checkCancellation()
-                let data = try await backend.screenshot()
-                let attachment = try persistScreenshotAttachment(data, sessionID: call.sessionID)
-                var payload = elementPayload(axResolved.match, treeHash: axResolved.treeHash, cacheHit: axResolved.cacheHit)
-                payload["baselineSHA256"] = baselineSHA256
-                payload["sha256"] = GUIAutomationPayloadPolicy.sha256Hex(data)
-                payload["effectVerification"] = "semantic_required"
-                payload["localObservation"] = "final_screenshot_attached"
-                payload["structuredPath"] = "ax_text_first"
-                payload["perceptionClass"] = "ax_text_action"
-                payload["perceptionAXAttempted"] = "true"
-                payload["perceptionAXSucceeded"] = "true"
-                payload["perceptionOCRInvoked"] = "false"
-                payload["perceptionOCRSucceeded"] = "false"
-                payload["perceptionLocalSufficient"] = "false"
-                payload["perceptionRemoteVisionRequired"] = "true"
-                payload["perceptionFallbackReason"] = "fresh_ax_unique_text_match_post_action_semantics_need_fresh_observation"
-                payload["providerVisualRoundTripAvoided"] = "0"
-                return ToolResult(
-                    toolCallID: call.id,
-                    success: true,
-                    summary: "Unique visible text was resolved through the current accessibility tree and tapped locally; final screenshot attached for semantic verification.",
-                    payload: payload,
-                    attachments: attachment.map { [$0] }
-                )
-            } catch {
-                // AX failure is expected on some third-party surfaces. Do not retry it here; continue
-                // immediately to one OCR pass from the already-captured current frame.
             }
 
             var resolution = await resolveLocalVisionText(call, screenshot: baseline)
@@ -2604,8 +2606,8 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                     "baselineSHA256": baselineSHA256,
                     "effectVerification": "not_dispatched",
                     "localObservation": "baseline_screenshot_attached",
-                    "perceptionClass": "ax_then_local_ocr_text_lookup",
-                    "perceptionAXAttempted": "true",
+                    "perceptionClass": ProductionPerceptionPolicy.accessibilityRuntimeAllowed ? "ax_then_local_ocr_text_lookup" : "local_ocr_text_lookup_policy_ax_disabled",
+                    "perceptionAXAttempted": ProductionPerceptionPolicy.accessibilityRuntimeAllowed ? "true" : "false",
                     "perceptionAXSucceeded": "false",
                     "perceptionAnchorCacheHit": "false",
                     "perceptionLocalSufficient": "false",
@@ -2644,17 +2646,21 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 "sha256": GUIAutomationPayloadPolicy.sha256Hex(data),
                 "effectVerification": "semantic_required",
                 "localObservation": "final_screenshot_attached",
-                "perceptionClass": "ax_then_local_ocr_text_action",
-                "perceptionAXAttempted": "true",
+                "perceptionClass": ProductionPerceptionPolicy.accessibilityRuntimeAllowed ? "ax_then_local_ocr_text_action" : "local_ocr_text_action_policy_ax_disabled",
+                "perceptionAXAttempted": ProductionPerceptionPolicy.accessibilityRuntimeAllowed ? "true" : "false",
                 "perceptionAXSucceeded": "false",
                 "perceptionAnchorCacheHit": "false",
-                "perceptionFallbackReason": "ax_unavailable_fresh_local_ocr_unique_text_match"
+                "perceptionFallbackReason": ProductionPerceptionPolicy.accessibilityRuntimeAllowed
+                    ? "ax_unavailable_fresh_local_ocr_unique_text_match"
+                    : "production_ax_quarantined_fresh_local_ocr_unique_text_match"
             ]
             await enrichWithLocalVision(&payload, screenshot: data)
             return ToolResult(
                 toolCallID: call.id,
                 success: true,
-                summary: "AX did not resolve the text, but one unique visible OCR label was resolved and tapped locally; final screenshot attached for semantic verification.",
+                summary: ProductionPerceptionPolicy.accessibilityRuntimeAllowed
+                    ? "AX did not resolve the text, but one unique visible OCR label was resolved and tapped locally; final screenshot attached for semantic verification."
+                    : "One unique visible OCR label was resolved and tapped locally without invoking production AX; final screenshot attached for semantic verification.",
                 payload: payload,
                 attachments: attachment.map { [$0] }
             )
@@ -3650,19 +3656,21 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             try Task.checkCancellation()
 
             var axResolved = false
-            do {
-                let tree = try await backend.tree()
-                let matches = GUIElementResolver.find(in: tree, query: query, role: step.expectRole, mode: mode, maximumMatches: 3)
-                if expectation == "present", matches.count == 1 { return }
-                if expectation == "absent", matches.isEmpty { return }
-                if matches.count > 1 {
-                    throw ToolRouterError.noExecutionRoute("structured plan expectation is ambiguous; refine expectQuery/expectRole")
+            if ProductionPerceptionPolicy.accessibilityRuntimeAllowed {
+                do {
+                    let tree = try await backend.tree()
+                    let matches = GUIElementResolver.find(in: tree, query: query, role: step.expectRole, mode: mode, maximumMatches: 3)
+                    if expectation == "present", matches.count == 1 { return }
+                    if expectation == "absent", matches.isEmpty { return }
+                    if matches.count > 1 {
+                        throw ToolRouterError.noExecutionRoute("structured plan expectation is ambiguous; refine expectQuery/expectRole")
+                    }
+                    axResolved = true
+                } catch let error as ToolRouterError {
+                    if String(describing: error).contains("ambiguous") { throw error }
+                } catch {
+                    // AX is best-effort on standalone TrollStore. Continue immediately to same-frame OCR.
                 }
-                axResolved = true
-            } catch let error as ToolRouterError {
-                if String(describing: error).contains("ambiguous") { throw error }
-            } catch {
-                // AX is best-effort on standalone TrollStore. Continue immediately to same-frame OCR.
             }
 
             let screenshot = try await backend.screenshot()

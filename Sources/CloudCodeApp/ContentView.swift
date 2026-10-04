@@ -591,12 +591,17 @@ private struct ChatView: View {
                 }
                 .onChange(of: visibleMessages.last?.content) { _ in
                     if isConversationAtBottom {
-                        scrollConversationToBottom(proxy, animated: true)
+                        // Streaming tokens can arrive many times per second. Restarting a 0.2 s
+                        // animation for every token makes long replies visibly flicker/jump and
+                        // keeps the scroll view in a near-continuous animation loop. Follow the
+                        // growing message without animation while a stream is active; normal
+                        // message changes keep the existing animated behavior.
+                        scrollConversationToBottom(proxy, animated: model.streamingAssistantMessageID == nil)
                     }
                 }
                 .onChange(of: model.activityLines.last) { _ in
                     if isConversationAtBottom {
-                        scrollConversationToBottom(proxy, animated: true)
+                        scrollConversationToBottom(proxy, animated: !model.isCurrentSessionRunning)
                     }
                 }
 
@@ -2489,7 +2494,7 @@ private struct EditProviderSheet: View {
                     }
                 }
                 Section {
-                    Text("修改后会更新本地厂商配置；若填入新 API Key 将覆盖 Keychain 中的 Key。")
+                    Text("保存时会重新探测当前 Base URL 的模型、协议与鉴权状态；若填入新 API Key 将覆盖 Keychain 中的 Key。探测失败会保留配置并标记为 NEEDS_VALIDATION。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

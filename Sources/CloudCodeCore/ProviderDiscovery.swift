@@ -5,12 +5,22 @@ import FoundationNetworking
 
 public struct ProviderDiscoveryResult: Sendable, Equatable {
     public var models: [String]
+    /// Models returned directly by an authenticated `/models` request, including an empty catalog.
+    /// Pricing, ratio, and inference fallback results are deliberately excluded.
+    public var authoritativeModels: [String]?
     public var protocols: [ProviderProtocol]
     public var authMode: ProviderAuthMode
     public var readiness: ProviderReadiness
 
-    public init(models: [String], protocols: [ProviderProtocol], authMode: ProviderAuthMode, readiness: ProviderReadiness) {
+    public init(
+        models: [String],
+        authoritativeModels: [String]? = nil,
+        protocols: [ProviderProtocol],
+        authMode: ProviderAuthMode,
+        readiness: ProviderReadiness
+    ) {
         self.models = models
+        self.authoritativeModels = authoritativeModels
         self.protocols = protocols
         self.authMode = authMode
         self.readiness = readiness
@@ -63,9 +73,11 @@ public struct ProviderDiscoveryClient: Sendable {
         // for /messages. Never downgrade inference auth just because catalog discovery
         // succeeded with a weaker/different header shape.
         var discoveredCatalog: (models: [String], authMode: ProviderAuthMode)?
+        var authoritativeModels: [String]?
         for catalogAuthMode in authModes {
             do {
                 let models = try await discoverModels(baseURL: baseURL, apiKey: apiKey, authMode: catalogAuthMode)
+                authoritativeModels = models
                 if !models.isEmpty {
                     discoveredCatalog = (models, catalogAuthMode)
                     break
@@ -171,6 +183,7 @@ public struct ProviderDiscoveryClient: Sendable {
                 if !validatedModels.isEmpty {
                     return ProviderDiscoveryResult(
                         models: validatedModels,
+                        authoritativeModels: authoritativeModels,
                         protocols: validatedProtocols,
                         authMode: inferenceAuthMode,
                         readiness: .ready
@@ -180,6 +193,7 @@ public struct ProviderDiscoveryClient: Sendable {
             if sawCapacityBlockedProbe {
                 return ProviderDiscoveryResult(
                     models: [],
+                    authoritativeModels: authoritativeModels,
                     protocols: [],
                     authMode: preferredAuthMode ?? .both,
                     readiness: .capacity
@@ -191,6 +205,7 @@ public struct ProviderDiscoveryClient: Sendable {
             if sawAuthoritativeEmptyCatalog {
                 return ProviderDiscoveryResult(
                     models: [],
+                    authoritativeModels: authoritativeModels,
                     protocols: [],
                     authMode: preferredAuthMode ?? .both,
                     readiness: .unavailable
@@ -199,6 +214,7 @@ public struct ProviderDiscoveryClient: Sendable {
             if sawReachableUnparseableCatalog {
                 return ProviderDiscoveryResult(
                     models: [],
+                    authoritativeModels: authoritativeModels,
                     protocols: [],
                     authMode: preferredAuthMode ?? .both,
                     readiness: .needsValidation
@@ -238,6 +254,7 @@ public struct ProviderDiscoveryClient: Sendable {
                     let orderedModels = [model] + models.filter { $0 != model }
                     return ProviderDiscoveryResult(
                         models: orderedModels,
+                        authoritativeModels: authoritativeModels,
                         protocols: supported,
                         authMode: inferenceAuthMode,
                         readiness: .ready
@@ -249,6 +266,7 @@ public struct ProviderDiscoveryClient: Sendable {
         if let capacityBlockedAuthMode {
             return ProviderDiscoveryResult(
                 models: models,
+                authoritativeModels: authoritativeModels,
                 protocols: [],
                 authMode: capacityBlockedAuthMode,
                 readiness: .capacity
@@ -257,6 +275,7 @@ public struct ProviderDiscoveryClient: Sendable {
 
         return ProviderDiscoveryResult(
             models: models,
+            authoritativeModels: authoritativeModels,
             protocols: [],
             authMode: preferredAuthMode ?? discoveredCatalog.authMode,
             readiness: .needsValidation

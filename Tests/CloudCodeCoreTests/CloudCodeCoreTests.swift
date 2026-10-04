@@ -5707,7 +5707,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(saved.messages.last(where: { $0.role == .assistant })?.content, "resumed-ok")
     }
 
-    func testAgentCoreStreamInterruptionArmsOneCheckpointContinuationWithoutPersistingPartialOutput() async throws {
+    func testAgentCoreStreamInterruptionArmsOneCheckpointContinuationWithDurablePartialOutput() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let registry = ToolRegistry(descriptors: [])
@@ -5746,7 +5746,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(firstCheckpoint.payload["resume.mode"], "auto_provider_stream_interruption_once")
         let persistedAfterFirst = try await sessions.load(initial.id)
         XCTAssertEqual(persistedAfterFirst.messages.filter { $0.role == .user && $0.content == "resume-stream-safely" }.count, 1)
-        XCTAssertFalse(persistedAfterFirst.messages.contains { $0.role == .assistant && $0.content.contains("partial-") })
+        XCTAssertTrue(persistedAfterFirst.messages.contains { $0.role == .assistant && $0.content.contains("partial-") })
 
         let second = await agent.send(
             text: "resume-stream-safely",
@@ -5768,7 +5768,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(secondCheckpoint.payload["resume.mode"], "manual_provider_stream_interruption")
         let persistedAfterSecond = try await sessions.load(initial.id)
         XCTAssertEqual(persistedAfterSecond.messages.filter { $0.role == .user && $0.content == "resume-stream-safely" }.count, 1)
-        XCTAssertFalse(persistedAfterSecond.messages.contains { $0.role == .assistant && $0.content.contains("partial-") })
+        XCTAssertTrue(persistedAfterSecond.messages.contains { $0.role == .assistant && $0.content.contains("partial-") })
         let attemptCount = await provider.attemptCount()
         XCTAssertEqual(attemptCount, 2)
     }
@@ -7868,7 +7868,7 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(descriptor.risk, .sensitiveWrite)
     }
 
-    func testHarnessContextCompressionDropsAssistantToolCallWhenLargeResultDoesNotFit() {
+    func testHarnessContextCompressionCompactsLargeResultAndKeepsCompletePair() {
         let messages = [
             ChatMessage(role: .system, content: "safety"),
             ChatMessage(role: .user, content: "list apps"),
@@ -7881,7 +7881,8 @@ final class CloudCodeCoreTests: XCTestCase {
             from: messages,
             policy: HarnessContextPolicy(maxCharacters: 8_000, maxMessages: 12)
         )
-        XCTAssertFalse(compressed.contains { $0.providerMetadata["tool_call_id"] == "call-apps" })
+        XCTAssertEqual(compressed.filter { $0.providerMetadata["tool_call_id"] == "call-apps" }.count, 2)
+        XCTAssertTrue(compressed.contains { $0.role == .tool && $0.providerMetadata["context_compacted"] == "true" })
         XCTAssertTrue(compressed.contains { $0.role == .user && $0.content == "continue" })
     }
 

@@ -391,6 +391,73 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
     }
 }
 
+private enum ProviderStreamFailureCause: String, Equatable {
+    case transport
+    case parserMalformed = "parser_malformed"
+    case missingTerminal = "missing_terminal"
+    case upstreamEvent = "upstream_event"
+}
+
+private enum ProviderRequestPayloadLimit {
+    static let bytes = 8 * 1024 * 1024
+}
+
+private func providerStreamFailureCause(for error: Error) -> ProviderStreamFailureCause {
+    if let providerError = error as? ProviderError {
+        switch providerError {
+        case .malformedEvent:
+            return .parserMalformed
+        case .protocolIncompatible(_):
+            return .upstreamEvent
+        case .transport(_):
+            return .transport
+        default:
+            return .transport
+        }
+    }
+
+    let nsError = error as NSError
+    if error is URLError || nsError.domain == NSURLErrorDomain {
+        return .transport
+    }
+    if error is DecodingError || nsError.domain == NSCocoaErrorDomain {
+        return .parserMalformed
+    }
+    return .transport
+}
+
+private func logProviderStreamFailureCause(
+    _ cause: ProviderStreamFailureCause,
+    underlyingError: Error? = nil,
+    diagnosticLogger: DiagnosticLogStore?
+) async {
+    guard let diagnosticLogger else { return }
+    var metadata = ["cause": cause.rawValue]
+    if let underlyingError,
+       !(underlyingError is ProviderError),
+       (cause == .transport || cause == .parserMalformed) {
+        let nsError = underlyingError as NSError
+        metadata["errorDomain"] = String(nsError.domain.prefix(128))
+        metadata["errorCode"] = String(nsError.code)
+    } else if let providerError = underlyingError as? ProviderError {
+        switch providerError {
+        case .malformedEvent:
+            metadata["errorType"] = "malformed_event"
+        case .transport(_):
+            metadata["errorType"] = "transport"
+        default:
+            break
+        }
+    }
+    try? await diagnosticLogger.log(
+        level: .warning,
+        subsystem: "provider",
+        action: "request.stream-cause",
+        result: cause.rawValue,
+        metadata: metadata
+    )
+}
+
 public enum ProviderEvent: Sendable, Equatable {
     case status(String)
     case token(String)
@@ -1003,6 +1070,23 @@ private extension ProviderRequestBuilding {
                     var endpoint = (configuration.baseURL.host ?? "") + configuration.baseURL.path
                     do {
                         let request = try makeRequest(configuration: requestConfiguration, apiKey: apiKey, messages: requestMessages, tools: requestTools)
+                        let requestBodyBytes = request.httpBody?.count ?? 0
+                        guard requestBodyBytes <= ProviderRequestPayloadLimit.bytes else {
+                            try? await diagnosticLogger?.log(
+                                level: .error,
+                                subsystem: "provider",
+                                action: "request.payload-limit",
+                                result: "rejected",
+                                metadata: [
+                                    "providerPayloadBytes": String(requestBodyBytes),
+                                    "providerPayloadLimitBytes": String(ProviderRequestPayloadLimit.bytes),
+                                    "providerID": configuration.providerID ?? "",
+                                    "model": configuration.model
+                                ]
+                            )
+                            continuation.finish(throwing: ProviderError.transport("Provider request exceeds bounded payload limit"))
+                            return
+                        }
                         endpoint = (request.url?.host ?? configuration.baseURL.host ?? "") + (request.url?.path ?? configuration.baseURL.path)
                         try? await diagnosticLogger?.log(
                             level: .info,
@@ -1021,7 +1105,7 @@ private extension ProviderRequestBuilding {
                                 "endpointPath": request.url?.path ?? configuration.baseURL.path,
                                 "endpoint": endpoint,
                                 "transportState": "connecting",
-                                "requestBodyBytes": String(request.httpBody?.count ?? 0),
+                                "requestBodyBytes": String(requestBodyBytes),
                                 "messageCount": String(requestMessages.count),
                                 "toolCount": String(requestTools.count),
                                 "gatewayRecoveryCompacted": didCompactContextForGatewayRecovery ? "true" : "false"
@@ -1102,7 +1186,23 @@ private extension ProviderRequestBuilding {
                             )
                             if !didCompactContextForGatewayRecovery, genericContextRecovery || agentRouterEnvelopeRecovery {
                                 didCompactContextForGatewayRecovery = true
-                                requestMessages = HarnessContextManager.providerMessages(from: messages, policy: .gatewayRecovery)
+                                let semanticProgress = messages.filter {
+                                    $0.providerMetadata["context_layer"] == "checkpoint_semantic_progress"
+                                }.map(\.content).joined(separator: "\n")
+                                let recoveryContext = HarnessContextManager.providerContext(
+                                    from: messages.filter { $0.providerMetadata["context_layer"] != "checkpoint_semantic_progress" },
+                                    policy: .gatewayRecovery,
+                                    semanticProgress: semanticProgress
+                                )
+                                guard recoveryContext.isWithinBudget else {
+                                    try? await diagnosticLogger?.log(level: .error, subsystem: "provider",
+                                        action: "request.context-limit", result: "rejected",
+                                        metadata: ["contextCompressionReason": recoveryContext.compressionReason,
+                                                   "providerContextEstimatedCharacters": String(recoveryContext.estimatedCharacters)])
+                                    continuation.finish(throwing: ProviderError.transport("Gateway recovery context exceeds bounded payload limit"))
+                                    return
+                                }
+                                requestMessages = recoveryContext.messages
                                 if agentRouterEnvelopeRecovery {
                                     requestTools = ProviderCompatibilityClassifier.recoveryToolSchemas(from: tools, messages: messages)
                                 }
@@ -1430,7 +1530,10 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
                       let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
 
                 if let errorObject = object["error"] {
-                    if outputStarted { throw ProviderError.streamInterrupted }
+                    if outputStarted {
+                        await logProviderStreamFailureCause(.upstreamEvent, diagnosticLogger: diagnosticLogger)
+                        throw ProviderError.streamInterrupted
+                    }
                     let detail = providerErrorDetail(from: errorObject) ?? "Gemini 原生接口返回错误"
                     throw ProviderError.protocolIncompatible(detail)
                 }
@@ -1525,11 +1628,26 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            if outputStarted { throw ProviderError.streamInterrupted }
+            if outputStarted {
+                if (error as? ProviderError) != .streamInterrupted {
+                    await logProviderStreamFailureCause(
+                        providerStreamFailureCause(for: error),
+                        underlyingError: error,
+                        diagnosticLogger: diagnosticLogger
+                    )
+                }
+                throw ProviderError.streamInterrupted
+            }
             throw error
         }
         guard sawEvent else { throw ProviderError.malformedEvent }
-        guard terminal else { throw outputStarted ? ProviderError.streamInterrupted : ProviderError.malformedEvent }
+        guard terminal else {
+            if outputStarted {
+                await logProviderStreamFailureCause(.missingTerminal, diagnosticLogger: diagnosticLogger)
+                throw ProviderError.streamInterrupted
+            }
+            throw ProviderError.malformedEvent
+        }
         for index in toolCallState.keys.sorted() {
             if let call = toolCallState[index], !call.name.isEmpty {
                 guard !call.id.isEmpty else { throw ProviderError.malformedEvent }
@@ -1645,7 +1763,10 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
                 }
 
                 if let errorObject = object["error"] {
-                    if outputStarted { throw ProviderError.streamInterrupted }
+                    if outputStarted {
+                        await logProviderStreamFailureCause(.upstreamEvent, diagnosticLogger: diagnosticLogger)
+                        throw ProviderError.streamInterrupted
+                    }
                     let detail = providerErrorDetail(from: errorObject) ?? "上游未提供可解析的错误详情"
                     throw ProviderError.protocolIncompatible(detail)
                 }
@@ -1734,11 +1855,26 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            if outputStarted { throw ProviderError.streamInterrupted }
+            if outputStarted {
+                if (error as? ProviderError) != .streamInterrupted {
+                    await logProviderStreamFailureCause(
+                        providerStreamFailureCause(for: error),
+                        underlyingError: error,
+                        diagnosticLogger: diagnosticLogger
+                    )
+                }
+                throw ProviderError.streamInterrupted
+            }
             throw error
         }
         guard sawEvent else { throw ProviderError.malformedEvent }
-        guard terminal else { throw outputStarted ? ProviderError.streamInterrupted : ProviderError.malformedEvent }
+        guard terminal else {
+            if outputStarted {
+                await logProviderStreamFailureCause(.missingTerminal, diagnosticLogger: diagnosticLogger)
+                throw ProviderError.streamInterrupted
+            }
+            throw ProviderError.malformedEvent
+        }
         for index in calls.keys.sorted() {
             guard let call = calls[index], !call.id.isEmpty, !call.name.isEmpty else { throw ProviderError.malformedEvent }
             continuation.yield(.toolCall(id: call.id, name: call.name, argumentsJSON: call.arguments.isEmpty ? "{}" : call.arguments))
@@ -1861,6 +1997,7 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
                 let detail = providerErrorDetail(from: object["response"] ?? object["error"] ?? object)
                     ?? "上游未提供可解析的 Responses 错误详情"
                 if outputStarted {
+                    await logProviderStreamFailureCause(.upstreamEvent, diagnosticLogger: diagnosticLogger)
                     throw ProviderError.streamInterrupted
                 }
                 throw ProviderError.protocolIncompatible(detail)
@@ -1871,11 +2008,26 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            if outputStarted { throw ProviderError.streamInterrupted }
+            if outputStarted {
+                if (error as? ProviderError) != .streamInterrupted {
+                    await logProviderStreamFailureCause(
+                        providerStreamFailureCause(for: error),
+                        underlyingError: error,
+                        diagnosticLogger: diagnosticLogger
+                    )
+                }
+                throw ProviderError.streamInterrupted
+            }
             throw error
         }
         guard sawEvent else { throw ProviderError.malformedEvent }
-        guard terminal else { throw outputStarted ? ProviderError.streamInterrupted : ProviderError.malformedEvent }
+        guard terminal else {
+            if outputStarted {
+                await logProviderStreamFailureCause(.missingTerminal, diagnosticLogger: diagnosticLogger)
+                throw ProviderError.streamInterrupted
+            }
+            throw ProviderError.malformedEvent
+        }
         for key in calls.keys.sorted() {
             guard let call = calls[key], !call.id.isEmpty, !call.name.isEmpty else { throw ProviderError.malformedEvent }
             continuation.yield(.toolCall(id: call.id, name: call.name, argumentsJSON: call.arguments.isEmpty ? "{}" : call.arguments))
