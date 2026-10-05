@@ -60,7 +60,7 @@ final class CloudCodeLaunchUITests: XCTestCase {
         )
         XCTAssertEqual(XCTWaiter.wait(for: [keyboardHidden], timeout: 5), .completed, "点击收起后键盘仍然存在")
 
-        composer.tap()
+        composer.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.2)).tap()
         XCTAssertTrue(keyboard.waitForExistence(timeout: 5), "再次聚焦后键盘未出现")
         composer.typeText("cd")
         XCTAssertEqual(composer.value as? String, "abcd", "再次聚焦后无法继续输入")
