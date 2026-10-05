@@ -506,6 +506,7 @@ jobs:
               print(f"TABITOKEN_CATALOG_SCHEMA={shape}")
               return [], first_catalog
 
+          saw_upstream_unavailable = False
           pricing_ids = []
           pricing_status, pricing_body = request(
               "public-pricing-models",
@@ -533,6 +534,9 @@ jobs:
               authenticated_pricing_ids, _ = parse_model_catalog(auth_pricing_body)
           elif auth_pricing_status == 429:
               print("::warning::Authenticated Tabitoken pricing is rate-limited; continuing with /v1/models without treating 429 as credit.")
+          elif 500 <= auth_pricing_status < 600:
+              saw_upstream_unavailable = True
+              print(f"::warning::Authenticated Tabitoken pricing is externally unavailable with HTTP {auth_pricing_status}; continuing to direct model/inference probes.")
           elif auth_pricing_status not in (401, 403):
               raise SystemExit(f"FAIL: authenticated Tabitoken pricing returned HTTP {auth_pricing_status}")
           print(f"TABITOKEN_AUTH_PRICING status={auth_pricing_status} model_count={len(authenticated_pricing_ids)}")
@@ -570,6 +574,9 @@ jobs:
               ratio_ids = parse_ratio_catalog(ratio_body)
           elif ratio_status == 429:
               print("::warning::Authenticated Tabitoken ratio catalog is rate-limited; continuing without treating 429 as credit.")
+          elif 500 <= ratio_status < 600:
+              saw_upstream_unavailable = True
+              print(f"::warning::Tabitoken ratio catalog is externally unavailable with HTTP {ratio_status}; continuing without failing the whole capability suite.")
           elif ratio_status not in (401, 403, 404):
               raise SystemExit(f"FAIL: Tabitoken ratio catalog returned HTTP {ratio_status}")
           print(f"TABITOKEN_RATIO_CATALOG status={ratio_status} model_count={len(ratio_ids)}")
@@ -598,6 +605,9 @@ jobs:
                               dashboard_ids.append(model.strip())
           elif dashboard_status == 429:
               print("::warning::Authenticated Tabitoken /api/models is rate-limited; continuing without treating 429 as credit.")
+          elif 500 <= dashboard_status < 600:
+              saw_upstream_unavailable = True
+              print(f"::warning::Tabitoken /api/models is externally unavailable with HTTP {dashboard_status}; continuing without failing the whole capability suite.")
           elif dashboard_status not in (401, 403, 404):
               raise SystemExit(f"FAIL: Tabitoken /api/models returned HTTP {dashboard_status}")
           print(f"TABITOKEN_DASHBOARD_MODELS status={dashboard_status} model_count={len(dashboard_ids)}")
@@ -704,6 +714,10 @@ jobs:
                       saw_model_unavailable = True
                       print(f"TABITOKEN_MODEL_NOT_FOUND key={key_index} status={probe_status}")
                       continue
+                  if 500 <= probe_status < 600:
+                      saw_upstream_unavailable = True
+                      print(f"::warning::Tabitoken inference route is externally unavailable with HTTP {probe_status}; deterministic Provider regressions will still run.")
+                      break
                   if probe_status not in (400, 404, 422):
                       raise SystemExit(f"FAIL: Tabitoken candidate probe returned non-model HTTP {probe_status} for key={key_index}")
 
@@ -713,9 +727,17 @@ jobs:
                   continue
 
           if not selected_model or base_anthropic is None or selected_key_index is None:
+              if saw_upstream_unavailable:
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                      output.write("upstream_unavailable=true\n")
+                      output.write("model_unavailable=false\n")
+                      output.write("billing_blocked=false\n")
+                  print(f"::warning::Tabitoken is currently externally unavailable; live probes stop here and deterministic Provider regressions will run. catalog_attempts={catalog_attempts}")
+                  raise SystemExit(0)
               if saw_model_unavailable:
                   with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
                       output.write("model_unavailable=true\n")
+                      output.write("upstream_unavailable=false\n")
                       output.write("billing_blocked=false\n")
                   print(f"::warning::Tabitoken credentials reached the provider, but no configured Anthropic model currently has an available channel; catalog_attempts={catalog_attempts}")
                   raise SystemExit(0)
@@ -803,6 +825,7 @@ jobs:
               output.write(f"key_index={selected_key_index}\n")
               output.write("billing_blocked=false\n")
               output.write("model_unavailable=false\n")
+              output.write("upstream_unavailable=false\n")
           PY
 
       - name: Resolve pinned Swift package
@@ -830,7 +853,7 @@ jobs:
           swift test --filter testSirthiswayAgentUsesFullCloudCodeToolSchemaExecutesToolAndContinuesAfterResult
 
       - name: Run real Cloud Code Agent tool round against Tabitoken
-        if: steps.live_probe.outputs.billing_blocked != 'true' && steps.live_probe.outputs.model_unavailable != 'true'
+        if: steps.live_probe.outputs.billing_blocked != 'true' && steps.live_probe.outputs.model_unavailable != 'true' && steps.live_probe.outputs.upstream_unavailable != 'true'
         env:
           CLOUDCODE_LIVE_SMOKE: "1"
           CLOUDCODE_PROVIDER_BOOTSTRAP: ${{ secrets.CLOUDCODE_PROVIDER_BOOTSTRAP }}
@@ -841,7 +864,7 @@ jobs:
           swift test --filter testTabitokenAgentUsesFullCloudCodeToolSchemaExecutesToolAndContinuesAfterResult
 
       - name: Run deterministic Provider regressions when a live provider is externally blocked
-        if: steps.live_probe.outputs.billing_blocked == 'true' || steps.live_probe.outputs.model_unavailable == 'true' || steps.compatibility_probe.outputs.justwoker_capacity_blocked == 'true' || steps.compatibility_probe.outputs.justwoker_auth_failed == 'true' || steps.compatibility_probe.outputs.justwoker_upstream_unavailable == 'true'
+        if: steps.live_probe.outputs.billing_blocked == 'true' || steps.live_probe.outputs.model_unavailable == 'true' || steps.live_probe.outputs.upstream_unavailable == 'true' || steps.compatibility_probe.outputs.justwoker_capacity_blocked == 'true' || steps.compatibility_probe.outputs.justwoker_auth_failed == 'true' || steps.compatibility_probe.outputs.justwoker_upstream_unavailable == 'true'
         run: |
           set -euo pipefail
           swift test --filter Provider
