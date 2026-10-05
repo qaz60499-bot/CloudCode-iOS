@@ -1,0 +1,62 @@
+name: UI Operations Benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulator-ui-ops:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Show toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          swift --version
+
+      - name: Install XcodeGen
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          xcodegen --version | grep -F '2.46.0'
+
+      - name: Test streaming UI flush coordinator
+        run: |
+          set -euo pipefail
+          swift package resolve
+          swift test --filter StreamingUIFlushCoordinatorTests
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Run real Simulator interaction benchmark
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          UDID="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ { print $2; exit }')"
+          test -n "$UDID"
+          xcrun simctl boot "$UDID" >/dev/null 2>&1 || true
+          python3 -c 'import subprocess,sys; subprocess.run(["xcrun","simctl","bootstatus",sys.argv[1],"-b"], check=True, timeout=180)' "$UDID"
+
+          xcodebuild             -project CloudCodeIOS.xcodeproj             -scheme CloudCodeIOS             -configuration Release             -destination "platform=iOS Simulator,id=$UDID"             -derivedDataPath build/UIOpsDerivedData             -resultBundlePath build/UIOpsBenchmark.xcresult             CODE_SIGNING_ALLOWED=NO             test             -only-testing:CloudCodeIOSUITests/CloudCodeLaunchUITests/testComposerCanDismissRefocusAndContinueSending             -only-testing:CloudCodeIOSUITests/CloudCodeLaunchUITests/testComposerOperationSmoothnessBenchmark             2>&1 | tee build/ui-ops-benchmark.log
+
+          grep -E 'UI_OP_BENCHMARK|UI_OP_SUMMARY|Test Case.*testComposer' build/ui-ops-benchmark.log || true
+          xcrun xcresulttool export attachments             --path build/UIOpsBenchmark.xcresult             --output-path build/ui-ops-attachments >/dev/null 2>&1 || true
+          xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true
+
+      - name: Upload UI operations evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: CloudCode-ui-ops-benchmark
+          if-no-files-found: warn
+          path: |
+            build/ui-ops-benchmark.log
+            build/UIOpsBenchmark.xcresult
+            build/ui-ops-attachments

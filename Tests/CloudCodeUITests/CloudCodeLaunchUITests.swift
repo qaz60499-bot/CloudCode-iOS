@@ -96,6 +96,136 @@ final class CloudCodeLaunchUITests: XCTestCase {
         XCTAssertEqual(composer.value as? String, "e", "切换设置再返回后 composer 无法继续输入")
     }
 
+    func testComposerOperationSmoothnessBenchmark() throws {
+        let app = XCUIApplication()
+        let uptime = { ProcessInfo.processInfo.systemUptime }
+        let ms = { (start: TimeInterval) in (uptime() - start) * 1_000.0 }
+        let median: ([Double]) -> Double = { values in
+            let sorted = values.sorted()
+            guard !sorted.isEmpty else { return 0 }
+            let middle = sorted.count / 2
+            return sorted.count.isMultiple(of: 2)
+                ? (sorted[middle - 1] + sorted[middle]) / 2
+                : sorted[middle]
+        }
+
+        let launchStart = uptime()
+        app.launch()
+        let chatTab = app.tabBars.buttons["对话"]
+        XCTAssertTrue(chatTab.waitForExistence(timeout: 20), "对话 Tab 未在启动后出现")
+        let launchReadyMS = ms(launchStart)
+        chatTab.tap()
+
+        let composer = app.textViews["CloudCodeComposer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 10), "聊天输入框不可用")
+        let keyboard = app.keyboards.firstMatch
+        let dismissKeyboard = app.buttons["CloudCodeDismissKeyboard"].firstMatch
+        let send = app.buttons["发送"].firstMatch
+        let settingsTab = app.tabBars.buttons["设置"]
+
+        var focusSamples: [Double] = []
+        var typeSamples: [Double] = []
+        var dismissSamples: [Double] = []
+        var refocusSamples: [Double] = []
+        var sendClearSamples: [Double] = []
+        var bubbleSamples: [Double] = []
+        var navigationSamples: [Double] = []
+
+        for round in 1...6 {
+            let payload = "ui-bench-\(round)-abcdefgh"
+
+            let focusStart = uptime()
+            composer.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.3)).tap()
+            XCTAssertTrue(keyboard.waitForExistence(timeout: 5), "第 \(round) 轮首次聚焦后键盘未出现")
+            focusSamples.append(ms(focusStart))
+
+            let typeStart = uptime()
+            composer.typeText(payload)
+            XCTAssertEqual(composer.value as? String, payload, "第 \(round) 轮输入后内容不一致")
+            typeSamples.append(ms(typeStart))
+
+            let dismissStart = uptime()
+            XCTAssertTrue(dismissKeyboard.waitForExistence(timeout: 5), "第 \(round) 轮收起键盘按钮不可用")
+            dismissKeyboard.tap()
+            let keyboardHidden = XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "exists == false"),
+                object: keyboard
+            )
+            XCTAssertEqual(XCTWaiter.wait(for: [keyboardHidden], timeout: 5), .completed, "第 \(round) 轮键盘未收起")
+            dismissSamples.append(ms(dismissStart))
+
+            let refocusStart = uptime()
+            composer.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.3)).tap()
+            XCTAssertTrue(keyboard.waitForExistence(timeout: 5), "第 \(round) 轮再次聚焦后键盘未出现")
+            refocusSamples.append(ms(refocusStart))
+            composer.typeText("z")
+            let finalPayload = payload + "z"
+            XCTAssertEqual(composer.value as? String, finalPayload, "第 \(round) 轮再次输入后内容不一致")
+            XCTAssertTrue(send.exists && send.isEnabled, "第 \(round) 轮发送按钮不可用")
+
+            let sendStart = uptime()
+            send.tap()
+            let cleared = XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "value == %@", ""),
+                object: composer
+            )
+            XCTAssertEqual(XCTWaiter.wait(for: [cleared], timeout: 5), .completed, "第 \(round) 轮发送后输入框未清空")
+            sendClearSamples.append(ms(sendStart))
+            XCTAssertTrue(app.staticTexts[finalPayload].firstMatch.waitForExistence(timeout: 5), "第 \(round) 轮用户消息未出现")
+            bubbleSamples.append(ms(sendStart))
+
+            if round == 1 || round == 6 {
+                let attachment = XCTAttachment(screenshot: app.screenshot())
+                attachment.name = "ui-ops-round-\(round)"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+            }
+
+            if round.isMultiple(of: 2) {
+                if dismissKeyboard.waitForExistence(timeout: 1) {
+                    dismissKeyboard.tap()
+                }
+                let navigationStart = uptime()
+                XCTAssertTrue(settingsTab.waitForExistence(timeout: 5), "第 \(round) 轮设置 Tab 不可用")
+                settingsTab.tap()
+                XCTAssertTrue(app.navigationBars["设置"].waitForExistence(timeout: 5), "第 \(round) 轮设置页未打开")
+                chatTab.tap()
+                XCTAssertTrue(composer.waitForExistence(timeout: 5), "第 \(round) 轮返回对话后输入框不可用")
+                navigationSamples.append(ms(navigationStart))
+            }
+
+            print(String(format:
+                "UI_OP_BENCHMARK round=%d focus_ms=%.3f type_ms=%.3f dismiss_ms=%.3f refocus_ms=%.3f send_clear_ms=%.3f bubble_ms=%.3f",
+                round,
+                focusSamples.last ?? 0,
+                typeSamples.last ?? 0,
+                dismissSamples.last ?? 0,
+                refocusSamples.last ?? 0,
+                sendClearSamples.last ?? 0,
+                bubbleSamples.last ?? 0
+            ))
+        }
+
+        func summary(_ name: String, _ values: [Double]) {
+            print(String(format:
+                "UI_OP_SUMMARY %@ median_ms=%.3f max_ms=%.3f samples=%d",
+                name,
+                median(values),
+                values.max() ?? 0,
+                values.count
+            ))
+        }
+
+        print(String(format: "UI_OP_SUMMARY launch_ready_ms=%.3f", launchReadyMS))
+        summary("focus", focusSamples)
+        summary("typing", typeSamples)
+        summary("dismiss", dismissSamples)
+        summary("refocus", refocusSamples)
+        summary("send_clear", sendClearSamples)
+        summary("bubble", bubbleSamples)
+        summary("settings_roundtrip", navigationSamples)
+    }
+
     func testComposerPasteRemainsEditableAcrossTextFormatsAndSizes() throws {
         let savedClipboard = UIPasteboard.general.items
         defer { UIPasteboard.general.items = savedClipboard }
