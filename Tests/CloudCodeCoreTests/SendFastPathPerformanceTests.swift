@@ -61,6 +61,68 @@ final class SendFastPathPerformanceTests: XCTestCase {
         XCTAssertEqual(calls, 14)
     }
 
+
+    func testRapidStreamHasNoFrameworkStallSpikes() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SendStreamPerformanceTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let registry = ToolRegistry(descriptors: [])
+        let sessions = SessionStore(root: root.appendingPathComponent("sessions", isDirectory: true))
+        let checkpoints = TaskCheckpointStore(fileURL: root.appendingPathComponent("checkpoints.json"))
+        let provider = BurstTokenProvider(tokenCount: 12_000, token: "abcd")
+        let agent = AgentCore(
+            provider: provider,
+            keyVault: MemoryKeyVault(keys: ["perf-key": "secret"]),
+            toolRouter: ToolRouter(registry: registry, executors: []),
+            registry: registry,
+            capabilityProbe: FastPathFixedCapabilityProbe(profile: CapabilityProfile(records: [])),
+            sessionStore: sessions,
+            checkpointStore: checkpoints,
+            maxToolRounds: 2
+        )
+        let configuration = ProviderConfiguration(
+            name: "stream-perf",
+            baseURL: URL(string: "https://example.com/v1")!,
+            model: "burst",
+            apiKeyReference: "perf-key"
+        )
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        var previousTokenAt: ContinuousClock.Instant?
+        var gapsMS: [Double] = []
+        var tokenCount = 0
+        let stream = await agent.send(
+            text: "stream benchmark",
+            session: AgentSession(permissionMode: .safe),
+            providerConfiguration: configuration
+        )
+        for try await event in stream {
+            if case .token = event {
+                let now = clock.now
+                if let previousTokenAt {
+                    gapsMS.append(milliseconds(previousTokenAt.duration(to: now)))
+                }
+                previousTokenAt = now
+                tokenCount += 1
+            }
+        }
+        let totalMS = milliseconds(start.duration(to: clock.now))
+        let sortedGaps = gapsMS.sorted()
+        let p95Gap = percentile(sortedGaps, 0.95)
+        let p99Gap = percentile(sortedGaps, 0.99)
+        let maxGap = sortedGaps.last ?? 0
+        print(String(format: "STREAM_SMOOTHNESS_METRICS tokens=%d total_ms=%.3f p95_gap_ms=%.3f p99_gap_ms=%.3f max_gap_ms=%.3f", tokenCount, totalMS, p95Gap, p99Gap, maxGap))
+        XCTAssertEqual(tokenCount, 12_000)
+    }
+
+    private func milliseconds(_ duration: Duration) -> Double {
+        Double(duration.components.seconds) * 1_000
+            + Double(duration.components.attoseconds) / 1_000_000_000_000_000
+    }
+
     private func percentile(_ sorted: [Double], _ fraction: Double) -> Double {
         guard !sorted.isEmpty else { return 0 }
         let index = min(sorted.count - 1, Int((Double(sorted.count - 1) * fraction).rounded(.up)))
@@ -71,6 +133,39 @@ final class SendFastPathPerformanceTests: XCTestCase {
 private struct FastPathFixedCapabilityProbe: CapabilityProbing, Sendable {
     let profile: CapabilityProfile
     func probe() async -> CapabilityProfile { profile }
+}
+
+
+private actor BurstTokenProvider: ProviderStreaming {
+    let tokenCount: Int
+    let token: String
+
+    init(tokenCount: Int, token: String) {
+        self.tokenCount = tokenCount
+        self.token = token
+    }
+
+    nonisolated func stream(
+        configuration: ProviderConfiguration,
+        apiKey: String,
+        messages: [ChatMessage],
+        tools: [ProviderToolSchema]
+    ) -> AsyncThrowingStream<ProviderEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                let (count, value) = await payload()
+                for _ in 0..<count {
+                    continuation.yield(.token(value))
+                }
+                continuation.yield(.finished)
+                continuation.finish()
+            }
+        }
+    }
+
+    private func payload() -> (Int, String) {
+        (tokenCount, token)
+    }
 }
 
 private actor ImmediateTokenProvider: ProviderStreaming {

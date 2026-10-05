@@ -27,4 +27,4 @@ jobs:
       - name: Benchmark immediate-provider send fast path
         run: |
           set -euo pipefail
-          swift test --filter SendFastPathPerformanceTests/testImmediateProviderFirstTokenFrameworkOverhead
+          swift test --filter SendFastPathPerformanceTests
