@@ -1,6 +1,8 @@
 name: Send Fast Path Benchmark
 
 on:
+  push:
+    branches: [diag/build173-send-fast-path-20261005]
   workflow_dispatch:
 
 permissions:
