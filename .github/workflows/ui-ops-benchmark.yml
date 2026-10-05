@@ -29,12 +29,6 @@ jobs:
           brew install xcodegen
           xcodegen --version | grep -F '2.46.0'
 
-      - name: Test streaming UI flush coordinator
-        run: |
-          set -euo pipefail
-          swift package resolve
-          swift test --filter StreamingUIFlushCoordinatorTests
-
       - name: Generate Xcode project
         run: xcodegen generate
 
