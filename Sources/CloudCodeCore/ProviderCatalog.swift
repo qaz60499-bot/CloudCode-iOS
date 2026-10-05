@@ -867,8 +867,8 @@ public enum ProviderCatalog {
                 protocols: [.anthropic, .openAIChat],
                 preferredProtocol: .anthropic,
                 authMode: .bearer,
-                models: ["claude-opus-5", "claude-opus-5-thinking"],
-                keySlots: [ProviderKeySlot(id: "slot-1", label: "Key 1", fingerprint: "4b311d96d45555d663e567e0e82b8cddc46d90f02a834ea81a78ed716e690184", models: ["claude-opus-5", "claude-opus-5-thinking"], protocols: [.anthropic, .openAIChat], modelProtocols: ["claude-opus-5": [.anthropic], "claude-opus-5-thinking": [.anthropic]])],
+                models: ["claude-opus-5", "claude-opus-5-thinking", "claude-opus-4-8", "claude-opus-4-8-thinking"],
+                keySlots: [ProviderKeySlot(id: "slot-1", label: "Key 1", fingerprint: "4b311d96d45555d663e567e0e82b8cddc46d90f02a834ea81a78ed716e690184", models: ["claude-opus-5", "claude-opus-5-thinking", "claude-opus-4-8", "claude-opus-4-8-thinking"], protocols: [.anthropic, .openAIChat], modelProtocols: ["claude-opus-5": [.anthropic], "claude-opus-5-thinking": [.anthropic], "claude-opus-4-8": [.anthropic], "claude-opus-4-8-thinking": [.anthropic]])],
                 source: .desktopSnapshot,
                 customModelAllowed: true
             ),

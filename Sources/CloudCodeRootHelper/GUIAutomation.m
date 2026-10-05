@@ -267,20 +267,17 @@ static CloudCodeHIDRuntime CloudCodeResolveHID(void)
     return runtime;
 }
 
-static BOOL CloudCodeResolveBackBoardRouteAtPoint(CGPoint point, CloudCodeHIDRuntime runtime, CloudCodeHIDRoute *route)
+static void CloudCodeResolveWindowContextAtPoint(CGPoint point, CloudCodeHIDRoute *route)
 {
-    if (!route || !runtime.dispatchConnection) { return NO; }
+    if (!route) { return; }
     dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_NOW | RTLD_GLOBAL);
-    dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW | RTLD_GLOBAL);
 
+    // Do not instantiate BKAccessibility or its event-routing connection manager here.
+    // Physical-device evidence on iOS 16.6 shows that merely entering that Accessibility
+    // routing path can surface the persistent green/gray Inspector scene and interfere with
+    // ordinary foreground touch delivery. We only derive the current CAWindowServer context
+    // and attach that context to a normal IOHID system-client event below.
     id (*sendObject0)(id, SEL) = (void *)objc_msgSend;
-    Class accessibilityClass = NSClassFromString(@"BKAccessibility");
-    SEL managerSelector = NSSelectorFromString(@"_eventRoutingClientConnectionManager");
-    if (!accessibilityClass || ![accessibilityClass respondsToSelector:managerSelector]) { return NO; }
-    id manager = nil;
-    @try { manager = sendObject0(accessibilityClass, managerSelector); } @catch (__unused NSException *exception) { manager = nil; }
-    if (!manager) { return NO; }
-
     uint32_t contextID = 0;
     mach_port_t taskPort = MACH_PORT_NULL;
     Class serverClass = NSClassFromString(@"CAWindowServer");
@@ -305,41 +302,16 @@ static BOOL CloudCodeResolveBackBoardRouteAtPoint(CGPoint point, CloudCodeHIDRun
         }
     }
 
+    route->contextID = contextID;
+    route->taskPort = taskPort;
+    route->usesBackBoardRoute = NO;
+    route->usesBundleRoute = NO;
     NSString *bundleID = CloudCodeFrontmostBundleID();
-    SEL bundleSelector = NSSelectorFromString(@"clientForBundleID:");
-    if (bundleID.length > 0 && [manager respondsToSelector:bundleSelector]) {
-        CloudCodeIOHIDEventSystemConnectionRef (*sendConnectionForBundle)(id, SEL, id) = (void *)objc_msgSend;
-        CloudCodeIOHIDEventSystemConnectionRef connection = NULL;
-        @try { connection = sendConnectionForBundle(manager, bundleSelector, bundleID); } @catch (__unused NSException *exception) { connection = NULL; }
-        if (connection) {
-            route->routedConnection = connection;
-            route->contextID = contextID;
-            route->taskPort = taskPort;
-            route->usesBackBoardRoute = YES;
-            route->usesBundleRoute = YES;
-            fprintf(stderr, "gui-hid-route: profile=modern-trollstore route=backboard-bundle bundle=%s contextID=%u taskPort=%u\n", bundleID.UTF8String ?: "", contextID, taskPort);
-            return YES;
-        }
-    }
+    fprintf(stderr, "gui-hid-route: profile=modern-trollstore route=system-client-context accessibility-route=disabled bundle=%s contextID=%u taskPort=%u\n",
+            bundleID.UTF8String ?: "", contextID, taskPort);
 
-    SEL connectionSelector = NSSelectorFromString(@"clientForTaskPort:");
-    if (MACH_PORT_VALID(taskPort) && [manager respondsToSelector:connectionSelector]) {
-        CloudCodeIOHIDEventSystemConnectionRef (*sendConnectionForPort)(id, SEL, mach_port_t) = (void *)objc_msgSend;
-        CloudCodeIOHIDEventSystemConnectionRef connection = NULL;
-        @try { connection = sendConnectionForPort(manager, connectionSelector, taskPort); } @catch (__unused NSException *exception) { connection = NULL; }
-        if (connection) {
-            route->routedConnection = connection;
-            route->contextID = contextID;
-            route->taskPort = taskPort;
-            route->usesBackBoardRoute = YES;
-            route->usesBundleRoute = NO;
-            fprintf(stderr, "gui-hid-route: profile=modern-trollstore route=backboard-context bundle=%s contextID=%u taskPort=%u\n", bundleID.UTF8String ?: "", contextID, taskPort);
-            return YES;
-        }
-    }
-
-    fprintf(stderr, "gui-hid-route: profile=modern-trollstore route=backboard-unavailable bundle=%s contextID=%u taskPort=%u\n", bundleID.UTF8String ?: "", contextID, taskPort);
-    return NO;
+    // The caller always uses the plain IOHID event-system client; contextID is retained
+    // only as non-Accessibility routing metadata for BKSHIDEventSetDigitizerInfo.
 }
 
 static BOOL CloudCodeHIDReady(CloudCodeHIDRuntime runtime, CGPoint point, CloudCodeHIDRoute *route)
@@ -348,17 +320,20 @@ static BOOL CloudCodeHIDReady(CloudCodeHIDRuntime runtime, CGPoint point, CloudC
         return NO;
     }
     *route = (CloudCodeHIDRoute){0};
-    // Current TrollVNC uses the global IOHID event-system client with sender 0x8000000817319371.
-    // Prefer that route first for TrollStore/root-helper injection. BackBoard targeted routing is
-    // retained only as a compatibility fallback when a system client cannot be created.
+
+    // Keep the event tied to the current display context without entering BKAccessibility.
+    // Physical-device evidence on iOS 16.6 showed that the Accessibility event-routing manager
+    // can leave a persistent green/gray Inspector scene and interfere with ordinary touch delivery.
+    CloudCodeResolveWindowContextAtPoint(point, route);
     if (runtime.createClient && runtime.dispatch) {
         route->systemClient = runtime.createClient(kCFAllocatorDefault);
         if (route->systemClient) {
-            fprintf(stderr, "gui-hid-route: profile=modern-trollstore route=system-client\n");
+            fprintf(stderr, "gui-hid-route: profile=modern-trollstore route=system-client purpose=tap\n");
             return YES;
         }
     }
-    return CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route);
+    fprintf(stderr, "gui-hid-route: profile=modern-trollstore purpose=tap result=no-route\n");
+    return NO;
 }
 
 static BOOL CloudCodeHIDGestureReady(CloudCodeHIDRuntime runtime, CGPoint point, CloudCodeHIDRoute *route)
@@ -368,19 +343,10 @@ static BOOL CloudCodeHIDGestureReady(CloudCodeHIDRuntime runtime, CGPoint point,
     }
     *route = (CloudCodeHIDRoute){0};
 
-    // A swipe/scroll is a sustained gesture and must stay owned by the current foreground App.
-    // Physical-device evidence on iOS 16.6 showed that the global IOHID system-client route can
-    // hand a mid-screen scroll to SpringBoard, causing a feed task to leave the target App and land
-    // on Home. Require a BackBoard bundle/context connection for gestures instead of falling back
-    // to a global system client. Single taps and Unicode input keep their existing compatibility
-    // routes because they do not carry the same system-gesture takeover risk.
-    if (CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route)) {
-        return YES;
-    }
-
-    // On iOS 16.6 TrollStore detached root helper, BackBoard connection manager cannot be acquired
-    // in this persona. Fall back to the IOHID system client so gestures (swipe/scroll/feed) can still
-    // be dispatched to the device rather than failing closed with code 66.
+    // Derive only the current CAWindowServer context. Do not acquire the Accessibility
+    // connection manager for gestures: that path is now proven to surface a persistent system UI
+    // overlay on the target iOS 16.6 device. Dispatch through the ordinary IOHID system client.
+    CloudCodeResolveWindowContextAtPoint(point, route);
     if (runtime.createClient && runtime.dispatch) {
         route->systemClient = runtime.createClient(kCFAllocatorDefault);
         if (route->systemClient) {
@@ -389,7 +355,7 @@ static BOOL CloudCodeHIDGestureReady(CloudCodeHIDRuntime runtime, CGPoint point,
         }
     }
 
-    fprintf(stderr, "gui-hid-route: profile=modern-trollstore purpose=gesture result=targeted-route-required\n");
+    fprintf(stderr, "gui-hid-route: profile=modern-trollstore purpose=gesture result=no-route\n");
     return NO;
 }
 
@@ -400,6 +366,7 @@ static BOOL CloudCodeHIDTextReady(CloudCodeHIDRuntime runtime, CGPoint point, Cl
     // disabled text input even when IOHIDEventCreateUnicodeEvent + SystemClient dispatch worked.
     if (!route || !runtime.createUnicode || !runtime.setInteger) { return NO; }
     *route = (CloudCodeHIDRoute){0};
+    CloudCodeResolveWindowContextAtPoint(point, route);
     if (runtime.createClient && runtime.dispatch) {
         route->systemClient = runtime.createClient(kCFAllocatorDefault);
         if (route->systemClient) {
@@ -407,7 +374,7 @@ static BOOL CloudCodeHIDTextReady(CloudCodeHIDRuntime runtime, CGPoint point, Cl
             return YES;
         }
     }
-    return CloudCodeResolveBackBoardRouteAtPoint(point, runtime, route);
+    return NO;
 }
 
 static void CloudCodeReleaseHIDRoute(CloudCodeHIDRoute *route)

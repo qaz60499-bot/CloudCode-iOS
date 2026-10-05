@@ -78,9 +78,18 @@ final class ProviderCatalogTests: XCTestCase {
     func testJustwokerMatchesCurrentDesktopBearerAuthAndExactModelProtocolEvidence() throws {
         let provider = try XCTUnwrap(ProviderCatalog.desktopSnapshot.first(where: { $0.id == "https-api-justwoker-icu" }))
         XCTAssertEqual(provider.authMode, .bearer)
+        XCTAssertEqual(provider.models, [
+            "claude-opus-5",
+            "claude-opus-5-thinking",
+            "claude-opus-4-8",
+            "claude-opus-4-8-thinking"
+        ])
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-5", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.protocolFor(model: "claude-opus-5-thinking", keySlotID: "slot-1"), .anthropic)
+        XCTAssertEqual(provider.protocolFor(model: "claude-opus-4-8", keySlotID: "slot-1"), .anthropic)
+        XCTAssertEqual(provider.protocolFor(model: "claude-opus-4-8-thinking", keySlotID: "slot-1"), .anthropic)
         XCTAssertEqual(provider.protocolCandidates(for: "claude-opus-5", keySlotID: "slot-1"), [.anthropic])
+        XCTAssertEqual(provider.protocolCandidates(for: "claude-opus-4-8", keySlotID: "slot-1"), [.anthropic])
     }
 
     func testGorouterWithoutExactModelProtocolEvidenceKeepsBoundedProtocolCandidates() throws {
