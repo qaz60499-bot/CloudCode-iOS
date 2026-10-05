@@ -2,7 +2,7 @@ name: Send Fast Path Benchmark
 
 on:
   push:
-    branches: [diag/build173-send-fast-path-20261005]
+    branches: [diag/build173-original-send-benchmark-20261005]
   workflow_dispatch:
 
 permissions:
@@ -28,3 +28,5 @@ jobs:
         run: |
           set -euo pipefail
           swift test --filter SendFastPathPerformanceTests
+          swift test --skip-build --filter Build169AgentContinuationTests
+          swift test --skip-build --filter ProviderContinuationBoundaryTests
