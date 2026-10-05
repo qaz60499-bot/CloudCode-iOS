@@ -333,22 +333,13 @@ private struct PasteSafeComposerTextView: UIViewRepresentable {
         view.accessibilityIdentifier = "CloudCodeComposer"
         view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let accessory = UIToolbar(frame: CGRect(x: 0, y: 0, width: 0, height: 44))
-        accessory.autoresizingMask = [.flexibleWidth]
-        let dismissButton = UIButton(type: .system)
-        dismissButton.setTitle("收起", for: .normal)
-        dismissButton.accessibilityIdentifier = "CloudCodeDismissKeyboard"
-        dismissButton.addTarget(context.coordinator, action: #selector(Coordinator.dismissKeyboard), for: .touchUpInside)
-        accessory.items = [
-            UIBarButtonItem(systemItem: .flexibleSpace),
-            UIBarButtonItem(customView: dismissButton)
-        ]
-        view.inputAccessoryView = accessory
         context.coordinator.activeTextView = view
         return view
     }
 
     func updateUIView(_ uiView: UITextView, context: Context) {
+        let focusChanged = context.coordinator.updateBindings(text: $text, isFocused: $isFocused)
+        context.coordinator.activeTextView = uiView
         if uiView.text != text {
             let previousSelection = uiView.selectedRange
             uiView.text = text
@@ -357,26 +348,79 @@ private struct PasteSafeComposerTextView: UIViewRepresentable {
                 uiView.selectedRange = NSRange(location: min(previousSelection.location, end), length: 0)
             }
         }
-        if isFocused, !uiView.isFirstResponder {
-            uiView.becomeFirstResponder()
-        } else if !isFocused, uiView.isFirstResponder {
-            uiView.resignFirstResponder()
+        if focusChanged {
+            context.coordinator.scheduleFocusReconciliation(for: uiView, desiredFocus: isFocused)
         }
+    }
+
+    static func dismantleUIView(_ uiView: UITextView, coordinator: Coordinator) {
+        coordinator.dismantle(uiView)
     }
 
     final class Coordinator: NSObject, UITextViewDelegate {
         @Binding private var text: String
         @Binding private var isFocused: Bool
         weak var activeTextView: UITextView?
+        private var lastRepresentableFocus: Bool?
+        private var pendingFocus: Bool?
+        private var focusWorkItem: DispatchWorkItem?
+        private var focusGeneration = 0
 
         init(text: Binding<String>, isFocused: Binding<Bool>) {
             _text = text
             _isFocused = isFocused
         }
 
-        @objc func dismissKeyboard() {
-            activeTextView?.resignFirstResponder()
-            if isFocused { isFocused = false }
+        func updateBindings(text: Binding<String>, isFocused: Binding<Bool>) -> Bool {
+            _text = text
+            _isFocused = isFocused
+            let desiredFocus = isFocused.wrappedValue
+            let changed = lastRepresentableFocus != desiredFocus
+            lastRepresentableFocus = desiredFocus
+            return changed
+        }
+
+        func scheduleFocusReconciliation(for textView: UITextView, desiredFocus: Bool) {
+            activeTextView = textView
+            guard textView.isFirstResponder != desiredFocus else {
+                cancelPendingFocusReconciliation()
+                return
+            }
+            guard focusWorkItem == nil || pendingFocus != desiredFocus else { return }
+
+            cancelPendingFocusReconciliation()
+            let generation = focusGeneration
+            pendingFocus = desiredFocus
+            let workItem = DispatchWorkItem { [weak self, weak textView] in
+                guard let self, self.focusGeneration == generation else { return }
+                self.focusWorkItem = nil
+                self.pendingFocus = nil
+                guard let textView,
+                      self.activeTextView === textView,
+                      self.isFocused == desiredFocus,
+                      textView.isFirstResponder != desiredFocus else { return }
+                if desiredFocus {
+                    textView.becomeFirstResponder()
+                } else {
+                    textView.resignFirstResponder()
+                }
+            }
+            focusWorkItem = workItem
+            DispatchQueue.main.async(execute: workItem)
+        }
+
+        func dismantle(_ textView: UITextView) {
+            cancelPendingFocusReconciliation()
+            if activeTextView === textView { activeTextView = nil }
+            textView.delegate = nil
+            (textView as? PasteSafeComposerTextView.PlainTextPasteView)?.onPlainTextPaste = nil
+        }
+
+        private func cancelPendingFocusReconciliation() {
+            focusGeneration &+= 1
+            focusWorkItem?.cancel()
+            focusWorkItem = nil
+            pendingFocus = nil
         }
 
         func textViewDidBeginEditing(_ textView: UITextView) {
@@ -783,7 +827,7 @@ private struct ChatView: View {
                     .padding(.horizontal, 2)
                     .padding(.vertical, 1)
             }
-            .frame(minHeight: 38, maxHeight: 116)
+            .frame(height: 116)
             .contentShape(Rectangle())
             .onTapGesture { isComposerFocused = true }
 
@@ -801,6 +845,11 @@ private struct ChatView: View {
     @ToolbarContentBuilder
     private var chatToolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .topBarTrailing) {
+            if isComposerFocused {
+                Button("收起") { isComposerFocused = false }
+                    .accessibilityIdentifier("CloudCodeDismissKeyboard")
+            }
+
             Button {
                 isComposerFocused = false
                 showDiagnostics = true

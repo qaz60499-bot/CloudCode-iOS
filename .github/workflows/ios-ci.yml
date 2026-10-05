@@ -237,6 +237,38 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             test \
             -only-testing:CloudCodeIOSUITests
+          xcrun xcresulttool get test-results tests --path build/UITests.xcresult > build/UITests-test-results.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          expected = {
+              "testChatComposerAcceptsTypingWithoutImplicitSubmit",
+              "testComposerCanDismissRefocusAndContinueSending",
+              "testComposerPasteRemainsEditableAcrossTextFormatsAndSizes",
+          }
+          results = {}
+
+          def visit(node):
+              if isinstance(node, dict):
+                  if node.get("nodeType") == "Test Case":
+                      name = str(node.get("name", ""))
+                      for test_name in expected:
+                          if test_name in name:
+                              results[test_name] = str(node.get("result", "Missing"))
+                  for child in node.values():
+                      visit(child)
+              elif isinstance(node, list):
+                  for child in node:
+                      visit(child)
+
+          visit(json.loads(Path("build/UITests-test-results.json").read_text(encoding="utf-8")))
+          missing = sorted(expected - results.keys())
+          not_passed = sorted(name for name, result in results.items() if result != "Passed")
+          if missing or not_passed:
+              raise SystemExit(f"FAIL: composer UI tests missing={missing}, not_passed={not_passed}")
+          print("PASS: all existing composer UI tests executed and passed")
+          PY
           xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true
 
       - name: Build unsigned device app
