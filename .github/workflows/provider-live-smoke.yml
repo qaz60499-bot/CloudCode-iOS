@@ -422,6 +422,16 @@ jobs:
               print(f"::warning::{label} hit explicit provider credit/capacity limits. Live generation probes stop and deterministic Provider regressions will run.")
               raise SystemExit(0)
 
+          def enter_upstream_fallback(label, status):
+              if not (500 <= status < 600):
+                  return False
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("upstream_unavailable=true\n")
+                  output.write("model_unavailable=false\n")
+                  output.write("billing_blocked=false\n")
+              print(f"::warning::{label} hit external upstream HTTP {status}. Live generation probes stop and deterministic Provider regressions will run.")
+              raise SystemExit(0)
+
           def is_model_not_found(status, body):
               if status not in (400, 404, 422, 503):
                   return False
@@ -654,6 +664,10 @@ jobs:
                   if models_status == 429:
                       print(f"::warning::Tabitoken /models is rate-limited for key={key_index} auth={models_auth_mode}; using another live source without treating 429 as credit.")
                       break
+                  if 500 <= models_status < 600:
+                      saw_upstream_unavailable = True
+                      print(f"::warning::Tabitoken /models is externally unavailable with HTTP {models_status}; direct inference will determine whether the whole provider is unavailable.")
+                      break
                   if models_status != 200:
                       raise SystemExit(f"FAIL: Tabitoken /models returned HTTP {models_status} for key={key_index} auth={models_auth_mode}")
                   ids, catalog = parse_model_catalog(models_body)
@@ -755,8 +769,11 @@ jobs:
                   "additionalProperties": False,
               },
           }]
-          tool_status, tool_body = request("anthropic-tool", "POST", "/messages", with_tool, {"anthropic-version": "2023-06-01"}, allow_billing_block=True)
+          tool_status, tool_body = request("anthropic-tool", "POST", "/messages", with_tool, {"anthropic-version": "2023-06-01"}, allow_billing_block=True, fail_on_mismatch=False)
           enter_billing_fallback("anthropic-tool", tool_status, tool_body)
+          enter_upstream_fallback("anthropic-tool", tool_status)
+          if not (200 <= tool_status < 300):
+              raise SystemExit(f"FAIL: Anthropic tool probe returned HTTP {tool_status}")
 
           dotted_tool = dict(base_anthropic)
           dotted_tool["tools"] = [{
@@ -779,6 +796,7 @@ jobs:
               fail_on_mismatch=False,
           )
           enter_billing_fallback("anthropic-tool-dotted-name", dotted_status, dotted_body)
+          enter_upstream_fallback("anthropic-tool-dotted-name", dotted_status)
           if dotted_status not in (400, 422):
               raise SystemExit(f"FAIL: dotted Anthropic tool name was not rejected; HTTP {dotted_status}")
 
@@ -796,6 +814,7 @@ jobs:
                   fail_on_mismatch=False,
               )
               enter_billing_fallback("anthropic-thinking-minimal", thinking_status, thinking_body)
+              enter_upstream_fallback("anthropic-thinking-minimal", thinking_status)
               if 200 <= thinking_status < 300:
                   large_payload = dict(thinking_payload)
                   large_payload["max_tokens"] = 8192
@@ -809,6 +828,7 @@ jobs:
                       fail_on_mismatch=False,
                   )
                   enter_billing_fallback("anthropic-thinking-max8192", large_status, large_body)
+                  enter_upstream_fallback("anthropic-thinking-max8192", large_status)
                   if large_status in (400, 404, 422):
                       print("TABITOKEN_THINKING_LARGE_MAX_TOKENS_UNSUPPORTED=true")
                   elif not (200 <= large_status < 300):
