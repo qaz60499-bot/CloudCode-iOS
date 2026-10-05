@@ -1,6 +1,9 @@
 name: UI Operations Benchmark
 
 on:
+  push:
+    branches:
+      - diag/build173-ui-ops-benchmark-20261005
   workflow_dispatch:
 
 permissions:
