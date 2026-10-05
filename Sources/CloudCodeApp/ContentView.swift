@@ -829,7 +829,6 @@ private struct ChatView: View {
             }
             .frame(height: 116)
             .contentShape(Rectangle())
-            .onTapGesture { isComposerFocused = true }
 
             Button(model.isCurrentSessionRunning ? "追加" : "发送", action: sendCurrentInput)
                 .buttonStyle(.borderedProminent)
