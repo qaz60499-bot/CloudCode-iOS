@@ -637,11 +637,14 @@ jobs:
                   raise SystemExit(f'FAIL: production IOHID routing re-entered Accessibility and can surface the green/gray Inspector scene: {forbidden_accessibility_hid}')
           tap_ready = gui_text.split('static BOOL CloudCodeHIDReady', 1)[1].split('static BOOL CloudCodeHIDGestureReady', 1)[0]
           gesture_ready = gui_text.split('static BOOL CloudCodeHIDGestureReady', 1)[1].split('static BOOL CloudCodeHIDTextReady', 1)[0]
-          for label, body in (('tap', tap_ready), ('gesture', gesture_ready)):
-              if 'CloudCodeResolveWindowContextAtPoint' not in body or 'runtime.createClient' not in body:
-                  raise SystemExit(f'FAIL: gui.{label} must retain CAWindowServer context plus IOHID system-client dispatch')
-              if body.index('CloudCodeResolveWindowContextAtPoint') > body.index('runtime.createClient'):
-                  raise SystemExit(f'FAIL: gui.{label} must resolve display context before creating the IOHID system client')
+          if 'runtime.createClient' not in tap_ready or 'CloudCodeResolveWindowContextAtPoint' in tap_ready:
+              raise SystemExit('FAIL: gui.tap must use the plain global IOHID system client; CAWindowServer context can route App-area taps into the software-keyboard/system window')
+          if 'purpose=tap context=global accessibility-route=disabled' not in tap_ready:
+              raise SystemExit('FAIL: gui.tap lost the explicit global non-Accessibility routing marker')
+          if 'CloudCodeResolveWindowContextAtPoint' not in gesture_ready or 'runtime.createClient' not in gesture_ready:
+              raise SystemExit('FAIL: gui.gesture must retain CAWindowServer context plus IOHID system-client dispatch')
+          if gesture_ready.index('CloudCodeResolveWindowContextAtPoint') > gesture_ready.index('runtime.createClient'):
+              raise SystemExit('FAIL: gui.gesture must resolve display context before creating the IOHID system client')
           hid_text_ready = gui_text.split('static BOOL CloudCodeHIDTextReady', 1)[1].split('static void CloudCodeReleaseHIDRoute', 1)[0]
           if 'if (!route || !runtime.createUnicode || !runtime.setInteger) { return NO; }' not in hid_text_ready:
               raise SystemExit('FAIL: Unicode text HID readiness must be independent of digitizer-only primitives')

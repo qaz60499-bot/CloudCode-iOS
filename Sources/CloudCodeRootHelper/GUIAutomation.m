@@ -321,14 +321,16 @@ static BOOL CloudCodeHIDReady(CloudCodeHIDRuntime runtime, CGPoint point, CloudC
     }
     *route = (CloudCodeHIDRoute){0};
 
-    // Keep the event tied to the current display context without entering BKAccessibility.
-    // Physical-device evidence on iOS 16.6 showed that the Accessibility event-routing manager
-    // can leave a persistent green/gray Inspector scene and interfere with ordinary touch delivery.
-    CloudCodeResolveWindowContextAtPoint(point, route);
+    // Single taps must use the plain global IOHID system-client route. Do not bind the
+    // event to CAWindowServer contextIdAtPosition here: when the software keyboard owns a separate
+    // system window, that context can consume an otherwise valid App-area tap. The pre-Build171
+    // global system-client route was proven to deliver composer/send taps on this iOS 16.6 device.
+    // BKAccessibility remains completely excluded, so this does not reintroduce the green/gray
+    // Inspector scene that Build171 removed.
     if (runtime.createClient && runtime.dispatch) {
         route->systemClient = runtime.createClient(kCFAllocatorDefault);
         if (route->systemClient) {
-            fprintf(stderr, "gui-hid-route: profile=modern-trollstore route=system-client purpose=tap\n");
+            fprintf(stderr, "gui-hid-route: profile=modern-trollstore route=system-client purpose=tap context=global accessibility-route=disabled\n");
             return YES;
         }
     }
