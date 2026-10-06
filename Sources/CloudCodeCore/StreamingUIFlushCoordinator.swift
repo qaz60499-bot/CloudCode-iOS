@@ -12,7 +12,7 @@ public final class StreamingUIFlushCoordinator {
     private var pendingFlushes: [UUID: PendingFlush] = [:]
 
     public init(
-        intervalNanoseconds: UInt64 = 60_000_000,
+        intervalNanoseconds: UInt64 = 33_000_000,
         publish: @escaping @MainActor (UUID) -> Void
     ) {
         self.intervalNanoseconds = intervalNanoseconds
