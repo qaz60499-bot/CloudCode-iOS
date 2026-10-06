@@ -88,9 +88,16 @@
     <true/>
     <key>com.apple.backboard.client</key>
     <true/>
+    <key>com.apple.springboard.launchapplications</key>
+    <true/>
     <key>com.apple.frontboard.launchapplications</key>
     <true/>
     <key>com.apple.backboardd.launchapplications</key>
+    <true/>
+    <!-- Read-only process-state lookup is required to verify that the exact target app owns
+         FrontBoard visibility after a launch. It is never used as a substitute for launching,
+         and a merely running/background process still fails the foreground postcondition. -->
+    <key>com.apple.runningboard.process-state</key>
     <true/>
     <key>com.apple.security.iokit-user-client-class</key>
     <array>

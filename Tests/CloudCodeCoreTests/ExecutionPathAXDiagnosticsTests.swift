@@ -48,7 +48,7 @@ final class ExecutionPathAXDiagnosticsTests: XCTestCase {
         let records = try await logStore.recent(sessionID: sessionID, limit: 20)
         let record = try XCTUnwrap(records.last(where: { $0.action == "gui.tree" && $0.result == "completed" }))
         XCTAssertEqual(record.metadata["axBackend"], "standalone_trollstore_axruntime")
-        XCTAssertEqual(record.metadata["axStage"], "direct_root_then_sampled_hit_test")
+        XCTAssertEqual(record.metadata["axStage"], "direct_root_then_position_root_then_sampled_hit_test")
         XCTAssertEqual(record.metadata["axScope"], "sampled_semantics")
         XCTAssertEqual(record.metadata["axLatencyMS"], "7")
     }
@@ -107,7 +107,7 @@ private struct AXMetricExecutor: ToolExecuting, Sendable {
                     "perceptionAXAttempted": "true",
                     "perceptionAXSucceeded": "true",
                     "axBackend": "standalone_trollstore_axruntime",
-                    "axStage": "direct_root_then_sampled_hit_test",
+                    "axStage": "direct_root_then_position_root_then_sampled_hit_test",
                     "axScope": "sampled_semantics",
                     "axLatencyMS": "7"
                 ]

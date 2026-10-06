@@ -75,6 +75,9 @@ public enum GUIAutomationFeature: String, CaseIterable, Sendable {
     case openApp = "open_app"
     case tree
     case screenshot
+    /// On-device Vision/OCR is an independent perception capability. It deliberately remains
+    /// outside the composite GUI requirement so AX degradation cannot incorrectly disable OCR.
+    case ocr
     case touch
     case textInput = "text_input"
     case gestures
@@ -107,7 +110,11 @@ public struct GUIAutomationCapabilitySnapshot: Sendable, Equatable {
     }
 
     public var compositeStatus: CapabilityStatus {
-        let required: [GUIAutomationFeature] = [.openApp, .screenshot, .touch, .textInput, .gestures, .tree, .verify]
+        // AX tree is an optional semantic accelerator, not a prerequisite for GUI automation.
+        // Production may intentionally quarantine AX/AXAudit when the OS surfaces a visible
+        // accessibility frame; screenshot + local OCR + HID/native routes must remain independently
+        // routable in that state.
+        let required: [GUIAutomationFeature] = [.openApp, .screenshot, .touch, .textInput, .gestures, .verify]
         if required.allSatisfy({ status($0) == .available }) { return .available }
         if required.contains(where: { status($0) == .deviceValidationRequired }) { return .deviceValidationRequired }
         if required.contains(where: { status($0) == .unknown }) { return .unknown }
@@ -207,6 +214,68 @@ public enum GUIElementMatchMode: String, Sendable {
 /// both the on-device TrollStore backend and an optional XCTest/WDA bridge can share identical
 /// query/ambiguity/stale-element rules without creating a second automation architecture.
 public enum GUIElementResolver {
+    /// Returns a bounded list of structured AX elements from the same tree format used by
+    /// `find`. Callers that need to make strategy-specific claims (for example, matching an
+    /// accessibility identifier or a role) can inspect the original fields without treating
+    /// labels and values as substitutes for those fields.
+    public static func elements(in tree: String, maximumElements: Int = 96) -> [GUIElementMatch] {
+        let limit = max(1, min(maximumElements, 256))
+        guard let data = tree.data(using: .utf8), data.count <= 512 * 1024,
+              let root = try? JSONSerialization.jsonObject(with: data) else { return [] }
+        var elements: [GUIElementMatch] = []
+        walkElements(root, path: "0", maximumElements: limit, elements: &elements)
+        return elements
+    }
+
+    /// Matches a package's exact semantic selector against the corresponding structured AX fields.
+    /// OCR cannot satisfy an identifier, role, trait, or relationship constraint.
+    public static func semanticMatch(selector: AppProviderSelector, elements: [GUIElementMatch]) -> GUIElementMatch? {
+        guard let matching = semanticMatches(selector: selector, elements: elements),
+              matching.count == 1 else { return nil }
+        return matching[0]
+    }
+
+    /// Returns exact structured matches, or nil when the AX candidate list/selector cannot be
+    /// evaluated safely. An empty list means AX supplied no matching evidence; multiple matches
+    /// remain distinguishable from that case so callers cannot use OCR to erase AX ambiguity.
+    public static func semanticMatches(selector: AppProviderSelector, elements: [GUIElementMatch]) -> [GUIElementMatch]? {
+        guard elements.count < 256,
+              selector.traits.isEmpty,
+              normalized(selector.relation ?? "").isEmpty else { return nil }
+
+        let requestedRole = selector.role.map { normalized($0) }.flatMap { $0.isEmpty ? nil : $0 }
+        let matching: [GUIElementMatch]
+        switch selector.strategy {
+        case .accessibilityIdentifier:
+            guard let value = normalized(selector.value), !value.isEmpty else { return nil }
+            matching = elements.filter { element in
+                normalized(element.identifier ?? "") == value
+                    && (requestedRole.map { normalized(element.role ?? "") == $0 } ?? true)
+            }
+        case .axRole:
+            guard let role = requestedRole else { return nil }
+            let value = selector.value.map { normalized($0) }.flatMap { $0.isEmpty ? nil : $0 }
+            matching = elements.filter { element in
+                guard normalized(element.role ?? "") == role else { return false }
+                guard let value else { return true }
+                return [element.identifier, element.label, element.title, element.placeholder, element.value]
+                    .compactMap { $0 }
+                    .contains { normalized($0) == value }
+            }
+        case .semanticLabel:
+            guard let value = normalized(selector.value), !value.isEmpty else { return nil }
+            matching = elements.filter { element in
+                (requestedRole.map { normalized(element.role ?? "") == $0 } ?? true)
+                    && [element.label, element.title, element.placeholder, element.value]
+                        .compactMap { $0 }
+                        .contains { normalized($0) == value }
+            }
+        case .visibleText, .relativeLayout, .ocrText, .coordinateFallback:
+            return nil
+        }
+        return matching
+    }
+
     public static func find(
         in tree: String,
         query: String,
@@ -267,6 +336,36 @@ public enum GUIElementResolver {
         }
     }
 
+    private static func walkElements(
+        _ raw: Any,
+        path: String,
+        maximumElements: Int,
+        elements: inout [GUIElementMatch]
+    ) {
+        guard elements.count < maximumElements else { return }
+        if let node = raw as? [String: Any] {
+            if let element = candidate(node, path: path) {
+                elements.append(element)
+                if elements.count >= maximumElements { return }
+            }
+            if let wrappedTree = node["tree"] {
+                walkElements(wrappedTree, path: "\(path).tree", maximumElements: maximumElements, elements: &elements)
+                if elements.count >= maximumElements { return }
+            }
+            if let children = node["children"] as? [Any] {
+                for (index, child) in children.enumerated() {
+                    walkElements(child, path: "\(path).\(index)", maximumElements: maximumElements, elements: &elements)
+                    if elements.count >= maximumElements { return }
+                }
+            }
+        } else if let array = raw as? [Any] {
+            for (index, child) in array.enumerated() {
+                walkElements(child, path: "\(path).\(index)", maximumElements: maximumElements, elements: &elements)
+                if elements.count >= maximumElements { return }
+            }
+        }
+    }
+
     private static func candidate(_ node: [String: Any], path: String) -> GUIElementMatch? {
         guard let rawFrame = node["frame"] as? [String: Any],
               let x = number(rawFrame["x"]), let y = number(rawFrame["y"]),
@@ -301,6 +400,12 @@ public enum GUIElementResolver {
         value.trimmingCharacters(in: .whitespacesAndNewlines).folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
     }
 
+    private static func normalized(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let result = normalized(value)
+        return result.isEmpty ? nil : result
+    }
+
     private static func string(_ raw: Any?) -> String? {
         guard let value = raw as? String else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -327,7 +432,7 @@ public enum GUIApprovalTargetSanitizer {
         case "gui.tapElementObserve":
             return "当前前台 App · structured element tap"
         case "gui.tapTextObserve":
-            return "当前前台 App · local OCR text tap"
+            return "当前前台 App · local AX/OCR text tap"
         case "gui.focusComposerObserve":
             return "当前前台 App · semantic chat composer focus"
         case "gui.typeElementObserve":
@@ -375,6 +480,8 @@ public actor ToolRegistry {
         ToolDescriptor(name: "files.list", summary: "List a directory through structured filesystem access.", risk: .readOnly),
         ToolDescriptor(name: "files.search", summary: "Search a bounded directory with persistent local index-first lookup. Cached candidates are revalidated against the real path before return; an index miss falls back to a bounded filesystem scan and incrementally updates the index.", risk: .readOnly),
         ToolDescriptor(name: "files.read", summary: "Read a bounded text file.", risk: .readOnly),
+        ToolDescriptor(name: "files.inspectDocument", summary: "Inspect a bounded local user document without uploading the original binary. Supports PDF text extraction, DOCX text extraction, ZIP entry listing, and common text formats.", risk: .readOnly, requiredCapabilities: ["native.files"]),
+        ToolDescriptor(name: "files.share", summary: "Present the iOS system Share Sheet for one revalidated local regular file. This only proves that the share sheet was presented; selecting an App/contact and verifying an actual send are separate GUI-authority steps.", risk: .sensitiveWrite, requiredCapabilities: ["native.files"]),
         ToolDescriptor(name: "files.stat", summary: "Read current filesystem stat-style metadata after revalidating the real path.", risk: .readOnly, requiredCapabilities: ["native.files"]),
         ToolDescriptor(name: "files.metadata", summary: "Read bounded current file metadata through public native filesystem APIs.", risk: .readOnly, requiredCapabilities: ["native.files"]),
         ToolDescriptor(name: "files.hash", summary: "Compute a bounded SHA-256 over a revalidated regular file.", risk: .readOnly, requiredCapabilities: ["native.files"]),
@@ -413,26 +520,27 @@ public actor ToolRegistry {
         ToolDescriptor(name: "apps.openURL", summary: "Open an exact user-provided URL, a discovered root URL scheme, or a previously validated AppKnowledge deep-link candidate. Provider-invented deep-link paths are rejected. Success requires the requested target App to become foreground; target-surface semantics still require fresh observation.", risk: .sensitiveWrite, preferredRoute: .urlScheme),
         ToolDescriptor(name: "apps.uninstall", summary: "Uninstall an app.", risk: .permanentDestructive, requiredCapabilities: ["apps.uninstall"], preferredRoute: .privateFramework),
         ToolDescriptor(name: "apps.terminate", summary: "Terminate an app/process.", risk: .systemChange, requiredCapabilities: ["apps.terminate"], preferredRoute: .privateFramework),
-        ToolDescriptor(name: "advanced.shell", summary: "Execute an advanced shell command. High risk and never the default tool path.", risk: .systemChange, requiredCapabilities: ["execution.ios_system"], preferredRoute: .cli),
+        ToolDescriptor(name: "cli.run", summary: "Run a bounded read-only command or pipeline through the verified local ios_system catalog. This build exposes only pwd, echo, ls, cat, stat, find, grep, head, tail, wc, sort, uniq on the read-only surface. Command substitution, background execution, redirection and mutating find/sort flags fail closed. Prefer typed native files/json/sqlite tools when they already express the task; jq is not claimed by this build.", risk: .readOnly, requiredCapabilities: ["cli.runtime"], preferredRoute: .cli),
+        ToolDescriptor(name: "advanced.shell", summary: "Execute a bounded high-risk command using only the verified P0 ios_system catalog: pwd, echo, ls, cat, cp, mv, mkdir, rm, stat, find, grep, head, tail, wc, sort, uniq. It remains workspace-scoped, confirmation-gated outside full mode, rejects executable paths/background/redirection, and never replaces typed native/root tools.", risk: .systemChange, requiredCapabilities: ["execution.ios_system"], preferredRoute: .cli),
         ToolDescriptor(name: "gui.openApp", summary: "Open an app using the GUI automation fallback backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.openApp.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.openAppObserve", summary: "Open exactly one target app, verify the target became foreground in the bounded helper, then immediately capture one fresh screenshot locally. The screenshot is for semantic planning only and never substitutes for the target-foreground launch verification.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.openApp.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.tree", summary: "Read the GUI accessibility tree from the configured automation backend.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.findElement", summary: "Resolve a unique visible accessibility element locally by identifier/label/title/placeholder/value, with optional role and exact-or-contains matching. Returns only bounded structural metadata and coordinates; no screenshot or Vision call is needed.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.waitForElement", summary: "Poll the local accessibility tree for a unique element for a bounded time without calling the remote model between polls. Use for known delayed pages; ambiguity and timeouts fail closed.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.findElement", summary: "Resolve a unique visible element through one exact AX read. Query-only text can fall back to current-frame local OCR; role and identifier constraints require original AX fields. OCR results claim text and geometry only. Ambiguity fails closed.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.waitForElement", summary: "Wait locally for a unique element for a bounded time. Query-only text can use current-frame OCR after AX failure; role/identifier require AX. No remote model between polls; ambiguity and timeouts fail closed.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.tapElementObserve", summary: "Find one unique accessibility element locally, tap its current frame center, then immediately capture a fresh screenshot. This avoids Vision coordinate lookup while preserving post-action semantic re-planning.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.tapTextObserve", summary: "Capture the current screen, resolve one unique visible OCR text fragment locally by exact/contains query, tap that text's current bounding box center, then capture one fresh screenshot. Use this instead of guessed coordinates for visible labels such as a contact/chat name when AX is unavailable or the selected provider is text-only. Protected authentication/payment/system-confirmation labels fail closed.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.screenshot.capabilityID, GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.focusComposerObserve", summary: "For an explicit messaging task already on a chat surface, tap one bounded bottom-center composer candidate locally, capture a fresh screenshot, and accept focus only when on-device OCR finds keyboard-like multi-row key evidence. No coordinate is chosen by the Provider; failure does not permit raw typing.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.screenshot.capabilityID, GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.tapTextObserve", summary: "Capture the current screen, first try one bounded exact/contains accessibility-tree text lookup, then fall back to on-device OCR only if AX cannot resolve a unique visible target. Tap the resolved current-frame center and capture one fresh screenshot. This keeps named labels such as a contact/chat name usable when either AX or OCR is degraded, without guessing coordinates. Protected authentication/payment/system-confirmation labels fail closed.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.screenshot.capabilityID, GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.focusComposerObserve", summary: "For an explicit messaging task already on a chat surface, tap one bounded bottom-center composer candidate locally, capture a fresh screenshot, and accept focus when a privacy-preserving AX focused-text-input probe succeeds; if AX cannot prove focus, fall back to on-device OCR keyboard-like evidence. No coordinate is chosen by the Provider; failure does not permit raw typing.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.screenshot.capabilityID, GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.typeElementObserve", summary: "Find one unique non-protected accessibility element locally, focus it, enter bounded text, then immediately capture a fresh screenshot. Secure/system-confirmation targets are rejected and ambiguity fails closed.", risk: .sensitiveWrite, requiredCapabilities: [GUIAutomationFeature.tree.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.runStructuredPlan", summary: "Execute a bounded local multi-step plan using only foreground-verified app launch, accessibility element queries, element taps/text, bounded swipes/back gestures, and local validators. Every non-final state-changing step must declare an accessibility-tree expectation before another write may run. Any ambiguity, stale tree, failed expectation, protected confirmation target, or unsupported action stops the plan and returns control for re-planning. Vision remains fallback only.", risk: .sensitiveWrite, requiredCapabilities: [GUIAutomationFeature.openApp.capabilityID, GUIAutomationFeature.tree.capabilityID, GUIAutomationFeature.screenshot.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.gestures.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.runStructuredPlan", summary: "Execute a bounded local multi-step plan using foreground-verified app launch, native input/gestures, and semantic checkpoints. Each checkpoint resolves from bounded AX first, then same-frame local OCR when AX is unavailable or insufficient; only when local semantic evidence remains insufficient does the plan stop for remote re-planning. Ambiguity, stale evidence, protected confirmation targets, or unsupported actions fail closed.", risk: .sensitiveWrite, requiredCapabilities: [GUIAutomationFeature.openApp.capabilityID, GUIAutomationFeature.screenshot.capabilityID, GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.gestures.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.screenshot", summary: "Capture a screenshot through the GUI automation backend.", risk: .readOnly, requiredCapabilities: [GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.tap", summary: "Tap a GUI coordinate/element through the configured backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.tap", summary: "Tap one current GUI coordinate through the configured backend. Optional semanticTarget may name the visually grounded control (for example like) only when the current observation actually identifies it; this metadata never grants coordinate authority.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.touch.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.type", summary: "Type text through the configured backend.", risk: .sensitiveWrite, requiredCapabilities: [GUIAutomationFeature.textInput.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.scroll", summary: "Scroll through the configured backend.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.swipe", summary: "Swipe through the configured backend using screen-point coordinates. duration is seconds (0.05–5.0; typically about 0.3).", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.swipeSequence", summary: "Execute an explicitly requested finite sequence of identical swipes locally using screen-point coordinates. duration is seconds (0.05–5.0; typically about 0.3). The bounded executor captures lightweight screenshots between gestures, stops early on byte-identical observations, and returns the final screenshot so the model does not need a full round-trip between every repeated swipe.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.feedSample", summary: "Sample 2–8 consecutive feed items locally in one bounded tool call. direction=forward means advance to later feed items and direction=backward means return toward earlier items; the model never chooses raw swipe coordinates. Optional metric=likeCount/commentCount/shareCount plus selection=max/min asks the executor to parse anchored compact counts locally, compare them deterministically, and by default return to the selected sample. Only complete, unambiguous local metric evidence may suppress remote visual comparison; otherwise all sampled screenshots remain available as the fallback.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.navigateBack", summary: "Navigate back from a temporary iOS detail/media surface using one explicit bounded strategy: edge for a left-edge navigation-pop gesture, or dismissDown for a fullscreen/modal downward dismiss. The tool returns a fresh final screenshot; that screenshot, not motion/hash alone, must be inspected semantically before continuing.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
-        ToolDescriptor(name: "gui.tapObserve", summary: "Execute one bounded tap and immediately capture a fresh screenshot locally. This is a one-write micro-plan; the returned image must be interpreted before any dependent write.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
+        ToolDescriptor(name: "gui.tapObserve", summary: "Execute one bounded tap and immediately capture a fresh screenshot locally. Optional semanticTarget may name the visually grounded control (for example like) only when the current observation actually identifies it. This is a one-write micro-plan; the returned image must be interpreted before any dependent write.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.touch.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.typeObserve", summary: "Execute one bounded text-input action and immediately capture a fresh screenshot locally. This is a one-write micro-plan; do not send or perform another dependent write before interpreting the returned image.", risk: .sensitiveWrite, requiredCapabilities: [GUIAutomationFeature.textInput.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.scrollObserve", summary: "Execute one bounded scroll and immediately capture a fresh screenshot locally. This is a one-write micro-plan; interpret the returned image before another dependent write.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
         ToolDescriptor(name: "gui.swipeObserve", summary: "Execute one bounded swipe using screen-point coordinates and immediately capture a fresh screenshot locally. duration is seconds (0.05–5.0; typically about 0.3). This is a one-write micro-plan; interpret the returned image before another dependent write.", risk: .safeWrite, requiredCapabilities: [GUIAutomationFeature.gestures.capabilityID, GUIAutomationFeature.screenshot.capabilityID], preferredRoute: .guiFallback),
@@ -1074,7 +1182,7 @@ public actor ToolRouter {
         let executionMS = max(0, Int(now.timeIntervalSince(executorStartedAt) * 1_000))
         let totalMS = max(0, Int(now.timeIntervalSince(executionStartedAt) * 1_000))
         let payload = result?.payload ?? [:]
-        let axToolNames: Set<String> = ["gui.tree", "gui.findElement", "gui.waitForElement", "gui.tapElementObserve", "gui.typeElementObserve", "gui.runStructuredPlan", "gui.verify"]
+        let axToolNames: Set<String> = ["gui.tree", "gui.findElement", "gui.waitForElement", "gui.tapElementObserve", "gui.typeElementObserve", "gui.verify"]
         let axAttempted = Self.payloadBool(payload["perceptionAXAttempted"])
             ?? (axToolNames.contains(call.name) ? true : nil)
         await executionPathMetrics.record(ExecutionPathMetric(
@@ -1125,7 +1233,7 @@ public actor ToolRouter {
             "totalLatencyMS": String(max(0, Int(now.timeIntervalSince(executionStartedAt) * 1_000))),
             "verification": verification.map { $0.passed ? "passed" : "failed" } ?? "none"
         ]
-        let axToolNames: Set<String> = ["gui.tree", "gui.findElement", "gui.waitForElement", "gui.tapElementObserve", "gui.typeElementObserve", "gui.runStructuredPlan", "gui.verify"]
+        let axToolNames: Set<String> = ["gui.tree", "gui.findElement", "gui.waitForElement", "gui.tapElementObserve", "gui.typeElementObserve", "gui.verify"]
         if axToolNames.contains(toolName) {
             metadata["perceptionAXAttempted"] = result?.payload["perceptionAXAttempted"] ?? "true"
             metadata["axLatencyMS"] = result?.payload["axLatencyMS"] ?? metadata["executionLatencyMS"] ?? "0"
@@ -1139,6 +1247,12 @@ public actor ToolRouter {
                 "axScope", "axBackend", "axStage", "axNodeCount", "axErrorDomain", "axErrorCode", "axLatencyMS",
                 "foregroundBundleID", "foregroundVerified", "appVersion", "effectVerification", "localObservation",
                 "localVisionOCR", "localVisionElementCount", "localVisionCoordinateSpace", "localVisionLatencyMS", "localVisionRegion", "localVisionBackend",
+                "localVisionCacheHit", "localVisionRequestCoalesced", "localVisionRecognitionLevel", "localVisionMinimumTextHeight", "localVisionPass",
+                "localVisionRecognitionInvocationCount", "localVisionHelperInvocationCount", "localVisionCacheReuseCount",
+                "localVisionCacheReuseRejectionCount", "localVisionRequestCoalescedCount", "localVisionCacheReuseReason",
+                "localVisionRequestLatencyMS", "localVisionFrameFingerprint", "localVisionFrameBytes", "localVisionFrameWidth", "localVisionFrameHeight",
+                "localVisionRequestedMaximumElements", "localVisionEffectiveMaximumElements", "localVisionMaximumElementsCapped",
+                "localVisionRecognitionCapacity", "localVisionRecognitionElementCount",
                 "localVisionFailureClass", "localVisionErrorDomain", "localVisionErrorCode", "localVisionPrimaryErrorDomain", "localVisionPrimaryErrorCode", "localVisionFallbackUsed",
                 "localVisionSecondaryBackend", "localVisionSecondaryStatus", "localVisionSecondaryErrorDomain", "localVisionSecondaryErrorCode",
                 "screenPointWidth", "screenPointHeight", "keyboardLikely", "focusStrategy", "textInputSafety",

@@ -49,6 +49,10 @@ private final class CloudCodeAppLauncher: ObservableObject {
         guard !didStart else { return }
         didStart = true
 
+        // RootHelper PC control is opt-in: PCControlBootstrap itself requires the explicit
+        // --pc-control-bridge launch argument. Ordinary user launches expose no listener.
+        PCControlBootstrap.startIfNeeded()
+
         // Render and commit a minimal SwiftUI shell before constructing the full runtime graph.
         // A single Task.yield() is not a first-frame guarantee: the main actor may resume before
         // CoreAnimation commits anything to screen. Keep a short launch-safe window so a device

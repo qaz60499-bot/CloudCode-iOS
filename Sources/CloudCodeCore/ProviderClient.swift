@@ -5,6 +5,36 @@ import FoundationNetworking
 #endif
 
 public enum ProviderEndpointPolicy {
+    public static func isOfficialGeminiAPI(_ url: URL) -> Bool {
+        url.host?.lowercased() == "generativelanguage.googleapis.com"
+    }
+
+    public static func normalizedModelID(_ model: String, for url: URL) -> String {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isOfficialGeminiAPI(url), trimmed.hasPrefix("models/") else { return trimmed }
+        return String(trimmed.dropFirst("models/".count))
+    }
+
+    public static func geminiNativeModelsURL() -> URL {
+        URL(string: "https://generativelanguage.googleapis.com/v1beta/models")!
+    }
+
+    public static func geminiNativeGenerateURL(model: String, streaming: Bool) throws -> URL {
+        let normalized = model.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "^models/", with: "", options: .regularExpression)
+        guard !normalized.isEmpty else { throw ProviderError.invalidEndpoint }
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._"))
+        guard normalized.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { throw ProviderError.invalidEndpoint }
+        let method = streaming ? "streamGenerateContent" : "generateContent"
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "generativelanguage.googleapis.com"
+        components.path = "/v1beta/models/\(normalized):\(method)"
+        if streaming { components.queryItems = [URLQueryItem(name: "alt", value: "sse")] }
+        guard let url = components.url else { throw ProviderError.invalidEndpoint }
+        return url
+    }
+
     public static func allowsBaseURL(_ url: URL) -> Bool {
         guard url.scheme?.lowercased() == "https",
               let host = url.host?.lowercased(),
@@ -15,6 +45,19 @@ public enum ProviderEndpointPolicy {
               url.fragment == nil else { return false }
         let loopbackHosts: Set<String> = ["localhost", "127.0.0.1", "::1", "[::1]"]
         return !loopbackHosts.contains(host)
+    }
+
+    public static func normalizedKnownProviderBaseURL(_ url: URL) -> URL {
+        guard allowsBaseURL(url),
+              let host = url.host?.lowercased(),
+              host == "app.cline.bot" || host == "api.cline.bot" else { return url }
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.scheme = "https"
+        components?.host = "api.cline.bot"
+        components?.path = "/api/v1"
+        components?.query = nil
+        components?.fragment = nil
+        return components?.url ?? URL(string: "https://api.cline.bot/api/v1")!
     }
 }
 
@@ -348,10 +391,78 @@ public enum ProviderError: Error, Equatable, CustomStringConvertible {
     }
 }
 
+private enum ProviderStreamFailureCause: String, Equatable {
+    case transport
+    case parserMalformed = "parser_malformed"
+    case missingTerminal = "missing_terminal"
+    case upstreamEvent = "upstream_event"
+}
+
+private enum ProviderRequestPayloadLimit {
+    static let bytes = 8 * 1024 * 1024
+}
+
+private func providerStreamFailureCause(for error: Error) -> ProviderStreamFailureCause {
+    if let providerError = error as? ProviderError {
+        switch providerError {
+        case .malformedEvent:
+            return .parserMalformed
+        case .protocolIncompatible(_):
+            return .upstreamEvent
+        case .transport(_):
+            return .transport
+        default:
+            return .transport
+        }
+    }
+
+    let nsError = error as NSError
+    if error is URLError || nsError.domain == NSURLErrorDomain {
+        return .transport
+    }
+    if error is DecodingError || nsError.domain == NSCocoaErrorDomain {
+        return .parserMalformed
+    }
+    return .transport
+}
+
+private func logProviderStreamFailureCause(
+    _ cause: ProviderStreamFailureCause,
+    underlyingError: Error? = nil,
+    diagnosticLogger: DiagnosticLogStore?
+) async {
+    guard let diagnosticLogger else { return }
+    var metadata = ["cause": cause.rawValue]
+    if let underlyingError,
+       !(underlyingError is ProviderError),
+       (cause == .transport || cause == .parserMalformed) {
+        let nsError = underlyingError as NSError
+        metadata["errorDomain"] = String(nsError.domain.prefix(128))
+        metadata["errorCode"] = String(nsError.code)
+    } else if let providerError = underlyingError as? ProviderError {
+        switch providerError {
+        case .malformedEvent:
+            metadata["errorType"] = "malformed_event"
+        case .transport(_):
+            metadata["errorType"] = "transport"
+        default:
+            break
+        }
+    }
+    try? await diagnosticLogger.log(
+        level: .warning,
+        subsystem: "provider",
+        action: "request.stream-cause",
+        result: cause.rawValue,
+        metadata: metadata
+    )
+}
+
 public enum ProviderEvent: Sendable, Equatable {
     case status(String)
     case token(String)
     case toolCall(id: String, name: String, argumentsJSON: String)
+    case toolCallWithMetadata(id: String, name: String, argumentsJSON: String, metadata: [String: String])
     case finished
 }
 
@@ -379,6 +490,21 @@ public struct ProviderToolSchema: Sendable, Equatable {
             "required": required,
             "additionalProperties": false
         ]
+    }
+
+    fileprivate var geminiParametersObject: [String: Any] {
+        var propertyObject: [String: Any] = [:]
+        for (name, type) in properties {
+            propertyObject[name] = ["type": type]
+        }
+        var result: [String: Any] = [
+            "type": "object",
+            "properties": propertyObject
+        ]
+        if !required.isEmpty {
+            result["required"] = required
+        }
+        return result
     }
 
     fileprivate var openAIChatObject: [String: Any] {
@@ -751,7 +877,7 @@ private enum ProviderImageProbeClassifier {
             // inference completion/stream envelope from the exact API endpoint before promoting
             // this route to image-supported.
             let successMarkers = [
-                "\"choices\"", "\"message_start\"", "\"message_stop\"", "\"content_block_",
+                "\"choices\"", "\"candidates\"", "\"message_start\"", "\"message_stop\"", "\"content_block_",
                 "\"response.completed\"", "\"response.output_", "data: [done]"
             ]
             let errorMarkers = ["\"error\"", "event: error", "\"type\":\"error\""]
@@ -788,12 +914,22 @@ private extension ProviderRequestBuilding {
         if cached.source != "unprobed" { return cached }
 
         do {
-            let modelsURL = try ProviderEndpoint.endpoint(baseURL: configuration.baseURL, path: "models")
+            let isOfficialGemini = ProviderEndpointPolicy.isOfficialGeminiAPI(configuration.baseURL)
+            let modelsURL: URL
+            if isOfficialGemini {
+                modelsURL = ProviderEndpointPolicy.geminiNativeModelsURL()
+            } else {
+                modelsURL = try ProviderEndpoint.endpoint(baseURL: configuration.baseURL, path: "models")
+            }
             var request = URLRequest(url: modelsURL)
             request.httpMethod = "GET"
             request.setValue("application/json", forHTTPHeaderField: "Accept")
-            ProviderCompatibilityHeaders.apply(to: &request)
-            applyProviderProbeAuth(apiKey, configuration: configuration, request: &request)
+            if isOfficialGemini {
+                request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+            } else {
+                ProviderCompatibilityHeaders.apply(to: &request)
+                applyProviderProbeAuth(apiKey, configuration: configuration, request: &request)
+            }
             request.timeoutInterval = 6
             let (data, response) = try await session.data(for: request)
             if let http = response as? HTTPURLResponse,
@@ -934,6 +1070,23 @@ private extension ProviderRequestBuilding {
                     var endpoint = (configuration.baseURL.host ?? "") + configuration.baseURL.path
                     do {
                         let request = try makeRequest(configuration: requestConfiguration, apiKey: apiKey, messages: requestMessages, tools: requestTools)
+                        let requestBodyBytes = request.httpBody?.count ?? 0
+                        guard requestBodyBytes <= ProviderRequestPayloadLimit.bytes else {
+                            try? await diagnosticLogger?.log(
+                                level: .error,
+                                subsystem: "provider",
+                                action: "request.payload-limit",
+                                result: "rejected",
+                                metadata: [
+                                    "providerPayloadBytes": String(requestBodyBytes),
+                                    "providerPayloadLimitBytes": String(ProviderRequestPayloadLimit.bytes),
+                                    "providerID": configuration.providerID ?? "",
+                                    "model": configuration.model
+                                ]
+                            )
+                            continuation.finish(throwing: ProviderError.transport("Provider request exceeds bounded payload limit"))
+                            return
+                        }
                         endpoint = (request.url?.host ?? configuration.baseURL.host ?? "") + (request.url?.path ?? configuration.baseURL.path)
                         try? await diagnosticLogger?.log(
                             level: .info,
@@ -952,7 +1105,7 @@ private extension ProviderRequestBuilding {
                                 "endpointPath": request.url?.path ?? configuration.baseURL.path,
                                 "endpoint": endpoint,
                                 "transportState": "connecting",
-                                "requestBodyBytes": String(request.httpBody?.count ?? 0),
+                                "requestBodyBytes": String(requestBodyBytes),
                                 "messageCount": String(requestMessages.count),
                                 "toolCount": String(requestTools.count),
                                 "gatewayRecoveryCompacted": didCompactContextForGatewayRecovery ? "true" : "false"
@@ -1033,7 +1186,23 @@ private extension ProviderRequestBuilding {
                             )
                             if !didCompactContextForGatewayRecovery, genericContextRecovery || agentRouterEnvelopeRecovery {
                                 didCompactContextForGatewayRecovery = true
-                                requestMessages = HarnessContextManager.providerMessages(from: messages, policy: .gatewayRecovery)
+                                let semanticProgress = messages.filter {
+                                    $0.providerMetadata["context_layer"] == "checkpoint_semantic_progress"
+                                }.map(\.content).joined(separator: "\n")
+                                let recoveryContext = HarnessContextManager.providerContext(
+                                    from: messages.filter { $0.providerMetadata["context_layer"] != "checkpoint_semantic_progress" },
+                                    policy: .gatewayRecovery,
+                                    semanticProgress: semanticProgress
+                                )
+                                guard recoveryContext.isWithinBudget else {
+                                    try? await diagnosticLogger?.log(level: .error, subsystem: "provider",
+                                        action: "request.context-limit", result: "rejected",
+                                        metadata: ["contextCompressionReason": recoveryContext.compressionReason,
+                                                   "providerContextEstimatedCharacters": String(recoveryContext.estimatedCharacters)])
+                                    continuation.finish(throwing: ProviderError.transport("Gateway recovery context exceeds bounded payload limit"))
+                                    return
+                                }
+                                requestMessages = recoveryContext.messages
                                 if agentRouterEnvelopeRecovery {
                                     requestTools = ProviderCompatibilityClassifier.recoveryToolSchemas(from: tools, messages: messages)
                                 }
@@ -1304,6 +1473,28 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
     }
 
     fileprivate func makeRequest(configuration: ProviderConfiguration, apiKey: String, messages: [ChatMessage], tools: [ProviderToolSchema]) throws -> URLRequest {
+        if ProviderEndpointPolicy.isOfficialGeminiAPI(configuration.baseURL) {
+            let url = try ProviderEndpointPolicy.geminiNativeGenerateURL(model: configuration.model, streaming: true)
+            var body: [String: Any] = ["contents": try geminiNativeContents(messages, model: configuration.model)]
+            let systemText = messages.filter { $0.role == .system }.map(\.content).filter { !$0.isEmpty }.joined(separator: "\n\n")
+            if !systemText.isEmpty {
+                body["systemInstruction"] = ["parts": [["text": systemText]]]
+            }
+            if !tools.isEmpty {
+                body["tools"] = [["functionDeclarations": tools.map { tool in
+                    ["name": tool.name, "description": tool.description, "parameters": tool.geminiParametersObject]
+                }]]
+            }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("text/event-stream, application/json", forHTTPHeaderField: "Accept")
+            request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            request.timeoutInterval = 120
+            return request
+        }
+
         let url = try ProviderEndpoint.endpoint(baseURL: configuration.baseURL, path: "chat/completions")
         var body: [String: Any] = [
             "model": configuration.model,
@@ -1322,6 +1513,7 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
 
     fileprivate func consume(lines: AsyncThrowingStream<String, Error>, continuation: AsyncThrowingStream<ProviderEvent, Error>.Continuation) async throws -> Bool {
         var toolCallState: [Int: ToolCallAccumulator] = [:]
+        var geminiToolCallGroupID: String?
         var sawEvent = false
         var terminal = false
         var outputStarted = false
@@ -1335,8 +1527,59 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
                     break
                 }
                 guard let data = payload.data(using: .utf8),
-                      let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let choices = object["choices"] as? [[String: Any]],
+                      let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+
+                if let errorObject = object["error"] {
+                    if outputStarted {
+                        await logProviderStreamFailureCause(.upstreamEvent, diagnosticLogger: diagnosticLogger)
+                        throw ProviderError.streamInterrupted
+                    }
+                    let detail = providerErrorDetail(from: errorObject) ?? "Gemini 原生接口返回错误"
+                    throw ProviderError.protocolIncompatible(detail)
+                }
+
+                if let candidates = object["candidates"] as? [[String: Any]], let candidate = candidates.first {
+                    sawEvent = true
+                    if let content = candidate["content"] as? [String: Any],
+                       let parts = content["parts"] as? [[String: Any]] {
+                        for part in parts {
+                            if let text = part["text"] as? String, !text.isEmpty {
+                                outputStarted = true
+                                continuation.yield(.token(text))
+                            }
+                            if let functionCall = part["functionCall"] as? [String: Any],
+                               let name = functionCall["name"] as? String,
+                               !name.isEmpty {
+                                let index = toolCallState.count
+                                var accumulator = ToolCallAccumulator()
+                                if let apiCallID = functionCall["id"] as? String, !apiCallID.isEmpty {
+                                    accumulator.id = apiCallID
+                                    accumulator.apiCallIDPresent = true
+                                } else {
+                                    accumulator.id = "gemini-call-\(index)"
+                                }
+                                accumulator.name = name
+                                accumulator.thoughtSignature = part["thoughtSignature"] as? String
+                                if let args = functionCall["args"], JSONSerialization.isValidJSONObject(args),
+                                   let argsData = try? JSONSerialization.data(withJSONObject: args),
+                                   let argsJSON = String(data: argsData, encoding: .utf8) {
+                                    accumulator.arguments = argsJSON
+                                } else {
+                                    accumulator.arguments = "{}"
+                                }
+                                toolCallState[index] = accumulator
+                                if geminiToolCallGroupID == nil { geminiToolCallGroupID = UUID().uuidString.lowercased() }
+                                outputStarted = true
+                            }
+                        }
+                    }
+                    if let finishReason = candidate["finishReason"] as? String, !finishReason.isEmpty {
+                        terminal = true
+                    }
+                    continue
+                }
+
+                guard let choices = object["choices"] as? [[String: Any]],
                       let choice = choices.first else { continue }
                 sawEvent = true
 
@@ -1385,15 +1628,42 @@ public struct OpenAICompatibleProviderClient: ProviderStreaming, Sendable, Provi
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            if outputStarted { throw ProviderError.streamInterrupted }
+            if outputStarted {
+                if (error as? ProviderError) != .streamInterrupted {
+                    await logProviderStreamFailureCause(
+                        providerStreamFailureCause(for: error),
+                        underlyingError: error,
+                        diagnosticLogger: diagnosticLogger
+                    )
+                }
+                throw ProviderError.streamInterrupted
+            }
             throw error
         }
         guard sawEvent else { throw ProviderError.malformedEvent }
-        guard terminal else { throw outputStarted ? ProviderError.streamInterrupted : ProviderError.malformedEvent }
+        guard terminal else {
+            if outputStarted {
+                await logProviderStreamFailureCause(.missingTerminal, diagnosticLogger: diagnosticLogger)
+                throw ProviderError.streamInterrupted
+            }
+            throw ProviderError.malformedEvent
+        }
         for index in toolCallState.keys.sorted() {
             if let call = toolCallState[index], !call.name.isEmpty {
                 guard !call.id.isEmpty else { throw ProviderError.malformedEvent }
-                continuation.yield(.toolCall(id: call.id, name: call.name, argumentsJSON: call.arguments.isEmpty ? "{}" : call.arguments))
+                let argumentsJSON = call.arguments.isEmpty ? "{}" : call.arguments
+                if let groupID = geminiToolCallGroupID {
+                    var metadata = [
+                        "gemini_call_group": groupID,
+                        "gemini_api_call_id_present": call.apiCallIDPresent ? "true" : "false"
+                    ]
+                    if let signature = call.thoughtSignature, !signature.isEmpty {
+                        metadata["gemini_thought_signature"] = signature
+                    }
+                    continuation.yield(.toolCallWithMetadata(id: call.id, name: call.name, argumentsJSON: argumentsJSON, metadata: metadata))
+                } else {
+                    continuation.yield(.toolCall(id: call.id, name: call.name, argumentsJSON: argumentsJSON))
+                }
             }
         }
         return outputStarted || !toolCallState.isEmpty
@@ -1493,7 +1763,10 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
                 }
 
                 if let errorObject = object["error"] {
-                    if outputStarted { throw ProviderError.streamInterrupted }
+                    if outputStarted {
+                        await logProviderStreamFailureCause(.upstreamEvent, diagnosticLogger: diagnosticLogger)
+                        throw ProviderError.streamInterrupted
+                    }
                     let detail = providerErrorDetail(from: errorObject) ?? "上游未提供可解析的错误详情"
                     throw ProviderError.protocolIncompatible(detail)
                 }
@@ -1582,11 +1855,26 @@ public struct AnthropicProviderClient: ProviderStreaming, Sendable, ProviderRequ
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            if outputStarted { throw ProviderError.streamInterrupted }
+            if outputStarted {
+                if (error as? ProviderError) != .streamInterrupted {
+                    await logProviderStreamFailureCause(
+                        providerStreamFailureCause(for: error),
+                        underlyingError: error,
+                        diagnosticLogger: diagnosticLogger
+                    )
+                }
+                throw ProviderError.streamInterrupted
+            }
             throw error
         }
         guard sawEvent else { throw ProviderError.malformedEvent }
-        guard terminal else { throw outputStarted ? ProviderError.streamInterrupted : ProviderError.malformedEvent }
+        guard terminal else {
+            if outputStarted {
+                await logProviderStreamFailureCause(.missingTerminal, diagnosticLogger: diagnosticLogger)
+                throw ProviderError.streamInterrupted
+            }
+            throw ProviderError.malformedEvent
+        }
         for index in calls.keys.sorted() {
             guard let call = calls[index], !call.id.isEmpty, !call.name.isEmpty else { throw ProviderError.malformedEvent }
             continuation.yield(.toolCall(id: call.id, name: call.name, argumentsJSON: call.arguments.isEmpty ? "{}" : call.arguments))
@@ -1709,6 +1997,7 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
                 let detail = providerErrorDetail(from: object["response"] ?? object["error"] ?? object)
                     ?? "上游未提供可解析的 Responses 错误详情"
                 if outputStarted {
+                    await logProviderStreamFailureCause(.upstreamEvent, diagnosticLogger: diagnosticLogger)
                     throw ProviderError.streamInterrupted
                 }
                 throw ProviderError.protocolIncompatible(detail)
@@ -1719,11 +2008,26 @@ public struct OpenAIResponsesProviderClient: ProviderStreaming, Sendable, Provid
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            if outputStarted { throw ProviderError.streamInterrupted }
+            if outputStarted {
+                if (error as? ProviderError) != .streamInterrupted {
+                    await logProviderStreamFailureCause(
+                        providerStreamFailureCause(for: error),
+                        underlyingError: error,
+                        diagnosticLogger: diagnosticLogger
+                    )
+                }
+                throw ProviderError.streamInterrupted
+            }
             throw error
         }
         guard sawEvent else { throw ProviderError.malformedEvent }
-        guard terminal else { throw outputStarted ? ProviderError.streamInterrupted : ProviderError.malformedEvent }
+        guard terminal else {
+            if outputStarted {
+                await logProviderStreamFailureCause(.missingTerminal, diagnosticLogger: diagnosticLogger)
+                throw ProviderError.streamInterrupted
+            }
+            throw ProviderError.malformedEvent
+        }
         for key in calls.keys.sorted() {
             guard let call = calls[key], !call.id.isEmpty, !call.name.isEmpty else { throw ProviderError.malformedEvent }
             continuation.yield(.toolCall(id: call.id, name: call.name, argumentsJSON: call.arguments.isEmpty ? "{}" : call.arguments))
@@ -2235,6 +2539,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                             result: "started",
                             metadata: [
                                 "providerID": configuration.providerID ?? "",
+                                "model": configuration.model,
                                 "host": baseURLCandidate.host ?? "",
                                 "baseURL": ProviderEndpointRoutingPolicy.normalizedOrigin(baseURLCandidate),
                                 "protocol": protocolCandidate.rawValue,
@@ -2257,7 +2562,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                                 case .token:
                                     emittedOutput = true
                                     emittedToken = true
-                                case .toolCall:
+                                case .toolCall, .toolCallWithMetadata:
                                     emittedOutput = true
                                     emittedToolCall = true
                                 case .finished:
@@ -2286,6 +2591,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                                 result: "completed",
                                 metadata: [
                                     "providerID": configuration.providerID ?? "",
+                                    "model": configuration.model,
                                     "host": baseURLCandidate.host ?? "",
                                     "baseURL": ProviderEndpointRoutingPolicy.normalizedOrigin(baseURLCandidate),
                                     "protocol": protocolCandidate.rawValue,
@@ -2308,7 +2614,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                             let hasAnotherProtocol = protocolIndex + 1 < orderedProtocols.count
                             let hasAnotherHost = baseURLIndex + 1 < orderedBaseURLs.count
                             let hasAnotherKey = keyIndex + 1 < keyCandidates.count
-                            let mayFallbackProtocol = !emittedOutput && hasAnotherProtocol && ProviderProtocolFallbackClassifier.shouldFallback(error)
+                            let mayFallbackProtocol = !emittedOutput && hasAnotherProtocol && ProviderProtocolFallbackClassifier.shouldFallback(error, providerID: configuration.providerID)
                             let mayFallbackHost = !emittedOutput && hasAnotherHost && ProviderHostFallbackClassifier.shouldFallback(error)
                             let mayRotateKey = !emittedOutput && hasAnotherKey && configuration.allowSameProviderKeyFailover == true && ProviderKeyRotationClassifier.shouldRotate(error)
                             if !emittedOutput && ProviderCompatibilityDriftClassifier.shouldDegradeProtocol(error) {
@@ -2333,6 +2639,7 @@ public struct ProviderClientRouter: ProviderStreaming, Sendable {
                                 error: error,
                                 metadata: [
                                     "providerID": configuration.providerID ?? "",
+                                    "model": configuration.model,
                                     "host": baseURLCandidate.host ?? "",
                                     "baseURL": ProviderEndpointRoutingPolicy.normalizedOrigin(baseURLCandidate),
                                     "protocol": protocolCandidate.rawValue,
@@ -2737,13 +3044,17 @@ public enum ProviderProtocolFallbackClassifier {
     /// Protocol failover is only allowed before any provider output. It is reserved for
     /// errors that can plausibly be route/protocol specific; credential/quota/rate-limit
     /// failures stay on the current protocol decision and move only through the Key pool.
-    public static func shouldFallback(_ error: Error) -> Bool {
+    ///
+    /// AgentRouter is the one deliberate exception for `clientRejected`: one compatibility
+    /// envelope/protocol can be rejected while the same Key×Host×model succeeds on the alternate
+    /// supported protocol. Treat that as route-scoped evidence, never as proof the model is down.
+    public static func shouldFallback(_ error: Error, providerID: String? = nil) -> Bool {
         guard let providerError = error as? ProviderError else { return false }
         switch providerError {
         case .modelUnavailable, .malformedEvent, .protocolIncompatible:
             return true
         case .clientRejected:
-            return false
+            return providerID == ProviderCatalog.agentRouterID
         case .invalidResponse(let code):
             return code == 400 || code == 404 || code == 405 || code == 422 || (500...599).contains(code)
         case .missingAPIKey, .invalidEndpoint, .authenticationFailed, .capacityExhausted,
@@ -2876,13 +3187,30 @@ enum ProviderEndpoint {
 
     static func endpoint(baseURL: URL, path: String) throws -> URL {
         guard ProviderEndpointPolicy.allowsBaseURL(baseURL) else { throw ProviderError.invalidEndpoint }
-        var baseComponents = baseURL.path
+        let routeBaseURL = ProviderEndpointPolicy.normalizedKnownProviderBaseURL(baseURL)
+        var baseComponents = routeBaseURL.path
             .split(separator: "/", omittingEmptySubsequences: true)
             .map(String.init)
         let requestedComponents = path
             .split(separator: "/", omittingEmptySubsequences: true)
             .map(String.init)
         guard !requestedComponents.isEmpty else { throw ProviderError.invalidEndpoint }
+
+        // Google exposes an official OpenAI-compatible Gemini API under /v1beta/openai.
+        // Treat that versioned compatibility prefix as the API root instead of blindly
+        // appending our ordinary /v1 suffix (which would produce the invalid
+        // /v1beta/openai/v1/... route). Also make the documented Google root usable as a
+        // convenience base URL so a valid Gemini API key is not rejected only because the
+        // compatibility prefix was omitted in UI configuration.
+        let host = routeBaseURL.host?.lowercased()
+        if ProviderEndpointPolicy.isOfficialGeminiAPI(routeBaseURL) {
+            // Treat every path on the official Gemini API host as input configuration, not as a
+            // trusted endpoint prefix. Users commonly paste the native REST root (/v1beta), a
+            // native models/generateContent URL, or the documented OpenAI compatibility root.
+            // Cloud Code's Network Provider speaks the OpenAI-compatible protocol, so normalize all
+            // of those historical/user-entered forms onto the one documented compatibility root.
+            baseComponents = ["v1beta", "openai"]
+        }
 
         if baseComponents.suffix(requestedComponents.count).elementsEqual(requestedComponents) {
             return baseURL
@@ -2891,11 +3219,15 @@ enum ProviderEndpoint {
             baseComponents.removeLast(suffix.count)
             break
         }
-        if baseComponents.last != "v1" {
+        let isGeminiOpenAICompatibilityRoot = host == "generativelanguage.googleapis.com"
+            && baseComponents.count >= 2
+            && baseComponents[0] == "v1beta"
+            && baseComponents[1] == "openai"
+        if baseComponents.last != "v1" && !isGeminiOpenAICompatibilityRoot {
             baseComponents.append("v1")
         }
         baseComponents.append(contentsOf: requestedComponents)
-        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+        guard var components = URLComponents(url: routeBaseURL, resolvingAgainstBaseURL: false) else {
             throw ProviderError.invalidEndpoint
         }
         components.path = "/" + baseComponents.joined(separator: "/")
@@ -2926,7 +3258,11 @@ enum ProviderCompatibilityHeaders {
 
 private enum ProviderRequestFactory {
     static func authMode(_ configuration: ProviderConfiguration) -> ProviderAuthMode {
-        ProviderAuthMode(rawValue: configuration.authModeName ?? "") ?? .bearer
+        // Google's official native Gemini API uses x-goog-api-key. The dedicated native request
+        // path sets that header directly; keep metadata/auth-state aligned so validation and UI do
+        // not preserve the old OpenAI-compatibility Bearer assumption.
+        if ProviderEndpointPolicy.isOfficialGeminiAPI(configuration.baseURL) { return .xAPIKey }
+        return ProviderAuthMode(rawValue: configuration.authModeName ?? "") ?? .bearer
     }
 
     static func jsonPOST(url: URL, apiKey: String, authMode: ProviderAuthMode, body: [String: Any]) throws -> URLRequest {
@@ -3044,6 +3380,134 @@ private func responsesImageContent(_ message: ChatMessage, attachments: [Provide
     return content
 }
 
+private func geminiNativeContents(_ messages: [ChatMessage], model: String) throws -> [[String: Any]] {
+    var result: [[String: Any]] = []
+    let requiresThoughtSignature = model.lowercased().contains("gemini-3")
+
+    func append(role: String, parts: [[String: Any]]) {
+        guard !parts.isEmpty else { return }
+        if let lastIndex = result.indices.last,
+           result[lastIndex]["role"] as? String == role,
+           var existing = result[lastIndex]["parts"] as? [[String: Any]] {
+            existing.append(contentsOf: parts)
+            result[lastIndex]["parts"] = existing
+            return
+        }
+        result.append(["role": role, "parts": parts])
+    }
+
+    func functionCallPart(_ message: ChatMessage, allowDummySignature: Bool) -> [String: Any]? {
+        guard message.role == .assistant,
+              let name = providerVisibleToolName(message) else { return nil }
+        let arguments = message.providerMetadata["tool_arguments"] ?? "{}"
+        let args: [String: Any]
+        if let data = arguments.data(using: .utf8),
+           let parsed = try? JSONSerialization.jsonObject(with: data),
+           let dictionary = parsed as? [String: Any] {
+            args = dictionary
+        } else {
+            args = [:]
+        }
+        var functionCall: [String: Any] = ["name": name, "args": args]
+        if message.providerMetadata["gemini_api_call_id_present"] == "true",
+           let callID = message.providerMetadata["tool_call_id"], !callID.isEmpty {
+            functionCall["id"] = callID
+        }
+        var part: [String: Any] = ["functionCall": functionCall]
+        if let signature = message.providerMetadata["gemini_thought_signature"], !signature.isEmpty {
+            part["thoughtSignature"] = signature
+        } else if requiresThoughtSignature && allowDummySignature {
+            // Existing sessions can contain tool-call history created before native Gemini routing,
+            // so no authentic Gemini signature exists for those injected blocks. Google's REST API
+            // explicitly documents this sentinel for transferred/manually constructed history.
+            part["thoughtSignature"] = "skip_thought_signature_validator"
+        }
+        return part
+    }
+
+    func functionResponsePart(_ message: ChatMessage, apiCallIDPresent: Bool) -> [String: Any]? {
+        guard message.role == .tool,
+              let name = providerVisibleToolName(message) else { return nil }
+        var responseObject: [String: Any] = ["result": message.content]
+        if let data = message.content.data(using: .utf8),
+           let parsed = try? JSONSerialization.jsonObject(with: data),
+           let dictionary = parsed as? [String: Any] {
+            responseObject = dictionary
+        }
+        var functionResponse: [String: Any] = ["name": name, "response": responseObject]
+        if apiCallIDPresent,
+           let callID = message.providerMetadata["tool_call_id"], !callID.isEmpty {
+            functionResponse["id"] = callID
+        }
+        return ["functionResponse": functionResponse]
+    }
+
+    var groupedCallIDs = Set<String>()
+    for message in messages where message.role == .assistant {
+        guard message.providerMetadata["gemini_call_group"] != nil,
+              let callID = message.providerMetadata["tool_call_id"], !callID.isEmpty else { continue }
+        groupedCallIDs.insert(callID)
+    }
+    var emittedGroups = Set<String>()
+
+    for message in messages where message.role != .system {
+        if message.role == .assistant,
+           let groupID = message.providerMetadata["gemini_call_group"], !groupID.isEmpty {
+            guard emittedGroups.insert(groupID).inserted else { continue }
+            let groupedCalls = messages.filter {
+                $0.role == .assistant && $0.providerMetadata["gemini_call_group"] == groupID
+            }
+            var callParts: [[String: Any]] = []
+            var responseParts: [[String: Any]] = []
+            var apiIDByCallID: [String: Bool] = [:]
+            for call in groupedCalls {
+                if let part = functionCallPart(call, allowDummySignature: false) { callParts.append(part) }
+                if let callID = call.providerMetadata["tool_call_id"] {
+                    apiIDByCallID[callID] = call.providerMetadata["gemini_api_call_id_present"] == "true"
+                }
+            }
+            for candidate in messages where candidate.role == .tool {
+                guard let callID = candidate.providerMetadata["tool_call_id"],
+                      let apiIDPresent = apiIDByCallID[callID] else { continue }
+                if let part = functionResponsePart(candidate, apiCallIDPresent: apiIDPresent) {
+                    responseParts.append(part)
+                }
+            }
+            append(role: "model", parts: callParts)
+            append(role: "user", parts: responseParts)
+            continue
+        }
+
+        if message.role == .tool,
+           let callID = message.providerMetadata["tool_call_id"],
+           groupedCallIDs.contains(callID) {
+            continue
+        }
+
+        if message.role == .tool {
+            if let part = functionResponsePart(message, apiCallIDPresent: false) {
+                append(role: "user", parts: [part])
+            }
+            continue
+        }
+
+        if message.role == .assistant, providerVisibleToolName(message) != nil {
+            if let part = functionCallPart(message, allowDummySignature: true) { append(role: "model", parts: [part]) }
+            continue
+        }
+
+        let role = message.role == .assistant ? "model" : "user"
+        let attachments = try providerImageAttachments(message)
+        var parts: [[String: Any]] = []
+        if !message.content.isEmpty { parts.append(["text": message.content]) }
+        parts.append(contentsOf: attachments.map { attachment in
+            ["inlineData": ["mimeType": attachment.mimeType, "data": attachment.base64]]
+        })
+        append(role: role, parts: parts)
+    }
+    return result
+}
+
 private func openAIMessageObject(_ message: ChatMessage) throws -> [String: Any] {
     var object: [String: Any] = ["role": message.role.rawValue]
     let attachments = try providerImageAttachments(message)
@@ -3157,4 +3621,6 @@ private struct ToolCallAccumulator: Sendable {
     var id = ""
     var name = ""
     var arguments = ""
+    var thoughtSignature: String?
+    var apiCallIDPresent = false
 }

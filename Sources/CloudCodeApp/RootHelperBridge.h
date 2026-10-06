@@ -1,10 +1,17 @@
 #import <Foundation/Foundation.h>
+#import "IOSSystemBridge.h"
 
 NS_ASSUME_NONNULL_BEGIN
+
+FOUNDATION_EXPORT NSString *CloudCodeVisionProbeJSON(NSData *jpeg, NSString *initializer, NSString *language, BOOL cpuOnly, double pointWidth, double pointHeight);
+FOUNDATION_EXPORT NSString * _Nullable CloudCodeHostAXTreeJSON(NSString * _Nullable * _Nullable diagnostic);
+FOUNDATION_EXPORT NSString * _Nullable CloudCodeHostAXProbeJSON(NSString * _Nullable * _Nullable diagnostic);
+FOUNDATION_EXPORT NSString * _Nullable CloudCodeHostAXFocusedTextInputJSON(NSString * _Nullable * _Nullable diagnostic);
 
 FOUNDATION_EXPORT NSInteger CloudCodeSpawnRootHelper(NSString *path, NSArray<NSString *> *arguments);
 FOUNDATION_EXPORT NSInteger CloudCodeSpawnRootHelperWithOutput(NSString *path, NSArray<NSString *> *arguments, NSString * _Nullable * _Nullable diagnostic);
 FOUNDATION_EXPORT NSInteger CloudCodeSpawnHelperWithOutput(NSString *path, NSArray<NSString *> *arguments, BOOL asRoot, NSTimeInterval timeout, NSString * _Nullable * _Nullable diagnostic);
 FOUNDATION_EXPORT NSInteger CloudCodeSpawnHelperWithSeparatedOutput(NSString *path, NSArray<NSString *> *arguments, BOOL asRoot, NSTimeInterval timeout, NSString * _Nullable * _Nullable standardOutput, NSString * _Nullable * _Nullable standardError);
+FOUNDATION_EXPORT NSInteger CloudCodeSpawnHelperWithSeparatedOutputCancellable(NSString *path, NSArray<NSString *> *arguments, BOOL asRoot, NSTimeInterval timeout, BOOL (^ _Nullable cancellationPredicate)(void), NSString * _Nullable * _Nullable standardOutput, NSString * _Nullable * _Nullable standardError);
 
 NS_ASSUME_NONNULL_END
