@@ -1272,7 +1272,7 @@ public actor AgentCore {
                         let completedRepeatedSwipeCountBeforeRound = completedRepeatedSwipeCount
                         var assistantText = ""
                         let partialAssistantMessageID = UUID()
-                        var lastPartialSaveAt = Date.distantPast
+                        var lastPartialSaveAt = Date()
                         var lastPartialSavedBytes = 0
                         var providerToolCalls: [(String, String, String, [String: String])] = []
                         var providerToolCallIDs = Set<String>()
@@ -1642,8 +1642,8 @@ public actor AgentCore {
                                     assistantText += token
                                     continuation.yield(.token(token))
                                     let partialBytes = assistantText.utf8.count
-                                    if Date().timeIntervalSince(lastPartialSaveAt) >= 0.75
-                                        || partialBytes - lastPartialSavedBytes >= 16_384 {
+                                    if Date().timeIntervalSince(lastPartialSaveAt) >= 1.5
+                                        || partialBytes - lastPartialSavedBytes >= 65_536 {
                                         ProviderContinuationBoundary.record(text: assistantText, messageID: partialAssistantMessageID,
                                             session: &session, payload: &checkpoint.payload, interrupted: true)
                                         try await sessionStore.save(session)
