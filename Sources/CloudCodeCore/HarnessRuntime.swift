@@ -452,6 +452,8 @@ public enum HarnessContextManager {
 
     static func scopedProviderToolNames(for request: String, availableNames: Set<String>) -> Set<String> {
         let normalized = request.lowercased()
+        let explicitlyRequestsRawAXTree = ["gui.tree", "accessibility tree", "ax tree", "无障碍树", "辅助功能树"]
+            .contains(where: normalized.contains)
         var prefixes = Set<String>()
 
         let guiMarkers = [
@@ -487,7 +489,11 @@ public enum HarnessContextManager {
             prefixes.formUnion(["cli.", "advanced.", "capability."])
         }
 
-        guard !prefixes.isEmpty else { return availableNames }
+        guard !prefixes.isEmpty else {
+            var unscoped = availableNames
+            if !explicitlyRequestsRawAXTree { unscoped.remove("gui.tree") }
+            return unscoped
+        }
         var scoped = Set(availableNames.filter { name in prefixes.contains(where: name.hasPrefix) })
 
         if isGUIRequest {
@@ -531,6 +537,11 @@ public enum HarnessContextManager {
             }
             scoped = scoped.intersection(guiFastPath)
         }
+
+        // Raw AX tree access is a low-level diagnostic surface. Keep the bounded AX backend and
+        // query-scoped semantic tools available, but do not advertise raw gui.tree to ordinary
+        // Provider planning unless the user explicitly requested AX/accessibility-tree diagnosis.
+        if !explicitlyRequestsRawAXTree { scoped.remove("gui.tree") }
 
         // Failure explanation is a local read-only introspection tool and remains useful even when
         // the provider schema is domain-scoped. It never broadens execution authority.

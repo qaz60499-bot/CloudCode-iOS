@@ -7202,6 +7202,28 @@ final class CloudCodeCoreTests: XCTestCase {
         XCTAssertEqual(unknown, available)
     }
 
+    func testHarnessHidesRawAXTreeUnlessExplicitlyRequested() {
+        let available: Set<String> = [
+            "apps.launch", "gui.screenshot", "gui.tree", "gui.findElement",
+            "gui.waitForElement", "gui.tapElementObserve", "gui.tapObserve", "capability.probe"
+        ]
+
+        let ordinary = HarnessContextManager.scopedProviderToolNames(
+            for: "打开微信找到发送按钮",
+            availableNames: available
+        )
+        XCTAssertFalse(ordinary.contains("gui.tree"))
+        XCTAssertTrue(ordinary.contains("gui.findElement"))
+        XCTAssertTrue(ordinary.contains("gui.waitForElement"))
+        XCTAssertTrue(ordinary.contains("gui.tapElementObserve"))
+
+        let explicit = HarnessContextManager.scopedProviderToolNames(
+            for: "读取当前 gui.tree 做 AX tree 诊断",
+            availableNames: available
+        )
+        XCTAssertTrue(explicit.contains("gui.tree"))
+    }
+
     func testHarnessProvidesNativeDeviceAndIPAPipelineHints() {
         let native = HarnessContextManager.executionHint(from: [
             ChatMessage(role: .user, content: "修改这个应用容器里的配置文件")
