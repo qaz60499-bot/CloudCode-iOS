@@ -1,0 +1,32 @@
+name: Send Fast Path Benchmark
+
+on:
+  push:
+    branches: [diag/build173-diagnostic-log-ab-20261005]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Show Swift
+        run: swift --version
+
+      - name: Resolve pinned package
+        run: |
+          set -euo pipefail
+          swift package resolve
+
+      - name: Benchmark immediate-provider send fast path
+        run: |
+          set -euo pipefail
+          swift test --filter SendFastPathPerformanceTests
+          swift test --skip-build --filter Build169AgentContinuationTests
+          swift test --skip-build --filter ProviderContinuationBoundaryTests
