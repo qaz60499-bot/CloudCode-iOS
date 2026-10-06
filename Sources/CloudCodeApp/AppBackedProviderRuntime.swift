@@ -955,7 +955,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
         let capturedAt = Date()
         let demandedSelectors = selectors ?? []
         let hasSemanticSelector = demandedSelectors.contains { Self.isSemanticSelector($0) }
-        let shouldReadAX = ProductionPerceptionPolicy.accessibilityRuntimeAllowed
+        let shouldReadAX = ProductionPerceptionPolicy.boundedSemanticReadAllowed
             && (hasSemanticSelector || requireAXText)
         var axElements: [LocalPerceptionTextElement] = []
         var axMatches: [GUIElementMatch] = []
@@ -1292,7 +1292,7 @@ public actor AppBackedProviderRuntime: AppBackedProviderStreaming {
             let started = Date()
             switch extractor.kind {
             case .axText:
-                guard ProductionPerceptionPolicy.accessibilityRuntimeAllowed else { continue }
+                guard ProductionPerceptionPolicy.boundedSemanticReadAllowed else { continue }
                 let text = extractionObservation.axElements.map(\.text).joined(separator: "\n")
                 if let bound = Self.boundText(text, expectedTag: expectedTag), bound.count >= extractor.minimumCharacters {
                     await learningStore.record(packageID: package.summary.id, selectorKey: "extractor.ax", success: true, appVersion: appVersion, latencyMS: Int(Date().timeIntervalSince(started) * 1_000))
