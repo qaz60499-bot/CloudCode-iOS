@@ -9,9 +9,11 @@ final class ToolPlanRepeatGuardTests: XCTestCase {
             previouslyBlocked: ["tap"], containsMutation: true, finiteRepeatHasVerifiedProgress: false), .stop)
     }
 
-    func testRepeatedReadChangesRouteWithoutRepeatingOCR() {
-        XCTAssertEqual(ToolPlanRepeatGuard.decision(signature: "ocr", lastExecutedSignature: "ocr",
-            previouslyBlocked: [], containsMutation: false, finiteRepeatHasVerifiedProgress: false), .changeReadRoute)
+    func testRepeatedReadRemainsAvailableForFreshObservation() {
+        XCTAssertEqual(ToolPlanRepeatGuard.decision(signature: "screenshot", lastExecutedSignature: "screenshot",
+            previouslyBlocked: [], containsMutation: false, finiteRepeatHasVerifiedProgress: false), .execute)
+        XCTAssertEqual(ToolPlanRepeatGuard.decision(signature: "screenshot", lastExecutedSignature: "screenshot",
+            previouslyBlocked: ["screenshot"], containsMutation: false, finiteRepeatHasVerifiedProgress: false), .execute)
     }
 
     func testOnlyVerifiedBoundedFiniteProgressPermitsIntentionalRepetition() {

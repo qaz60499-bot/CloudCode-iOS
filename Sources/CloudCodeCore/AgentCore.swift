@@ -1117,7 +1117,9 @@ public actor AgentCore {
                     var lastExecutedPlanHash = checkpoint.payload["orchestration.lastPlanHash"]
                     var lastPlanFiniteProgress = checkpoint.payload["orchestration.lastPlanFiniteProgress"] == "true"
                     var blockedPlanHashes = Set((checkpoint.payload["orchestration.blockedPlanHashes"] ?? "").split(separator: ",").map(String.init))
-                    var blockedReadToolNames = Set((checkpoint.payload["orchestration.blockedReadToolNames"] ?? "").split(separator: ",").map(String.init))
+                    // Build169 persisted read-tool bans across resume. Read-only observations are
+                    // safe to repeat and may change asynchronously, so migrate that stale state out.
+                    checkpoint.payload.removeValue(forKey: "orchestration.blockedReadToolNames")
                     var circuitRequestFingerprint = checkpoint.payload["orchestration.requestFingerprint"]
                         ?? TaskContract.fingerprint(for: activeRequest)
                     var guiTreeFailedForCurrentForegroundState = false
@@ -1261,7 +1263,6 @@ public actor AgentCore {
                             lastExecutedPlanHash = nil
                             lastPlanFiniteProgress = false
                             blockedPlanHashes.removeAll()
-                            blockedReadToolNames.removeAll()
                             circuitRequestFingerprint = roundRequestFingerprint
                             for key in ["orchestration.lastPlanHash", "orchestration.lastPlanFiniteProgress",
                                         "orchestration.blockedPlanHashes", "orchestration.blockedReadToolNames"] {
@@ -1320,12 +1321,6 @@ public actor AgentCore {
                             ))
                         }
                         var roundDescriptors = providerDescriptors
-                        if !blockedReadToolNames.isEmpty {
-                            roundDescriptors.removeAll { blockedReadToolNames.contains($0.name) }
-                            providerContextMessages.append(ChatMessage(role: .system,
-                                content: "The identical read plan produced no verified progress. Its route is temporarily blocked: \(blockedReadToolNames.sorted().joined(separator: ", ")). Use existing fresh observation/OCR evidence or a different deterministic route. Do not repeat a click to break this circuit.",
-                                providerMetadata: ["context_layer": "orchestration_circuit_breaker"]))
-                        }
                         var learnedAXAvoidanceActive = false
                         if let observationBundleID = currentGUIBundleID ?? lastAcceptedUnverifiedLaunchBundleID,
                            let interactionExperienceStore {
@@ -1968,15 +1963,6 @@ public actor AgentCore {
                             break
                         case .stop:
                             throw AgentRunError.orchestrationStopped("相同无进展计划在 observation/reconcile 后仍被重复提出；已阻止重复状态变更并保留检查点。")
-                        case .changeReadRoute:
-                            blockedPlanHashes.insert(proposedPlanHash)
-                            blockedReadToolNames.formUnion(proposedNames)
-                            checkpoint.payload["orchestration.blockedPlanHashes"] = blockedPlanHashes.sorted().joined(separator: ",")
-                            checkpoint.payload["orchestration.blockedReadToolNames"] = blockedReadToolNames.sorted().joined(separator: ",")
-                            checkpoint.updatedAt = Date()
-                            try await checkpointStore.upsert(checkpoint)
-                            continuation.yield(.status("重复读取没有验证到新进度；已在第二次计划时切换策略，复用现有观察并暂停原读取路由。"))
-                            continue
                         case .reconcileBeforeMutation:
                             blockedPlanHashes.insert(proposedPlanHash)
                             checkpoint.payload["orchestration.blockedPlanHashes"] = blockedPlanHashes.sorted().joined(separator: ",")
