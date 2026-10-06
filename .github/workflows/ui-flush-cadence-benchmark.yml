@@ -1,0 +1,33 @@
+name: UI Flush Cadence Benchmark
+
+on:
+  push:
+    branches:
+      - diag/build173-ui-flush-*-loadbench-20261005
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cadence:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Show Swift
+        run: swift --version
+
+      - name: Resolve pinned package
+        run: |
+          set -euo pipefail
+          swift package resolve
+          test "$(git -C .build/checkouts/ZIPFoundation rev-parse HEAD)" = "22787ffb59de99e5dc1fbfe80b19c97a904ad48d"
+
+      - name: Benchmark default streaming UI flush cadence
+        run: |
+          set -euo pipefail
+          swift test --filter StreamingUIFlushCadenceBenchmarkTests 2>&1 | tee ui-flush-cadence.log
+          grep -F 'UI_FLUSH_CADENCE_METRICS' ui-flush-cadence.log
