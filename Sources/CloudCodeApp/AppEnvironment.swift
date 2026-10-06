@@ -2656,17 +2656,16 @@ public final class CloudCodeViewModel: ObservableObject {
                     EmbeddedRootHelper.stopBackgroundAssertion(workerPID: workerPID)
                 }.value
 
-                stillAlive = true
-                for _ in 0..<15 {
+                // The RootHelper stop command now confirms process exit before returning success.
+                // Do not add a second polling loop on top of that confirmed teardown. If the helper
+                // reports a bounded failure, take one status sample and leave the PID recorded so a
+                // later acquire can reconcile it without delaying every foreground/background turn.
+                if outcome?.success == true {
+                    stillAlive = false
+                } else {
                     stillAlive = await Task.detached(priority: .utility) {
                         EmbeddedRootHelper.backgroundAssertionIsAlive(workerPID: workerPID)
                     }.value
-                    if !stillAlive { break }
-                    do {
-                        try await Task.sleep(nanoseconds: 200_000_000)
-                    } catch {
-                        break
-                    }
                 }
             }
 

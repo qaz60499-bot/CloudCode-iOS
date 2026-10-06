@@ -2689,7 +2689,8 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             // system frame even without explicit Automation-state writes. Composer verification is
             // therefore screenshot/OCR-only in normal Agent execution; the explicit Perception Probe
             // remains the place for bounded AX diagnostics.
-            if ProductionPerceptionPolicy.boundedSemanticReadAllowed {
+            let focusAXAllowed = ProductionPerceptionPolicy.accessibilityRuntimeAllowed
+            if focusAXAllowed {
                 let axFocus = EmbeddedRootHelper.focusedTextInput()
                 try Task.checkCancellation()
                 if let focused = axFocus.payload, focused.focusedTextInput {
@@ -2767,7 +2768,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 "effectVerification": keyboardLikely ? "local_keyboard_heuristic_passed" : "semantic_required",
                 "localObservation": "final_screenshot_attached",
                 "perceptionClass": "semantic_composer_focus",
-                "perceptionAXAttempted": ProductionPerceptionPolicy.boundedSemanticReadAllowed ? "true" : "false",
+                "perceptionAXAttempted": focusAXAllowed ? "true" : "false",
                 "perceptionAXSucceeded": "false",
                 "perceptionAnchorCacheHit": "false"
             ]
@@ -2775,7 +2776,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             if keyboardLikely {
                 payload["perceptionLocalSufficient"] = "true"
                 payload["perceptionRemoteVisionRequired"] = "false"
-                payload["perceptionFallbackReason"] = ProductionPerceptionPolicy.boundedSemanticReadAllowed
+                payload["perceptionFallbackReason"] = focusAXAllowed
                     ? "ax_unavailable_local_keyboard_heuristic_verified_composer_focus"
                     : "production_ax_quarantined_local_keyboard_heuristic_verified_composer_focus"
                 payload["providerVisualRoundTripAvoided"] = "1"
@@ -2789,10 +2790,10 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                 toolCallID: call.id,
                 success: keyboardLikely,
                 summary: keyboardLikely
-                    ? (ProductionPerceptionPolicy.boundedSemanticReadAllowed
+                    ? (focusAXAllowed
                         ? "AX did not prove text focus, but chat composer focus was locally verified by keyboard-like OCR evidence."
                         : "Chat composer focus was locally verified by keyboard-like OCR evidence without invoking production AX.")
-                    : (ProductionPerceptionPolicy.boundedSemanticReadAllowed
+                    : (focusAXAllowed
                         ? "Composer candidate was tapped, but neither AX focus nor local keyboard evidence verified the composer; raw typing remains blocked."
                         : "Composer candidate was tapped, but local keyboard evidence did not verify focus; raw typing remains blocked without invoking production AX."),
                 payload: payload,
@@ -3114,7 +3115,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
             var axStatus = "skipped_local_sufficient"
             if localSufficient {
                 axSkippedLocalSufficientSamples += 1
-            } else if !ProductionPerceptionPolicy.boundedSemanticReadAllowed {
+            } else if !ProductionPerceptionPolicy.accessibilityRuntimeAllowed {
                 // Production AX is intentionally quarantined on this device. Do not call tree()
                 // merely to rediscover that policy failure: feed sampling must continue through
                 // screenshot + local OCR without surfacing a synthetic GUI/AX failure to the Agent.
@@ -3373,7 +3374,7 @@ public struct GUIFallbackExecutor: DeferredCapabilitySelfValidatingToolExecutor,
                         screenSize: returnedScreenSize
                     )
                 }
-                if !returnedSufficient, ProductionPerceptionPolicy.boundedSemanticReadAllowed {
+                if !returnedSufficient, ProductionPerceptionPolicy.accessibilityRuntimeAllowed {
                     axAttemptedSamples += 1
                     if let tree = try? await backend.tree() {
                         let returnedAX = LocalAXTreeTextExtractor.extract(from: tree, maximumElements: 96)

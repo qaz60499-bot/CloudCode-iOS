@@ -1114,12 +1114,15 @@ public actor AgentCore {
 
                     var previousToolPlanSignature: String?
                     var repeatedToolPlanCount = 0
-                    var lastExecutedPlanHash = checkpoint.payload["orchestration.lastPlanHash"]
-                    var lastPlanFiniteProgress = checkpoint.payload["orchestration.lastPlanFiniteProgress"] == "true"
-                    var blockedPlanHashes = Set((checkpoint.payload["orchestration.blockedPlanHashes"] ?? "").split(separator: ",").map(String.init))
-                    var blockedReadToolNames = Set((checkpoint.payload["orchestration.blockedReadToolNames"] ?? "").split(separator: ",").map(String.init))
-                    var circuitRequestFingerprint = checkpoint.payload["orchestration.requestFingerprint"]
-                        ?? TaskContract.fingerprint(for: activeRequest)
+                    // Build169 added a pre-dispatch plan-hash circuit on top of the existing
+                    // per-action verification guard and post-result four-round loop guard. Drop its
+                    // persisted state so resumed tasks return to result-based repetition handling.
+                    for key in ["orchestration.lastPlanHash", "orchestration.lastPlanFiniteProgress",
+                                "orchestration.blockedPlanHashes", "orchestration.blockedReadToolNames",
+                                "orchestration.requestFingerprint", "orchestration.strategySwitchRound",
+                                "orchestration.failureSignature"] {
+                        checkpoint.payload.removeValue(forKey: key)
+                    }
                     var guiTreeFailedForCurrentForegroundState = false
                     var lastLocalVisionElementsJSON: String?
                     var lastObservationFrame: ObservationFrame?
@@ -1256,20 +1259,6 @@ public actor AgentCore {
                         } else {
                             continuation.yield(.status(round == 0 ? "正在使用工具优先路由规划…" : "正在根据工具结果继续…"))
                         }
-                        let roundRequestFingerprint = TaskContract.fingerprint(for: activeRequest)
-                        if roundRequestFingerprint != circuitRequestFingerprint {
-                            lastExecutedPlanHash = nil
-                            lastPlanFiniteProgress = false
-                            blockedPlanHashes.removeAll()
-                            blockedReadToolNames.removeAll()
-                            circuitRequestFingerprint = roundRequestFingerprint
-                            for key in ["orchestration.lastPlanHash", "orchestration.lastPlanFiniteProgress",
-                                        "orchestration.blockedPlanHashes", "orchestration.blockedReadToolNames"] {
-                                checkpoint.payload.removeValue(forKey: key)
-                            }
-                        }
-                        checkpoint.payload["orchestration.requestFingerprint"] = circuitRequestFingerprint
-                        let completedRepeatedSwipeCountBeforeRound = completedRepeatedSwipeCount
                         var assistantText = ""
                         let partialAssistantMessageID = UUID()
                         var lastPartialSaveAt = Date()
@@ -1320,12 +1309,6 @@ public actor AgentCore {
                             ))
                         }
                         var roundDescriptors = providerDescriptors
-                        if !blockedReadToolNames.isEmpty {
-                            roundDescriptors.removeAll { blockedReadToolNames.contains($0.name) }
-                            providerContextMessages.append(ChatMessage(role: .system,
-                                content: "The identical read plan produced no verified progress. Its route is temporarily blocked: \(blockedReadToolNames.sorted().joined(separator: ", ")). Use existing fresh observation/OCR evidence or a different deterministic route. Do not repeat a click to break this circuit.",
-                                providerMetadata: ["context_layer": "orchestration_circuit_breaker"]))
-                        }
                         var learnedAXAvoidanceActive = false
                         if let observationBundleID = currentGUIBundleID ?? lastAcceptedUnverifiedLaunchBundleID,
                            let interactionExperienceStore {
@@ -1935,66 +1918,7 @@ public actor AgentCore {
                             return
                         }
 
-                        let proposedNames = providerToolCalls.compactMap { toolNameMap.internalName(forProviderName: $0.1) }
-                        let canonicalPlan = providerToolCalls.map { call -> String in
-                            guard let name = toolNameMap.internalName(forProviderName: call.1),
-                                  let arguments = try? Self.validatedArguments(fromJSON: call.2, toolName: name) else {
-                                return call.1 + "|" + call.2
-                            }
-                            return Self.semanticToolSignature(name: name, arguments: arguments)
-                        }.joined(separator: "\n")
-                        let proposedPlanHash = ProviderFingerprint.sha256(circuitRequestFingerprint + "\n" + canonicalPlan)
-                        let containsMutation = proposedNames.contains { descriptorsByName[$0]?.risk != .readOnly }
-                        let hasFiniteRepeatRemaining = requiredRepeatedSwipeCount.map { completedRepeatedSwipeCount < $0 } ?? false
-                        let finiteRepeatCanContinue = lastPlanFiniteProgress
-                            && hasFiniteRepeatRemaining
-                            && proposedNames.allSatisfy { ["gui.swipe", "gui.scroll", "gui.scrollObserve", "gui.swipeSequence", "gui.feedSample"].contains($0) }
-                        let idempotentForegroundSelection = !proposedNames.isEmpty && proposedNames.allSatisfy(Self.allowsImmediateSemanticRepeat)
-                        let protectsGUIPlan = proposedNames.contains { $0.hasPrefix("gui.") }
-                        let repeatDecision: ToolPlanRepeatGuard.Decision = protectsGUIPlan ? ToolPlanRepeatGuard.decision(signature: proposedPlanHash,
-                            lastExecutedSignature: lastExecutedPlanHash, previouslyBlocked: blockedPlanHashes,
-                            containsMutation: containsMutation,
-                            finiteRepeatHasVerifiedProgress: finiteRepeatCanContinue || idempotentForegroundSelection) : .execute
-                        if repeatDecision != .execute {
-                            checkpoint.payload["orchestration.strategySwitchRound"] = String(round + 1)
-                            checkpoint.payload["orchestration.failureSignature"] = proposedPlanHash
-                            try? await diagnosticLogger?.log(level: .warning, subsystem: "agent",
-                                action: "tool-plan.circuit", result: repeatDecision.rawValue, sessionID: session.id,
-                                metadata: ["round": String(round + 1), "planHash": proposedPlanHash,
-                                           "containsMutation": containsMutation ? "true" : "false"])
-                        }
-                        switch repeatDecision {
-                        case .execute:
-                            break
-                        case .stop:
-                            throw AgentRunError.orchestrationStopped("相同无进展计划在 observation/reconcile 后仍被重复提出；已阻止重复状态变更并保留检查点。")
-                        case .changeReadRoute:
-                            blockedPlanHashes.insert(proposedPlanHash)
-                            blockedReadToolNames.formUnion(proposedNames)
-                            checkpoint.payload["orchestration.blockedPlanHashes"] = blockedPlanHashes.sorted().joined(separator: ",")
-                            checkpoint.payload["orchestration.blockedReadToolNames"] = blockedReadToolNames.sorted().joined(separator: ",")
-                            checkpoint.updatedAt = Date()
-                            try await checkpointStore.upsert(checkpoint)
-                            continuation.yield(.status("重复读取没有验证到新进度；已在第二次计划时切换策略，复用现有观察并暂停原读取路由。"))
-                            continue
-                        case .reconcileBeforeMutation:
-                            blockedPlanHashes.insert(proposedPlanHash)
-                            checkpoint.payload["orchestration.blockedPlanHashes"] = blockedPlanHashes.sorted().joined(separator: ",")
-                            guard let screenshotName = toolNameMap.providerName(forInternalName: "gui.screenshot"),
-                                  descriptorsByName["gui.screenshot"]?.risk == .readOnly else {
-                                throw AgentRunError.orchestrationStopped("重复状态变更需要只读 observation/reconcile，但当前无可用截图路由；已阻止重复动作。")
-                            }
-                            providerToolCalls = [("reconcile-" + UUID().uuidString, screenshotName, "{}", ["circuit_breaker": "observe_before_duplicate_mutation"])]
-                            session.messages.append(ChatMessage(role: .system,
-                                content: "A duplicate mutation was suppressed before dispatch. The next result is a read-only reconciliation observation. The earlier action may already have succeeded; do not repeat it merely because old history was compressed.",
-                                providerMetadata: ["context_layer": "orchestration_circuit_breaker"]))
-                            continuation.yield(.status("已阻止重复状态变更；先执行一次只读 observation/reconcile。"))
-                        }
                         let toolPlanSignature = providerToolCalls.map { "\($0.1)|\($0.2)" }.joined(separator: "\n")
-                        if repeatDecision == .execute { lastExecutedPlanHash = proposedPlanHash }
-                        checkpoint.payload["orchestration.lastPlanHash"] = lastExecutedPlanHash
-                        checkpoint.payload["orchestration.lastPlanFiniteProgress"] = "false"
-                        try await checkpointStore.upsert(checkpoint)
 
                         if !assistantText.isEmpty {
                             ProviderContinuationBoundary.record(text: assistantText, messageID: partialAssistantMessageID,
@@ -3434,10 +3358,6 @@ public actor AgentCore {
                                 $0.role == .tool && $0.providerMetadata["tool_call_id"] == providerCallID
                             })?.content ?? "missing-tool-result"
                         }.joined(separator: "\n")
-                        lastPlanFiniteProgress = completedRepeatedSwipeCount > completedRepeatedSwipeCountBeforeRound
-                        checkpoint.payload["orchestration.lastPlanFiniteProgress"] = lastPlanFiniteProgress ? "true" : "false"
-                        checkpoint.updatedAt = Date()
-                        try await checkpointStore.upsert(checkpoint)
                         let completedRoundSignature = toolPlanSignature + "\nRESULTS\n" + resultSignature
                         if completedRoundSignature == previousToolPlanSignature {
                             repeatedToolPlanCount += 1
