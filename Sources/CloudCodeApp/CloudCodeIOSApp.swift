@@ -62,6 +62,8 @@ private final class CloudCodeAppLauncher: ObservableObject {
             try? await Task.sleep(nanoseconds: 450_000_000)
             guard model == nil else { return }
 
+            await ProviderSanitizer.runIfRequested()
+
             let startupBreadcrumbs = StartupBreadcrumbStore()
             let startupRunID = startupBreadcrumbs.beginRun(initialStage: "app.main.enter")
             startupBreadcrumbs.append(runID: startupRunID, stage: "firstScene.visibleWindow")

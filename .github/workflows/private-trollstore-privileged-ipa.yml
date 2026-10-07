@@ -96,8 +96,15 @@ jobs:
           import sys
           target = pathlib.Path(sys.argv[1])
           payload = json.loads(os.environ["CLOUDCODE_PROVIDER_BOOTSTRAP"])
+          retained = {"https-agentrouter-org", "https-api-justwoker-icu"}
+          payload["providers"] = [
+              provider for provider in (payload.get("providers") or [])
+              if provider.get("providerID") in retained
+          ]
+          if {provider.get("providerID") for provider in payload["providers"]} != retained:
+              raise SystemExit("FAIL: retained Provider bootstrap entries are incomplete")
           target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-          print("Private Provider bootstrap embedded; secret values were not printed.")
+          print("Private Provider bootstrap embedded with only Agent Router and Just Worker; secret values were not printed.")
           PY
 
       - name: Sign privileged TrollStore validation build
