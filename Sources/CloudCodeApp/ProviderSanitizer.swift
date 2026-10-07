@@ -69,10 +69,13 @@ enum ProviderSanitizer {
 
     private static func run() async throws {
         let fileManager = FileManager.default
-        guard let support = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+        guard let applicationSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             throw NSError(domain: "ProviderSanitizer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Application Support unavailable"])
         }
 
+        // Match AppEnvironment.supportRoot(): custom Provider state lives under
+        // Library/Application Support/CloudCode/Provider, not directly under Application Support.
+        let support = applicationSupport.appendingPathComponent("CloudCode", isDirectory: true)
         let customURL = support.appendingPathComponent("Provider/custom-providers.json")
         let liveCatalogURL = support.appendingPathComponent("Provider/live-model-catalogs.json")
         let customProviders = loadCustomProviders(from: customURL)
