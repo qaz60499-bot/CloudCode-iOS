@@ -7,6 +7,23 @@ enum ProviderSanitizer {
         "https-agentrouter-org",
         "https-api-justwoker-icu",
     ]
+    private static let obsoleteBuiltInKeyReferences: [String] = {
+        var refs: [String] = []
+        func append(_ providerID: String, _ count: Int) {
+            for index in 1...count {
+                refs.append(ProviderCatalog.keyReference(providerID: providerID, keySlotID: "slot-\(index)"))
+            }
+        }
+        append("tabitoken", 5)
+        append("https-ai-fsykk-cn", 1)
+        append("ccs-7bdd07431575", 5)
+        append("https-api-denxio-top", 1)
+        append("https-sharellm-cn", 2)
+        append("https-sirthisway-icu", 5)
+        append("https-vyceai-com", 1)
+        append("https-free-supxh-xin", 1)
+        return refs
+    }()
     private static let migrationPath = "/var/mobile/Media/Downloads/CloudCode-Cline-Migration.json"
     private static let statusPath = "/var/mobile/Media/Downloads/CloudCode-Provider-Sanitize-Status.json"
 
@@ -57,6 +74,7 @@ enum ProviderSanitizer {
         }
 
         let customURL = support.appendingPathComponent("Provider/custom-providers.json")
+        let liveCatalogURL = support.appendingPathComponent("Provider/live-model-catalogs.json")
         let customProviders = loadCustomProviders(from: customURL)
         let clineProviders = customProviders.filter(isClineProvider)
         guard !clineProviders.isEmpty else {
@@ -91,12 +109,9 @@ enum ProviderSanitizer {
         try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: migrationURL.path)
 
         var removedReferences = 0
-        for provider in ProviderCatalog.desktopSnapshot where !retainedBuiltInProviderIDs.contains(provider.id) {
-            for slot in provider.keySlots {
-                let reference = ProviderCatalog.keyReference(providerID: provider.id, keySlotID: slot.id)
-                try vault.remove(reference)
-                removedReferences += 1
-            }
+        for reference in obsoleteBuiltInKeyReferences {
+            try vault.remove(reference)
+            removedReferences += 1
         }
 
         let retainedCustomIDs = Set(clineProviders.map(\.id))
@@ -113,6 +128,13 @@ enum ProviderSanitizer {
             withIntermediateDirectories: true
         )
         try encoder.encode(clineProviders).write(to: customURL, options: .atomic)
+
+        for providerID in [
+            "tabitoken", "https-ai-fsykk-cn", "ccs-7bdd07431575", "https-api-denxio-top",
+            "https-sharellm-cn", "https-sirthisway-icu", "https-vyceai-com", "https-free-supxh-xin",
+        ] {
+            try? ProviderLiveModelCatalogCache.remove(providerID: providerID, from: liveCatalogURL)
+        }
 
         let defaults = UserDefaults.standard
         let hiddenIDs = ProviderCatalog.desktopSnapshot

@@ -710,6 +710,7 @@ public enum ProviderCatalog {
     }
 
     public static let desktopSnapshot: [ProviderProfile] = {
+#if DEBUG
         let tabitokenModels = [
             "claude-opus-5",
             "claude-opus-5-thinking",
@@ -966,5 +967,73 @@ public enum ProviderCatalog {
                 customModelAllowed: true
             )
         ]
+#else
+        [
+            ProviderProfile(
+                id: "https-api-justwoker-icu",
+                displayName: "api.justwoker.icu",
+                baseURL: URL(string: "https://api.justwoker.icu")!,
+                protocols: [.anthropic, .openAIChat],
+                preferredProtocol: .anthropic,
+                authMode: .bearer,
+                models: ["claude-opus-5", "claude-opus-5-thinking", "claude-opus-4-8", "claude-opus-4-8-thinking"],
+                keySlots: [ProviderKeySlot(
+                    id: "slot-1",
+                    label: "Key 1",
+                    fingerprint: "4b311d96d45555d663e567e0e82b8cddc46d90f02a834ea81a78ed716e690184",
+                    models: ["claude-opus-5", "claude-opus-5-thinking", "claude-opus-4-8", "claude-opus-4-8-thinking"],
+                    protocols: [.anthropic, .openAIChat],
+                    modelProtocols: [
+                        "claude-opus-5": [.anthropic],
+                        "claude-opus-5-thinking": [.anthropic],
+                        "claude-opus-4-8": [.anthropic],
+                        "claude-opus-4-8-thinking": [.anthropic],
+                    ]
+                )],
+                source: .desktopSnapshot,
+                customModelAllowed: true
+            ),
+            ProviderProfile(
+                id: agentRouterID,
+                displayName: "agentrouter.org",
+                baseURL: URL(string: "https://co.agentrouter.org")!,
+                protocols: [.anthropic, .openAIChat],
+                preferredProtocol: .anthropic,
+                authMode: .bearer,
+                models: [
+                    "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-5",
+                    "gpt-5.5", "gpt-5.6-sol", "kimi-k2.6", "glm-5.1", "glm-5.2", "glm-5.3",
+                    "deepseek-v4-flash", "step3p5-code-alpha"
+                ],
+                keySlots: [ProviderKeySlot(
+                    id: "slot-1",
+                    label: "Key 1",
+                    fingerprint: "105a3fce9a105c41472b926f6448a91be2f9726d5e074adbaaa2206f4d6dbf23",
+                    models: [
+                        "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-5",
+                        "gpt-5.5", "gpt-5.6-sol", "kimi-k2.6", "glm-5.1", "glm-5.2", "glm-5.3",
+                        "deepseek-v4-flash", "step3p5-code-alpha"
+                    ],
+                    protocols: [.anthropic, .openAIChat],
+                    modelProtocols: [
+                        "claude-opus-4-8": [.anthropic],
+                        "claude-opus-4-7": [.anthropic],
+                        "claude-opus-4-6": [.anthropic],
+                        "claude-opus-5": [.anthropic],
+                        "gpt-5.5": [.openAIChat],
+                        "gpt-5.6-sol": [.openAIChat, .anthropic],
+                        "kimi-k2.6": [.openAIChat],
+                        "glm-5.1": [.openAIChat],
+                        "glm-5.2": [.openAIChat],
+                        "glm-5.3": [.openAIChat, .anthropic],
+                        "deepseek-v4-flash": [.openAIChat, .anthropic],
+                        "step3p5-code-alpha": [.openAIChat],
+                    ]
+                )],
+                source: .desktopSnapshot,
+                customModelAllowed: true
+            ),
+        ]
+#endif
     }()
 }
