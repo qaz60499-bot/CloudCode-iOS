@@ -971,7 +971,7 @@ public enum ProviderCatalog {
         [
             ProviderProfile(
                 id: "https-api-justwoker-icu",
-                displayName: "api.justwoker.icu",
+                displayName: "Just Worker",
                 baseURL: URL(string: "https://api.justwoker.icu")!,
                 protocols: [.anthropic, .openAIChat],
                 preferredProtocol: .anthropic,
@@ -995,7 +995,7 @@ public enum ProviderCatalog {
             ),
             ProviderProfile(
                 id: agentRouterID,
-                displayName: "agentrouter.org",
+                displayName: "Agent Router",
                 baseURL: URL(string: "https://co.agentrouter.org")!,
                 protocols: [.anthropic, .openAIChat],
                 preferredProtocol: .anthropic,
