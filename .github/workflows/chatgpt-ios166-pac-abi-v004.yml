@@ -67,5 +67,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chatgpt-ios166-pac-abi-width-v004-only
-          path: \${{ runner.temp }}/pac-abi-v004/
+          path: ${{ runner.temp }}/pac-abi-v004/
           if-no-files-found: warn
