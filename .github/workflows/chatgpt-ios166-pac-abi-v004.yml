@@ -1,0 +1,71 @@
+name: IPA Total iOS16.6 PAC ABI declaration v0.0.4 (shim only)
+on:
+  push:
+    branches: [ci/chatgpt-ios166-sync-internal-20261026]
+    paths:
+      - tools/chatgpt-compat/ChatGPTCompatibility.authenticated-arm64.c
+      - .github/workflows/chatgpt-ios166-pac-abi-v004.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compile-pac-only:
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Compile corrected Swift PAC ABI shim (no phone, no other libraries)
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/pac-abi-v004"
+          mkdir -p "$OUT"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          SRC="tools/chatgpt-compat/ChatGPTCompatibility.authenticated-arm64.c"
+          python3 - "$SRC" <<'PY'
+          import pathlib,re,sys
+          s=pathlib.Path(sys.argv[1]).read_text()
+          for name in ("swift_getOpaqueTypeMetadata2", "swift_getOpaqueTypeMetadata",
+                       "swift_getOpaqueTypeConformance2", "swift_getOpaqueTypeConformance"):
+              matches=re.findall(r"\b"+name+r"\s*\([^;{}]*?\bunsigned\s+index\s*\)",s,re.S)
+              assert len(matches)==1,(name,len(matches))
+          assert "uintptr_t index)" not in s
+          assert 'sizeof(unsigned) == 4' in s
+          assert "autda" in s and "xpacd" in s and "brk" in s
+          print("SWIFT60_OPAQUE_INDEX_DECLARATIONS_4_OF_4_PASS")
+          PY
+          "$(xcrun --find clang)" -target arm64-apple-ios16.6 -march=armv8.3-a \
+            -dynamiclib -O2 -fno-common -Werror \
+            -miphoneos-version-min=16.6 -isysroot "$SDK" \
+            -Wl,-install_name,@rpath/ChatGPTCompatibility.dylib \
+            -Wl,-dead_strip -L "$SDK/usr/lib/swift" -lswiftCore \
+            "$SRC" -o "$OUT/ChatGPTCompatibility.dylib"
+          xcrun otool -hv "$OUT/ChatGPTCompatibility.dylib" >"$OUT/header.txt"
+          xcrun otool -l "$OUT/ChatGPTCompatibility.dylib" >"$OUT/loadcommands.txt"
+          xcrun otool -L "$OUT/ChatGPTCompatibility.dylib" >"$OUT/dependencies.txt"
+          xcrun otool -D "$OUT/ChatGPTCompatibility.dylib" >"$OUT/install-name.txt"
+          xcrun nm -gU "$OUT/ChatGPTCompatibility.dylib" >"$OUT/exports.txt"
+          xcrun nm -m -u "$OUT/ChatGPTCompatibility.dylib" >"$OUT/undefined.txt"
+          xcrun otool -tvV "$OUT/ChatGPTCompatibility.dylib" >"$OUT/disassembly.txt"
+          grep -E 'minos +16\.6' "$OUT/loadcommands.txt"
+          grep -Fqx '@rpath/ChatGPTCompatibility.dylib' "$OUT/install-name.txt"
+          for symbol in \
+            _swift_conformsToProtocol2 \
+            _swift_getOpaqueTypeConformance2 \
+            _swift_getOpaqueTypeMetadata2 \
+            _swift_getTypeByMangledNameInContext2 \
+            _swift_getTypeByMangledNameInContextInMetadataState2; do
+            awk '{print $NF}' "$OUT/exports.txt" | grep -Fx "$symbol" >/dev/null ||
+              { echo "MISSING_PAC_ABI_EXPORT $symbol"; exit 1; }
+          done
+          grep -Ei '\bautda\b' "$OUT/disassembly.txt" >/dev/null
+          grep -Ei '\bxpacd\b' "$OUT/disassembly.txt" >/dev/null
+          grep -Ei '\bbrk\b' "$OUT/disassembly.txt" >/dev/null
+          shasum -a 256 "$OUT/ChatGPTCompatibility.dylib" | tee "$OUT/sha256.txt"
+          echo "PAC_V004_ARM64_IOS166_STATIC_ABI_PASS_NOT_DEVICE_CALLS"
+      - name: Publish standalone PAC ABI research binary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatgpt-ios166-pac-abi-width-v004-only
+          path: \${{ runner.temp }}/pac-abi-v004/
+          if-no-files-found: warn
