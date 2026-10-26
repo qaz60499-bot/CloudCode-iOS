@@ -1,0 +1,63 @@
+name: ChatGPT iOS16.6 Swift module ABI feasibility
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  swift-module-minos-test:
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - name: Compiler and SDK identity
+        run: |
+          set -euo pipefail
+          xcrun swiftc --version
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+      - name: Test official Swift 6.0 Observation and Synchronization source against iOS16.6
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/ios166-swift-official"
+          OUT="$RUNNER_TEMP/ios166-swift-probe"
+          mkdir -p "$SRC/Observation" "$SRC/Synchronization/Mutex" "$OUT"
+          BASE="https://raw.githubusercontent.com/swiftlang/swift/swift-6.0-RELEASE/stdlib/public"
+          for f in Locking.swift Observable.swift ObservationRegistrar.swift ObservationTracking.swift ThreadLocal.swift; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 30 "$BASE/Observation/Sources/Observation/$f" -o "$SRC/Observation/$f"
+          done
+          for f in Cell.swift; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 30 "$BASE/Synchronization/$f" -o "$SRC/Synchronization/$f"
+          done
+          for f in DarwinImpl.swift Mutex.swift SpinLoopHint.swift; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 30 "$BASE/Synchronization/Mutex/$f" -o "$SRC/Synchronization/Mutex/$f"
+          done
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          SWIFTC="$(xcrun --find swiftc)"
+          set +e
+          "$SWIFTC" -parse-as-library -emit-module -module-name Observation \
+            -target arm64-apple-ios16.6 -sdk "$SDK" \
+            -emit-module-path "$OUT/Observation.swiftmodule" \
+            "$SRC"/Observation/*.swift > "$OUT/observation.stdout" 2> "$OUT/observation.stderr"
+          OBS_RC=$?
+          "$SWIFTC" -parse-as-library -emit-module -module-name Synchronization \
+            -target arm64-apple-ios16.6 -sdk "$SDK" \
+            -emit-module-path "$OUT/Synchronization.swiftmodule" \
+            "$SRC"/Synchronization/Cell.swift "$SRC"/Synchronization/Mutex/*.swift \
+            > "$OUT/synchronization.stdout" 2> "$OUT/synchronization.stderr"
+          SYNC_RC=$?
+          set -e
+          printf 'official_swift_tag=swift-6.0-RELEASE\nobservation_emit_module_rc=%d\nsynchronization_emit_module_rc=%d\n' "$OBS_RC" "$SYNC_RC" | tee "$OUT/status.txt"
+          echo '--- Observation first diagnostics ---'
+          head -45 "$OUT/observation.stderr"
+          echo '--- Synchronization first diagnostics ---'
+          head -45 "$OUT/synchronization.stderr"
+          echo 'Emitting a Swift module is a compiler-front-end gate only; not linked dylib, ABI equivalence or real app compatibility.'
+      - name: Upload isolated probe logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatgpt-ios166-upstream-module-probe
+          path: ${{ runner.temp }}/ios166-swift-probe/
+          if-no-files-found: warn
