@@ -1,0 +1,154 @@
+name: ChatGPT iOS 16.6 isolated compatibility layer bundle
+on:
+  push:
+    branches: [ci/chatgpt-ios166-sync-internal-20261026]
+    paths:
+      - .github/workflows/chatgpt-ios166-compat-layer-bundle.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  package-existing-compat-modules:
+    runs-on: macos-15
+    timeout-minutes: 16
+    steps:
+      - name: Checkout isolated compatibility layer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Validate loader planner against in-memory test images
+        working-directory: tools/chatgpt-compat
+        run: |
+          set -euo pipefail
+          python3 test-ios166-compat-loader-plan.py
+      - name: Reuse successful combined Observation Synchronization iOS16.6 dylibs
+        uses: actions/download-artifact@v4
+        with:
+          name: chatgpt-ios166-observation-sync-composite
+          run-id: 40327038485
+          repository: qaz60499-bot/CloudCode-iOS
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/ios166-previously-verified
+      - name: Build authenticated arm64 Swift descriptor shim and package all three modules
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios166-layer"
+          FRAMES="$OUT/Frameworks"
+          LOGS="$OUT/audit"
+          mkdir -p "$FRAMES" "$LOGS"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          PREV="$RUNNER_TEMP/ios166-previously-verified/ios"
+          for name in libswiftObservation.dylib libswiftSynchronization.dylib; do
+            test -s "$PREV/$name"
+            cp "$PREV/$name" "$FRAMES/$name"
+          done
+          CLANG="$(xcrun --find clang)"
+          "$CLANG" -target arm64-apple-ios16.6 -march=armv8.3-a \
+            -dynamiclib -O2 -fno-common -Werror \
+            -miphoneos-version-min=16.6 -isysroot "$SDK" \
+            -Wl,-install_name,@rpath/ChatGPTCompatibility.dylib \
+            -Wl,-dead_strip -L "$SDK/usr/lib/swift" -lswiftCore \
+            tools/chatgpt-compat/ChatGPTCompatibility.authenticated-arm64.c \
+            -o "$FRAMES/ChatGPTCompatibility.dylib"
+          for dylib in "$FRAMES"/*.dylib; do
+            name="$(basename "$dylib")"
+            shasum -a 256 "$dylib" >>"$LOGS/sha256.txt"
+            xcrun otool -hv "$dylib" >"$LOGS/$name-header.txt"
+            xcrun otool -l "$dylib" >"$LOGS/$name-loadcommands.txt"
+            xcrun otool -L "$dylib" >"$LOGS/$name-dependencies.txt"
+            xcrun otool -D "$dylib" >"$LOGS/$name-install-name.txt"
+            xcrun nm -gU "$dylib" >"$LOGS/$name-exports.txt"
+            xcrun nm -m -u "$dylib" >"$LOGS/$name-undefined.txt"
+            xcrun otool -l "$dylib" | grep -A5 LC_BUILD_VERSION | grep -E 'minos +16\.6'
+            xcrun otool -hv "$dylib" | grep -E 'ARM64 +ALL'
+            if grep -E 'FinanceKit|MarketplaceKit|/System/Library/Frameworks/Symbols.framework' "$LOGS/$name-dependencies.txt"; then
+              echo "RESEARCH_LAYER_SYSTEM_FRAMEWORK_LEAK_FAIL $name"; exit 1
+            fi
+          done
+          grep -Fqx '@rpath/libswiftObservation.dylib' "$LOGS/libswiftObservation.dylib-install-name.txt"
+          grep -Fqx '@rpath/libswiftSynchronization.dylib' "$LOGS/libswiftSynchronization.dylib-install-name.txt"
+          grep -Fqx '@rpath/ChatGPTCompatibility.dylib' "$LOGS/ChatGPTCompatibility.dylib-install-name.txt"
+          # Actual Swift target symbols imported by ChatGPT.framework from real LC_DYLD_CHAINED_FIXUPS.
+          obs=(
+            '_$s11Observation10ObservableMp'
+            '_$s11Observation04withA8Tracking_8onChangexxyXE_yyYbcyXKtlF'
+            '_$s11Observation0A9RegistrarV12withMutation2of7keyPath_q0_x_s03KeyG0Cyxq_Gq0_yKXEtKAA10ObservableRzr1_lF'
+            '_$s11Observation0A9RegistrarV6access_7keyPathyx_s03KeyE0Cyxq_GtAA10ObservableRzr0_lF'
+            '_$s11Observation0A9RegistrarV6didSet_7keyPathyx_s03KeyF0Cyxq_GtAA10ObservableRzr0_lF'
+            '_$s11Observation0A9RegistrarV7willSet_7keyPathyx_s03KeyF0Cyxq_GtAA10ObservableRzr0_lF'
+            '_$s11Observation0A9RegistrarVACycfC'
+            '_$s11Observation0A9RegistrarVMa'
+            '_$s11Observation0A9RegistrarVMn'
+          )
+          sync=(
+            '_$s15Synchronization5MutexVMa'
+            '_$s15Synchronization5MutexVMn'
+            '_$s15Synchronization5_CellVMa'
+            '_$s15Synchronization5_CellVMn'
+          )
+          shim=(
+            _swift_conformsToProtocol2
+            _swift_getOpaqueTypeConformance2
+            _swift_getOpaqueTypeMetadata2
+            _swift_getTypeByMangledNameInContext2
+            _swift_getTypeByMangledNameInContextInMetadataState2
+          )
+          for symbol in "${obs[@]}"; do
+            xcrun nm -gU "$FRAMES/libswiftObservation.dylib" | awk '{print $NF}' | grep -Fx "$symbol" >/dev/null ||
+              { echo "OBSERVATION_TARGET_ABI_MISSING $symbol"; exit 1; }
+          done
+          for symbol in "${sync[@]}"; do
+            xcrun nm -gU "$FRAMES/libswiftSynchronization.dylib" | awk '{print $NF}' | grep -Fx "$symbol" >/dev/null ||
+              { echo "SYNC_TARGET_ABI_MISSING $symbol"; exit 1; }
+          done
+          for symbol in "${shim[@]}"; do
+            xcrun nm -gU "$FRAMES/ChatGPTCompatibility.dylib" | awk '{print $NF}' | grep -Fx "$symbol" >/dev/null ||
+              { echo "SHIM_TARGET_ABI_MISSING $symbol"; exit 1; }
+          done
+          xcrun otool -tvV "$FRAMES/ChatGPTCompatibility.dylib" >"$LOGS/ChatGPTCompatibility.disassembly.txt"
+          grep -Ei '\bautda\b' "$LOGS/ChatGPTCompatibility.disassembly.txt" >/dev/null
+          grep -Ei '\bxpacd\b' "$LOGS/ChatGPTCompatibility.disassembly.txt" >/dev/null
+          grep -Ei '\bbrk\b' "$LOGS/ChatGPTCompatibility.disassembly.txt" >/dev/null
+          echo "COMPAT_LAYER_ABI_18_OF_18_PASS"
+          echo "COMPAT_LAYER_THREE_DYLIBS_ARM64_IOS166_PASS"
+          cp tools/chatgpt-compat/ios166-compat-layer-README.md "$OUT/README.md"
+          cp tools/chatgpt-compat/ios166-compat-loader-plan.py "$OUT/ios166-compat-loader-plan.py"
+          cp tools/chatgpt-compat/test-ios166-compat-loader-plan.py "$OUT/test-ios166-compat-loader-plan.py"
+          python3 - "$OUT" <<'PY'
+          import datetime,hashlib,json,pathlib,sys
+          out=pathlib.Path(sys.argv[1])
+          libs={}
+          for f in sorted((out/'Frameworks').glob("*.dylib")):
+              libs[f.name]={"sha256":hashlib.sha256(f.read_bytes()).hexdigest(),
+                            "bytes":f.stat().st_size,"install_name":"@rpath/"+f.name}
+          manifest={
+              "research_only":True,
+              "target":"arm64-apple-ios16.6",
+              "modules":libs,
+              "required_target_exports_verified":18,
+              "observation_synchronization_provenance":"GitHub Actions run 40327038485 artifact 12650619594",
+              "authenticated_shim_provenance":"tools/chatgpt-compat/ChatGPTCompatibility.authenticated-arm64.c",
+              "official_app_present":False,
+              "not_an_ipa":True,
+              "not_an_installer":True,
+              "unimplemented_system_modules":["FinanceKit","MarketplaceKit","Symbols"],
+              "unresolved":["FairPlay-encrypted original main framework","absolute system install-name imports",
+                            "UIKit AVFAudio newer ObjC classes","device Swift ABI/PAC actual integration"],
+              "must_not_overwrite_bundle_id":"com.openai.chat",
+              "status":"LIBRARY_PROTOTYPE_ONLY_NOT_RUNNABLE_CHATGPT"
+          }
+          (out/"compatibility-manifest.json").write_text(json.dumps(manifest,indent=2)+"\n")
+          print("LAYER_MANIFEST_THREE_MODULES",len(libs))
+          assert len(libs)==3
+          PY
+          # No decrypted app, no production app code, no installation and no device mutations.
+          if find "$OUT" -iname '*.ipa' | grep -q .; then
+            echo "INVALID_ARTIFACT_INCLUDES_IPA"; exit 1
+          fi
+          echo "COMPAT_LAYER_PACKAGE_RESEARCH_ONLY_PASS"
+      - name: Publish isolated research-layer archive (not an IPA)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatgpt-ios166-compat-layer-three-libs
+          path: ${{ runner.temp }}/ios166-layer/
+          if-no-files-found: warn
