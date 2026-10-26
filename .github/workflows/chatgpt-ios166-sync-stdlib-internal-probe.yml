@@ -1,0 +1,141 @@
+name: ChatGPT iOS16.6 Synchronization stdlib ABI isolation
+on:
+  push:
+    branches:
+      - ci/chatgpt-ios166-sync-internal-20261026
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  synchronization-internal-abi:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Compiler identity and fetch pinned official Swift 6.0 sources
+        run: |
+          set -euo pipefail
+          xcrun swiftc --version
+          xcodebuild -version
+          SRC="$RUNNER_TEMP/ios166-sync-source"
+          OUT="$RUNNER_TEMP/ios166-sync-results"
+          mkdir -p "$SRC/Mutex" "$OUT/ios" "$OUT/mac"
+          BASE="https://raw.githubusercontent.com/swiftlang/swift/swift-6.0-RELEASE/stdlib/public/Synchronization"
+          for f in Cell.swift Mutex/Mutex.swift Mutex/DarwinImpl.swift; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 30 "$BASE/$f" -o "$SRC/$f"
+          done
+          shasum -a 256 "$SRC/Cell.swift" "$SRC/Mutex/Mutex.swift" "$SRC/Mutex/DarwinImpl.swift" | tee "$OUT/source-sha256.txt"
+          echo "Upstream CMake selects only Cell, Mutex and DarwinImpl on Darwin; excludes SpinLoopHint."
+      - name: Compile official Synchronization with upstream-required frontend switches
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/ios166-sync-source"
+          OUT="$RUNNER_TEMP/ios166-sync-results"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          # From swift-6.0-RELEASE/stdlib/public/Synchronization/CMakeLists.txt:
+          FEATURES=(-Xfrontend -enable-builtin-module
+            -Xfrontend -enable-experimental-feature -Xfrontend RawLayout
+            -Xfrontend -enable-experimental-feature -Xfrontend StaticExclusiveOnly
+            -Xfrontend -enable-experimental-feature -Xfrontend Extern)
+          set +e
+          xcrun swiftc -parse-as-library -emit-library -emit-module -module-name Synchronization             -target arm64-apple-ios16.6 -sdk "$SDK" "${FEATURES[@]}"             -emit-module-path "$OUT/ios/Synchronization.swiftmodule"             -Xlinker -install_name -Xlinker @rpath/libswiftSynchronization.dylib             "$SRC/Cell.swift" "$SRC/Mutex/Mutex.swift" "$SRC/Mutex/DarwinImpl.swift"             -o "$OUT/ios/libswiftSynchronization.dylib"             >"$OUT/ios/build.stdout" 2>"$OUT/ios/build.stderr"
+          RC=$?
+          set -e
+          echo "IOS_WITH_UPSTREAM_FEATURES_RC=$RC" | tee "$OUT/ios/status.txt"
+          head -90 "$OUT/ios/build.stderr"
+          if [[ "$RC" -ne 0 ]]; then
+            echo "IOS_SYNC_COMPILE_FAIL" | tee -a "$OUT/ios/status.txt"
+          else
+            echo "IOS_SYNC_COMPILE_PASS" | tee -a "$OUT/ios/status.txt"
+            xcrun otool -hv "$OUT/ios/libswiftSynchronization.dylib" | tee "$OUT/ios/header.txt"
+            xcrun otool -l "$OUT/ios/libswiftSynchronization.dylib" | tee "$OUT/ios/loadcommands.txt"
+            xcrun otool -L "$OUT/ios/libswiftSynchronization.dylib" | tee "$OUT/ios/loadlibs.txt"
+            xcrun nm -gU "$OUT/ios/libswiftSynchronization.dylib" | tee "$OUT/ios/exports.txt"
+            xcrun nm -u "$OUT/ios/libswiftSynchronization.dylib" | tee "$OUT/ios/undefined.txt"
+            shasum -a 256 "$OUT/ios/libswiftSynchronization.dylib" | tee "$OUT/ios/sha256.txt"
+            expected=(
+              '_$s15Synchronization5MutexVMa'
+              '_$s15Synchronization5MutexVMn'
+              '_$s15Synchronization5_CellVMa'
+              '_$s15Synchronization5_CellVMn'
+            )
+            count=0
+            for symbol in "${expected[@]}"; do
+              if grep -F "$symbol" "$OUT/ios/exports.txt" >/dev/null; then
+                echo "SYNC_EXPORT_MATCH $symbol" | tee -a "$OUT/ios/status.txt"
+                count=$((count+1))
+              else
+                echo "SYNC_EXPORT_MISSING $symbol" | tee -a "$OUT/ios/status.txt"
+              fi
+            done
+            echo "SYNC_EXPORT_SUMMARY=$count/4" | tee -a "$OUT/ios/status.txt"
+            if [[ $count -ne 4 ]]; then echo "SYNC_ABI_EXPORT_FAIL" | tee -a "$OUT/ios/status.txt"; fi
+            if ! grep -A5 LC_BUILD_VERSION "$OUT/ios/loadcommands.txt" | grep -q 'minos 16.6'; then
+              echo "SYNC_MINOS_FAIL" | tee -a "$OUT/ios/status.txt"
+            else
+              echo "SYNC_MINOS_PASS" | tee -a "$OUT/ios/status.txt"
+            fi
+          fi
+      - name: Independently test official Mutex behavior on isolated macOS runner
+        if: always()
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/ios166-sync-source"
+          OUT="$RUNNER_TEMP/ios166-sync-results"
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          FEATURES=(-Xfrontend -enable-builtin-module
+            -Xfrontend -enable-experimental-feature -Xfrontend RawLayout
+            -Xfrontend -enable-experimental-feature -Xfrontend StaticExclusiveOnly
+            -Xfrontend -enable-experimental-feature -Xfrontend Extern)
+          set +e
+          xcrun swiftc -parse-as-library -emit-library -emit-module -module-name Synchronization             -target arm64-apple-macos13.0 -sdk "$SDK" "${FEATURES[@]}"             -emit-module-path "$OUT/mac/Synchronization.swiftmodule"             -Xlinker -install_name -Xlinker @rpath/libswiftSynchronization.dylib             "$SRC/Cell.swift" "$SRC/Mutex/Mutex.swift" "$SRC/Mutex/DarwinImpl.swift"             -o "$OUT/mac/libswiftSynchronization.dylib"             >"$OUT/mac/build.stdout" 2>"$OUT/mac/build.stderr"
+          RC=$?
+          set -e
+          echo "MAC_SYNC_BUILD_RC=$RC" | tee "$OUT/mac/status.txt"
+          head -80 "$OUT/mac/build.stderr"
+          if [[ "$RC" -eq 0 ]]; then
+            cat >"$OUT/mac/test.swift" <<'SWIFT'
+          import Synchronization
+          import Dispatch
+          let protected = Mutex<Int>(0)
+          DispatchQueue.concurrentPerform(iterations: 10000) { _ in
+            protected.withLock { $0 += 1 }
+          }
+          let actual = protected.withLock { $0 }
+          guard actual == 10000 else { fatalError("MUTEX_CONCURRENT_COUNTER_FAIL") }
+          print("MUTEX_CONCURRENT_COUNTER_PASS")
+          let busy = protected.withLockIfAvailable { $0 }
+          guard busy == 10000 else { fatalError("MUTEX_TRYLOCK_FAIL") }
+          print("MUTEX_TRYLOCK_PASS")
+          SWIFT
+            set +e
+            xcrun swiftc -target arm64-apple-macos13.0 -sdk "$SDK"               -I "$OUT/mac" "$OUT/mac/test.swift" "$OUT/mac/libswiftSynchronization.dylib"               -Xlinker -rpath -Xlinker @executable_path               -o "$OUT/mac/test" >"$OUT/mac/client.stdout" 2>"$OUT/mac/client.stderr"
+            CLIENT_RC=$?
+            set -e
+            echo "MAC_CLIENT_LINK_RC=$CLIENT_RC" | tee -a "$OUT/mac/status.txt"
+            head -80 "$OUT/mac/client.stderr"
+            if [[ "$CLIENT_RC" -eq 0 ]]; then
+              xcrun otool -L "$OUT/mac/test" | tee "$OUT/mac/client-loadlibs.txt"
+              if grep -F '@rpath/libswiftSynchronization.dylib' "$OUT/mac/client-loadlibs.txt" >/dev/null && ! grep -F '/usr/lib/swift/libswiftSynchronization.dylib' "$OUT/mac/client-loadlibs.txt" >/dev/null; then
+                echo "MAC_CLIENT_LOCAL_SYNC_BIND_PASS" | tee -a "$OUT/mac/status.txt"
+                "$OUT/mac/test" | tee "$OUT/mac/runtime.txt"
+              else
+                echo "MAC_CLIENT_LOCAL_SYNC_BIND_FAIL" | tee -a "$OUT/mac/status.txt"
+              fi
+            fi
+          fi
+      - name: Upload isolated logs and candidate dylib (never IPA)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatgpt-ios166-sync-stdlib-internal-probe
+          path: ${{ runner.temp }}/ios166-sync-results/
+          if-no-files-found: warn
+      - name: Enforce compile and exported metadata gates
+        if: always()
+        run: |
+          set -euo pipefail
+          STATUS="$RUNNER_TEMP/ios166-sync-results/ios/status.txt"
+          grep -Fx 'IOS_SYNC_COMPILE_PASS' "$STATUS"
+          grep -Fx 'SYNC_EXPORT_SUMMARY=4/4' "$STATUS"
+          grep -Fx 'SYNC_MINOS_PASS' "$STATUS"
+          echo 'IOS_SYNC_STATIC_GATES_PASS; NOT a claim of Swift ABI behavior on iOS16 or official app startup.'
