@@ -182,6 +182,82 @@ jobs:
             xcrun nm -u "$OUT/libCompatObservationClient.dylib" > "$OUT/client-undefined.txt"
             xcrun otool -l "$OUT/libCompatObservationClient.dylib" | grep -A5 LC_BUILD_VERSION | head -8
           fi
+      - name: Check Synchronization Swift standard-library internal compilation route
+        if: always()
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/ios166-swift-official"
+          OUT="$RUNNER_TEMP/ios166-swift-probe"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          set +e
+          xcrun swiftc -parse-stdlib -parse-as-library -emit-module -module-name Synchronization \
+            -target arm64-apple-ios16.6 -sdk "$SDK" \
+            -emit-module-path "$OUT/SynchronizationStdlib.swiftmodule" \
+            "$SRC"/Synchronization/Cell.swift "$SRC"/Synchronization/Mutex/*.swift \
+            > "$OUT/synchronization-stdlib.stdout" 2> "$OUT/synchronization-stdlib.stderr"
+          RC=$?
+          set -e
+          echo "synchronization_parse_stdlib_rc=$RC" | tee "$OUT/synchronization-stdlib-status.txt"
+          head -45 "$OUT/synchronization-stdlib.stderr"
+          echo 'This is a compiler probe only; Swift stdlib internal ABI equivalence not proven.'
+      - name: Verify Observation lock and TLS functionality on isolated native macOS runner
+        if: always()
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/ios166-swift-official"
+          MAC="$RUNNER_TEMP/ios166-swift-probe/mac-functional"
+          mkdir -p "$MAC"
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          xcrun clang -target arm64-apple-macos13.0 -isysroot "$SDK" \
+            -Wall -Wextra -Werror -c \
+            tools/chatgpt-compat/ios166-observation-posix-runtime.c -o "$MAC/helpers.o"
+          xcrun swiftc -parse-as-library -emit-library -emit-module \
+            -module-name Observation -target arm64-apple-macos13.0 -sdk "$SDK" \
+            -emit-module-path "$MAC/Observation.swiftmodule" \
+            -Xlinker -install_name -Xlinker @rpath/libswiftObservation.dylib \
+            "$SRC"/Observation/*.swift "$MAC/helpers.o" -o "$MAC/libswiftObservation.dylib" \
+            > "$MAC/library.stdout" 2> "$MAC/library.stderr"
+          cat > "$MAC/functional.swift" <<'SWIFT'
+          import Observation
+          final class ObservableCounter: Observable {
+            let registrar = ObservationRegistrar()
+            private var storage = 0
+            var number: Int {
+              get {
+                registrar.access(self, keyPath: \.number)
+                return storage
+              }
+              set {
+                registrar.withMutation(of: self, keyPath: \.number) {
+                  storage = newValue
+                }
+              }
+            }
+          }
+          let counter = ObservableCounter()
+          var notifications = 0
+          let initial = withObservationTracking({
+            counter.number
+          }, onChange: {
+            notifications += 1
+          })
+          counter.number = 42
+          guard initial == 0 && counter.number == 42 && notifications == 1 else {
+            fatalError("OBSERVATION_RUNTIME_SEMANTICS_FAIL")
+          }
+          print("OBSERVATION_RUNTIME_SEMANTICS_PASS")
+          SWIFT
+          xcrun swiftc -target arm64-apple-macos13.0 -sdk "$SDK" \
+            -I "$MAC" "$MAC/functional.swift" "$MAC/libswiftObservation.dylib" \
+            -Xlinker -rpath -Xlinker @executable_path \
+            -o "$MAC/functional" > "$MAC/client.stdout" 2> "$MAC/client.stderr"
+          xcrun otool -L "$MAC/functional" | tee "$MAC/client-loads.txt"
+          grep -F "@rpath/libswiftObservation.dylib" "$MAC/client-loads.txt" >/dev/null
+          if grep -F "/usr/lib/swift/libswiftObservation.dylib" "$MAC/client-loads.txt" >/dev/null; then
+            echo 'Mac sample falsely linked OS Observation module'; exit 1
+          fi
+          "$MAC/functional" | tee "$MAC/result.txt"
+          grep -F 'OBSERVATION_RUNTIME_SEMANTICS_PASS' "$MAC/result.txt" >/dev/null
       - name: Upload isolated probe logs
         if: always()
         uses: actions/upload-artifact@v4
