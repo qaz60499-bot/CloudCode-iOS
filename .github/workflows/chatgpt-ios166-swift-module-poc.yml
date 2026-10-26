@@ -163,7 +163,7 @@ jobs:
           set +e
           xcrun swiftc -parse-as-library -emit-library \
             -module-name CompatObservationClient -target arm64-apple-ios16.6 -sdk "$SDK" \
-            -I "$OUT" -L "$OUT" -lswiftObservation \
+            -I "$OUT" "$OUT/libswiftObservation.dylib" \
             -Xlinker -rpath -Xlinker @loader_path \
             "$OUT/Client.swift" -o "$OUT/libCompatObservationClient.dylib" \
             > "$OUT/client.stdout" 2> "$OUT/client.stderr"
@@ -173,6 +173,12 @@ jobs:
           head -50 "$OUT/client.stderr"
           if [[ "$CLIENT_RC" -eq 0 ]]; then
             xcrun otool -L "$OUT/libCompatObservationClient.dylib" | tee "$OUT/client-loads.txt"
+            if grep -F "@rpath/libswiftObservation.dylib" "$OUT/client-loads.txt" >/dev/null && ! grep -F "/usr/lib/swift/libswiftObservation.dylib" "$OUT/client-loads.txt" >/dev/null; then
+              echo "CLIENT_LOCAL_OBSERVATION_BIND_PASS" | tee -a "$OUT/client-status.txt"
+            else
+              echo "CLIENT_LOCAL_OBSERVATION_BIND_FAIL" | tee -a "$OUT/client-status.txt"
+              exit 1
+            fi
             xcrun nm -u "$OUT/libCompatObservationClient.dylib" > "$OUT/client-undefined.txt"
             xcrun otool -l "$OUT/libCompatObservationClient.dylib" | grep -A5 LC_BUILD_VERSION | head -8
           fi
