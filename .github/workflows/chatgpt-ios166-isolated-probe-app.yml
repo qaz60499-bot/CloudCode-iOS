@@ -53,18 +53,23 @@ jobs:
             <key>CFBundleName</key><string>IPACompatProbe</string>
             <key>CFBundleDisplayName</key><string>IPA Compat Probe</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>0.0.1</string>
-            <key>CFBundleVersion</key><string>1</string>
+            <key>CFBundleShortVersionString</key><string>0.0.2</string>
+            <key>CFBundleVersion</key><string>2</string>
             <key>MinimumOSVersion</key><string>16.6</string>
             <key>LSRequiresIPhoneOS</key><true/>
             <key>UIDeviceFamily</key><array><integer>1</integer></array>
             <key>UIRequiresFullScreen</key><true/>
+            <!-- Expose only this independent app's own crash-safe result text. -->
+            <key>UIFileSharingEnabled</key><true/>
             <key>UISupportedInterfaceOrientations</key>
             <array><string>UIInterfaceOrientationPortrait</string></array>
             <key>UIStatusBarStyle</key><string>UIStatusBarStyleDefault</string>
           </dict></plist>
           PLIST
           plutil -lint "$APP/Info.plist"
+          # Fail closed if probe source no longer emits on-device milestones.
+          grep -F 'stage=OBSERVATION_TRACKING_ESTABLISHED' tools/chatgpt-compat/ios166-compat-test-app.swift
+          grep -F 'PAC shim actual function calls: NOT TESTED' tools/chatgpt-compat/ios166-compat-test-app.swift
           # Swift compiler autolinks the SDK's absolute-path Swift modules even
           # with -I/-L. Correct this ONLY on this unsigned, self-authored probe.
           # Never run install_name_tool on the encrypted official ChatGPT IPA.
