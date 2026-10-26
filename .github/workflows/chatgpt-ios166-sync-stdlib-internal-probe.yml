@@ -81,6 +81,40 @@ jobs:
               echo "SYNC_MINOS_PASS" | tee -a "$OUT/ios/status.txt"
             fi
           fi
+      - name: iOS16.6 independent client explicitly binds local Synchronization ABI
+        if: always()
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios166-sync-results/ios"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          cat > "$OUT/Client.swift" <<'SWIFT'
+          import Synchronization
+          public final class IsolatedSynchronizationClient {
+            private let counter = Mutex<Int>(0)
+            public init() {}
+            public func increment() -> Int {
+              counter.withLock { value in
+                value += 1
+                return value
+              }
+            }
+          }
+          SWIFT
+          xcrun swiftc -parse-as-library -emit-library -module-name IsolatedSynchronizationClient \
+            -target arm64-apple-ios16.6 -sdk "$SDK" -I "$OUT" \
+            "$OUT/Client.swift" "$OUT/libswiftSynchronization.dylib" \
+            -Xlinker -rpath -Xlinker @loader_path \
+            -o "$OUT/libIsolatedSynchronizationClient.dylib" \
+            >"$OUT/client.stdout" 2>"$OUT/client.stderr"
+          xcrun otool -L "$OUT/libIsolatedSynchronizationClient.dylib" | tee "$OUT/client-loadlibs.txt"
+          xcrun otool -l "$OUT/libIsolatedSynchronizationClient.dylib" | tee "$OUT/client-loadcommands.txt"
+          xcrun nm -u "$OUT/libIsolatedSynchronizationClient.dylib" | tee "$OUT/client-undefined.txt"
+          grep -F '@rpath/libswiftSynchronization.dylib' "$OUT/client-loadlibs.txt"
+          if grep -F '/usr/lib/swift/libswiftSynchronization.dylib' "$OUT/client-loadlibs.txt"; then
+            echo 'IOS_CLIENT_WRONG_SYSTEM_LIBRARY_FAIL'; exit 1
+          fi
+          grep -A5 LC_BUILD_VERSION "$OUT/client-loadcommands.txt" | grep -q 'minos 16.6'
+          echo "IOS_CLIENT_LOCAL_SYNCHRONIZATION_BIND_PASS"
       - name: Independently test official Mutex behavior on isolated macOS runner
         if: always()
         run: |
@@ -112,6 +146,49 @@ jobs:
           let busy = protected.withLockIfAvailable { $0 }
           guard busy == 10000 else { fatalError("MUTEX_TRYLOCK_FAIL") }
           print("MUTEX_TRYLOCK_PASS")
+          let held = DispatchSemaphore(value: 0)
+          let release = DispatchSemaphore(value: 0)
+          let worker = DispatchGroup()
+          worker.enter()
+          DispatchQueue.global().async {
+            protected.withLock { _ in
+              held.signal()
+              _ = release.wait(timeout: .now() + 8)
+            }
+            worker.leave()
+          }
+          guard held.wait(timeout: .now() + 8) == .success else {
+            fatalError("MUTEX_LOCK_CONTENTION_SETUP_FAIL")
+          }
+          let shouldBeNil = protected.withLockIfAvailable { $0 }
+          guard shouldBeNil == nil else {
+            fatalError("MUTEX_CONTENDED_TRYLOCK_FAIL")
+          }
+          release.signal()
+          guard worker.wait(timeout: .now() + 8) == .success else {
+            fatalError("MUTEX_LOCK_CONTENTION_TEARDOWN_FAIL")
+          }
+          print("MUTEX_CONTENDED_TRYLOCK_PASS")
+          struct MoveOnlyValue: ~Copyable {
+            var number: Int
+            init(_ number: Int) { self.number = number }
+          }
+          let noncopyable = Mutex<MoveOnlyValue>(MoveOnlyValue(17))
+          let n = noncopyable.withLock { $0.number }
+          guard n == 17 else { fatalError("MUTEX_MOVE_ONLY_GENERIC_FAIL") }
+          print("MUTEX_MOVE_ONLY_GENERIC_PASS")
+          enum TestError: Error { case expected }
+          do {
+            try protected.withLock { _ -> Void in
+              throw TestError.expected
+            }
+            fatalError("MUTEX_THROW_EXPECTED")
+          } catch TestError.expected {
+            guard protected.withLockIfAvailable({ $0 }) != nil else {
+              fatalError("MUTEX_THROW_LOCK_NOT_RELEASED")
+            }
+            print("MUTEX_THROW_UNLOCK_PASS")
+          }
           SWIFT
             set +e
             xcrun swiftc -target arm64-apple-macos13.0 -sdk "$SDK"               -I "$OUT/mac" "$OUT/mac/test.swift" "$OUT/mac/libswiftSynchronization.dylib"               -Xlinker -rpath -Xlinker @executable_path               -o "$OUT/mac/test" >"$OUT/mac/client.stdout" 2>"$OUT/mac/client.stderr"
