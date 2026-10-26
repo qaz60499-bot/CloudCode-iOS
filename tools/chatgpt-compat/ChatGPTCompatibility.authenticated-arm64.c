@@ -22,6 +22,9 @@
 #  error "Compiler attribute detection is required"
 #endif
 
+/* Swift 6.0 MetadataLookup.cpp uses unsigned (32-bit) opaque index. */
+_Static_assert(sizeof(unsigned) == 4, "Swift opaque-type index must be 32-bit");
+
 typedef struct {
     const void *value;
     uintptr_t state;
@@ -38,11 +41,11 @@ extern SWIFT_CC MetadataResponseCompat swift_getOpaqueTypeMetadata(
     uintptr_t request,
     const void *const *arguments,
     const void *descriptor,
-    uintptr_t index);
+    unsigned index);
 extern SWIFT_CC const void *swift_getOpaqueTypeConformance(
     const void *const *arguments,
     const void *descriptor,
-    uintptr_t index);
+    unsigned index);
 extern SWIFT_CC const void *swift_getTypeByMangledNameInContext(
     const char *typeNameStart,
     size_t typeNameLength,
@@ -86,7 +89,7 @@ SWIFT_CC MetadataResponseCompat swift_getOpaqueTypeMetadata2(
     uintptr_t request,
     const void *const *arguments,
     const void *signedDescriptor,
-    uintptr_t index) {
+    unsigned index) {
     const void *descriptor = auth_data_descriptor(
         signedDescriptor, SWIFT_PTRAUTH_OPAQUE_TYPE_DESCRIPTOR);
     return swift_getOpaqueTypeMetadata(request, arguments, descriptor, index);
@@ -95,7 +98,7 @@ SWIFT_CC MetadataResponseCompat swift_getOpaqueTypeMetadata2(
 SWIFT_CC const void *swift_getOpaqueTypeConformance2(
     const void *const *arguments,
     const void *signedDescriptor,
-    uintptr_t index) {
+    unsigned index) {
     const void *descriptor = auth_data_descriptor(
         signedDescriptor, SWIFT_PTRAUTH_OPAQUE_TYPE_DESCRIPTOR);
     return swift_getOpaqueTypeConformance(arguments, descriptor, index);
