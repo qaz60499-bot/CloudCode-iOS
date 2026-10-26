@@ -41,6 +41,12 @@ jobs:
             test -s "$PREV/$name"
             cp "$PREV/$name" "$FRAMES/$name"
           done
+          # Preserve actual binary Swift module interfaces for independent client builds.
+          mkdir -p "$OUT/SwiftModules"
+          for name in Observation.swiftmodule Synchronization.swiftmodule; do
+            test -s "$PREV/$name"
+            cp "$PREV/$name" "$OUT/SwiftModules/$name"
+          done
           CLANG="$(xcrun --find clang)"
           "$CLANG" -target arm64-apple-ios16.6 -march=armv8.3-a \
             -dynamiclib -O2 -fno-common -Werror \
