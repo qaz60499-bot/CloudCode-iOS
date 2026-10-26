@@ -51,6 +51,12 @@ jobs:
             xcrun otool -L "$OUT/ios/libswiftSynchronization.dylib" | tee "$OUT/ios/loadlibs.txt"
             xcrun nm -gU "$OUT/ios/libswiftSynchronization.dylib" | tee "$OUT/ios/exports.txt"
             xcrun nm -u "$OUT/ios/libswiftSynchronization.dylib" | tee "$OUT/ios/undefined.txt"
+            xcrun nm -m -u "$OUT/ios/libswiftSynchronization.dylib" | tee "$OUT/ios/undefined-binding.txt"
+            if grep -F '_swift_runtimeSupportsNoncopyableTypes' "$OUT/ios/undefined-binding.txt" | grep -qE 'weak external|weak.*external'; then
+              echo "SYNC_NONCOPYABLE_WEAK_IMPORT_PASS" | tee -a "$OUT/ios/status.txt"
+            else
+              echo "SYNC_NONCOPYABLE_WEAK_IMPORT_FAIL" | tee -a "$OUT/ios/status.txt"
+            fi
             shasum -a 256 "$OUT/ios/libswiftSynchronization.dylib" | tee "$OUT/ios/sha256.txt"
             expected=(
               '_$s15Synchronization5MutexVMa'
