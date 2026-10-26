@@ -65,6 +65,15 @@ jobs:
           </dict></plist>
           PLIST
           plutil -lint "$APP/Info.plist"
+          # Swift compiler autolinks the SDK's absolute-path Swift modules even
+          # with -I/-L. Correct this ONLY on this unsigned, self-authored probe.
+          # Never run install_name_tool on the encrypted official ChatGPT IPA.
+          xcrun install_name_tool -change \
+            /usr/lib/swift/libswiftObservation.dylib \
+            @rpath/libswiftObservation.dylib "$APP/IPACompatProbe"
+          xcrun install_name_tool -change \
+            /usr/lib/swift/libswiftSynchronization.dylib \
+            @rpath/libswiftSynchronization.dylib "$APP/IPACompatProbe"
           xcrun otool -L "$APP/IPACompatProbe" | tee "$BASE/evidence/loader-dependencies.txt"
           xcrun otool -l "$APP/IPACompatProbe" | tee "$BASE/evidence/main-loadcommands.txt"
           xcrun otool -l "$APP/Frameworks/libswiftObservation.dylib" > "$BASE/evidence/observation-loadcommands.txt"
