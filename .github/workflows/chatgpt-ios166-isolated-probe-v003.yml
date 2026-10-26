@@ -1,0 +1,133 @@
+name: IPA Total iOS16.6 isolated ABI probe v0.0.3
+on:
+  push:
+    branches: [ci/chatgpt-ios166-sync-internal-20261026]
+    paths:
+      - .github/workflows/chatgpt-ios166-isolated-probe-v003.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  build-probe-only:
+    runs-on: macos-15
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@v4
+        with:
+          name: chatgpt-ios166-compat-layer-three-libs
+          run-id: 40331436250
+          repository: qaz60499-bot/CloudCode-iOS
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/isolated-layer
+      - name: Build standalone isolated iOS16.6 UIKit app with real compatibility modules
+        run: |
+          set -euo pipefail
+          BASE="$RUNNER_TEMP/ios166-isolated-probe"
+          APP="$BASE/Payload/IPACompatProbe.app"
+          LAYER="$RUNNER_TEMP/isolated-layer"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p "$APP/Frameworks" "$BASE/evidence"
+          for lib in libswiftObservation.dylib libswiftSynchronization.dylib ChatGPTCompatibility.dylib; do
+            test -s "$LAYER/Frameworks/$lib"
+            cp "$LAYER/Frameworks/$lib" "$APP/Frameworks/$lib"
+          done
+          test -s "$LAYER/SwiftModules/Observation.swiftmodule"
+          test -s "$LAYER/SwiftModules/Synchronization.swiftmodule"
+          xcrun swiftc -parse-as-library -emit-executable -module-name IPACompatProbe \
+            -target arm64-apple-ios16.6 -sdk "$SDK" \
+            -I "$LAYER/SwiftModules" -L "$APP/Frameworks" \
+            tools/chatgpt-compat/ios166-compat-test-app-v003.swift \
+            -lswiftObservation -lswiftSynchronization -framework UIKit \
+            -Xlinker -rpath -Xlinker @executable_path/Frameworks \
+            -o "$APP/IPACompatProbe" >"$BASE/evidence/swiftc.stdout" 2>"$BASE/evidence/swiftc.stderr"
+          cat >"$APP/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleDevelopmentRegion</key><string>en</string>
+            <key>CFBundleIdentifier</key><string>cc.guess.ipatotal.compatprobe.ios166.v003</string>
+            <key>CFBundleExecutable</key><string>IPACompatProbe</string>
+            <key>CFBundleName</key><string>IPACompatProbe</string>
+            <key>CFBundleDisplayName</key><string>IPA ABI Probe v3</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>0.0.3</string>
+            <key>CFBundleVersion</key><string>3</string>
+            <key>MinimumOSVersion</key><string>16.6</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>UIDeviceFamily</key><array><integer>1</integer></array>
+            <key>UIRequiresFullScreen</key><true/>
+            <!-- Expose only this independent app's own crash-safe result text. -->
+            <key>UIFileSharingEnabled</key><true/>
+            <key>UISupportedInterfaceOrientations</key>
+            <array><string>UIInterfaceOrientationPortrait</string></array>
+            <key>UIStatusBarStyle</key><string>UIStatusBarStyleDefault</string>
+          </dict></plist>
+          PLIST
+          plutil -lint "$APP/Info.plist"
+          # Fail closed if probe source no longer emits on-device milestones.
+          grep -F 'OBSERVATION_TRACKING_ESTABLISHED' tools/chatgpt-compat/ios166-compat-test-app-v003.swift
+          grep -F 'PAC shim actual function calls: NOT TESTED' tools/chatgpt-compat/ios166-compat-test-app-v003.swift
+          grep -F 'Observation rearm' tools/chatgpt-compat/ios166-compat-test-app-v003.swift
+          grep -F 'Official ChatGPT 1.2026.286: NOT LOADED' tools/chatgpt-compat/ios166-compat-test-app-v003.swift
+          # Swift compiler autolinks the SDK's absolute-path Swift modules even
+          # with -I/-L. Correct this ONLY on this unsigned, self-authored probe.
+          # Never run install_name_tool on the encrypted official ChatGPT IPA.
+          xcrun install_name_tool -change \
+            /usr/lib/swift/libswiftObservation.dylib \
+            @rpath/libswiftObservation.dylib "$APP/IPACompatProbe"
+          xcrun install_name_tool -change \
+            /usr/lib/swift/libswiftSynchronization.dylib \
+            @rpath/libswiftSynchronization.dylib "$APP/IPACompatProbe"
+          xcrun otool -L "$APP/IPACompatProbe" | tee "$BASE/evidence/loader-dependencies.txt"
+          xcrun otool -l "$APP/IPACompatProbe" | tee "$BASE/evidence/main-loadcommands.txt"
+          xcrun otool -l "$APP/Frameworks/libswiftObservation.dylib" > "$BASE/evidence/observation-loadcommands.txt"
+          xcrun otool -l "$APP/Frameworks/libswiftSynchronization.dylib" > "$BASE/evidence/sync-loadcommands.txt"
+          xcrun otool -l "$APP/Frameworks/ChatGPTCompatibility.dylib" > "$BASE/evidence/pac-loadcommands.txt"
+          grep -F '@rpath/libswiftObservation.dylib' "$BASE/evidence/loader-dependencies.txt"
+          grep -F '@rpath/libswiftSynchronization.dylib' "$BASE/evidence/loader-dependencies.txt"
+          grep -A6 'LC_BUILD_VERSION' "$BASE/evidence/main-loadcommands.txt" | grep -E 'minos +16\.6'
+          python3 - "$APP" <<'PY'
+          import pathlib,plistlib,struct,sys,json
+          root=pathlib.Path(sys.argv[1])
+          info=plistlib.loads((root/"Info.plist").read_bytes())
+          assert info["CFBundleIdentifier"]=="cc.guess.ipatotal.compatprobe.ios166.v003"
+          assert info["MinimumOSVersion"]=="16.6"
+          assert "com.openai.chat" not in str(info)
+          result={}
+          for p in [root/"IPACompatProbe",*sorted((root/"Frameworks").glob("*.dylib"))]:
+              blob=p.read_bytes()[:0x40000]
+              assert struct.unpack_from("<I",blob)[0]==0xfeedfacf
+              hdr=struct.unpack_from("<IiiIIIII",blob)
+              assert hdr[1]==0x100000c
+              cursor=32
+              encrypted=False
+              for i in range(hdr[4]):
+                  cmd,size=struct.unpack_from("<II",blob,cursor)
+                  if cmd==0x2c and struct.unpack_from("<I",blob,cursor+16)[0]!=0:
+                      encrypted=True
+                  cursor+=size
+              assert not encrypted,p
+              result[p.name]={"cryptid":0,"arm64":True}
+          assert len(result)==4
+          (root.parent.parent/"evidence"/"unencrypted-macho-check.json").write_text(json.dumps(result,indent=2))
+          print("ISOLATED_PROBE_4_MACHOS_UNENCRYPTED_PASS")
+          PY
+          # The app is deliberately unsigned. TrollStore can apply its own
+          # installation trust mechanism on compatible devices only; this
+          # workflow never attempts device installation or production reuse.
+          cd "$BASE"
+          zip -q -r "$RUNNER_TEMP/CompatProbe_iOS16.6_TEST_ONLY.ipa" Payload
+          shasum -a 256 "$RUNNER_TEMP/CompatProbe_iOS16.6_TEST_ONLY.ipa" | tee "$BASE/evidence/test-ipa-sha256.txt"
+          echo "ISOLATED_PROBE_BUILD_ONLY_PASS"
+      - name: Publish test-only IPA and static audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios166-isolated-compat-probe-v003-test-only
+          path: |
+            ${{ runner.temp }}/CompatProbe_iOS16.6_TEST_ONLY.ipa
+            ${{ runner.temp }}/ios166-isolated-probe/evidence/
+          if-no-files-found: warn
