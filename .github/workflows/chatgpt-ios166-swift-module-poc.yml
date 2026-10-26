@@ -258,6 +258,17 @@ jobs:
           fi
           "$MAC/functional" | tee "$MAC/result.txt"
           grep -F 'OBSERVATION_RUNTIME_SEMANTICS_PASS' "$MAC/result.txt" >/dev/null
+      - name: Inspect iOS16.6 Observation runtime dependencies
+        if: always()
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios166-swift-probe"
+          if [[ ! -f "$OUT/libswiftObservation.dylib" ]]; then echo "NO_OBSERVATION_DYLIB"; exit 1; fi
+          xcrun otool -L "$OUT/libswiftObservation.dylib" | tee "$OUT/Observation.loadlibs.txt"
+          xcrun nm -u "$OUT/libswiftObservation.dylib" | tee "$OUT/Observation.undefined.txt" | grep -E '_swift_|_swift_|_observation|__swift|_objc|_pthread' | head -100 || true
+          echo "OBS_IMPORT_TOTAL=$(wc -l < "$OUT/Observation.undefined.txt")"
+          echo "OBS_KNOWN_FIVE_2_IMPORTS:"
+          grep -E '_swift_(conformsToProtocol2|getOpaqueTypeConformance2|getOpaqueTypeMetadata2|getTypeByMangledNameInContext2|getTypeByMangledNameInContextInMetadataState2)' "$OUT/Observation.undefined.txt" || true
       - name: Upload isolated probe logs
         if: always()
         uses: actions/upload-artifact@v4
