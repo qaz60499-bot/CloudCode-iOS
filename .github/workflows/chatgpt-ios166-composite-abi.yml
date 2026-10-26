@@ -1,0 +1,160 @@
+name: ChatGPT iOS16.6 Observation Synchronization composite ABI
+on:
+  push:
+    branches: [ci/chatgpt-ios166-sync-internal-20261026]
+    paths:
+      - .github/workflows/chatgpt-ios166-composite-abi.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  composite-module-integration:
+    runs-on: macos-15
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Fetch only pinned upstream files required for integration
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/compat-sources"; OUT="$RUNNER_TEMP/compat-composite"
+          mkdir -p "$SRC/Observation" "$SRC/Sync/Mutex" "$OUT/ios" "$OUT/mac"
+          BASE=https://raw.githubusercontent.com/swiftlang/swift/swift-6.0-RELEASE/stdlib/public
+          for f in Locking.swift Observable.swift ObservationRegistrar.swift ObservationTracking.swift ThreadLocal.swift; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 25 "$BASE/Observation/Sources/Observation/$f" -o "$SRC/Observation/$f"
+          done
+          for f in Cell.swift Mutex/Mutex.swift Mutex/DarwinImpl.swift; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 25 "$BASE/Synchronization/$f" -o "$SRC/Sync/$f"
+          done
+          shasum -a 256 "$SRC"/Observation/*.swift "$SRC"/Sync/Cell.swift "$SRC"/Sync/Mutex/*.swift | tee "$OUT/upstream-source-sha256.txt"
+          xcrun swiftc --version
+      - name: Build separate official-source iOS16.6 ABI libraries and a combined client
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/compat-sources"; OUT="$RUNNER_TEMP/compat-composite/ios"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          FEATURES=(-Xfrontend -enable-builtin-module
+            -Xfrontend -enable-experimental-feature -Xfrontend RawLayout
+            -Xfrontend -enable-experimental-feature -Xfrontend StaticExclusiveOnly
+            -Xfrontend -enable-experimental-feature -Xfrontend Extern)
+          xcrun clang -target arm64-apple-ios16.6 -miphoneos-version-min=16.6 -isysroot "$SDK" \
+            -Wall -Wextra -Werror -fvisibility=hidden \
+            -c tools/chatgpt-compat/ios166-observation-posix-runtime.c -o "$OUT/observation-runtime.o"
+          xcrun swiftc -parse-as-library -emit-library -emit-module -module-name Observation \
+            -target arm64-apple-ios16.6 -sdk "$SDK" -emit-module-path "$OUT/Observation.swiftmodule" \
+            -Xlinker -install_name -Xlinker @rpath/libswiftObservation.dylib \
+            "$SRC"/Observation/*.swift "$OUT/observation-runtime.o" -o "$OUT/libswiftObservation.dylib" \
+            > "$OUT/observation.stdout" 2> "$OUT/observation.stderr"
+          xcrun swiftc -parse-as-library -emit-library -emit-module -module-name Synchronization \
+            -target arm64-apple-ios16.6 -sdk "$SDK" "${FEATURES[@]}" \
+            -emit-module-path "$OUT/Synchronization.swiftmodule" \
+            -Xlinker -install_name -Xlinker @rpath/libswiftSynchronization.dylib \
+            "$SRC/Sync/Cell.swift" "$SRC/Sync/Mutex/Mutex.swift" "$SRC/Sync/Mutex/DarwinImpl.swift" \
+            -o "$OUT/libswiftSynchronization.dylib" > "$OUT/sync.stdout" 2> "$OUT/sync.stderr"
+          cat > "$OUT/CombinedClient.swift" <<'SWIFT'
+          import Observation
+          import Synchronization
+
+          final class CompositeCounter: Observable {
+            let registrar = ObservationRegistrar()
+            private var stored = 0
+            var number: Int {
+              get {
+                registrar.access(self, keyPath: \.number)
+                return stored
+              }
+              set {
+                registrar.withMutation(of: self, keyPath: \.number) { stored = newValue }
+              }
+            }
+          }
+          public func compositeABIClient() -> Int {
+            let protected = Mutex<CompositeCounter>(CompositeCounter())
+            let initial = protected.withLock { model in
+              withObservationTracking({ model.number }, onChange: {})
+            }
+            return protected.withLock { model in model.number += 1; return initial + model.number }
+          }
+          SWIFT
+          xcrun swiftc -parse-as-library -emit-library -module-name IsolatedCombinedClient \
+            -target arm64-apple-ios16.6 -sdk "$SDK" -I "$OUT" \
+            "$OUT/CombinedClient.swift" "$OUT/libswiftObservation.dylib" "$OUT/libswiftSynchronization.dylib" \
+            -Xlinker -rpath -Xlinker @loader_path \
+            -o "$OUT/libIsolatedCombinedClient.dylib" > "$OUT/client.stdout" 2> "$OUT/client.stderr"
+          xcrun otool -L "$OUT/libIsolatedCombinedClient.dylib" | tee "$OUT/client-loadlibs.txt"
+          xcrun nm -m -u "$OUT/libIsolatedCombinedClient.dylib" | tee "$OUT/client-undefined.txt"
+          grep -F '@rpath/libswiftObservation.dylib' "$OUT/client-loadlibs.txt"
+          grep -F '@rpath/libswiftSynchronization.dylib' "$OUT/client-loadlibs.txt"
+          if grep -E '/usr/lib/swift/libswift(Observation|Synchronization)\.dylib' "$OUT/client-loadlibs.txt"; then
+            echo "COMPOSITE_SYSTEM_LIB_ACCIDENTAL_BIND_FAIL"; exit 1
+          fi
+          for lib in "$OUT"/libswift*.dylib "$OUT/libIsolatedCombinedClient.dylib"; do
+            xcrun otool -l "$lib" | grep -A6 'LC_BUILD_VERSION' | grep 'minos 16.6'
+            shasum -a 256 "$lib"
+          done
+          echo COMPOSITE_IOS166_EXPLICIT_LINK_PASS
+      - name: Run macOS combined real Observation plus Mutex metadata and threading
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/compat-sources"; OUT="$RUNNER_TEMP/compat-composite/mac"
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          FEATURES=(-Xfrontend -enable-builtin-module
+            -Xfrontend -enable-experimental-feature -Xfrontend RawLayout
+            -Xfrontend -enable-experimental-feature -Xfrontend StaticExclusiveOnly
+            -Xfrontend -enable-experimental-feature -Xfrontend Extern)
+          xcrun clang -target arm64-apple-macos13.0 -isysroot "$SDK" -Wall -Wextra -Werror \
+            -c tools/chatgpt-compat/ios166-observation-posix-runtime.c -o "$OUT/observation-runtime.o"
+          xcrun swiftc -parse-as-library -emit-library -emit-module -module-name Observation \
+            -target arm64-apple-macos13.0 -sdk "$SDK" -emit-module-path "$OUT/Observation.swiftmodule" \
+            -Xlinker -install_name -Xlinker @rpath/libswiftObservation.dylib \
+            "$SRC"/Observation/*.swift "$OUT/observation-runtime.o" \
+            -o "$OUT/libswiftObservation.dylib" >"$OUT/observation.stdout" 2>"$OUT/observation.stderr"
+          xcrun swiftc -parse-as-library -emit-library -emit-module -module-name Synchronization \
+            -target arm64-apple-macos13.0 -sdk "$SDK" "${FEATURES[@]}" \
+            -emit-module-path "$OUT/Synchronization.swiftmodule" \
+            -Xlinker -install_name -Xlinker @rpath/libswiftSynchronization.dylib \
+            "$SRC/Sync/Cell.swift" "$SRC/Sync/Mutex/Mutex.swift" "$SRC/Sync/Mutex/DarwinImpl.swift" \
+            -o "$OUT/libswiftSynchronization.dylib" >"$OUT/sync.stdout" 2>"$OUT/sync.stderr"
+          cat > "$OUT/combined.swift" <<'SWIFT'
+          import Observation
+          import Synchronization
+          import Dispatch
+          final class Counter: Observable {
+            let registrar = ObservationRegistrar()
+            private var storage = 0
+            var number: Int {
+              get { registrar.access(self,keyPath: \.number); return storage }
+              set { registrar.withMutation(of:self,keyPath: \.number) { storage = newValue } }
+            }
+          }
+          func genericRead<T: Observable>(_ value: T, _ key: KeyPath<T, Int>) -> Int {
+            value[keyPath: key]
+          }
+          let combined = Mutex<Counter>(Counter())
+          var notified = 0
+          let initial = combined.withLock { model in
+            withObservationTracking({ genericRead(model, \.number) }, onChange: { notified += 1 })
+          }
+          DispatchQueue.concurrentPerform(iterations: 500) { _ in
+            combined.withLock { $0.number += 1 }
+          }
+          guard initial == 0 && notified == 1 && combined.withLock({ $0.number }) == 500 else {
+            fatalError("COMPOSITE_OBSERVATION_MUTEX_SEMANTICS_FAIL")
+          }
+          print("COMPOSITE_OBSERVATION_MUTEX_SEMANTICS_PASS")
+          print("COMPOSITE_SWIFT_METADATA", String(reflecting: type(of: combined)))
+          SWIFT
+          xcrun swiftc -target arm64-apple-macos13.0 -sdk "$SDK" -I "$OUT" \
+            "$OUT/combined.swift" "$OUT/libswiftObservation.dylib" "$OUT/libswiftSynchronization.dylib" \
+            -Xlinker -rpath -Xlinker @executable_path -o "$OUT/combined" >"$OUT/client.stdout" 2>"$OUT/client.stderr"
+          xcrun otool -L "$OUT/combined" | tee "$OUT/client-loadlibs.txt"
+          grep -F '@rpath/libswiftObservation.dylib' "$OUT/client-loadlibs.txt"
+          grep -F '@rpath/libswiftSynchronization.dylib' "$OUT/client-loadlibs.txt"
+          "$OUT/combined" | tee "$OUT/runtime-result.txt"
+          grep -F 'COMPOSITE_OBSERVATION_MUTEX_SEMANTICS_PASS' "$OUT/runtime-result.txt"
+      - name: Upload only independent research artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatgpt-ios166-observation-sync-composite
+          path: ${{ runner.temp }}/compat-composite
+          if-no-files-found: warn
