@@ -73,7 +73,7 @@ jobs:
           set +e
           "$SWIFTC" -parse-as-library -emit-library -emit-module -module-name Observation \
             -target arm64-apple-ios16.6 -sdk "$SDK" \
-            -emit-module-path "$OUT/ObservationLink.swiftmodule" \
+            -emit-module-path "$OUT/Observation.swiftmodule" \
             -Xlinker -install_name -Xlinker @rpath/libswiftObservation.dylib \
             "$SRC"/Observation/*.swift "$OUT/ios166-observation-runtime.o" \
             -o "$OUT/libswiftObservation.dylib" > "$OUT/observation-link.stdout" 2> "$OUT/observation-link.stderr"
@@ -95,6 +95,87 @@ jobs:
             done
           fi
           echo 'Even a successful link is not a claim of deployment or behavioral ABI compatibility.'
+      - name: Match all nine required Observation ABI exports
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios166-swift-probe"
+          if [[ ! -e "$OUT/libswiftObservation.dylib" ]]; then
+            echo "Observation dylib missing: cannot compare ABI exports" > "$OUT/abi9-status.txt"
+            exit 1
+          fi
+          expected=(
+            '_$s11Observation10ObservableMp'
+            '_$s11Observation04withA8Tracking_8onChangexxyXE_yyYbcyXKtlF'
+            '_$s11Observation0A9RegistrarV12withMutation2of7keyPath_q0_x_s03KeyG0Cyxq_Gq0_yKXEtKAA10ObservableRzr1_lF'
+            '_$s11Observation0A9RegistrarV6access_7keyPathyx_s03KeyE0Cyxq_GtAA10ObservableRzr0_lF'
+            '_$s11Observation0A9RegistrarV6didSet_7keyPathyx_s03KeyF0Cyxq_GtAA10ObservableRzr0_lF'
+            '_$s11Observation0A9RegistrarV7willSet_7keyPathyx_s03KeyF0Cyxq_GtAA10ObservableRzr0_lF'
+            '_$s11Observation0A9RegistrarVACycfC'
+            '_$s11Observation0A9RegistrarVMa'
+            '_$s11Observation0A9RegistrarVMn'
+          )
+          total=0; ok=0
+          xcrun nm -gU "$OUT/libswiftObservation.dylib" > "$OUT/Observation.nm.txt"
+          for name in "${expected[@]}"; do
+            total=$((total+1))
+            if grep -F "$name" "$OUT/Observation.nm.txt" >/dev/null; then
+              echo "ABI9_MATCH $name" | tee -a "$OUT/abi9-status.txt"
+              ok=$((ok+1))
+            else
+              echo "ABI9_MISSING $name" | tee -a "$OUT/abi9-status.txt"
+            fi
+          done
+          echo "ABI9_SUMMARY $ok/$total" | tee -a "$OUT/abi9-status.txt"
+          [[ "$ok" -eq "$total" ]]
+      - name: Link independent Observation client against iOS16.6 candidate
+        if: always()
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios166-swift-probe"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          cat > "$OUT/Client.swift" <<'SWIFT'
+          import Observation
+          final class Counter: Observable {
+            let registrar = ObservationRegistrar()
+            var value = 0
+            func current() -> Int {
+              registrar.access(self, keyPath: \.value)
+              return value
+            }
+            func increment() {
+              registrar.withMutation(of: self, keyPath: \.value) {
+                value += 1
+              }
+            }
+          }
+          @_cdecl("ios166_observation_client_probe")
+          public func observationProbe() -> Int32 {
+            let model = Counter()
+            let first = withObservationTracking({
+              model.current()
+            }, onChange: {
+              _ = model.current()
+            })
+            model.increment()
+            return Int32(first + model.current())
+          }
+          SWIFT
+          set +e
+          xcrun swiftc -parse-as-library -emit-library \
+            -module-name CompatObservationClient -target arm64-apple-ios16.6 -sdk "$SDK" \
+            -I "$OUT" -L "$OUT" -lswiftObservation \
+            -Xlinker -rpath -Xlinker @loader_path \
+            "$OUT/Client.swift" -o "$OUT/libCompatObservationClient.dylib" \
+            > "$OUT/client.stdout" 2> "$OUT/client.stderr"
+          CLIENT_RC=$?
+          set -e
+          echo "observation_client_link_rc=$CLIENT_RC" | tee "$OUT/client-status.txt"
+          head -50 "$OUT/client.stderr"
+          if [[ "$CLIENT_RC" -eq 0 ]]; then
+            xcrun otool -L "$OUT/libCompatObservationClient.dylib" | tee "$OUT/client-loads.txt"
+            xcrun nm -u "$OUT/libCompatObservationClient.dylib" > "$OUT/client-undefined.txt"
+            xcrun otool -l "$OUT/libCompatObservationClient.dylib" | grep -A5 LC_BUILD_VERSION | head -8
+          fi
       - name: Upload isolated probe logs
         if: always()
         uses: actions/upload-artifact@v4
