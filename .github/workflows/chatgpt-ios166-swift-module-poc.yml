@@ -1,6 +1,9 @@
 name: ChatGPT iOS16.6 Swift module ABI feasibility
 
 on:
+  push:
+    branches:
+      - ci/chatgpt-ios166-module-abi-20261026
   workflow_dispatch:
 
 permissions:
