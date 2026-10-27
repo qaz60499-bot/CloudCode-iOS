@@ -1,0 +1,63 @@
+name: IPA Total iOS16.6 arm64e PAC object ABI probe v0.0.6
+on:
+  push:
+    branches: [ci/chatgpt-ios166-sync-internal-20261026]
+    paths:
+      - tools/chatgpt-compat/ChatGPTCompatibility.authenticated-arm64.c
+      - .github/workflows/chatgpt-ios166-arm64e-object-v006.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compile-arm64e-object-only:
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Verify Swift 6 ABI constants and compile arm64e iOS 16.6 object
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios166-arm64e-v006"
+          mkdir -p "$OUT"
+          SRC="tools/chatgpt-compat/ChatGPTCompatibility.authenticated-arm64.c"
+          python3 - "$SRC" <<'PY'
+          import pathlib, re, sys
+          s=pathlib.Path(sys.argv[1]).read_text()
+          for name, value in (
+              ("SWIFT_PTRAUTH_PROTOCOL_DESCRIPTOR", "0xe909"),
+              ("SWIFT_PTRAUTH_OPAQUE_TYPE_DESCRIPTOR", "0xbdd1"),
+              ("SWIFT_PTRAUTH_CONTEXT_DESCRIPTOR", "0xb5e3"),
+          ):
+              assert re.search(r"\b" + name + r"\s*=\s*" + value + r"\b", s), name
+          for name in (
+              "swift_getOpaqueTypeMetadata2", "swift_getOpaqueTypeMetadata",
+              "swift_getOpaqueTypeConformance2", "swift_getOpaqueTypeConformance",
+          ):
+              assert len(re.findall(r"\b" + name + r"\s*\([^;{}]*?\bunsigned\s+index\s*\)", s, re.S)) == 1, name
+          assert re.search(r"const void \*value;\s*uintptr_t state;", s)
+          assert all(x in s for x in ("autda", "xpacd", "brk #0xc472"))
+          print("SWIFT60_PAC_DISCRIMINATOR_AND_ABI_STATIC_CONTRACT_PASS")
+          PY
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          CLANG="$(xcrun --find clang)"
+          "$CLANG" -target arm64e-apple-ios16.6 -arch arm64e \
+            -miphoneos-version-min=16.6 -isysroot "$SDK" \
+            -O1 -g -Wall -Wextra -Werror -fno-common \
+            -c "$SRC" -o "$OUT/ChatGPTCompatibility.arm64e.o"
+          xcrun lipo -info "$OUT/ChatGPTCompatibility.arm64e.o" | tee "$OUT/lipo.txt"
+          xcrun otool -hv "$OUT/ChatGPTCompatibility.arm64e.o" | tee "$OUT/macho-header.txt"
+          xcrun otool -tvV "$OUT/ChatGPTCompatibility.arm64e.o" > "$OUT/disassembly.txt"
+          grep -Ei 'arm64e' "$OUT/lipo.txt"
+          grep -Ei '\bautda\b' "$OUT/disassembly.txt"
+          grep -Ei '\bxpacd\b' "$OUT/disassembly.txt"
+          grep -Ei '\bbrk\b' "$OUT/disassembly.txt"
+          shasum -a 256 "$OUT/ChatGPTCompatibility.arm64e.o" | tee "$OUT/sha256.txt"
+          echo 'ARM64E_OBJECT_ABI_COMPILE_PASS_ONLY_NOT_RUNTIME_PAC_OR_SWIFT' | tee "$OUT/verification-level.txt"
+          cat "$OUT/verification-level.txt" >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish only isolated arm64e object evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios166-arm64e-pac-object-v006-static-only
+          path: ${{ runner.temp }}/ios166-arm64e-v006/
+          if-no-files-found: warn
