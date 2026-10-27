@@ -1,0 +1,95 @@
+name: IPA Total iOS16.6 v011 shim-bound real Swift Runtime independent oracle
+on:
+  push:
+    branches: [ci/chatgpt-ios166-sync-internal-20261026]
+    paths:
+      - .github/workflows/chatgpt-ios166-shim-bound-real-v011.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos-arm64-namespaced-real-swift:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Re-run all five Swift ABI shims with private test-only linker symbols
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios166-shim-bound-v011"
+          mkdir -p "$OUT"
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          CLANG="$(xcrun --find clang)"
+          REMAP=(
+            -Dswift_conformsToProtocol2=ipa_test_swift_conformsToProtocol2
+            -Dswift_getOpaqueTypeMetadata2=ipa_test_swift_getOpaqueTypeMetadata2
+            -Dswift_getOpaqueTypeConformance2=ipa_test_swift_getOpaqueTypeConformance2
+            -Dswift_getTypeByMangledNameInContext2=ipa_test_swift_getTypeByMangledNameInContext2
+            -Dswift_getTypeByMangledNameInContextInMetadataState2=ipa_test_swift_getTypeByMangledNameInContextInMetadataState2
+          )
+          "$CLANG" -target arm64-apple-macos13 -arch arm64 -march=armv8.3-a \
+            -isysroot "$SDK" -O1 -g -Wall -Wextra -Werror "${REMAP[@]}" \
+            -c tools/chatgpt-compat/ChatGPTCompatibility.authenticated-arm64.c -o "$OUT/shim.o"
+          xcrun nm -gU "$OUT/shim.o" | tee "$OUT/namespaced-shim-exports.txt"
+          for symbol in \
+            _ipa_test_swift_conformsToProtocol2 \
+            _ipa_test_swift_getOpaqueTypeMetadata2 \
+            _ipa_test_swift_getOpaqueTypeConformance2 \
+            _ipa_test_swift_getTypeByMangledNameInContext2 \
+            _ipa_test_swift_getTypeByMangledNameInContextInMetadataState2; do
+              awk '{print $NF}' "$OUT/namespaced-shim-exports.txt" | grep -Fx "$symbol" >/dev/null ||
+                { echo "TEST_SHIM_SYMBOL_NOT_DEFINED $symbol"; exit 2; }
+          done
+          echo 'FIVE_PRIVATE_SHIM_SYMBOLS_PROVEN_DEFINED_IN_OUR_OBJECT' | tee "$OUT/symbol-binding-proof.txt"
+          for spec in \
+            v008:ios166_real_swift_runtime_oracle_v008.c \
+            v009:ios166_real_swift_witness_oracle_v009.c \
+            v010:ios166_real_swift_opaque_oracle_v010.c; do
+            ver="${spec%%:*}"
+            file="${spec#*:}"
+            "$CLANG" -target arm64-apple-macos13 -arch arm64 \
+              -isysroot "$SDK" -O1 -g -Wall -Wextra -Werror "${REMAP[@]}" \
+              -c "tools/chatgpt-compat/$file" -o "$OUT/$ver.o"
+          done
+          echo 'public func ipaV011RuntimeAnchor() -> Int { 42 }' > "$OUT/anchor.swift"
+          for ver in v008 v009 v010; do
+            xcrun swiftc -parse-as-library -target arm64-apple-macos13 -sdk "$SDK" \
+              "$OUT/anchor.swift" "$OUT/shim.o" "$OUT/$ver.o" \
+              -o "$OUT/oracle-$ver"
+            xcrun lipo -info "$OUT/oracle-$ver" | tee "$OUT/lipo-$ver.txt"
+            xcrun nm -gU "$OUT/oracle-$ver" > "$OUT/symbols-$ver.txt"
+          done
+          "$OUT/oracle-v008" | tee "$OUT/results-v008.txt"
+          grep -Fx 'REAL_SWIFT_RUNTIME_MANGLED_TYPE_FORWARDING_PASS_NULL_CONTEXT_ONLY' "$OUT/results-v008.txt"
+          xcrun swiftc -target arm64-apple-macos13 -sdk "$SDK" \
+            -module-name IPAWitnessOracle -emit-library \
+            tools/chatgpt-compat/ios166_real_swift_witness_protocol_v009.swift \
+            -o "$OUT/libIPAWitnessOracle.dylib"
+          xcrun nm -gU "$OUT/libIPAWitnessOracle.dylib" > "$OUT/swift-symbols.txt"
+          PROTOCOL_RAW="$(grep -E 'Mp$' "$OUT/swift-symbols.txt" | awk '{print $NF}')"
+          OPAQUE_RAW="$(grep -E 'QOMQ$' "$OUT/swift-symbols.txt" | awk '{print $NF}')"
+          test -n "$PROTOCOL_RAW" && test -n "$OPAQUE_RAW"
+          test "$(printf '%s\n' "$PROTOCOL_RAW" | wc -l | tr -d ' ')" = "1"
+          test "$(printf '%s\n' "$OPAQUE_RAW" | wc -l | tr -d ' ')" = "1"
+          PROTOCOL="${PROTOCOL_RAW#_}"
+          OPAQUE="${OPAQUE_RAW#_}"
+          IPA_WITNESS_LIBRARY="$OUT/libIPAWitnessOracle.dylib" \
+            IPA_WITNESS_PROTOCOL_SYMBOL="$PROTOCOL" \
+            "$OUT/oracle-v009" | tee "$OUT/results-v009.txt"
+          grep -Fx 'REAL_SWIFT_RUNTIME_WITNESS_POSITIVE_PASS' "$OUT/results-v009.txt"
+          grep -Fx 'REAL_SWIFT_RUNTIME_WITNESS_NEGATIVE_PASS' "$OUT/results-v009.txt"
+          IPA_OPAQUE_LIBRARY="$OUT/libIPAWitnessOracle.dylib" \
+            IPA_OPAQUE_DESCRIPTOR_SYMBOL="$OPAQUE" \
+            "$OUT/oracle-v010" | tee "$OUT/results-v010.txt"
+          grep -Fx 'REAL_SWIFT_RUNTIME_OPAQUE_METADATA_PASS' "$OUT/results-v010.txt"
+          grep -Fx 'REAL_SWIFT_RUNTIME_OPAQUE_CONFORMANCE_PASS' "$OUT/results-v010.txt"
+          echo 'ALL_FIVE_NAMESPACED_SHIMS_EXECUTED_REAL_SWIFT_MACOS_ARM64_NO_PAC' | tee "$OUT/verification-level.txt"
+          cat "$OUT/verification-level.txt" >> "$GITHUB_STEP_SUMMARY"
+          shasum -a 256 "$OUT/oracle-v008" "$OUT/oracle-v009" "$OUT/oracle-v010" | tee "$OUT/sha256.txt"
+      - name: Upload disambiguated linkage and runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios166-five-namespaced-shims-v011-macos-arm64
+          path: ${{ runner.temp }}/ios166-shim-bound-v011/
+          if-no-files-found: warn
