@@ -1,0 +1,49 @@
+name: IPA Total iOS16.6 PAC signed descriptor isolated runtime v0.0.5
+on:
+  push:
+    branches: [ci/chatgpt-ios166-sync-internal-20261026]
+    paths:
+      - tools/chatgpt-compat/pac_abi_runtime_harness_v005.c
+      - tools/chatgpt-compat/ChatGPTCompatibility.authenticated-arm64.c
+      - .github/workflows/chatgpt-ios166-pac-mock-v005.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos-arm64-pac-mock-runtime:
+    runs-on: macos-15-arm64
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Compile and execute mock-delegate authenticated PAC ABI harness
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          OUT="/tmp/ios166-pac-v005"
+          mkdir -p "$OUT"
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          CLANG="$(xcrun --find clang)"
+          "$CLANG" -target arm64-apple-macos13 -arch arm64 -march=armv8.3-a \
+            -isysroot "$SDK" -O1 -g -Wall -Wextra -Werror \
+            tools/chatgpt-compat/ChatGPTCompatibility.authenticated-arm64.c \
+            tools/chatgpt-compat/pac_abi_runtime_harness_v005.c \
+            -o "$OUT/pac_abi_mock_harness"
+          xcrun lipo -info "$OUT/pac_abi_mock_harness" | tee "$OUT/lipo.txt"
+          xcrun otool -tvV "$OUT/pac_abi_mock_harness" > "$OUT/disassembly.txt"
+          grep -Ei '\bautda\b' "$OUT/disassembly.txt" >/dev/null
+          grep -Ei '\bpacda\b' "$OUT/disassembly.txt" >/dev/null
+          grep -Ei '\bbrk\b' "$OUT/disassembly.txt" >/dev/null
+          "$OUT/pac_abi_mock_harness" | tee "$OUT/test-results.txt"
+          grep -Fx 'PAC_FIVE_NON_NULL_SIGNED_POINTER_FORWARDING_PASS' "$OUT/test-results.txt"
+          grep -Fx 'PAC_SWIFTCALL_C_HARNESS_METADATA_RESPONSE_PASS' "$OUT/test-results.txt"
+          grep -Fx 'PAC_WRONG_DISCRIMINATOR_REJECTED_IN_FORK_PASS' "$OUT/test-results.txt"
+          grep -Fx 'PAC_RUNTIME_MOCK_DELEGATE_TESTS_PASS_NOT_REAL_SWIFT_RUNTIME' "$OUT/test-results.txt"
+          shasum -a 256 "$OUT/pac_abi_mock_harness" | tee "$OUT/sha256.txt"
+          echo 'ISOLATED_MACOS_ARM64_PAC_ORACLE_PASS_NOT_IOS16_DEVICE'
+      - name: Upload isolated PAC runtime test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios166-pac-mock-v005-macos-arm64-only
+          path: /tmp/ios166-pac-v005/
+          if-no-files-found: warn
