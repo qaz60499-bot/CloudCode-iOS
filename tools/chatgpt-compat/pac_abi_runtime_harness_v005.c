@@ -120,6 +120,33 @@ static int positive_tests(void) {
     CHECK(calls == 5);
     return errors ? 1 : 0;
 }
+static int pac_auth_capability(void) {
+    /* A non-arm64e process can successfully execute PACDA/AUTDA opcodes
+     * while those instructions behave as hints with no useful data key.
+     * Never count that result as authenticated pointer validation.
+     * Compare INTEGER representations only; never dereference probes.
+     */
+    uintptr_t raw = (uintptr_t)&descriptor_protocol;
+    uintptr_t s1 = (uintptr_t)sign_data(&descriptor_protocol, DISC_PROTOCOL);
+    uintptr_t s2 = (uintptr_t)sign_data(&descriptor_protocol, DISC_OPAQUE);
+    uintptr_t stripped = s1;
+    __asm__ volatile("xpacd %x0" : "+r"(stripped));
+    const int changed1 = (s1 != raw);
+    const int changed2 = (s2 != raw);
+    const int changed_by_discriminator = (s1 != s2);
+    const int stripped_to_raw = (stripped == raw);
+    printf("PAC_CAPABILITY_DIAGNOSTIC sign_changed_a=%d sign_changed_b=%d discriminator_changed=%d strip_to_raw=%d\n",
+           changed1, changed2, changed_by_discriminator, stripped_to_raw);
+    if (!changed1 && !changed2) {
+        puts("PAC_DATA_AUTH_UNAVAILABLE_FOR_THIS_ARM64_PROCESS; SECURITY_NEGATIVE_NOT_TESTED");
+        return 0;
+    }
+    if (!changed_by_discriminator || !stripped_to_raw) {
+        fprintf(stderr, "PAC_SIGN_OR_STRIP_INCONSISTENT_FAIL\n");
+        return -1;
+    }
+    return 1;
+}
 static int negative_tests(void) {
     pid_t child = fork();
     if (child < 0) {
@@ -155,6 +182,12 @@ int main(void) {
     puts("PAC_FIVE_NON_NULL_SIGNED_POINTER_FORWARDING_PASS");
     puts("PAC_SWIFTCALL_C_HARNESS_METADATA_RESPONSE_PASS");
     /* A test of mocked runtime ABI forwarding, NOT a Swift runtime call. */
+    int capability = pac_auth_capability();
+    if (capability < 0) return 5;
+    if (capability == 0) {
+        puts("PAC_MOCK_ABI_FORWARDING_PASS_AUTHENTICATION_NOT_VERIFIED");
+        return 0;
+    }
     int negative = negative_tests();
     if (negative != 0) return negative;
     puts("PAC_RUNTIME_MOCK_DELEGATE_TESTS_PASS_NOT_REAL_SWIFT_RUNTIME");
