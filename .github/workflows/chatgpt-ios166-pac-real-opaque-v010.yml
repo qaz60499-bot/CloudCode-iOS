@@ -1,0 +1,67 @@
+name: IPA Total iOS16.6 PAC v010 real Swift opaque metadata ABI oracle
+on:
+  push:
+    branches: [ci/chatgpt-ios166-sync-internal-20261026]
+    paths:
+      - tools/chatgpt-compat/ios166_real_swift_opaque_oracle_v010.c
+      - .github/workflows/chatgpt-ios166-pac-real-opaque-v010.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos-arm64-opaque-oracle:
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Test real compiler-emitted Swift opaque metadata and witness on macOS ARM64
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios166-real-opaque-v010"
+          mkdir -p "$OUT"
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          CLANG="$(xcrun --find clang)"
+          xcrun swiftc -target arm64-apple-macos13 -sdk "$SDK" \
+            -module-name IPAWitnessOracle -emit-library \
+            tools/chatgpt-compat/ios166_real_swift_witness_protocol_v009.swift \
+            -o "$OUT/libIPAWitnessOracle.dylib"
+          xcrun nm -gU "$OUT/libIPAWitnessOracle.dylib" > "$OUT/swift-symbols.txt"
+          grep 'QOMQ' "$OUT/swift-symbols.txt" > "$OUT/opaque-symbol-candidates.txt"
+          SYMBOL_RAW="$(grep -E 'QOMQ$' "$OUT/opaque-symbol-candidates.txt" | awk '{print $NF}')"
+          test -n "$SYMBOL_RAW"
+          test "$(printf '%s\n' "$SYMBOL_RAW" | wc -l | tr -d ' ')" = "1"
+          SYMBOL="${SYMBOL_RAW#_}"
+          case "$SYMBOL" in '$s'*QOMQ) ;; *) echo 'OPAQUE_DESCRIPTOR_SYMBOL_NOT_VALID'; exit 2;; esac
+          echo 'REAL_COMPILER_EMITTED_OPAQUE_DESCRIPTOR_FOUND' | tee "$OUT/descriptor-check.txt"
+          "$CLANG" -target arm64-apple-macos13 -arch arm64 -march=armv8.3-a \
+            -isysroot "$SDK" -O1 -g -Wall -Wextra -Werror \
+            -c tools/chatgpt-compat/ChatGPTCompatibility.authenticated-arm64.c -o "$OUT/shim.o"
+          "$CLANG" -target arm64-apple-macos13 -arch arm64 \
+            -isysroot "$SDK" -O1 -g -Wall -Wextra -Werror \
+            -c tools/chatgpt-compat/ios166_real_swift_opaque_oracle_v010.c -o "$OUT/oracle.o"
+          echo 'public func opaqueRuntimeAnchor() -> Int { 42 }' > "$OUT/anchor.swift"
+          xcrun swiftc -parse-as-library -target arm64-apple-macos13 \
+            -sdk "$SDK" "$OUT/anchor.swift" "$OUT/shim.o" "$OUT/oracle.o" \
+            -o "$OUT/real_swift_opaque_oracle"
+          xcrun lipo -info "$OUT/real_swift_opaque_oracle" | tee "$OUT/lipo.txt"
+          IPA_OPAQUE_LIBRARY="$OUT/libIPAWitnessOracle.dylib" \
+            IPA_OPAQUE_DESCRIPTOR_SYMBOL="$SYMBOL" \
+            "$OUT/real_swift_opaque_oracle" | tee "$OUT/test-results.txt"
+          for expected in \
+            REAL_SWIFT_RUNTIME_OPAQUE_METADATA_PASS \
+            REAL_SWIFT_RUNTIME_OPAQUE_CONFORMANCE_PASS \
+            REAL_SWIFT_RUNTIME_FIVE_SHIM_ENTRIES_EXERCISED_ACROSS_V008_V009_V010 \
+            DATA_PAC_DESCRIPTOR_SIGNING_NOT_VERIFIED \
+            IOS16_DEVICE_RUNTIME_NOT_TESTED; do
+              grep -Fx "$expected" "$OUT/test-results.txt"
+          done
+          echo 'REAL_SWIFT_OPAQUE_METADATA_AND_WITNESS_PASS_MACOS_ARM64_ONLY' | tee "$OUT/verification-level.txt"
+          shasum -a 256 "$OUT/real_swift_opaque_oracle" | tee "$OUT/sha256.txt"
+          cat "$OUT/verification-level.txt" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload opaque type ABI evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios166-real-swift-opaque-v010-macos-arm64
+          path: ${{ runner.temp }}/ios166-real-opaque-v010/
+          if-no-files-found: warn
