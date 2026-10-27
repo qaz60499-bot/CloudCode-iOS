@@ -1,0 +1,61 @@
+name: IPA Total iOS16.6 arm64e PAC linked dylib v0.0.7
+on:
+  push:
+    branches: [ci/chatgpt-ios166-sync-internal-20261026]
+    paths:
+      - tools/chatgpt-compat/ChatGPTCompatibility.authenticated-arm64.c
+      - .github/workflows/chatgpt-ios166-arm64e-dylib-v007.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  link-arm64e-dylib-only:
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Link arm64e dylib against iOS 16.6 SDK (static binary inspection only)
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios166-arm64e-v007"
+          mkdir -p "$OUT"
+          SRC="tools/chatgpt-compat/ChatGPTCompatibility.authenticated-arm64.c"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          "$(xcrun --find clang)" -target arm64e-apple-ios16.6 -arch arm64e \
+            -dynamiclib -O2 -Wall -Wextra -Werror \
+            -miphoneos-version-min=16.6 -isysroot "$SDK" \
+            -Wl,-install_name,@rpath/ChatGPTCompatibility.dylib \
+            -Wl,-dead_strip -L "$SDK/usr/lib/swift" -lswiftCore \
+            "$SRC" -o "$OUT/ChatGPTCompatibility.arm64e.dylib"
+          xcrun lipo -info "$OUT/ChatGPTCompatibility.arm64e.dylib" | tee "$OUT/lipo.txt"
+          xcrun otool -hv "$OUT/ChatGPTCompatibility.arm64e.dylib" > "$OUT/header.txt"
+          xcrun otool -l "$OUT/ChatGPTCompatibility.arm64e.dylib" > "$OUT/loadcommands.txt"
+          xcrun otool -L "$OUT/ChatGPTCompatibility.arm64e.dylib" > "$OUT/dependencies.txt"
+          xcrun otool -D "$OUT/ChatGPTCompatibility.arm64e.dylib" > "$OUT/install-name.txt"
+          xcrun nm -gU "$OUT/ChatGPTCompatibility.arm64e.dylib" > "$OUT/exports.txt"
+          xcrun otool -tvV "$OUT/ChatGPTCompatibility.arm64e.dylib" > "$OUT/disassembly.txt"
+          grep -Ei 'arm64e' "$OUT/lipo.txt"
+          grep -E 'minos +16\.6' "$OUT/loadcommands.txt"
+          grep -Fqx '@rpath/ChatGPTCompatibility.dylib' "$OUT/install-name.txt"
+          for symbol in \
+            _swift_conformsToProtocol2 \
+            _swift_getOpaqueTypeConformance2 \
+            _swift_getOpaqueTypeMetadata2 \
+            _swift_getTypeByMangledNameInContext2 \
+            _swift_getTypeByMangledNameInContextInMetadataState2; do
+              awk '{print $NF}' "$OUT/exports.txt" | grep -Fx "$symbol" >/dev/null ||
+                { echo "MISSING_ARM64E_EXPORT $symbol"; exit 1; }
+          done
+          grep -Ei '\bautda\b' "$OUT/disassembly.txt" > /dev/null
+          grep -Ei '\bxpacd\b' "$OUT/disassembly.txt" > /dev/null
+          grep -Ei '\bbrk\b' "$OUT/disassembly.txt" > /dev/null
+          shasum -a 256 "$OUT/ChatGPTCompatibility.arm64e.dylib" | tee "$OUT/sha256.txt"
+          echo 'ARM64E_DYLIB_LINK_AND_STATIC_INSPECTION_PASS_NOT_RUNTIME_OR_DEVICE' | tee "$OUT/verification-level.txt"
+          cat "$OUT/verification-level.txt" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload isolated arm64e dylib evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios166-arm64e-pac-dylib-v007-static-only
+          path: ${{ runner.temp }}/ios166-arm64e-v007/
+          if-no-files-found: warn
