@@ -36,10 +36,19 @@ jobs:
           "$OUT/pac_abi_mock_harness" | tee "$OUT/test-results.txt"
           grep -Fx 'PAC_FIVE_NON_NULL_SIGNED_POINTER_FORWARDING_PASS' "$OUT/test-results.txt"
           grep -Fx 'PAC_SWIFTCALL_C_HARNESS_METADATA_RESPONSE_PASS' "$OUT/test-results.txt"
-          grep -Fx 'PAC_WRONG_DISCRIMINATOR_REJECTED_IN_FORK_PASS' "$OUT/test-results.txt"
-          grep -Fx 'PAC_RUNTIME_MOCK_DELEGATE_TESTS_PASS_NOT_REAL_SWIFT_RUNTIME' "$OUT/test-results.txt"
+          if grep -Fx 'PAC_WRONG_DISCRIMINATOR_REJECTED_IN_FORK_PASS' "$OUT/test-results.txt"; then
+            grep -Fx 'PAC_RUNTIME_MOCK_DELEGATE_TESTS_PASS_NOT_REAL_SWIFT_RUNTIME' "$OUT/test-results.txt"
+            echo 'PAC_HARDWARE_NEGATIVE_VERIFIED_ON_HOST_NOT_IOS' | tee "$OUT/verification-level.txt"
+          elif grep -Fx 'PAC_MOCK_ABI_FORWARDING_PASS_AUTHENTICATION_NOT_VERIFIED' "$OUT/test-results.txt"; then
+            grep -F 'PAC_DATA_AUTH_UNAVAILABLE_FOR_THIS_ARM64_PROCESS' "$OUT/test-results.txt"
+            echo 'PAC_ABI_MOCK_PASS_AUTHENTICATION_UNVERIFIED_HOST_HAS_NO_ACTIVE_DATA_PAC' | tee "$OUT/verification-level.txt"
+          else
+            echo 'PAC_NEGATIVE_UNEXPECTED_OR_UNVERIFIED' >&2
+            exit 1
+          fi
+          cat "$OUT/verification-level.txt" >> "$GITHUB_STEP_SUMMARY"
           shasum -a 256 "$OUT/pac_abi_mock_harness" | tee "$OUT/sha256.txt"
-          echo 'ISOLATED_MACOS_ARM64_PAC_ORACLE_PASS_NOT_IOS16_DEVICE'
+          echo 'ISOLATED_MACOS_ARM64_PAC_MOCK_TEST_COMPLETED_NOT_IOS16_DEVICE'
       - name: Upload isolated PAC runtime test evidence
         if: always()
         uses: actions/upload-artifact@v4
