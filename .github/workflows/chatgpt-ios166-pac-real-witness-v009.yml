@@ -1,0 +1,67 @@
+name: IPA Total iOS16.6 PAC v009 real Swift Runtime witness oracle
+on:
+  push:
+    branches: [ci/chatgpt-ios166-sync-internal-20261026]
+    paths:
+      - tools/chatgpt-compat/ios166_real_swift_witness_oracle_v009.c
+      - tools/chatgpt-compat/ios166_real_swift_witness_protocol_v009.swift
+      - .github/workflows/chatgpt-ios166-pac-real-witness-v009.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos-arm64-witness-oracle:
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Run real Swift compiler emitted protocol/witness oracle on macOS arm64
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios166-real-witness-v009"
+          mkdir -p "$OUT"
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          CLANG="$(xcrun --find clang)"
+          xcrun swiftc -target arm64-apple-macos13 -sdk "$SDK" \
+            -module-name IPAWitnessOracle -emit-library \
+            tools/chatgpt-compat/ios166_real_swift_witness_protocol_v009.swift \
+            -o "$OUT/libIPAWitnessOracle.dylib"
+          xcrun nm -gU "$OUT/libIPAWitnessOracle.dylib" > "$OUT/swift-symbols.txt"
+          SYMBOL_RAW="$(grep -E 'Mp$' "$OUT/swift-symbols.txt" | awk '{print $NF}')"
+          test -n "$SYMBOL_RAW"
+          test "$(printf '%s\n' "$SYMBOL_RAW" | wc -l | tr -d ' ')" = "1"
+          SYMBOL="${SYMBOL_RAW#_}"
+          case "$SYMBOL" in '$s'*Mp) ;; *) echo "UNEXPECTED_SWIFT_PROTOCOL_DESCRIPTOR_SYMBOL"; exit 2;; esac
+          echo 'COMPILER_EMITTED_PUBLIC_PROTOCOL_DESCRIPTOR_FOUND' | tee "$OUT/descriptor-check.txt"
+          "$CLANG" -target arm64-apple-macos13 -arch arm64 -march=armv8.3-a \
+            -isysroot "$SDK" -O1 -g -Wall -Wextra -Werror \
+            -c tools/chatgpt-compat/ChatGPTCompatibility.authenticated-arm64.c -o "$OUT/shim.o"
+          "$CLANG" -target arm64-apple-macos13 -arch arm64 \
+            -isysroot "$SDK" -O1 -g -Wall -Wextra -Werror \
+            -c tools/chatgpt-compat/ios166_real_swift_witness_oracle_v009.c -o "$OUT/oracle.o"
+          echo 'public func witnessRuntimeAnchor() -> Int { 42 }' > "$OUT/anchor.swift"
+          xcrun swiftc -parse-as-library -target arm64-apple-macos13 \
+            -sdk "$SDK" "$OUT/anchor.swift" "$OUT/shim.o" "$OUT/oracle.o" \
+            -o "$OUT/real_swift_witness_oracle"
+          xcrun lipo -info "$OUT/real_swift_witness_oracle" | tee "$OUT/lipo.txt"
+          IPA_WITNESS_LIBRARY="$OUT/libIPAWitnessOracle.dylib" \
+            IPA_WITNESS_PROTOCOL_SYMBOL="$SYMBOL" \
+            "$OUT/real_swift_witness_oracle" | tee "$OUT/test-results.txt"
+          for expected in \
+            REAL_SWIFT_RUNTIME_WITNESS_POSITIVE_PASS \
+            REAL_SWIFT_RUNTIME_WITNESS_NEGATIVE_PASS \
+            REAL_SWIFT_RUNTIME_PROTOCOL_FORWARDING_PASS_UNSIGNED_MACOS_ARM64 \
+            DATA_PAC_DESCRIPTOR_SIGNING_NOT_VERIFIED \
+            IOS16_DEVICE_RUNTIME_NOT_TESTED; do
+              grep -Fx "$expected" "$OUT/test-results.txt"
+          done
+          echo 'REAL_SWIFT_WITNESS_RUNTIME_FOR_PROTOCOL_DESCRIPTOR_MACOS_ARM64_ONLY' | tee "$OUT/verification-level.txt"
+          shasum -a 256 "$OUT/real_swift_witness_oracle" | tee "$OUT/sha256.txt"
+          cat "$OUT/verification-level.txt" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload isolated witness oracle evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios166-real-swift-witness-v009-macos-arm64
+          path: ${{ runner.temp }}/ios166-real-witness-v009/
+          if-no-files-found: warn
