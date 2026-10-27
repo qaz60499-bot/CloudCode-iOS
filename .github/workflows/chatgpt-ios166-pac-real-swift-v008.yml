@@ -1,0 +1,57 @@
+name: IPA Total iOS16.6 PAC v008 real Swift Runtime null-context oracle
+on:
+  push:
+    branches: [ci/chatgpt-ios166-sync-internal-20261026]
+    paths:
+      - tools/chatgpt-compat/ios166_real_swift_runtime_oracle_v008.c
+      - tools/chatgpt-compat/ChatGPTCompatibility.authenticated-arm64.c
+      - .github/workflows/chatgpt-ios166-pac-real-swift-v008.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos-arm64-real-swift-oracle:
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Compile shim and real Swift Runtime metadata oracle on macOS arm64
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios166-real-swift-v008"
+          mkdir -p "$OUT"
+          uname -m | tee "$OUT/host-architecture.txt"
+          xcrun swiftc --version | tee "$OUT/swift-version.txt"
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          CLANG="$(xcrun --find clang)"
+          "$CLANG" -target arm64-apple-macos13 -arch arm64 -march=armv8.3-a \
+            -isysroot "$SDK" -O1 -g -Wall -Wextra -Werror \
+            -c tools/chatgpt-compat/ChatGPTCompatibility.authenticated-arm64.c \
+            -o "$OUT/shim.o"
+          "$CLANG" -target arm64-apple-macos13 -arch arm64 \
+            -isysroot "$SDK" -O1 -g -Wall -Wextra -Werror \
+            -c tools/chatgpt-compat/ios166_real_swift_runtime_oracle_v008.c \
+            -o "$OUT/oracle.o"
+          echo 'public func ipaTotalSwiftRuntimeAnchor() -> Int { 42 }' > "$OUT/anchor.swift"
+          xcrun swiftc -parse-as-library -target arm64-apple-macos13 \
+            -sdk "$SDK" "$OUT/anchor.swift" "$OUT/shim.o" "$OUT/oracle.o" \
+            -o "$OUT/real_swift_oracle"
+          xcrun lipo -info "$OUT/real_swift_oracle" | tee "$OUT/lipo.txt"
+          xcrun otool -L "$OUT/real_swift_oracle" > "$OUT/dependencies.txt"
+          "$OUT/real_swift_oracle" | tee "$OUT/test-results.txt"
+          grep -Fx 'REAL_SWIFT_RUNTIME_METADATA_EQUAL type=Si' "$OUT/test-results.txt"
+          grep -Fx 'REAL_SWIFT_RUNTIME_METADATA_EQUAL type=Sb' "$OUT/test-results.txt"
+          grep -Fx 'REAL_SWIFT_RUNTIME_METADATA_EQUAL type=SS' "$OUT/test-results.txt"
+          grep -Fx 'REAL_SWIFT_RUNTIME_MANGLED_TYPE_FORWARDING_PASS_NULL_CONTEXT_ONLY' "$OUT/test-results.txt"
+          grep -Fx 'PAC_SIGNED_DESCRIPTOR_AUTHENTICATION_NOT_TESTED' "$OUT/test-results.txt"
+          grep -Fx 'IOS16_SWIFT_RUNTIME_NOT_TESTED' "$OUT/test-results.txt"
+          echo 'REAL_SWIFT_RUNTIME_TWO_SHIM_ENTRIES_PASS_NULL_DESCRIPTOR_ONLY_MACOS_ARM64' | tee "$OUT/verification-level.txt"
+          shasum -a 256 "$OUT/real_swift_oracle" | tee "$OUT/sha256.txt"
+          cat "$OUT/verification-level.txt" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload dynamic oracle evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios166-real-swift-runtime-null-context-v008-macos-arm64
+          path: ${{ runner.temp }}/ios166-real-swift-v008/
+          if-no-files-found: warn
