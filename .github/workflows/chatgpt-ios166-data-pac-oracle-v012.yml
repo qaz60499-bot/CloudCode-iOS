@@ -1,0 +1,67 @@
+name: IPA Total iOS16.6 v012 real arm64e data PAC device oracle candidate
+on:
+  push:
+    branches: [ci/chatgpt-ios166-sync-internal-20261026]
+    paths:
+      - .github/workflows/chatgpt-ios166-data-pac-oracle-v012.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compile-arm64e-pac-oracle:
+    runs-on: macos-15
+    timeout-minutes: 13
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Compile safe-to-query arm64e discriminator oracle (NOT execute)
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios166-v012-data-pac"
+          mkdir -p "$OUT"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          "$(xcrun --find clang)" -target arm64e-apple-ios16.6 -arch arm64e \
+            -dynamiclib -O1 -Wall -Wextra -Werror \
+            -miphoneos-version-min=16.6 -isysroot "$SDK" \
+            -Wl,-install_name,@rpath/IpaDataPacOracleV012.dylib \
+            tools/chatgpt-compat/ios166-data-pac-oracle-v012.c \
+            -o "$OUT/IpaDataPacOracleV012.dylib"
+          xcrun lipo -info "$OUT/IpaDataPacOracleV012.dylib" | tee "$OUT/architecture.txt"
+          xcrun otool -l "$OUT/IpaDataPacOracleV012.dylib" >"$OUT/loadcommands.txt"
+          xcrun otool -D "$OUT/IpaDataPacOracleV012.dylib" >"$OUT/install-name.txt"
+          xcrun nm -gU "$OUT/IpaDataPacOracleV012.dylib" >"$OUT/exports.txt"
+          xcrun otool -tvV "$OUT/IpaDataPacOracleV012.dylib" >"$OUT/disassembly.txt"
+          grep -Fi 'arm64e' "$OUT/architecture.txt"
+          grep -E 'minos +16\.6' "$OUT/loadcommands.txt"
+          grep -Fqx '@rpath/IpaDataPacOracleV012.dylib' "$OUT/install-name.txt"
+          awk '{print $NF}' "$OUT/exports.txt" | grep -Fx '_ipa_ios166_data_pac_oracle_v012'
+          grep -Ei '\bpacda\b' "$OUT/disassembly.txt"
+          grep -Ei '\bautda\b' "$OUT/disassembly.txt"
+          python3 - "$OUT/IpaDataPacOracleV012.dylib" <<'PY'
+          import pathlib,struct,sys
+          data=pathlib.Path(sys.argv[1]).read_bytes()
+          magic,cpu,subtype,kind,ncmd,cmdsz,_,_=struct.unpack_from("<IiiIIIII",data)
+          assert (magic,cpu,kind)==(0xfeedfacf,0x100000c,6)
+          pos=32
+          builds=[]; crypt=[]; signatures=[]
+          for _ in range(ncmd):
+              cmd,size=struct.unpack_from("<II",data,pos)
+              assert size>=8 and pos+size<=32+cmdsz
+              if cmd==0x32: builds.append(struct.unpack_from("<II",data,pos+8))
+              if cmd==0x2c: crypt.append(struct.unpack_from("<I",data,pos+16)[0])
+              if cmd==0x1d: signatures.append(True)
+              pos+=size
+          assert pos==32+cmdsz and builds==[(2,0x00100600)]
+          assert not any(crypt) and not signatures
+          print("ARM64E_PAC_ORACLE_STATIC_LAYOUT_PASS_DEVICE_AUTH_NOT_TESTED")
+          PY
+          shasum -a 256 "$OUT/IpaDataPacOracleV012.dylib" | tee "$OUT/sha256.txt"
+          echo 'DATA_PAC_ORACLE_COMPILED_NOT_EXECUTED_HARDWARE_REJECTION_NOT_TESTED' \
+            | tee "$OUT/verification-level.txt"
+          cat "$OUT/verification-level.txt" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload candidate oracle and disassembly
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios166-v012-real-arm64e-data-pac-device-oracle-not-executed
+          path: ${{ runner.temp }}/ios166-v012-data-pac/
+          if-no-files-found: warn
