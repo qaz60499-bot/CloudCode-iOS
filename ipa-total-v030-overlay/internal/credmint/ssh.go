@@ -303,6 +303,10 @@ func (d *sshDevice) writeFile(name string, data []byte, executable bool) (string
 }
 
 func (d *sshDevice) readFile(remote string) ([]byte, error) {
+	if !strings.HasPrefix(remote, d.dir+"/") &&
+		!strings.HasPrefix(remote, "/var/containers/Bundle/Application/") {
+		return nil, errors.New("read outside approved paths")
+	}
 	f, err := d.sftp.Open(remote)
 	if err == nil {
 		defer f.Close()
