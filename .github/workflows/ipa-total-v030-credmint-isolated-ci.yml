@@ -1,0 +1,72 @@
+name: IPA Total V030 isolated credmint candidate compile
+
+on:
+  push:
+    branches:
+      - ci/ipa-total-v030-credmint-isolated
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolated-compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      GOTOOLCHAIN: auto
+      CGO_ENABLED: "0"
+      GOPROXY: https://proxy.golang.org,direct
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout upstream exact published tag commit without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/londek/ipadecrypt.git "$RUNNER_TEMP/ipadecrypt"
+          cd "$RUNNER_TEMP/ipadecrypt"
+          git checkout --detach 849a1290afda0d74e608f80859119391dbab9e86
+          test "$(git rev-parse HEAD)" = "849a1290afda0d74e608f80859119391dbab9e86"
+      - name: Apply isolated five-file overlay without changing upstream checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/ipadecrypt"
+          OVR="$GITHUB_WORKSPACE/ipa-total-v030-overlay"
+          for path in internal/credmint/ssh.go internal/credmint/mint.go internal/credmint/isolation_v030_test.go internal/config/config.go cmd/ipadecrypt/bootstrap.go; do
+            test -s "$OVR/$path"
+            cp "$OVR/$path" "$SRC/$path"
+          done
+          ! grep -F 'ssh.InsecureIgnoreHostKey()' "$SRC/internal/credmint/ssh.go"
+          ! grep -F 'stopRemote(d, executable)' "$SRC/internal/credmint/mint.go"
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: ${{ runner.temp }}/ipadecrypt/go.mod
+          cache: false
+      - name: Format check and real Go unit tests
+        shell: bash
+        working-directory: ${{ runner.temp }}/ipadecrypt
+        run: |
+          set -euo pipefail
+          for f in internal/credmint/ssh.go internal/credmint/mint.go internal/credmint/isolation_v030_test.go internal/config/config.go cmd/ipadecrypt/bootstrap.go; do
+            gofmt -w "$f"
+          done
+          go test -count=1 -timeout=4m ./internal/credmint ./internal/config ./cmd/ipadecrypt
+          go vet ./internal/credmint ./internal/config ./cmd/ipadecrypt
+      - name: Build separate untrusted candidate, never production release
+        shell: bash
+        working-directory: ${{ runner.temp }}/ipadecrypt
+        run: |
+          set -euo pipefail
+          GOOS=windows GOARCH=amd64 go build -trimpath -o "$RUNNER_TEMP/ipadecrypt-v030-isolated-candidate.exe" ./cmd/ipadecrypt
+          sha256sum "$RUNNER_TEMP/ipadecrypt-v030-isolated-candidate.exe" > "$RUNNER_TEMP/ipadecrypt-v030-isolated-candidate.sha256"
+          echo 'COMPILE_ONLY_NOT_MINT_NOT_DECRYPT_NOT_INSTALL_NOT_IOS_RUNTIME' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: ipa-total-v030-isolated-build-not-device-tested
+          path: |
+            ${{ runner.temp }}/ipadecrypt-v030-isolated-candidate.exe
+            ${{ runner.temp }}/ipadecrypt-v030-isolated-candidate.sha256
+          if-no-files-found: error
+          retention-days: 3
