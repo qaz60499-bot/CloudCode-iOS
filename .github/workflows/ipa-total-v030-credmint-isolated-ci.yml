@@ -74,3 +74,31 @@ jobs:
             ${{ runner.temp }}/ipadecrypt-v030-isolated-candidate.sha256
           if-no-files-found: error
           retention-days: 3
+
+  windows-offline-smoke:
+    needs: isolated-compile
+    runs-on: windows-2025
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ipa-total-v030-isolated-build-not-device-tested
+          path: ${{ runner.temp }}/ipa-candidate
+      - name: Execute native Windows CLI help without credentials or device
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:RUNNER_TEMP 'ipa-candidate/ipadecrypt-v030-isolated-candidate.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            throw 'missing isolated candidate Windows executable'
+          }
+          $help = & $exe --help 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0 -or -not $help.Contains('bootstrap') -or -not $help.Contains('decrypt')) {
+            throw 'Windows executable did not start or CLI help is incomplete'
+          }
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expected = (Get-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'ipa-candidate/ipadecrypt-v030-isolated-candidate.sha256') -Raw).Split(' ')[0].Trim().ToLowerInvariant()
+          if ($hash -ne $expected) { throw 'cross-runner artifact hash mismatch' }
+          'WIN_NATIVE_CLI_HELP_AND_HASH_PASS_NO_CREDENTIALS_NO_MINT_NO_DEVICE' | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
