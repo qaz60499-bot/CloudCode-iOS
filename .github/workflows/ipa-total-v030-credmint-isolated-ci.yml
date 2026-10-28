@@ -33,7 +33,7 @@ jobs:
           set -euo pipefail
           SRC="$RUNNER_TEMP/ipadecrypt"
           OVR="$GITHUB_WORKSPACE/ipa-total-v030-overlay"
-          for path in internal/credmint/ssh.go internal/credmint/mint.go internal/credmint/isolation_v030_test.go internal/config/config.go cmd/ipadecrypt/bootstrap.go; do
+          for path in internal/credmint/ssh.go internal/credmint/mint.go internal/credmint/isolation_v030_test.go internal/credmint/ssh_mock_v030_test.go internal/config/config.go cmd/ipadecrypt/bootstrap.go; do
             test -s "$OVR/$path"
             cp "$OVR/$path" "$SRC/$path"
           done
