@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -303,8 +304,15 @@ func (d *sshDevice) writeFile(name string, data []byte, executable bool) (string
 }
 
 func (d *sshDevice) readFile(remote string) ([]byte, error) {
-	if !strings.HasPrefix(remote, d.dir+"/") &&
-		!strings.HasPrefix(remote, "/var/containers/Bundle/Application/") {
+	if path.Clean(remote) != remote || !strings.HasPrefix(remote, "/") {
+		return nil, errors.New("noncanonical device path")
+	}
+	inWorkDir := d.dir != "" && strings.HasPrefix(remote, d.dir+"/")
+	appMetadata := strings.HasPrefix(remote, "/var/containers/Bundle/Application/") &&
+		strings.Contains(remote, ".app/") &&
+		(strings.HasSuffix(remote, ".app/Info.plist") ||
+		(strings.Contains(remote, ".app/SC_Info/") && strings.HasSuffix(remote, ".sinf")))
+	if !inWorkDir && !appMetadata {
 		return nil, errors.New("read outside approved paths")
 	}
 	f, err := d.sftp.Open(remote)
@@ -312,12 +320,8 @@ func (d *sshDevice) readFile(remote string) ([]byte, error) {
 		defer f.Close()
 		return io.ReadAll(f)
 	}
-	// Remote root-created files cannot be read through a mobile SFTP session.
-	// Only known credential temp or installed app metadata paths may fall back.
-	if !strings.HasPrefix(remote, d.dir+"/") &&
-		!strings.HasPrefix(remote, "/var/containers/Bundle/Application/") {
-		return nil, errors.New("privileged read outside approved paths")
-	}
+	// Root-created outputs and authorized App metadata are read through
+	// sudo only after the same allowlist above has been checked.
 	return d.run("cat -- "+shellQuote(remote), nil)
 }
 

@@ -45,10 +45,16 @@ func newMockSSH(t *testing.T, exitStatus uint32) *mockSSH {
         },
     }
     serverConfig.AddHostKey(signer)
-    clientConn, serverConn := net.Pipe()
+    // TCP loopback is used only inside the ephemeral CI runner. net.Pipe
+    // deadlocks in SSH when both peers first write their protocol headers.
+    listener, err := net.Listen("tcp", "127.0.0.1:0")
+    if err != nil {t.Fatal(err)}
     m := &mockSSH{events:make(chan mockSSHResult, 16),done:make(chan struct{})}
     go func(){
         defer close(m.done)
+        defer listener.Close()
+        serverConn, err := listener.Accept()
+        if err != nil {return}
         defer serverConn.Close()
         server, channels, requests, err := ssh.NewServerConn(serverConn,serverConfig)
         if err != nil { return }
@@ -94,6 +100,8 @@ func newMockSSH(t *testing.T, exitStatus uint32) *mockSSH {
             }()
         }
     }()
+    clientConn, err := net.DialTimeout("tcp", listener.Addr().String(), 4*time.Second)
+    if err != nil {t.Fatal(err)}
     config := &ssh.ClientConfig{
         User:"mobile",
         Auth:[]ssh.AuthMethod{ssh.Password("mock-ssh-login")},

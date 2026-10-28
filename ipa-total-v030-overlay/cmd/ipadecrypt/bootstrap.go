@@ -23,6 +23,10 @@ func bootstrapHandler(cmd *cobra.Command, args []string) {
 		return
 	}
 
+	// Treat any legacy persisted plaintext passwords as untrusted. Never use
+	// or persist them during an isolated candidate bootstrap.
+	cfg.Apple.Password = ""
+	cfg.Device.Auth.Password = ""
 	upd := updater.Start(context.Background(), resolveVersion(), cfg)
 	defer upd.Wait()
 

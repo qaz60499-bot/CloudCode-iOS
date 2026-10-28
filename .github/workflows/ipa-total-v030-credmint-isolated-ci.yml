@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ipa-total-v030-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   isolated-compile:
     runs-on: ubuntu-24.04
@@ -51,7 +55,7 @@ jobs:
           for f in internal/credmint/ssh.go internal/credmint/mint.go internal/credmint/isolation_v030_test.go internal/config/config.go cmd/ipadecrypt/bootstrap.go; do
             gofmt -w "$f"
           done
-          go test -count=1 -timeout=4m ./internal/credmint ./internal/config ./cmd/ipadecrypt
+          go test -count=1 -v -timeout=70s ./internal/credmint ./internal/config ./cmd/ipadecrypt
           go vet ./internal/credmint ./internal/config ./cmd/ipadecrypt
       - name: Build separate untrusted candidate, never production release
         shell: bash
