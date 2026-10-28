@@ -1,0 +1,133 @@
+name: IPA Total iOS16.6 independent ChatGPT Lab v002 unsigned build
+on:
+  push:
+    branches: [ci/chatgpt-ios166-sync-internal-20261026]
+    paths:
+      - .github/workflows/chatgpt-ios166-lab-v002.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  isolated-lab-build-only:
+    runs-on: macos-15
+    timeout-minutes: 17
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Reuse previously verified self-authored compatibility libraries
+        uses: actions/download-artifact@v4
+        with:
+          name: chatgpt-ios166-compat-layer-three-libs
+          run-id: 40331436250
+          repository: qaz60499-bot/CloudCode-iOS
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/ios166-lab-layer
+      - name: Compile fully separate research UI, check Mach-O and package unsigned IPA
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios166-lab-v002"
+          APP="$OUT/Payload/ChatGPTIOS16Lab.app"
+          LAYER="$RUNNER_TEMP/ios166-lab-layer"
+          mkdir -p "$APP/Frameworks" "$OUT/evidence"
+          for lib in libswiftObservation.dylib libswiftSynchronization.dylib ChatGPTCompatibility.dylib; do
+            test -s "$LAYER/Frameworks/$lib"
+            cp "$LAYER/Frameworks/$lib" "$APP/Frameworks/$lib"
+          done
+          for module in Observation.swiftmodule Synchronization.swiftmodule; do
+            test -s "$LAYER/SwiftModules/$module"
+          done
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun swiftc -parse-as-library -emit-executable -module-name ChatGPTIOS16Lab \
+            -target arm64-apple-ios16.6 -sdk "$SDK" \
+            -I "$LAYER/SwiftModules" -L "$APP/Frameworks" \
+            tools/chatgpt-compat/ios166-chatgpt-lab-v002.swift \
+            -lswiftObservation -lswiftSynchronization -framework UIKit \
+            -Xlinker -rpath -Xlinker @executable_path/Frameworks \
+            -o "$APP/ChatGPTIOS16Lab" >"$OUT/evidence/swiftc.stdout" \
+            2>"$OUT/evidence/swiftc.stderr"
+          xcrun install_name_tool -change \
+            /usr/lib/swift/libswiftObservation.dylib \
+            @rpath/libswiftObservation.dylib "$APP/ChatGPTIOS16Lab"
+          xcrun install_name_tool -change \
+            /usr/lib/swift/libswiftSynchronization.dylib \
+            @rpath/libswiftSynchronization.dylib "$APP/ChatGPTIOS16Lab"
+          cat > "$APP/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>CFBundleIdentifier</key><string>cc.guess.ipatotal.chatgpt166.lab</string>
+          <key>CFBundleExecutable</key><string>ChatGPTIOS16Lab</string>
+          <key>CFBundleName</key><string>ChatGPTIOS16Lab</string>
+          <key>CFBundleDisplayName</key><string>ChatGPT iOS16 Lab</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>CFBundleShortVersionString</key><string>0.0.2</string>
+          <key>CFBundleVersion</key><string>2</string>
+          <key>MinimumOSVersion</key><string>16.6</string>
+          <key>LSRequiresIPhoneOS</key><true/>
+          <key>UIDeviceFamily</key><array><integer>1</integer></array>
+          <key>UIFileSharingEnabled</key><true/>
+          <key>UIRequiresFullScreen</key><true/>
+          <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
+          </dict></plist>
+          PLIST
+          plutil -lint "$APP/Info.plist"
+          xcrun otool -L "$APP/ChatGPTIOS16Lab" | tee "$OUT/evidence/dependencies.txt"
+          xcrun otool -l "$APP/ChatGPTIOS16Lab" > "$OUT/evidence/main-loadcommands.txt"
+          grep -F '@rpath/libswiftObservation.dylib' "$OUT/evidence/dependencies.txt"
+          grep -F '@rpath/libswiftSynchronization.dylib' "$OUT/evidence/dependencies.txt"
+          xcrun lipo -info "$APP/ChatGPTIOS16Lab" | tee "$OUT/evidence/architecture.txt"
+          python3 - "$APP" "$OUT/evidence" <<'PY'
+          import json,pathlib,plistlib,struct,sys
+          app=pathlib.Path(sys.argv[1]); evidence=pathlib.Path(sys.argv[2])
+          plist=plistlib.loads((app/'Info.plist').read_bytes())
+          assert plist['CFBundleIdentifier']=='cc.guess.ipatotal.chatgpt166.lab'
+          assert plist['MinimumOSVersion']=='16.6'
+          assert plist['CFBundleExecutable']=='ChatGPTIOS16Lab'
+          assert 'com.openai.chat' not in str(plist)
+          assert not any(x in plist for x in
+              ('CFBundleURLTypes','UIBackgroundModes','com.apple.security.application-groups','keychain-access-groups'))
+          expected=['ChatGPTIOS16Lab','Frameworks/libswiftObservation.dylib',
+                    'Frameworks/libswiftSynchronization.dylib','Frameworks/ChatGPTCompatibility.dylib']
+          audit={}
+          for relative in expected:
+              blob=(app/relative).read_bytes()
+              magic,cpu,subtype,kind,ncmd,cmdsz,flags,reserved=struct.unpack_from('<IiiIIIII',blob)
+              assert magic==0xfeedfacf and cpu==0x100000c
+              assert kind==(2 if relative=='ChatGPTIOS16Lab' else 6)
+              p=32; build=[]; sigs=[]; crypt=[]
+              for _ in range(ncmd):
+                  cmd,size=struct.unpack_from('<II',blob,p)
+                  assert size>=8 and p+size<=32+cmdsz
+                  if cmd==0x32: build.append(struct.unpack_from('<II',blob,p+8))
+                  if cmd==0x2c: crypt.append(struct.unpack_from('<I',blob,p+16)[0])
+                  if cmd==0x1d: sigs.append(True)
+                  p+=size
+              assert p==32+cmdsz and build==[(2,0x00100600)]
+              assert not any(crypt) and not sigs
+              audit[relative]={'arch':'arm64','ios_minimum':'16.6','cryptid':0,'unsigned':True}
+          assert sorted(p.name for p in (app/'Frameworks').iterdir()) == [
+              'ChatGPTCompatibility.dylib','libswiftObservation.dylib','libswiftSynchronization.dylib']
+          assert not list(app.glob('*.appex')) and not list(app.glob('*.xcent'))
+          (evidence/'isolated-app-audit.json').write_text(json.dumps(audit,indent=2))
+          print('IOS166_LAB_FOUR_MACHOS_STATIC_PASS_NOT_DEVICE_EXECUTION')
+          PY
+          grep -F 'official_chatgpt_binary=NOT_INCLUDED' tools/chatgpt-compat/ios166-chatgpt-lab-v002.swift
+          grep -F 'pac_export_owned_by_bundled_shim' tools/chatgpt-compat/ios166-chatgpt-lab-v002.swift
+          grep -F 'swift_pac_descriptor_calls=NOT_TESTED' tools/chatgpt-compat/ios166-chatgpt-lab-v002.swift
+          shasum -a 256 "$APP/ChatGPTIOS16Lab" "$APP/Frameworks/"*.dylib \
+            | tee "$OUT/evidence/binary-sha256.txt"
+          cd "$OUT"
+          zip -q -r "$RUNNER_TEMP/ChatGPT_iOS16_Lab_v002_UNSIGNED.ipa" Payload
+          shasum -a 256 "$RUNNER_TEMP/ChatGPT_iOS16_Lab_v002_UNSIGNED.ipa" \
+            | tee "$OUT/evidence/ipa-sha256.txt"
+          echo 'INDEPENDENT_CHATGPT_IOS16_LAB_BUILD_ONLY_PASS_NO_OFFICIAL_BINARY'
+      - name: Preserve bounded audit and isolated unsigned IPA
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios166-independent-chatgpt-lab-v002-unsigned-test-only
+          path: |
+            ${{ runner.temp }}/ChatGPT_iOS16_Lab_v002_UNSIGNED.ipa
+            ${{ runner.temp }}/ios166-lab-v002/evidence/
+          if-no-files-found: warn
