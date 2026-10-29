@@ -99,6 +99,16 @@ func bootstrapHandler(cmd *cobra.Command, args []string) {
 		if err := promptMintDevice(cfg); err != nil {
 			return
 		}
+		choice, err := tui.Select("maintenance on iPhone: this will restart fairplayd and briefly launch a staged app; do not proceed while Codex or RemoteAI uses the phone", []string{
+			"Cancel; keep the iPhone untouched",
+			"Explicitly authorize one FairPlay maintenance attempt in exclusive device window",
+		})
+		if err != nil || choice != 1 {
+			tui.Info("mint skipped: maintenance was not approved")
+			return
+		}
+		// Approval is in-memory and bound to this one bootstrap invocation.
+		cfg.Device.ApproveRestart = true
 
 		// Config is for an isolated E: profile; never serialize Apple/SSH password.
 		// Keep the SSH password only in the local in-memory Mint argument.

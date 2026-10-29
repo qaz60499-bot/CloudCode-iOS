@@ -49,6 +49,21 @@ func TestV031KnownHostsMustBeExplicitInIsolatedProfile(t *testing.T) {
     }
 }
 
+func TestV032MintRequiresExplicitFairplayMaintenanceApproval(t *testing.T) {
+    _, err := Mint(t.Context(), config.Device{User:"mobile",TriggerBundleID:"com.openai.chat"})
+    if err == nil || !strings.Contains(err.Error(),"not explicitly approved") {
+        t.Fatalf("unexpected service restart authorization: %v",err)
+    }
+}
+
+func TestV032PrivilegedPayloadFailClosedBeforeSSH(t *testing.T) {
+    d := &sshDevice{}
+    _, err := d.run("cat >/tmp/must-not-run", []byte("unexpected payload"))
+    if err == nil || !strings.Contains(err.Error(),"privileged stdin payload") {
+        t.Fatalf("unintended privileged payload accepted: %v",err)
+    }
+}
+
 func TestV031CleanupRefusesUnsafeAndMalformedPaths(t *testing.T) {
     for _, tc := range []struct{path, prefix string; allow bool}{
         {"/var/tmp/fp-retrieve-abcd123", "fp-retrieve-", true},

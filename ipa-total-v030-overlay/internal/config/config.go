@@ -36,7 +36,7 @@ type Versions struct {
 
 type Apple struct {
 	Email                       string `json:"email,omitempty"`
-	Password                    string `json:"password,omitempty"`
+	Password                    string `json:"-"` // sensitive login secret: memory only
 	PasswordToken               string `json:"passwordToken,omitempty"`
 	DirectoryServicesIdentifier string `json:"directoryServicesIdentifier,omitempty"`
 	StoreFront                  string `json:"storeFront,omitempty"`
@@ -69,6 +69,7 @@ func (a *Apple) SetAccount(acc *appstore.Account) {
 // device); otherwise it is a plain network SSH connection to Host:Port.
 type Device struct {
 	SudoPassword string `json:"-"` // memory-only, never persisted
+	ApproveRestart bool `json:"-"` // explicit per-run service maintenance approval
 	TriggerBundleID string `json:"triggerBundleID,omitempty"` // explicitly authorized App Store app
 	Host string     `json:"host,omitempty"`
 	Port int        `json:"port,omitempty"`
@@ -80,9 +81,9 @@ type Device struct {
 
 type DeviceAuth struct {
 	Kind          string `json:"kind,omitempty"`
-	Password      string `json:"password,omitempty"`
+	Password      string `json:"-"` // mobile SSH password: memory only
 	KeyPath       string `json:"keyPath,omitempty"`
-	KeyPassphrase string `json:"keyPassphrase,omitempty"`
+	KeyPassphrase string `json:"-"` // private key passphrase: memory only
 }
 
 func New(path string) *Config {

@@ -284,9 +284,10 @@ func (d *sshDevice) writeFile(name string, data []byte, executable bool) (string
 		return "", fmt.Errorf("create %s: %w", remote, err)
 	}
 
-	if _, err := f.Write(data); err != nil {
+	written, writeErr := f.Write(data)
+	if writeErr != nil || written != len(data) {
 		f.Close()
-		return "", fmt.Errorf("write %s: %w", remote, err)
+		return "", fmt.Errorf("incomplete SFTP upload %s: %d/%d bytes: %w", remote, written, len(data), errors.Join(writeErr, io.ErrShortWrite))
 	}
 
 	if err := f.Close(); err != nil {
@@ -330,7 +331,10 @@ func (d *sshDevice) readFile(remote string) ([]byte, error) {
 // run executes cmd and returns stdout, erroring (with combined output) on a
 // non-zero exit or timeout. Mirrors native_ssh.py SSHDevice.run.
 func (d *sshDevice) run(cmd string, stdin []byte) ([]byte, error) {
-	return d.runWithPrivilege(cmd, stdin, true)
+	if len(stdin) != 0 {
+		return nil, errors.New("privileged stdin payload is unsupported: refusing to drop data or expose sudo password")
+	}
+	return d.runWithPrivilege(cmd, nil, true)
 }
 func (d *sshDevice) runUnprivileged(cmd string, stdin []byte) ([]byte, error) {
 	return d.runWithPrivilege(cmd, stdin, false)
@@ -355,9 +359,10 @@ func (d *sshDevice) runWithPrivilege(cmd string, stdin []byte, privileged bool) 
 	sess.Stderr = &errBuf
 
 	if privileged {
+		if len(stdin) != 0 { return nil, errors.New("unsafe privileged stdin payload") }
 		var prefix io.Reader
 		cmd, prefix = d.rootCommand(cmd)
-		sess.Stdin = io.MultiReader(prefix, bytes.NewReader(stdin))
+		sess.Stdin = prefix
 	} else if stdin != nil {
 		sess.Stdin = bytes.NewReader(stdin)
 	}

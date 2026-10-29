@@ -29,6 +29,15 @@ var fairplaydRe = regexp.MustCompile(`^fairplayd(?:\.[AH][0-9]+)?$`)
 // device must be signed into the same Apple account and have at least one
 // owned App Store app installed.
 func Mint(ctx context.Context, dev config.Device) ([]byte, error) {
+	// Mint will restart fairplayd and launch a staged signed executable.
+	// Requiring a per-run, trusted-terminal confirmation prevents a routine
+	// bootstrap from unexpectedly interrupting Codex/RemoteAI device work.
+	if !dev.ApproveRestart {
+		return nil, errors.New("device FairPlay maintenance not explicitly approved for this run")
+	}
+	if dev.TriggerBundleID == "" {
+		return nil, errors.New("authorized App Store trigger bundle ID is required")
+	}
 	files, err := bundleFiles()
 	if err != nil {
 		return nil, err
