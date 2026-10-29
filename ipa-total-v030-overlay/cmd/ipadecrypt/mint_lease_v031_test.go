@@ -7,11 +7,16 @@ import (
 
 func TestV033AccountAndDeviceStagesAreExclusive(t *testing.T) {
     for _, tc := range []struct{auth,mint,want string; fail bool}{
-        {"","","combined",false},
+        {"","","",true},
+        {"0","0","",true},
         {"1","","auth-only",false},
         {"","1","mint-only",false},
+        {"1","0","auth-only",false},
+        {"0","1","mint-only",false},
         {"1","1","",true},
-        {"x","x","combined",false},
+        {"x","x","",true},
+        {"x","","",true},
+        {"","bad","",true},
     } {
         t.Setenv("IPADECRYPT_ACCOUNT_AUTH_ONLY",tc.auth)
         t.Setenv("IPADECRYPT_ACCOUNT_MINT_ONLY",tc.mint)
