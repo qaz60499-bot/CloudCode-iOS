@@ -21,12 +21,20 @@ import (
 )
 
 func bootstrapMode() (string, error) {
-	authOnly := os.Getenv("IPADECRYPT_ACCOUNT_AUTH_ONLY") == "1"
-	mintOnly := os.Getenv("IPADECRYPT_ACCOUNT_MINT_ONLY") == "1"
-	if authOnly && mintOnly { return "", errors.New("auth-only and mint-only cannot be combined") }
-	if authOnly { return "auth-only", nil }
-	if mintOnly { return "mint-only", nil }
-	return "combined", nil
+	authFlag := os.Getenv("IPADECRYPT_ACCOUNT_AUTH_ONLY")
+	mintFlag := os.Getenv("IPADECRYPT_ACCOUNT_MINT_ONLY")
+	if (authFlag != "" && authFlag != "0" && authFlag != "1") ||
+		(mintFlag != "" && mintFlag != "0" && mintFlag != "1") {
+		return "", errors.New("account stage flags must be 0 or 1")
+	}
+	if authFlag == "1" && mintFlag == "1" {
+		return "", errors.New("auth-only and mint-only cannot be combined")
+	}
+	if authFlag == "1" { return "auth-only", nil }
+	if mintFlag == "1" { return "mint-only", nil }
+	// The isolated candidate must never silently enter the upstream
+	// combined sign-in + device-maintenance flow.
+	return "", errors.New("select one explicit account stage: auth-only or mint-only")
 }
 
 func bootstrapHandler(cmd *cobra.Command, args []string) {
@@ -143,6 +151,13 @@ func bootstrapHandler(cmd *cobra.Command, args []string) {
 			return
 		}
 
+		// Interactive prompts and config writes may take minutes. A lease
+		// verified before those prompts cannot authorize later device work.
+		// Recheck immediately before Mint; do not trust a previous snapshot.
+		if err := requireExclusiveLeaseForMint(); err != nil {
+			tui.Err("exclusive phone lease lost before mint: %v", err)
+			return
+		}
 		live := tui.NewLive()
 		live.Spin("minting credential (one-time)")
 
