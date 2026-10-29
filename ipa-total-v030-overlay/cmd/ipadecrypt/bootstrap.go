@@ -20,7 +20,18 @@ import (
 	"github.com/spf13/cobra"
 )
 
+func bootstrapMode() (string, error) {
+	authOnly := os.Getenv("IPADECRYPT_ACCOUNT_AUTH_ONLY") == "1"
+	mintOnly := os.Getenv("IPADECRYPT_ACCOUNT_MINT_ONLY") == "1"
+	if authOnly && mintOnly { return "", errors.New("auth-only and mint-only cannot be combined") }
+	if authOnly { return "auth-only", nil }
+	if mintOnly { return "mint-only", nil }
+	return "combined", nil
+}
+
 func bootstrapHandler(cmd *cobra.Command, args []string) {
+	mode, err := bootstrapMode()
+	if err != nil { tui.Err("%v", err); return }
 	cfg, paths, err := loadConfigOrDefault(rootDirOverride)
 	if err != nil {
 		tui.Err("%v", err)
@@ -59,13 +70,25 @@ func bootstrapHandler(cmd *cobra.Command, args []string) {
 	tui.Step(1, 3, "Sign in to the App Store")
 	tui.Info("ipadecrypt needs an Apple ID to download .ipas and to mint your\ndecryption credential. Use the same Apple ID that owns apps on your\njailbroken device. Credentials are stored locally on this machine.")
 
-	account, err := bootstrapSignIn(cfg, paths)
-	if err != nil {
-		tui.Err("%v", err)
-		return
+	var account *appstore.Account
+	if mode == "mint-only" {
+		// A prior auth-only run may have saved an account ID and token. Never
+		// reuse an unknown session or silently prompt for an Apple password.
+		if cfg.Apple.DirectoryServicesIdentifier == "" || cfg.Apple.PasswordToken == "" {
+			tui.Err("mint-only requires a separately completed local account authorization")
+			return
+		}
+		account = cfg.Apple.Account()
+	} else {
+		account, err = bootstrapSignIn(cfg, paths)
+		if err != nil {
+			tui.Err("%v", err)
+			return
+		}
 	}
-
-	if account == nil {
+	if account == nil { return }
+	if mode == "auth-only" {
+		tui.OK("account authorization complete; no iPhone SSH/SFTP/FairPlay operation attempted")
 		return
 	}
 

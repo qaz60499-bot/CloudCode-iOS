@@ -5,6 +5,23 @@ import (
     "testing"
 )
 
+func TestV033AccountAndDeviceStagesAreExclusive(t *testing.T) {
+    for _, tc := range []struct{auth,mint,want string; fail bool}{
+        {"","","combined",false},
+        {"1","","auth-only",false},
+        {"","1","mint-only",false},
+        {"1","1","",true},
+        {"x","x","combined",false},
+    } {
+        t.Setenv("IPADECRYPT_ACCOUNT_AUTH_ONLY",tc.auth)
+        t.Setenv("IPADECRYPT_ACCOUNT_MINT_ONLY",tc.mint)
+        got,err:=bootstrapMode()
+        if (err!=nil)!=tc.fail || got!=tc.want {
+            t.Fatalf("account mode mismatch got=%q err=%v",got,err)
+        }
+    }
+}
+
 func TestV031MintLeaseFailClosed(t *testing.T) {
     cases := []struct{
         label string
