@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"time"
 	"strings"
 
 	"github.com/londek/ipadecrypt/internal/appstore"
@@ -84,6 +88,14 @@ func bootstrapHandler(cmd *cobra.Command, args []string) {
 		tui.Bullet("root SSH (OpenSSH from Sileo), reachable over the network or USB")
 		tui.Bullet("at least one App Store app bought with this Apple ID, installed")
 
+		if err := requireExclusiveLeaseForMint(); err != nil {
+			tui.Err("device maintenance window not verified: %v", err)
+			return
+		}
+		if os.Getenv("IPADECRYPT_KNOWN_HOSTS_FILE") == "" {
+			tui.Err("missing strict IPADECRYPT_KNOWN_HOSTS_FILE; use the trusted Windows OpenSSH known_hosts")
+			return
+		}
 		if err := promptMintDevice(cfg); err != nil {
 			return
 		}
@@ -131,6 +143,33 @@ func bootstrapHandler(cmd *cobra.Command, args []string) {
 
 	tui.Spacer()
 	tui.OK("bootstrap complete - run `ipadecrypt decrypt <bundle-id|app-store-id|app-store-url|path-to-local-ipa>`")
+}
+
+// requireExclusiveLeaseForMint uses the project's existing fail-closed
+// controller gate. A quiet process list is not an exclusive device lease.
+// This command never connects to the iPhone or changes any device setting.
+func requireExclusiveLeaseForMint() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "D:\\Python314\\python.exe", "-B",
+		"E:\\google\\IPA-Total-20261026\\ios166_device_control_gate.py")
+	result, err := cmd.Output()
+	if err != nil { return errors.New("controller gate unavailable or failed") }
+	return validateLeaseJSON(result)
+}
+
+func validateLeaseJSON(result []byte) error {
+	var state struct {
+		Status string `json:"status"`
+		Exclusive bool `json:"exclusive_control_proven"`
+	}
+	if err := json.Unmarshal(result, &state); err != nil {
+		return errors.New("controller gate returned invalid status")
+	}
+	if state.Status != "NO_DETECTED_ACTIVE_DEVICE_CONTROLLER" || !state.Exclusive {
+		return errors.New("RemoteAI has priority or no verifiable exclusive lease exists")
+	}
+	return nil
 }
 
 // verifyDeviceDecryptReady checks that the configured device can serve the

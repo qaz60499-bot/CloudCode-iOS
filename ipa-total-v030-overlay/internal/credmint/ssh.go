@@ -46,6 +46,7 @@ type sshDevice struct {
 func dial(ctx context.Context, dev config.Device) (*sshDevice, error) {
 	if dev.User != "mobile" { return nil, errors.New("isolated mint adapter requires mobile SSH, not direct root SSH") }
 	if dev.SudoPassword == "" { return nil, errors.New("transient sudo password must be supplied in the local trusted terminal") }
+	if dev.USB { return nil, errors.New("USB mint is disabled while RemoteAI is primary") }
 	host := dev.Host
 	port := dev.Port
 
@@ -73,11 +74,12 @@ func dial(ctx context.Context, dev config.Device) (*sshDevice, error) {
 		return nil, err
 	}
 
-	knownHostsFile := os.Getenv("IPADECRYPT_KNOWN_HOSTS_FILE")
+	// A separate E: application profile changes USERPROFILE. Never silently
+	// look for .ssh/known_hosts in that sandbox or accept unknown host keys.
+	knownHostsFile := strings.TrimSpace(os.Getenv("IPADECRYPT_KNOWN_HOSTS_FILE"))
 	if knownHostsFile == "" {
-		home, err := os.UserHomeDir()
-		if err != nil { d.closeTunnel(); return nil, fmt.Errorf("known_hosts home: %w", err) }
-		knownHostsFile = filepath.Join(home, ".ssh", "known_hosts")
+		d.closeTunnel()
+		return nil, errors.New("explicit IPADECRYPT_KNOWN_HOSTS_FILE is required")
 	}
 	hostKeyCallback, err := knownhosts.New(knownHostsFile)
 	if err != nil { d.closeTunnel(); return nil, fmt.Errorf("strict known_hosts load: %w", err) }
@@ -428,11 +430,23 @@ func (d *sshDevice) processes() ([]byte, error) {
 	return d.run(shellQuote(d.ps)+" -e -o pid,comm", nil)
 }
 
-func (d *sshDevice) cleanup() {
-	if d.dir != "" || d.triggerDir != "" {
-		d.run("rm -r -- "+shellQuote(d.dir)+" "+shellQuote(d.triggerDir), nil)
-	}
+// cleanup is deliberately limited to names created by setup. It must never
+// remove a caller-supplied directory when a partial SSH/SFTP setup fails.
+func validStagingDir(dir, prefix string) bool {
+	if !strings.HasPrefix(dir, "/") || path.Clean(dir) != dir { return false }
+	name := path.Base(dir)
+	if !strings.HasPrefix(name, prefix) || len(name) <= len(prefix) { return false }
+	return remoteNameRe.MatchString(name)
+}
 
+func (d *sshDevice) cleanup() {
+	for _, item := range []struct{dir, prefix string}{
+		{d.dir, "fp-retrieve-"}, {d.triggerDir, "fp-trigger-"},
+	} {
+		if validStagingDir(item.dir, item.prefix) && d.ssh != nil {
+			d.run("rm -rf -- "+shellQuote(item.dir), nil)
+		}
+	}
 	d.close()
 }
 

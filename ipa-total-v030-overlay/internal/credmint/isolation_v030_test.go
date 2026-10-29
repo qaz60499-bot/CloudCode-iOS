@@ -37,6 +37,44 @@ func TestSudoPasswordRequiredBeforeSSH(t *testing.T) {
     }
 }
 
+func TestV031KnownHostsMustBeExplicitInIsolatedProfile(t *testing.T) {
+    t.Setenv("IPADECRYPT_KNOWN_HOSTS_FILE", "")
+    _, err := dial(t.Context(), config.Device{
+        User:"mobile", Host:"192.168.1.4", Port:22,
+        SudoPassword:"FAKE_SUDO_ONLY",
+        Auth: config.DeviceAuth{Kind:"password", Password:"FAKE_LOGIN_ONLY"},
+    })
+    if err == nil || !strings.Contains(err.Error(), "IPADECRYPT_KNOWN_HOSTS_FILE") {
+        t.Fatalf("must fail before network when host trust is unspecified: %v",err)
+    }
+}
+
+func TestV031CleanupRefusesUnsafeAndMalformedPaths(t *testing.T) {
+    for _, tc := range []struct{path, prefix string; allow bool}{
+        {"/var/tmp/fp-retrieve-abcd123", "fp-retrieve-", true},
+        {"/var/jb/var/tmp/fp-trigger-abcd123", "fp-trigger-", true},
+        {"/", "fp-retrieve-", false},
+        {"", "fp-retrieve-", false},
+        {"/etc", "fp-retrieve-", false},
+        {"/var/tmp/fp-retrieve-", "fp-retrieve-", false},
+        {"/var/tmp/fp-retrieve-../foo", "fp-retrieve-", false},
+        {"/var/tmp/fp-trigger-abcd", "fp-retrieve-", false},
+    } {
+        if got := validStagingDir(tc.path,tc.prefix); got!=tc.allow {
+            t.Fatalf("cleanup acceptance mismatch path=%q got=%v want=%v",tc.path,got,tc.allow)
+        }
+    }
+}
+
+func TestV031USBModeDeniedBeforeTunnel(t *testing.T) {
+    _, err := dial(t.Context(), config.Device{
+        User:"mobile", SudoPassword:"FAKE_SUDO_ONLY", USB:true,
+    })
+    if err == nil || !strings.Contains(err.Error(), "USB") {
+        t.Fatalf("USB mode must fail without port or tunnel effects: %v",err)
+    }
+}
+
 func TestExplicitTriggerOnlyBeforeAnyDeviceIO(t *testing.T) {
     _, _, _, err := triggerApp(&sshDevice{}, "")
     if err == nil || !strings.Contains(err.Error(), "explicit") {
