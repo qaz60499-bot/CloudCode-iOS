@@ -1,0 +1,8 @@
+Package: com.openai.ipatotal.trolldecrypt.v046
+Name: IPA Total Isolated Decrypt Probe
+Version: 1.3.0-v046
+Architecture: iphoneos-arm
+Description: Isolated rootless early-LLDB experimental decryptor. No appstored/installd tweaks or daemon restarts. Research only.
+Maintainer: Local IPA Total research
+Section: Applications
+Depends: firmware (>= 15.0), lldb
