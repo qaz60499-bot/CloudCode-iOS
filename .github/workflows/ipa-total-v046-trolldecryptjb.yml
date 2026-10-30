@@ -66,6 +66,46 @@ jobs:
           cd "$RUNNER_TEMP/trolldecryptjb"
           make -j2 messages=yes 2>&1 | tee "$RUNNER_TEMP/trolldecryptjb-build.log"
 
+      - name: Build standalone no-hook rootless app package (never install)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/trolldecryptjb"
+          EXTRA="$GITHUB_WORKSPACE/ipa-total-v046-nohook"
+          for f in Makefile control entitlements.plist TDRootViewController.m Resources/Info.plist; do
+            test -s "$EXTRA/$f"
+            cp "$EXTRA/$f" "$SRC/$f"
+            cmp "$EXTRA/$f" "$SRC/$f"
+          done
+          ! grep -Eq '^(TWEAK_NAME|TOOL_NAME)[[:space:]]*=' "$SRC/Makefile"
+          ! grep -q 'spawnRoot(' "$SRC/TDRootViewController.m"
+          ! grep -q 'TDDaemonKiller' "$SRC/TDRootViewController.m"
+          command -v dpkg-deb >/dev/null || brew install dpkg
+          export THEOS="$RUNNER_TEMP/theos"
+          export THEOS_PACKAGE_SCHEME=rootless
+          cd "$SRC"
+          make clean package FINALPACKAGE=1 messages=no
+          DEB=$(find "$SRC/packages" -type f -name '*.deb' -print -quit)
+          test -n "$DEB"
+          dpkg-deb --contents "$DEB" > "$RUNNER_TEMP/nohook-contents.txt"
+          dpkg-deb --field "$DEB" Package > "$RUNNER_TEMP/nohook-package-id.txt"
+          grep -Fx 'com.openai.ipatotal.trolldecrypt.v046' "$RUNNER_TEMP/nohook-package-id.txt"
+          grep 'TrollDecrypt.app/TrollDecrypt' "$RUNNER_TEMP/nohook-contents.txt"
+          ! grep -E 'TrollDecryptHook|TDDaemonKiller|appstored|installd' "$RUNNER_TEMP/nohook-contents.txt"
+          shasum -a 256 "$DEB" > "$RUNNER_TEMP/nohook-package.sha256"
+          cp "$DEB" "$RUNNER_TEMP/ipa-total-v046-nohook.deb"
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: ipa-total-v046-nohook-research-deb-not-installed
+          path: |
+            ${{ runner.temp }}/ipa-total-v046-nohook.deb
+            ${{ runner.temp }}/nohook-contents.txt
+            ${{ runner.temp }}/nohook-package.sha256
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Record evidence without releasing/installing package
         if: always()
         shell: bash
