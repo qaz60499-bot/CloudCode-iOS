@@ -52,6 +52,11 @@ enum AppBundleStager {
             return StagedBinary(bundle: bundle, binaryURL: stagedBinary, rootSinf: stagedSinf)
         } catch {
             cleanup(bundle)
+            // FileSystem.removeTree suppresses filesystem errors. Do not hide
+            // an orphaned UUID container behind the original staging error.
+            guard !FileManager.default.fileExists(atPath: bundle.containerURL.path) else {
+                throw UnfairError.io("staging failed and UUID container cleanup is incomplete")
+            }
             throw error
         }
     }
@@ -81,6 +86,9 @@ enum AppBundleStager {
             return bundle
         } catch {
             cleanup(bundle)
+            guard !FileManager.default.fileExists(atPath: bundle.containerURL.path) else {
+                throw UnfairError.io("staging failed and UUID container cleanup is incomplete")
+            }
             throw error
         }
     }
@@ -97,6 +105,9 @@ enum AppBundleStager {
             try createStagingDirectory(app)
         } catch {
             FileSystem.removeTree(container)
+            guard !FileManager.default.fileExists(atPath: container.path) else {
+                throw UnfairError.io("creating staging app failed and UUID container cleanup is incomplete")
+            }
             throw error
         }
         logger.log("staged app: \(app.path)")
