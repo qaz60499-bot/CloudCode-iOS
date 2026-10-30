@@ -26,6 +26,8 @@ jobs:
           git -C "$RUNNER_TEMP/unfair-upstream" checkout --detach a754437649b1428e07918c0315a678ed7fc57dec
           test "$(git -C "$RUNNER_TEMP/unfair-upstream" rev-parse HEAD)" = "a754437649b1428e07918c0315a678ed7fc57dec"
           cp research/ipa-total-v077/AppBundleStager.swift "$RUNNER_TEMP/unfair-upstream/Sources/UnfairKit/AppBundleStager.swift"
+          cp research/ipa-total-v077/PackageProcessor.swift "$RUNNER_TEMP/unfair-upstream/Sources/UnfairKit/PackageProcessor.swift"
+          cp research/ipa-total-v077/BinaryDecryptor.swift "$RUNNER_TEMP/unfair-upstream/Sources/UnfairKit/BinaryDecryptor.swift"
           git -C "$RUNNER_TEMP/unfair-upstream" diff --check
           shasum -a 256 "$RUNNER_TEMP/unfair-upstream/Sources/UnfairKit/AppBundleStager.swift"
       - name: Execute disposable macOS staging rollback test
