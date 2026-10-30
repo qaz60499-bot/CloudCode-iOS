@@ -6,6 +6,7 @@ on:
       - ci/ipa-total-v046-trolldecryptjb
     paths:
       - 'ipa-total-v046-trolldecryptjb-overlay/**'
+      - 'ipa-total-v046-nohook/**'
       - '.github/workflows/ipa-total-v046-trolldecryptjb.yml'
   workflow_dispatch:
 
@@ -113,7 +114,7 @@ jobs:
           {
             echo '## V046 rootless source compilation evidence'
             echo 'Source: 34306/TrollDecryptJB @ 1dad89b0132a0c3772aceddf53cbf25f0ac3ecfb + 3-file bounded V046 overlay'
-            echo 'No IPA, .deb, phone install, sign-in, FairPlay access, or device changes performed by CI.'
+            echo 'A separate nonproduction app-only .deb may be packaged, but it was not installed, launched or released. No ChatGPT IPA, phone install, sign-in, FairPlay access, or device changes performed by CI.'
             echo 'Compilation exit status is reflected in the job status. Native build does not prove decrypted image or iOS16 functionality.'
           } >> "$GITHUB_STEP_SUMMARY"
 
