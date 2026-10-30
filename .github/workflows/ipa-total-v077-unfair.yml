@@ -40,20 +40,24 @@ jobs:
           cd "$RUNNER_TEMP/unfair-upstream"
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           swift build -c release -v \
-            -Xswiftc -sdk -Xswiftc "$SDK" \
-            -Xswiftc -target -Xswiftc arm64-apple-ios16.0 \
-            -Xcc -arch -Xcc arm64 \
-            -Xcc --target=arm64-apple-ios16.0 \
+            --triple arm64-apple-ios16.0 \
+            --sdk "$SDK" \
             -Xcc "-isysroot$SDK" \
-            -Xcc -mios-version-min=16.0 \
-            -Xcc -miphoneos-version-min=16.0
-          test -s .build/release/unfair-swift
-          file .build/release/unfair-swift
-          xcrun vtool -show-build .build/release/unfair-swift
-          xcrun otool -L .build/release/unfair-swift
-          xcrun dwarfdump --uuid .build/release/unfair-swift
-          shasum -a 256 .build/release/unfair-swift
-          cp .build/release/unfair-swift "$RUNNER_TEMP/ipa-total-v077-unfair-arm64-unsigned"
+            -Xcc -mios-version-min=16.0
+          BIN_DIR="$(swift build -c release --triple arm64-apple-ios16.0 --sdk "$SDK" --show-bin-path)"
+          BIN="$BIN_DIR/unfair-swift"
+          test -s "$BIN"
+          file "$BIN"
+          BUILD_INFO="$(xcrun vtool -show-build "$BIN")"
+          printf '%s\n' "$BUILD_INFO"
+          printf '%s\n' "$BUILD_INFO" | grep -Eq 'platform IOS'
+          printf '%s\n' "$BUILD_INFO" | grep -Eq 'minos 16[.]0'
+          # Fail closed on the known SwiftPM macOS SDK mislink issue.
+          printf '%s\n' "$BUILD_INFO" | grep -Eq 'sdk 18[.]5'
+          xcrun otool -L "$BIN"
+          xcrun dwarfdump --uuid "$BIN"
+          shasum -a 256 "$BIN"
+          cp "$BIN" "$RUNNER_TEMP/ipa-total-v077-unfair-arm64-unsigned"
       - name: Preserve source/build evidence only
         if: always()
         uses: actions/upload-artifact@v4
