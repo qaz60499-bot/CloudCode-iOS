@@ -1,0 +1,62 @@
+name: IPA Total V077 unfair isolated arm64 audit
+on:
+  push:
+    branches: [ci/ipa-total-v077-unfair-20261030]
+    paths:
+      - '.github/workflows/ipa-total-v077-unfair.yml'
+      - 'research/ipa-total-v077/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify-unfair:
+    runs-on: macos-15
+    timeout-minutes: 22
+    steps:
+      - name: Checkout experimental branch
+        uses: actions/checkout@v4
+      - name: Verify pinned upstream and compile toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift --version
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          git clone -q https://github.com/lbr77/unfair.git "$RUNNER_TEMP/unfair-upstream"
+          git -C "$RUNNER_TEMP/unfair-upstream" checkout --detach a754437649b1428e07918c0315a678ed7fc57dec
+          test "$(git -C "$RUNNER_TEMP/unfair-upstream" rev-parse HEAD)" = "a754437649b1428e07918c0315a678ed7fc57dec"
+          cp research/ipa-total-v077/AppBundleStager.swift "$RUNNER_TEMP/unfair-upstream/Sources/UnfairKit/AppBundleStager.swift"
+          git -C "$RUNNER_TEMP/unfair-upstream" diff --check
+          shasum -a 256 "$RUNNER_TEMP/unfair-upstream/Sources/UnfairKit/AppBundleStager.swift"
+      - name: Execute disposable macOS staging rollback test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 research/ipa-total-v077/ios166-v077-unfair-staging-macos-smoke.py --source research/ipa-total-v077/AppBundleStager.swift
+      - name: Compile pinned patched source for iOS arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/unfair-upstream"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          swift build -c release \
+            -Xswiftc -sdk -Xswiftc "$SDK" \
+            -Xswiftc -target -Xswiftc arm64-apple-ios16.0 \
+            -Xcc -arch -Xcc arm64 \
+            -Xcc --target=arm64-apple-ios16.0 \
+            -Xcc "-isysroot$SDK" \
+            -Xcc -mios-version-min=16.0 \
+            -Xcc -miphoneos-version-min=16.0
+          test -s .build/release/unfair-swift
+          file .build/release/unfair-swift
+          xcrun vtool -show-build .build/release/unfair-swift
+          shasum -a 256 .build/release/unfair-swift
+          cp .build/release/unfair-swift "$RUNNER_TEMP/ipa-total-v077-unfair-arm64-unsigned"
+      - name: Preserve source/build evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-total-v077-unfair-build-evidence
+          path: ${{ runner.temp }}/ipa-total-v077-unfair-arm64-unsigned
+          if-no-files-found: ignore
+          retention-days: 7
