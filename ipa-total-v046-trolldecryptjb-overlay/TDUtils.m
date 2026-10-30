@@ -124,7 +124,7 @@ void decryptApp(NSDictionary *app) {
         ![requestedVersion isEqualToString:@"1.2026.286"]) {
         NSLog(@"[trolldecrypt-v054] rejecting non-target installed ChatGPT version: %@", requestedVersion);
         dispatch_async(dispatch_get_main_queue(), ^{
-            UIViewController *presenter = [UIApplication sharedApplication].keyWindow.rootViewController;
+            UIViewController *presenter = [[UIApplication sharedApplication].delegate window].rootViewController;
             if (!presenter) return;
             UIAlertController *warning = [UIAlertController alertControllerWithTitle:@"Protected ChatGPT version"
                 message:@"The installed ChatGPT is not 1.2026.286. It will not be launched, interrupted or mislabeled as a newer decrypted app."
