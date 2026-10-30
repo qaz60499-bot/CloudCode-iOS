@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 // V054: A page-aligned non-Mach-O wrapper retains the original signed encrypted
 // file in the installed helper bundle. TrollStore recursively re-signs every
