@@ -1,0 +1,67 @@
+name: IPA Total V054 isolated signed-ciphertext FairPlay test helper
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/ipa-total-v054-fairplayed-original-signature-test]
+    paths:
+      - ".github/workflows/ipa-total-v054-fairplayed-signature-control.yml"
+      - "tools/ipa-total-v054/fpcore.c"
+permissions:
+  contents: read
+concurrency:
+  group: ipa-total-v054-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ios16-unsigned:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout pinned FairPlayed, patch only isolated decryption engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/morzelowski/FairPlayed.git "$RUNNER_TEMP/FairPlayed"
+          git -C "$RUNNER_TEMP/FairPlayed" checkout --detach bad7df138839b5e0ac8b9f20cc4689140b8436fb
+          test "$(git -C "$RUNNER_TEMP/FairPlayed" rev-parse HEAD)" = bad7df138839b5e0ac8b9f20cc4689140b8436fb
+          cp "$GITHUB_WORKSPACE/tools/ipa-total-v054/fpcore.c" "$RUNNER_TEMP/FairPlayed/FairPlayed/FairPlayed/fpcore.c"
+          grep -q 'FP54_PAGE_OFFSET 16384' "$RUNNER_TEMP/FairPlayed/FairPlayed/FairPlayed/fpcore.c"
+          grep -q 'fp54_unwrap_output' "$RUNNER_TEMP/FairPlayed/FairPlayed/FairPlayed/fpcore.c"
+      - name: Build real iOS 16+ unsigned native helper (no user ciphertext or license in CI)
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project "$RUNNER_TEMP/FairPlayed/FairPlayed/FairPlayed.xcodeproj" \
+            -scheme FairPlayed -configuration Debug -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/v054-derived" \
+            IPHONEOS_DEPLOYMENT_TARGET=16.0 \
+            PRODUCT_BUNDLE_IDENTIFIER=com.ipa.total.fairplay.v054 \
+            CODE_SIGNING_ALLOWED=NO build 2>&1 | tee "$RUNNER_TEMP/v054-build.log"
+      - name: Verify architecture, bundle ID, and native executable before archiving
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/v054-derived/Build/Products/Debug-iphoneos/FairPlayed.app"
+          test -s "$app/FairPlayed"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")" = "com.ipa.total.fairplay.v054"
+          test ! -e "$app/EmbeddedPayload/ChatGPT"
+          xcrun lipo -info "$app/FairPlayed"
+          xcrun vtool -show-build "$app/FairPlayed"
+          mkdir -p "$RUNNER_TEMP/v054-delivery"
+          /usr/bin/ditto -c -k --keepParent "$app" "$RUNNER_TEMP/v054-delivery/v054-unsigned-helper-NO-APPLE-LICENSE.zip"
+          (cd "$RUNNER_TEMP/v054-delivery" && shasum -a 256 "v054-unsigned-helper-NO-APPLE-LICENSE.zip" > sha256.txt)
+          echo 'NATIVE_BUILD_PASS_NO_PHONE_NO_DECRYPTION_AND_NOT_CHATGPT_APP' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-total-v054-isolated-ios16-helper-NO-LICENSE
+          path: ${{ runner.temp }}/v054-delivery/
+          retention-days: 3
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ipa-total-v054-ios16-compiler-log
+          path: ${{ runner.temp }}/v054-build.log
+          retention-days: 3
+          if-no-files-found: warn
