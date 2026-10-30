@@ -30,6 +30,8 @@ enum FileSystem {
         }
     }
     static func removeTree(_ url: URL) {
+        // Failure injection applies only to the disposable macOS test double.
+        if ProcessInfo.processInfo.environment["UNFAIR_V078_FAIL_CLEANUP"] == "1" { return }
         try? FileManager.default.removeItem(at: url)
     }
 }
@@ -79,6 +81,37 @@ mustThrow("app-outside-record") {
 }
 guard checks == 4 else { fatalError("FAIL expected 4 rollback checks") }
 print("PASS 4/4 synthetic rollback checks; real iOS staging and FairPlay not exercised")
+
+// Simulate FileSystem.removeTree silently failing. Source must report an orphan
+// rather than making the test believe cleanup completed. Only test TMP is used.
+func mustReportOrphan(_ tag: String, _ f: () throws -> Void) {
+    let before = Set(try! fm.contentsOfDirectory(atPath: staging.path))
+    do { try f(); fatalError("EXPECTED_THROW " + tag) }
+    catch {
+        guard String(describing: error).contains("cleanup is incomplete") else {
+            fatalError("SILENT_ORPHAN_MISREPORTED " + tag + " " + String(describing: error))
+        }
+        let after = Set(try! fm.contentsOfDirectory(atPath: staging.path))
+        let added = after.subtracting(before)
+        guard added.count == 1 else { fatalError("MISSING_INJECTED_ORPHAN " + tag) }
+        for folder in added { try! fm.removeItem(at: staging.appendingPathComponent(folder)) }
+        print("PASS orphan cleanup failure detected " + tag)
+    }
+}
+setenv("UNFAIR_V078_FAIL_CLEANUP", "1", 1)
+mustReportOrphan("binary") {
+    _ = try AppBundleStager.stageBinary(missing, rootSinf: missing, logger: logger)
+}
+mustReportOrphan("app") {
+    _ = try AppBundleStager.stageAppBundle(
+        sourceApp: app,
+        encryptedRecords: [MachORecord(url: app.appendingPathComponent("DoesNotExist"), name: "DoesNotExist")],
+        logger: logger
+    )
+}
+unsetenv("UNFAIR_V078_FAIL_CLEANUP")
+assertEmpty("after-fault-injection")
+print("PASS 2/2 injected cleanup-failure detection cases")
 '''
 
 def main():
