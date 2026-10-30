@@ -64,15 +64,21 @@ jobs:
           export THEOS_PACKAGE_SCHEME=rootless
           cd "$RUNNER_TEMP/trolldecryptjb"
           make -j2 messages=no 2>&1 | tee "$RUNNER_TEMP/v047-build.log"
-          find .theos -maxdepth 7 -type f -name TrollDecrypt -print
-          find .theos -maxdepth 6 -type d -name TrollDecrypt.app -print
+          make stage messages=no 2>&1 | tee -a "$RUNNER_TEMP/v047-build.log"
+          find .theos -maxdepth 8 -type f -name TrollDecrypt -print
+          find .theos -maxdepth 7 -type d -name TrollDecrypt.app -print
 
       - name: Validate app executable and preserve bounded build evidence
         shell: bash
         run: |
           set -euo pipefail
           target="$RUNNER_TEMP/trolldecryptjb"
-          app="$target/.theos/obj/debug/arm64/TrollDecrypt.app"
+          mapfile -t apps < <(find "$target/.theos/_" -type d -name TrollDecrypt.app -print)
+          if [ "${#apps[@]}" -ne 1 ]; then
+            echo "Expected exactly one staged app bundle; found ${#apps[@]}" >&2
+            exit 2
+          fi
+          app="${apps[0]}"
           test -s "$app/TrollDecrypt"
           test -s "$app/Info.plist"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist" | grep -Fx com.ipa.total.research.trolldecrypt.v046
