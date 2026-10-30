@@ -259,8 +259,7 @@ pid_t attachLLDBToProcessByName(const char *executableName, pid_t target_pid) {
         return 0;
     }
     NSString *scriptContent = [NSString stringWithFormat:
-        @"process attach --name %@ --waitfor
-", quotedName];
+        @"process attach --name %@ --waitfor\n", quotedName];
     [scriptContent writeToFile:scriptPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
     NSString *logPath = getLogPath();
 
