@@ -1,0 +1,100 @@
+name: IPA Total V047 app-only native build (no injection)
+on:
+  push:
+    branches: [ci/ipa-total-v047-app-only]
+    paths:
+      - 'ipa-total-v047-app-only-overlay/**'
+      - '.github/workflows/ipa-total-v047-app-only.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ipa-v047-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app-only:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Source pins and native toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          shasum -a 256 ipa-total-v046-trolldecryptjb-overlay/* ipa-total-v047-app-only-overlay/Makefile
+
+      - name: Fetch fixed upstream and Theos
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/34306/TrollDecryptJB.git "$RUNNER_TEMP/trolldecryptjb"
+          git -C "$RUNNER_TEMP/trolldecryptjb" checkout --detach 1dad89b0132a0c3772aceddf53cbf25f0ac3ecfb
+          test "$(git -C "$RUNNER_TEMP/trolldecryptjb" rev-parse HEAD)" = 1dad89b0132a0c3772aceddf53cbf25f0ac3ecfb
+          git -C "$RUNNER_TEMP/trolldecryptjb" submodule update --init --recursive
+          git clone --depth 1 --recursive https://github.com/theos/theos.git "$RUNNER_TEMP/theos"
+          echo "THEOS=$RUNNER_TEMP/theos" >> "$GITHUB_ENV"
+
+      - name: Replace only research source and exact app-only recipe
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/trolldecryptjb"
+          for p in TDUtils.m TDDumpDecrypted.m TDDumpDecrypted.h; do
+            cp "ipa-total-v046-trolldecryptjb-overlay/$p" "$target/$p"
+          done
+          for p in Makefile TDRootViewController.m entitlements.plist Resources/Info.plist; do
+            cp "ipa-total-v047-app-only-overlay/$p" "$target/$p"
+          done
+          ! grep -E '^TWEAK_NAME[[:space:]]*=' "$target/Makefile"
+          ! grep -E '^TOOL_NAME[[:space:]]*=' "$target/Makefile"
+          ! grep -E 'TDDaemonKiller|spawnRoot\(' "$target/TDRootViewController.m"
+          ! grep -F 'kill(pid, SIGKILL)' "$target/TDUtils.m"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$target/Resources/Info.plist" | grep -Fx com.ipa.total.research.trolldecrypt.v046
+          /usr/libexec/PlistBuddy -c 'Print :application-identifier' "$target/entitlements.plist" | grep -Fx com.ipa.total.research.trolldecrypt.v046
+
+      - name: Build only isolated rootless application (no daemon tweak)
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew list ldid >/dev/null 2>&1 || brew install ldid
+          export THEOS="$RUNNER_TEMP/theos"
+          export THEOS_PACKAGE_SCHEME=rootless
+          cd "$RUNNER_TEMP/trolldecryptjb"
+          make -j2 messages=no 2>&1 | tee "$RUNNER_TEMP/v047-build.log"
+          find .theos -maxdepth 7 -type f -name TrollDecrypt -print
+          find .theos -maxdepth 6 -type d -name TrollDecrypt.app -print
+
+      - name: Validate app executable and preserve bounded build evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/trolldecryptjb"
+          app="$target/.theos/obj/debug/arm64/TrollDecrypt.app"
+          test -s "$app/TrollDecrypt"
+          test -s "$app/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist" | grep -Fx com.ipa.total.research.trolldecrypt.v046
+          xcrun lipo -info "$app/TrollDecrypt"
+          file "$app/TrollDecrypt"
+          otool -l "$app/TrollDecrypt" | grep -A8 -m1 LC_BUILD_VERSION || true
+          mkdir -p "$RUNNER_TEMP/v047-validated"
+          /usr/bin/ditto -c -k --keepParent "$app" "$RUNNER_TEMP/v047-validated/v047-app-only-native-build-NOT-CHATGPT.zip"
+          shasum -a 256 "$RUNNER_TEMP/v047-validated/v047-app-only-native-build-NOT-CHATGPT.zip" > "$RUNNER_TEMP/v047-validated/sha256.txt"
+          echo 'APP_ONLY_NATIVE_BUILD_AND_BUNDLE_ID_PASS; NO_CRYPTID_CLAIM; NO_IOS16_RUNTIME_CLAIM' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: ipa-total-v047-app-only-native-NOT-ChatGPT
+          path: ${{ runner.temp }}/v047-validated/
+          retention-days: 3
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ipa-total-v047-build-log
+          path: ${{ runner.temp }}/v047-build.log
+          retention-days: 3
+          if-no-files-found: warn
