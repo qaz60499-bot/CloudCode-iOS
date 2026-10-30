@@ -82,6 +82,25 @@ mustThrow("app-outside-record") {
 guard checks == 4 else { fatalError("FAIL expected 4 rollback checks") }
 print("PASS 4/4 synthetic rollback checks; real iOS staging and FairPlay not exercised")
 
+// In production this guard must reject an in-root symlink that resolves to
+// another app or out-of-root folder, even though the lexical path is in-root.
+let rootEscape = staging.appendingPathComponent("outside-link")
+try! fm.createSymbolicLink(at: rootEscape, withDestinationURL: sourceRoot)
+guard !AppBundleStager.isInsideApplicationBundleRoot(rootEscape.appendingPathComponent("FixtureMachO")) else {
+    fatalError("SYMLINK_ESCAPE_ACCEPTED_ROOT_GUARD")
+}
+try! fm.removeItem(at: rootEscape)
+let escapedRecord = app.appendingPathComponent("LinkToOutside")
+try! fm.createSymbolicLink(at: escapedRecord, withDestinationURL: plain)
+mustThrow("app-symlink-escape") {
+    _ = try AppBundleStager.stageAppBundle(
+        sourceApp: app,
+        encryptedRecords: [MachORecord(url: escapedRecord, name: "LinkToOutside")],
+        logger: logger
+    )
+}
+print("PASS 2/2 symlink escape safeguards")
+
 // Simulate FileSystem.removeTree silently failing. Source must report an orphan
 // rather than making the test believe cleanup completed. Only test TMP is used.
 func mustReportOrphan(_ tag: String, _ f: () throws -> Void) {
