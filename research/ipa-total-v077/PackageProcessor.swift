@@ -330,7 +330,9 @@ public final class PackageProcessor {
             url.standardizedFileURL.path,
             url.standardizedFileURL.resolvingSymlinksInPath().path,
         ]
-        guard paths.contains(where: isInsideRequiredXRoot) else {
+        // Require BOTH representations to stay under X. A symlink in X may
+        // resolve elsewhere; accepting only one representation is unsafe.
+        guard paths.allSatisfy(isInsideRequiredXRoot) else {
             throw UnfairError.io("\(label) must be inside /var/folders/bg/<token>/X: \(url.path)")
         }
     }
@@ -341,11 +343,13 @@ public final class PackageProcessor {
             url.standardizedFileURL.resolvingSymlinksInPath().path,
         ]
         #if os(iOS)
-        guard paths.contains(where: { AppBundleStager.isInsideApplicationBundleRoot(URL(fileURLWithPath: $0)) }) || paths.contains(where: isInsideRequiredXRoot) else {
+        // The application-root guard already checks lexical AND real paths.
+        // X-root paths must meet the same requirement on both representations.
+        guard AppBundleStager.isInsideApplicationBundleRoot(url) || paths.allSatisfy(isInsideRequiredXRoot) else {
             throw UnfairError.io("\(label) must be inside /var/containers/Bundle/Application or /var/folders/bg/<token>/X: \(url.path)")
         }
         #else
-        guard paths.contains(where: isInsideRequiredXRoot) else {
+        guard paths.allSatisfy(isInsideRequiredXRoot) else {
             throw UnfairError.io("\(label) must be inside /var/folders/bg/<token>/X: \(url.path)")
         }
         #endif
