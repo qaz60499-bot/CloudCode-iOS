@@ -1,0 +1,67 @@
+name: IPA Total V048 iOS16 FairPlayed isolated helper native build
+on:
+  push:
+    branches: [ci/ipa-total-v048-fairplayed-ios16]
+    paths: [.github/workflows/ipa-total-v048-fairplayed-ios16.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ipa-total-v048-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ios16-unsigned-app:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout pinned source (never upload user licensed IPA)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/morzelowski/FairPlayed.git "$RUNNER_TEMP/FairPlayed"
+          git -C "$RUNNER_TEMP/FairPlayed" checkout --detach bad7df138839b5e0ac8b9f20cc4689140b8436fb
+          test "$(git -C "$RUNNER_TEMP/FairPlayed" rev-parse HEAD)" = bad7df138839b5e0ac8b9f20cc4689140b8436fb
+          xcodebuild -version
+      - name: Build unsigned iOS16 helper with no licensed resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project "$RUNNER_TEMP/FairPlayed/FairPlayed/FairPlayed.xcodeproj" \
+             -scheme FairPlayed -configuration Debug -sdk iphoneos \
+             -destination 'generic/platform=iOS' \
+             -derivedDataPath "$RUNNER_TEMP/fairplayed-derived" \
+             IPHONEOS_DEPLOYMENT_TARGET=16.0 \
+             PRODUCT_BUNDLE_IDENTIFIER=com.ipa.total.fairplay.v048 \
+             CODE_SIGNING_ALLOWED=NO \
+             build 2>&1 | tee "$RUNNER_TEMP/fairplayed-build.log"
+      - name: Validate actual iOS application bundle and archive (NOT decrypted ChatGPT)
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/fairplayed-derived/Build/Products/Debug-iphoneos/FairPlayed.app"
+          test -s "$app/FairPlayed"
+          test -s "$app/Info.plist"
+          test ! -d "$app/EmbeddedPayload/ChatGPT"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")" = "com.ipa.total.fairplay.v048"
+          xcrun lipo -info "$app/FairPlayed"
+          xcrun vtool -show-build "$app/FairPlayed" | tee "$RUNNER_TEMP/ios16-load-command.txt"
+          # A complete helper is NOT a usable ChatGPT version, nor proof of FairPlay.
+          mkdir -p "$RUNNER_TEMP/v048-validated"
+          /usr/bin/ditto -c -k --keepParent "$app" "$RUNNER_TEMP/v048-validated/v048-unsigned-helper-NO-APPLE-LICENSE.zip"
+          shasum -a 256 "$RUNNER_TEMP/v048-validated/v048-unsigned-helper-NO-APPLE-LICENSE.zip" > "$RUNNER_TEMP/v048-validated/sha256.txt"
+          echo 'IOS16_NATIVE_HELPER_BUILD_PASS_NOT_DECRYPTED_NO_DEVICE_TEST' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: ipa-total-v048-ios16-helper-source-app-no-license
+          path: ${{ runner.temp }}/v048-validated/
+          retention-days: 3
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ipa-total-v048-ios16-helper-build-log
+          path: ${{ runner.temp }}/fairplayed-build.log
+          retention-days: 3
+          if-no-files-found: warn
