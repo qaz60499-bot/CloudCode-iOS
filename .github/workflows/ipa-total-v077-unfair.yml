@@ -39,7 +39,7 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP/unfair-upstream"
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          swift build -c release \
+          swift build -c release -v \
             -Xswiftc -sdk -Xswiftc "$SDK" \
             -Xswiftc -target -Xswiftc arm64-apple-ios16.0 \
             -Xcc -arch -Xcc arm64 \
@@ -50,6 +50,8 @@ jobs:
           test -s .build/release/unfair-swift
           file .build/release/unfair-swift
           xcrun vtool -show-build .build/release/unfair-swift
+          xcrun otool -L .build/release/unfair-swift
+          xcrun dwarfdump --uuid .build/release/unfair-swift
           shasum -a 256 .build/release/unfair-swift
           cp .build/release/unfair-swift "$RUNNER_TEMP/ipa-total-v077-unfair-arm64-unsigned"
       - name: Preserve source/build evidence only
