@@ -211,8 +211,12 @@ int find_off_cryptid(const char *filePath) {
     for (uint32_t i = 0; i < header->ncmds; i++) {
         if (lc->cmd == LC_ENCRYPTION_INFO || lc->cmd == LC_ENCRYPTION_INFO_64) {
             struct encryption_info_command *encryption_info = (struct encryption_info_command*) lc;
-
-
+            // Release builds may remove NSLog: use the value in real control flow.
+            if (encryption_info->cryptid == 0) {
+                free(buffer);
+                fclose(file);
+                return 0;
+            }
             NSLog(@"[trolldecrypt] cryptid: %d\n", encryption_info->cryptid);
             NSLog(@"[trolldecrypt] Found cryptid at offset: 0x%llx\n", (mach_vm_address_t)lc + offsetof(struct encryption_info_command, cryptid) - (mach_vm_address_t)header);
 
