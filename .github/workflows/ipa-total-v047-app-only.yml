@@ -73,12 +73,13 @@ jobs:
         run: |
           set -euo pipefail
           target="$RUNNER_TEMP/trolldecryptjb"
-          mapfile -t apps < <(find "$target/.theos/_" -type d -name TrollDecrypt.app -print)
-          if [ "${#apps[@]}" -ne 1 ]; then
-            echo "Expected exactly one staged app bundle; found ${#apps[@]}" >&2
+          staged_apps="$(find "$target/.theos/_" -type d -name TrollDecrypt.app -print)"
+          app_count="$(find "$target/.theos/_" -type d -name TrollDecrypt.app | wc -l | tr -d '[:space:]')"
+          if [ "$app_count" != 1 ]; then
+            echo "Expected exactly one staged app bundle; found $app_count" >&2
             exit 2
           fi
-          app="${apps[0]}"
+          app="$staged_apps"
           test -s "$app/TrollDecrypt"
           test -s "$app/Info.plist"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist" | grep -Fx com.ipa.total.research.trolldecrypt.v046
