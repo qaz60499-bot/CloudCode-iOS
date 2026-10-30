@@ -6,30 +6,19 @@ static NSString *getLogPath(void) {
     return [NSTemporaryDirectory() stringByAppendingPathComponent:@"lldb_output.log"];
 }
 
+// A vnode-only waiter misses the first LLDB write if the child has not yet
+// created the redirected log. Poll the bounded, truncated per-launch log:
+// this runs only on the background extraction queue, never on the UI thread.
 static BOOL waitForContentOfFileSync(NSString *filePath, NSString *content, NSTimeInterval timeout) {
-    int fd = open([filePath UTF8String], O_EVTONLY);
-    if (fd == -1) {
-        NSLog(@"[trolldecrypt] Failed to open file for monitoring: %@", filePath);
-        return NO;
-    }
-
-    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-    dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
-    dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_VNODE, fd, DISPATCH_VNODE_WRITE, queue);
-    dispatch_source_set_event_handler(source, ^{
-        NSString *fileContent = [NSString stringWithContentsOfFile:filePath encoding:NSUTF8StringEncoding error:nil];
-        if ([fileContent containsString:content]) {
-            NSLog(@"[trolldecrypt] File content matched: %@", filePath);
-            dispatch_semaphore_signal(semaphore);
-        }
-    });
-    dispatch_resume(source);
-
-    int rc = dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)));
-    dispatch_source_cancel(source);
-    close(fd);
-
-    return (rc == 0);
+    if (filePath.length == 0 || content.length == 0 || timeout <= 0) return NO;
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    do {
+        NSString *output = [NSString stringWithContentsOfFile:filePath encoding:NSUTF8StringEncoding error:nil];
+        if ([output containsString:content]) return YES;
+        [NSThread sleepForTimeInterval:0.15];
+    } while ([deadline timeIntervalSinceNow] > 0);
+    NSLog(@"[trolldecrypt-v054] timed out waiting for LLDB marker; no decryption attempted: %@", content);
+    return NO;
 }
 
 
@@ -126,6 +115,25 @@ NSArray *sysctl_ps(void) {
 }
 
 void decryptApp(NSDictionary *app) {
+    // Protect the already-installed 1.2024.348. It shares both executable name
+    // and bundle identifier with the requested 1.2026.286. Never interpret
+    // extracting the old installed app as a successful newer-app extraction.
+    NSString *requestedID = app[@"bundleID"];
+    NSString *requestedVersion = app[@"version"];
+    if ([requestedID isEqualToString:@"com.openai.chat"] &&
+        ![requestedVersion isEqualToString:@"1.2026.286"]) {
+        NSLog(@"[trolldecrypt-v054] rejecting non-target installed ChatGPT version: %@", requestedVersion);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIViewController *presenter = [UIApplication sharedApplication].keyWindow.rootViewController;
+            if (!presenter) return;
+            UIAlertController *warning = [UIAlertController alertControllerWithTitle:@"Protected ChatGPT version"
+                message:@"The installed ChatGPT is not 1.2026.286. It will not be launched, interrupted or mislabeled as a newer decrypted app."
+                preferredStyle:UIAlertControllerStyleAlert];
+            [warning addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+            [presenter presentViewController:warning animated:YES completion:nil];
+        });
+        return;
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
         alertWindow = [[UIWindow alloc] initWithFrame: [UIScreen mainScreen].bounds];
         alertWindow.rootViewController = [UIViewController new];
@@ -200,8 +208,25 @@ void decryptApp(NSDictionary *app) {
         
         NSLog(@"[trolldecrypt] launch app and lldb force pause...");
         [[UIApplication sharedApplication] launchApplicationWithIdentifier:bundleID suspended:YES]; // Launch app in suspended state
-        waitForContentOfFileSync(getLogPath(), @"Architecture set to", 30.0); // Wait for lldb to attach
-        
+        // Merely logging "Architecture set to" does NOT prove LLDB caught
+        // the target; require a real stopped-process message before reading it.
+        BOOL stopped = waitForContentOfFileSync(getLogPath(), @"Process ", 30.0) &&
+                       waitForContentOfFileSync(getLogPath(), @"stopped", 2.0);
+        if (!stopped) {
+            detachLLDB(lldb_pid);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                errorController = [UIAlertController alertControllerWithTitle:@"LLDB did not stop target"
+                    message:@"No verified stopped-process marker. No memory extraction was attempted."
+                    preferredStyle:UIAlertControllerStyleAlert];
+                [errorController addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
+                    [kw removeFromSuperview];
+                    kw.hidden = YES;
+                }]];
+                [root presentViewController:errorController animated:YES completion:nil];
+            });
+            return;
+        }
+
         // Get PID after lldb caught it
         pid_t pid = -1;
         processes = sysctl_ps();
@@ -284,15 +309,15 @@ pid_t attachLLDBToProcessByName(const char *executableName, pid_t target_pid) {
         NSLog(@"[trolldecrypt] lldb spawned done, lldb PID: %d", lldb_pid);
         NSLog(@"[trolldecrypt] lldb output: %@", logPath);
         
-        waitForContentOfFileSync(logPath, @"process attach --name", 5.0);
-        sleep(1); // Give lldb a moment to settle
-        
-        // Verify lldb is still running
-        if (kill(lldb_pid, 0) == 0) {
-            NSLog(@"[trolldecrypt] lldb attached to '%s' (PID: %d)", executableName, target_pid);
-        } else {
-            NSLog(@"[trolldecrypt] lldb process died");
+        BOOL commandObserved = waitForContentOfFileSync(logPath, @"process attach --name", 5.0);
+        // The command echo is NOT evidence of a successful target attach.
+        // The actual stopped-process evidence is checked after launch.
+        if (!commandObserved || kill(lldb_pid, 0) != 0) {
+            NSLog(@"[trolldecrypt-v054] lldb startup or command-echo failed");
+            detachLLDB(lldb_pid);
             lldb_pid = 0;
+        } else {
+            NSLog(@"[trolldecrypt-v054] lldb waiting for target; not yet attached");
         }
     } else {
         NSLog(@"[trolldecrypt] fail to spawn lldb: %d", status);
