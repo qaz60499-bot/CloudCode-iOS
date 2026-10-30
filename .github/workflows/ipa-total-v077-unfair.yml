@@ -39,13 +39,20 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP/unfair-upstream"
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          swift build -c release -v \
-            --triple arm64-apple-ios16.0 \
-            --sdk "$SDK" \
-            -Xcc "-isysroot$SDK" \
-            -Xcc -mios-version-min=16.0
-          BIN_DIR="$(swift build -c release --triple arm64-apple-ios16.0 --sdk "$SDK" --show-bin-path)"
-          BIN="$BIN_DIR/unfair-swift"
+          # SwiftPM's native CLI can incorrectly link with the macOS SDK
+          # even when --triple and --sdk are set; use Xcode's native iOS destination.
+          python3 -c 'from pathlib import Path; p=Path("Package.swift"); s=p.read_text(); needle=".macOS(.v10_15),"; assert needle in s; p.write_text(s.replace(needle, needle+"\n        .iOS(.v16),", 1))'
+          xcodebuild -list
+          xcodebuild -scheme unfair-swift \
+            -destination 'generic/platform=iOS' \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/unfair-ios-derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            IPHONEOS_DEPLOYMENT_TARGET=16.0 \
+            build
+          BIN="$(find "$RUNNER_TEMP/unfair-ios-derived/Build/Products" -type f -name unfair-swift -print -quit)"
+          test -n "$BIN"
           test -s "$BIN"
           file "$BIN"
           BUILD_INFO="$(xcrun vtool -show-build "$BIN")"
