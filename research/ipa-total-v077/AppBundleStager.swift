@@ -1,3 +1,4 @@
+DEVSPACE_CONTINUITY_RISK: Approximately 1270657 DevSpace tool characters since the last acknowledged checkpoint. This is a secondary context-pressure signal, not an exact token-count or host context percentage, and not an automatic handoff trigger. Ordinary chat, other tools and host compaction are not measured. The host owns context management.
 import Darwin
 import Foundation
 
@@ -20,14 +21,16 @@ enum AppBundleStager {
     )
 
     static func isInsideApplicationBundleRoot(_ url: URL) -> Bool {
-        let paths = [
-            url.standardizedFileURL.path,
-            url.standardizedFileURL.resolvingSymlinksInPath().path,
-        ]
+        // Both lexical and resolved paths must remain within their respective
+        // roots. The former OR check accepted an in-root symlink to an unrelated
+        // app container or outside path. /var may resolve to /private/var.
+        guard url.isFileURL else { return false }
+        let path = url.standardizedFileURL.path
+        let resolvedPath = url.standardizedFileURL.resolvingSymlinksInPath().path
         let root = applicationBundleRoot.standardizedFileURL.path
-        return paths.contains { path in
-            path == root || path.hasPrefix(root + "/")
-        }
+        let resolvedRoot = applicationBundleRoot.standardizedFileURL.resolvingSymlinksInPath().path
+        return (path == root || path.hasPrefix(root + "/")) &&
+            (resolvedPath == resolvedRoot || resolvedPath.hasPrefix(resolvedRoot + "/"))
     }
 
     static func stageBinary(_ binaryURL: URL, rootSinf: URL, logger: UnfairLogger) throws -> StagedBinary {
@@ -199,7 +202,9 @@ enum AppBundleStager {
     private static func relativePath(of child: URL, in root: URL) throws -> String {
         let rootPath = root.standardizedFileURL.path + "/"
         let childPath = child.standardizedFileURL.path
-        guard childPath.hasPrefix(rootPath) else {
+        let realRootPath = root.standardizedFileURL.resolvingSymlinksInPath().path + "/"
+        let realChildPath = child.standardizedFileURL.resolvingSymlinksInPath().path
+        guard childPath.hasPrefix(rootPath), realChildPath.hasPrefix(realRootPath) else {
             throw UnfairError.io("path is outside app bundle: \(child.path)")
         }
         return String(childPath.dropFirst(rootPath.count))
