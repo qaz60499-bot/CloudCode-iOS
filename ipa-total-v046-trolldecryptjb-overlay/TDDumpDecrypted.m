@@ -564,7 +564,7 @@ int find_off_cryptid(const char *filePath) {
         if(!imageName || !imageAddress)
 			continue;
 
-        NSLog(@"[trolldecrypt] Comparing %s to %s", imageName, appPath);
+        NSLog(@"[trolldecrypt-v046] Inspecting mapped image: %s", imageName);
 
         NSString *imageFullPath = [NSString stringWithUTF8String:imageName];
         NSString *prefix = [NSString stringWithFormat:@"%@/", [self appPath]];
