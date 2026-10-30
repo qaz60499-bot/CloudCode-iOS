@@ -41,7 +41,7 @@ jobs:
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           # SwiftPM's native CLI can incorrectly link with the macOS SDK
           # even when --triple and --sdk are set; use Xcode's native iOS destination.
-          python3 -c 'from pathlib import Path; p=Path("Package.swift"); s=p.read_text(); needle=".macOS(.v10_15),"; assert needle in s; p.write_text(s.replace(needle, needle+"\n        .iOS(.v16),", 1))'
+          python3 -c 'from pathlib import Path; p=Path("Package.swift"); s=p.read_text(); needle=".macOS(.v10_15),"; assert needle in s; assert s.startswith("// swift-tools-version: 5.4"); s=s.replace("// swift-tools-version: 5.4","// swift-tools-version: 5.7",1).replace(needle, needle+"\n        .iOS(.v16),", 1); p.write_text(s)'
           xcodebuild -list
           xcodebuild -scheme unfair-swift \
             -destination 'generic/platform=iOS' \
