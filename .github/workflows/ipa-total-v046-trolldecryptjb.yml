@@ -1,0 +1,86 @@
+name: IPA Total V046 TrollDecryptJB rootless native compile
+
+on:
+  push:
+    branches:
+      - ci/ipa-total-v046-trolldecryptjb
+    paths:
+      - 'ipa-total-v046-trolldecryptjb-overlay/**'
+      - '.github/workflows/ipa-total-v046-trolldecryptjb.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ipa-v046-trolldecryptjb-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-macos-build:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify native build tools and source fingerprints
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          shasum -a 256 ipa-total-v046-trolldecryptjb-overlay/*
+
+      - name: Checkout pinned upstream and Theos (no device, no App Store auth)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/34306/TrollDecryptJB.git "$RUNNER_TEMP/trolldecryptjb"
+          git -C "$RUNNER_TEMP/trolldecryptjb" checkout --detach 1dad89b0132a0c3772aceddf53cbf25f0ac3ecfb
+          test "$(git -C "$RUNNER_TEMP/trolldecryptjb" rev-parse HEAD)" = 1dad89b0132a0c3772aceddf53cbf25f0ac3ecfb
+          git -C "$RUNNER_TEMP/trolldecryptjb" submodule update --init --recursive
+          git clone --depth 1 --recursive https://github.com/theos/theos.git "$RUNNER_TEMP/theos"
+          echo "THEOS=$RUNNER_TEMP/theos" >> "$GITHUB_ENV"
+
+      - name: Apply bounded overlay and verify actual source
+        shell: bash
+        run: |
+          set -euo pipefail
+          for p in TDUtils.m TDDumpDecrypted.m TDDumpDecrypted.h; do
+            test -s "ipa-total-v046-trolldecryptjb-overlay/$p"
+            cp "ipa-total-v046-trolldecryptjb-overlay/$p" "$RUNNER_TEMP/trolldecryptjb/$p"
+            cmp "ipa-total-v046-trolldecryptjb-overlay/$p" "$RUNNER_TEMP/trolldecryptjb/$p"
+          done
+          ! grep -F "kill(pid, SIGKILL)" "$RUNNER_TEMP/trolldecryptjb/TDUtils.m"
+          grep -F 'if (remaining.count != 0)' "$RUNNER_TEMP/trolldecryptjb/TDDumpDecrypted.m"
+          grep -F 'if (!fullyDumped)' "$RUNNER_TEMP/trolldecryptjb/TDUtils.m"
+
+      - name: Compile native rootless iOS Objective-C code, never install
+        shell: bash
+        run: |
+          set -o pipefail
+          brew list ldid >/dev/null 2>&1 || brew install ldid
+          export THEOS="$RUNNER_TEMP/theos"
+          export THEOS_PACKAGE_SCHEME=rootless
+          export THEOS_DEVICE_IP=
+          export THEOS_DEVICE_PORT=
+          cd "$RUNNER_TEMP/trolldecryptjb"
+          make -j2 messages=yes 2>&1 | tee "$RUNNER_TEMP/trolldecryptjb-build.log"
+
+      - name: Record evidence without releasing/installing package
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## V046 rootless source compilation evidence'
+            echo 'Source: 34306/TrollDecryptJB @ 1dad89b0132a0c3772aceddf53cbf25f0ac3ecfb + 3-file bounded V046 overlay'
+            echo 'No IPA, .deb, phone install, sign-in, FairPlay access, or device changes performed by CI.'
+            echo 'Compilation exit status is reflected in the job status. Native build does not prove decrypted image or iOS16 functionality.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ipa-total-v046-native-build-log-only
+          path: ${{ runner.temp }}/trolldecryptjb-build.log
+          if-no-files-found: warn
+          retention-days: 3
