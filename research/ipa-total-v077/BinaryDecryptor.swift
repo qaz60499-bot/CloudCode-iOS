@@ -396,9 +396,18 @@ public final class BinaryDecryptor {
             cpuTypeArm64,
             cpuSubtypeArm64All
         )
+        // Capture errno immediately; subsequent logging may overwrite it.
         let remapErrno = errno
         guard result == 0 else {
-            throw UnfairError.decryptFailed("mremap_encrypted failed: \(String(cString: strerror(remapErrno)))")
+            // A kernel pager failure is not proof that credentials are absent:
+            // preserve exact syscall and region evidence for an authorized
+            // device-side diagnosis, without logging any license content.
+            throw UnfairError.decryptFailed(
+                "mremap_encrypted failed: result=\(result) errno=\(remapErrno) " +
+                "\(String(cString: strerror(remapErrno))) " +
+                "fileoff=0x\(String(chunk.fileOffset, radix: 16)) " +
+                "size=0x\(String(chunk.size, radix: 16))"
+            )
         }
 
         logger.verbose("copying 0x\(String(chunk.size, radix: 16)) decrypted bytes back to base at cryptoff=0x\(String(chunk.destinationOffset, radix: 16))")
