@@ -63,20 +63,8 @@ mach_vm_region(vm_map_read_t target_task, mach_vm_address_t *address, mach_vm_si
 
 #define swap32(value) (((value & 0xFF000000) >> 24) | ((value & 0x00FF0000) >> 8) | ((value & 0x0000FF00) << 8) | ((value & 0x000000FF) << 24) )
 
-unsigned char *readProcessMemory (mach_port_t proc, mach_vm_address_t addr, mach_msg_type_number_t* size) {
-    mach_msg_type_number_t  dataCnt = (mach_msg_type_number_t) *size;
-    vm_offset_t readMem;
-    
-    kern_return_t kr = vm_read(proc, addr, *size, &readMem, &dataCnt);
-    
-    if (kr) {
-        //fprintf (stderr, "Unable to read target task's memory @%p - kr 0x%x\n", (void *) addr, kr);
-        return NULL;
-    }
-    
-    return ((unsigned char *) readMem);
-}
-
+// V098: all remote reads use caller-owned buffers. Do not use vm_read:
+// its returned allocation must be vm_deallocate'd, unlike malloc buffers.
 // The upstream PATH_MAX-sized vm_read of a remote dyld imageFilePath can
 // cross an unreadable mapping even when the NUL-terminated path is valid.
 // Read page-bounded chunks, stop at NUL, and keep all bytes in caller-owned
@@ -417,11 +405,9 @@ static BOOL v055CopyExactly(int srcFd, int dstFd, uint64_t count) {
 			// Create a dir structure in ~ just like in /path/to/FooApp.app/Whatever
 			[self makeDirectories:encryptedImageFilenameStr];
 
-            //0x1518
-            uint64_t aslr_slide = 0;
-            get_image_size(imageAddress, targetTask, &aslr_slide);
-            NSLog(@"[trolldecrypt] aslr_slide= 0x%llx", aslr_slide);
-
+            // V098: skip unused ASLR/file-size diagnostics. The old
+            // get_image_size parser trusted unchecked remote load commands,
+            // and its return value was not used to validate the extraction.
             // Actual on-disk cryptid offset is resolved after FAT slice selection.
 
 			NSLog(@"[trolldecrypt] offset to cryptid (%d) found in memory @ %p (from %p). off_cryptid = %u (0x%x)\n", eic->cryptid, &eic->cryptid, image_mh, off_cryptid, off_cryptid);
@@ -564,20 +550,37 @@ static BOOL v055CopyExactly(int srcFd, int dstFd, uint64_t count) {
     struct task_dyld_info dyld_info;
     mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
 
-    if(task_info(targetTask, TASK_DYLD_INFO, (task_info_t)&dyld_info, &count) != KERN_SUCCESS) return NO;
+    if (task_info(targetTask, TASK_DYLD_INFO, (task_info_t)&dyld_info, &count) != KERN_SUCCESS ||
+        dyld_info.all_image_info_addr == 0) {
+        mach_port_deallocate(mach_task_self(), targetTask);
+        return NO;
+    }
 
-    mach_msg_type_number_t size = sizeof(struct dyld_all_image_infos);
-    uint8_t* data = readProcessMemory(targetTask, dyld_info.all_image_info_addr, &size);
-    if (data == NULL) return NO;
-    struct dyld_all_image_infos* infos = (struct dyld_all_image_infos *) data;
-    if (infos->infoArrayCount == 0 || infos->infoArrayCount > 4096) return NO;
-
-    mach_msg_type_number_t size2 = sizeof(struct dyld_image_info) * infos->infoArrayCount;
-    uint8_t* info_addr = readProcessMemory(targetTask, (mach_vm_address_t) infos->infoArray, &size2);
-    if (info_addr == NULL) return NO;
-    struct dyld_image_info* info = (struct dyld_image_info*) info_addr;
-        
-    uint32_t numberOfImages = infos->infoArrayCount;
+    // V098: read dyld metadata into owned, bounded host buffers. The upstream
+    // vm_read() version leaked its returned VM allocation and task rights on
+    // early exits. Require exact reads, including the fixed-size metadata.
+    struct dyld_all_image_infos dyldSnapshot = {0};
+    if (readmem((mach_vm_offset_t *)&dyldSnapshot, dyld_info.all_image_info_addr,
+                sizeof(dyldSnapshot), targetTask, NULL) != KERN_SUCCESS ||
+        dyldSnapshot.infoArrayCount == 0 || dyldSnapshot.infoArrayCount > 4096 ||
+        dyldSnapshot.infoArray == NULL) {
+        mach_port_deallocate(mach_task_self(), targetTask);
+        return NO;
+    }
+    uint32_t numberOfImages = dyldSnapshot.infoArrayCount;
+    size_t bytes = (size_t)numberOfImages * sizeof(struct dyld_image_info);
+    struct dyld_image_info *info = malloc(bytes);
+    if (!info) {
+        mach_port_deallocate(mach_task_self(), targetTask);
+        return NO;
+    }
+    if (readmem((mach_vm_offset_t *)info,
+                (mach_vm_address_t)dyldSnapshot.infoArray, bytes,
+                targetTask, NULL) != KERN_SUCCESS) {
+        free(info);
+        mach_port_deallocate(mach_task_self(), targetTask);
+        return NO;
+    }
     mach_vm_address_t imageAddress = 0;
     // V045 target-only strict closure: an early abort can map just the main
     // executable. Never emit a convincing-looking partial ChatGPT IPA.
@@ -613,17 +616,21 @@ static BOOL v055CopyExactly(int srcFd, int dstFd, uint64_t count) {
                 NSLog(@"[trolldecrypt-v045] required image %d: %@", i, relative);
                 if (![self dumpDecryptedImage:imageAddress fileName:imageName image:i task: targetTask]) {
                     NSLog(@"[trolldecrypt-v045] incomplete extraction for %@", relative);
+                    free(info);
+                    mach_port_deallocate(mach_task_self(), targetTask);
                     return NO;
                 }
                 [remaining removeObject:relative];
             }
         }
     }
-    if (remaining.count != 0) {
+    BOOL complete = remaining.count == 0;
+    if (!complete) {
         NSLog(@"[trolldecrypt-v045] encrypted startup closure incomplete: %@", remaining);
-        return NO;
     }
-    return YES;
+    free(info);
+    mach_port_deallocate(mach_task_self(), targetTask);
+    return complete;
 }
 
 
