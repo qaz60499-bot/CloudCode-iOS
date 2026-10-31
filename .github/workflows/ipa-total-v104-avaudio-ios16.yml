@@ -1,0 +1,56 @@
+name: IPA Total V104 AVAudioApplication iOS16 semantic adapter
+on:
+  push:
+    branches:
+      - ci/ipa-total-v104-avaudio-semantic-20261031
+    paths:
+      - .github/workflows/ipa-total-v104-avaudio-ios16.yml
+      - tools/chatgpt-compat/ChatGPTCompatAVAudioApplication-ios166.m
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-avaudio-ios16:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile REAL iOS16 arm64 Objective-C semantic adapter
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --find clang
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p output/audit
+          xcrun --sdk iphoneos clang \
+            -target arm64-apple-ios16.6 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=16.6 \
+            -fobjc-arc -fblocks -fvisibility=default -Werror -O2 \
+            -dynamiclib \
+            -Wl,-install_name,@rpath/IPACompatAVAudioApplication.dylib \
+            -framework Foundation -framework AVFAudio \
+            tools/chatgpt-compat/ChatGPTCompatAVAudioApplication-ios166.m \
+            -o output/IPACompatAVAudioApplication.dylib
+          file output/IPACompatAVAudioApplication.dylib | grep -E 'Mach-O 64-bit.*arm64'
+          xcrun otool -hv output/IPACompatAVAudioApplication.dylib > output/audit/header.txt
+          xcrun otool -l output/IPACompatAVAudioApplication.dylib > output/audit/commands.txt
+          xcrun otool -L output/IPACompatAVAudioApplication.dylib > output/audit/dependencies.txt
+          xcrun nm -gU output/IPACompatAVAudioApplication.dylib > output/audit/exports.txt
+          xcrun nm -m -u output/IPACompatAVAudioApplication.dylib > output/audit/undefined.txt
+          grep -A5 LC_BUILD_VERSION output/audit/commands.txt | grep -E 'minos +16\.6'
+          grep -F '_OBJC_CLASS_$_AVAudioApplication' output/audit/exports.txt
+          grep -F '_OBJC_METACLASS_$_AVAudioApplication' output/audit/exports.txt
+          ! grep -E '^.*_AVAudioApplication(InputMuteStateChangeNotification|MuteStateKey)$' output/audit/exports.txt
+          ! grep -E 'FinanceKit|MarketplaceKit|/System/Library/Frameworks/Symbols.framework' output/audit/dependencies.txt
+          shasum -a 256 output/IPACompatAVAudioApplication.dylib > output/audit/SHA256SUMS.txt
+          printf '%s\n' 'Native semantic candidate: recording permission uses iOS16 AVAudioSession; input mute returns NSError and NO.' 'Unverified: Apple notification constants, app-level input mute, real official IPA integration and device execution.' > output/README.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-total-v104-avaudio-objc-ios16-NOT-APP
+          path: output/
+          retention-days: 7
+          if-no-files-found: error
