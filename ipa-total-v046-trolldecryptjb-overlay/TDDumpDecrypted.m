@@ -77,27 +77,46 @@ unsigned char *readProcessMemory (mach_port_t proc, mach_vm_address_t addr, mach
     return ((unsigned char *) readMem);
 }
 
+// The upstream PATH_MAX-sized vm_read of a remote dyld imageFilePath can
+// cross an unreadable mapping even when the NUL-terminated path is valid.
+// Read page-bounded chunks, stop at NUL, and keep all bytes in caller-owned
+// storage. A missing terminator or failed memory read is NOT a valid path.
+static BOOL v097ReadRemotePath(vm_map_t task, mach_vm_address_t address,
+                               char *output, size_t capacity) {
+    if (!task || !address || !output || capacity < 2 || capacity > PATH_MAX) return NO;
+    size_t used = 0;
+    output[0] = '\0';
+    while (used < capacity - 1) {
+        const mach_vm_address_t cursor = address + (mach_vm_address_t)used;
+        if (cursor < address) return NO;
+        const size_t untilPageEnd = 4096 - (size_t)(cursor & 4095);
+        size_t amount = capacity - 1 - used;
+        if (amount > 128) amount = 128;
+        if (amount > untilPageEnd) amount = untilPageEnd;
+        mach_vm_size_t actual = 0;
+        kern_return_t kr = mach_vm_read_overwrite(task, cursor, amount,
+                         (mach_vm_address_t)(output + used), &actual);
+        if (kr != KERN_SUCCESS || actual != amount) return NO;
+        char *end = memchr(output + used, 0, amount);
+        if (end) return YES;
+        used += amount;
+    }
+    output[capacity - 1] = '\0';
+    return NO;
+}
+
 static kern_return_t
 readmem(mach_vm_offset_t *buffer, mach_vm_address_t address, mach_vm_size_t size, vm_map_t targetTask, vm_region_basic_info_data_64_t *info)
 {
-  // get task for pid
-  vm_map_t port = targetTask;
-  
-  kern_return_t kr;
-  mach_msg_type_number_t info_cnt = sizeof (vm_region_basic_info_data_64_t);
-  mach_port_t object_name;
-  mach_vm_size_t size_info;
-  mach_vm_address_t address_info = address;
-  kr = mach_vm_region(port, &address_info, &size_info, VM_REGION_BASIC_INFO_64, (vm_region_info_t)info, &info_cnt, &object_name);
-  if (kr)
-  {
-    fprintf(stderr, "[ERROR] mach_vm_region failed with error %d\n", (int)kr);
-    return KERN_FAILURE;
-  }
-  
-  /* read memory - vm_read_overwrite because we supply the buffer */
-  mach_vm_size_t nread;
-  kr = mach_vm_read_overwrite(port, address, size, (mach_vm_address_t)buffer, &nread);
+  // Region metadata is not used by callers. The former mach_vm_region
+  // returned a send right through object_name on every 64-KiB chunk without
+  // deallocating it, potentially thousands of leaked ports for ChatGPT.framework.
+  // A bounded read with exact byte-count validation is sufficient here.
+  (void)info;
+  if (size == 0 || !targetTask || !buffer) return KERN_FAILURE;
+  mach_vm_size_t nread = 0;
+  kern_return_t kr = mach_vm_read_overwrite(targetTask, address, size,
+                                             (mach_vm_address_t)buffer, &nread);
   if (kr)
   {
     fprintf(stderr, "[ERROR] vm_read failed! %d\n", kr);
@@ -186,45 +205,47 @@ get_image_size(mach_vm_address_t address, vm_map_t targetTask, uint64_t *vmaddr_
   return imagefilesize;
 }
 
-int find_off_cryptid(const char *filePath) {
-    NSLog(@"[trolldecrypt] %s filePath: %s", __FUNCTION__, filePath);
-    int off_cryptid = 0;
-    FILE* file = fopen(filePath, "rb");
-    if (!file) return 1;
-
-    fseek(file, 0, SEEK_END);
-    long fileSize = ftell(file);
-    fseek(file, 0, SEEK_SET);
-
-    char* buffer = malloc(fileSize);//new char[fileSize];
-    fread(buffer, 1, fileSize, file);
-
-    struct mach_header_64* header = (struct mach_header_64*)buffer;
-    if (header->magic != MH_MAGIC_64) {
-        printf("[-] error: not a valid macho file\n");
-        free(buffer);
-        fclose(file);
-        return 2;
-    }
-
-    struct load_command* lc = (struct load_command*)((mach_vm_address_t)header + sizeof(struct mach_header_64));
-    for (uint32_t i = 0; i < header->ncmds; i++) {
-        if (lc->cmd == LC_ENCRYPTION_INFO || lc->cmd == LC_ENCRYPTION_INFO_64) {
-            struct encryption_info_command *encryption_info = (struct encryption_info_command*) lc;
-
-
-            NSLog(@"[trolldecrypt] cryptid: %d\n", encryption_info->cryptid);
-            NSLog(@"[trolldecrypt] Found cryptid at offset: 0x%llx\n", (mach_vm_address_t)lc + offsetof(struct encryption_info_command, cryptid) - (mach_vm_address_t)header);
-
-            off_cryptid = (mach_vm_address_t)lc + offsetof(struct encryption_info_command, cryptid) - (mach_vm_address_t)header;
-            break;
+// Bound the parser to a 1 MiB load-command table, instead of allocating
+// the entire on-disk framework. The caller provides the verified FAT slice.
+static uint32_t find_off_cryptid(const char *filePath, uint32_t sliceOffset) {
+    FILE *file = fopen(filePath, "rb");
+    if (!file) return 0;
+    uint32_t result = 0;
+    uint8_t *commands = NULL;
+    struct mach_header_64 mh = {0};
+    do {
+        if (fseeko(file, (off_t)sliceOffset, SEEK_SET) != 0 ||
+            fread(&mh, 1, sizeof(mh), file) != sizeof(mh) ||
+            mh.magic != MH_MAGIC_64 || mh.ncmds == 0 ||
+            mh.ncmds > 4096 ||
+            mh.sizeofcmds < mh.ncmds * sizeof(struct load_command) ||
+            mh.sizeofcmds > 1024 * 1024) break;
+        commands = malloc(mh.sizeofcmds);
+        if (!commands || fread(commands, 1, mh.sizeofcmds, file) != mh.sizeofcmds) break;
+        size_t cursor = 0;
+        for (uint32_t i = 0; i < mh.ncmds; ++i) {
+            if (cursor > mh.sizeofcmds ||
+                mh.sizeofcmds - cursor < sizeof(struct load_command)) break;
+            struct load_command *lc = (struct load_command *)(commands + cursor);
+            if (lc->cmdsize < sizeof(struct load_command) ||
+                lc->cmdsize > mh.sizeofcmds - cursor) break;
+            if ((lc->cmd == LC_ENCRYPTION_INFO_64 &&
+                 lc->cmdsize >= sizeof(struct encryption_info_command_64)) ||
+                (lc->cmd == LC_ENCRYPTION_INFO &&
+                 lc->cmdsize >= sizeof(struct encryption_info_command))) {
+                struct encryption_info_command *enc = (struct encryption_info_command *)lc;
+                if (enc->cryptid == 0 || enc->cryptsize == 0) break;
+                uint64_t at = (uint64_t)sliceOffset + sizeof(mh) +
+                    cursor + offsetof(struct encryption_info_command, cryptid);
+                if (at <= UINT32_MAX) result = (uint32_t)at;
+                break;
+            }
+            cursor += lc->cmdsize;
         }
-        lc = (struct load_command*)((mach_vm_address_t)lc + lc->cmdsize);
-    }
-    free(buffer);
+    } while (0);
+    free(commands);
     fclose(file);
-
-    return off_cryptid;
+    return result;
 }
 
 @implementation DumpDecrypted
@@ -294,6 +315,38 @@ int find_off_cryptid(const char *filePath) {
 }
 
  
+// Bound each protected-image copy to 64 KiB rather than allocating the
+// entire encrypted framework in the app's address space.
+static BOOL v055ReadExact(int fd, void *buffer, size_t count) {
+    size_t done = 0;
+    while (done < count) {
+        ssize_t n = read(fd, (uint8_t *)buffer + done, count - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return NO;
+        done += (size_t)n;
+    }
+    return YES;
+}
+static BOOL v055WriteExact(int fd, const void *buffer, size_t count) {
+    size_t done = 0;
+    while (done < count) {
+        ssize_t n = write(fd, (const uint8_t *)buffer + done, count - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return NO;
+        done += (size_t)n;
+    }
+    return YES;
+}
+static BOOL v055CopyExactly(int srcFd, int dstFd, uint64_t count) {
+    uint8_t buf[65536];
+    while (count) {
+        size_t n = count > sizeof(buf) ? sizeof(buf) : (size_t)count;
+        if (!v055ReadExact(srcFd, buf, n) || !v055WriteExact(dstFd, buf, n)) return NO;
+        count -= n;
+    }
+    return YES;
+}
+
 -(BOOL) dumpDecryptedImage:(vm_address_t)imageAddress fileName:(const char *)encryptedImageFilenameStr image:(int)imageNum task:(vm_map_t)targetTask{
 	// struct load_command *lc;
 	struct encryption_info_command *eic;
@@ -301,8 +354,8 @@ int find_off_cryptid(const char *filePath) {
 	struct fat_arch *arch;
 	// struct mach_header *mh;
 	char buffer[1024];
-	unsigned int fileoffs = 0, off_cryptid = 0, restsize;
-	int i, fd, outfd, r, n;
+	unsigned int fileoffs = 0, off_cryptid = 0;
+	int i, fd, outfd, n;
 
     struct mach_header header = {0};
     vm_region_basic_info_data_64_t region_info = {0};
@@ -369,7 +422,7 @@ int find_off_cryptid(const char *filePath) {
             get_image_size(imageAddress, targetTask, &aslr_slide);
             NSLog(@"[trolldecrypt] aslr_slide= 0x%llx", aslr_slide);
 
-			off_cryptid=find_off_cryptid(encryptedImageFilenameStr);
+            // Actual on-disk cryptid offset is resolved after FAT slice selection.
 
 			NSLog(@"[trolldecrypt] offset to cryptid (%d) found in memory @ %p (from %p). off_cryptid = %u (0x%x)\n", eic->cryptid, &eic->cryptid, image_mh, off_cryptid, off_cryptid);
 			//NSLog(@"[trolldecrypt] Found encrypted data at offset %u 0x%08x. image_mh @ %p. cryptedData @ 0x%x. cryptsize = %u (0x%x) bytes.\n", eic->cryptoff, eic->cryptoff, image_mh, (unsigned int)image_mh + eic->cryptoff, eic->cryptsize, eic->cryptsize);
@@ -415,6 +468,12 @@ int find_off_cryptid(const char *filePath) {
 				return false;
 			}
 
+            off_cryptid = find_off_cryptid(encryptedImageFilenameStr, fileoffs);
+            if (off_cryptid == 0) {
+                NSLog(@"[trolldecrypt-v055] missing or invalid disk cryptid command");
+                close(fd);
+                return false;
+            }
 			NSLog(@"[trolldecrypt] Opening %s for writing.\n", decryptedAppPathStr);
 			outfd = open(decryptedAppPathStr, O_RDWR|O_CREAT|O_TRUNC, 0644);
 			if (outfd == -1) {
@@ -422,87 +481,66 @@ int find_off_cryptid(const char *filePath) {
 				return false;
 			}
 			
-			/* calculate address of beginning of crypted data */
-			n = fileoffs + eic->cryptoff;
-			
-			restsize = lseek(fd, 0, SEEK_END) - n - eic->cryptsize;		
-			//NSLog(@"[trolldecrypt] restsize = %u, n = %u, cryptsize = %u, total = %u", restsize, n, eic->cryptsize, n + eic->cryptsize + restsize);
-			lseek(fd, 0, SEEK_SET);
-			
-			NSLog(@"[trolldecrypt] Copying the not encrypted start of the file (%u bytes)\n", n);
-			
-			/* first copy all the data before the encrypted data */
-			char *buf = (char *)malloc((size_t)n);
-			r = read(fd, buf, n);
-			if(r != n) {
-				NSLog(@"[trolldecrypt] Error reading start of file\n");
-				return false;
-			}
-			r = write(outfd, buf, n);
-			if(r != n) {
-				NSLog(@"[trolldecrypt] Error writing start of file\n");
-				return  false;
-			}
-			free(buf);
-
-			/* now write the previously encrypted data */
-
-			NSLog(@"[trolldecrypt] Dumping the decrypted data into the file (%u bytes)\n", eic->cryptsize);
-            buf = (char *)malloc((size_t)eic->cryptsize);
-            if (buf == NULL || readmem((mach_vm_offset_t*)buf, imageAddress+eic->cryptoff, eic->cryptsize, targetTask, &region_info) != KERN_SUCCESS) {
-                NSLog(@"[trolldecrypt-v045] encrypted region was not completely readable; removing partial output");
-                free(buf);
-                close(fd);
-                close(outfd);
-                unlink(decryptedAppPathStr);
+            // Validate all on-disk offsets BEFORE copying or patching cryptid.
+            // A mistaken overflow or truncated input must never create a
+            // cryptid=0 IPA whose protected range was not actually recovered.
+            off_t fileLength = lseek(fd, 0, SEEK_END);
+            uint64_t encryptedStart = (uint64_t)fileoffs + (uint64_t)eic->cryptoff;
+            uint64_t encryptedSize = (uint64_t)eic->cryptsize;
+            if (fileLength < 0 || encryptedSize == 0 ||
+                encryptedStart > (uint64_t)fileLength ||
+                encryptedSize > (uint64_t)fileLength - encryptedStart ||
+                off_cryptid == 0 ||
+                (uint64_t)off_cryptid + sizeof(uint32_t) > (uint64_t)fileLength ||
+                lseek(fd, 0, SEEK_SET) != 0) {
+                NSLog(@"[trolldecrypt-v055] invalid protected region or cryptid offset");
+                close(fd); close(outfd); unlink(decryptedAppPathStr);
                 return false;
             }
-			// r = write(outfd, (unsigned char *)image_mh + eic->cryptoff, eic->cryptsize);
-            r = write(outfd, buf, eic->cryptsize);
-			if (r != eic->cryptsize) {
-				NSLog(@"[trolldecrypt] Error writing encrypted part of file\n");
-				return false;
-			}
-            free(buf);
-            
-			
-			/* and finish with the remainder of the file */
-			NSLog(@"[trolldecrypt] Copying the not encrypted remainder of the file (%u bytes)\n", restsize);
-			lseek(fd, eic->cryptsize, SEEK_CUR);
-			buf = (char *)malloc((size_t)restsize);
-			r = read(fd, buf, restsize);
-			if (r != restsize) {
-				NSLog(@"[trolldecrypt] Error reading rest of file, got %u bytes\n", r);
-				return false;
-			}
-			r = write(outfd, buf, restsize);
-			if (r != restsize) {
-				NSLog(@"[trolldecrypt] Error writing rest of file\n");
-				return false;
-			}
-			free(buf);
-            
 
-			if (off_cryptid) {
-				uint32_t zero=0;
-				NSLog(@"[trolldecrypt] Setting the LC_ENCRYPTION_INFO->cryptid to 0 at offset 0x%x into file\n", off_cryptid);
-				if (lseek(outfd, off_cryptid, SEEK_SET) == off_cryptid) {
-					if(write(outfd, &zero, 4) != 4) {
-						NSLog(@"[trolldecrypt] Error writing cryptid value!!\n");
-						// Not a fatal error, just warn
-					}
-				} else {
-					NSLog(@"[trolldecrypt] Failed to seek to cryptid offset!!");
-					// this error is not treated as fatal
-				}
-			}
-	
-			close(fd);
-			close(outfd);
-			sync();
-            // exit(1);
-			
-			return true;
+            BOOL copyOK = v055CopyExactly(fd, outfd, encryptedStart);
+            uint64_t remainingEncrypted = encryptedSize;
+            uint64_t memoryOffset = 0;
+            BOOL plaintextChanged = NO;
+            uint8_t ciphertext[65536], plaintext[65536];
+
+            while (copyOK && remainingEncrypted > 0) {
+                size_t length = remainingEncrypted > sizeof(plaintext)
+                    ? sizeof(plaintext) : (size_t)remainingEncrypted;
+                copyOK = v055ReadExact(fd, ciphertext, length) &&
+                    readmem((mach_vm_offset_t *)plaintext,
+                        (mach_vm_address_t)imageAddress + eic->cryptoff + memoryOffset,
+                        length, targetTask, &region_info) == KERN_SUCCESS;
+                if (!copyOK) break;
+                if (memcmp(ciphertext, plaintext, length) != 0) plaintextChanged = YES;
+                copyOK = v055WriteExact(outfd, plaintext, length);
+                memoryOffset += length;
+                remainingEncrypted -= length;
+            }
+            // Merely reading memory is NOT enough: a mapped encrypted page may
+            // still contain ciphertext. Refuse to produce a fake decrypted IPA.
+            if (!plaintextChanged) {
+                NSLog(@"[trolldecrypt-v055] protected bytes unchanged; refusing fake cryptid=0");
+                copyOK = NO;
+            }
+            if (copyOK) {
+                uint64_t remainder = (uint64_t)fileLength - encryptedStart - encryptedSize;
+                copyOK = v055CopyExactly(fd, outfd, remainder);
+            }
+            if (copyOK) {
+                uint32_t clearCryptid = 0;
+                copyOK = lseek(outfd, (off_t)off_cryptid, SEEK_SET) == (off_t)off_cryptid &&
+                    v055WriteExact(outfd, &clearCryptid, sizeof(clearCryptid));
+            }
+
+            close(fd);
+            if (close(outfd) != 0) copyOK = NO;
+            if (!copyOK) {
+                unlink(decryptedAppPathStr);
+                NSLog(@"[trolldecrypt-v055] incomplete or unchanged plaintext; output removed");
+                return false;
+            }
+            return true;
 		}
 		
 		lc = (struct load_command *)((unsigned char *)lc+lc->cmdsize);		
@@ -555,14 +593,15 @@ int find_off_cryptid(const char *filePath) {
 
     for (int i = 0; i < numberOfImages; i++) {
         NSLog(@"[trolldecrypt] image %d", i);
-        mach_msg_type_number_t size3 = PATH_MAX;
-        uint8_t *fpath_addr = readProcessMemory(targetTask, (mach_vm_address_t) info[i].imageFilePath, &size3);
-        
+        char imagePath[PATH_MAX];
         imageAddress = (mach_vm_address_t)info[i].imageLoadAddress;
-        const char *imageName = (const char *)fpath_addr;
-
-        if(!imageName || !imageAddress)
-			continue;
+        if (!imageAddress || !v097ReadRemotePath(targetTask,
+                (mach_vm_address_t)info[i].imageFilePath,
+                imagePath, sizeof(imagePath))) {
+            NSLog(@"[trolldecrypt-v097] unavailable or unterminated mapped image path");
+            continue;
+        }
+        const char *imageName = imagePath;
 
         NSLog(@"[trolldecrypt-v046] Inspecting mapped image: %s", imageName);
 
