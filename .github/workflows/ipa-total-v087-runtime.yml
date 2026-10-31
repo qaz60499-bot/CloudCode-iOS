@@ -38,3 +38,35 @@ jobs:
           path: ${{ runner.temp }}/IPA-V087-Runtime-Identity-ARM64
           if-no-files-found: error
           retention-days: 7
+
+  verify-unfair-patch:
+    runs-on: macos-15
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile pinned upstream with V087 isolated Swift patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone -q https://github.com/lbr77/unfair.git "$RUNNER_TEMP/v087-unfair"
+          git -C "$RUNNER_TEMP/v087-unfair" checkout --detach a754437649b1428e07918c0315a678ed7fc57dec
+          test "$(git -C "$RUNNER_TEMP/v087-unfair" rev-parse HEAD)" = "a754437649b1428e07918c0315a678ed7fc57dec"
+          cp research/ipa-total-v087/AppBundleStager.swift "$RUNNER_TEMP/v087-unfair/Sources/UnfairKit/AppBundleStager.swift"
+          cp research/ipa-total-v087/PackageProcessor.swift "$RUNNER_TEMP/v087-unfair/Sources/UnfairKit/PackageProcessor.swift"
+          cp research/ipa-total-v087/BinaryDecryptor.swift "$RUNNER_TEMP/v087-unfair/Sources/UnfairKit/BinaryDecryptor.swift"
+          cd "$RUNNER_TEMP/v087-unfair"
+          git diff --check
+          python3 -c 'from pathlib import Path; p=Path("Package.swift"); s=p.read_text(); needle=".macOS(.v10_15),"; assert needle in s and s.startswith("// swift-tools-version: 5.4"); s=s.replace("// swift-tools-version: 5.4","// swift-tools-version: 5.7",1).replace(needle,needle+"\n        .iOS(.v16),",1); p.write_text(s)'
+          xcodebuild -scheme unfair-swift \
+            -destination 'generic/platform=iOS' \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/v087-unfair-derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            IPHONEOS_DEPLOYMENT_TARGET=16.0 \
+            build
+          BIN="$(find "$RUNNER_TEMP/v087-unfair-derived/Build/Products" -type f -name unfair-swift -print -quit)"
+          test -s "$BIN"
+          file "$BIN"
+          xcrun vtool -show-build "$BIN"
+          shasum -a 256 "$BIN"
