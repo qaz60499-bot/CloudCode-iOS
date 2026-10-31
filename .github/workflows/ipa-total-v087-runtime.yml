@@ -1,0 +1,40 @@
+name: IPA Total V087 isolated runtime identity iOS arm64
+on:
+  push:
+    branches: [ci/ipa-total-v087-runtime-20261030]
+    paths:
+      - '.github/workflows/ipa-total-v087-runtime.yml'
+      - 'research/ipa-total-v087/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build native nonprivileged iOS 16 CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos swiftc \
+            -target arm64-apple-ios16.0 \
+            -sdk "$SDK" \
+            -O \
+            -o "$RUNNER_TEMP/IPA-V087-Runtime-Identity-ARM64" \
+            research/ipa-total-v087/RuntimeIdentity.swift
+          file "$RUNNER_TEMP/IPA-V087-Runtime-Identity-ARM64"
+          BUILD_INFO="$(xcrun vtool -show-build "$RUNNER_TEMP/IPA-V087-Runtime-Identity-ARM64")"
+          printf '%s\n' "$BUILD_INFO"
+          printf '%s\n' "$BUILD_INFO" | grep -Eq 'platform IOS'
+          printf '%s\n' "$BUILD_INFO" | grep -Eq 'minos 16[.]0'
+          xcrun otool -L "$RUNNER_TEMP/IPA-V087-Runtime-Identity-ARM64"
+          shasum -a 256 "$RUNNER_TEMP/IPA-V087-Runtime-Identity-ARM64"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-total-v087-runtime-identity-arm64-unsigned
+          path: ${{ runner.temp }}/IPA-V087-Runtime-Identity-ARM64
+          if-no-files-found: error
+          retention-days: 7
