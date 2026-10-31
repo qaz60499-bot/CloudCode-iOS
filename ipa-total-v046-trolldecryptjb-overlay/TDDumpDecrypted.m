@@ -195,7 +195,8 @@ get_image_size(mach_vm_address_t address, vm_map_t targetTask, uint64_t *vmaddr_
 
 // Bound the parser to a 1 MiB load-command table, instead of allocating
 // the entire on-disk framework. The caller provides the verified FAT slice.
-static uint32_t find_off_cryptid(const char *filePath, uint32_t sliceOffset) {
+static uint32_t find_off_cryptid(const char *filePath, uint32_t sliceOffset,
+                                 uint32_t expectedCryptoff, uint32_t expectedCryptsize) {
     FILE *file = fopen(filePath, "rb");
     if (!file) return 0;
     uint32_t result = 0;
@@ -222,7 +223,11 @@ static uint32_t find_off_cryptid(const char *filePath, uint32_t sliceOffset) {
                 (lc->cmd == LC_ENCRYPTION_INFO &&
                  lc->cmdsize >= sizeof(struct encryption_info_command))) {
                 struct encryption_info_command *enc = (struct encryption_info_command *)lc;
-                if (enc->cryptid == 0 || enc->cryptsize == 0) break;
+                // The mapped header and on-disk encryption layout must
+                // refer to the same protected region before extracting.
+                if (enc->cryptid == 0 || enc->cryptsize == 0 ||
+                    enc->cryptoff != expectedCryptoff ||
+                    enc->cryptsize != expectedCryptsize) break;
                 uint64_t at = (uint64_t)sliceOffset + sizeof(mh) +
                     cursor + offsetof(struct encryption_info_command, cryptid);
                 if (at <= UINT32_MAX) result = (uint32_t)at;
@@ -349,12 +354,22 @@ static BOOL v055CopyExactly(int srcFd, int dstFd, uint64_t count) {
     vm_region_basic_info_data_64_t region_info = {0};
     if (readmem((mach_vm_offset_t*)&header, imageAddress, sizeof(struct mach_header), targetTask, &region_info))
     {
-        NSLog(@"[trolldecrypt] Can't read header!");
-        exit(1);
+        NSLog(@"[trolldecrypt-v100] cannot read mapped Mach-O header");
+        return false;
     }
-    //XXX: change all image_mh -> header NOW
-    
+    // V100: reject malformed or partially mapped images before allocation.
+    if ((header.magic != MH_MAGIC_64 && header.magic != MH_MAGIC) ||
+        header.ncmds == 0 || header.ncmds > 4096 ||
+        header.sizeofcmds < (uint64_t)header.ncmds * sizeof(struct load_command) ||
+        header.sizeofcmds > 1024 * 1024) {
+        NSLog(@"[trolldecrypt-v100] invalid mapped Mach-O command bounds");
+        return false;
+    }
     struct load_command *lc = (struct load_command*)malloc(header.sizeofcmds);
+    if (!lc) return false;
+    uint8_t *const loadCommands = (uint8_t *)lc;
+    size_t commandCursor = 0;
+    struct encryption_info_command encryptionCopy = {0};
 	
 	/* detect if this is a arm64 binary */
 	if (header.magic == MH_MAGIC_64) {
@@ -374,18 +389,71 @@ static BOOL v055CopyExactly(int srcFd, int dstFd, uint64_t count) {
         }
 		NSLog(@"[trolldecrypt] detected 32bit ARM binary in memory.\n");
 	} else {
-		NSLog(@"[trolldecrypt] No valid header found!!");
-		return false;
+        NSLog(@"[trolldecrypt-v100] no valid mapped header");
+        free(loadCommands);
+        return false;
 	}
 
 
-    // sleep(1);exit(1);
+    // Validate the entire command table, including commands *after* the
+    // encryption command, before using any remote metadata.
+    size_t checkedCursor = 0;
+    uint32_t encryptedCommands = 0;
+    for (uint32_t k = 0; k < header.ncmds; ++k) {
+        if (checkedCursor > header.sizeofcmds ||
+            header.sizeofcmds - checkedCursor < sizeof(struct load_command)) {
+            free(loadCommands);
+            return false;
+        }
+        const struct load_command *candidate =
+            (const struct load_command *)(loadCommands + checkedCursor);
+        if (candidate->cmdsize < sizeof(struct load_command) ||
+            candidate->cmdsize > header.sizeofcmds - checkedCursor ||
+            (candidate->cmdsize & 3) != 0) {
+            free(loadCommands);
+            return false;
+        }
+        if (candidate->cmd == LC_ENCRYPTION_INFO ||
+            candidate->cmd == LC_ENCRYPTION_INFO_64) {
+            const size_t requiredBytes = candidate->cmd == LC_ENCRYPTION_INFO_64 ?
+                sizeof(struct encryption_info_command_64) :
+                sizeof(struct encryption_info_command);
+            if (++encryptedCommands > 1 || candidate->cmdsize < requiredBytes) {
+                free(loadCommands);
+                return false;
+            }
+        }
+        checkedCursor += candidate->cmdsize;
+    }
+    if (encryptedCommands != 1 || checkedCursor != header.sizeofcmds) {
+        free(loadCommands);
+        return false;
+    }
+
     const struct mach_header *image_mh = &header;
 	
 	/* searching all load commands for an LC_ENCRYPTION_INFO load command */
-	for (i=0; i<image_mh->ncmds; i++) {
-		if (lc->cmd == LC_ENCRYPTION_INFO || lc->cmd == LC_ENCRYPTION_INFO_64) {
-			eic = (struct encryption_info_command *)lc;
+    for (i = 0; i < image_mh->ncmds; ++i) {
+        if (commandCursor > header.sizeofcmds ||
+            header.sizeofcmds - commandCursor < sizeof(struct load_command) ||
+            lc->cmdsize < sizeof(struct load_command) ||
+            lc->cmdsize > header.sizeofcmds - commandCursor ||
+            (lc->cmdsize & 3) != 0) {
+            NSLog(@"[trolldecrypt-v100] invalid mapped load-command cursor");
+            free(loadCommands);
+            return false;
+        }
+        if (lc->cmd == LC_ENCRYPTION_INFO || lc->cmd == LC_ENCRYPTION_INFO_64) {
+            const size_t minCommandSize = lc->cmd == LC_ENCRYPTION_INFO_64 ?
+                sizeof(struct encryption_info_command_64) :
+                sizeof(struct encryption_info_command);
+            if (lc->cmdsize < minCommandSize) {
+                free(loadCommands);
+                return false;
+            }
+            memcpy(&encryptionCopy, lc, sizeof(encryptionCopy));
+            free(loadCommands);
+            eic = &encryptionCopy;
             // struct encryption_info_command *eic = (uint8_t*)malloc(sizeof(struct encryption_info_command););
             // readmem((mach_vm_offset_t*)eic, imageAddress+sizeof(struct mach_header_64), header.sizeofcmds, targetTask, &region_info);
 			
@@ -425,6 +493,7 @@ static BOOL v055CopyExactly(int srcFd, int dstFd, uint64_t count) {
 			n = read(fd, (void *)buffer, sizeof(buffer));
 			if (n != sizeof(buffer)) {
 				NSLog(@"[trolldecrypt] Warning read only %d of %lu bytes from encrypted file.\n", n, sizeof(buffer));
+                close(fd);
 				return false;
 			}
 
@@ -434,8 +503,17 @@ static BOOL v055CopyExactly(int srcFd, int dstFd, uint64_t count) {
 			/* Is this a FAT file - we assume the right endianess */
 			if (fh->magic == FAT_CIGAM) {
 				NSLog(@"[trolldecrypt] Executable is a FAT image - searching for right architecture\n");
+                uint32_t fatCount = swap32(fh->nfat_arch);
+                // Only the first 1024 on-disk bytes were read. Never walk
+                // architecture records beyond that buffer.
+                if (fatCount == 0 || fatCount > 16 ||
+                    fatCount > (sizeof(buffer) - sizeof(*fh)) / sizeof(struct fat_arch)) {
+                    NSLog(@"[trolldecrypt-v100] invalid FAT architecture table");
+                    close(fd);
+                    return false;
+                }
 				arch = (struct fat_arch *)&fh[1];
-				for (i=0; i<swap32(fh->nfat_arch); i++) {
+				for (i=0; i<fatCount; i++) {
 					if ((image_mh->cputype == swap32(arch->cputype)) && (image_mh->cpusubtype == swap32(arch->cpusubtype))) {
 						fileoffs = swap32(arch->offset);
 						NSLog(@"[trolldecrypt] Correct arch is at offset 0x%x in the file.\n", fileoffs);
@@ -445,16 +523,19 @@ static BOOL v055CopyExactly(int srcFd, int dstFd, uint64_t count) {
 				}
 				if (fileoffs == 0) {
 					NSLog(@"[trolldecrypt] Could not find correct arch in FAT image\n");
+                    close(fd);
 					return false;
 				}
 			} else if (fh->magic == MH_MAGIC || fh->magic == MH_MAGIC_64) {
 				NSLog(@"[trolldecrypt] Executable is a plain MACH-O image, fileoffs = 0\n");
 			} else {
 				NSLog(@"[trolldecrypt] Executable is of unknown type, fileoffs = 0\n");
+                close(fd);
 				return false;
 			}
 
-            off_cryptid = find_off_cryptid(encryptedImageFilenameStr, fileoffs);
+            off_cryptid = find_off_cryptid(encryptedImageFilenameStr, fileoffs,
+                                            eic->cryptoff, eic->cryptsize);
             if (off_cryptid == 0) {
                 NSLog(@"[trolldecrypt-v055] missing or invalid disk cryptid command");
                 close(fd);
@@ -464,6 +545,7 @@ static BOOL v055CopyExactly(int srcFd, int dstFd, uint64_t count) {
 			outfd = open(decryptedAppPathStr, O_RDWR|O_CREAT|O_TRUNC, 0644);
 			if (outfd == -1) {
 				NSLog(@"[trolldecrypt] Failed opening: ");
+                close(fd);
 				return false;
 			}
 			
@@ -529,11 +611,11 @@ static BOOL v055CopyExactly(int srcFd, int dstFd, uint64_t count) {
             return true;
 		}
 		
-		lc = (struct load_command *)((unsigned char *)lc+lc->cmdsize);		
-        // readmem((mach_vm_offset_t*)lc, lc+lc->cmdsize, header.sizeofcmds, targetTask, &region_info);
-	}
-	// DEBUG(@"[!] This mach-o file is not encrypted. Nothing was decrypted.\n");
-	return false;
+        commandCursor += lc->cmdsize;
+        lc = (struct load_command *)(loadCommands + commandCursor);
+    }
+    free(loadCommands);
+    return false;
 }
 
 
