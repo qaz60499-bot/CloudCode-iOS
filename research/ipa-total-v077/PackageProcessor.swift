@@ -258,16 +258,34 @@ public final class PackageProcessor {
     }
 
     private func findRootSinf(appURL: URL, records: [MachORecord]) -> URL? {
+        // FileManager.fileExists follows symbolic links and also accepts
+        // directories. Neither is a valid source for FairPlay credential
+        // staging; do not read a license outside the selected application.
+        let scInfo = appURL.appendingPathComponent("SC_Info", isDirectory: true)
+        guard let directoryValues = try? scInfo.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+              directoryValues.isDirectory == true,
+              directoryValues.isSymbolicLink != true else {
+            return nil
+        }
+
         for record in records where record.isEncrypted {
             guard record.url.deletingLastPathComponent().standardizedFileURL == appURL.standardizedFileURL else {
                 continue
             }
-            let source = appURL
-                .appendingPathComponent("SC_Info", isDirectory: true)
-                .appendingPathComponent(record.name + ".sinf")
-            if FileManager.default.fileExists(atPath: source.path) {
-                return source
+            let source = scInfo.appendingPathComponent(record.name + ".sinf")
+            guard let values = try? source.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                  values.isRegularFile == true,
+                  values.isSymbolicLink != true else {
+                continue
             }
+            // Also require real containment, so an indirect linked parent
+            // cannot escape while a leaf file appears regular.
+            let realSCInfo = scInfo.standardizedFileURL.resolvingSymlinksInPath()
+            let realSourceParent = source.standardizedFileURL.resolvingSymlinksInPath().deletingLastPathComponent()
+            guard realSourceParent == realSCInfo else {
+                continue
+            }
+            return source
         }
         return nil
     }
