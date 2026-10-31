@@ -23,7 +23,7 @@ enum { IPACompatAudioErrorUnsupportedInputMute = 1 };
 + (instancetype)sharedInstance;
 + (void)requestRecordPermissionWithCompletionHandler:(void (^)(BOOL granted))response;
 @property(nonatomic, readonly) NSInteger recordPermission;
-@property(nonatomic, readonly, getter=isInputMuted) BOOL inputMuted;
+/* isInputMuted intentionally unavailable: iOS16 has no reliable app-wide query. */
 - (BOOL)setInputMuted:(BOOL)muted error:(NSError * _Nullable * _Nullable)error;
 @end
 
@@ -54,13 +54,6 @@ enum { IPACompatAudioErrorUnsupportedInputMute = 1 };
     // values. Preserve the actual system permission, not a boolean guess.
     return (NSInteger)[AVAudioSession sharedInstance].recordPermission;
 #pragma clang diagnostic pop
-}
-
-- (BOOL)isInputMuted {
-    // This adapter never claims to have applied a mute. It cannot observe
-    // iOS17's app-level mute state on iOS16. Callers must not treat the
-    // value as an audio pipeline guarantee.
-    return NO;
 }
 
 - (BOOL)setInputMuted:(BOOL)muted error:(NSError **)error {
