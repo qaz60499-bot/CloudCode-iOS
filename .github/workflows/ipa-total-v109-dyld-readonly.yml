@@ -1,0 +1,41 @@
+name: IPA Total V109 device dyld shared-cache read-only audit
+on:
+  push:
+    branches: [ci/ipa-total-v109-dyld-syscache-20261031]
+    paths:
+      - .github/workflows/ipa-total-v109-dyld-readonly.yml
+      - tools/chatgpt-compat/ios166-v109-dyld-presence.c
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-native-dyld-audit:
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile iOS16 arm64 nonprivileged dlopen presence audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p out/audit
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.6 \
+            -miphoneos-version-min=16.6 -isysroot "$SDK" \
+            -O2 -Werror -Wall -Wextra \
+            tools/chatgpt-compat/ios166-v109-dyld-presence.c \
+            -o out/IPA-V109-dyld-readonly-arm64
+          codesign --force --sign - out/IPA-V109-dyld-readonly-arm64
+          file out/IPA-V109-dyld-readonly-arm64 | grep -E 'Mach-O 64-bit.*arm64'
+          xcrun otool -l out/IPA-V109-dyld-readonly-arm64 > out/audit/macho-loadcommands.txt
+          xcrun otool -L out/IPA-V109-dyld-readonly-arm64 > out/audit/dependencies.txt
+          grep -A5 LC_BUILD_VERSION out/audit/macho-loadcommands.txt | grep -E 'minos +16[.]6'
+          ! grep -E 'FinanceKit|MarketplaceKit|Symbols.framework|libswiftObservation|libswiftSynchronization' out/audit/dependencies.txt
+          shasum -a 256 out/IPA-V109-dyld-readonly-arm64 > out/audit/SHA256SUMS.txt
+          printf '%s\n' 'READ-ONLY: dlopen/dlsym only. Absence of a system .framework FILE does not prove missing dyld shared-cache image.' > out/audit/README.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-total-v109-ios16-dyld-presence-CLI-NOT-APP
+          path: out/
+          retention-days: 7
+          if-no-files-found: error
