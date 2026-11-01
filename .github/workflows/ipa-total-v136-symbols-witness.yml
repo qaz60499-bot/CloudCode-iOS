@@ -1,0 +1,167 @@
+name: IPA Total V136 Symbols native witness and behavior differential (NOT APP)
+on:
+  push:
+    branches: [ci/ipa-total-v136-symbols-witness-20261101]
+    paths:
+      - .github/workflows/ipa-total-v136-symbols-witness.yml
+      - tools/chatgpt-compat/ChatGPTCompatSymbols-ios166.swift
+      - tools/chatgpt-compat/ios166-v123-*
+      - tools/chatgpt-compat/ios166-v136-*
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-ios16-symbols-candidate:
+    runs-on: macos-15
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native compile and ABI symbol audit, no IPA produced
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p output/audit output/swiftmodule
+          xcrun swiftc -parse-as-library -emit-library -emit-module \
+            -enable-library-evolution -module-name Symbols \
+            -target arm64-apple-ios16.6 -sdk "$SDK" \
+            -emit-module-path output/swiftmodule/Symbols.swiftmodule \
+            -Xlinker -install_name -Xlinker @rpath/IPASymbolsCompatCandidate.dylib \
+            tools/chatgpt-compat/ChatGPTCompatSymbols-ios166.swift \
+            -o output/IPASymbolsCompatCandidate.dylib
+          file output/IPASymbolsCompatCandidate.dylib | grep -E 'Mach-O 64-bit.*arm64'
+          xcrun otool -l output/IPASymbolsCompatCandidate.dylib > output/audit/commands.txt
+          xcrun otool -L output/IPASymbolsCompatCandidate.dylib > output/audit/dependencies.txt
+          xcrun nm -gjU output/IPASymbolsCompatCandidate.dylib | sort > output/audit/exports.txt
+          grep -A5 LC_BUILD_VERSION output/audit/commands.txt | grep -E 'minos +16\.6'
+          ! grep -E 'FinanceKit|MarketplaceKit|/System/Library/Frameworks/Symbols.framework' output/audit/dependencies.txt
+          cat > output/audit/required-nine.txt <<'SYMBOLS'
+          _$s7Symbols19ReplaceSymbolEffectVAA0cD0AAMc
+          _$s7Symbols19ReplaceSymbolEffectVACycfC
+          _$s7Symbols19ReplaceSymbolEffectVMa
+          _$s7Symbols19SymbolEffectOptionsV5speedyACSdFZ
+          _$s7Symbols19SymbolEffectOptionsV7defaultACvgZ
+          _$s7Symbols19SymbolEffectOptionsVMa
+          _$s7Symbols21AutomaticSymbolEffectVAA0cD0AAMc
+          _$s7Symbols21AutomaticSymbolEffectVACycfC
+          _$s7Symbols21AutomaticSymbolEffectVMa
+          SYMBOLS
+          while IFS= read -r sym; do
+            grep -Fx "$sym" output/audit/exports.txt || {
+              echo "::error::Missing exact V070 strong symbol $sym"; exit 1;
+            }
+          done < output/audit/required-nine.txt
+          echo "V123_EXACT_NINE_IMPORT_SYMBOL_NAMES_PRESENT"
+          shasum -a 256 output/IPASymbolsCompatCandidate.dylib > output/audit/SHA256SUMS.txt
+          cat > output/README.txt <<'README'
+          iOS16 ARM64 native Symbols API subset candidate only.
+          Passing exact exported symbol spellings is NOT proof of ABI layout or
+          protocol-witness equivalence to Apple's Symbols.framework.
+          Symbol animation rendering is NOT implemented.
+          This is not a ChatGPT IPA or installable app.
+          No finance/store entitlement and no iOS 16 device execution.
+          README
+      - name: Verify request composition on native host
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun swiftc -parse-as-library -module-name Symbols \
+            tools/chatgpt-compat/ChatGPTCompatSymbols-ios166.swift \
+            tools/chatgpt-compat/ios166-v123-symbols-options-check.swift \
+            -o "$RUNNER_TEMP/options-check"
+          "$RUNNER_TEMP/options-check" | tee output/audit/composition-check.txt
+      - name: Compare selected public SDK signatures without exporting the SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun swift-api-digester -dump-sdk -module Symbols \
+            -target arm64-apple-ios18.0 -sdk "$SDK" -o "$RUNNER_TEMP/apple-symbols.json"
+          python3 tools/chatgpt-compat/ios166-v123-symbols-public-shape.py \
+            --input "$RUNNER_TEMP/apple-symbols.json" --output output/audit/apple-public-shape.json
+          python3 tools/chatgpt-compat/ios166-v123-symbols-public-shape.py \
+            --input output/swiftmodule/Symbols.abi.json --output output/audit/candidate-public-shape.json
+          python3 - <<'PY'
+          from collections import Counter
+          import json,pathlib
+          def load(name):
+              return json.loads(pathlib.Path('output/audit/'+name+'-public-shape.json').read_text())['types']
+          apple,own=load('apple'),load('candidate')
+          def signatures(node):
+              return Counter((m['name'],m['kind'],m.get('printedName'),m['static'],tuple(m['types']))
+                             for m in node['members'])
+          def nested(node):
+              return next(m for m in node['members'] if m['name']=='RepeatBehavior')
+          report={}
+          for name,a,b in [('SymbolEffectOptions',apple['SymbolEffectOptions'],own['SymbolEffectOptions']),
+                           ('RepeatBehavior',nested(apple['SymbolEffectOptions']),nested(own['SymbolEffectOptions']))]:
+              missing=list((signatures(a)-signatures(b)).elements())
+              extra=list((signatures(b)-signatures(a)).elements())
+              report[name]={'apple_kind':a['declKind'],'candidate_kind':b['declKind'],
+                            'apple_member_count':len(a['members']),'candidate_member_count':len(b['members']),
+                            'missing_public_signatures':missing,'extra_public_signatures':extra}
+          report['swift_binary_layout_or_witness_proven']=False
+          report['official_app_verified']=False
+          report['public_conformance_differences']={}
+          for name in apple:
+              if apple[name]['conformances']!=own[name]['conformances']:
+                  report['public_conformance_differences'][name]={
+                      'apple':apple[name]['conformances'],'candidate':own[name]['conformances']}
+          ar,br=nested(apple['SymbolEffectOptions']),nested(own['SymbolEffectOptions'])
+          if ar['conformances']!=br['conformances']:
+              report['public_conformance_differences']['RepeatBehavior']={
+                  'apple':ar['conformances'],'candidate':br['conformances']}
+          pathlib.Path('output/audit/options-public-comparison.json').write_text(json.dumps(report,indent=2))
+          print(json.dumps(report,indent=2))
+          for key in ('SymbolEffectOptions','RepeatBehavior'):
+              assert report[key]['apple_kind']==report[key]['candidate_kind']=='Struct'
+              assert not report[key]['missing_public_signatures'], key+' missing public overload'
+              assert not report[key]['extra_public_signatures'], key+' extra public overload'
+          assert not report['public_conformance_differences'], 'public protocol conformance mismatch'
+          PY
+      - name: Differential real Apple Symbols and separate candidate client calls
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/host
+          HOST_TARGET="$(uname -m)-apple-macosx15.0"
+          xcrun swiftc -parse-as-library -emit-library -emit-module \
+            -target "$HOST_TARGET" \
+            -enable-library-evolution -module-name IPASymbolsCandidate \
+            -emit-module-path output/host/IPASymbolsCandidate.swiftmodule \
+            -Xlinker -install_name -Xlinker @rpath/libIPASymbolsCandidate.dylib \
+            tools/chatgpt-compat/ChatGPTCompatSymbols-ios166.swift \
+            -o output/host/libIPASymbolsCandidate.dylib
+          xcrun swiftc -parse-as-library \
+            -target "$HOST_TARGET" \
+            tools/chatgpt-compat/ios166-v136-symbols-behavior.swift \
+            -o output/host/apple-behavior
+          xcrun swiftc -parse-as-library -D IPA_HOST_CANDIDATE \
+            -target "$HOST_TARGET" \
+            -I output/host -L output/host -lIPASymbolsCandidate \
+            -Xlinker -rpath -Xlinker "$PWD/output/host" \
+            tools/chatgpt-compat/ios166-v136-symbols-behavior.swift \
+            -o output/host/candidate-behavior
+          output/host/apple-behavior > output/audit/apple-native-behavior.json
+          output/host/candidate-behavior > output/audit/candidate-native-behavior.json
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun swiftc -parse-as-library -target arm64-apple-ios16.6 -sdk "$SDK" \
+            -I output/swiftmodule -L output -Xlinker output/IPASymbolsCompatCandidate.dylib \
+            -Xlinker -rpath -Xlinker @executable_path \
+            tools/chatgpt-compat/ios166-v136-symbols-behavior.swift \
+            -o output/SymbolsBehaviorClient-ios16
+          xcrun otool -L output/SymbolsBehaviorClient-ios16 > output/audit/ios16-client-dependencies.txt
+          grep -F '@rpath/IPASymbolsCompatCandidate.dylib' output/audit/ios16-client-dependencies.txt
+          python3 tools/chatgpt-compat/ios166-v136-symbols-behavior-compare.py \
+            --apple output/audit/apple-native-behavior.json \
+            --candidate output/audit/candidate-native-behavior.json \
+            --output output/audit/native-behavior-comparison.json
+      - name: Publish native module candidate and ABI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-total-v136-symbols-witness-native-NOT-APP
+          path: output/
+          retention-days: 7
+          if-no-files-found: warn
