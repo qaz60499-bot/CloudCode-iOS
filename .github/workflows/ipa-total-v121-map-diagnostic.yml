@@ -42,6 +42,38 @@ jobs:
           cd "$OUT"
           shasum -a 256 map-diagnostic.ios IPAFairPlayProbe-hashguard.ios > SHA256SUMS.txt
           echo 'PUBLIC_SOURCE_ONLY_NO_IPA_SINF_CREDENTIALS=true' > scope.txt
+      - name: Build independent TrollStore UI entry, still no licensed payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/IPA-V121"
+          APP="$OUT/Payload/IPAIntegrity.app"
+          mkdir -p "$APP"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.6 -isysroot "$SDK" \
+            -O2 -Wall -Wextra -Werror -Dmain=v121_diagnostic_main -c \
+            tools/chatgpt-compat/ios166-v121-map-diagnostic.c -o "$OUT/diagnostic.o"
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.6 -isysroot "$SDK" \
+            -fobjc-arc -O2 -Wall -Werror tools/chatgpt-compat/ios166-v121-provenance-app.m \
+            "$OUT/diagnostic.o" -framework UIKit -framework Foundation -framework CoreGraphics \
+            -o "$APP/IPAIntegrity"
+          python3 - "$APP" <<'PY'
+          import pathlib,plistlib,sys
+          app=pathlib.Path(sys.argv[1])
+          p=dict(CFBundleIdentifier='cc.guess.ipatotal.provenance.ios166',
+                 CFBundleExecutable='IPAIntegrity',CFBundleName='IPAIntegrity',
+                 CFBundleDisplayName='IPA Integrity 16.6',CFBundleShortVersionString='0.0.1',
+                 CFBundleVersion='1',CFBundlePackageType='APPL',MinimumOSVersion='16.6',
+                 LSRequiresIPhoneOS=True,UIDeviceFamily=[1],UIRequiresFullScreen=True,
+                 UISupportedInterfaceOrientations=['UIInterfaceOrientationPortrait'],
+                 UILaunchScreen={})
+          (app/'Info.plist').write_bytes(plistlib.dumps(p))
+          assert not (app/'OriginalImage.raw').exists()
+          PY
+          xcrun otool -l "$APP/IPAIntegrity" > "$OUT/app-commands.txt"
+          cd "$OUT"
+          zip -q -r IPAIntegrity_iOS166_EMPTY_UNSIGNED.ipa Payload
+          shasum -a 256 IPAIntegrity_iOS166_EMPTY_UNSIGNED.ipa >> SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
           name: ipa-v121-native-provenance-diagnostic-NO-PAYLOAD
