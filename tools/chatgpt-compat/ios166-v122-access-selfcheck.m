@@ -177,11 +177,15 @@ static NSString *JSONText(NSDictionary *object) {
     BOOL ownContainer = [home hasPrefix:@"/private/var/mobile/Containers/Data/Application/"]
         && [cachePath hasPrefix:[home stringByAppendingString:@"/Library/Caches"]];
     NSError *error = nil;
-    BOOL saved = ownContainer && [json writeToURL:outputURL atomically:YES
+    BOOL directoryReady = ownContainer && [[NSFileManager defaultManager]
+        createDirectoryAtURL:caches withIntermediateDirectories:YES attributes:nil error:&error];
+    BOOL saved = directoryReady && [json writeToURL:outputURL atomically:YES
                          encoding:NSUTF8StringEncoding error:&error];
     self.saveStatus.text = saved
         ? @"Self-check JSON saved in this app's Caches."
-        : @"Self-check collected; saving to this app's Caches failed.";
+        : (!ownContainer ? @"Self-check collected; cache path is not verified as this app's container."
+                         : (!directoryReady ? @"Self-check collected; this app's cache directory could not be created."
+                                            : @"Self-check collected; writing this app's cache file failed."));
     self.outputView.text = json;
 }
 @end
