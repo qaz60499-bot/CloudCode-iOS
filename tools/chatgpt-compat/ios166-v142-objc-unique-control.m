@@ -14,6 +14,8 @@
 @property(nonatomic, readonly) int recordPermission;
 #endif
 - (BOOL)setInputMuted:(BOOL)muted error:(NSError **)error;
+- (BOOL)isInputMuted;
+- (BOOL)setInputMuteStateChangeHandler:(void (^)(BOOL))handler error:(NSError **)error;
 @end
 
 @implementation IPACompatV142ProbeClass
@@ -26,5 +28,9 @@
 #endif
 - (BOOL)setInputMuted:(BOOL)muted error:(NSError **)error {
     (void)muted; (void)error; return NO;
+}
+- (BOOL)isInputMuted { return NO; } // Unique ABI fixture only, not audio behavior.
+- (BOOL)setInputMuteStateChangeHandler:(void (^)(BOOL))handler error:(NSError **)error {
+    (void)handler; (void)error; return NO;
 }
 @end

@@ -6,7 +6,7 @@
  * alter the system, inspect user data, or invoke the app under study.
  *
  * argv: <candidate dylib> <expected class>
- * Exit 0 = class introduced by this candidate and four method ABIs match;
+ * Exit 0 = class introduced by this candidate and six observed method ABIs match;
  * 20 = class already exists (candidate NEVER dlopened); 23 = ABI mismatch;
  * 24 = loader/class owner failure. Never label 0 as official app success.
  */
@@ -28,6 +28,8 @@ static const Expected kMethods[] = {
     {"requestRecordPermissionWithCompletionHandler:", YES, "v", {"@", ":", "@?"}, 3},
     {"recordPermission", NO, "q", {"@", ":"}, 2},
     {"setInputMuted:error:", NO, "B", {"@", ":", "B", "^@"}, 4},
+    {"isInputMuted", NO, "B", {"@", ":"}, 2},
+    {"setInputMuteStateChangeHandler:error:", NO, "B", {"@", ":", "@?", "^@"}, 4},
 };
 static BOOL EqType(const char *actual, const char *expected) {
     return actual != NULL && strcmp(actual, expected) == 0;
@@ -90,7 +92,7 @@ int main(int argc, char **argv) {
                 return 23;
             }
         }
-        printf("PASS_ISOLATED_OBJC_CLASS_OWNER_AND_4_METHOD_ABIS class=%s image=%s\n", className, owner);
+        printf("PASS_ISOLATED_OBJC_CLASS_OWNER_AND_6_METHOD_ABIS class=%s image=%s\n", className, owner);
         dlclose(candidate);
         dlclose(system);
         return 0;

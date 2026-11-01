@@ -43,7 +43,7 @@ jobs:
           GOOD="$(pwd -P)/output/v142-good.dylib"
           BAD="$(pwd -P)/output/v142-bad.dylib"
           ./output/v142-objc-loader "$GOOD" IPACompatV142ProbeClass > output/audit/unique-good.txt
-          grep -F PASS_ISOLATED_OBJC_CLASS_OWNER_AND_4_METHOD_ABIS output/audit/unique-good.txt
+          grep -F PASS_ISOLATED_OBJC_CLASS_OWNER_AND_6_METHOD_ABIS output/audit/unique-good.txt
           set +e
           ./output/v142-objc-loader "$BAD" IPACompatV142ProbeClass > output/audit/unique-bad.txt 2>&1
           code=$?
@@ -64,7 +64,7 @@ jobs:
           xcrun otool -L output/v142-objc-loader > output/audit/loader-libraries.txt
           shasum -a 256 output/v142-objc-loader output/v142-good.dylib output/v142-bad.dylib > output/audit/SHA256SUMS.txt
           printf '%s\n' \
-            'PASS: self-written macOS arm64 unique ObjC class dlopen + owner + four method ABI checks.' \
+            'PASS: self-written macOS arm64 unique ObjC class dlopen + owner + six observed method ABI checks.' \
             'PASS: wrong method ABI -> exit23; duplicate Apple AVAudioApplication -> exit20 without candidate dlopen.' \
             'NOT TESTED: iOS16.6 phone runtime; genuine AVAudioApplication candidate; official ChatGPT.' \
             > output/audit/BOUNDARY.txt
