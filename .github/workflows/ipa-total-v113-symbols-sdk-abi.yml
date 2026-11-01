@@ -1,0 +1,62 @@
+name: IPA Total V113 Compare Apple Symbols SDK ABI without redistributing SDK
+on:
+  push:
+    branches: [ci/ipa-total-v112-symbols-abi-20261031]
+    paths:
+      - .github/workflows/ipa-total-v113-symbols-sdk-abi.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compare-original-apple-public-abi:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect Apple SDK Symbols ABI locally; publish summary only
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p output
+          xcrun swift-api-digester -dump-sdk -module Symbols \
+            -target arm64-apple-ios18.0 -sdk "$SDK" \
+            -o "$RUNNER_TEMP/apple-Symbols-sdk-abi.json"
+          test -s "$RUNNER_TEMP/apple-Symbols-sdk-abi.json"
+          python3 - "$RUNNER_TEMP/apple-Symbols-sdk-abi.json" <<'PY'
+          import json,sys,pathlib
+          root=json.loads(pathlib.Path(sys.argv[1]).read_text())
+          raw=root.get("ABIRoot",{})
+          names=("SymbolEffect","ContentTransitionSymbolEffect","SymbolEffectOptions",
+                 "SymbolEffectConfiguration","ReplaceSymbolEffect","AutomaticSymbolEffect")
+          result={}
+          for decl in raw.get("children",[]):
+              if decl.get("name") in names:
+                  result[decl["name"]]={
+                      "kind":decl.get("kind"),
+                      "public_members":[x.get("name") for x in decl.get("children",[])
+                                        if x.get("name")][:35],
+                      "child_count":len(decl.get("children",[])),
+                      "declKind":decl.get("declKind"),
+                      "printedName":decl.get("printedName"),
+                      "isFrozen":decl.get("isFrozen"),
+                  }
+          result["notes"]=[
+              "Apple SDK ABI description analyzed on macOS CI only",
+              "Only a small public summary is exported; no Apple Swift interface copied",
+              "Name parity is insufficient for binary layout/witness equivalence",
+              "No official iOS16 ChatGPT installation or execution",
+          ]
+          assert len(result)>3, "SDK ABI did not yield target public types"
+          pathlib.Path("output/Symbols-AppleSDK-PublicABISummary.json").write_text(
+              json.dumps(result,indent=2,ensure_ascii=False))
+          print(json.dumps({k:{"kind":v["kind"],"members":v["child_count"]}
+                  for k,v in result.items() if isinstance(v,dict)},indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ipa-v113-apple-symbols-public-abi-summary-NO-SDK-COPY
+          path: output/Symbols-AppleSDK-PublicABISummary.json
+          retention-days: 7
+          if-no-files-found: warn
