@@ -13,7 +13,7 @@ public func v143FinanceCompileOnlyDoNotExecute() async throws -> Bool {
     let available = FinanceStore.isDataAvailable(.financialData)
     let status = try await store.authorizationStatus()
     let authorization = try await store.requestAuthorization()
-    return available && status == .authorized && authorization != .notDetermined
+    return available && status == .authorized && authorization != .notDetermined && status != .denied
 }
 
 @available(iOS 17.4, *)

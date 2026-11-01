@@ -54,7 +54,7 @@ jobs:
           echo "intentional async/throws compile rejection status: $code"
           test "$code" -ne 0
           grep -Ei 'async|throw|await|try' output/audit/negative.txt
-          echo 'PASS: Apple's genuine Swift SDK rejected invalid synchronous authorization caller.'
+          echo "PASS: Genuine Apple Swift SDK rejected invalid synchronous authorization caller."
           # Explicitly inspect object identity and minOS. No IPA or runtime.
           xcrun otool -l output/V143AppleSDKOnly.o > output/audit/object-commands.txt
           shasum -a 256 output/V143AppleSDKOnly.o > output/audit/SHA256SUMS.txt
