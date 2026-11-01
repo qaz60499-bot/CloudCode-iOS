@@ -1,0 +1,91 @@
+name: IPA Total V146 native macOS Swift dyld async + negative provider differential (NOT APP)
+on:
+  push:
+    branches:
+      - ci/ipa-total-v146-host-dyld-20261101
+    paths:
+      - .github/workflows/ipa-total-v146-host-dyld.yml
+      - tools/chatgpt-compat/ios166-v146-dyld-swift-async-host-client.swift
+      - tools/chatgpt-compat/ios166-v144-research-*.swift
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos-arm64-real-dyld-runtime:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Swift resilient modules and execute true dyld real async behavior plus missing strong bind negative
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/modules output/positive output/negative output/audit
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          # Two self-written modules use exact pinned Swift mangled strong imports.
+          for module in FinanceKit MarketplaceKit; do
+            SDKROOT="$SDK" xcrun --sdk macosx swiftc \
+              -target arm64-apple-macos14.0 -sdk "$SDK" -parse-as-library \
+              -emit-library -emit-module -enable-library-evolution -Onone \
+              -emit-module-path "output/modules/${module}.swiftmodule" \
+              -module-name "$module" \
+              -Xlinker -install_name -Xlinker "@rpath/libV146${module}Research.dylib" \
+              "tools/chatgpt-compat/ios166-v144-research-${module}.swift" \
+              -o "output/positive/libV146${module}Research.dylib"
+            codesign --force --sign - "output/positive/libV146${module}Research.dylib"
+          done
+          # Negative library intentionally omits FinanceStore.requestAuthorization async entry+Tu.
+          SDKROOT="$SDK" xcrun --sdk macosx swiftc \
+            -target arm64-apple-macos14.0 -sdk "$SDK" -parse-as-library \
+            -emit-library -enable-library-evolution -Onone \
+            -module-name FinanceKit -DV144_NEGATIVE \
+            -Xlinker -install_name -Xlinker "@rpath/libV146FinanceKitResearch.dylib" \
+            tools/chatgpt-compat/ios166-v144-research-FinanceKit.swift \
+            -o output/negative/libV146FinanceKitResearch.dylib
+          cp output/positive/libV146MarketplaceKitResearch.dylib output/negative/libV146MarketplaceKitResearch.dylib
+          codesign --force --sign - output/negative/libV146FinanceKitResearch.dylib
+
+          SDKROOT="$SDK" xcrun --sdk macosx swiftc \
+            -target arm64-apple-macos14.0 -sdk "$SDK" -parse-as-library \
+            -I output/modules -L output/positive \
+            -lV146FinanceKitResearch -lV146MarketplaceKitResearch \
+            -Xlinker -rpath -Xlinker '@executable_path/positive' \
+            tools/chatgpt-compat/ios166-v146-dyld-swift-async-host-client.swift \
+            -o output/v146-macos-dyld-test
+          codesign --force --sign - output/v146-macos-dyld-test
+          file output/v146-macos-dyld-test | grep -E 'Mach-O 64-bit.*arm64'
+          xcrun otool -L output/v146-macos-dyld-test > output/audit/real-dependencies.txt
+          grep -F '@rpath/libV146FinanceKitResearch.dylib' output/audit/real-dependencies.txt
+          grep -F '@rpath/libV146MarketplaceKitResearch.dylib' output/audit/real-dependencies.txt
+
+          # Positive proves actual dyld-resolved providers AND Swift async execution.
+          output/v146-macos-dyld-test > output/audit/positive.txt 2>&1
+          grep -F 'PASS_MACOS_ARM64_REAL_DYLD_SWIFT_ASYNC_ABI_DENY_SEMANTICS' output/audit/positive.txt
+
+          # Rebind ONLY our own test client's rpath to independent negative binaries.
+          cp output/v146-macos-dyld-test output/v146-macos-dyld-negative
+          install_name_tool -rpath '@executable_path/positive' '@executable_path/negative' \
+            output/v146-macos-dyld-negative
+          codesign --force --sign - output/v146-macos-dyld-negative
+          set +e
+          output/v146-macos-dyld-negative > output/audit/negative.txt 2>&1
+          bad_status=$?
+          set -e
+          echo "intentional dyld failure exit: $bad_status"
+          test "$bad_status" -ne 0
+          grep -Ei 'symbol not found|symbol not found in flat namespace|missing symbol' output/audit/negative.txt
+          grep -F 'requestAuthorization' output/audit/negative.txt
+          shasum -a 256 output/v146-macos-dyld-test output/v146-macos-dyld-negative \
+            output/positive/*.dylib output/negative/*.dylib > output/audit/SHA256SUMS.txt
+          printf '%s\n' \
+            'PASS: independent macOS arm64 actual dyld and Swift async return/throw behavior.' \
+            'PASS: own test client rebound to deliberately deficient provider fails before main.' \
+            'NOT TESTED: iPhone14,2 iOS16.6 device runtime or Apple framework implementation.' \
+            'NOT OFFICIAL ChatGPT; does not address FairPlay 0/6 or 5 user functions.' \
+            > output/audit/BOUNDARY.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-total-v146-macos-arm64-dyld-async-evidence-NOT-APP
+          path: output/audit/
+          retention-days: 7
+          if-no-files-found: error
