@@ -1,0 +1,77 @@
+name: IPA Total V118 isolated FairPlay mapping feasibility helper (NO IPA UPLOAD)
+on:
+  push:
+    branches: [ci/ipa-total-v118-fairplay-probe-20261031]
+    paths:
+      - .github/workflows/ipa-total-v118-fairplay-probe.yml
+      - tools/chatgpt-compat/ios166-v118-fairplay-probe.m
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-empty-native-helper:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile unsigned iOS16.6 helper WITHOUT original IPA, SC_Info, credentials, or account
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="$RUNNER_TEMP/IPA-V118"
+          APP="$BASE/Payload/IPAFairPlayProbe.app"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p "$APP" "$BASE/audit"
+          xcrun --sdk iphoneos clang             -target arm64-apple-ios16.6 -isysroot "$SDK" -miphoneos-version-min=16.6             -fobjc-arc -O2 -Wall -Werror -fno-common             tools/chatgpt-compat/ios166-v118-fairplay-probe.m             -framework UIKit -framework Foundation             -o "$APP/IPAFairPlayProbe"
+          cat > "$APP/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>CFBundleIdentifier</key><string>cc.guess.ipatotal.fairplayprobe.ios166</string>
+          <key>CFBundleExecutable</key><string>IPAFairPlayProbe</string>
+          <key>CFBundleName</key><string>IPAFairPlayProbe</string>
+          <key>CFBundleDisplayName</key><string>IPA FP 16.6 Probe</string>
+          <key>CFBundleShortVersionString</key><string>0.0.1</string>
+          <key>CFBundleVersion</key><string>1</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>MinimumOSVersion</key><string>16.6</string>
+          <key>LSRequiresIPhoneOS</key><true/>
+          <key>UIDeviceFamily</key><array><integer>1</integer></array>
+          <key>UIRequiresFullScreen</key><true/>
+          <key>UIFileSharingEnabled</key><false/>
+          <key>UISupportedInterfaceOrientations</key>
+          <array><string>UIInterfaceOrientationPortrait</string></array>
+          </dict></plist>
+          PLIST
+          plutil -lint "$APP/Info.plist"
+          xcrun otool -l "$APP/IPAFairPlayProbe" > "$BASE/audit/commands.txt"
+          xcrun otool -L "$APP/IPAFairPlayProbe" > "$BASE/audit/dependencies.txt"
+          grep -A6 LC_BUILD_VERSION "$BASE/audit/commands.txt" | grep -E 'minos +16\.6'
+          python3 - "$APP" <<'PY'
+          import pathlib,plistlib,struct,sys,json
+          app=pathlib.Path(sys.argv[1])
+          info=plistlib.loads((app/"Info.plist").read_bytes())
+          assert info["CFBundleIdentifier"]=="cc.guess.ipatotal.fairplayprobe.ios166"
+          assert info["MinimumOSVersion"]=="16.6"
+          exe=app/"IPAFairPlayProbe"
+          b=exe.read_bytes()
+          assert struct.unpack_from("<I",b)[0]==0xfeedfacf
+          assert struct.unpack_from("<I",b,4)[0]==0x100000c
+          assert "EmbeddedPayload" not in [p.name for p in app.iterdir()]
+          print("NO_OFFICIAL_IPA_NO_SINF_NO_SECRET_IN_CI=true")
+          print("NATIVE_HELPER_ARM64_MINIOS166=true")
+          PY
+          cd "$BASE"
+          zip -q -r "$RUNNER_TEMP/IPAFairPlayProbe_iOS166_UNSIGNED_NO_PAYLOAD.ipa" Payload
+          shasum -a 256 "$RUNNER_TEMP/IPAFairPlayProbe_iOS166_UNSIGNED_NO_PAYLOAD.ipa" > "$BASE/audit/SHA256SUMS.txt"
+          echo "BUILD_ONLY_NO_IPHONE_INSTALLATION=true"
+      - name: Upload ONLY unsigned empty helper binary and auditable files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-v118-ios166-empty-fairplayprobe-NO-LICENSED-PAYLOAD
+          path: |
+            ${{ runner.temp }}/IPAFairPlayProbe_iOS166_UNSIGNED_NO_PAYLOAD.ipa
+            ${{ runner.temp }}/IPA-V118/audit/
+          retention-days: 7
+          if-no-files-found: warn
