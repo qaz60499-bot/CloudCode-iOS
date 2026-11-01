@@ -30,6 +30,7 @@ private func unpackMarketplace(_ value: AppDistributor) -> String? {
     switch value {
     case .marketplace(let payload): return payload
     case .appStore, .testFlight, .web, .other: return nil
+    @unknown default: return nil
     }
 }
 
