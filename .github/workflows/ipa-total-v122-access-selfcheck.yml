@@ -1,0 +1,60 @@
+name: IPA Total V122 self-only access-context preflight
+on:
+  push:
+    branches: [ci/ipa-total-v122-access-selfcheck-20261031]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-selfcheck:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build self-only iOS16.6 application with explicit capability requests
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/IPA-V122"
+          APP="$OUT/Payload/IPAAccess.app"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p "$APP"
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.6 -isysroot "$SDK" \
+            -fobjc-arc -O2 -Wall -Werror tools/chatgpt-compat/ios166-v122-access-selfcheck.m \
+            -framework UIKit -framework Foundation -framework Security -o "$APP/IPAAccess"
+          python3 - "$APP" "$OUT" <<'PY'
+          import pathlib,plistlib,sys
+          app,out=map(pathlib.Path,sys.argv[1:])
+          info=dict(CFBundleIdentifier='cc.guess.ipatotal.access.ios166',CFBundleExecutable='IPAAccess',
+                    CFBundleName='IPAAccess',CFBundleDisplayName='IPA Access 16.6',
+                    CFBundleShortVersionString='0.0.1',CFBundleVersion='1',CFBundlePackageType='APPL',
+                    MinimumOSVersion='16.6',LSRequiresIPhoneOS=True,UIDeviceFamily=[1],
+                    UISupportedInterfaceOrientations=['UIInterfaceOrientationPortrait'],UILaunchScreen={})
+          (app/'Info.plist').write_bytes(plistlib.dumps(info))
+          ent={'application-identifier':'cc.guess.ipatotal.access.ios166',
+               'platform-application':True,'com.apple.private.security.no-sandbox':True}
+          (out/'selfcheck-entitlements.plist').write_bytes(plistlib.dumps(ent))
+          PY
+          codesign --force --sign - --entitlements "$OUT/selfcheck-entitlements.plist" --generate-entitlement-der "$APP/IPAAccess"
+          codesign --verify --strict "$APP/IPAAccess"
+          codesign --display --entitlements - --xml "$APP/IPAAccess" > "$OUT/signed-entitlements.plist"
+          python3 - "$OUT" <<'PY'
+          import pathlib,plistlib,sys
+          out=pathlib.Path(sys.argv[1]);p=plistlib.loads((out/'signed-entitlements.plist').read_bytes())
+          assert p['platform-application'] is True and p['com.apple.private.security.no-sandbox'] is True
+          assert 'com.apple.private.persona-mgmt' not in p
+          print('SIGNED_REQUESTS_ONLY_NOT_RUNTIME_PRIVILEGE_PROOF=true')
+          PY
+          xcrun otool -l "$APP/IPAAccess" > "$OUT/commands.txt"
+          xcrun otool -L "$APP/IPAAccess" > "$OUT/dependencies.txt"
+          grep -A6 LC_BUILD_VERSION "$OUT/commands.txt" | grep -E 'minos +16\.6'
+          cd "$OUT"
+          zip -q -r IPAAccess_iOS166_SELF_ONLY.ipa Payload
+          shasum -a 256 IPAAccess_iOS166_SELF_ONLY.ipa > SHA256SUMS.txt
+          echo 'NO_ROOT_NO_PERSONA_NO_REMAP_NO_LICENSE_NO_OTHER_APP_ACCESS=true' > scope.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-v122-access-selfcheck-NO-TARGET-PAYLOAD
+          path: ${{ runner.temp }}/IPA-V122/
+          retention-days: 7
+          if-no-files-found: error
