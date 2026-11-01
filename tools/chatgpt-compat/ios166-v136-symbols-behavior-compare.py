@@ -24,6 +24,11 @@ def compare(apple, candidate):
                 if apple["semantic_equalities"][key] != candidate["semantic_equalities"][key]]
     failed_witnesses = {provider: sorted(k for k, v in report["witness_calls"].items() if not v)
                         for provider, report in (("apple", apple), ("candidate", candidate))}
+    apple_layouts, candidate_layouts = apple.get("value_layouts"), candidate.get("value_layouts")
+    layout_mismatches = (sorted(k for k in apple_layouts.keys() | candidate_layouts.keys()
+                                if apple_layouts.get(k) != candidate_layouts.get(k))
+                         if isinstance(apple_layouts, dict) and isinstance(candidate_layouts, dict)
+                         else None)
     return {
         "status": "FAIL_NATIVE_BEHAVIOR_DIFFERENCE" if mismatch or any(failed_witnesses.values())
                   else "PASS_SELECTED_NATIVE_CALLS_ONLY",
@@ -31,6 +36,9 @@ def compare(apple, candidate):
         "behavior_mismatches": mismatch, "failed_witness_calls": failed_witnesses,
         "layout_observations": {"apple_host": apple.get("value_layouts"),
                                 "candidate_host": candidate.get("value_layouts")},
+        "host_layout_mismatches": layout_mismatches,
+        "binary_abi_gate": ("BLOCKED_HOST_LAYOUT_DIFFERENCES" if layout_mismatches else
+                            "BLOCKED_NEEDS_IOS16_LAYOUT_AND_WITNESS_VALIDATION"),
         "ios16_binary_layout_equivalence_proven": False,
         "ios16_device_execution_proven": False, "rendering_proven": False,
         "official_boot_plaintext": "0/6", "official_features": "0/5",

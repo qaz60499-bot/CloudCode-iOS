@@ -146,13 +146,16 @@ jobs:
           output/host/apple-behavior > output/audit/apple-native-behavior.json
           output/host/candidate-behavior > output/audit/candidate-native-behavior.json
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          xcrun swiftc -parse-as-library -target arm64-apple-ios16.6 -sdk "$SDK" \
+          SDKROOT="$SDK" xcrun swiftc -parse-as-library -target arm64-apple-ios16.6 -sdk "$SDK" \
             -I output/swiftmodule -L output -Xlinker output/IPASymbolsCompatCandidate.dylib \
             -Xlinker -rpath -Xlinker @executable_path \
             tools/chatgpt-compat/ios166-v136-symbols-behavior.swift \
             -o output/SymbolsBehaviorClient-ios16
           xcrun otool -L output/SymbolsBehaviorClient-ios16 > output/audit/ios16-client-dependencies.txt
+          xcrun otool -l output/SymbolsBehaviorClient-ios16 > output/audit/ios16-client-commands.txt
+          grep -A5 LC_BUILD_VERSION output/audit/ios16-client-commands.txt | grep -E 'minos +16\.6'
           grep -F '@rpath/IPASymbolsCompatCandidate.dylib' output/audit/ios16-client-dependencies.txt
+          ! grep -F '/System/Library/Frameworks/Symbols.framework' output/audit/ios16-client-dependencies.txt
           python3 tools/chatgpt-compat/ios166-v136-symbols-behavior-compare.py \
             --apple output/audit/apple-native-behavior.json \
             --candidate output/audit/candidate-native-behavior.json \

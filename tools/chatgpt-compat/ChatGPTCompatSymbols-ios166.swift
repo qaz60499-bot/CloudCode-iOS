@@ -1,4 +1,4 @@
-// IPA Total V123 - iOS16.6 Symbols public-API subset candidate.
+// IPA Total V136 - iOS16.6 Symbols public-API subset candidate.
 // Independent replacement subset for research: not Apple's Symbols.framework.
 // Exact exported names, API shape, resilient layout and witness semantics are
 // distinct tests. Do NOT install this in production or claim animations work.
@@ -34,17 +34,25 @@ public struct ReplaceSymbolEffect: SymbolEffect, ContentTransitionSymbolEffect {
     internal init(scope: UInt8) {
         self.configuration = SymbolEffectConfiguration(kind: .replace, scope: scope)
     }
-    public var downUp: Self { Self(scope: 1) }
-    public var offUp: Self { Self(scope: 2) }
-    public var upUp: Self { Self(scope: 3) }
+    // Direction and explicit layer selection compose independently. These are
+    // surrogate bits, NOT Apple's private representation. V136 native Apple
+    // equality tests distinguish unspecified, byLayer and wholeSymbol requests.
+    internal func withDirection(_ direction: UInt8) -> Self {
+        var result = self
+        result.configuration.scope = (result.configuration.scope & 0xF0) | direction
+        return result
+    }
+    public var downUp: Self { withDirection(1) }
+    public var offUp: Self { withDirection(2) }
+    public var upUp: Self { withDirection(3) }
     public var byLayer: Self {
         var result = self
-        result.configuration.scope |= 0x10
+        result.configuration.scope = (result.configuration.scope & ~0x30) | 0x10
         return result
     }
     public var wholeSymbol: Self {
         var result = self
-        result.configuration.scope &= ~0x10
+        result.configuration.scope = (result.configuration.scope & ~0x30) | 0x20
         return result
     }
     public static var downUp: Self { Self(scope: 1) }
