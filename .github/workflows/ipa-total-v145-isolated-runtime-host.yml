@@ -1,0 +1,88 @@
+name: IPA Total V145 iOS16.6 Swift ABI isolated device research IPA (NOT CHATGPT)
+on:
+  push:
+    branches:
+      - ci/ipa-total-v145-isolated-runtime-host-20261101
+    paths:
+      - .github/workflows/ipa-total-v145-isolated-runtime-host.yml
+      - tools/chatgpt-compat/ios166-v145-*
+      - tools/chatgpt-compat/ios166-v144-research-FinanceKit.swift
+      - tools/chatgpt-compat/ios166-v144-research-MarketplaceKit.swift
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-ios166-research-app:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native build, sign, and package isolated iOS16.6 Swift runtime lab
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p output/modules output/libs output/audit output/package/Payload/IPAABI145.app/Frameworks
+          APP=output/package/Payload/IPAABI145.app
+          cp tools/chatgpt-compat/ios166-v145-isolated-Info.plist "$APP/Info.plist"
+          plutil -lint "$APP/Info.plist"
+          SDKROOT="$SDK" xcrun swiftc -target arm64-apple-ios16.6 -sdk "$SDK" \
+            -parse-as-library -emit-library -emit-module -enable-library-evolution \
+            -emit-module-path output/modules/FinanceKit.swiftmodule \
+            -module-name FinanceKit -Onone \
+            -Xlinker -install_name -Xlinker @rpath/libV145financeResearch.dylib \
+            tools/chatgpt-compat/ios166-v144-research-FinanceKit.swift \
+            -o output/libs/libV145financeResearch.dylib
+          SDKROOT="$SDK" xcrun swiftc -target arm64-apple-ios16.6 -sdk "$SDK" \
+            -parse-as-library -emit-library -emit-module -enable-library-evolution \
+            -emit-module-path output/modules/MarketplaceKit.swiftmodule \
+            -module-name MarketplaceKit -Onone \
+            -Xlinker -install_name -Xlinker @rpath/libV145marketResearch.dylib \
+            tools/chatgpt-compat/ios166-v144-research-MarketplaceKit.swift \
+            -o output/libs/libV145marketResearch.dylib
+          # Link only against our isolated research dynamic libraries.
+          # Validate against accidental auto-linking of newer Apple frameworks.
+          SDKROOT="$SDK" xcrun swiftc -target arm64-apple-ios16.6 -sdk "$SDK" \
+            -parse-as-library -Onone -module-name V145SwiftABIApp \
+            -I output/modules -L output/libs \
+            -lV145financeResearch -lV145marketResearch \
+            -Xlinker -rpath -Xlinker @executable_path/Frameworks \
+            -framework UIKit \
+            tools/chatgpt-compat/ios166-v145-isolated-swift-abi-app.swift \
+            -o "$APP/IPAABI145"
+          xcrun otool -L "$APP/IPAABI145" > output/audit/app-dependencies.txt
+          grep -F @rpath/libV145financeResearch.dylib output/audit/app-dependencies.txt
+          grep -F @rpath/libV145marketResearch.dylib output/audit/app-dependencies.txt
+          if grep -E '/System/Library/Frameworks/(FinanceKit|MarketplaceKit).framework/' output/audit/app-dependencies.txt; then
+            echo 'BLOCKED_UNEXPECTED_SYSTEM_FRAMEWORK_LINK'; exit 64
+          fi
+          cp output/libs/libV145financeResearch.dylib "$APP/Frameworks/"
+          cp output/libs/libV145marketResearch.dylib "$APP/Frameworks/"
+          xcrun swift tools/chatgpt-compat/ios166-v145-icon-render.swift "$APP"
+          test -s "$APP/V145Icon60x60@2x.png"
+          test -s "$APP/V145Icon60x60@3x.png"
+          for bin in "$APP/IPAABI145" "$APP/Frameworks/"*.dylib; do
+            xcrun otool -l "$bin" | grep -A5 LC_BUILD_VERSION | grep -E 'minos +16\.6'
+            file "$bin" | grep -E 'Mach-O 64-bit.*arm64'
+          done
+          # Standard ad hoc signing for an isolated TrollStore research candidate:
+          # no special entitlements and no profile/user authorization data.
+          for bin in "$APP/Frameworks/"*.dylib; do codesign --force --sign - --timestamp=none "$bin"; done
+          codesign --force --sign - --timestamp=none "$APP"
+          codesign --verify --deep --strict "$APP"
+          (cd output/package && zip -qr ../IPA-ABI-Lab-V145-iOS166-TEST-ONLY.ipa Payload)
+          shasum -a 256 output/IPA-ABI-Lab-V145-iOS166-TEST-ONLY.ipa > output/audit/IPA-SHA256SUMS.txt
+          shasum -a 256 "$APP/IPAABI145" "$APP/Frameworks/"*.dylib > output/audit/native-SHA256SUMS.txt
+          printf '%s\n' \
+            'Isolated research IPA: cc.guess.ipatotal.swiftabi.v145 / version 0.0.145 / iOS16.6' \
+            'Distinct IPA 145 icon, no user accounts, no storage, no permissions requested.' \
+            'Not the official ChatGPT app. No FairPlay decryption or user data touched.' \
+            'No device installation has occurred on GitHub Actions.' > output/audit/BOUNDARY.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-total-v145-isolated-swift-abi-TEST-ONLY
+          path: |
+            output/IPA-ABI-Lab-V145-iOS166-TEST-ONLY.ipa
+            output/audit/
+          retention-days: 7
+          if-no-files-found: error
