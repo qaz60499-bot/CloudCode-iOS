@@ -1,0 +1,72 @@
+name: IPA Total V143 real Apple FinanceKit MarketplaceKit Swift ABI audit (NOT APP)
+on:
+  push:
+    branches:
+      - ci/ipa-total-v143-fm-apple-swift-abi-20261101
+    paths:
+      - .github/workflows/ipa-total-v143-fm-apple-swift-abi.yml
+      - tools/chatgpt-compat/ios166-v143-fm-apple-sdk-client.swift
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-iphoneos-sdk-strong-abi-client:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift compiler checks native Apple SDK ABI and strict negative
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/audit
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iPhoneOS SDK version: $SDK_VERSION"
+          # Compile Apple SDK usage to a Mach-O OBJECT only; no link or execution.
+          # In particular DO NOT call FinanceStore.requestAuthorization.
+          SDKROOT="$SDK" xcrun --sdk iphoneos swiftc \
+            -target arm64-apple-ios17.4 -sdk "$SDK" \
+            -parse-as-library -Onone -emit-object \
+            -module-name V143AppleSDKOnly \
+            tools/chatgpt-compat/ios166-v143-fm-apple-sdk-client.swift \
+            -o output/V143AppleSDKOnly.o
+          file output/V143AppleSDKOnly.o | grep -E 'Mach-O 64-bit.*arm64'
+          xcrun nm -u output/V143AppleSDKOnly.o > output/audit/sdk-undefined.txt
+          echo 'Apple SDK generated FinanceKit + MarketplaceKit imports:'
+          grep -E 'FinanceKit|MarketplaceKit' output/audit/sdk-undefined.txt
+          grep -F 'FinanceKit0A5StoreC19authorizationStatus' output/audit/sdk-undefined.txt
+          grep -F 'FinanceKit0A5StoreC20requestAuthorization' output/audit/sdk-undefined.txt
+          grep -F 'MarketplaceKit14AppDistributorO7current' output/audit/sdk-undefined.txt
+
+          # Strict negative: the genuine SDK must reject a synchronous,
+          # no-try call of an actual async throws API. Do NOT weaken the SDK.
+          set +e
+          SDKROOT="$SDK" xcrun --sdk iphoneos swiftc \
+            -target arm64-apple-ios17.4 -sdk "$SDK" -typecheck \
+            -DV143_NEGATIVE -module-name V143SDKNegative \
+            tools/chatgpt-compat/ios166-v143-fm-apple-sdk-client.swift \
+            > output/audit/negative.txt 2>&1
+          code=$?
+          set -e
+          echo "intentional async/throws compile rejection status: $code"
+          test "$code" -ne 0
+          grep -Ei 'async|throw|await|try' output/audit/negative.txt
+          echo 'PASS: Apple's genuine Swift SDK rejected invalid synchronous authorization caller.'
+          # Explicitly inspect object identity and minOS. No IPA or runtime.
+          xcrun otool -l output/V143AppleSDKOnly.o > output/audit/object-commands.txt
+          shasum -a 256 output/V143AppleSDKOnly.o > output/audit/SHA256SUMS.txt
+          printf '%s\n' \
+            'PASS: iPhoneOS arm64 Apple SDK compiled independent FinanceKit/MarketplaceKit Swift consumer.' \
+            'PASS: missing async/throws handling was rejected by Apple Swift compiler.' \
+            'NOT TESTED: iOS16.6 framework availability, Swift ABI provider, official ChatGPT.' \
+            'No runtime calls, no entitlement invocation, no user financial data, no app installed.' \
+            > output/audit/BOUNDARY.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-total-v143-real-sdk-fm-abi-audit-NOT-APP
+          path: output/audit/
+          retention-days: 7
+          if-no-files-found: error
