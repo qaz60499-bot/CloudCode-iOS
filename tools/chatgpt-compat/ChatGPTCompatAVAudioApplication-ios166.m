@@ -16,8 +16,14 @@ NS_ASSUME_NONNULL_BEGIN
 
 static NSString *const IPACompatAudioErrorDomain = @"IPACompatAVAudioApplication";
 enum { IPACompatAudioErrorUnsupportedInputMute = 1 };
-/* Apple notification constant values are not verified. We deliberately do
- * NOT export invented values or report this class as fully compatible. */
+/* V137 independently observed these exact exported NSString values by dlsym
+ * against Apple AVFAudio on macOS 15.8.2. They are notification NAME metadata,
+ * not evidence that iOS 16 generates corresponding input-mute events. The
+ * adapter still refuses input mute and never synthesizes a false notification.
+ * Provider routing, device runtime behavior and event semantics remain open. */
+NSNotificationName const AVAudioApplicationInputMuteStateChangeNotification =
+    @"AVAudioApplicationInputMuteStateChangeNotification";
+NSString *const AVAudioApplicationMuteStateKey = @"AVAudioApplicationMuteStateKey";
 
 @interface AVAudioApplication : NSObject
 + (instancetype)sharedInstance;
