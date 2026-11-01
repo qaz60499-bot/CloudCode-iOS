@@ -1,0 +1,59 @@
+name: IPA Total V140 AVAudioApplication observed constants (NOT APP)
+on:
+  push:
+    branches:
+      - ci/ipa-total-v140-avaudio-constants-20261101
+    paths:
+      - .github/workflows/ipa-total-v140-avaudio-constants-ios16.yml
+      - tools/chatgpt-compat/ChatGPTCompatAVAudioApplication-ios166.m
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-avaudio-ios16:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and audit real arm64 iOS16.6 research adapter
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
+          mkdir -p output/audit
+          SDKROOT="$SDK" xcrun --sdk iphoneos clang \
+            -target arm64-apple-ios16.6 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=16.6 \
+            -fobjc-arc -fblocks -fvisibility=default -Wall -Werror -O2 \
+            -dynamiclib \
+            -Wl,-install_name,@rpath/IPACompatAVAudioApplication.dylib \
+            -framework Foundation -framework AVFAudio \
+            tools/chatgpt-compat/ChatGPTCompatAVAudioApplication-ios166.m \
+            -o output/IPACompatAVAudioApplication.dylib
+          file output/IPACompatAVAudioApplication.dylib | grep -E 'Mach-O 64-bit.*arm64'
+          xcrun otool -l output/IPACompatAVAudioApplication.dylib > output/audit/commands.txt
+          xcrun otool -L output/IPACompatAVAudioApplication.dylib > output/audit/dependencies.txt
+          xcrun nm -gU output/IPACompatAVAudioApplication.dylib > output/audit/exports.txt
+          xcrun nm -m -u output/IPACompatAVAudioApplication.dylib > output/audit/undefined.txt
+          grep -A5 LC_BUILD_VERSION output/audit/commands.txt | grep -E 'minos +16\.6'
+          grep -A5 LC_BUILD_VERSION output/audit/commands.txt | grep -F "sdk $SDK_VERSION"
+          grep -F '_OBJC_CLASS_$_AVAudioApplication' output/audit/exports.txt
+          grep -F '_OBJC_METACLASS_$_AVAudioApplication' output/audit/exports.txt
+          grep -E '[[:space:]]_AVAudioApplicationInputMuteStateChangeNotification$' output/audit/exports.txt
+          grep -E '[[:space:]]_AVAudioApplicationMuteStateKey$' output/audit/exports.txt
+          ! grep -E 'FinanceKit|MarketplaceKit|/System/Library/Frameworks/Symbols.framework' output/audit/dependencies.txt
+          shasum -a 256 output/IPACompatAVAudioApplication.dylib > output/audit/SHA256SUMS.txt
+          printf '%s\n' \
+            'V140 research library only. Apple macOS host V137 separately observed two literal NSString values.' \
+            'No iOS16 runtime event delivery, notification semantics, provider rebind, or official ChatGPT execution proven.' \
+            > output/README.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-total-v140-avaudio-constants-ios16-NOT-APP
+          path: output/
+          retention-days: 7
+          if-no-files-found: error
