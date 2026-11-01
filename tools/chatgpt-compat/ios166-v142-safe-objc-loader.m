@@ -78,7 +78,7 @@ int main(int argc, char **argv) {
         Dl_info metadata = {0};
         // Verify owner using class image and dladdr; a class from another image
         // cannot be accepted as a successful provider.
-        if (cls == Nil || owner == NULL || dladdr((const void *)cls, &metadata) == 0 ||
+        if (cls == Nil || owner == NULL || dladdr((__bridge const void *)cls, &metadata) == 0 ||
             metadata.dli_fname == NULL || strcmp(owner, libPath) != 0) {
             fprintf(stderr, "BLOCKED_CLASS_PROVIDER_MISMATCH class=%s owner=%s\n",
                     className, owner != NULL ? owner : "(none)");
