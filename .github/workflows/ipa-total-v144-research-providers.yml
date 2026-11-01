@@ -52,13 +52,17 @@ jobs:
             xcrun otool -l "output/libV144${name}Research.dylib" > "output/audit/${name}-commands.txt"
             grep -A5 LC_BUILD_VERSION "output/audit/${name}-commands.txt" | grep -E 'minos +16\.6'
           done
+          set +e
           python3 tools/chatgpt-compat/ios166-v144-research-provider-export-audit.py \
             --manifest tools/chatgpt-compat/ios166-v144-expected-strong-symbols.txt \
             --finance-nm output/audit/finance-exports.txt \
             --market-nm output/audit/market-exports.txt \
             --finance-negative-nm output/audit/negative-exports.txt \
             > output/audit/compare.json
+          audit_code=$?
+          set -e
           cat output/audit/compare.json
+          test "$audit_code" -eq 0
           shasum -a 256 output/libV144*Research.dylib > output/audit/SHA256SUMS.txt
           printf '%s\n' \
             'These are independent, self-written iPhoneOS16.6 Swift ABI research libraries.' \
