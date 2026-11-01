@@ -586,13 +586,9 @@ static NSString * const kJournalSchema = @"ios166-v121-provenance-attempt-journa
         ? [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:&parseError] : nil;
     if (![object isKindOfClass:[NSDictionary class]]) {
         if (reason) *reason = @"diagnostic_output_not_single_json_object";
-        return @{
-            @"exit_code": @(diagnosticExit),
-            @"json_text": trimmed,
-            @"json": @{}
-        };
+        return nil;
     }
-    if (reason) *reason = @"diagnostic_json_captured";
+    if (reason) *reason = nil;
     return @{
         @"exit_code": @(diagnosticExit),
         @"json_text": trimmed,
