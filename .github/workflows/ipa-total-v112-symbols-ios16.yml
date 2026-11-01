@@ -1,0 +1,70 @@
+name: IPA Total V112 iOS16 Symbols ABI subset candidate (NOT APP)
+on:
+  push:
+    branches: [ci/ipa-total-v112-symbols-abi-20261031]
+    paths:
+      - .github/workflows/ipa-total-v112-symbols-ios16.yml
+      - tools/chatgpt-compat/ChatGPTCompatSymbols-ios166.swift
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-ios16-symbols-candidate:
+    runs-on: macos-15
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native compile and ABI symbol audit, no IPA produced
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p output/audit output/swiftmodule
+          xcrun swiftc -parse-as-library -emit-library -emit-module \
+            -enable-library-evolution -module-name Symbols \
+            -target arm64-apple-ios16.6 -sdk "$SDK" \
+            -emit-module-path output/swiftmodule/Symbols.swiftmodule \
+            -Xlinker -install_name -Xlinker @rpath/IPASymbolsCompatCandidate.dylib \
+            tools/chatgpt-compat/ChatGPTCompatSymbols-ios166.swift \
+            -o output/IPASymbolsCompatCandidate.dylib
+          file output/IPASymbolsCompatCandidate.dylib | grep -E 'Mach-O 64-bit.*arm64'
+          xcrun otool -l output/IPASymbolsCompatCandidate.dylib > output/audit/commands.txt
+          xcrun otool -L output/IPASymbolsCompatCandidate.dylib > output/audit/dependencies.txt
+          xcrun nm -gjU output/IPASymbolsCompatCandidate.dylib | sort > output/audit/exports.txt
+          grep -A5 LC_BUILD_VERSION output/audit/commands.txt | grep -E 'minos +16\.6'
+          ! grep -E 'FinanceKit|MarketplaceKit|/System/Library/Frameworks/Symbols.framework' output/audit/dependencies.txt
+          cat > output/audit/required-nine.txt <<'SYMBOLS'
+          _$s7Symbols19ReplaceSymbolEffectVAA0cD0AAMc
+          _$s7Symbols19ReplaceSymbolEffectVACycfC
+          _$s7Symbols19ReplaceSymbolEffectVMa
+          _$s7Symbols19SymbolEffectOptionsV5speedyACSdFZ
+          _$s7Symbols19SymbolEffectOptionsV7defaultACvgZ
+          _$s7Symbols19SymbolEffectOptionsVMa
+          _$s7Symbols21AutomaticSymbolEffectVAA0cD0AAMc
+          _$s7Symbols21AutomaticSymbolEffectVACycfC
+          _$s7Symbols21AutomaticSymbolEffectVMa
+          SYMBOLS
+          while IFS= read -r sym; do
+            grep -Fx "$sym" output/audit/exports.txt || {
+              echo "::error::Missing exact V070 strong symbol $sym"; exit 1;
+            }
+          done < output/audit/required-nine.txt
+          echo "V112_EXACT_NINE_IMPORT_SYMBOL_NAMES_PRESENT"
+          shasum -a 256 output/IPASymbolsCompatCandidate.dylib > output/audit/SHA256SUMS.txt
+          cat > output/README.txt <<'README'
+          iOS16 ARM64 native Symbols API subset candidate only.
+          Passing exact exported symbol spellings is NOT proof of ABI layout or
+          protocol-witness equivalence to Apple's Symbols.framework.
+          Symbol animation rendering is NOT implemented.
+          This is not a ChatGPT IPA or installable app.
+          No finance/store entitlement and no iOS 16 device execution.
+          README
+      - name: Publish native module candidate and ABI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-total-v112-symbols-ios16-native-NOT-APP
+          path: output/
+          retention-days: 7
+          if-no-files-found: warn
