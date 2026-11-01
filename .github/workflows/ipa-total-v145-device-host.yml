@@ -32,7 +32,7 @@ jobs:
               -o "output/Payload/IPAABI145.app/Frameworks/libV145${module}Research.dylib"
           done
           SDKROOT="$SDK" xcrun --sdk iphoneos swiftc \
-            -target arm64-apple-ios16.6 -sdk "$SDK" -Onone \
+            -target arm64-apple-ios16.6 -sdk "$SDK" -parse-as-library -Onone \
             -I output/modules -L output/Payload/IPAABI145.app/Frameworks \
             -lV145FinanceKitResearch -lV145MarketplaceKitResearch \
             -Xlinker -rpath -Xlinker "@executable_path/Frameworks" \
