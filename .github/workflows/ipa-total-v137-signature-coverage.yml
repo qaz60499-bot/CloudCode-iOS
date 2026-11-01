@@ -1,0 +1,75 @@
+name: IPA Total V137 signature coverage telemetry native test NO DEVICE
+on:
+  push:
+    branches: [ci/ipa-total-v137-signature-coverage-20261101]
+    paths:
+      - .github/workflows/ipa-total-v137-signature-coverage.yml
+      - tools/chatgpt-compat/ios166-v121-map-diagnostic.c
+      - tools/chatgpt-compat/ios166-v137-signature-coverage-host.c
+      - tools/chatgpt-compat/ios166-v137-avaudio-runtime-probe.m
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compile-and-synthetic-serialization:
+    runs-on: macos-15
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile iPhoneOS diagnostic and exercise actual serializer on synthetic inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          xcodebuild -version > output/xcode.txt
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.6 -isysroot "$SDK" \
+            -O2 -Wall -Wextra -Werror tools/chatgpt-compat/ios166-v121-map-diagnostic.c \
+            -o output/map-diagnostic.ios
+          xcrun otool -l output/map-diagnostic.ios > output/commands.txt
+          grep -A6 LC_BUILD_VERSION output/commands.txt | grep -E 'minos +16\.6'
+          xcrun clang -O1 -Wall -Wextra -Werror \
+            tools/chatgpt-compat/ios166-v137-signature-coverage-host.c -o output/coverage-serializer.host
+          output/coverage-serializer.host > output/synthetic-coverage.jsonl
+          python3 - <<'PY'
+          import json,pathlib
+          cases=[json.loads(line) for line in pathlib.Path('output/synthetic-coverage.jsonl').read_text().splitlines()]
+          assert len(cases)==6
+          expected=[(None,None,None),(12288,True,True),(12287,False,True),(8191,False,False),(-1,False,False),(None,None,None)]
+          for result,(end,signature,ciphertext) in zip(cases,expected):
+              assert result['signature_coverage_end_offset']==end
+              assert result['signature_coverage_reaches_code_signature_offset'] is signature
+              assert result['signature_coverage_covers_encrypted_interval'] is ciphertext
+              assert result['encrypted_range_end']==8192
+              assert result['code_signature_offset']==12288
+              assert result['mmap_attempted'] is False and result['remap_attempted'] is False
+              assert result['read_attempted'] is False
+          print('PASS_ACTUAL_C_SERIALIZER_6_SYNTHETIC_CASES_NO_DEVICE_OR_MAPPING')
+          PY
+          shasum -a 256 output/map-diagnostic.ios output/coverage-serializer.host > output/SHA256SUMS.txt
+      - name: Recheck corrected AVFAudio metadata types on host
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          xcrun clang -target arm64-apple-macos14.0 -isysroot "$SDK" \
+            -fobjc-arc -fblocks -Werror -O2 -framework Foundation -framework AVFAudio \
+            tools/chatgpt-compat/ios166-v137-avaudio-runtime-probe.m -o output/audio-probe.host
+          output/audio-probe.host > output/audio-host-runtime.json
+          python3 - <<'PY'
+          import json,pathlib
+          r=json.loads(pathlib.Path('output/audio-host-runtime.json').read_text())
+          assert r['classPresent'] is True and r['actionsInvoked']==[]
+          assert r['runtimeEnvironment']=='macOS host'
+          assert 'AudioSession.framework' in r['classImage'] or 'AVFAudio.framework' in r['classImage']
+          for name in ['AVAudioApplicationInputMuteStateChangeNotification','AVAudioApplicationMuteStateKey']:
+              assert r['constants'][name]['present'] is True and r['constants'][name]['literal']==name
+          print('PASS_HOST_RUNTIME_METADATA_TYPES_NOT_IOS_PROOF')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ipa-total-v137-signature-coverage-NO-DEVICE
+          path: output/
+          retention-days: 7
+          if-no-files-found: error

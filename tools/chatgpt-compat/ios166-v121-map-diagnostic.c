@@ -52,6 +52,12 @@ struct diagnostic {
     bool signature_attempted;
     int signature_return;
     int signature_errno;
+    bool signature_input_valid;
+    int64_t signature_input_file_start;
+    uint64_t signature_input_blob_start;
+    uint64_t signature_input_blob_size;
+    bool signature_coverage_observed;
+    int64_t signature_coverage_end;
     bool mmap_attempted;
     int mmap_errno;
     bool remap_attempted;
@@ -338,7 +344,7 @@ static void print_inspect_result(const struct macho_info *info, uint32_t page_si
                                  bool csops_available, int csops_result,
                                  int csops_errno, bool csops_flags_valid,
                                  uint32_t csops_flags) {
-    printf("{\"schema\":\"ios166-v121-map-diagnostic/1\","
+    printf("{\"schema\":\"ios166-v121-map-diagnostic/2\","
            "\"scope\":\"precondition_only_not_decryption_or_official_compatibility\","
            "\"mode\":\"inspect\",\"status\":\"eligible\",");
     print_header(info);
@@ -359,11 +365,22 @@ static void print_inspect_result(const struct macho_info *info, uint32_t page_si
 static void print_page_result(enum run_mode mode, const struct macho_info *info,
                               const struct diagnostic *result) {
     const char *mode_name = mode == MODE_SIGNED_PAGE ? "signed-page" : "unsigned-page";
-    printf("{\"schema\":\"ios166-v121-map-diagnostic/1\","
+    uint64_t encrypted_end = (uint64_t)info->cryptoff + (uint64_t)info->cryptsize;
+    bool coverage_reaches_signature = result->signature_coverage_observed
+        && result->signature_coverage_end >= 0
+        && (uint64_t)result->signature_coverage_end >= info->signature_offset;
+    bool coverage_covers_encrypted = result->signature_coverage_observed
+        && result->signature_coverage_end >= 0
+        && (uint64_t)result->signature_coverage_end >= encrypted_end;
+    printf("{\"schema\":\"ios166-v121-map-diagnostic/2\","
            "\"scope\":\"precondition_only_not_decryption_or_official_compatibility\","
            "\"mode\":\"%s\",\"status\":\"%s\",\"reason\":\"%s\","
-           "\"span_semantics\":\"single_page_attempt_only_partial_span_semantics_unknown_failure_does_not_disprove_full_range_mapping\",",
-           mode_name, result->status, result->reason);
+           "\"span_semantics\":\"single_page_attempt_only_partial_span_semantics_unknown_failure_does_not_disprove_full_range_mapping\","
+           "\"encrypted_range_offset\":%u,\"encrypted_range_size\":%u,\"encrypted_range_end\":%llu,"
+           "\"code_signature_offset\":%u,\"code_signature_size\":%u,",
+           mode_name, result->status, result->reason,
+           info->cryptoff, info->cryptsize, (unsigned long long)encrypted_end,
+           info->signature_offset, info->signature_size);
     print_header(info);
     printf(",\"page_size\":%u,\"signature_fcntl_attempted\":%s,"
            "\"signature_fcntl_return\":",
@@ -372,6 +389,27 @@ static void print_page_result(enum run_mode mode, const struct macho_info *info,
     else printf("null");
     printf(",\"signature_fcntl_errno\":");
     if (result->signature_attempted) printf("%d", result->signature_errno);
+    else printf("null");
+    printf(",\"signature_registration_inputs\":");
+    if (result->signature_input_valid) {
+        printf("{\"fs_file_start\":%lld,\"fs_blob_start\":%llu,\"fs_blob_size\":%llu}",
+               (long long)result->signature_input_file_start,
+               (unsigned long long)result->signature_input_blob_start,
+               (unsigned long long)result->signature_input_blob_size);
+    } else {
+        printf("null");
+    }
+    printf(",\"signature_coverage_end_offset\":");
+    if (result->signature_coverage_observed) {
+        printf("%lld", (long long)result->signature_coverage_end);
+    } else {
+        printf("null");
+    }
+    printf(",\"signature_coverage_reaches_code_signature_offset\":");
+    if (result->signature_coverage_observed) printf("%s", coverage_reaches_signature ? "true" : "false");
+    else printf("null");
+    printf(",\"signature_coverage_covers_encrypted_interval\":");
+    if (result->signature_coverage_observed) printf("%s", coverage_covers_encrypted ? "true" : "false");
     else printf("null");
     printf(",\"mmap_attempted\":%s,\"mmap_errno\":",
            result->mmap_attempted ? "true" : "false");
@@ -405,7 +443,7 @@ static void print_rejection(enum run_mode mode, const char *reason) {
     const char *mode_name = mode == MODE_INSPECT ? "inspect"
         : mode == MODE_SIGNED_PAGE ? "signed-page"
         : mode == MODE_UNSIGNED_PAGE ? "unsigned-page" : "invalid";
-    printf("{\"schema\":\"ios166-v121-map-diagnostic/1\","
+    printf("{\"schema\":\"ios166-v121-map-diagnostic/2\","
            "\"scope\":\"precondition_only_not_decryption_or_official_compatibility\","
            "\"mode\":\"%s\",\"status\":\"rejected\",\"reason\":\"%s\"}\n",
            mode_name, reason);
@@ -481,6 +519,10 @@ int main(int argc, char **argv) {
         signature_registration.fs_file_start = 0;
         signature_registration.fs_blob_start = (void *)(uintptr_t)info.signature_offset;
         signature_registration.fs_blob_size = info.signature_size;
+        result.signature_input_valid = true;
+        result.signature_input_file_start = (int64_t)signature_registration.fs_file_start;
+        result.signature_input_blob_start = (uint64_t)(uintptr_t)signature_registration.fs_blob_start;
+        result.signature_input_blob_size = (uint64_t)signature_registration.fs_blob_size;
         errno = 0;
         result.signature_attempted = true;
         result.signature_return = fcntl(fd, F_ADDFILESIGS_RETURN, &signature_registration);
@@ -492,6 +534,8 @@ int main(int argc, char **argv) {
             close(fd);
             return 1;
         }
+        result.signature_coverage_observed = true;
+        result.signature_coverage_end = (int64_t)signature_registration.fs_file_start;
     }
 
     uint8_t baseline[READ_BYTES];

@@ -112,7 +112,7 @@ int main(void) {
             @"runtimeEnvironment": runtimeEnvironment,
             @"hostOS": osVersion,
             @"frameworkPath": [NSString stringWithUTF8String:frameworkPath],
-            @"classPresent": @(cls != Nil),
+            @"classPresent": cls != Nil ? @YES : @NO,
             @"classImage": imagePath != NULL ? [NSString stringWithUTF8String:imagePath] : @"",
             @"constants": @{
                 @"AVAudioApplicationInputMuteStateChangeNotification":
