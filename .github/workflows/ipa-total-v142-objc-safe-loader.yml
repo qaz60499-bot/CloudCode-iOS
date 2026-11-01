@@ -1,0 +1,115 @@
+name: IPA Total V142 class-collision & ABI loader controls (NOT APP)
+on:
+  push:
+    branches:
+      - ci/ipa-total-v142-objc-safe-loader-20261101
+    paths:
+      - .github/workflows/ipa-total-v142-objc-safe-loader.yml
+      - tools/chatgpt-compat/ios166-v142-safe-objc-loader.m
+      - tools/chatgpt-compat/ios166-v142-objc-unique-control.m
+      - tools/chatgpt-compat/ChatGPTCompatAVAudioApplication-ios166.m
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-dlopen-class-abi-negative-controls:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build real Apple ObjC runtime loader and check fail-closed preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/audit
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=14.0 -isysroot "$SDK" \
+            -fobjc-arc -fblocks -Wall -Wextra -Werror -O1 \
+            -framework Foundation -framework AVFAudio \
+            tools/chatgpt-compat/ios166-v142-safe-objc-loader.m -o output/v142-objc-loader
+          for name in good bad; do
+            flags=()
+            if [ "$name" = bad ]; then flags=(-DV142_BAD_ABI); fi
+            xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=14.0 -isysroot "$SDK" \
+              -fobjc-arc -fblocks -Wall -Wextra -Werror -O1 -dynamiclib \
+              "${flags[@]}" \
+              -Wl,-install_name,@rpath/libV142UniqueClass.dylib \
+              -framework Foundation \
+              tools/chatgpt-compat/ios166-v142-objc-unique-control.m \
+              -o "output/v142-${name}.dylib"
+          done
+          GOOD="$(pwd -P)/output/v142-good.dylib"
+          BAD="$(pwd -P)/output/v142-bad.dylib"
+          ./output/v142-objc-loader "$GOOD" IPACompatV142ProbeClass > output/audit/unique-good.txt
+          grep -F PASS_ISOLATED_OBJC_CLASS_OWNER_AND_4_METHOD_ABIS output/audit/unique-good.txt
+          set +e
+          ./output/v142-objc-loader "$BAD" IPACompatV142ProbeClass > output/audit/unique-bad.txt 2>&1
+          code=$?
+          set -e
+          echo "negative method ABI code: $code"
+          test "$code" -eq 23
+          grep -F FAIL_OBJC_METHOD_ABI output/audit/unique-bad.txt
+
+          # An Apple-implemented class is already present once system AVFAudio
+          # is loaded. The runner must refuse before loading ANY candidate.
+          set +e
+          ./output/v142-objc-loader "$GOOD" AVAudioApplication > output/audit/duplicate-class.txt 2>&1
+          code=$?
+          set -e
+          echo "duplicate-class prevention code: $code"
+          test "$code" -eq 20
+          grep -F 'candidate NOT LOADED' output/audit/duplicate-class.txt
+          xcrun otool -L output/v142-objc-loader > output/audit/loader-libraries.txt
+          shasum -a 256 output/v142-objc-loader output/v142-good.dylib output/v142-bad.dylib > output/audit/SHA256SUMS.txt
+          printf '%s\n' \
+            'PASS: self-written macOS arm64 unique ObjC class dlopen + owner + four method ABI checks.' \
+            'PASS: wrong method ABI -> exit23; duplicate Apple AVAudioApplication -> exit20 without candidate dlopen.' \
+            'NOT TESTED: iOS16.6 phone runtime; genuine AVAudioApplication candidate; official ChatGPT.' \
+            > output/audit/BOUNDARY.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-total-v142-objc-macos-controls-NOT-APP
+          path: output/audit/
+          retention-days: 7
+          if-no-files-found: error
+
+  native-ios166-research-loader-compile-only:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: iPhoneOS arm64 native compilation; no device launch or app packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/audit
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.6 -isysroot "$SDK" \
+            -miphoneos-version-min=16.6 -fobjc-arc -fblocks -Wall -Wextra -Werror -O1 \
+            -framework Foundation -framework AVFAudio \
+            tools/chatgpt-compat/ios166-v142-safe-objc-loader.m -o output/v142-ios166-loader
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.6 -isysroot "$SDK" \
+            -miphoneos-version-min=16.6 -fobjc-arc -fblocks -Wall -Wextra -Werror -O1 \
+            -dynamiclib -Wl,-install_name,@rpath/IPACompatAVAudioApplication.dylib \
+            -framework Foundation -framework AVFAudio \
+            tools/chatgpt-compat/ChatGPTCompatAVAudioApplication-ios166.m \
+            -o output/IPACompatAVAudioApplication.dylib
+          xcrun otool -l output/v142-ios166-loader > output/audit/loader-commands.txt
+          xcrun otool -l output/IPACompatAVAudioApplication.dylib > output/audit/candidate-commands.txt
+          xcrun nm -gU output/IPACompatAVAudioApplication.dylib > output/audit/candidate-exports.txt
+          grep -A5 LC_BUILD_VERSION output/audit/loader-commands.txt | grep -E 'minos +16\.6'
+          grep -A5 LC_BUILD_VERSION output/audit/candidate-commands.txt | grep -E 'minos +16\.6'
+          grep -F '_OBJC_CLASS_$_AVAudioApplication' output/audit/candidate-exports.txt
+          shasum -a 256 output/v142-ios166-loader output/IPACompatAVAudioApplication.dylib > output/audit/SHA256SUMS.txt
+          printf '%s\n' \
+            'PASS only if native arm64 iPhoneOS16.6 research loader & candidate compile.' \
+            'NOT TESTED: actual iOS16.6 dlopen; class conflict; real runtime method ABI; audio or official app.' \
+            > output/audit/BOUNDARY.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-total-v142-iphoneos-arm64-compile-NOT-APP
+          path: output/audit/
+          retention-days: 7
+          if-no-files-found: error
