@@ -22,7 +22,7 @@ jobs:
           APP="$BASE/Payload/IPAFairPlayProbe.app"
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           mkdir -p "$APP" "$BASE/audit"
-          xcrun --sdk iphoneos clang             -target arm64-apple-ios16.6 -isysroot "$SDK" -miphoneos-version-min=16.6             -fobjc-arc -O2 -Wall -Werror -fno-common             tools/chatgpt-compat/ios166-v118-fairplay-probe.m             -framework UIKit -framework Foundation             -o "$APP/IPAFairPlayProbe"
+          xcrun --sdk iphoneos clang             -target arm64-apple-ios16.6 -isysroot "$SDK" -miphoneos-version-min=16.6             -fobjc-arc -O2 -Wall -Werror -fno-common             tools/chatgpt-compat/ios166-v118-fairplay-probe.m             -framework UIKit -framework Foundation -framework CoreGraphics             -o "$APP/IPAFairPlayProbe"
           cat > "$APP/Info.plist" <<'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
