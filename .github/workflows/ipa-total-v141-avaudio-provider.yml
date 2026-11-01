@@ -1,0 +1,104 @@
+name: IPA Total V141 AVFAudio two-level provider route (isolated NOT APP)
+on:
+  push:
+    branches:
+      - ci/ipa-total-v141-avaudio-provider-20261101
+    paths:
+      - .github/workflows/ipa-total-v141-avaudio-provider.yml
+      - tools/chatgpt-compat/ios166-v141-avaudio-provider-client.m
+      - tools/chatgpt-compat/ios166-v141-avaudio-provider-constants.m
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-apple-client-provider-differential:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apple-linked original vs isolated redirected provider
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/negative output/audit
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          # Real Apple headers + Apple's AVFAudio library are used for the client.
+          SDKROOT="$SDK" xcrun --sdk macosx clang \
+            -arch arm64 -mmacosx-version-min=14.0 -isysroot "$SDK" \
+            -fobjc-arc -Wall -Wextra -Werror -O1 \
+            -Wl,-headerpad_max_install_names \
+            -framework Foundation -framework AVFAudio \
+            tools/chatgpt-compat/ios166-v141-avaudio-provider-client.m \
+            -o output/v141-client
+          xcrun otool -L output/v141-client > output/audit/client-before.txt
+          ORIGINAL="$(awk '/AVFAudio.framework\/.*AVFAudio/ {print $1; exit}' output/audit/client-before.txt)"
+          test -n "$ORIGINAL"
+          echo "Apple SDK original load command: $ORIGINAL"
+          ./output/v141-client apple > output/audit/apple-provider.txt
+
+          # The candidate has ONLY two actual NSString exports, not the ObjC
+          # class (avoids undefined duplicate AVAudioApplication class behavior).
+          SDKROOT="$SDK" xcrun --sdk macosx clang \
+            -arch arm64 -mmacosx-version-min=14.0 -isysroot "$SDK" \
+            -fobjc-arc -Wall -Wextra -Werror -O1 -dynamiclib \
+            -Wl,-install_name,@rpath/libV141AVAudioConstants.dylib \
+            -framework Foundation \
+            tools/chatgpt-compat/ios166-v141-avaudio-provider-constants.m \
+            -o output/libV141AVAudioConstants.dylib
+          xcrun nm -gU output/libV141AVAudioConstants.dylib > output/audit/provider-exports.txt
+          grep -E '[[:space:]]_AVAudioApplicationInputMuteStateChangeNotification$' output/audit/provider-exports.txt
+          grep -E '[[:space:]]_AVAudioApplicationMuteStateKey$' output/audit/provider-exports.txt
+
+          # ONLY patch a freshly compiled independent test client. Never modify
+          # genuine official ChatGPT images, macOS/iOS system files or services.
+          cp output/v141-client output/v141-client-rebound
+          xcrun install_name_tool \
+            -change "$ORIGINAL" "@rpath/libV141AVAudioConstants.dylib" \
+            -add_rpath "@executable_path" output/v141-client-rebound
+          codesign --force --sign - output/v141-client-rebound
+          xcrun otool -L output/v141-client-rebound > output/audit/client-after.txt
+          grep -F '@rpath/libV141AVAudioConstants.dylib' output/audit/client-after.txt
+          ! grep -F "$ORIGINAL" output/audit/client-after.txt
+          ./output/v141-client-rebound candidate > output/audit/redirected-provider.txt
+          grep -F 'libV141AVAudioConstants.dylib' output/audit/redirected-provider.txt
+
+          # Strict negative control: same dylib ID but one strong NSString
+          # symbol missing. dyld must refuse process launch, not silently use
+          # the Apple system AVFAudio or declare provider closure complete.
+          SDKROOT="$SDK" xcrun --sdk macosx clang \
+            -arch arm64 -mmacosx-version-min=14.0 -isysroot "$SDK" \
+            -fobjc-arc -Wall -Wextra -Werror -O1 -dynamiclib \
+            -DV141_OMIT_SECOND \
+            -Wl,-install_name,@rpath/libV141AVAudioConstants.dylib \
+            -framework Foundation \
+            tools/chatgpt-compat/ios166-v141-avaudio-provider-constants.m \
+            -o output/negative/libV141AVAudioConstants.dylib
+          cp output/v141-client-rebound output/negative/v141-client-rebound
+          set +e
+          (cd output/negative && ./v141-client-rebound candidate) > output/audit/missing-strong-import.txt 2>&1
+          code=$?
+          set -e
+          echo "missing strong import launch status: $code"
+          test "$code" -ne 0
+          grep -Ei 'AVAudioApplicationMuteStateKey|symbol not found|missing symbol' \
+            output/audit/missing-strong-import.txt
+
+          # This is macOS arm64 load behavior. It does NOT prove the iOS16
+          # device's dyld, AVAudio class ABI, notification semantics, or the
+          # encrypted ChatGPT image can be patched/loaded.
+          xcrun otool -L output/libV141AVAudioConstants.dylib > output/audit/provider-libraries.txt
+          shasum -a 256 output/v141-client output/v141-client-rebound \
+            output/libV141AVAudioConstants.dylib > output/audit/SHA256SUMS.txt
+          printf '%s\n' \
+            'PASS: self-written Apple-SDK-linked client redirected only in isolation.' \
+            'PASS: missing strong import prevents launch. Host macOS arm64 only.' \
+            'NOT TESTED: iOS16.6 runtime, AVAudioApplication ObjC class routing, input mute, official IPA boot.' \
+            > output/README.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-total-v141-avaudio-provider-ISOLATED-NOT-APP
+          path: output/audit/
+          retention-days: 7
+          if-no-files-found: error
