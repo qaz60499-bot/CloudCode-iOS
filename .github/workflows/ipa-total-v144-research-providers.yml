@@ -43,7 +43,7 @@ jobs:
             esac
             SDKROOT="$SDK" xcrun --sdk iphoneos swiftc \
               -target arm64-apple-ios16.6 -sdk "$SDK" -parse-as-library \
-              -emit-library -emit-module -Onone \
+              -emit-library -emit-module -enable-library-evolution -Onone \
               -module-name "$module" "${flags[@]}" \
               -Xlinker -install_name -Xlinker "@rpath/libV144${name}Research.dylib" \
               "$src" -o "output/libV144${name}Research.dylib"
