@@ -1,0 +1,74 @@
+name: IPA Total V144 iPhoneOS16.6 isolated Swift provider ABI controls (NOT APP)
+on:
+  push:
+    branches:
+      - ci/ipa-total-v144-research-providers-20261101
+    paths:
+      - .github/workflows/ipa-total-v144-research-providers.yml
+      - tools/chatgpt-compat/ios166-v144-*
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-ios166-swift-providers:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile independent fail-closed Swift research provider libraries and check 22 actual exports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/audit
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          for name in finance market negative; do
+            case "$name" in
+              finance)
+                module=FinanceKit
+                src=tools/chatgpt-compat/ios166-v144-research-FinanceKit.swift
+                flags=(-DV144_POSITIVE)
+                ;;
+              market)
+                module=MarketplaceKit
+                src=tools/chatgpt-compat/ios166-v144-research-MarketplaceKit.swift
+                flags=(-DV144_POSITIVE)
+                ;;
+              negative)
+                module=FinanceKit
+                src=tools/chatgpt-compat/ios166-v144-research-FinanceKit.swift
+                flags=(-DV144_NEGATIVE)
+                ;;
+            esac
+            SDKROOT="$SDK" xcrun --sdk iphoneos swiftc \
+              -target arm64-apple-ios16.6 -sdk "$SDK" -parse-as-library \
+              -emit-library -emit-module -Onone \
+              -module-name "$module" "${flags[@]}" \
+              -Xlinker -install_name -Xlinker "@rpath/libV144${name}Research.dylib" \
+              "$src" -o "output/libV144${name}Research.dylib"
+            file "output/libV144${name}Research.dylib" | grep -E 'Mach-O 64-bit.*arm64'
+            xcrun nm -gU "output/libV144${name}Research.dylib" > "output/audit/${name}-exports.txt"
+            xcrun otool -l "output/libV144${name}Research.dylib" > "output/audit/${name}-commands.txt"
+            grep -A5 LC_BUILD_VERSION "output/audit/${name}-commands.txt" | grep -E 'minos +16\.6'
+          done
+          python3 tools/chatgpt-compat/ios166-v144-research-provider-export-audit.py \
+            --manifest tools/chatgpt-compat/ios166-v144-expected-strong-symbols.txt \
+            --finance-nm output/audit/finance-exports.txt \
+            --market-nm output/audit/market-exports.txt \
+            --finance-negative-nm output/audit/negative-exports.txt \
+            > output/audit/compare.json
+          cat output/audit/compare.json
+          shasum -a 256 output/libV144*Research.dylib > output/audit/SHA256SUMS.txt
+          printf '%s\n' \
+            'These are independent, self-written iPhoneOS16.6 Swift ABI research libraries.' \
+            'FinanceKit candidate denies financial data and authorization; MarketplaceKit getter throws.' \
+            'No real provider path/Swift metadata witness/async behavior/dyld closure or official app execution.' \
+            'Do not install as system frameworks or claim these are feature-complete replacements.' \
+            > output/audit/BOUNDARY.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-total-v144-swift-provider-export-audit-NOT-APP
+          path: output/audit/
+          retention-days: 7
+          if-no-files-found: error
