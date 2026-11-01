@@ -37,6 +37,13 @@ struct OptionsDifferential {
             ("repeat2ThenNonRepeating", .repeat(2).nonRepeating),
             ("speedNegativeThen2", .speed(-1).speed(2)),
             ("repeatNegativeDelay0", .repeat(.periodic(-1, delay: 0))),
+            ("repeat2ThenNil", .repeat(2).repeat(nil)),
+            ("speed2Repeat2ThenNil", .speed(2).repeat(2).repeat(nil)),
+            ("repeatNegative2", .repeat(-2)), ("speedNegative2", .speed(-2)),
+            ("periodic2DelayNegative", .repeat(.periodic(2, delay: -1))),
+            ("periodic2DelayInfinity", .repeat(.periodic(2, delay: .infinity))),
+            ("periodic2DelayNaN", .repeat(.periodic(2, delay: .nan))),
+            ("periodic2ThenNil", .repeat(.periodic(2, delay: 0.5)).repeat(nil)),
         ]
         var equalities: [String: Bool] = [:]
         var witnesses: [String: Bool] = [:]
@@ -61,4 +68,3 @@ struct OptionsDifferential {
         print(String(decoding: try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]), as: UTF8.self))
     }
 }
-

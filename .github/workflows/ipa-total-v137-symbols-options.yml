@@ -193,6 +193,55 @@ jobs:
             --apple output/audit/apple-native-behavior.json \
             --candidate output/audit/candidate-native-behavior.json \
             --output output/audit/native-behavior-comparison.json
+          python3 tools/chatgpt-compat/ios166-v137-symbols-options-compare.py \
+            --apple output/audit/apple-native-behavior.json \
+            --candidate output/audit/candidate-native-behavior.json \
+            --swapped output/audit/apple-compiled-swap-stdout.txt \
+            --execution output/audit/apple-compiled-swap-result.json \
+            --output output/audit/v137-options-and-swap.json
+          printf 'import Symbols\nlet invalid = SymbolEffectOptions.repeat()\n' > "$RUNNER_TEMP/noarg.swift"
+          if xcrun swiftc -typecheck -target "$HOST_TARGET" "$RUNNER_TEMP/noarg.swift" > output/audit/apple-noarg.txt 2>&1; then
+            echo 'Apple unexpectedly accepted no-argument repeat'; exit 1
+          fi
+          if xcrun swiftc -typecheck -target "$HOST_TARGET" -I output/swap "$RUNNER_TEMP/noarg.swift" > output/audit/candidate-noarg.txt 2>&1; then
+            echo 'Candidate unexpectedly accepted no-argument repeat'; exit 1
+          fi
+          grep -F 'missing argument for parameter #1' output/audit/apple-noarg.txt
+          grep -F 'missing argument for parameter #1' output/audit/candidate-noarg.txt
+      - name: Regression of effect configuration and Apple compiled witness client
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOST_TARGET="$(uname -m)-apple-macosx15.0"
+          xcrun swiftc -parse-as-library -target "$HOST_TARGET" \
+            tools/chatgpt-compat/ios166-v136-symbols-behavior.swift -o output/host/apple-effects
+          xcrun swiftc -parse-as-library -target "$HOST_TARGET" -D IPA_HOST_CANDIDATE \
+            -I output/host -L output/host -lIPASymbolsCandidate \
+            -Xlinker -rpath -Xlinker "$PWD/output/host" \
+            tools/chatgpt-compat/ios166-v136-symbols-behavior.swift -o output/host/candidate-effects
+          output/host/apple-effects > output/audit/apple-effects.json
+          output/host/candidate-effects > output/audit/candidate-effects.json
+          cp output/host/apple-effects output/swap/apple-compiled-effects
+          APPLE_PROVIDER="$(xcrun otool -L output/swap/apple-compiled-effects | awk '/\/Symbols.framework\// {print $1}')"
+          test -n "$APPLE_PROVIDER"
+          xcrun install_name_tool -change "$APPLE_PROVIDER" @rpath/IPASymbolsCompatCandidate.dylib \
+            -add_rpath @executable_path output/swap/apple-compiled-effects
+          codesign --force --sign - output/swap/apple-compiled-effects
+          xcrun otool -L output/swap/apple-compiled-effects > output/audit/effects-swap-dependencies.txt
+          python3 - <<'PY'
+          import json, pathlib, subprocess
+          root=pathlib.Path('output/audit')
+          result=subprocess.run(['output/swap/apple-compiled-effects'],capture_output=True,text=True,timeout=20)
+          (root/'effects-swap-execution.json').write_text(json.dumps({'returncode':result.returncode,'stderr':result.stderr}))
+          (root/'effects-swapped.json').write_text(result.stdout)
+          assert result.returncode==0 and not result.stderr, 'isolated precompiled effects client failed'
+          PY
+          python3 tools/chatgpt-compat/ios166-v136-symbols-behavior-compare.py \
+            --apple output/audit/apple-effects.json --candidate output/audit/candidate-effects.json \
+            --output output/audit/effects-comparison.json
+          python3 tools/chatgpt-compat/ios166-v136-symbols-behavior-compare.py \
+            --apple output/audit/candidate-effects.json --candidate output/audit/effects-swapped.json \
+            --output output/audit/effects-swap-comparison.json
       - name: Publish native module candidate and ABI evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -201,4 +250,27 @@ jobs:
           path: output/
           retention-days: 7
           if-no-files-found: warn
-
+  avaudio-host-runtime:
+    runs-on: macos-15
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read public AVFAudio host runtime metadata without permission calls
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/v137-avaudio
+          xcodebuild -version > output/v137-avaudio/xcode.txt
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          xcrun --sdk macosx clang -target arm64-apple-macos14.0 -isysroot "$SDK" \
+            -fobjc-arc -fblocks -Werror -O2 -framework Foundation -framework AVFAudio \
+            tools/chatgpt-compat/ios166-v137-avaudio-runtime-probe.m \
+            -o output/v137-avaudio/probe
+          output/v137-avaudio/probe | tee output/v137-avaudio/host-runtime.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ipa-total-v137-avaudio-host-metadata-NOT-APP
+          path: output/v137-avaudio/
+          retention-days: 7
+          if-no-files-found: warn

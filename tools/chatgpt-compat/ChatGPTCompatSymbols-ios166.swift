@@ -1,4 +1,4 @@
-// IPA Total V136 - iOS16.6 Symbols public-API subset candidate.
+// IPA Total V137 - iOS16.6 Symbols public-API subset candidate.
 // Independent replacement subset for research: not Apple's Symbols.framework.
 // Exact exported names, API shape, resilient layout and witness semantics are
 // distinct tests. Do NOT install this in production or claim animations work.
@@ -86,8 +86,7 @@ public struct SymbolEffectOptions: Hashable, Sendable {
     internal var repeatRequest: RepeatRequest?
 
     internal init(speedMultiplier: Double = 1.0, repeatRequest: RepeatRequest? = nil) {
-        self.speedMultiplier = speedMultiplier.isFinite && speedMultiplier > 0
-            ? speedMultiplier : 1.0
+        self.speedMultiplier = speedMultiplier
         self.repeatRequest = repeatRequest
     }
 
@@ -97,7 +96,9 @@ public struct SymbolEffectOptions: Hashable, Sendable {
     }
     public func speed(_ value: Double) -> Self {
         var result = self
-        result.speedMultiplier = value.isFinite && value > 0 ? value : 1.0
+        // Preserve the request verbatim, including zero, negative, infinity and
+        // NaN. V137 Apple native equality does not normalize these to default.
+        result.speedMultiplier = value
         return result
     }
     public static var repeating: Self {
@@ -125,8 +126,8 @@ public struct SymbolEffectOptions: Hashable, Sendable {
 
         internal init(kind: Kind, count: Int? = nil, delay: Double? = nil) {
             self.kind = kind
-            self.count = count.map { max(0, $0) }
-            self.delay = delay.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
+            self.count = count
+            self.delay = delay
         }
     }
     public struct RepeatBehavior {
@@ -140,11 +141,15 @@ public struct SymbolEffectOptions: Hashable, Sendable {
             Self(request: RepeatRequest(kind: .periodic, count: count, delay: delay))
         }
     }
-    public static func `repeat`(_ count: Int? = nil) -> Self {
+    public static func `repeat`(_ count: Int?) -> Self {
         Self.default.`repeat`(count)
     }
-    public func `repeat`(_ count: Int? = nil) -> Self {
-        self.`repeat`(.periodic(count))
+    public func `repeat`(_ count: Int?) -> Self {
+        // The legacy optional-count overload differs from RepeatBehavior:
+        // nil clears an existing repeat request; .periodic(nil) repeats forever.
+        var result = self
+        result.repeatRequest = count.map { RepeatRequest(kind: .periodic, count: $0) }
+        return result
     }
     public static func `repeat`(_ behavior: RepeatBehavior) -> Self {
         Self.default.`repeat`(behavior)
