@@ -30,7 +30,7 @@ jobs:
             -framework Foundation -framework AVFAudio \
             tools/chatgpt-compat/ios166-v142-safe-objc-loader.m -o output/v142-objc-loader
           for name in good bad; do
-            flags=()
+            flags=(-DV142_CONTROL_GOOD)
             if [ "$name" = bad ]; then flags=(-DV142_BAD_ABI); fi
             xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=14.0 -isysroot "$SDK" \
               -fobjc-arc -fblocks -Wall -Wextra -Werror -O1 -dynamiclib \
