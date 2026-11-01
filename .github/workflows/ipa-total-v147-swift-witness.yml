@@ -1,0 +1,86 @@
+name: IPA Total V147 real Swift witness, resilient enum and async tasks (HOST ONLY)
+on:
+  push:
+    branches:
+      - ci/ipa-total-v147-swift-witness-20261101
+    paths:
+      - .github/workflows/ipa-total-v147-swift-witness.yml
+      - tools/chatgpt-compat/ios166-v147-witness-enum-async-host-client.swift
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  swift-resilient-abi-witness-differential:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile resilient providers and prove imported Swift witness/metadata/enum/task runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/modules output/positive output/negative output/audit
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          for module in FinanceKit MarketplaceKit; do
+            SDKROOT="$SDK" xcrun --sdk macosx swiftc \
+              -target arm64-apple-macos14.0 -sdk "$SDK" -parse-as-library \
+              -emit-library -emit-module -enable-library-evolution -Onone \
+              -emit-module-path "output/modules/${module}.swiftmodule" \
+              -module-name "$module" \
+              -Xlinker -install_name -Xlinker "@rpath/libV147${module}Research.dylib" \
+              "tools/chatgpt-compat/ios166-v144-research-${module}.swift" \
+              -o "output/positive/libV147${module}Research.dylib"
+            codesign --force --sign - "output/positive/libV147${module}Research.dylib"
+          done
+          SDKROOT="$SDK" xcrun --sdk macosx swiftc \
+            -target arm64-apple-macos14.0 -sdk "$SDK" -parse-as-library -Onone \
+            -I output/modules -L output/positive \
+            -lV147FinanceKitResearch -lV147MarketplaceKitResearch \
+            -Xlinker -rpath -Xlinker '@executable_path/positive' \
+            tools/chatgpt-compat/ios166-v147-witness-enum-async-host-client.swift \
+            -o output/v147-positive
+          codesign --force --sign - output/v147-positive
+          file output/v147-positive | grep -E 'Mach-O 64-bit.*arm64'
+          xcrun otool -L output/v147-positive > output/audit/imports.txt
+          grep -F '@rpath/libV147FinanceKitResearch.dylib' output/audit/imports.txt
+          grep -F '@rpath/libV147MarketplaceKitResearch.dylib' output/audit/imports.txt
+          output/v147-positive > output/audit/positive.txt 2>&1
+          grep -F 'PASS_V147_REAL_IMPORTED_WITNESS_RESILIENT_ENUM_CONCURRENT_ASYNC' output/audit/positive.txt
+
+          # True negative: runtime provider has the same type and async members,
+          # but no Equatable witness conformance; client remains unmodified.
+          # The negative is isolated to the self-written test library, never an Apple app.
+          python3 -c 'from pathlib import Path; src=Path("tools/chatgpt-compat/ios166-v144-research-FinanceKit.swift").read_text(); needle="public enum AuthorizationStatus: Equatable {"; assert src.count(needle)==1; Path("output/negative/FinanceKit.swift").write_text(src.replace(needle, "public enum AuthorizationStatus {"))'
+          SDKROOT="$SDK" xcrun --sdk macosx swiftc \
+            -target arm64-apple-macos14.0 -sdk "$SDK" -parse-as-library \
+            -emit-library -enable-library-evolution -Onone -module-name FinanceKit \
+            -Xlinker -install_name -Xlinker '@rpath/libV147FinanceKitResearch.dylib' \
+            output/negative/FinanceKit.swift \
+            -o output/negative/libV147FinanceKitResearch.dylib
+          codesign --force --sign - output/negative/libV147FinanceKitResearch.dylib
+          cp output/positive/libV147MarketplaceKitResearch.dylib output/negative/
+          cp output/v147-positive output/v147-negative
+          install_name_tool -rpath '@executable_path/positive' '@executable_path/negative' output/v147-negative
+          codesign --force --sign - output/v147-negative
+          set +e
+          output/v147-negative > output/audit/negative.txt 2>&1
+          negative_exit=$?
+          set -e
+          echo "WITNESS_NEGATIVE_EXIT=$negative_exit" | tee output/audit/negative-exit.txt
+          test "$negative_exit" -ne 0
+          grep -Ei 'symbol not found|missing symbol' output/audit/negative.txt
+          grep -Ei 'Equatable|FinanceKit' output/audit/negative.txt
+          shasum -a 256 output/v147-positive output/v147-negative \
+            output/positive/*.dylib output/negative/*.dylib > output/audit/SHA256SUMS.txt
+          printf '%s\n' \
+            'PASS: macOS arm64 real imported Swift witness, resilient enum payload, async existential and concurrent task group.' \
+            'PASS: missing protocol witness in self-written provider gives real dyld negative; unmodified test client.' \
+            'NOT TESTED: iPhone14,2 iOS16.6 device runtime; native Apple framework semantic equivalence.' \
+            'NOT OFFICIAL ChatGPT; FairPlay startup images 0/6 and user features 0/5 remain.' \
+            > output/audit/BOUNDARY.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-total-v147-host-witness-enum-async-evidence-NOT-APP
+          path: output/audit/
+          retention-days: 7
+          if-no-files-found: error
