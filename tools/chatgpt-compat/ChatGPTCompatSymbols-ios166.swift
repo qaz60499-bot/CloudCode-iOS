@@ -21,7 +21,8 @@ public struct SymbolEffectConfiguration: Hashable, Sendable {
 public protocol SymbolEffect: Hashable, Sendable {
     var configuration: SymbolEffectConfiguration { get }
 }
-public protocol ContentTransitionSymbolEffect: SymbolEffect {}
+public protocol ContentTransitionSymbolEffect {}
+public protocol TransitionSymbolEffect {}
 
 public struct ReplaceSymbolEffect: SymbolEffect, ContentTransitionSymbolEffect {
     public var configuration: SymbolEffectConfiguration
@@ -63,7 +64,7 @@ public struct ReplaceSymbolEffect: SymbolEffect, ContentTransitionSymbolEffect {
     }
 }
 
-public struct AutomaticSymbolEffect: SymbolEffect, ContentTransitionSymbolEffect {
+public struct AutomaticSymbolEffect: SymbolEffect, ContentTransitionSymbolEffect, TransitionSymbolEffect {
     public var configuration: SymbolEffectConfiguration
     public init() {
         self.configuration = SymbolEffectConfiguration(kind: .automatic)
@@ -74,12 +75,12 @@ public struct SymbolEffectOptions: Hashable, Sendable {
     // Internal representation models real user-visible repeat + speed requests,
     // but is NOT asserted to match Apple's private struct memory layout.
     internal var speedMultiplier: Double
-    internal var repeatBehavior: RepeatBehavior?
+    internal var repeatRequest: RepeatRequest?
 
-    internal init(speedMultiplier: Double = 1.0, repeatBehavior: RepeatBehavior? = nil) {
+    internal init(speedMultiplier: Double = 1.0, repeatRequest: RepeatRequest? = nil) {
         self.speedMultiplier = speedMultiplier.isFinite && speedMultiplier > 0
             ? speedMultiplier : 1.0
-        self.repeatBehavior = repeatBehavior
+        self.repeatRequest = repeatRequest
     }
 
     public static var `default`: Self { Self() }
@@ -106,7 +107,7 @@ public struct SymbolEffectOptions: Hashable, Sendable {
     // The SDK's nested type is a struct, not the previous guessed enum.
     // Preserve periodic and continuous requests distinctly. No renderer or
     // equivalence to Apple's resilient value layout is implied by these fields.
-    public struct RepeatBehavior: Hashable, Sendable {
+    internal struct RepeatRequest: Hashable, Sendable {
         internal enum Kind: UInt8, Hashable, Sendable {
             case periodic, continuous
         }
@@ -119,10 +120,16 @@ public struct SymbolEffectOptions: Hashable, Sendable {
             self.count = count.map { max(0, $0) }
             self.delay = delay.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
         }
-        public static var continuous: Self { Self(kind: .continuous) }
-        public static var periodic: Self { Self(kind: .periodic) }
+    }
+    public struct RepeatBehavior {
+        // Apple does not expose Hashable/Sendable conformances for this type.
+        // Keep comparable/sendable storage in the internal request instead.
+        internal var request: RepeatRequest
+        internal init(request: RepeatRequest) { self.request = request }
+        public static var continuous: Self { Self(request: RepeatRequest(kind: .continuous)) }
+        public static var periodic: Self { Self(request: RepeatRequest(kind: .periodic)) }
         public static func periodic(_ count: Int? = nil, delay: Double? = nil) -> Self {
-            Self(kind: .periodic, count: count, delay: delay)
+            Self(request: RepeatRequest(kind: .periodic, count: count, delay: delay))
         }
     }
     public static func `repeat`(_ count: Int? = nil) -> Self {
@@ -136,7 +143,7 @@ public struct SymbolEffectOptions: Hashable, Sendable {
     }
     public func `repeat`(_ behavior: RepeatBehavior) -> Self {
         var result = self
-        result.repeatBehavior = behavior
+        result.repeatRequest = behavior.request
         return result
     }
 }

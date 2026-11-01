@@ -4,7 +4,8 @@ import json
 from pathlib import Path
 
 TARGET = {"SymbolEffect", "ContentTransitionSymbolEffect", "SymbolEffectOptions",
-          "SymbolEffectConfiguration", "ReplaceSymbolEffect", "AutomaticSymbolEffect"}
+          "SymbolEffectConfiguration", "ReplaceSymbolEffect", "AutomaticSymbolEffect",
+          "TransitionSymbolEffect"}
 
 def describe(decl, depth=0):
     if depth > 4:
@@ -22,7 +23,7 @@ def describe(decl, depth=0):
 def summarize(raw):
     declarations = raw["ABIRoot"]["children"]
     result = {d["name"]: describe(d) for d in declarations if d.get("name") in TARGET}
-    if set(result) != TARGET:
+    if not (TARGET - {"TransitionSymbolEffect"}) <= set(result):
         raise ValueError("missing selected public SDK/candidate type")
     return {"schema": "ios166-v123-symbols-public-shape/1", "types": result,
             "private_layout_read": False, "runtime_compatibility_proven": False}

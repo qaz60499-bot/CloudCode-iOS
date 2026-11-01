@@ -102,12 +102,22 @@ jobs:
                             'missing_public_signatures':missing,'extra_public_signatures':extra}
           report['swift_binary_layout_or_witness_proven']=False
           report['official_app_verified']=False
+          report['public_conformance_differences']={}
+          for name in apple:
+              if apple[name]['conformances']!=own[name]['conformances']:
+                  report['public_conformance_differences'][name]={
+                      'apple':apple[name]['conformances'],'candidate':own[name]['conformances']}
+          ar,br=nested(apple['SymbolEffectOptions']),nested(own['SymbolEffectOptions'])
+          if ar['conformances']!=br['conformances']:
+              report['public_conformance_differences']['RepeatBehavior']={
+                  'apple':ar['conformances'],'candidate':br['conformances']}
           pathlib.Path('output/audit/options-public-comparison.json').write_text(json.dumps(report,indent=2))
           print(json.dumps(report,indent=2))
           for key in ('SymbolEffectOptions','RepeatBehavior'):
               assert report[key]['apple_kind']==report[key]['candidate_kind']=='Struct'
               assert not report[key]['missing_public_signatures'], key+' missing public overload'
               assert not report[key]['extra_public_signatures'], key+' extra public overload'
+          assert not report['public_conformance_differences'], 'public protocol conformance mismatch'
           PY
       - name: Publish native module candidate and ABI evidence
         if: always()
