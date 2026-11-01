@@ -19,7 +19,7 @@ struct OptionsDifferential {
             ("speedNegative", .speed(-1)), ("speedInfinity", .speed(.infinity)),
             ("speedNaN", .speed(.nan)), ("speed2then1", .speed(2).speed(1)),
             ("repeating", .repeating), ("nonRepeating", .nonRepeating),
-            ("repeatNil", .repeat()), ("repeat0", .repeat(0)),
+            ("repeatNil", .repeat(nil)), ("repeat0", .repeat(0)),
             ("repeat1", .repeat(1)), ("repeat2", .repeat(2)),
             ("repeatNegative", .repeat(-1)), ("continuous", .repeat(.continuous)),
             ("periodic", .repeat(.periodic)),
@@ -61,3 +61,4 @@ struct OptionsDifferential {
         print(String(decoding: try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]), as: UTF8.self))
     }
 }
+
