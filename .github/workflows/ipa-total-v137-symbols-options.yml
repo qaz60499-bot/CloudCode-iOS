@@ -23,7 +23,7 @@ jobs:
           xcodebuild -version
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           mkdir -p output/audit output/swiftmodule
-          xcrun swiftc -parse-as-library -emit-library -emit-module \
+          SDKROOT="$SDK" xcrun --sdk iphoneos swiftc -parse-as-library -emit-library -emit-module \
             -enable-library-evolution -module-name Symbols \
             -target arm64-apple-ios16.6 -sdk "$SDK" \
             -emit-module-path output/swiftmodule/Symbols.swiftmodule \
@@ -35,6 +35,16 @@ jobs:
           xcrun otool -L output/IPASymbolsCompatCandidate.dylib > output/audit/dependencies.txt
           xcrun nm -gjU output/IPASymbolsCompatCandidate.dylib | sort > output/audit/exports.txt
           grep -A5 LC_BUILD_VERSION output/audit/commands.txt | grep -E 'minos +16\.6'
+          IPHONE_SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)" python3 - <<'PY'
+          import os,re,pathlib
+          commands=pathlib.Path('output/audit/commands.txt').read_text()
+          build=commands.split('LC_BUILD_VERSION',1)[1]
+          assert re.search(r'platform\s+2\b',build)
+          actual=re.search(r'\bsdk\s+([0-9.]+)',build).group(1)
+          expected=os.environ['IPHONE_SDK_VERSION']
+          assert tuple(map(int,actual.split('.'))) == tuple(map(int,expected.split('.'))), (actual,expected)
+          print('PASS_IPHONEOS_LINKER_SDK',actual)
+          PY
           ! grep -E 'FinanceKit|MarketplaceKit|/System/Library/Frameworks/Symbols.framework' output/audit/dependencies.txt
           cat > output/audit/required-nine.txt <<'SYMBOLS'
           _$s7Symbols19ReplaceSymbolEffectVAA0cD0AAMc
@@ -274,3 +284,4 @@ jobs:
           path: output/v137-avaudio/
           retention-days: 7
           if-no-files-found: warn
+
