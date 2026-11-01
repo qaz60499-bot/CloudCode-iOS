@@ -1,0 +1,50 @@
+name: IPA Total V121 image provenance and single-page diagnostic
+on:
+  push:
+    branches: [ci/ipa-total-v121-image-provenance-20261031]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-build:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile public source only, no licensed payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/IPA-V121"
+          mkdir -p "$OUT"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.6 -isysroot "$SDK" \
+            -O2 -Wall -Wextra -Werror \
+            tools/chatgpt-compat/ios166-v121-map-diagnostic.c -o "$OUT/map-diagnostic.ios"
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.6 -isysroot "$SDK" \
+            -fobjc-arc -O2 -Wall -Werror -fno-common \
+            tools/chatgpt-compat/ios166-v118-fairplay-probe.m \
+            -framework UIKit -framework Foundation -framework CoreGraphics \
+            -o "$OUT/IPAFairPlayProbe-hashguard.ios"
+          xcrun otool -l "$OUT/map-diagnostic.ios" > "$OUT/commands.txt"
+          xcrun otool -L "$OUT/map-diagnostic.ios" > "$OUT/dependencies.txt"
+          xcrun nm -u "$OUT/map-diagnostic.ios" > "$OUT/imports.txt"
+          xcrun otool -l "$OUT/IPAFairPlayProbe-hashguard.ios" > "$OUT/hashguard-commands.txt"
+          grep -A6 LC_BUILD_VERSION "$OUT/commands.txt" | grep -E 'minos +16\.6'
+          xcrun clang -O1 -Wall -Wextra -Werror tools/chatgpt-compat/ios166-v121-map-diagnostic.c -o "$OUT/map-diagnostic.host"
+          "$OUT/map-diagnostic.host" --inspect /dev/null > "$OUT/negative-host.json" && exit 8 || test "$?" = 1
+          python3 - "$OUT/negative-host.json" <<'PY'
+          import json,sys
+          r=json.load(open(sys.argv[1]))
+          assert r['status']=='rejected' and r['reason']=='input_not_regular_file'
+          print('HOST_NEGATIVE_NOT_DEVICE_ACCEPTANCE=true')
+          PY
+          cd "$OUT"
+          shasum -a 256 map-diagnostic.ios IPAFairPlayProbe-hashguard.ios > SHA256SUMS.txt
+          echo 'PUBLIC_SOURCE_ONLY_NO_IPA_SINF_CREDENTIALS=true' > scope.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-v121-native-provenance-diagnostic-NO-PAYLOAD
+          path: ${{ runner.temp }}/IPA-V121/
+          retention-days: 7
+          if-no-files-found: error

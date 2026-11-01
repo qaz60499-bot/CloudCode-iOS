@@ -4,6 +4,7 @@
 // Never upload target app, SC_Info or app credentials to a CI service.
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -50,6 +51,29 @@ static NSString *probe(void) {
                       stringByAppendingPathComponent:@"ChatGPT"];
     int fd = open(path.fileSystemRepresentation, O_RDONLY);
     if (fd < 0) return @"NO_LOCAL_EMBEDDED_TEST_IMAGE";
+    // V121: TrollStore changed this nested Mach-O despite omission of its
+    // Info.plist. cryptid=1 alone did not prove the original signature survived.
+    // Fail before remap unless the full pinned V117 image is byte-identical.
+    const size_t originalSize = 551440;
+    uint8_t expected[CC_SHA256_DIGEST_LENGTH] = {
+        0x9c,0x6b,0x55,0xca,0xa0,0x18,0x02,0x76,0xb9,0x17,0x5c,0xc9,0x49,0xec,0x36,0x78,
+        0x22,0x2f,0x28,0x76,0x72,0xa1,0xc5,0xff,0xf3,0xcb,0xc5,0x7a,0x79,0xd7,0xae,0xb0
+    };
+    uint8_t actual[CC_SHA256_DIGEST_LENGTH];
+    struct stat originalStat = {0};
+    if (fstat(fd, &originalStat) != 0 || originalStat.st_size != originalSize) {
+        close(fd); return @"EMBEDDED_IMAGE_CHANGED_OR_UNREADABLE; remap NOT attempted";
+    }
+    uint8_t *imageBytes = malloc(originalSize);
+    if (!imageBytes || pread(fd, imageBytes, originalSize, 0) != originalSize) {
+        free(imageBytes); close(fd);
+        return @"EMBEDDED_IMAGE_CHANGED_OR_UNREADABLE; remap NOT attempted";
+    }
+    CC_SHA256(imageBytes, (CC_LONG)originalSize, actual);
+    free(imageBytes);
+    if (memcmp(expected, actual, sizeof(expected)) != 0) {
+        close(fd); return @"EMBEDDED_IMAGE_HASH_MISMATCH; remap NOT attempted";
+    }
     struct mach_header_64 mh = {0};
     if (pread(fd, &mh, sizeof(mh), 0) != sizeof(mh)
         || mh.magic != MH_MAGIC_64 || mh.cputype != CPU_TYPE_ARM64
@@ -109,6 +133,14 @@ static NSString *probe(void) {
         }
     }
     munmap(base, extent); close(fd);
+    if (result != 0) {
+        return [NSString stringWithFormat:
+                @"iOS %@\nProtected original SHA256: verified\n"
+                 @"mremap cryptid2=%d errno=%d\n"
+                 @"Read page: NOT ATTEMPTED\nChanged bytes: NOT MEASURED\n"
+                 @"This is NOT ChatGPT.",
+                 UIDevice.currentDevice.systemVersion, result, err];
+    }
     // No plaintext bytes, license IDs, keys or addresses in the result.
     return [NSString stringWithFormat:
             @"iOS %@\nProtected original: YES\nmremap cryptid2=%d errno=%d\n"
