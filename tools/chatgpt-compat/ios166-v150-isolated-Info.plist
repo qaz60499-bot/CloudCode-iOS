@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>cc.guess.ipatotal.swiftabi.v150</string>
+  <key>CFBundleName</key><string>IPAABI150</string>
+  <key>CFBundleDisplayName</key><string>IPA ABI Lab 150</string>
+  <key>CFBundleExecutable</key><string>IPAABI150</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleShortVersionString</key><string>0.0.150</string>
+  <key>CFBundleVersion</key><string>150</string>
+  <key>MinimumOSVersion</key><string>16.6</string>
+  <key>LSRequiresIPhoneOS</key><true/>
+  <key>UIDeviceFamily</key><array><integer>1</integer></array>
+  <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+  <key>UILaunchScreen</key><dict/>
+  <key>CFBundleIcons</key><dict>
+    <key>CFBundlePrimaryIcon</key><dict>
+      <key>CFBundleIconFiles</key><array><string>V150Icon60x60</string></array>
+    </dict>
+  </dict>
+</dict></plist>
