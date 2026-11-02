@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- V154 specification ONLY; not named IPACompatV154.plist and not staged by Theos.
+     Compiling with IPA_V154_OFFICIAL=1 must NOT be treated as official injection
+     permission or as a verified FairPlay launch route. -->
+<plist version="1.0"><dict><key>Filter</key><dict>
+<key>Bundles</key><array><string>com.openai.chat</string></array>
+</dict></dict></plist>
