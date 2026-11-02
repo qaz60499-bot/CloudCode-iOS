@@ -1,0 +1,9 @@
+Package: cc.guess.ipatotal.v154injecttest
+Name: IPA Total V154 Rootless Injection - Research Only
+Version: 0.0.154
+Architecture: iphoneos-arm64
+Description: ElleKit test-only injection for isolated IPA Total V150 research app. No official ChatGPT hooks or app modification.
+Maintainer: IPA Total Local Research
+Author: IPA Total Local Research
+Section: Tweaks
+Depends: firmware (>= 16.6), ellekit
