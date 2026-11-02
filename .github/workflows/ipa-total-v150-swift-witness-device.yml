@@ -4,7 +4,7 @@ on:
     branches:
       - ci/ipa-total-v150-swift-witness-device-20261101
     paths:
-      - .github/workflows/ipa-total-v150-device-host.yml
+      - .github/workflows/ipa-total-v150-swift-witness-device.yml
       - tools/chatgpt-compat/ios166-v150-*
       - tools/chatgpt-compat/ios166-v144-research-*.swift
   workflow_dispatch:
