@@ -1,9 +1,10 @@
-name: ChatGPT iOS16.6 Swift module ABI feasibility
+name: IPA Total P3.174AX Swift6 Observation Notification Probe
 
 on:
   push:
     branches:
       - ci/chatgpt-ios166-module-abi-20261026
+      - ci/ipa-observation-notify-20261110
   workflow_dispatch:
 
 permissions:
@@ -135,29 +136,96 @@ jobs:
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           cat > "$OUT/Client.swift" <<'SWIFT'
           import Observation
+          
+          // First-party, compiler-owned Swift6 typed iOS16.6 research source.
+          // No original IPA is rewritten, no metadata/Witness/PAC is fabricated.
           final class Counter: Observable {
-            let registrar = ObservationRegistrar()
-            var value = 0
-            func current() -> Int {
-              registrar.access(self, keyPath: \.value)
-              return value
-            }
-            func increment() {
-              registrar.withMutation(of: self, keyPath: \.value) {
-                value += 1
+              let registrar = ObservationRegistrar()
+              var value = 0
+              func current() -> Int {
+                  registrar.access(self, keyPath: \.value)
+                  return value
               }
-            }
+              func increment() {
+                  registrar.withMutation(of: self, keyPath: \.value) {
+                      value += 1
+                  }
+              }
           }
           @_cdecl("ios166_observation_client_probe")
           public func observationProbe() -> Int32 {
-            let model = Counter()
-            let first = withObservationTracking({
-              model.current()
-            }, onChange: {
-              _ = model.current()
-            })
-            model.increment()
-            return Int32(first + model.current())
+              let model = Counter()
+              let first = withObservationTracking({
+                  model.current()
+              }, onChange: {
+                  _ = model.current()
+              })
+              model.increment()
+              return Int32(first + model.current())
+          }
+          
+          // Real notification semantics: access, withMutation, subscription invalidation
+          // fires once, and does not re-fire automatically on the second mutation.
+          final class TrackedCounter: Observable {
+              let registrar = ObservationRegistrar()
+              private var storage = 0
+              var number: Int {
+                  get {
+                      registrar.access(self, keyPath: \.number)
+                      return storage
+                  }
+                  set {
+                      registrar.withMutation(of: self, keyPath: \.number) {
+                          storage = newValue
+                      }
+                  }
+              }
+          }
+          @_cdecl("ios166_observation_notify_count_probe")
+          public func notificationProbe() -> Int32 {
+              let model = TrackedCounter()
+              var notifications = 0
+              let initial = withObservationTracking({
+                  model.number
+              }, onChange: {
+                  notifications += 1
+              })
+              guard initial == 0 && notifications == 0 else { return -11 }
+              model.number = 42
+              guard model.number == 42 && notifications == 1 else { return -12 }
+              model.number = 43
+              guard model.number == 43 && notifications == 1 else { return -13 }
+              return 1
+          }
+          
+          // Separate explicit willSet/didSet path, both required as distinct strong
+          // functions by the original untouched Termoso binary.
+          final class ExplicitCounter: Observable {
+              let registrar = ObservationRegistrar()
+              private var storage = 0
+              var number: Int {
+                  registrar.access(self, keyPath: \.number)
+                  return storage
+              }
+              func setNumber(_ newValue: Int) {
+                  registrar.willSet(self, keyPath: \.number)
+                  storage = newValue
+                  registrar.didSet(self, keyPath: \.number)
+              }
+          }
+          @_cdecl("ios166_observation_willdid_count_probe")
+          public func explicitNotificationProbe() -> Int32 {
+              let model = ExplicitCounter()
+              var notifications = 0
+              let initial = withObservationTracking({
+                  model.number
+              }, onChange: {
+                  notifications += 1
+              })
+              guard initial == 0 && notifications == 0 else { return -21 }
+              model.setNumber(42)
+              guard model.number == 42 && notifications == 1 else { return -22 }
+              return 1
           }
           SWIFT
           set +e
@@ -180,6 +248,10 @@ jobs:
               exit 1
             fi
             xcrun nm -u "$OUT/libCompatObservationClient.dylib" > "$OUT/client-undefined.txt"
+            for target_symbol in _ios166_observation_notify_count_probe _ios166_observation_willdid_count_probe; do
+              xcrun nm -gU "$OUT/libCompatObservationClient.dylib" | grep -F "$target_symbol" >/dev/null
+            done
+            echo "P3174AX_NOTIFICATION_EXPORTS_2_OF_2" | tee -a "$OUT/client-status.txt"
             xcrun otool -l "$OUT/libCompatObservationClient.dylib" | grep -A5 LC_BUILD_VERSION | head -8
           fi
       - name: Check Synchronization Swift standard-library internal compilation route
@@ -273,6 +345,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: chatgpt-ios166-upstream-module-probe
+          name: ipa-total-p3174ax-observation-notify-20261110
           path: ${{ runner.temp }}/ios166-swift-probe/
           if-no-files-found: warn
