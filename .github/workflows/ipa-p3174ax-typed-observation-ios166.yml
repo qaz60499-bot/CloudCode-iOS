@@ -1,0 +1,116 @@
+name: IPA Total P3.174AX typed Swift6 Observation semantics
+
+on:
+  push:
+    branches:
+      - ci/ipa-total-p3174ax-observation-typed-20261110
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  typed-observation:
+    runs-on: macos-15
+    timeout-minutes: 14
+    steps:
+      - name: Checkout isolated research branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pinned v7.0.1
+      - name: Build original upstream Swift 6 Observation module for native iOS16.6
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/build/p3174ax"
+          SRC="$RUNNER_TEMP/p3174ax-swift6"
+          mkdir -p "$OUT" "$SRC/Observation"
+          BASE="https://raw.githubusercontent.com/swiftlang/swift/swift-6.0-RELEASE/stdlib/public/Observation/Sources/Observation"
+          for f in Locking.swift Observable.swift ObservationRegistrar.swift ObservationTracking.swift ThreadLocal.swift; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 30 "$BASE/$f" -o "$SRC/Observation/$f"
+          done
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun clang -target arm64-apple-ios16.6 -miphoneos-version-min=16.6 -isysroot "$SDK" \
+            -Wall -Wextra -Werror -fvisibility=hidden \
+            -c tools/chatgpt-compat/ios166-observation-posix-runtime.c -o "$OUT/ios166-observation-runtime.o"
+          xcrun swiftc -parse-as-library -emit-library -emit-module -module-name Observation \
+            -target arm64-apple-ios16.6 -sdk "$SDK" \
+            -emit-module-path "$OUT/Observation.swiftmodule" \
+            -Xlinker -install_name -Xlinker @rpath/libswiftObservation.dylib \
+            "$SRC"/Observation/*.swift "$OUT/ios166-observation-runtime.o" \
+            -o "$OUT/libswiftObservation.dylib"
+          shasum -a 256 "$OUT/libswiftObservation.dylib" | tee "$OUT/original-upstream-sha256.txt"
+          xcrun otool -L "$OUT/libswiftObservation.dylib" | tee "$OUT/Observation.loadlibs.txt"
+      - name: Build genuinely typed KeyPath and notification iOS16.6 Swift client
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/build/p3174ax"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          SWIFT="tools/chatgpt-compat/p3174ax_typed_swift6_observation_notifications.swift"
+          shasum -a 256 "$SWIFT" | tee "$OUT/source-sha256.txt"
+          xcrun swiftc -parse-as-library -emit-library \
+            -module-name IPACompatP3174AXClient \
+            -target arm64-apple-ios16.6 -sdk "$SDK" \
+            -I "$OUT" "$OUT/libswiftObservation.dylib" \
+            -Xlinker -install_name -Xlinker @rpath/libIPACompatP3174AXClient.dylib \
+            -Xlinker -rpath -Xlinker @loader_path \
+            "$SWIFT" -o "$OUT/libIPACompatP3174AXClient.dylib"
+          xcrun otool -L "$OUT/libIPACompatP3174AXClient.dylib" | tee "$OUT/Client.loadlibs.txt"
+          grep -F '@rpath/libswiftObservation.dylib' "$OUT/Client.loadlibs.txt"
+          if grep -F '/usr/lib/swift/libswiftObservation.dylib' "$OUT/Client.loadlibs.txt"; then exit 4; fi
+          xcrun nm -gU "$OUT/libIPACompatP3174AXClient.dylib" | tee "$OUT/Client.exports.txt"
+          grep -F '_p3174ax_observation_one_shot_typed' "$OUT/Client.exports.txt"
+          grep -F '_p3174ax_observation_will_did_typed' "$OUT/Client.exports.txt"
+          shasum -a 256 "$OUT/libIPACompatP3174AXClient.dylib" | tee "$OUT/client-sha256.txt"
+      - name: Independently run identical Swift6 typed-client source with native macOS real callbacks
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/build/p3174ax"
+          MAC="$OUT/mac-native"
+          SRC="$RUNNER_TEMP/p3174ax-swift6"
+          mkdir -p "$MAC"
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          xcrun clang -target arm64-apple-macos13.0 -isysroot "$SDK" \
+            -Wall -Wextra -Werror \
+            -c tools/chatgpt-compat/ios166-observation-posix-runtime.c \
+            -o "$MAC/ios-observation-runtime.o"
+          xcrun swiftc -parse-as-library -emit-library -emit-module -module-name Observation \
+            -target arm64-apple-macos13.0 -sdk "$SDK" \
+            -emit-module-path "$MAC/Observation.swiftmodule" \
+            -Xlinker -install_name -Xlinker @rpath/libswiftObservation.dylib \
+            "$SRC"/Observation/*.swift "$MAC/ios-observation-runtime.o" \
+            -o "$MAC/libswiftObservation.dylib"
+          xcrun swiftc -parse-as-library -emit-library \
+            -module-name IPACompatP3174AXClient \
+            -target arm64-apple-macos13.0 -sdk "$SDK" \
+            -I "$MAC" "$MAC/libswiftObservation.dylib" \
+            -Xlinker -install_name -Xlinker @rpath/libIPACompatP3174AXClient.dylib \
+            -Xlinker -rpath -Xlinker @loader_path \
+            tools/chatgpt-compat/p3174ax_typed_swift6_observation_notifications.swift \
+            -o "$MAC/libIPACompatP3174AXClient.dylib"
+          cat > "$MAC/NativeProbe.c" <<'C'
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          int main(int argc,char**argv) {
+              if (argc!=2) return 2;
+              void* lib=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);
+              if(!lib){fprintf(stderr,"MAC_LOAD_RED:%s\n",dlerror());return 3;}
+              int32_t (*one)(void)=(int32_t(*)(void))dlsym(lib,"p3174ax_observation_one_shot_typed");
+              int32_t (*two)(void)=(int32_t(*)(void))dlsym(lib,"p3174ax_observation_will_did_typed");
+              if(!one || !two) return 4;
+              int32_t a=one(),b=two();
+              printf("P3174AX_MAC_REAL_SWIFT6_CALLBACKS:%d:%d\n",(int)a,(int)b);
+              return a==1 && b==1?0:5;
+          }
+          C
+          xcrun clang -target arm64-apple-macos13.0 -isysroot "$SDK" \
+            -Wall -Wextra -Werror "$MAC/NativeProbe.c" -o "$MAC/NativeProbe"
+          "$MAC/NativeProbe" "$MAC/libIPACompatP3174AXClient.dylib" \
+            | tee "$MAC/typed-notification-result.txt"
+          grep -Fx 'P3174AX_MAC_REAL_SWIFT6_CALLBACKS:1:1' "$MAC/typed-notification-result.txt"
+      - name: Retain native iOS signed-target research build and source results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-p3174ax-typed-observation-swift6-ios166
+          path: build/p3174ax/
+          if-no-files-found: error
+          retention-days: 10
